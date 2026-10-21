@@ -1,0 +1,149 @@
+# =============================================================================
+# ZHA Auto-Konfig — anvender model-specifikke defaults paa nye enheder
+# =============================================================================
+# Lytter efter device_registry_updated event (action: create) og applikerer
+# automatisk Power-on / level / color-temp defaults via cluster-commands
+# hvis enheden matcher en kendt profil.
+#
+# Workflow med denne automation aktiv:
+#   1. Du paerer en enhed via ZHA UI
+#   2. ZHA enumererer enhedens clusters (~10-30 sek)
+#   3. Denne automation fyrer 30 sek efter join
+#   4. Hvis enhed matcher kendt model -> defaults sat automatisk
+#   5. Du modtager en persistent notification med bekraeftelse
+#   6. Du behoever kun manuelt at omdoebe device i HA UI
+#
+# Tilfoej nye profiles ved at tilfoeje en `choose`-branch nedenfor med
+# matching model + tilsvarende script-kald.
+#
+# OBS: 30 sek delay er noedvendig fordi manufacturer/model er ikke
+# tilgaengelige umiddelbart efter device join — ZHA skal foerst polle
+# device descriptors fra paeren.
+# =============================================================================
+
+- id: zha_auto_config_new_device
+  alias: "ZHA: auto-konfig ny enhed ved parring"
+  description: >
+    Anvender model-specifikke defaults via cluster-commands paa nye
+    Zigbee-enheder. Reducerer manuel UI-arbejde — du parrer, og
+    Power-on settings sættes automatisk.
+  mode: parallel
+  max: 10
+  trigger:
+    - platform: event
+      event_type: device_registry_updated
+      event_data:
+        action: create
+  variables:
+    device_id: "{{ trigger.event.data.device_id }}"
+  action:
+    # ZHA skal naa at hente cluster descriptors fra paeren
+    - delay:
+        seconds: 30
+
+    - variables:
+        manufacturer: "{{ device_attr(device_id, 'manufacturer') | default('') | lower }}"
+        model: "{{ device_attr(device_id, 'model') | default('') }}"
+        # Extract IEEE from ZHA identifier tuple ('zha', 'xx:xx:xx:xx:xx:xx:xx:xx')
+        ieee_match: >-
+          {% set ids = device_attr(device_id, 'identifiers') | list %}
+          {% set z = ids | selectattr(0, 'eq', 'zha') | list %}
+          {{ z[0][1] if z else '' }}
+
+    - choose:
+        # Ikke en ZHA-enhed (fx ESPHome, Hue, etc) -> skip
+        - conditions: "{{ ieee_match == '' }}"
+          sequence:
+            - stop: "Ikke ZHA — auto-konfig springes over"
+
+        # Paerer med BAADE color temperature OG farve (eller WS):
+        # Innr RGB+W (RB 282 C, FL 230 C, RF 271 T, OFL 142 C, OLS 210)
+        # IKEA Tradfri WS (white spectrum) — model-navnet indeholder " WS "
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ (manufacturer == 'innr' and model in
+                    ['RB 282 C', 'FL 230 C', 'RF 271 T', 'OFL 142 C', 'OLS 210'])
+                   or (manufacturer in ['ikea of sweden', 'ikea'] and
+                       (' WS ' in (' ' ~ model ~ ' ') or 'CWS' in model)) }}
+          sequence:
+            - service: script.innr_color_bulb_defaults
+              data:
+                ieee: "{{ ieee_match }}"
+            - service: persistent_notification.create
+              data:
+                notification_id: "auto_config_{{ ieee_match }}"
+                title: "Auto-konfig: {{ model }}"
+                message: >-
+                  Defaults sat paa {{ ieee_match }}: Power-on On, level 30%
+                  (firmware-default — adaptive overstyrer per sun-bracket),
+                  Start-up CT 370 mireds initial (overstyrer ogsaa adaptivt).
+
+                  HUSK: omdoeb device i HA UI til konventionen
+                  (fx "Stue Loft" -> light.stue_loft). Plus tilfoj IEEE +
+                  brightness/CT-targets til bulb_configs i
+                  automations/bulb_firmware_defaults.yaml for adaptive sync.
+
+        # IKEA Tradfri SINGLE warm-white paerer (ingen CT, ingen farve)
+        # Matcher kendte models + bredt fallback for IKEA bulbs UDEN WS/CWS
+        # (= no color-temp cluster, no color cluster). Audit-runde 19 (2026-05-04):
+        # tilfojet broader matching for at fange newer models (LED2002G5, LED2201G8,
+        # LED1949* series) som kommer i Tradfri Startsæt 2024-2026.
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ manufacturer in ['ikea of sweden', 'ikea'] and
+                   not (' WS ' in (' ' ~ model ~ ' ') or 'CWS' in model
+                        or 'CW' in model.upper().replace('CWS','')) and
+                   ('LED' in model or 'TRADFRI' in model.upper()) }}
+          sequence:
+            - service: script.tradfri_white_bulb_defaults
+              data:
+                ieee: "{{ ieee_match }}"
+            - service: persistent_notification.create
+              data:
+                notification_id: "auto_config_{{ ieee_match }}"
+                title: "Auto-konfig: {{ model }}"
+                message: >-
+                  Defaults sat paa {{ ieee_match }}: Power-on On, level 30%.
+                  (IKEA white-only paere — ingen CT/color support.)
+
+                  HUSK: omdoeb device i HA UI til konventionen
+                  (fx light.tradfri_white_2 til _5 for standby bulbs).
+
+        # Innr smart plugs (SP 240 indoor, OSP 240 outdoor)
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ manufacturer == 'innr' and model in
+                   ['SP 240', 'SP240', 'OSP 240', 'OSP240'] }}
+          sequence:
+            - service: script.innr_plug_defaults
+              data:
+                ieee: "{{ ieee_match }}"
+            - service: persistent_notification.create
+              data:
+                notification_id: "auto_config_{{ ieee_match }}"
+                title: "Auto-konfig: {{ model }} plug"
+                message: >-
+                  Defaults sat paa {{ ieee_match }}: Power-on On.
+                  Pluggen taender automatisk efter strom-tilbagevenden.
+
+                  HUSK: omdoeb device i HA UI til konventionen
+                  (fx "Stue Plug" -> switch.stue_plug).
+
+        # Catch-all: log ukendt model saa vi senere kan tilfoeje profil
+        - conditions: "{{ true }}"
+          sequence:
+            - service: persistent_notification.create
+              data:
+                notification_id: "auto_config_unknown_{{ ieee_match }}"
+                title: "Auto-konfig: ukendt model"
+                message: >-
+                  Ny ZHA-enhed paret men matcher ingen kendt profil:
+                  Manufacturer: {{ manufacturer }}
+                  Model: {{ model }}
+                  IEEE: {{ ieee_match }}
+
+                  Hvis denne enhed skal have auto-defaults, tilfoej en
+                  profil i automations/zha_auto_config.yaml.

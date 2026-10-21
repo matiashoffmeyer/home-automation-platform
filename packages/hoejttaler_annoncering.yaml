@@ -1,0 +1,572 @@
+# =============================================================================
+# Højttaler-annonceringer — køkken-timer + vejrudsigt (bygget 2026-10-07, B199)
+# =============================================================================
+# User-spec 2026-10-07 (højttaleren er ikke parret endnu — "hvis den er der"):
+#   · "'Kitchen timer is done' skal pause musik, afspilles 1 gang, og så skal
+#     musikken genoptages hvis den kørte."
+#   · "når en HA timer startes pause musik og sige: 'Timer started, N minutes'"
+#   · "Kan den også læse en vejrudsigt op når vejrvarslet kører?"
+#
+# HVIS DEN ER DER: alt herunder kræver binary_sensor.hoejttaler_online `on`
+# (ping-integrationen, oprettes ved parring — tjekliste punkt 7 i
+# docs/hardware_shopping.md) OG en media_player.hoejttaler. Findes de ikke, er
+# hvert kald en tavs no-op — telefonens "Kitchen timer is done"-løkke og
+# vejr-blinket kører præcis som før.
+#
+# SÅDAN SPILLER DEN EN BESKED (script.hoejttaler_annoncer):
+#   Volumio's play_media tager KUN JSON (packages/hoejttaler.yaml), så HA's
+#   tts.speak (media-source://tts/…) kan ikke bruges. scripts/tts_url.py beder
+#   HA om en almindelig URL (POST /api/tts_get_url, Google Translate-TTS) og
+#   henter filen én gang → cachen er varm og lydens længde kendt (CBR 64 kbps).
+#   Målt 2026-10-07: URL'en er http://192.0.2.151:8123/api/tts_proxy/….mp3
+#   (internal_url, LAN) og svarer 200 audio/mpeg uden login; "Kitchen timer is
+#   done" = 2,1 s, en vejrudsigt på ~22 ord = 11,6 s.
+#   Rækkefølge: snapshot (spiller? volumen) → annoncerings-volumen → afspil →
+#   vent lydens længde + 2 s → stop, ryd køen, volumen tilbage.
+#
+# SPILLER DEN NOGET, SPRINGES BESKEDEN OVER — radio, Spotify, MA, AirPlay,
+# Volumio-appens kø; også `vigtig: true` (timeren er færdig — telefonens
+# TTS-løkke og lys-alarmen siger det alligevel). User 14/10 efter 13/10's
+# Dai Dai-kaos, hvor timer-beskederne pausede Spotify via HA og "genoptog" P4
+# i stedet (to gange): "Vi skal respekteres og ikke afbrydes når vi gør
+# manuelle ting" + "oplæsninger som timer og vejr varsel skal springe
+# højttaler over hvis der er noget der spiller (selvfølgelig)". Før: radioen
+# blev pauset og genoptaget — den vej findes ikke længere.
+#   · `vigtig` gennembryder kun STILLE (godnat/Sleep Over).
+#
+# STILLE: godnat (fælles eller børnenes putning) og Sleep Over (en gæst sover
+# i open plan) → kun `vigtig` spiller. Vejr-oplæsningen om morgenen kræver
+# desuden at ingen voksen sover i soveværelset (binary_sensor.
+# sovevaerelse_voksne_oppe, samme bevis som morgenradioen).
+#
+# SPROG: engelsk, som user selv skrev sætningerne (og som telefonens køkken-
+# timer allerede taler). Google-TTS kan også dansk (målt) → feltet `sprog`.
+#
+# AirBnB: køkken-timeren findes kun i familie-modes, og vejr-blinket kører
+# ikke i AirBnB → begge veje er familie-only (🏡 punkt 5).
+# =============================================================================
+
+input_boolean:
+  hoejttaler_timer_annoncering_enabled:
+    name: "Højttaler: sig køkken-timeren"
+    icon: mdi:timer-music
+  hoejttaler_vejr_oplaesning_enabled:
+    name: "Højttaler: læs vejrvarslet op"
+    icon: mdi:weather-partly-rainy
+  # B205: regn-varslet spiller "Regn" (Østen) efter oplæsningen.
+  hoejttaler_regn_sang_enabled:
+    name: "Højttaler: regnsang ved regnvarsel"
+    icon: mdi:music-note
+
+input_number:
+  # Fast niveau for beskeder — uafhængigt af hvad musikken stod på; den gamle
+  # volumen sættes tilbage bagefter. 35 % = gæt (højttaleren findes ikke endnu,
+  # 2×75 W) — mål når den er i brug.
+  hoejttaler_annoncering_volumen:
+    name: "Højttaler: volumen for beskeder"
+    icon: mdi:volume-medium
+    min: 5
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+shell_command:
+  # Beskeden sendes base64-kodet: HA shlex-splitter et templated shell_command
+  # EFTER renderingen, så en apostrof i teksten ville ellers flytte argumenterne.
+  hoejttaler_tts_url: "python3 /config/scripts/tts_url.py {{ b64 }} {{ sprog }}"
+  # B205: Music Assistants kø for "Højttaler via HA" (universal-afspilleren
+  # up26491670 → DLNA → højttaleren). Uri'en er MA-formen spotify://track/<id>
+  # (ingen mellemrum/apostroffer → sikker efter shlex-split).
+  hoejttaler_ma_spil: "python3 /config/scripts/ma_api.py play up26491670 {{ uri }}"
+  hoejttaler_ma_stop: "python3 /config/scripts/ma_api.py stop up26491670"
+
+script:
+  hoejttaler_annoncer:
+    alias: "Højttaler: sig en besked (kun når intet spiller)"
+    icon: mdi:bullhorn
+    # queued: to beskeder lige efter hinanden (timer + vejr) må hverken tabes
+    # eller tale oven i hinanden — og hver kørsel genopretter sin egen musik.
+    mode: queued
+    max: 5
+    fields:
+      besked:
+        description: "Teksten der skal siges"
+        required: true
+        example: "Kitchen timer is done"
+      sprog:
+        description: "Google-TTS-sprog (default en)"
+        required: false
+        example: "en"
+      vigtig:
+        description: >-
+          true = spil også under godnat og Sleep Over (afbryder ALDRIG
+          noget der spiller — så springes beskeden over)
+        required: false
+        example: false
+    sequence:
+      - variables:
+          tekst: "{{ (besked | default('') | string) | trim }}"
+          lang: "{{ sprog | default('en', true) }}"
+          er_vigtig: "{{ (vigtig | default(false)) in [true, 'true', 'True', 'on', 1, '1'] }}"
+          # SNAPSHOT før vi rører noget. Volumio's 'playing' hænger (slukket
+          # højttaler, AirPlay-telefon der gik, MPD der stoppede) → ankeret i
+          # packages/hoejttaler.yaml. Målt 11/10 06:30: en hængende AirPlay fra
+          # dagen før fik vejr-oplæsningen sprunget over.
+          spillede: "{{ is_state('binary_sensor.hoejttaler_spiller_reelt', 'on') }}"
+          # En person spiller noget (Spotify, MA-strøm, AirPlay) → ankeret i
+          # packages/hoejttaler.yaml. 13/10 17:46-17:52: timer-beskederne
+          # pausede Spotify via HA og "genoptog" P4 i stedet — to gange.
+          anden_kilde: "{{ is_state('binary_sensor.hoejttaler_anden_kilde', 'on') }}"
+          vol_foer: "{{ state_attr('media_player.hoejttaler', 'volume_level') | float(-1) }}"
+          stille: >-
+            {{ is_state('binary_sensor.godnat_common_active', 'on')
+               or is_state('input_boolean.godnat_boern_active', 'on')
+               or is_state('input_boolean.sleepover_i_nat', 'on') }}
+      # Højttaleren skal være der og tændt (se headeren).
+      - condition: template
+        value_template: >-
+          {{ tekst != ''
+             and states('media_player.hoejttaler') not in ['unavailable', 'unknown']
+             and is_state('binary_sensor.hoejttaler_online', 'on') }}
+      # Spiller højttaleren NOGET (også radioen), springes beskeden over — også
+      # `vigtig` (user 14/10: "Vi skal respekteres og ikke afbrydes når vi gør
+      # manuelle ting" + "oplæsninger som timer og vejr varsel skal springe
+      # højttaler over hvis der er noget der spiller"). Timer-færdig har
+      # telefonens TTS-løkke + lys-alarmen ved siden af.
+      - if:
+          - condition: template
+            value_template: "{{ spillede or anden_kilde or (not er_vigtig and stille) }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Højttaler"
+              message: >-
+                Besked sprunget over ({{ 'der spiller allerede noget — afbrydes ikke'
+                if spillede or anden_kilde else 'godnat eller Sleep Over' }}): {{ tekst }}
+          - stop: "Afbryder ikke"
+      - service: shell_command.hoejttaler_tts_url
+        continue_on_error: true
+        response_variable: tts
+        data:
+          b64: "{{ tekst | base64_encode }}"
+          sprog: "{{ lang }}"
+      - variables:
+          svar: >-
+            {% set ud = (tts.stdout | default('')) if tts is defined else '' %}
+            {{ ud | trim if (ud | trim).startswith('{') else '{}' }}
+      # svar er allerede parset til en dict af HA (native types) — eller en
+      # streng, hvis noget gik skævt; derfor `is mapping`.
+      - variables:
+          url: "{{ (svar.url | default('')) if svar is mapping else '' }}"
+          sekunder: "{{ ((svar.sekunder | default(0)) if svar is mapping else 0) | float(0) }}"
+      - if:
+          - condition: template
+            value_template: "{{ not url.startswith('http') }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Højttaler"
+              message: >-
+                Kunne ikke lave lyd til beskeden (tts_url.py:
+                {{ ((tts.stderr | default('')) if tts is defined else 'intet svar') | trim | truncate(120) }}): {{ tekst }}
+          - stop: "Ingen TTS-URL"
+      - service: media_player.volume_set
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+        data:
+          volume_level: >-
+            {{ ([[states('input_number.hoejttaler_annoncering_volumen') | float(35), 5] | max, 100] | min) / 100 }}
+      - service: media_player.play_media
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+        data:
+          media_content_type: music
+          media_content_id: >-
+            {{ {'uri': url, 'service': 'webradio', 'type': 'webradio', 'title': 'Besked'} | to_json }}
+      # Lydens længde (fra tts_url.py) + 2 s til at Volumio henter og starter
+      # filen. Ukendt længde → ~0,55 s pr. ord (målt 22 ord = 11,6 s).
+      # Volumio starter "webradio"-filen FORFRA når den er slut — derfor har
+      # tts_url.py lagt 5 s stilhed bag talen, så de 2 s lander i stilheden
+      # (13/10: uden den sagde den "Good morning" igen).
+      - delay:
+          milliseconds: >-
+            {% set s = sekunder if sekunder > 0 else (tekst.split() | count) * 0.55 + 1 %}
+            {{ ((s + 2) * 1000) | int }}
+      # Bagefter: intet at genoptage (der spillede intet, ellers var beskeden
+      # sprunget over). Ryd køen, så Volumio-appens play-knap ikke siger
+      # beskeden igen (og stop den, hvis køen står på gentag).
+      - service: media_player.media_stop
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+      - service: media_player.clear_playlist
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+      - if:
+          - condition: template
+            value_template: "{{ vol_foer >= 0 }}"
+        then:
+          - service: media_player.volume_set
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+            data:
+              volume_level: "{{ vol_foer }}"
+      - service: logbook.log
+        data:
+          name: "Højttaler"
+          message: >-
+            Sagde "{{ tekst }}" ({{ sekunder }} s).
+
+  # ---------------------------------------------------------------------------
+  # B205 (2026-10-09) — HA spiller ÉN bestemt sang fra Spotify. User: "ingen
+  # grund til ikke at ha begge aktive så du kan afspille bestemte sange, feks
+  # ved regn varsel så kan Østens sang Regn spille."
+  # Vejen: Music Assistant (add-on'en, input_boolean.hoejttaler_spotify_via_ha)
+  # → dens kø for "Højttaler via HA" → DLNA → højttaleren (scripts/ma_api.py
+  # play). Volumio's egen play_media kan ikke Spotify.
+  # Som en besked (user 14/10): spiller højttaleren noget — også radioen —
+  # springes sangen over, og bagefter genoptages INTET (B233).
+  # Venter først på en igangværende besked (vejr-oplæsningen startes i samme
+  # sekund af vejr-blinket). Ingen kill-switch HER — den hører til anledningen
+  # (input_boolean.hoejttaler_regn_sang_enabled i automations/rain_warning.yaml).
+  # ---------------------------------------------------------------------------
+  hoejttaler_spil_sang:
+    alias: "Højttaler: spil en sang fra Spotify (kun når intet spiller)"
+    icon: mdi:music-circle
+    mode: single
+    max_exceeded: silent
+    fields:
+      uri:
+        description: "Music Assistant-uri, fx spotify://track/55Z56AGM7ZmsNw2yu0JExG"
+        required: true
+        example: "spotify://track/55Z56AGM7ZmsNw2yu0JExG"
+      volumen:
+        description: "Volumen i % (udeladt = radioens nuværende, eller start-volumen efter standby)"
+        required: false
+        example: 30
+      anledning:
+        description: "Til logbogen, fx regnvarsel"
+        required: false
+        example: "regnvarsel"
+    sequence:
+      - delay:
+          seconds: 3
+      - wait_template: >-
+          {{ is_state('script.hoejttaler_vejr_oplaesning', 'off')
+             and is_state('script.hoejttaler_annoncer', 'off') }}
+        timeout:
+          seconds: 120
+        continue_on_timeout: true
+      - variables:
+          sang: "{{ (uri | default('') | string) | trim }}"
+          grund: "{{ anledning | default('', true) }}"
+          vol_felt: "{{ volumen | default(-1) | int(-1) }}"
+          # Som script.hoejttaler_annoncer — samme anker (Volumio står STALE på
+          # 'playing' når MA's DLNA-strøm er slut, målt 09/10 16:46: Volumio
+          # play, MPD stop; og på en AirPlay der for længst er gået, 11/10).
+          spillede: "{{ is_state('binary_sensor.hoejttaler_spiller_reelt', 'on') }}"
+          vol_foer: "{{ state_attr('media_player.hoejttaler', 'volume_level') | float(-1) }}"
+          # IKKE binary_sensor.hoejttaler_spotify_aktiv: den undtager netop
+          # dette script, mens det kører (= nu) → den ville sige "ingen Spotify"
+          # og sangen afbrød en telefons Spotify via HA (09/10 16:42). Her har
+          # vi ikke spillet noget endnu, så MA-strøm i MPD = en andens musik.
+          spotify: >-
+            {{ is_state('binary_sensor.spotify_bro_spiller', 'on')
+               or state_attr('sensor.hoejttaler_spotify', 'myair') == true
+               or state_attr('sensor.hoejttaler_spotify', 'kilde') == 'ha' }}
+          stille: >-
+            {{ is_state('binary_sensor.godnat_common_active', 'on')
+               or is_state('input_boolean.godnat_boern_active', 'on')
+               or is_state('input_boolean.sleepover_i_nat', 'on') }}
+          spring_over: >-
+            {% if sang == '' %}ingen uri
+            {% elif states('input_select.house_mode') not in ['Normal', 'Home Vacation'] %}AirBnB
+            {% elif states('media_player.hoejttaler') in ['unavailable', 'unknown']
+                    or not is_state('binary_sensor.hoejttaler_online', 'on') %}højttaleren er slukket
+            {% elif not is_state('binary_sensor.music_assistant_running', 'on') %}Music Assistant kører ikke
+            {% elif stille %}godnat eller Sleep Over
+            {% elif spotify or spillede %}der spiller allerede noget
+            {% endif %}
+      - if:
+          - condition: template
+            value_template: "{{ spring_over | trim != '' }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Højttaler"
+              message: "Sang{{ ' (' ~ grund ~ ')' if grund else '' }} sprunget over: {{ spring_over | trim }}."
+          - stop: "Sprunget over"
+      - service: media_player.volume_set
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+        data:
+          volume_level: >-
+            {% if vol_felt > 0 %}{{ ([vol_felt, 100] | min) / 100 }}
+            {% elif vol_foer >= 0.05 %}{{ vol_foer }}
+            {% else %}{{ (states('input_number.hoejttaler_standby_start_volumen') | float(25)) / 100 }}
+            {% endif %}
+      - service: shell_command.hoejttaler_ma_spil
+        continue_on_error: true
+        response_variable: ma
+        data:
+          uri: "{{ sang }}"
+      # from_json, IKKE rå stdout: HA's native-parsing er Python-literal, og
+      # JSON's `true` er ingen → svaret forblev en streng, og en sang der
+      # spillede blev stoppet som "fejlet" efter 4 s (09/10 16:46).
+      - variables:
+          svar: >-
+            {% set ud = ((ma.stdout | default('')) if ma is defined else '') | trim %}
+            {{ (ud | from_json) if ud.startswith('{') else {} }}
+      - variables:
+          navn: "{{ (svar.navn | default(sang)) if svar is mapping else sang }}"
+          sekunder: "{{ ((svar.sekunder | default(0)) if svar is mapping else 0) | int(0) }}"
+          ok: "{{ svar is mapping and svar.ok | default(false) }}"
+      - if:
+          - condition: template
+            value_template: "{{ not ok }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Højttaler"
+              message: >-
+                Sangen kunne ikke startes (ma_api.py rc={{ ma.returncode | default('?') if ma is defined else '?' }}:
+                {{ ((ma.stderr | default('') ~ ' ' ~ ma.stdout | default('')) if ma is defined else 'intet svar') | trim | truncate(160) }}).
+        else:
+          # Sangens længde + 5 s (MA's flow-strøm starter ~2 s efter kaldet).
+          # Ukendt længde → 6 min loft. En telefon der tager over afbryder
+          # ventetiden (Spotify-broen — pushet straks; myair via scannerens 30-s-poll).
+          - wait_template: >-
+              {{ is_state('binary_sensor.spotify_bro_spiller', 'on')
+                 or state_attr('sensor.hoejttaler_spotify', 'myair') == true }}
+            timeout:
+              seconds: "{{ (sekunder + 5) if sekunder > 0 else 360 }}"
+            continue_on_timeout: true
+          - if:
+              - condition: template
+                value_template: "{{ wait.completed }}"
+            then:
+              - service: logbook.log
+                data:
+                  name: "Højttaler"
+                  message: "Spillede {{ navn }} — en telefon tog over med Spotify."
+              - stop: "Spotify tog over"
+      # B233 (14/10): INGEN radio-genoptagelse. Sangen spiller kun når intet
+      # andet gør (spring_over ovenfor), så der er aldrig noget at give tilbage —
+      # og en radio der kom tilbage efter en sang var en del af "lyd-kaosset".
+      - service: shell_command.hoejttaler_ma_stop
+        continue_on_error: true
+      - if:
+          - condition: template
+            value_template: "{{ vol_foer >= 0 }}"
+        then:
+          - service: media_player.volume_set
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+            data:
+              volume_level: "{{ vol_foer }}"
+      - if:
+          - condition: template
+            value_template: "{{ ok }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Højttaler"
+              message: >-
+                Spillede {{ navn }}{{ ' (' ~ grund ~ ')' if grund else '' }}.
+
+  # ---------------------------------------------------------------------------
+  # Vejrudsigten læses op — kaldes af vejr-blinket (automations/rain_warning.yaml,
+  # morgen- og aften-varslet) i samme øjeblik blinket starter. Blinket kører kun
+  # på varsel-dage (regn/sne/vind/UV), når nogen er i open plan, Active og ikke
+  # AirBnB; gatesne herunder er dem der handler om LYD.
+  # ---------------------------------------------------------------------------
+  hoejttaler_vejr_oplaesning:
+    alias: "Højttaler: læs vejrudsigten op"
+    icon: mdi:weather-partly-rainy
+    mode: single
+    max_exceeded: silent
+    fields:
+      periode:
+        description: "morgen (dagens vejr) eller aften (nattens vejr)"
+        required: false
+        example: "morgen"
+    sequence:
+      - variables:
+          per: "{{ periode | default('morgen', true) }}"
+      - condition: state
+        entity_id: input_boolean.hoejttaler_vejr_oplaesning_enabled
+        state: "on"
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+      - condition: template
+        value_template: >-
+          {{ states('media_player.hoejttaler') not in ['unavailable', 'unknown']
+             and is_state('binary_sensor.hoejttaler_online', 'on') }}
+      # Morgen: ingen voksen må sove i soveværelset (samme bevis som morgenradioen)
+      # — med mindre morgen-varslets B209-ventetid er udløbet (automations/
+      # rain_warning.yaml afgør det og sender vent_udloebet med).
+      - condition: template
+        value_template: >-
+          {{ per != 'morgen' or is_state('binary_sensor.sovevaerelse_voksne_oppe', 'on')
+             or ((vent_udloebet | default(false)) | string | lower) == 'true' }}
+      - service: weather.get_forecasts
+        continue_on_error: true
+        target:
+          entity_id: weather.forecast_home
+        data:
+          type: "{{ 'daily' if per == 'morgen' else 'hourly' }}"
+        response_variable: fc
+      # Varslerne læses fra de SAMME sensorer som blinket (packages/
+      # weather_warning.yaml) — det der siges, er det der blinkes. met.no's
+      # prognose giver kun vejrtype og temperatur.
+      - variables:
+          tekst: >-
+            {%- set navne = {'clear-night': 'clear', 'cloudy': 'cloudy',
+                 'exceptional': 'unusual weather', 'fog': 'foggy', 'hail': 'hail',
+                 'lightning': 'thunderstorms', 'lightning-rainy': 'thunderstorms with rain',
+                 'partlycloudy': 'partly cloudy', 'pouring': 'heavy rain', 'rainy': 'rainy',
+                 'snowy': 'snow', 'snowy-rainy': 'sleet', 'sunny': 'sunny',
+                 'windy': 'windy', 'windy-variant': 'windy and cloudy'} -%}
+            {%- set liste = (fc.get('weather.forecast_home', {}).get('forecast', []))
+                 if fc is defined and fc is mapping else [] -%}
+            {%- set ns = namespace(t='', tmin=none) -%}
+            {%- if per == 'morgen' -%}
+              {%- set v = 'sensor.vejr_varsel_i_dag' -%}
+              {%- set ns.t = 'Good morning.' -%}
+              {%- set d = liste[0] if liste | count > 0 else {} -%}
+              {%- if d.condition is defined -%}
+                {%- set ns.t = ns.t ~ " Today's forecast is " ~ navne.get(d.condition, d.condition) -%}
+                {%- if d.temperature is defined -%}
+                  {%- set ns.t = ns.t ~ ', with a high of ' ~ (d.temperature | float(0) | round(0) | int) -%}
+                  {%- if d.templow is defined -%}
+                    {%- set ns.t = ns.t ~ ' and a low of ' ~ (d.templow | float(0) | round(0) | int) -%}
+                  {%- endif -%}
+                  {%- set ns.t = ns.t ~ ' degrees' -%}
+                {%- endif -%}
+                {%- set ns.t = ns.t ~ '.' -%}
+              {%- endif -%}
+            {%- else -%}
+              {%- set v = 'sensor.vejr_varsel_i_nat' -%}
+              {%- set ns.t = 'Weather tonight.' -%}
+              {%- set slut = (today_at('09:00') + timedelta(days=1)).timestamp() -%}
+              {%- for h in liste -%}
+                {%- if h.temperature is defined and as_timestamp(h.datetime, 0) <= slut -%}
+                  {%- set t = h.temperature | float(0) -%}
+                  {%- if ns.tmin is none or t < ns.tmin %}{% set ns.tmin = t %}{% endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+            {%- if state_attr(v, 'is_rain') == true -%}
+              {%- set mm = state_attr(v, 'precip_mm') | float(0) -%}
+              {%- if mm >= 1 -%}
+                {%- set ns.t = ns.t ~ ' Expect rain, about ' ~ (mm | round(0) | int) ~ ' millimeters.' -%}
+              {%- else -%}
+                {%- set ns.t = ns.t ~ ' Rain showers are likely.' -%}
+              {%- endif -%}
+              {%- if per == 'morgen' %}{% set ns.t = ns.t ~ ' Remember rain gear.' %}{% endif -%}
+            {%- endif -%}
+            {%- if per == 'morgen' and state_attr(v, 'is_snow') == true -%}
+              {%- set ns.t = ns.t ~ ' Snow is on the way.' -%}
+            {%- endif -%}
+            {%- if state_attr(v, 'is_wind') == true -%}
+              {%- set ms = (state_attr(v, 'wind_gust_kmh') | float(0) / 3.6) | round(0) | int -%}
+              {%- set ns.t = ns.t ~ ' It will be windy, with gusts up to ' ~ ms
+                   ~ ' meters per second. Secure things on the terrace.' -%}
+            {%- endif -%}
+            {%- if per == 'morgen' and state_attr(v, 'is_uv') == true -%}
+              {%- set ns.t = ns.t ~ ' The UV index reaches '
+                   ~ (state_attr(v, 'uv_effective') | float(0) | round(0) | int)
+                   ~ '. Remember sunscreen.' -%}
+            {%- endif -%}
+            {%- if per != 'morgen' and ns.tmin is not none -%}
+              {%- set ns.t = ns.t ~ ' The temperature drops to ' ~ (ns.tmin | round(0) | int) ~ ' degrees.' -%}
+            {%- endif -%}
+            {{ ns.t }}
+      - service: script.hoejttaler_annoncer
+        data:
+          besked: "{{ tekst }}"
+          sprog: "en"
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Køkken-timeren startet → "Timer started, N minutes"
+  # ---------------------------------------------------------------------------
+  # timer.koekken_gestus er husets eneste bruger-timer (den anden, depot_light_
+  # lock, er intern). Den startes af fingre, stemme, dashboard-knapperne og
+  # Styrbar — alle via koekken_gestus_start_timer (packages/koekken_gestus_
+  # timer.yaml). timer.restarted = et nyt tal mens den kører ("fortryd 3, sig 8").
+  - id: hoejttaler_koekken_timer_start
+    alias: "Højttaler: sig når køkken-timeren startes"
+    # queued, ikke restart: en afbrudt annoncering ville efterlade Volumio-køen.
+    mode: queued
+    max: 3
+    trigger:
+      - platform: event
+        event_type: timer.started
+        event_data:
+          entity_id: timer.koekken_gestus
+      - platform: event
+        event_type: timer.restarted
+        event_data:
+          entity_id: timer.koekken_gestus
+    condition:
+      - condition: state
+        entity_id: input_boolean.hoejttaler_timer_annoncering_enabled
+        state: "on"
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+      - condition: state
+        entity_id: binary_sensor.hoejttaler_online
+        state: "on"
+    action:
+      # duration = timerens køre-varighed ("0:05:00"); state er skrevet før
+      # eventet når frem til en automation.
+      - variables:
+          minutter: >-
+            {% set p = (state_attr('timer.koekken_gestus', 'duration') or '0:00:00') | string %}
+            {% set d = p.split(':') %}
+            {{ ((d[0] | int(0)) * 60 + (d[1] | int(0)) + (1 if (d[2] | default('0') | int(0)) >= 30 else 0))
+               if d | count == 3 else 0 }}
+      - condition: template
+        value_template: "{{ minutter | int(0) >= 1 }}"
+      - service: script.hoejttaler_annoncer
+        data:
+          besked: "Timer started, {{ minutter }} {{ 'minute' if minutter | int(0) == 1 else 'minutes' }}"
+          sprog: "en"
+
+  # ---------------------------------------------------------------------------
+  # Køkken-timeren færdig → "Kitchen timer is done" ÉN gang
+  # ---------------------------------------------------------------------------
+  # Telefonens TTS-løkke (script.koekken_gestus_telefon_alarm) og lys-alarmen
+  # kører uændret ved siden af. timer.finished fyrer ikke ved timer.cancel.
+  - id: hoejttaler_koekken_timer_slut
+    alias: "Højttaler: sig når køkken-timeren er færdig"
+    mode: queued
+    max: 3
+    trigger:
+      - platform: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.koekken_gestus
+    condition:
+      - condition: state
+        entity_id: input_boolean.hoejttaler_timer_annoncering_enabled
+        state: "on"
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+      - condition: state
+        entity_id: binary_sensor.hoejttaler_online
+        state: "on"
+    action:
+      - service: script.hoejttaler_annoncer
+        data:
+          besked: "Kitchen timer is done"
+          sprog: "en"
+          vigtig: true

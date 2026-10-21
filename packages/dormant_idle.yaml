@@ -1,0 +1,179 @@
+# =============================================================================
+# Dormant efter idle i dagstimerne (user-spec 2026-07-05)
+# =============================================================================
+# User: "1 time med Activity idle og lukkede døre (hoved + terrasse) skal
+# trigger Dormant — slider justerbar tid. Men kun i dagstimerne, ikke om natten
+# hvor vi ligger stille!"
+#
+# EKSTRA Dormant-path oven på de eksisterende (dormant_schedule.yaml +
+# packages/house_modes.yaml GPS/3h-paths). Fyrer når:
+#   - sensor.activity_state == 'idle' SAMMENHÆNGENDE i ≥ N min (slider)
+#   - BEGGE døre lukkede (hoveddør + terrassedør = off)
+#   - i dag-vinduet [dagstart, dagslut) (default 08:00–22:00, sliders)
+#   - huset er Active + ikke AirBnB
+#   - køkken + depot occupancy off (belt+seler: activity_state's idle dækker
+#     stue/spisestue/sove/boern/bad/entré/terrasse, men IKKE køkken/depot →
+#     luk den kendte gap så vi ikke går Dormant mens nogen står i køkkenet)
+#
+# NAT-BESKYTTELSE (kernen i user-spec): uden for dag-vinduet fyrer reglen
+# ALDRIG. Ligger man stille i sengen om natten (og sove-Apollo evt. taber
+# still-target → activity_state flipper 'idle') går huset IKKE Dormant hen
+# over hovedet på os → ingen natlig Roborock-start / lys-sluk. Godnat gør
+# activity_state='godnat' (ikke idle) → dobbelt dækket når knappen trykkes.
+#
+# 'idle' varighed = now - sensor.last_physical_activity (2026-08-08 — FØR:
+# activity_state.last_changed). activity_state følger RÅ occupancy, så et
+# 5-sekunders radar-blip i et tomt hus nulstillede hele uret: målt 08-08 blippede
+# køkken-Apolloen 16:08:20→25 og skubbede dvalen fra 15:16 til 17:18:25 = præcis
+# blip + N min. last_physical_activity kræver en ON-flanke der HOLDER
+# (physical_activity_sustain_seconds) → blips tæller ikke. Det er samtidig SAMME
+# anker som weekend-stearinlyset i dormant_schedule.yaml bruger (fejlklasse #2:
+# to kopier af "hvor længe har huset været stille" ville drifte fra hinanden).
+#
+# Slider = 0 → hele reglen slået fra. Fejlklasse #4 (re-arm): dør-luk mens vi
+# allerede har været idle længe er egen trigger; /5-poll er backstop for at
+# fange "vi kryds ind i dag-vinduet mens vi allerede var idle".
+# =============================================================================
+
+input_number:
+  dormant_idle_minutes:
+    name: "Dormant: idle-minutter før dvale (dagstimer)"
+    icon: mdi:home-clock
+    min: 0
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+input_datetime:
+  dormant_idle_dagstart:
+    name: "Dormant idle: dag-vindue start"
+    icon: mdi:weather-sunset-up
+    has_date: false
+    has_time: true
+
+  dormant_idle_dagslut:
+    name: "Dormant idle: dag-vindue slut"
+    icon: mdi:weather-sunset-down
+    has_date: false
+    has_time: true
+
+automation:
+  - id: house_dormant_idle_daytime
+    alias: "Hus: Dormant efter idle i dagstimerne (lukkede døre)"
+    description: >
+      Active → Dormant når activity_state har været 'idle' i ≥ N min (slider),
+      begge døre er lukkede, og vi er i dag-vinduet. Fyrer ALDRIG om natten
+      (uden for vinduet) — beskytter os når vi ligger stille i sengen.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      # Fast-path: idle-flanken har holdt i N min (templated for = re-armer
+      # automatisk når slideren ændres).
+      - platform: state
+        entity_id: sensor.activity_state
+        not_from: ["unknown", "unavailable"]
+        to: "idle"
+        for:
+          minutes: "{{ states('input_number.dormant_idle_minutes') | int(60) }}"
+        id: idle_flank
+      # Re-arm: dør lukker mens vi allerede kan have været idle længe.
+      - platform: state
+        entity_id:
+          - binary_sensor.parasoll_hoveddoer
+          - binary_sensor.parasoll_terrassedoer
+        to: "off"
+        id: door_closed
+      # Backstop: fanger krydset ind i dag-vinduet mens vi allerede var idle
+      # (idle-flanken fyrede før vinduet åbnede → condition fejlede → ingen
+      # re-fire uden denne).
+      - platform: time_pattern
+        minutes: "/5"
+        id: poll
+    condition:
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Slider > 0 = feature slået til
+      - condition: template
+        value_template: "{{ (states('input_number.dormant_idle_minutes') | int(0)) > 0 }}"
+      # Begge døre lukkede
+      - condition: state
+        entity_id: binary_sensor.parasoll_hoveddoer
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.parasoll_terrassedoer
+        state: "off"
+      # Kun i dag-vinduet [dagstart, dagslut) — uden for = ALDRIG (nat-beskyttelse)
+      - condition: template
+        value_template: >-
+          {% set s = states('input_datetime.dormant_idle_dagstart') %}
+          {% set e = states('input_datetime.dormant_idle_dagslut') %}
+          {% set s = '08:00:00' if s in ['unknown','unavailable','none'] else s %}
+          {% set e = '22:00:00' if e in ['unknown','unavailable','none'] else e %}
+          {{ today_at(s) <= now() < today_at(e) }}
+      # activity_state == idle NU, og ingen vedvarende fysisk aktivitet i ≥ N min.
+      # Blip-immun: ankeret er last_sustained_presence, ikke activity_state's egen
+      # last_changed (se hoved-kommentaren). Mangler ankeret (fresh install /
+      # recorder-tab) → fail-closed, ingen Dormant.
+      #
+      # 2026-09-11 (B128): ankeret skiftet last_physical_activity →
+      # last_sustained_presence. "Blip-immun" holdt ikke i praksis: sustain-kravet
+      # er 12 s, og stue-Apolloens spøgelser varer 13-95 s, så de opfylder det.
+      # Målt 09-11 med lejligheden beviseligt tom i 4,3 t bumpede de
+      # `last_physical_activity` **26 gange** — største hul 45,8 min, altså kan et
+      # 60-min-ur aldrig nås. Den nye 120 s-tier var urørt i hele vinduet.
+      # IKKE replayet i Normal-mode (huset har været AirBnB i hele datavinduet).
+      # Forsvarligt alligevel, fordi `wasp_dormant_allowed` nedenfor bærer beviset
+      # for at nogen faktisk ER gået ud — uret afgør kun HVORNÅR.
+      - condition: template
+        value_template: >-
+          {% set n = states('input_number.dormant_idle_minutes') | int(60) %}
+          {% set t = states('sensor.last_sustained_presence') %}
+          {{ is_state('sensor.activity_state','idle')
+             and t not in ['unknown','unavailable','none','']
+             and (now() - as_datetime(t)).total_seconds() >= n * 60 }}
+      # Belt+seler mod activity_state's køkken/depot-gap: står nogen i køkkenet
+      # eller depotet lige nu → ikke Dormant. (unavailable ≠ off → fail-closed.)
+      - condition: state
+        entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.depot_valhorn_occupancy
+        state: "off"
+      # 2026-07-05 (user-spec, wasp-in-a-box): idle alene er ikke nok — kræv at en
+      # yderdør er åbnet siden sidste ophold indenfor. "Ligger stille i sofaen i
+      # 1 time" med lukkede døre = wasp in a box, ikke gået ud → BLIV Active.
+      # Se packages/wasp_in_a_box.yaml.
+      - condition: state
+        entity_id: binary_sensor.wasp_dormant_allowed
+        state: "on"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.house_state
+        data:
+          option: "Dormant"
+      # Samme oprydning som de øvrige Dormant-paths (dormant_schedule.yaml):
+      # clear godnat-flags + sluk indvendige lys (terrasse styres separat).
+      - service: input_boolean.turn_off
+        target:
+          entity_id: !include ../rosters/godnat_flag.yaml
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.alle_indvendige
+        data:
+          transition: 10
+      - service: logbook.log
+        data:
+          name: "Dormant skema"
+          message: >-
+            Idle-dagsregel: activity_state 'idle' i
+            {{ states('input_number.dormant_idle_minutes') }}+ min med lukkede
+            døre i dag-vinduet → Dormant.

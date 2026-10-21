@@ -1,0 +1,1103 @@
+# =============================================================================
+# Køkken Presence Lights — open-plan-koblet (NOT independent room)
+# =============================================================================
+# Køkken er fysisk en del af open-plan-rummet (stue + spisestue + køkken er ÉT
+# rum med 3 zoner). Derfor bruger køkken-presence:
+#   TRIGGERS:    stue_apollo_occupancy_filtered ELLER spisestue_apollo_occupancy
+#   LUX SOURCE:  sensor.open_plan_lux (fallback chain spisestue→sove→stue)
+#   OFF RULE:    binary_sensor.open_plan_empty_for_20m (BÅDE stue+spisestue
+#                tomme i 20 min) — IKKE per-rum sensor
+#
+# Pre-flyt context: stue + spisestue Apollo er begge unplugged (B14 backlog).
+# → presence_light_koekken_on triggers fyrer aldrig pre-flyt.
+# → Lyset må tændes manuelt via Styrbar / dashboard.
+# Post-flyt: re-plug Apollos → automation virker automatisk.
+#
+# CROSS-REFERENCES:
+#   - presence_stue.yaml — same triggers, samme open-plan-pattern
+#   - presence_lights.yaml — cross-room lux-fald automations
+#   - packages/activity_state.yaml — sensor.open_plan_lux + open_plan_empty_for_20m
+#
+# Magic numbers (rules_spec.md slettet 2026-10-07 — tallene her er historik;
+# autoriteten er sliderne, se system_design.md §4):
+#   - lux thresholds: <5 = pitch dark (90% bright), <20 = dim (65%), else 40%
+#   - elev<0 = sun below horizon (warmer + dimmer 30%)
+#   - day-aware lux: under sun_bracket=day halve threshold (sprint 2026-05-07)
+#   - global_brightness_factor: 0.5-1.5 multiplier (slider Light Aggressiveness)
+#   - color_temp via sensor.auto_color_temp_evening (sun-aware K, default 2850K)
+#
+# Splittet ud fra presence_lights.yaml 2026-05-05 (Phase 2 refactor).
+# =============================================================================
+
+- id: presence_light_koekken_on
+  alias: "Lysnet: Køkken tænd"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.stue_apollo_occupancy_filtered
+      from: "off"
+      to: "on"
+    - platform: state
+      entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+      from: "off"
+      to: "on"
+    # 2026-06-15: køkken-Apollo (ex-bad, fysisk flyttet til køkkenet) giver
+    # direkte køkken-occupancy ud over de to open-plan-Apollos.
+    # 2026-08-19g: FILTRERET — et 5 s nær-blip (radar-timeout, still-only i
+    # gate 0) tændte lyskæden mens user lå i sofaen. Se koekken_cooking.yaml.
+    - platform: state
+      entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+      from: "off"
+      to: "on"
+    # 2026-08-20 (#4 re-arm): occupancy-flanken er ikke nok. Køkken-Apolloens
+    # still-felt er 6 m og når sofaen, så occupancy står typisk ALLEREDE on når
+    # man rent faktisk går ud i køkkenet — der kommer aldrig en ny flanke, og
+    # 08-19g's bevægelses-krav er en CONDITION, ikke en trigger. Målt live
+    # 16:50-17:02: occupancy on uafbrudt, ægte bevægelse i køkkenet, lux faldt
+    # gennem tærsklen — og intet fyrede. Rummets gamle lux-fald-tænd
+    # (presence_lux_koekken_on) blev slettet sammen med køkkenloftet 2026-07-28
+    # og efterlod køkkenet som eneste fælles-rum uden re-arm. Bevægelse ER
+    # køkkenets tænd-bevis (08-19g) → den er også dens re-arm. Gates er urørte:
+    # alle betingelser nedenfor + per-gren-tjek køres som hidtil.
+    - platform: state
+      entity_id: binary_sensor.koekken_bevaegelse_nylig
+      from: "off"
+      to: "on"
+    # 2026-10-11 (#4 re-arm, user-bug "køkkenlyskæden er mørk"): lux-gaten er
+    # en CONDITION — mørknede det MENS man var i køkkenet, kom der aldrig en ny
+    # flanke. Målt 16:44-16:56: bevægelse 16:44:54/56 med gaten off (vinduet
+    # ≥ 35 lx), køkkenet faldt til 9 lx, user hævede tærsklen → gaten on
+    # 16:56:04, og intet tændte. Gaten der åbner ER re-armen; lyskæde-grenens
+    # egne krav (occupancy + nylig bevægelse + manuel-sluk-grace) er urørte, så
+    # en kæde man selv slukkede (kanalen bliver ren → gaten åbner) forbliver slukket.
+    - platform: state
+      entity_id: binary_sensor.koekken_lyskaede_lux_ok
+      from: "off"
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-06-10 (opg 4): Manual mode (delt stue-zone) = bruger har selv
+    # indstillet lyset — auto-tænd blokeret indtil drift-back → Auto.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_koekken', 'Manual') }}"
+    # 2026-06-23 (user-spec): robot-spærre gælder nu KUN når huset er Dormant
+    # (binary_sensor.roborock_blokerer_lys). Er huset Active må robottens motion
+    # gerne tænde lys — KUN early-detect spærres (se early-detect-rummene).
+    # Dormant-wake er robot-filtreret centralt i house_state_to_active.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    # 2026-05-05 fix + 2026-05-23 morgen-override: se presence_stue.yaml
+    # for rationale (common-rum skal kunne lyse weekend morgen uden manuel
+    # godmorgen, mens bedrooms forbliver beskyttet).
+    # 2026-06-06 fix: godnat_any_active → godnat_common_active (børne-putning
+    # må ikke blokere køkkenet for voksne; se presence_stue.yaml).
+    - condition: template
+      value_template: >
+        {{ is_state('binary_sensor.godnat_common_active', 'off')
+           or is_state('binary_sensor.godnat_faelles_morgen_fri', 'on') }}
+    # 2026-08-13g (Sleep Over): køkkenet er samme visuelle rum som sofaen —
+    # lyskæde/spots må ikke tænde over en sovende gæst. Se packages/sleepover.yaml.
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_stue   # mood ejer open-plan som ét rum
+      state: "off"
+    # 2026-07-02: sol-gate + lux-gates + lys-off-gates FLYTTET ned i action som
+    # per-gren betingelser — loft og lyskæde har nu HVER SIN lux-gate (lyskæden
+    # er afkoblet fra globale faktorer + sol-gate, se packages/koekken_lyskaede.yaml).
+    # 2026-06-16: entré NED-grace blokerer relight i 5 min (hele huset).
+    - condition: state
+      entity_id: input_boolean.entre_shutdown_grace
+      state: "off"
+  action:
+    # 500ms delay: kort debounce; hver gren re-tjekker selv sit lys bagefter.
+    - delay:
+        milliseconds: 500
+    # --- LYSKÆDE (egne sliders, egen lux-gate, ingen sol-gate) --------------
+    # 2026-07-28: loft-grenen er FJERNET — light.koekken_loft er nedlagt
+    # (user: "køkken loft er gammel legacy. drop den"). Køkkenet har nu kun
+    # lyskæde (her) + spots (central-zone-logikken nedenfor).
+    # Styrke × elpris_dim_factor (el-spare gælder), farve = hue/mætning-sliders.
+    # 0 lx på slideren = auto-tænd fra. Se packages/koekken_lyskaede.yaml.
+    - if:
+        - condition: state
+          entity_id: light.koekken_lyskaede
+          state: "off"
+        # 2026-07-08 (#1/#9, user-spec): lyskæden er nu KØKKEN-drevet — tænder KUN
+        # når KØKKEN-Apolloen faktisk ser nogen (ikke bare sofa/spisestue-presence)
+        # OG køkken-lux (koekken_lux_effektiv, ikke open_plan) er under tærskel.
+        # Slukkes af presence_koekken_lyskaede_off når køkkenet er tomt / lys stiger
+        # → hænger ikke tændt mens man sidder i sofaen (rod-årsag #1).
+        - condition: state
+          entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+          state: "on"
+        # 2026-08-19g (user-spec): TÆND kræver BEVÆGELSE. Occupancy alene
+        # dækker hele Apolloens 6 m felt inkl. sofaen, og en sofa-liggende er
+        # et still-target — bevist live 21:14 (still i 3,1 m tændte køkkenlys
+        # i et tomt køkken). Sluk-vejen er urørt: stilstand holder lyset tændt.
+        - condition: state
+          entity_id: binary_sensor.koekken_bevaegelse_nylig
+          state: "on"
+        # 2026-08-29d: ét anker (#2) — samme regel stod også i lyskædens egen
+        # dark_on-gren, og begge læste den RÅ kanal i stedet for dagslys.
+        - condition: state
+          entity_id: binary_sensor.koekken_lyskaede_lux_ok
+          state: "on"
+        # 2026-07-03 (runde 2, user-valg): manuel-sluk grace — slukkede brugeren
+        # SELV lyskæden (app/fysisk; stemplet af koekken_lyskaede_manual_off_track
+        # i packages/koekken_lyskaede.yaml) for < N min siden, må presence IKKE
+        # gen-tænde (2026-07-02: gennemgang mod badet gen-tændte 2,8 min efter
+        # manuelt sluk). 0 = grace fra. Aldrig stemplet = unknown → as_timestamp
+        # fallback 0 → passerer. Cooking-tænd (spots-session/akkumulering) er
+        # BEVIDST undtaget — ægte madlavning vinder (user-valg).
+        - condition: template
+          value_template: >-
+            {% set g = states('input_number.koekken_manual_off_grace_minutes') | float(5) %}
+            {{ g <= 0 or
+               (now().timestamp() - (state_attr('input_datetime.koekken_lyskaede_manual_off_at', 'timestamp') | float(0))) > g * 60 }}
+      then:
+        # 2026-07-08 (curved fade, user-spec): SEGMENT 1 — hurtigt op til 50 %
+        # af målet (hurtig-slideren). Enforcerens on_edge-gren fuldfører
+        # kurven (segment 2, langsom-slideren) mod fuldt mål.
+        # 2026-09-03 (user-spec "core features skal være de samme i AirBnB"):
+        # den separate AirBnB-gren (2700 K, transition 3, ingen kurve) er
+        # fjernet — gæsten får husets rigtige lyskæde, farve og kurve.
+        # 2026-09-25: segment 1 males af script.koekken_lyskaede_maal (andel
+        # 0.5 = samme halve mål, samme hurtig-fade), så husets farveregel bor
+        # ét sted — om morgenen (binary_sensor.koekken_morgenlys) tænder kæden
+        # direkte i det bløde hvide arbejdslys i stedet for hygge-orange.
+        - action: script.koekken_lyskaede_maal
+          data:
+            andel: 0.5
+            transition: "{{ states('sensor.koekken_lyskaede_fade_hurtig_effektiv') | int(2) }}"
+    # 2026-06-17 (item 1): køkken-spots er AFKOBLET fra almindelig presence —
+    # de styres nu KUN af central-zone-logikken (presence_koekken_cooking_spots_on
+    # + presence_koekken_spots_off). Loft/lyskæde følger stadig presence ovenfor.
+
+# 2026-07-28: 'Køkken gradvis sluk' (open-plan tom 20 min) er SLETTET — dens
+# eneste mål var light.koekken_loft, som er nedlagt. Lyskæden slukkes af
+# presence_koekken_lyskaede_off, spots af presence_koekken_spots_off.
+
+# ---------------------------------------------------------------------------
+# Køkken-spots: central-zone-styret, lux-gated, aggressiv sluk (item 1)
+# ---------------------------------------------------------------------------
+- id: presence_koekken_cooking_spots_on
+  alias: "Lysnet: Køkken-spots ved madlavning (central zone + lux-gated)"
+  description: >
+    2026-06-17 (item 1 user-spec, omlagt): tænd KUN køkken-spots
+    (switch.koekken_spots) hvis akkumuleret bevægelse i Apolloens CENTRALE zone
+    (zone 1-3 = 0-250 cm, ikke periferien) de sidste 15 min ≥ tærskel
+    (sensor.koekken_cooking_threshold_min, slider koekken_cooking_aggressiveness)
+    OG dagslyset er under koekken_spots_lux_threshold. Spots
+    slukker via presence_koekken_spots_off når HELE køkken-feltet er tomt
+    (rev.2 2026-06-17 — ikke længere central-zone, var for aggressiv under
+    madlavning). 2026-08-29: lux-gaten er IKKE længere en dagslys-spærre, men
+    et blænde-loft (250 lx) — madlavning skal kunne få arbejdslys hele dagen.
+    2026-08-29d: loftet hæves 20 % (koekken_session_lux_bonus_pct) når køkkenet
+    har været aktivt > 5 min (koekken_session_aktiv_minutter) af de sidste 15 —
+    meget aktivitet er selv et argument for arbejdslys.
+    2026-09-03 (user-spec): lyskæden ramper FØRST, spots tænder når den er i
+    mål — se action. Actionen varer derfor op til fade_hurtig + fade_langsom;
+    re-triggers i det vindue droppes bevidst tavst (spots er på vej).
+    2026-09-27: blip-vagt — uden frisk bevægelses-bevis (120 s) eller krop på
+    kameraet skal rå occupancy have holdt 2 × radar-timeout (occ_hold re-armer).
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # Akkumuleret tid krydser tærskel (re-eval når recent-sensor/slider ændres).
+    - platform: template
+      value_template: >
+        {{ (states('sensor.koekken_occupancy_recent') | float(0) * 60)
+           >= (states('sensor.koekken_cooking_threshold_min') | float(99)) }}
+    # Re-eval ved hver ny central-zone-bevægelse (tærskel-tjek sker i condition).
+    - platform: state
+      entity_id: binary_sensor.koekken_apollo_central_zone_filtered
+      from: "off"
+      to: "on"
+    # Runde 3b (2026-07-03, user-spec): session-gen-tænd kræver VEDVARENDE
+    # tilstedeværelse i central-zonen (slider, 0 = instant som før) — ren
+    # gennemgang forbi køkkenet skal ikke flippe spots + lyskæde til arbejdslys.
+    # Instant-triggeren ovenfor afvises af session-grenen i condition (zone
+    # skal have været on ≥ slider-sekunder); akkumulerings-stien er urørt.
+    # NB: trigger-`for:` binder ved load → slider-ændring kræver reload/restart.
+    - platform: state
+      entity_id: binary_sensor.koekken_apollo_central_zone_filtered
+      from: "off"
+      to: "on"
+      for:
+        seconds: "{{ states('input_number.koekken_session_relight_seconds') | int(10) }}"
+      id: zone_hold
+    # 2026-08-29d (#4 re-arm): bonussen kan blive opfyldt MENS man står i
+    # køkkenet med zonen allerede on — så fyrer ingen af triggerne ovenfor, og
+    # lyset ville først komme ved næste zone-flanke. Denne fyrer på selve
+    # krydsningen af aktivitets-kravet.
+    - platform: template
+      value_template: >
+        {{ (states('sensor.koekken_aktiv_15m') | float(0)) * 60
+           >= (states('input_number.koekken_session_aktiv_minutter') | float(5)) }}
+    # 2026-09-14 (user-spec: "køkken sessions starter stadig for langsomt. hvis
+    # et menneske er på frames i kameraet i 5 sek, så starter vi en frisk køkken
+    # session (hvis lux kravene er opfyldt som normalt)"). Akkumulerings-stien
+    # måler 15 min historik og relight-stien kræver en zone-kant — kameraet ser
+    # en KROP, og den ser den med det samme. Gates: se kamera-grenene nedenfor.
+    - platform: state
+      entity_id: binary_sensor.koekken_kamera_krop
+      from: "off"
+      to: "on"
+      for:
+        seconds: "{{ states('input_number.koekken_kamera_session_sekunder') | int(5) }}"
+      id: kamera
+    # 2026-09-27 (user-bug "køkkenet flap tændte lige spots 2 gange"): re-arm
+    # til blip-vagten nedenfor. Afviser den en zone-kant fordi occupancy endnu
+    # er for ung, er der ingen ny kant når den så HAR holdt — denne fyrer på
+    # netop det tidspunkt (#4). Samme tal som vagten: 2 × radar-timeout.
+    # NB: trigger-`for:` binder ved load.
+    - platform: state
+      entity_id: binary_sensor.koekken_apollo_occupancy
+      from: "off"
+      to: "on"
+      for:
+        seconds: "{{ ((states('number.koekken_apollo_radar_timeout') | float(5)) * 2) | int }}"
+      id: occ_hold
+    # 2026-09-28 (user: "igen tændte køkkenlyset alt for langsomt! ret for
+    # good nu, jeg har sagt det mange gange"). 18:58:52 slukkede spots efter
+    # 30 s tomt; 18:59:16 var han tilbage, men central-zonen blinkede kun
+    # 1,07 s (krav 3 s) → spots først 18:59:52. MÅLT 21-28/9 (kamera-vejen slået
+    # fra af user 21/9): 258 spots-tændinger, median 10,5 s efter occupancy,
+    # p90 66 s — 204 af dem genoptændinger midt i en madlavning.
+    # GENOPTÆND I SESSION: er madlavningen i gang (koekken_session_active,
+    # ryddes efter 15 min tomt), er "nogen er i køkkenet" nok — ikke "nogen
+    # står i midten". Tre kanter, så den der kommer SIDST fyrer (#4): occupancy,
+    # bevægelses-bevis, menneske-bevis. Replay samme uge med blip-vagten:
+    # 225 genoptændinger p50 11,3 → 2,0 s, p90 116 → 19 s; 128 nye tændinger
+    # (~16/dag, ophold median 25 s, 1 af 128 et radar-blip).
+    - platform: state
+      entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+      from: "off"
+      to: "on"
+      id: session_relight
+    - platform: state
+      entity_id: binary_sensor.koekken_bevaegelse_nylig
+      from: "off"
+      to: "on"
+      id: session_relight
+    - platform: state
+      entity_id: binary_sensor.koekken_menneske_proof
+      from: "off"
+      to: "on"
+      id: session_relight
+  condition:
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-08-19 (user-spec, Smooth Mode-sprintet): festen sætter
+    # open-plan room_mode = Manual via dance_room_modes_claim, og DET var grunden
+    # til at køkken-spottene udeblev under festlys. Spottene er en switch og
+    # indgår slet ikke i festens bulb-roster — madlavning under en fest skal
+    # stadig have arbejdslys. Manual sat af et menneske spærrer stadig.
+    - condition: template
+      value_template: >-
+        {{ not is_state('input_select.room_mode_koekken', 'Manual')
+           or is_state('input_boolean.dance_mode', 'on')
+           or not is_state('input_select.dance_manual_event', 'off') }}
+    # 2026-06-23 (user-spec): robot-spærre KUN i Dormant (roborock_blokerer_lys).
+    # 2026-09-03c (user-bug "nu tændte køkken via ghost presence"): DEN gate er
+    # det forkerte anker her — den kræver Dormant og er derfor off i præcis det
+    # scenarie der snyder (CLAUDE.md, permanente fakta). Målt 3/9: robotten
+    # kørte 07:24-08:27 gennem køkkenet med house_state = Active, så gaten stod
+    # åben hele vejen; robottens egen bevægelse fyldte central-zonens 15-min
+    # akkumulator, og sessionen startede 08:32:48 — 5 min efter robotten var
+    # dokket, på en zone-kant der havde stået on i 8 s (= relight-slideren).
+    # Det rigtige anker er maskeringen (pre-roll 180 s, delay_off 20 min).
+    # Bevidst en HÅRD spærre kun på SESSIONEN: en session er husets kraftigste
+    # lys-handling (kæde på 100 % + spots), og robotten kan ikke skelnes fra en
+    # kok på radaren mens den kører. Den almindelige presence-tænding er urørt,
+    # så et menneske der laver mad imens står ikke i mørke — det får bare ikke
+    # arbejdslys automatisk, og kontakten er udvejen (🏡 punkt 2).
+    # 2026-09-16 (user-bug "18.50 den 15. sep burde køkken session være
+    # startet"): maskeringens 20-min hale ramte et MENNESKE. Målt 15/9:
+    # robotten dokkede 18:47:52, maskeringen faldt 19:07:52, og spottene kom
+    # 19:08:10 — 18 s efter. Køkkenet stod mørkt 18:40:48 → 19:08:10.
+    # Halen findes for at rense robottens spor ud af 15-min-AKKUMULATORERNE;
+    # den siger intet om hvor robotten er LIGE NU. Derfor deles gaten:
+    # akkumulerings-stierne (som halen er beregnet til) beholder den fulde
+    # hale, mens de to LIVE-vidner — en zone-kant der har HOLDT i
+    # relight-sekunder, og en krop på kameraet — kun spærres mens robotten
+    # faktisk kører (roborock_koerer_nu, uden efterløb). En dokket robot kan
+    # ikke holde en zone-kant i 10 s. Fejlklasse #19: en handling må ikke arve
+    # en udgangstid der er kalibreret til et andet formål.
+    # Bevidst IKKE gatet på input_boolean.roborock_session_active: det flag
+    # ryddes kun ved en REN afslutning, så en hængende session ville lade
+    # køkkenet stå uden arbejdslys for evigt (forkert fejl-retning her).
+    # `anker is not none` er ikke en deploy-shim: bypasset bytter maskeringens
+    # hale ud med et NU-vidne, så findes vidnet ikke, er der intet at bytte med,
+    # og den fulde hale er det rigtige svar (#9 — en manglende entity læses som
+    # off og ville ellers åbne gaten helt).
+    - condition: template
+      value_template: >-
+        {% set anker = states.binary_sensor.roborock_koerer_nu %}
+        {% set live = trigger is defined
+                      and trigger.id in ['zone_hold', 'kamera']
+                      and anker is not none %}
+        {{ not is_state('binary_sensor.roborock_blokerer_lys', 'on')
+           and not is_state('binary_sensor.roborock_koerer_nu', 'on')
+           and (live or not is_state('binary_sensor.roborock_zone_maskering', 'on')) }}
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    # 2026-08-27b: cinema_active ovenfor er SCENE-flaget og var off hele
+    # filmaftenen 27/8 — projektoren sætter den ikke. Den projektor-drevne
+    # gate er filmmoerke_koekken. Udgangen er automatisk: slukker projektoren,
+    # falder gaten, og lyskæden lyser hele tiden videre på predark-niveau, så
+    # køkkenet aldrig står helt mørkt fordi en suppressor hænger.
+    - condition: state
+      entity_id: binary_sensor.filmmoerke_koekken
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_stue   # mood ejer open-plan som ét rum
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.godnat_common_active
+      state: "off"
+    # 2026-08-13g (Sleep Over): dækker morgen-vinduet efter godnat-flagene er
+    # ryddet 06:00, hvor gæsten stadig sover i open-plan.
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    # Entré NED-grace blokerer relight i 5 min (hele huset).
+    - condition: state
+      entity_id: input_boolean.entre_shutdown_grace
+      state: "off"
+    # 2026-06-17 (item 1): LUX-GATE — dedikeret absolut tærskel (slider).
+    # 2026-08-29 (user-spec "køkkensessions skal ikke kun kunne ske om aftenen.
+    # hele dagen"): DENNE gate var hele forklaringen. Sessionen (input_boolean.
+    # koekken_session_active) har ingen ur- eller sol-gate nogen steder, men den
+    # kan kun FØDES her — og på 45 lx var to tredjedele af en solskinsdag
+    # spærret. Tærsklen er nu et blænde-loft (250 lx), ikke en dagslys-spærre.
+    # NB: gaten er det ENESTE der holdt spots slukket i dagslys — akkumulerings-
+    # kravet er ikke et net, for koekken_occupancy_recent har p50 = 7 af 15 min
+    # i dagtimerne (målt 10 døgn), og tærsklen står på 10 s ved aggressivitet
+    # 100. Slukket sker derfor på sluk-vejene (tomt felt + hæng-backstoppen).
+    # 2026-07-08 (#9, user-spec): brug KØKKEN-Apolloens lux (koekken_lux_effektiv),
+    # IKKE open_plan_lux — spisestue-Apolloen (nær vindue) trak open_plan kunstigt
+    # højt, så spots ikke tændte i et mørkt køkken.
+    # 2026-08-27: dagslys-kanalen, ikke den rå. Er lyskæden tændt, ligger
+    # koekken_lux_effektiv ~76 lx for højt, og arbejdslyset kunne dermed
+    # blokeres af den dekorative kæde midt i madlavningen.
+    # 2026-08-29d (user-spec): gaten er ikke længere sliderens rå værdi, men
+    # sensor.koekken_spots_lux_gate_effektiv — samme blænde-loft, hævet
+    # koekken_session_lux_bonus_pct (20 %) når køkkenet har været aktivt i mere
+    # end koekken_session_aktiv_minutter (5) af de sidste 15. "Er du SÅ meget i
+    # køkkenet, tænder jeg allerede selv om det ikke er heeelt mørkt nok endnu."
+    - condition: template
+      value_template: >
+        {{ (states('sensor.koekken_dagslys_lx') | float(50))
+           < (states('sensor.koekken_spots_lux_gate_effektiv')
+              | float(states('input_number.koekken_spots_lux_threshold') | float(60))) }}
+    # 2026-06-17 (item 1): nogen står faktisk i den centrale zone NU (ikke kun
+    # akkumuleret historik — undgå at tænde efter personen er gået).
+    # 2026-09-14: kamera-grenen er sit EGET vidne — den har set en krop i
+    # billedet i 5 s i træk. At kræve radarens ord OVEN I det ville gøre
+    # kameraet til pynt, for det er præcis de mennesker radaren ikke kan bevise
+    # (sofa-enden, over 250 cm) det er hængt op for at fange.
+    # 2026-09-16 VERIFICERET på historik, ikke på en fysisk test: over 3 døgn
+    # nåede 325 kamera-kroppe de 5 s (p50 for en on-periode er netop 5,0 s, så
+    # tærsklen er opfyldelig — den er ikke en #25-fælde). Af 27 session-starter
+    # faldt 5 på et kamera-mærke, og i 2 af dem kunne radar-grenen beviseligt
+    # IKKE have fyret: 15/09 11:18:51 (bevaegelse_nylig off → betingelsen
+    # nedenfor havde blokeret) og 16/09 06:32:53 (central_zone off → betingelsen
+    # ovenfor havde blokeret). Grenen henter altså sessioner ingen anden vej kan
+    # hente. Og den over-fyrer ikke: 325 kvalificerede kroppe gav 5 starter,
+    # fordi lux-gaten og spots-off-kravet bærer resten.
+    - condition: template
+      value_template: >-
+        {{ (trigger is defined and trigger.id == 'kamera')
+           or is_state('binary_sensor.koekken_apollo_central_zone_filtered', 'on')
+           or (trigger is defined and trigger.id == 'session_relight'
+               and is_state('input_boolean.koekken_session_active', 'on')
+               and is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'on')) }}
+    # 2026-08-19g (user-spec): samme bevægelses-krav som lyskæden. Central-zonen
+    # accepterer still-target op til 250 cm, og sofaen ligger inden for radarens
+    # måleusikkerhed på den grænse — spots tændte 21:14:44 på præcis det.
+    - condition: template
+      value_template: >-
+        {{ (trigger is defined and trigger.id == 'kamera')
+           or is_state('binary_sensor.koekken_bevaegelse_nylig', 'on') }}
+    # 2026-09-27 BLIP-VAGT (user-bug "køkkenet flap tændte lige spots 2
+    # gange"). 07:54:00 og 07:54:44 tændte spots i et tomt køkken — user havde
+    # forladt det 07:41. menneske_bevist (20-min latch fra kaffen 07:35-07:41)
+    # holdt stadig spøgelses-filteret åbent, så central_zone_filtered = rå
+    # zone, og sessionen (22 min) var aktiv: relight på 3 s hold + et 1-s
+    # moving-blip i bevaegelse_nylig slap igennem. Rå occupancy-episoderne var
+    # 5,2 s (= radar-timeout = ÉT blip, permanente fakta) og 9,2 s.
+    # Målt 7 døgn, 231 spots-tændinger: dagens to er de ENESTE med en rå
+    # occupancy-episode under 10 s; ægte tændinger (krop på kameraet 69/71 af
+    # de lange) har p10 = 12 s. Friskheden af bevægelses-beviset alene skiller
+    # IKKE (samme fordeling for begge), og et ubetinget varighedskrav koster
+    # 117 af 216 ægte tændinger p50 6 s. Derfor BETINGET: kun når der hverken
+    # er frisk bevægelses-bevis (menneske_proof on inden for 120 s) eller en
+    # krop på kameraet NU, skal rå occupancy have holdt 2 × radar-timeout.
+    # Replay: blokerer 3 (dagens to + 24/9 11:10, alle uden krop), forsinker
+    # 22 af 220 ægte med p50 5,8 s / max 8 s — occ_hold-triggeren fyrer dem.
+    # Efter en restart er proof.last_changed = boot → "frisk" → vagten er
+    # åben (fail-open til den gamle adfærd, ikke en mørk kok).
+    - condition: template
+      value_template: >-
+        {% set occ = states.binary_sensor.koekken_apollo_occupancy %}
+        {% set proof = states.binary_sensor.koekken_menneske_proof %}
+        {% set krav = (states('number.koekken_apollo_radar_timeout') | float(5)) * 2 %}
+        {% set frisk = proof is none or proof.state == 'on'
+                       or (now() - proof.last_changed).total_seconds() <= 120 %}
+        {{ (trigger is defined and trigger.id == 'kamera')
+           or frisk
+           or is_state('binary_sensor.koekken_kamera_krop', 'on')
+           or (occ is not none and occ.state == 'on'
+               and (now() - occ.last_changed).total_seconds() >= krav - 0.5) }}
+    # Fejlklasse #21: kill-switchen skal være en condition på vejen ind, ikke en
+    # note. Slår user kamera-kroppene fra, dør DENNE vej — de øvrige er urørte.
+    - condition: template
+      value_template: >-
+        {{ not (trigger is defined and trigger.id == 'kamera')
+           or is_state('input_boolean.koekken_kamera_krop_enabled', 'on') }}
+    # Kun hvis spots faktisk er slukket (undgå re-fire).
+    - condition: state
+      entity_id: switch.koekken_spots
+      state: "off"
+    # 2026-06-21 (kitchen sessions): akkumulering over tærskel ELLER en allerede
+    # AKTIV session → tænd. Under en session tænder spots hurtigt ved bevægelse
+    # uden at vente på re-akkumulering (man går væk + kommer tilbage). Sessionen
+    # slutter når køkkenet har været tomt i koekken_session_timeout_minutes
+    # (presence_koekken_session_end).
+    # Runde 3b (2026-07-03): session-grenen kræver nu at central-zonen har været
+    # on i ≥ relight-slideren (den vedvarende trigger ovenfor fyrer på præcis
+    # dét tidspunkt; -1 s epsilon mod trigger/last_changed-jitter). Instant-
+    # edge-triggeren opfylder dermed IKKE længere session-stien (gennemgang).
+    # Akkumulerings-stien (ægte madlavning) er uændret — instant som altid.
+    - condition: template
+      value_template: >
+        {% set relight_s = states('input_number.koekken_session_relight_seconds') | float(10) %}
+        {% set zone_on_s = (now() - states.binary_sensor.koekken_apollo_central_zone_filtered.last_changed).total_seconds() %}
+        {{ (trigger is defined and trigger.id == 'kamera')
+           or (trigger is defined and trigger.id == 'session_relight'
+               and is_state('input_boolean.koekken_session_active', 'on'))
+           or (is_state('input_boolean.koekken_session_active', 'on')
+               and zone_on_s >= (relight_s - 1))
+           or (states('sensor.koekken_occupancy_recent') | float(0) * 60)
+              >= (states('sensor.koekken_cooking_threshold_min') | float(99)) }}
+  action:
+    # 2026-09-03 (user-spec: "først ramper lyskæden op og når den rammer fuld,
+    # så tænder spots"). Rækkefølgen var omvendt fordi lyskædens cooking-mode
+    # blev DEFINERET af switch.koekken_spots — kæden kunne først vide at der
+    # laves mad efter spottene var tændt, og hoppede så i gang bagefter.
+    # Ramp-flaget sætter det nye anker (binary_sensor.koekken_madlavningslys)
+    # FØR spots, så enforceren i packages/koekken_lyskaede.yaml kører hele sin
+    # kurve, og spottene lægges oven på et køkken der allerede er lyst.
+    - variables:
+        kaede_var_taendt: "{{ is_state('light.koekken_lyskaede', 'on') }}"
+    # Start/forny sessionen (idempotent). Holder spots hurtig-tændende resten af
+    # madlavningen indtil køkkenet er tomt længe nok.
+    - service: input_boolean.turn_on
+      target:
+        entity_id:
+          - input_boolean.koekken_session_active
+          - input_boolean.koekken_cooking_ramp
+    # Ankeret er nu on → enforceren tænder/omfarver kæden. Tænder den IKKE
+    # (uden for cooking-tænd-vinduet, film, godnat, AirBnB, varsel-blink...),
+    # er der ingen rampe at vente på, og spottene skal komme med det samme.
+    - wait_template: "{{ is_state('light.koekken_lyskaede', 'on') }}"
+      timeout: "00:00:02"
+      continue_on_timeout: true
+    # Rampens fremdrift kan IKKE aflæses på pæren: HA melder brightness = målet
+    # med det samme, længe før lyset er der (permanent faktum). Derfor ventes
+    # der på TID, sammensat af enforcerens egne fade-sensorer — samme kilde som
+    # den bruger selv, så de to ikke kan divergere (fejlklasse #2).
+    #   kæden var slukket: segment 1 (hurtig) + segment 2 (langsom) + margin
+    #   kæden var tændt:   enforcerens tune-gren = 2 s delay + transition
+    # Kun selve FADET skaleres med input_number.koekken_spots_ramp_pct (70 % =
+    # user-spec 09-03); enforcerens faste reaktionstid er overhead, ikke rampe,
+    # og må ikke ganges væk — ellers rammer spottene før kæden er begyndt.
+    - if:
+        - condition: state
+          entity_id: light.koekken_lyskaede
+          state: "on"
+      then:
+        - variables:
+            # 2026-09-25 (user: "spots skal først tændes når lyskæden når sit
+            # top morgen niveau, ikke midt i rampen"): målt 24/9 tændte spots
+            # 06:32:05 mens kædens tænd-kurve (06:31:37 + 27 s) stadig kørte,
+            # og 25/9 i samme sekund som kæden sprang fra 2 % orange til hvid.
+            # (a) Kæden var tændt: enforcerens tune-gren fuldfører nu resten af
+            #     tænd-kurven (sensor.koekken_lyskaede_kurve_slut) i stedet for
+            #     at hoppe — vent på DEN, ikke kun på 1 s.
+            # (b) Om morgenen (koekken_morgenlys) er procent-slideren sat ud af
+            #     spil: 100 % + 1 s margin. Resten af døgnet gælder slideren.
+            vent_s: >-
+              {% set hurtig = states('sensor.koekken_lyskaede_fade_hurtig_effektiv') | int(2) %}
+              {% set langsom = states('sensor.koekken_lyskaede_fade_langsom_effektiv') | int(15) %}
+              {% set morgen = is_state('binary_sensor.koekken_arbejdslys', 'on') %}
+              {% set pct = 1.0 if morgen
+                           else states('input_number.koekken_spots_ramp_pct') | float(70) / 100 %}
+              {% set margin = 1 if morgen else 0 %}
+              {% if kaede_var_taendt and trigger is defined
+                    and trigger.id == 'session_relight' %}
+                {# Genoptænd: kæden står allerede i madlavnings-lys — ingen
+                   rampe at vente på, og ventetiden ER klagen. #}
+                0
+              {% elif kaede_var_taendt %}
+                {% set fade = langsom if is_state('binary_sensor.dark_mode_stue', 'on') else 1 %}
+                {% set k = as_timestamp(states('sensor.koekken_lyskaede_kurve_slut'), 0) %}
+                {% set rest = [k - now().timestamp() - 2, 0] | max %}
+                {{ (2 + ([fade, rest] | max) * pct + margin) | round(0, 'ceil') | int }}
+              {% else %}
+                {{ (2 + (hurtig + langsom) * pct + margin) | round(0, 'ceil') | int }}
+              {% endif %}
+        - delay:
+            seconds: "{{ vent_s | int(0) }}"
+    - service: switch.turn_on
+      target:
+        entity_id: switch.koekken_spots
+    # Spots ejer ankeret nu → ryd ramp-flaget. Rækkefølgen (spots FØRST) er
+    # bevidst: ankeret må ikke blinke off, ellers fyrer enforcerens cook_end og
+    # fader kæden ned til hygge i samme sekund arbejdslyset kom.
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.koekken_cooking_ramp
+    - service: logbook.log
+      data:
+        name: "Køkken madlavnings-lys"
+        message: >
+          Spots tændt ({{ 'session-relight (hurtig)'
+          if (states('sensor.koekken_occupancy_recent') | float(0) * 60)
+             < (states('sensor.koekken_cooking_threshold_min') | float(99))
+          else 'akkumulering opfyldt' }}, dagslys {{ states('sensor.koekken_dagslys_lx') | round(0) }}
+          < gate {{ states('sensor.koekken_spots_lux_gate_effektiv') }}{{
+          ' (aktivitets-bonus: ' ~ ((states('sensor.koekken_aktiv_15m') | float(0)) * 60) | round(1)
+          ~ ' min aktivt)' if state_attr('sensor.koekken_spots_lux_gate_effektiv', 'bonus_aktiv')
+          else '' }}).
+
+# ---------------------------------------------------------------------------
+# Køkken-spots sluk: HELE køkken-feltet tomt → spots off (2026-06-17 rev.2)
+# ---------------------------------------------------------------------------
+- id: presence_koekken_spots_off
+  alias: "Lysnet: Køkken-spots sluk (køkken tomt)"
+  description: >
+    2026-06-17 rev.2 (user-spec "wider zone only"): spots slukker når man
+    forlader HELE køkken-Apolloens felt (binary_sensor.koekken_apollo_occupancy_filtered
+    pr. 2026-08-19g), ikke kun den centrale 0-250 cm zone. Den tidligere central-zone-sluk var for
+    aggressiv: spots døde mens man lavede mad og bare trådte ud af de 250 cm
+    (vask/køleskab/spisebord), selv om man tydeligvis var i køkkenet. Sluk-
+    forsinkelsen styres af slider input_number.koekken_spots_off_seconds.
+    Apollo-occupancy inkluderer still-target i hele feltet → spots slukker IKKE
+    mens nogen står stille i køkkenet; først når feltet faktisk er tomt.
+    Backstop: hele open-plan tomt 20 min. Slukker KUN — tænder aldrig (cooking-on).
+  mode: restart
+  trigger:
+    # 2026-06-28 (flicker-fix): brug `for:` på selve off-transitionen i stedet
+    # for delay+re-check inde i action. En kort occupancy-dropout (Apollo-flicker
+    # mens man laver mad og bevæger sig) NULSTILLER for-timeren → spots slukker
+    # ALDRIG midt i en aktiv session. Den gamle delay+choose-condition gatede
+    # ikke pålideligt selve turn_off'en (bevist: 12,57 s dropout → spots off
+    # 80 s senere mens user stod i køkkenet). `for:` reset på enhver re-occupancy.
+    - platform: state
+      entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ states('input_number.koekken_spots_off_seconds') | int(10) }}"
+      id: field_clear
+    # 2026-08-28b: se noten ved lyskædens 'doed' — uden `from:` er
+    # `unavailable → on` en gyldig flanke, og et template.reload sender hver
+    # template-binary-sensor den vej.
+    - platform: state
+      entity_id: binary_sensor.open_plan_empty_for_20m
+      from: "off"
+      to: "on"
+      id: openplan_empty
+    # 2026-07-12 (fejlklasse #4 — re-arm): bygget mod AirBnB-spejlet, der tændte
+    # spots MENS køkkenet allerede var tomt → ingen off-flanke, og super-
+    # watchdog'en dækker ikke switches. Spejlet er væk (09-03), men vejen bliver:
+    # den er cause-agnostisk og dækker enhver anden tænd-vej. Level-baseret:
+    # spots on + felt tomt i N sek → sluk, uanset hvordan de blev tændt.
+    - platform: template
+      value_template: >-
+        {{ is_state('switch.koekken_spots', 'on')
+           and is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'off') }}
+      for:
+        seconds: "{{ states('input_number.koekken_spots_off_seconds') | int(10) }}"
+      id: rearm
+    # 2026-08-27b (user-valg): spottene er onoff — de kan ikke dæmpes med, så
+    # under film er den eneste måde at fjerne deres glare fra lærredet at
+    # slukke dem. Lyskæden bliver stående (clampet til predark-niveau), så
+    # køkkenet ikke bliver bælgmørkt for den der henter popcorn.
+    - platform: state
+      entity_id: binary_sensor.filmmoerke_koekken
+      from: "off"
+      to: "on"
+      id: film
+    # 2026-08-29 (user-incident, cause-agnostisk net): alle tre veje ovenfor —
+    # og anomali-vagtens 45 min — kræver et UBRUDT hul i en sensor der flapper
+    # 300-450 gange i timen. Svigter filteret, findes hullet ikke, og spots kan
+    # brænde i 10 timer uden at nogen vej kan røre dem. Denne måler AKKUMULERET
+    # tomhed i stedet, hvilket radaren faktisk kan levere: 0,1-1,1 % duty i et
+    # tomt hus mod 7-57 % når nogen er hjemme. Slider = 0 slår backstoppen fra.
+    # Slukker kun; cooking-on tænder straks igen hvis nogen faktisk er der.
+    - platform: time_pattern
+      minutes: "/5"
+      id: hang
+    # 2026-10-10 (CLAUDE.md permanent fakta, restart dræber `for:`): deploy-
+    # restart 10:07:17, 21 s efter feltet blev tomt → field_clear-timeren døde,
+    # og rearm-templaten var allerede sand da automationen blev sat op (restored
+    # state) → template-triggers fyrer kun på falsk→sand. Spots hang tændt i et
+    # tomt køkken til hæng-backstoppen. Boot-grenen venter settle + sluk-
+    # forsinkelsen og slukker kun hvis feltet ikke har flanket siden boot.
+    - platform: homeassistant
+      event: start
+      id: boot
+  condition:
+    # Boot: switchen kan stå unavailable de første sekunder — tjekkes efter delayen.
+    - condition: template
+      value_template: >-
+        {{ trigger.id == 'boot' or is_state('switch.koekken_spots', 'on') }}
+    # 2026-09-23: stue-Styrbar langt OP = open-plan fuldt lys i mindst 30 min.
+    # Denne vej har ingen Manual-gate og slukkede spottene 3-22 min efter
+    # hvert langt tryk (19/9 + 22/9). Holdets slip slukker selv spottene når
+    # open-plan er tom (packages/open_plan_fuldt_lys.yaml) = re-arm (#4).
+    - condition: state
+      entity_id: input_boolean.open_plan_fuldt_lys
+      state: "off"
+    - condition: or
+      conditions:
+        - condition: template
+          value_template: "{{ trigger.id != 'hang' }}"
+        - condition: template
+          value_template: >-
+            {% set g = states('input_number.koekken_spots_hang_pct') | float(0) %}
+            {{ g > 0
+               and (states('sensor.koekken_felt_aktiv_30m') | float(100)) < g
+               and (now() - states.switch.koekken_spots.last_changed).total_seconds() > 1800 }}
+  action:
+    - if:
+        - condition: template
+          value_template: "{{ trigger.id == 'boot' }}"
+      then:
+        - delay:
+            seconds: "{{ (states('input_number.koekken_spots_off_seconds') | int(10)) + 30 }}"
+    # Restored last_changed = boot-tidspunktet, så "ingen flanke i sluk-
+    # forsinkelsen" er målt på observeret tid efter boot, ikke på den genskabte.
+    - condition: template
+      value_template: >-
+        {% set o = 'binary_sensor.koekken_apollo_occupancy_filtered' %}
+        {{ trigger.id != 'boot'
+           or (is_state('switch.koekken_spots', 'on')
+               and is_state('input_boolean.open_plan_fuldt_lys', 'off')
+               and is_state(o, 'off')
+               and (now() - states[o].last_changed).total_seconds()
+                   >= (states('input_number.koekken_spots_off_seconds') | int(10))) }}
+    - service: switch.turn_off
+      target:
+        entity_id: switch.koekken_spots
+    - service: logbook.log
+      data:
+        name: "Køkken madlavnings-lys"
+        message: >
+          Spots slukket ({{ 'køkken tomt ' ~ states('input_number.koekken_spots_off_seconds') ~ ' s'
+          if trigger.id == 'field_clear'
+          else ('re-arm: tændt i tomt køkken' if trigger.id == 'rearm'
+          else ('HA-genstart: feltet tomt efter boot' if trigger.id == 'boot'
+          else ('film startede (onoff kan ikke dæmpes)' if trigger.id == 'film'
+          else (('hæng-backstop: feltet kun '
+                 ~ (states('sensor.koekken_felt_aktiv_30m') | float(0) | round(1))
+                 ~ ' % aktivt i 30 min') if trigger.id == 'hang'
+          else 'open-plan tomt 20 min (backstop)')))) }}).
+
+# ===========================================================================
+# Køkken-spots DAGSLYS-sluk (2026-08-19f, user-spec "samme kontrol over alle rum")
+# ===========================================================================
+# Spots var husets sidste presence-lys med en tænd-grænse og INGEN sluk-grænse:
+# blev de tændt kl. 06 i et mørkt køkken, kunne kun "køkkenet er tomt"-vejen
+# slukke dem — og står man og laver morgenmad mens solen kommer, er feltet netop
+# ikke tomt. Præcis samme dødbånd som sofa-lampen 08-19 (5,5×), bare uden
+# nogen øvre kant overhovedet.
+#
+# Sluk-tærsklen er sensor.koekken_spots_dagslys_sluk_effektiv, som klamper mod
+# TÆND-tærsklen (fejlklasse: tænd og sluk for samme lys er ÉN regel — divergerer
+# de, får du enten et udødeligt lys eller en on/off-krig).
+#
+# Default 0 = FRA: adfærden er uændret indtil user skruer sliderens tal op på
+# 🔆 Rum for rum. Det er bevidst — det er den ene af de tre "manglende topper"
+# user bad om, og den skal kalibreres mod hans egen oplevelse, ikke mod et gæt.
+#
+# Manuel vinder: manual_override.yaml mapper switch.koekken_spots → room_mode_koekken,
+# så et fysisk tryk sætter stuen i Manual og denne vej holder fingrene væk.
+# AirBnB-udgang: gæsten trykker bare på kontakten igen → Manual → ingen krig.
+# ---------------------------------------------------------------------------
+- id: presence_koekken_spots_dagslys_off
+  alias: "Lysnet: Køkken-spots sluk ved dagslys"
+  description: >
+    Slukker switch.koekken_spots når køkkenets egen lux har ligget over
+    sensor.koekken_spots_dagslys_sluk_effektiv i sluk-forsinkelsen. Slukker KUN.
+    Slået fra så længe input_number.koekken_spots_dagslys_sluk_lux er 0.
+  mode: single
+  trigger:
+    - platform: template
+      value_template: >-
+        {% set thr = states('sensor.koekken_spots_dagslys_sluk_effektiv') | float(0) %}
+        {{ thr > 0
+           and (states('sensor.koekken_dagslys_lx') | float(0)) > thr
+           and is_state('switch.koekken_spots', 'on') }}
+      for:
+        minutes: "{{ states('input_number.stue_dagslys_sluk_minutter') | int(5) }}"
+    # Fejlklasse #4/#13: dagslys-kanalen danser omkring tærsklen og
+    # nulstiller for-vinduet, mens templaten står konstant true → ingen ren ny
+    # flanke. Backstoppen re-evaluerer; conditions gør den til en no-op ellers.
+    - platform: time_pattern
+      minutes: "/15"
+  condition:
+    - condition: state
+      entity_id: switch.koekken_spots
+      state: "on"
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_koekken', 'Manual') }}"
+    - condition: template
+      value_template: >-
+        {% set thr = states('sensor.koekken_spots_dagslys_sluk_effektiv') | float(0) %}
+        {{ thr > 0 and (states('sensor.koekken_dagslys_lx') | float(0)) > thr }}
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.koekken_spots
+    - service: logbook.log
+      data:
+        name: "Køkken madlavnings-lys"
+        message: >-
+          Spots slukket ved dagslys: ægte dagslys
+          {{ states('sensor.koekken_dagslys_lx') | float(0) | round(0) }} >
+          tærskel {{ states('sensor.koekken_spots_dagslys_sluk_effektiv') | float(0) | round(0) }}
+          (slider {{ states('input_number.koekken_spots_dagslys_sluk_lux') | int(0) }},
+          tænd-tærskel {{ states('input_number.koekken_spots_lux_threshold') | int(0) }}).
+
+# ---------------------------------------------------------------------------
+# Køkken-lyskæde sluk: open-plan tomt (hygge) / lys stiger (2026-07-22 rev.)
+# ---------------------------------------------------------------------------
+# HYGGE-niveau (spots off, farvet/lavt) = open-plan-AMBIENT: lyskæden holdes
+# tændt indtil HELE open-plan (stue+spisestue+køkken) har været tomt "noget tid"
+# (openplan_empty, 20m × faktor), ELLER køkken-lux stiger over tænd-tærskel +
+# buffer (5 lx hysterese, dagslys — strammet fra 15 2026-07-24: krogens
+# dagslys-gulv nåede sjældent 40 lx → lyskæden hang tændt formiddagen).
+# 2026-08-05: 'bright' er LEVEL-baseret (lyskæde on + spots off + ikke Manual +
+# lux over tærskel, holdt i koekken_lyskaede_lux_off_minutter) — den rene flanke
+# kunne ikke re-arme når krydsningen faldt inde i en madlavnings-session.
+# User-spec 2026-07-22: den må IKKE slukke
+# bare fordi køkken-zonen er tom (man er gået til sofaen) — se den sidste
+# condition-gate der neutraliserer de hurtige køkken-tomt-flanker (empty/rearm)
+# for hygge. KRAFTIGT arbejdslys (madlavnings-ankeret) håndteres af
+# spots-vetoet (stays on under session). Manual vetoer. Samme adfærd i AirBnB
+# (09-03, spejlet fjernet). Slukker KUN — tænder aldrig.
+# (Historik: 2026-07-08 #1 bandt sluk til hurtig køkken-tomt for at undgå at et
+#  KRAFTIGT lys hang i sofa-tid; hygge-kæden ønskes nu bevidst som ambient.)
+- id: presence_koekken_lyskaede_off
+  alias: "Lysnet: Køkken-lyskæde sluk (køkken tomt / lys stiger)"
+  mode: restart
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ states('input_number.koekken_spots_off_seconds') | int(10) }}"
+      id: empty
+    # 2026-09-23: 'bright'-grenen er FJERNET (var: spots-vetoet lux-sluk ved
+    # `lux_threshold + 5` på køkken-kanalen). Den kan ikke overleve flytningen
+    # til vindues-kanalen i 'lux_haard' nedenfor: på en kanal kæden selv lyser
+    # ind i SKAL sluk-tærsklen ligge over tænd-tærsklen + kædens eget bidrag
+    # (målt +56 lx på spisestue-Apolloen, hvid kæde i bælgmørke), ellers slukker
+    # grenen kæden få sekunder efter den selv tændte, i ring. Med den afstand er
+    # 'bright' aldrig sand uden at 'lux_haard' også er sand = ren dublet af en
+    # gren der oven i købet IKKE er vetoet af spots. Dens historik (08-04-hanget,
+    # fejlklasse #4/#19: hvorfor en lux-sluk skal være LEVEL-baseret og ikke en
+    # flanke) gælder stadig — 'lux_haard' er bygget efter samme mønster.
+    - platform: state
+      entity_id: binary_sensor.open_plan_empty_for_20m
+      from: "off"
+      to: "on"
+      id: openplan_empty
+    # 2026-08-26d (user-spec): lyskædens EGEN udløbsdato. open_plan_empty_for_20m
+    # nulstilles af hvert sub-sekund spøgelse (natten til 26/8: hang 3 t 41 min),
+    # så den kan ikke stå alene. openplan_beboet_langsom har delay_on 3 s → et
+    # blip kan ikke forlænge livet; når den falder, ER open-plan reelt tom.
+    # 2026-08-28b: `from: "on"` er IKKE pynt. Et `template.reload` — og enhver
+    # availability-blip — sender template-binary-sensorer gennem `unavailable`,
+    # og uden `from:` er `unavailable → off` en gyldig flanke. Målt: reload
+    # 13:21:24 sendte openplan_beboet_langsom unavailable → off → on (3 s),
+    # 'doed' fyrede på artefakten og slukkede lyskæden MIDT i en
+    # madlavnings-session med spots tændt. Netop 'doed' er undtaget
+    # spots-vetoet nedenfor, så intet andet fangede den. Samme klasse som
+    # Matter-reglen "tænd-triggers kræver from: off".
+    - platform: state
+      entity_id: binary_sensor.openplan_beboet_langsom
+      from: "on"
+      to: "off"
+      id: doed
+    # 2026-08-26d (user-spec): "den skal også slukke ved meget høj lux som 65".
+    # HÅRD grænse — IKKE vetoet af spots: ved ægte dagslys er en dekorativ
+    # lyskæde usynlig, og spots leverer stadig arbejdslyset.
+    # LEVEL-baseret, ikke flanke (fejlklasse #4): en numeric_state-crossing der
+    # sker mens kæden er slukket, fyrer på en falsk betingelse og kan aldrig
+    # re-arme når kæden tændes bagefter.
+    #
+    # 2026-09-23 (user-bug "køkkenlyset har hængt i dag"): kanalen er flyttet
+    # fra sensor.koekken_dagslys_lx til sensor.spisestue_lux_reel — VINDUES-enden
+    # af open-plannet. Årsagen er målt, ikke æstetisk: på 129 rene dagslys-par
+    # (alt open-plan-lys slukket, 4 døgn) er spisestue-enden **median 3,37×
+    # lysere** end køkkenets dagslys_lx (p25 2,76, p75 3,74). Den gamle hårde
+    # grænse på 90 lx KØKKEN svarer altså til ~303 lx spisestue, hvilket
+    # september-solen aldrig nåede: hang-dagen 08:35 stod spisestuen på 124 lx
+    # mens køkkenet læste 26. Gaten sad på den mørke ende af et rum hvis
+    # lysindtryk afgøres ved vinduet — derfor kunne den ikke fyre.
+    # Kontaminering er ikke et problem HER, den er selvkorrigerende: kæden er
+    # tændt når denne gren evalueres, så kanalen er biased OPAD (+56 lx målt),
+    # og opad = "sluk kunstlyset" = den sikre retning. Tænd-gaten
+    # (binary_sensor.koekken_lyskaede_lux_ok) læser omvendt kanalen mens kæden
+    # er SLUKKET, altså ren. Derfor skal de to tærskler holdes >56 lx fra
+    # hinanden — se sliderne i packages/koekken_lyskaede.yaml.
+    # `is_number` fejler LUKKET: en unavailable Apollo må ikke blive "0 lx".
+    # 2026-09-24 (user: "hvorfor mangler jeg køkken session lys nu?"): under
+    # en madlavnings-session læser grenen KØKKENETS egen kanal
+    # (sensor.koekken_dagslys_lx mod lux_haard_off_session, 300 lx). Vindues-
+    # enden målte 196 lx kl. 17:51 og 435 lx kl. 17:57 i aftensolen, mens
+    # køkkenet målte 40-167 — vinduet er det forkerte instrument for en der
+    # står ved komfuret. Uden session: vinduet som før.
+    - platform: template
+      value_template: >-
+        {% set session = is_state('binary_sensor.koekken_madlavningslys', 'on') %}
+        {% set kanal = 'sensor.koekken_dagslys_lx' if session else 'sensor.spisestue_lux_reel' %}
+        {% set graense = states('input_number.koekken_lyskaede_lux_haard_off_session' if session
+                                else 'input_number.koekken_lyskaede_lux_haard_off') | float(0) %}
+        {{ is_state('light.koekken_lyskaede', 'on')
+           and graense > 0
+           and states(kanal) | is_number
+           and (states(kanal) | float(0)) > graense }}
+      for:
+        minutes: "{{ states('input_number.koekken_lyskaede_lux_off_minutter') | int(2) }}"
+      id: lux_haard
+    # 2026-09-03d (user: "står for længe tændt på orange efter endt køkken
+    # session"). 'doed' kræver at HELE open-plan er tomt og hjælper derfor ikke
+    # den aften hvor man går fra køkkenet til sofaen — målt 5 døgn: median
+    # 64 min fra sidste spots-off til kæden slukkede, med 200-396 min i de
+    # aftener hvor nogen blev siddende. Denne vej hænger på SESSIONENS
+    # afslutning, som selv kræver køkkenet tomt i koekken_session_timeout_
+    # minutes (15) — så flanken kommer aldrig mens nogen står og laver mad, og
+    # den kan kun armeres af en ægte madlavnings-session. Hygge-kæden tændt af
+    # presence/lux uden session er dermed urørt (open-plan-ambient, 2026-07-22).
+    - platform: state
+      entity_id: input_boolean.koekken_session_active
+      from: "on"
+      to: "off"
+      for:
+        minutes: >-
+          {{ states('input_number.koekken_lyskaede_efter_session_minutter')
+             | int(20) }}
+      id: efter_session
+    # 2026-07-12 (fejlklasse #4 — re-arm): welcome/recovery kan tænde lyskæden
+    # MENS køkkenet allerede er tomt → 'empty'-flanken ovenfor armerer aldrig.
+    # Level-baseret: lyskæde on + felt tomt i N sek → sluk.
+    - platform: template
+      value_template: >-
+        {{ is_state('light.koekken_lyskaede', 'on')
+           and is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'off') }}
+      for:
+        seconds: "{{ states('input_number.koekken_spots_off_seconds') | int(10) }}"
+      id: rearm
+  condition:
+    - condition: state
+      entity_id: light.koekken_lyskaede
+      state: "on"
+    # Manual = bruger styrer selv.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_koekken', 'Manual') }}"
+    # Cooking-session ejer lyskæden som arbejdslys → rør ikke.
+    # 2026-09-03: vetoet læser ANKERET (binary_sensor.koekken_madlavningslys),
+    # ikke switchen — under rampen er spots endnu ikke tændt, og et dagslys-sluk
+    # i det vindue ville rive kæden væk midt i opstarten.
+    # Samme dato: AirBnB-undtagelsen er fjernet sammen med spots/lyskæde-
+    # spejlet. Den fandtes kun fordi "spots on" i AirBnB ikke betød madlavning
+    # (mirroren tændte dem med kæden) og derfor ville blokere alle sluk-stier.
+    # Uden spejl betyder ankeret det samme i begge modes.
+    # 2026-08-26d: 'doed' og 'lux_haard' er UNDTAGET spots-vetoet.
+    # 'doed' fyrer først efter open-plan har været reelt tom i doed_minutter —
+    # en stærkere præmis end "spots off", så står spots stadig tændt dér, er de
+    # hængende, ikke madlavning. 'lux_haard' er user-spec: ved ægte dagslys skal
+    # lyskæden ud uanset hvad, og spots leverer stadig arbejdslyset.
+    - condition: template
+      value_template: >-
+        {{ not is_state('binary_sensor.koekken_madlavningslys', 'on')
+           or trigger.id in ['doed', 'lux_haard'] }}
+    # 0 på den hårde lux-slider = fra. Uden denne guard ville numeric_state
+    # 'above: <input_number med værdi 0>' fyre ved enhver lux over 0.
+    - condition: template
+      value_template: >-
+        {{ trigger.id != 'lux_haard'
+           or (states('input_number.koekken_lyskaede_lux_haard_off_session'
+                      if is_state('binary_sensor.koekken_madlavningslys', 'on')
+                      else 'input_number.koekken_lyskaede_lux_haard_off') | float(0)) > 0 }}
+    # 0 på efter-session-slideren = fra. Og køkkenet skal stadig være tomt NU:
+    # sessionen sluttede fordi feltet var tomt i 15 min, men der kan være kommet
+    # nogen tilbage i ventetiden — og så er kæden det lys de står i.
+    # 2026-10-03e: mens Sofa Zen LÅNER kæden (køkkenet ikke i brug, user-spec
+    # 3/10) er den en del af Zen-looket — 'efter_session' (20 min efter en
+    # madlavning) ville ellers slukke den midt i sofa-hyggen. Dagslys og
+    # open-plan-tomt ('doed') er stadig udgange: Zen slipper selv når stuen tømmes.
+    - condition: template
+      value_template: >-
+        {{ trigger.id in ['bright', 'lux_haard', 'doed']
+           or not is_state('binary_sensor.sofa_zen_laaner_kaeden', 'on') }}
+    - condition: template
+      value_template: >-
+        {{ trigger.id != 'efter_session'
+           or ((states('input_number.koekken_lyskaede_efter_session_minutter')
+                | float(0)) > 0
+               and is_state('binary_sensor.koekken_apollo_occupancy_filtered',
+                            'off')) }}
+    # 2026-07-22 (user-spec): HYGGE-lyskæden er open-plan-AMBIENT — den må IKKE
+    # slukke bare fordi KØKKEN-zonen er tom (man er gået fra køkkenet til sofaen).
+    # Ved hygge-niveau (farvet/lavt = spots OFF) skal den holdes tændt indtil HELE
+    # open-plan har været tomt "noget tid" (openplan_empty, 20m × faktor) eller
+    # dagslys stiger (bright). De hurtige KØKKEN-tomt-flanker (empty/rearm) må
+    # derfor kun slukke et KRAFTIGT arbejdslys (spots on = madlavning) — det er
+    # allerede vetoet ovenfor, så i praksis holder hygge-kæden nu til
+    # open-plan-tomt. 2026-09-03: AirBnB-undtagelsen er fjernet (spejlet findes
+    # ikke længere) — gæsten får samme ambient-adfærd som familien.
+    # 2026-08-26d: 'doed' og 'lux_haard' hører til de langsomme/absolutte veje og
+    # er derfor tilladt her på lige fod med bright/openplan_empty — det er stadig
+    # KUN de hurtige køkken-tomt-flanker (empty/rearm) der er neutraliseret.
+    # 2026-09-03d: 'efter_session' hører til de langsomme veje — dens flanke
+    # kommer først 15 min (session-timeout) + slideren efter køkkenet blev tomt.
+    - condition: template
+      value_template: >-
+        {{ trigger.id in ['bright', 'openplan_empty', 'doed', 'lux_haard',
+                          'efter_session']
+           or is_state('binary_sensor.koekken_madlavningslys', 'on') }}
+    # 2026-08-26g: mens natturen kører, FØLGER kæden spisestue-loftet og dør
+    # sammen med det (godnat_adult_nightwalk_off, 5 min tomt). Ellers ville
+    # 'doed'/'openplan_empty' rive natlyset væk mens man stadig er på badet —
+    # open-plan ER tomt under en nattur, det er hele pointen. Dagslys-grenene
+    # er UNDTAGET fra undtagelsen, så der findes stadig en vej ud uanset alt.
+    - condition: template
+      value_template: >-
+        {{ (trigger.id | default('', true)) in ['bright', 'lux_haard']
+           or not (is_state('binary_sensor.godnat_any_active', 'on')
+                   and is_state('switch.koekken_spots', 'off')
+                   and is_state('light.spisestue_loft', 'on')) }}
+  action:
+    - service: light.turn_off
+      target:
+        entity_id: light.koekken_lyskaede
+      data:
+        # 2026-08-26d: 'doed' er den langsomme udløbs-vej og har sin egen,
+        # bevidst meget længere fade (user-spec: "fade ud til sidst og dø").
+        transition: >-
+          {{ states('input_number.koekken_lyskaede_doed_fade_sekunder') | int(300)
+             if trigger.id in ['doed', 'efter_session']
+             else states('sensor.fade_extended_effective') | int(60) }}
+    - service: logbook.log
+      data:
+        name: "Køkken-lyskæde"
+        message: >-
+          Slukket ({{ 'køkken tomt' if trigger.id == 'empty'
+          else ('re-arm: tændt i tomt køkken' if trigger.id == 'rearm'
+          else ('udløbet: open-plan reelt tomt i '
+                ~ (states('input_number.koekken_lyskaede_doed_minutter') | int(90))
+                ~ ' min' if trigger.id == 'doed'
+          else ('hård lux-grænse ('
+                ~ ((states('input_number.koekken_lyskaede_lux_haard_off_session') | int(0)) ~ ' lx i køkkenet (madlavning), målt '
+                   ~ (states('sensor.koekken_dagslys_lx') | float(0) | round(0) | int)
+                   if is_state('binary_sensor.koekken_madlavningslys', 'on')
+                   else (states('input_number.koekken_lyskaede_lux_haard_off') | int(0)) ~ ' lx ved vinduet, målt '
+                   ~ (states('sensor.spisestue_lux_reel') | float(0) | round(0) | int))
+                ~ ') passeret' if trigger.id == 'lux_haard'
+          else ('køkken-session slut + '
+                ~ (states('input_number.koekken_lyskaede_efter_session_minutter')
+                   | int(20))
+                ~ ' min' if trigger.id == 'efter_session'
+          else 'open-plan tomt 20 min (backstop)')))) }}).
+
+# ---------------------------------------------------------------------------
+# Køkken-session slut: køkkenet tomt længe nok (2026-06-21, user-spec)
+# ---------------------------------------------------------------------------
+# En madlavnings-session starter når spots først tænder ved akkumulering, og
+# holder spots HURTIG-tændende ved bevægelse resten af madlavningen (man går væk
+# + kommer tilbage uden at vente på re-akkumulering). Sessionen SLUTTER når
+# køkken-Apolloens felt har været HELT tomt (inkl. still-target) i
+# koekken_session_timeout_minutes (default 15) — eller godnat / huset forlader
+# Active. Derefter kræver næste tænd fuld akkumulering igen. Spots' hurtige SLUK
+# (presence_koekken_spots_off) er uændret — sessionen påvirker kun gen-tænd.
+# ---------------------------------------------------------------------------
+- id: presence_koekken_session_end
+  alias: "Lysnet: Køkken-session slut (tomt X min / godnat / væk)"
+  description: >
+    Afslut madlavnings-sessionen (input_boolean.koekken_session_active) når
+    køkkenet har været tomt i koekken_session_timeout_minutes, ved godnat, eller
+    når huset forlader Active. Næste tænd kræver så fuld akkumulering igen.
+  mode: restart
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.koekken_session_timeout_minutes') | int(15) }}"
+      id: empty
+    - platform: state
+      entity_id: binary_sensor.godnat_common_active
+      from: "off"
+      to: "on"
+      id: godnat
+    - platform: state
+      entity_id: input_select.house_state
+      from: "Active"
+      id: leave
+    # 2026-07-21 (#4/#15): koekken_session_active er restore-state (ingen
+    # initial:) → en session der var ON da HA blev genstartet (deploy/HAOS-nat)
+    # ryddes ALDRIG af empty-`for:`/godnat/leave — de kræver friske flanker.
+    # Stuck session = relight-grenen (gren-2 i cooking_spots_on) tænder spots
+    # hurtigt hele aftenen og omgår brugerens akkumulerings-tærskel til næste
+    # godnat. Ryd stale session ved boot (guardet på tomt køkken nedenfor).
+    - platform: homeassistant
+      event: start
+      id: boot
+  condition:
+    - condition: state
+      entity_id: input_boolean.koekken_session_active
+      state: "on"
+    # Boot-stien rydder KUN hvis køkkenet reelt er tomt — er nogen midt i en
+    # madlavning der overlevede restarten, lad empty-for-stien afslutte normalt.
+    - condition: template
+      value_template: >
+        {{ trigger.id != 'boot'
+           or is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'off') }}
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.koekken_session_active
+    - service: logbook.log
+      data:
+        name: "Køkken-session"
+        message: >
+          Session slut ({{ 'tomt ' ~ states('input_number.koekken_session_timeout_minutes') ~ ' min'
+          if trigger.id == 'empty'
+          else ('godnat' if trigger.id == 'godnat'
+          else ('HA-genstart (stale session ryddet)' if trigger.id == 'boot'
+          else 'huset forlod Active')) }})
+          — næste tænd kræver akkumulering igen.

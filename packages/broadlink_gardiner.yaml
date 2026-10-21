@@ -1,0 +1,959 @@
+# =============================================================================
+# Somfy RTS gardiner via Broadlink RM4 Pro (2026-06-11)
+# =============================================================================
+# RM4 Pro (192.0.2.87, mac d5:4e:b8:af:bd:dd, remote.broadlink_rm4_pro)
+# provisioneret HELT uden Broadlink-app/cloud: AP-mode + python-broadlink
+# fra NUC'ens wlp2s0. RF-koder fanget med FAST frekvens 433.42 MHz
+# (find_rf_packet(frequency=433.42)) — RM4'erens auto-sweep finder ALDRIG
+# Somfy RTS (433.42 vs standard 433.92; "No radiofrequency found").
+#
+# REPLAY-VERIFICERET 2026-06-11: begge gardiner koerer paa alle 6 koder.
+# ⚠️ RTS rolling-code forbehold: hvis koderne holder op med at virke efter
+# massiv brug af den FYSISKE fjernbetjening (counter-desync), saa gen-fang
+# koderne (procedure: docs/thread_pairing_drejebog.md har ikke denne — se
+# git-log for capture-script, /tmp/somfy/ paa NUC, eller spoerg Claude).
+#
+# VEST-SÆRREGEL (user 2026-06-11): "vest skal aldrig 100% ned, højst 85%
+# — der står nogle ting". Implementering v2 (empirisk testet 2026-06-11):
+#   close = NED → delay (input_number.gardin_vest_ned_sekunder, målt 14s
+#   fra top til 85%-grænsen) → My-STOP.
+# Hvorfor ikke motor-preset? Vores fangne My-kode er en LANG-tryk-ramme
+# (capture krævede holdt knap) — den STOPPER fint under kørsel (verificeret),
+# men trigger IKKE kør-til-preset i hvile (verificeret dud). Korte tryk kan
+# ikke fanges af RM4 ved fast frekvens (for få rammer). Timet stop er derfor
+# den robuste vej. NB: lukning antager start fra TOP (delay er top→85%) —
+# luk fra midt-position overskyder ikke nedad (My stopper altid), men kan
+# stoppe FØR 85%. Acceptabelt for godnat/defense-flows der lukker fra åben.
+#
+# Entities matcher de planlagte Matter-navne -> AL eksisterende automation
+# (somrig_buttons RODRETs, winter/summer_defense, godnat-flows, entre_somrig
+# snapshot) virker uden aendringer. 3 Somfy paret: syd, vest_1, spisestue_vest
+# (2026-06-16). Planlagt vest_2 (Matter) findes stadig ikke.
+# Ingen positions-feedback (RTS er envejs) -> optimistic/assumed state.
+# =============================================================================
+input_number:
+  gardin_syd_antaget_pos:
+    name: "Gardin syd: antaget position (reference)"
+    icon: mdi:arrow-expand-vertical
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+  gardin_vest_antaget_pos:
+    name: "Gardin vest: antaget position (reference)"
+    icon: mdi:arrow-expand-vertical
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+  gardin_spisestue_antaget_pos:
+    name: "Gardin spisestue: antaget position (reference)"
+    icon: mdi:arrow-expand-vertical
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+  # Sekunder fra HELT oppe til 85%-grænsen på vest (user-målt 14.0s (justeret fra 13, 2026-06-11)
+  # 2026-06-11). Bruges som delay i vest close_cover (NED → delay → My-stop).
+  # Justér her hvis grænsen skal flyttes — IKKE i YAML.
+  # Syd: SLIDEREN = antal sekunder gardinet kører NED før stop-signalet (luk →
+  # vent slider → stop). 2026-07-08 (#10, live-testet med user): 5s → ~20% nede →
+  # syd lukker HELT på ~25s. Motoren selv-stopper i bund, så en slider-værdi OVER
+  # ~25s = allerede lukket (stop = no-op). MAX derfor sænket 40→28 så HELE
+  # slider-området giver synlig kontrol (5s≈20% → 28s=helt lukket); tidligere
+  # default 30 sad i "allerede lukket"-zonen → så ud som om slideren var død.
+  # Skru NED for delvis lukning; 26-28 = helt lukket.
+  # SCOPE (2026-08-29): gælder KUN den NORMALE lukning. Under mørklægning
+  # (binary_sensor.filmmoerke_stue = dark mode / pre-dark / projektor) sendes
+  # der intet stop, og syd kører HELT i bund uanset denne slider — det er den
+  # anden af de to luk-længder user bad om.
+  gardin_syd_ned_sekunder:
+    name: "Syd-gardin: luk-længde (sekunder)"
+    min: 5
+    max: 28
+    step: 0.5
+    unit_of_measurement: "s"
+    mode: slider
+    icon: mdi:curtains
+
+  # Fuld køretid top→bund. Bruges KUN af positions-slideren
+  # (set_cover_position), der re-homer i toppen og derefter kører ned i
+  # (100-mål) % af denne tid. Må IKKE deles med luk-længden ovenfor: den er
+  # brugerens valgte DELVISE luk, denne er motorens fysiske køretid.
+  # Syd: 25 s er MÅLT live med user 2026-07-08 (5 s ≈ 20 % nede ⇒ ~25 s til
+  # bund; derfor står luk-længdens max på 28 = "allerede i bund").
+  gardin_syd_fuld_sekunder:
+    name: "Syd-gardin: fuld køretid top→bund"
+    min: 10
+    max: 45
+    step: 0.5
+    unit_of_measurement: "s"
+    mode: slider
+    icon: mdi:timer-cog-outline
+
+  # Spisestue vest er ALDRIG blevet timet med stopur. 25 s var syds tid lånt
+  # som STARTGÆT. 2026-10-18 (user): mosbillede-reguleringen trappede
+  # 100→80→75→70→65→60 % (antaget) og user så gardinet stå på ~40 % åben —
+  # 40 %-point beordret, ~60 %-point kørt ⇒ fuld ≈ 25 × 40/60 ≈ 16,7 s →
+  # 16,5 s (den side der lader gardinet stå en anelse HØJERE end beordret,
+  # så mosbilledets gulv holder). Ét øjebliks-skøn, ikke et stopur: kan det
+  # være et fast overløb pr. trin i stedet, ses det som at store enkeltkørsler
+  # nu stopper for højt (sæt slideren til 50 % fra top og se efter) (📏).
+  gardin_spisestue_fuld_sekunder:
+    name: "Spisestue-gardin: fuld køretid top→bund"
+    min: 10
+    max: 45
+    step: 0.5
+    unit_of_measurement: "s"
+    mode: slider
+    icon: mdi:timer-cog-outline
+
+  gardin_vest_ned_sekunder:
+    name: "Vest-gardin: sekunder til 85%-stop"
+    min: 5
+    max: 25
+    step: 0.5
+    unit_of_measurement: "s"
+    mode: slider
+    icon: mdi:curtains
+
+  # Ekstra nedkørsel KUN ved mørklægning (Dark Mode + projektor pre-dark), user
+  # 2026-08-08: "2 sek længere ned" → afprøvet fysisk samme aften, "2 sek was to
+  # much so 1 sek instead" → 1,0 s. Almindelige lukninger (RODRET, godnat,
+  # sommerforsvar) er urørt
+  # og stopper fortsat ved 85 % — det er kun film/mørklægning der har brug for at
+  # lukke lysstriben i bunden. 0 = slået fra.
+  gardin_vest_moerklaeg_ekstra_sekunder:
+    name: "Vest-gardin: ekstra ned ved mørklægning (sekunder)"
+    min: 0
+    max: 6
+    step: 0.5
+    unit_of_measurement: "s"
+    mode: slider
+    icon: mdi:theater
+
+  # Stue-RODRET smart-sekvens (2026-06-11): minutter et klik "huskes" så
+  # næste klik i samme retning tager gardin nr. 2 (ned: syd→vest, op:
+  # vest→syd). Modsat klik indenfor køretiden (sliderne ovenfor) stopper
+  # det kørende gardin i stedet.
+  stue_rodret_seq_minutes:
+    name: "Stue RODRET: sekvens-hukommelse (minutter)"
+    min: 1
+    max: 15
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: slider
+    icon: mdi:gesture-double-tap
+
+# Sekvens-state for stue-RODRET'ens smart-klik (automations/somrig_buttons.yaml
+# somrig_stue_curtain_click_smart). seq: down1/down2/up1/up2/hold_down/hold_up/
+# stop. last_curtain: syd/vest/begge. Ingen `initial:` = persisterer restarts.
+input_text:
+  # 2026-09-23 (#14): HVILKE stue-gardiner kører lige nu, og hvilken vej — pr.
+  # gardin, målt fra DETS egen start: {"syd": [kører_til_epoch, "down"], ...}.
+  # Skrives af script.stue_rodret_koerer_saet. Se smart-klikkets header.
+  stue_rodret_koerer:
+    name: "Stue RODRET: gardiner i bevægelse"
+    icon: mdi:motion-play
+    max: 255
+  stue_rodret_seq:
+    name: "Stue RODRET gardin-sekvens"
+    icon: mdi:state-machine
+  stue_rodret_last_curtain:
+    name: "Stue RODRET sidst styrede gardin"
+    icon: mdi:curtains
+  # 2026-07-01 (user-spec): sidst NEDRULLEDE stue-gardin (syd/vest). Trackes af
+  # stue_curtain_track_last_lowered ved ENHVER close (knap + automations —
+  # optimistic Somfy-state → 'closed'; user bruger aldrig fysisk Somfy). OP-klik
+  # #1 ruller det sidst-nedrullede op igen, #2 det andet. Persisterer restarts.
+  stue_rodret_last_lowered:
+    name: "Stue RODRET sidst nedrullede gardin"
+    icon: mdi:arrow-collapse-down
+
+input_datetime:
+  # Spisestue-vest: sidste position scriptet/endestop selv kørte til + hvornår
+  # (reference for relativ nedkørsel, se gardin_spisestue_position). Runtime.
+  gardin_syd_antaget_at:
+    name: "Gardin syd: reference-position sat"
+    has_date: true
+    has_time: true
+  gardin_vest_antaget_at:
+    name: "Gardin vest: reference-position sat"
+    has_date: true
+    has_time: true
+  gardin_spisestue_antaget_at:
+    name: "Gardin spisestue: reference-position sat"
+    has_date: true
+    has_time: true
+  stue_rodret_seq_at:
+    name: "Stue RODRET sidste gardin-tryk"
+    has_date: true
+    has_time: true
+
+# =============================================================================
+# Nat-cyklus kill-switches per stue-gardin (user 2026-06-16)
+# =============================================================================
+# Styrer OM syd/vest stue-gardinet skal rulles automatisk NED ved godnat og
+# OP ved godmorgen. Begge default OFF (user-valg 2026-06-16): syd holder op med
+# sin tidligere auto-luk-om-natten indtil knappen tændes; vest fortsætter sin
+# "åben hele natten"-rolle (2026-06-12). Gater KUN nat-cyklussen (godnat_fuld /
+# godnat / godmorgen i script_pkg/house_routines.yaml) — IKKE dag-tid solar/varme-forsvar
+# (winter/summer_defense har egne kill-switches), IKKE manuel "sluk alt" og IKKE
+# RODRET-knappen. Sove + børn-gardin cykler altid (ikke berørt af disse knapper).
+#
+# Default OFF persisterer af sig selv: nyoprettet input_boolean uden `initial:`
+# starter off og restorer derefter user's valg på tværs af restarts. Tilføjes
+# bevidst IKKE til init_user_preferences' turn_on-liste (det ville tvinge ON).
+# Vest-knappen gater både vest_1 OG (endnu ikke parrede) vest_2 — no-op for
+# vest_2 indtil den findes.
+# =============================================================================
+input_boolean:
+  # NB: ingen blank linje mellem de to (ha_validate.py:244's regex læser kun
+  # en kontinuerlig 2-space-indrykket blok som "lokalt defineret" → blank linje
+  # ville få vest til at fremstå som broken ref i pre-push live-check).
+  gardin_syd_natcyklus_enabled:
+    name: "Syd-gardin: auto nat-cyklus (luk godnat / åbn godmorgen)"
+    icon: mdi:curtains
+  gardin_vest_natcyklus_enabled:
+    name: "Vest-gardin: auto nat-cyklus (luk godnat / åbn godmorgen)"
+    icon: mdi:curtains
+
+# =============================================================================
+# MODERN `template:`-syntaks (migreret 2026-09-16, HA Core 2026.9.2)
+# =============================================================================
+# Den gamle `cover: - platform: template`-form blev FJERNET i 2026.x, og de tre
+# gardiner forsvandt SPORLØST ved opdateringen: uden unique_id lå de aldrig i
+# entity-registry'et, så der var ingen `unavailable`-orphan at opdage dem på —
+# covers gik bare fra 4 til 1. Kun core-loggens
+#   "Configuring the template integration under the cover platform key is not
+#    supported, it must be configured under its own template key instead"
+# afslørede det.
+#
+# ⚠️ `name:` ER entity_id'et her: den gamle form tog entity_id fra DICT-NØGLEN
+# (gardin_stue_syd), den nye slugifier `name:`. Derfor er "(Somfy)" fjernet fra
+# navnene — "Gardin Stue Syd (Somfy)" ville blive cover.gardin_stue_syd_somfy og
+# brække hver eneste reference i huset. unique_id er tilføjet nu, så et fremtidigt
+# navneskift ikke længere kan flytte entity_id'et.
+# =============================================================================
+template:
+  - cover:
+      - name: "Gardin Stue Syd"
+        unique_id: gardin_stue_syd
+        device_class: curtain
+        open_cover:
+          # Endestop top = frisk reference (2026-09-23, relativ slider-kørsel).
+          - service: input_number.set_value
+            target: {entity_id: input_number.gardin_syd_antaget_pos}
+            data: {value: 100}
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.gardin_syd_antaget_at}
+            data: {timestamp: "{{ as_timestamp(now()) | int }}"}
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: &syd_op "b64:sMCwBAydBgAVFSgVFSgVFSkpKSkpFRUUFCooFhQpFRQVFBUVKBUVFBQWFCgWFCkVFCoUFCoUFAADcVBQUFBQUU9RUFFPUVBRmSooKygqKCoUFBQWKBUVFBUUFSkVFBUUFRUoGhAUFCooKikpFRQqFBQqFBUpKigqKBUVFBQqKRQVKRQWFBQUFigVFRQUFRUpFRQpFRQpFRUoFhQAA25QUFBRT1FQUU9RT1FQUZopKCopKSkpFRQVFCkVFRUUFBUpFBYUFBQWKBUVFBUpKSkpKhQUKhQUKhQUKikpKSoUFBUVKCoUFCoUFRUUFBUpFRQVFBUVKRQVKRQWKBUVKBUVAANwUFBQUU9RUFFPUU9RUFGaKSkpKSkpKRQVFBUpFRQWFBQUKhQVFRQUFSkVFBUUKSooKikVFCoUFCoUFSkpKSkpFRQVFSgqFBQqFBUUFRUUKRUUFRUUFCoUFSkUFSkVFCkVFAADb1BQUFFQUFBRT1FQUU9RmiooKigqKSkUFhQUKhQUFRUUFSkUFRQVFRQpFRQVFSgqKSkpFRQpFRUoFRUoKigqKRUUFRQqKBYUKRUUFBYUFCoUFBUVFBQqFRQpFRQqFBQqFBQAA3BQUVBQUFFPUVBRT1FQUJoqKCooKikqFBQVFSgWFBQUFhQpFRQVFBUUKRUUFRUpKSkpKRQWKBUVKRQVKSkpKSkUFhQUKigWFCkVFBQVFRQpFRUUFBUVKBYUKBYUKRUUKhQUAANuUFBQUU9RUFBQUU9RUFGZKSkqKSooKhQUFBYoFRUUFBUVKRQVFBUUFSkVFRQUKigqKSkUFSkVFCoUFCooKigqFBUVFCooFRUpFBUVFBQWKBUVFBQVFSgVFSkUFSkUFSkWEwADcFBQUFFPUVBRT1FPUk9RmSkqKSkpKSkVFRQUKhQUFhQUFCoUFRUUFRUoFRUUFSkpKSkqFBQqFBQqFBUpKSkpKhQUFhQoKhQUKhQVFRQVFCoUFBYUFBQqFBUpFRUoFRUpFBUAA29QUFBRUFBQUVBQUFFPUZopKSkpKSkpFBYUFCoUFBUVFBUpFRQVFRQUKhQUFhQpKSkpKRUVKBUVKBYUKSkqKCoUFBUVKSkVFCkVFBQWFBQqFBQVFRUUKRUUKRUUKhQUKhQUAANwUFBQUVBQUFFPUVBRT1GaKigqKCooKhQVFRQpFRQVFRUTKhQVFBYUFCoUFBUVKCopKSkUFSkUFigVFSgqKCopFRQVFCooFhQoFhQUFRUUKRUUFRUUFCoVFCkVFCoUFCoUFAADblBQUFFPUVBRT1FQUU9RmiooKigqKCoUFRQVKRUUFRQWEykVFRQUFhQpFRQVFCkpKigqFBQqFBUpFBYoKigqKRQVFRQqKBUVKBUVFBUUFSkVFBUUFRQpFRUoFhQpFRQpFRQAA3BQUFBRT1FQUFBRUBFPUZkqKCopKSkqFBQVFSgVFRUUFBUpFBYUFBQWKBQWFBQqKCopKRQVKhQUKhQUKikpKSkVFBUUKSoUFCoUFRUUFBYoFRUUFBUVKRQVKRQVKRQWKBQWAANzUFBQUFBRT1FQUU9RUFCaKSkpKSkpKRUVFBQqFRMWFBUUKhQUFRUUFCoUFRUUKg=="
+        close_cover:
+          # Position ukendt efter luk/stop → ugyldiggør referencen (2026-09-23).
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.gardin_syd_antaget_at}
+            data: {timestamp: 0}
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: &syd_ned "b64:sMCwBAydBgAAAUzjUFBQUJopKSkpFBQVFRQUKhQVFRQUFSkpKSkVFBQVFRQVFCkVFCkVFCkpKSkqKCooFRUoFhQoKhQVFRQpKSooFBYoKigUFigqKCooKigqKAADbVBQUFBQUFBQUFBQUU9RmSkpKSkVFBYUFBQqFBQVFRQUKigqKBYUFBUUFRQVKRQVKRQUKiooKigqKCoUFCoUFCooFRUUFSkpKSkUFSkpKRQVKSkpKigqKCooAANuUFBQUU9RT1FPUVBRT1GZKSkpKRUUFRQVFCoUFRQVFBUpKSkpFRQUFRUUFBYoFBUpFBYoKigqKCooKhQUKhQUKikVFBQVKSkpKRUUKSkpFRQpKSkqKCooKigAA21QUFBQUFBQUU9RT1FPUZopKSooFBUVFBQVKRQVFRQUFigqKCoUFBUVFBQVFSgVFSkVFCgqKSkpKSkpFRQpFRQpKRUUFRQqKCooFhQoKigWFCgqKCoqKCooKgADbVBQUFBQUU9RT1FQUFBQmykoKigWFBQUFhQpFRQUFRUUKSkpKRUUFRUUFBUVKBUVKBUVKCooKigqKCoUFSkUFigqFBQVFSgqKCoUFSkpKRQVKSkpKSkpKigqAANtT1FPUU9RT1FPUU9RT1GZKigqKBYUFBUVFCkVFBUUFRQpKSkqFBQVFRQVFBUpFBUpFBUpKSkpKSkpKRQWKBQWKCoUFBUUKSooKhQUKigqFBQqKSkoKigqKSkAA25QUFBQUFBQUU9RT1FPUZgqKSkqFBQVFRQUKhQVFBUUFSkpKSkUFRQVFBUVFCkVFCkVFCkpKigqKCkpFhQoFhQoKhQUFhQoKigqFBQqKCoUFSkpKSkpKSkpKQADbVBQUFBQUU9RT1FPUU9RmSkpKSoUFBQWFBQqFBQUFhQUKigqKRQVFBUUFRQVKRQVKRQVKSkpKSkpKSkVFCgWFCkpFRQVFCkpKSkVFCooKRUUKikoKigqKCopAANuUFBQUFBQUFBQUU9RT1GZKSkpKRUUFRQVFCkUFRUUFRQpKSkpFRUUFBUVFBQqFBQqFBQqKCooKigqKBYUKRUUKSkUFRUUKigpKRQVKSkpFBUpKigqKCooKigAA21QUFBQUFBQUU9RT1FPUZkpKSkpFRQVFBUUKhQUFRUUFCooKigVFRQUFhQUFCoUFSkUFSkpKSooKigpFRQpFRQpKRQWFBQqKCooFRUoKigUFigqKCooKigqKAADblBQUFBQUFBQUFFPUU9RmSkpKSkVFBUUFRUpFBUUFBUVKCooKhQVFBUUFRQVKRQVKRQVKSkpKSkpKSkVFCkVFCkpFRUUFCooKigWFCgqKBYUKCooKigqKCooAANtUFBQUFBRT1FPUU9RT1GZKigqKBUVFRMVFSkUFRQVFBUpKSkpFBUVFBQVFBUpFBUpFRQpKSkpKSkpKRUUKhQUKigVFRQUKigqKBUVKCooFhQoKigqKCopKSkAA21QUFBQUFFPUU9RT1FPUZkqKCooFRUVExUVKRQVFBUVFCkpKSkVFBUVFBQVFCkVFCkVFSgqKCkpKSkqFBQqFBQqKBUVFBUpKSkpFRQpKSkVFCkpKSkpKSkpKQADbU9QUFBPUQ=="
+          # === TO LUK-LÆNGDER (2026-08-29, user-spec "der er to længder den
+          # skal lukkes på, normal og darkmode/filmmode") ======================
+          # MØRKLÆGNING → INGEN stop: motoren selv-stopper i bund, så ét NED
+          # lander på HELT lukket uanset hvor gardinet stod. Det gør luk
+          # idempotent i mørklægning — og dét er hele fixet på "lukker af to
+          # omgange": pre-dark OG dark_mode kalder begge close_cover, og med et
+          # stop efter 22 s var første luk delvis, så anden luk kørte de næste
+          # 22 s ned i bunden = to synlige kørsler. Nu rammer den første bunden,
+          # og den anden er en no-op på et gardin i hvile.
+          # NORMAL → NED + slider + stop = den delvise længde som før.
+          # Bevidst en `condition` (ikke if/then): den afbryder resten af
+          # sekvensen, hvilket er præcis "send ingen stop".
+          - condition: state
+            entity_id: binary_sensor.filmmoerke_stue
+            state: "off"
+          - delay:
+              seconds: "{{ states('input_number.gardin_syd_ned_sekunder') | float(30) }}"
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: "b64:sMCwBAydBgAAAUvjUFFPUZopKSkpKRUUFBUVFRMVKSkVFRQUKRUUFhQoKigWFCgqKSkUFhQUFBYUFBUVFBUUFSgVFSkUFRQVKSkUFhQUFRUUFCoUFBYUFBQqFBUVFBUUFRQVFBUUFRQVFRQUFQADWVBRT1FQUFBQUFFPUk5SmSooKigqFBUUFRQVFRQpKRQWFBQqFBQVFSkpKBUVKCopKRUUFRUUFBUVFBQVFRQUKhQUKhQVFRQoKhQVFRQUFRUVKRQUFRUUFSkUFRQVFBUUFRUUFBUVFBQWFBQUAANbUFBQUU9RUFFPUU9RT1GaKigqKCoUFBUVFBUVFCgqFBUVFCkVFBUUKSkqFBQqKCopFBUUFRUUFBUVFBQWFBQpFRQqFBQVFSgqFBUUFRQVFBUpFRQVFBUUKRUVFBQVFRQUFhQUFRQVFBUVFBQAA1pQUVBQUFBQUU9RT1FQUJopKSkpKRUUFBUVFRQVKCoUFRQWKBQVFRQpKSoUFCooKikUFRQVFRQUFRUUFRQVFCkVFCkVFRQUKigWFBQUFhQUFSkUFhQUFRUoFRUUFBUVFBQVFRQVFBUUFRQVFAADW1BRT1FQUFBQUFFPUU9RmikpKSkpFBYTFRUVFBQpKRYUFBUpFBUVFCkpKRUUKSkpKhQVFBUUFRQVFBUVFBQWKBQVKRQWFBQqKRQVFBUUFRQUKhUTFhQVFCoUFBUVFBQVFRQUFRUUFBYUFBUUAANZUFBQUFBRT1FPUU9RUFCaKigqKCoUFRUVExUVFCopFBUUFSkUFRQVKSkpFBYoKigqFBQVFRQUFhQUFRUUFBUpFRQpFBUVFCkqFBQVFRQUFRUoFhQUFRUUKhQUFBYUFBUVFBQUFhQVFBUUFRMAA1xQUFBRT1FPUVBRT1FPUZkqKCsoKhMVFBYUFBQWKCoUFBYUKBYUFBQqKSkUFSkpKSkVFRQUFRUUFRQVFBUVFCkVFCoUFBQWKCoUFRQVFBUUFSkUFRUUFRQpFRQVFBUVFBQVFRQUFRUUFRUUFAADWlFQUFBQUU9RT1FPUVBQmikpKSkpFRUUFBUVFBQqKhMVFBUpFBUVFCooKhQVKSkpKRQVFRQUFRUUFRUUFBUVKBUVKBYUFBUpKRUUFBUVFBUUKRUUFRQVFSkUFRUUFBUVFBQWFBQUFhQUFBYTAANdUFBQUU9RT1FQUFBRT1GZKSkqKCoUFRQVFBUUFSkpFRQVFCkVFBUUKSooFRUoKigqFBUVFBQVFRQUFhQUFRUoFRUpFBUUFSkpFBUVFBQWFBQqFBQUFhQUKhQVFRQUFRUUFBUVFBQVFRQVFBUAA1hQUU9RUFBQUU9RT1FPUZoqKCooKhQVFBUUFBYUKCoUFhQUKhQUFRUoKikUFSkpKSkVFBQVFRQUFhQUFRUUFCoUFCoUFRUUKSkUFRUUFRQVFSgVFBUUFhMqFBUUFhQUFBYUFBQWFBQVFRQUFAADXFBQUFFQUFBRT1FPUVBQmiooKigqFBUUFRQVFBUpKRUUFRQpFRQVFCooKhQUKikpKRUUFRQVFRQVFBUUFRQVKRUUKRUUFBYoKhQUFBYUFBUVKBUVFBUUFSkVFBUUFRQVFBUVFBQVFQ=="
+        stop_cover:
+          # Position ukendt efter luk/stop → ugyldiggør referencen (2026-09-23).
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.gardin_syd_antaget_at}
+            data: {timestamp: 0}
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: &syd_stop "b64:sMCwBAydBgAAAUvjUFFPUZopKSkpKRUUFBUVFRMVKSkVFRQUKRUUFhQoKigWFCgqKSkUFhQUFBYUFBUVFBUUFSgVFSkUFRQVKSkUFhQUFRUUFCoUFBYUFBQqFBUVFBUUFRQVFBUUFRQVFRQUFQADWVBRT1FQUFBQUFFPUk5SmSooKigqFBUUFRQVFRQpKRQWFBQqFBQVFSkpKBUVKCopKRUUFRUUFBUVFBQVFRQUKhQUKhQVFRQoKhQVFRQUFRUVKRQUFRUUFSkUFRQVFBUUFRUUFBUVFBQWFBQUAANbUFBQUU9RUFFPUU9RT1GaKigqKCoUFBUVFBUVFCgqFBUVFCkVFBUUKSkqFBQqKCopFBUUFRUUFBUVFBQWFBQpFRQqFBQVFSgqFBUUFRQVFBUpFRQVFBUUKRUVFBQVFRQUFhQUFRQVFBUVFBQAA1pQUVBQUFBQUU9RT1FQUJopKSkpKRUUFBUVFRQVKCoUFRQWKBQVFRQpKSoUFCooKikUFRQVFRQUFRUUFRQVFCkVFCkVFRQUKigWFBQUFhQUFSkUFhQUFRUoFRUUFBUVFBQVFRQVFBUUFRQVFAADW1BRT1FQUFBQUFFPUU9RmikpKSkpFBYTFRUVFBQpKRYUFBUpFBUVFCkpKRUUKSkpKhQVFBUUFRQVFBUVFBQWKBQVKRQWFBQqKRQVFBUUFRQUKhUTFhQVFCoUFBUVFBQVFRQUFRUUFBYUFBUUAANZUFBQUFBRT1FPUU9RUFCaKigqKCoUFRUVExUVFCopFBUUFSkUFRQVKSkpFBYoKigqFBQVFRQUFhQUFRUUFBUpFRQpFBUVFCkqFBQVFRQUFRUoFhQUFRUUKhQUFBYUFBUVFBQUFhQVFBUUFRMAA1xQUFBRT1FPUVBRT1FPUZkqKCsoKhMVFBYUFBQWKCoUFBYUKBYUFBQqKSkUFSkpKSkVFRQUFRUUFRQVFBUVFCkVFCoUFBQWKCoUFRQVFBUUFSkUFRUUFRQpFRQVFBUVFBQVFRQUFRUUFRUUFAADWlFQUFBQUU9RT1FPUVBQmikpKSkpFRUUFBUVFBQqKhMVFBUpFBUVFCooKhQVKSkpKRQVFRQUFRUUFRUUFBUVKBUVKBYUFBUpKRUUFBUVFBUUKRUUFRQVFSkUFRUUFBUVFBQWFBQUFhQUFBYTAANdUFBQUU9RT1FQUFBRT1GZKSkqKCoUFRQVFBUUFSkpFRQVFCkVFBUUKSooFRUoKigqFBUVFBQVFRQUFhQUFRUoFRUpFBUUFSkpFBUVFBQWFBQqFBQUFhQUKhQVFRQUFRUUFBUVFBQVFRQVFBUAA1hQUU9RUFBQUU9RT1FPUZoqKCooKhQVFBUUFBYUKCoUFhQUKhQUFRUoKikUFSkpKSkVFBQVFRQUFhQUFRUUFCoUFCoUFRUUKSkUFRUUFRQVFSgVFBUUFhMqFBUUFhQUFBYUFBQWFBQVFRQUFAADXFBQUFFQUFBRT1FPUVBQmiooKigqFBUUFRQVFBUpKRUUFRQpFRQVFCooKhQUKikpKRUUFRQVFRQVFBUUFRQVKRUUKRUUFBYoKhQUFBYUFBUVKBUVFBUUFSkVFBUUFRQVFBUVFBQVFQ=="
+      # NB "1" i navnet er ikke pynt: det gamle entity_id var
+      # cover.gardin_stue_vest_1, og slugget skal ramme det præcist.
+        # === POSITIONS-SLIDER (2026-09-20, user-spec: soveværelsets
+        # gardin-knap — den med slider — skal gælde alle gardiner) ========
+        # RTS er ENVEJS: der findes ingen positions-MÅLING at styre efter, så
+        # slideren styres på TID, og tiden måles ALTID fra toppen. Enhver
+        # delvis position kører derfor først en fuld optur (motoren
+        # selv-stopper i top) og derefter ned i (100-mål) % af køretiden.
+        # Hvorfor re-home frem for en relativ kørsel fra HA's antagede
+        # position? Fordi antagelsen drifter lydløst hver gang nogen bruger
+        # den FYSISKE Somfy-fjernbetjening, som HA aldrig ser — og drift på
+        # en envejs-kanal kan ikke opdages, kun nulstilles. Samme valg som
+        # gardin_film_luk traf for vest, af samme grund. Prisen er ~30 s.
+        # 0 og 100 rammer motorens EGNE endestop → intet timet stop.
+        # Logikken bor i et `mode: queued`-script, ikke her: template-coverets
+        # egen action-kanal serialiserer IKKE (målt 2026-09-20 — to kald 6 s
+        # efter hinanden kørte BEGGE, uden "Already running"), og to
+        # overlappende kørsler sender OP/NED/STOP i forkert rækkefølge og
+        # efterlader gardinet et tilfældigt sted. ÉN queued-kanal pr. gardin
+        # (fejlklasse #2): anden dragning venter og re-homer bagefter, så
+        # facit altid er den SIDSTE position du valgte.
+        set_cover_position:
+          - service: script.gardin_syd_position
+            data:
+              maal: "{{ position | float(100) }}"
+      - name: "Gardin Stue Vest 1"
+        unique_id: gardin_stue_vest_1
+        device_class: curtain
+        open_cover:
+          # Endestop top = frisk reference (2026-09-23, relativ slider-kørsel).
+          - service: input_number.set_value
+            target: {entity_id: input_number.gardin_vest_antaget_pos}
+            data: {value: 100}
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.gardin_vest_antaget_at}
+            data: {timestamp: "{{ as_timestamp(now()) | int }}"}
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: &vest_op "b64:sMCwBAydBgAAAUzjUFBPUZopKSooFBUVFCooKigVFRQUKigqKCooFhQUFBYUFBUpKSoUFBUVKCoUFCoUFBYUKBYUKBYUKRUUKSkUFSkqKBUVKCooFRUUFSkpFBUUFSkAA2xQUVBQUFBQUU9RT1FPUZoqKCooFhMVFCooKigWFBQUKigqKSkpFRQVFBUUFRQqKCoUFRQVKSkUFSkUFRUUKhQUKhQUKhQUKigVFSgqKRQVKSkpFBUVFCkpFBYUFCoAA25QUU9RT1FPUVBRT1FPUZgrJysoFRQVFCopKSkVFBQVKSkpKSkqFBQVFRQUFRUoKikUFRQVKSkUFSkUFRUUKhQUKhQUKhQUKigWFCgqKBYUKSkpFRQUFSkpFRUUFCkAA25PUU9RUFBQUU9RT1FPUZopKSkpFRMVFSkpKSkVFBQVKSkpKigqFBQWFBQUFhQoKikVFBQVKSkVFCkVFBUUKRUUKRUUKhQUKigVFSgqKBYUKSkqFBQUFigqFBUUFSgAA25QUU9RT1FQUFBRT1FPUZopKSkpFBQWFCkpKSkVFBUUKSkpKSkpFRQWFBQUFhQoKikVFBQVKSkVFCoUFBUVKRQVKBUVKRQVKSkVFCkpKRUUKigqFBQUFigqFBQUFigAA25QUFBQUFFPUVBRT1FPUZkpKSkpFRQWEykqKCoUFBYUKigqKCooFRUUFBUVFBQqKCoUFRQVKSkVFCkVFBQVKRQWKBUVKBQWKCoUFCopKRUTKikpFBUVFSgqFBQVFSgAA29PUU9RUFBQUFBRT1FPUZkqKCsoFBUVFCooKigVFRQUKigqKCooFRUVExUVFRQpKSoUFBUVKCoUFCoUFBYUKBYUKBYUKRUUKCoUFSkpKRUUKSkqFBQVFSkpFBUUFSkAA2xQUFBQUFFPUVBQUFFPUZkqKSkpFBUVFCkpKSkVFBUUKigqKCooFhQUFBYUFBQqKCoUFRUUKSkVFCkVFBUVKBUVKRUUKRQVKSkUFigqKBQWKCooFBYUFCopFBUUFSkAA29QUE9RUFBQUE9RT1FPUZkrJysoFhMVFCooKigWFBQUKigqKCoqFBQVFRQUFBYoKikUFRQVKSkUFSkUFRUUKRUUKRUUKhQUKigUFigqKBYUKCopFRQUFSkpFRQUFSkAA21QUFBQUFBQUFBRT1FPUZgrKCkqFBQVFSkpKSkVFBQVKSkpKSkpFRQUFRUUFBUpKSkUFhQUKSkVFSgWFBQUKhQVKRUUKRUUKSkVFCkpKRUUKSooFRUUFCopFRQUFSkAA25QUFBQUFFPUU9RT1FQUZkpKSkpFRQUFSkpKSoUFBUVKCooKikpFBQWFBQVFRQpKSkVFRQUKSkVFSgWFBQUKhQUKhQUKhQUKikVFCooKhQUKigqFBQVFSgqFBUUFSgAA21QUFBQUFFPUU9RT1JPUJopKSkpFRQVFCkpKSoUFBYUKSkpKSkpFRQVFBUUFRQpKSkVFRQVKSkVFCkVFBQVKRQWKBQWKBQWKCoUFCooKhQUKigqFBUUFSkpFRQUFigAA29QUFBQUFFPUU9RT1FQUJopKSkpFRQVFCopKSgVFRUUKigqKCooFRUUFBUVFBQqKCoUFQ=="
+        close_cover:
+          # Position ukendt efter luk/stop → ugyldiggør referencen (2026-09-23).
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.gardin_vest_antaget_at}
+            data: {timestamp: 0}
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: &vest_ned "b64:sMCwBAydBgAAAUziUFBQUJopKSkpFRQpFBUpKRUUFBUpFRQVFBUUKRQVFRUTFigqKBUVKBUVKBUVKRQVKSkUFSkUFRQVKSkUFRUUKRUUKSkpFRQpKSkVFCkVFCkVFSgVFSkUAANYUFBQUFBRT1FPUU9RUFCZKigqKBUUKhQVKSkUFRQVKRUUFBUUFSkVFBQVFRQpKSkVFCkUFSkVFCkVFCkpFRQpFRQVFCkpFRQVFCkVFCkqKRQVKSkpFBUpFBUpFBUpFBUpEwADW1BQUFBQUFBQUFFPUU9QmiooKigVFSgUFigqFBQVFSgWFBQUFhQoFhQUFBYUKCooFhQpFRQpFRQpFRQqKBQWKBUVFBQqKBUVFBQqFBQqKCoUFCooKhQVKRQUKhQUKhQUKhQAA1lQUFBQUFFPUU9RT1FPUZkpKSkpFRQpFRQpKRUVFBQpFRQVFRQUKhQVFBUUFSgqKRQVKRQVKRQVKRQVKSkUFSkUFRQVKSkVFBUUKRUUKSkpFRQpKSkVFSgVFSgVFSkUFCoUAANaUFBQUFBQUFBQUU9RT1GYKigqKRUUKRUUKSkUFRUUKRUUFBUVFCoUFBQWFBQqKCoUFCoUFCoUFCoUFCooFhQoFhQUFCopFRQUFSkUFigqKBUVKCooFRUoFRUoFRUoFRUoFAADWlBQUFBQUFBRT1FPUU9RmSooKigVFSkUFSgqFBUVFCgWFBUUFRQpFRQUFRUUKSkpFRQpFRQpFRQqFBQqKRQVKRQVFBUpKRQVFBUpFBUpKSkVFCkpKRUUKRUUKRUUKRUUKRQAA1tPUU9RT1FPUVBQUFBQUJopKSkpFBQqFBUpKRUUFBUpFBUVFBQVKRQWFBQUFigqKBUVKBQWKBQWKBQWKCoUFCoUFBYUKCoUFBYUKBYUKCooFhQpKSkVFCoUFCoUFCoUFCoTAANZUFBQUU9RT1FPUU9RT1GYKikpKRUUKRUUKigUFRUUKRUUFBUVFCkVFBQVFRQpKSkVFCoUFCoUFCoUFCooFRUoFRUUFCooFRQVFSkUFSkpKRQVKSkpFBUpFBUpFBUpFBUpEwADWlBQUFBQUU9RT1FPUU9RmSooKigUFSkVFSgqFBQVFSgVFBUUFRQpFRQVFBUVKCooFRUoFRUpFBUpFBUpKBUVKBUVFBQqKBUVFBQqFBQqKCoUFCooKhQUKhQUKhQUKhQUKhMAA1lQUFBQUFBQUE9RT1FPUZkpKSkpFRQpFRQpKRUUFRQpFRQVFBUUKRUVFBQVFSgqKBUVKBUVKBUVKBUVKCoUFCoUFBUVKCoUFBUVKBUVKCooFRUoKigVFSgVFSgVFSkUFSkUAANaUFBPUU9RT1FPUU9RT1GYKigqKRUUKRQVKSkUFRQVKRUUFBUUFCoUFRQVFBUpKCoUFSkUFSkUFSkUFSkpFRQpFRQUFSkpFRQUFSkUFCopKRQVKSkpFBUpFBUpFBUpFBUpEwADWk9RUFBPUU9RT1FPUU9RmSooKigVFSgUFigqFBQVFSgWFBQUFhQoFhQUFBYUKCooFhQoFhQoFhQoFhQoKhQVKRQWFBQqKBQWFBQpFRQpKSkVFCkpKRUUKRUUKRUUKRUUKRQAA1pQUA=="
+          - delay:
+              seconds: "{{ states('input_number.gardin_vest_ned_sekunder') | float(14) }}"
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: "b64:sMCwBAydBgAAAUziUFFPUZkpKSkpFRQqKBUVKSkpFBUoKhQVKSkpKRQVFRQUFRUUKSkUFigUFigVFRQUKhQUKigWFBQUKigWFCkVFBQVFRQpFRQVFBUUKRUUKRUUKRUVKBUVAANsUFBQUU9RT1FQUFBRT1GZKSkpKRUUKigUFigqKBUVKCoUFSkpKSkVFBQVFRQVFCkpFRQpFRQpFRUUFCoUFCooFhQUFCopFRQpFRQVFRQUKhQUFRUUFSkUFSkVFCkVFCkVFAADbVBQUFFPUU9RUFBQUU9RmSkpKSkVFCooFRUoKigVFSgqFBQqKSkpFRQUFRUUFBUpKRUUKhQUKhQVFBUoFRUpKRUUFBUpKRUUKRUUFBUVFCkVFBQWFBQqFBQqFBQqFBQqFBQAA21QUFBQUFBQUU9RT1FPUZkpKSkqFBQqKBYUKCopFRQqKBQWKCooKhQUFBYUFBUVKCoUFSkUFCoUFRQVKRQVKSkVFBQVKSkVFCoUFBUVFBQqFBQWFBQUKhQUKhQVKRQVKRUUAANuUFBQUFBRT1FPUVBQUFCaKigqKBUVKCoUFCooKhQVKSkUFSkpKSkVFBQVFRQVFCkqFBQqFBQqFBQVFSgWFCgqFBQWFCgqFBQqFRQVFBQVKRUUFRQVFCkVFCkVFCoUFSkUFQADbFBQUFBQUU9RT1FPUVBQmiooKSkVFCkpFRQqKCoUFCooFRUoKigqFBQWFBQVFRQoKhQVKRUUKRQVFRQpFRQpKRUUFRUpKBUVKRQVFRQUFSkUFRUUFBUpFBUpFBUpFBYoFBYAA25PUFBQT1FPUU9RT1FQUJoqKCooFRQpKhQUKigqFBQqKBYUKCooKhQVFRQUFRUUKigUFigVFSgVFRQUKhUTKigVFRQVKSkUFSkUFRUUFBUpFBUVFBQVKRQWKBUUKRUVKBUVAANsUFBQUU9RT1FPUVBQUFCZKigqKBYTKSoUFSkpKRQWKCoUFCkpKigUFhQUFRUUFCooFRUoFRUoFRUUFSkUFSkpFBUVFCkpFRQpFRQVFBUUKRUUFRQVFCkVFSgVFSgVFSgVFQADbk9RT1FPUVBQUFBQUU9RmSkpKSkVFCkpFBUpKSkUFigqFBQqKCooFBYUFBUVFBQqKBYUKBYUKBYUFBUpFBQqKRUUFBUpKRUUKRUUFRQVFCkVFBUUFRUoFRUpFRQpFBUpFRQAA2xQUFBQUFFPUU9RT1FQUJopKSkpFBQqKBUVKSkpFRQpKRQVKSkqKBUUFRQVFBUUKSkVFSgVFSgVFRQUKhQUKigVFRQUKikVFCkVFBQWFBQpFRQVFBUUKhQUKhQUKhQUKhQUAANuUFBQUE9RUFBQUFBRT1GZKSkpKRUUKSkVFCkpKRUVKCoUFCooKigVFRQUFRUUFCopFRQpFRQpFRQUFigUFigqFBQUFigqFBQqFBUUFRQUKhQUFRUVEyoUFSkVFCkVFCkVFAADbVBQUFBQUFBQUFBQUFBRmSkpKSkVEyooFhQpKSoUFCooFRUoKigqFBQVFRQUFRUoKhQUKhQUKhQVFBUpFBUpKRQVFBUpKRQVKRQVFRQUFSkVFBUUFRQpFRQpFRQpFRQpFRQAA21QUA=="
+        stop_cover:
+          # Position ukendt efter luk/stop → ugyldiggør referencen (2026-09-23).
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.gardin_vest_antaget_at}
+            data: {timestamp: 0}
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: &vest_stop "b64:sMCwBAydBgAAAUziUFFPUZkpKSkpFRQqKBUVKSkpFBUoKhQVKSkpKRQVFRQUFRUUKSkUFigUFigVFRQUKhQUKigWFBQUKigWFCkVFBQVFRQpFRQVFBUUKRUUKRUUKRUVKBUVAANsUFBQUU9RT1FQUFBRT1GZKSkpKRUUKigUFigqKBUVKCoUFSkpKSkVFBQVFRQVFCkpFRQpFRQpFRUUFCoUFCooFhQUFCopFRQpFRQVFRQUKhQUFRUUFSkUFSkVFCkVFCkVFAADbVBQUFFPUU9RUFBQUU9RmSkpKSkVFCooFRUoKigVFSgqFBQqKSkpFRQUFRUUFBUpKRUUKhQUKhQVFBUoFRUpKRUUFBUpKRUUKRUUFBUVFCkVFBQWFBQqFBQqFBQqFBQqFBQAA21QUFBQUFBQUU9RT1FPUZkpKSkqFBQqKBYUKCopFRQqKBQWKCooKhQUFBYUFBUVKCoUFSkUFCoUFRQVKRQVKSkVFBQVKSkVFCoUFBUVFBQqFBQWFBQUKhQUKhQVKRQVKRUUAANuUFBQUFBRT1FPUVBQUFCaKigqKBUVKCoUFCooKhQVKSkUFSkpKSkVFBQVFRQVFCkqFBQqFBQqFBQVFSgWFCgqFBQWFCgqFBQqFRQVFBQVKRUUFRQVFCkVFCkVFCoUFSkUFQADbFBQUFBQUU9RT1FPUVBQmiooKSkVFCkpFRQqKCoUFCooFRUoKigqFBQWFBQVFRQoKhQVKRUUKRQVFRQpFRQpKRUUFRUpKBUVKRQVFRQUFSkUFRUUFBUpFBUpFBUpFBYoFBYAA25PUFBQT1FPUU9RT1FQUJoqKCooFRQpKhQUKigqFBQqKBYUKCooKhQVFRQUFRUUKigUFigVFSgVFRQUKhUTKigVFRQVKSkUFSkUFRUUFBUpFBUVFBQVKRQWKBUUKRUVKBUVAANsUFBQUU9RT1FPUVBQUFCZKigqKBYTKSoUFSkpKRQWKCoUFCkpKigUFhQUFRUUFCooFRUoFRUoFRUUFSkUFSkpFBUVFCkpFRQpFRQVFBUUKRUUFRQVFCkVFSgVFSgVFSgVFQADbk9RT1FPUVBQUFBQUU9RmSkpKSkVFCkpFBUpKSkUFigqFBQqKCooFBYUFBUVFBQqKBYUKBYUKBYUFBUpFBQqKRUUFBUpKRUUKRUUFRQVFCkVFBUUFRUoFRUpFRQpFBUpFRQAA2xQUFBQUFFPUU9RT1FQUJopKSkpFBQqKBUVKSkpFRQpKRQVKSkqKBUUFRQVFBUUKSkVFSgVFSgVFRQUKhQUKigVFRQUKikVFCkVFBQWFBQpFRQVFBUUKhQUKhQUKhQUKhQUAANuUFBQUE9RUFBQUFBRT1GZKSkpKRUUKSkVFCkpKRUVKCoUFCooKigVFRQUFRUUFCopFRQpFRQpFRQUFigUFigqFBQUFigqFBQqFBUUFRQUKhQUFRUVEyoUFSkVFCkVFCkVFAADbVBQUFBQUFBQUFBQUFBRmSkpKSkVEyooFhQpKSoUFCooFRUoKigqFBQVFRQUFRUoKhQUKhQUKhQVFBUpFBUpKRQVFBUpKRQVKRQVFRQUFSkVFBUUFRQpFRQpFRQpFRQpFRQAA21QUA=="
+
+      # --- Spisestue vest (Somfy RTS, paret 2026-06-16) ----------------------
+      # Ny vestvendt blackout-gardin i spisestuen. Helt-ned luk (close = NED;
+      # motoren stopper selv i bund som syd) — INGEN My-stop-delay/slider.
+      # INGEN nat-cyklus-knap per user-spec 2026-06-16: cykler ikke automatisk
+      # med godnat/godmorgen — styres manuelt (RODRET/scener/HA). Ingen
+      # positions-feedback (RTS envejs) → optimistic state. RF-koder fanget
+      # 2026-06-16 @ 433.42 MHz via scripts/somfy_capture.py.
+        # === POSITIONS-SLIDER (2026-09-20, user-spec: soveværelsets
+        # gardin-knap — den med slider — skal gælde alle gardiner) ========
+        # RTS er ENVEJS: der findes ingen positions-MÅLING at styre efter, så
+        # slideren styres på TID, og tiden måles ALTID fra toppen. Enhver
+        # delvis position kører derfor først en fuld optur (motoren
+        # selv-stopper i top) og derefter ned i (100-mål) % af køretiden.
+        # Hvorfor re-home frem for en relativ kørsel fra HA's antagede
+        # position? Fordi antagelsen drifter lydløst hver gang nogen bruger
+        # den FYSISKE Somfy-fjernbetjening, som HA aldrig ser — og drift på
+        # en envejs-kanal kan ikke opdages, kun nulstilles. Samme valg som
+        # gardin_film_luk traf for vest, af samme grund. Prisen er ~30 s.
+        # 0 og 100 rammer motorens EGNE endestop → intet timet stop.
+        # Logikken bor i et `mode: queued`-script, ikke her: template-coverets
+        # egen action-kanal serialiserer IKKE (målt 2026-09-20 — to kald 6 s
+        # efter hinanden kørte BEGGE, uden "Already running"), og to
+        # overlappende kørsler sender OP/NED/STOP i forkert rækkefølge og
+        # efterlader gardinet et tilfældigt sted. ÉN queued-kanal pr. gardin
+        # (fejlklasse #2): anden dragning venter og re-homer bagefter, så
+        # facit altid er den SIDSTE position du valgte.
+        set_cover_position:
+          - service: script.gardin_vest_position
+            data:
+              maal: "{{ position | float(100) }}"
+      - name: "Gardin Spisestue Vest"
+        unique_id: gardin_spisestue_vest
+        device_class: curtain
+        open_cover:
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: &spis_op "b64:sMCwBAydBgAAAU3jUFFQUJoqKSooFhMVFBYUFBQqKRUUFRQqKBYUFBUpKRUUFRUpFBYoFBYUFBUVFBQVFRQVKigVFSgqFBUVFCkpFRQVFRQUFhQpFRQVFBUVKBUVFBQWFBQUFhQVFRQUFRUVFAADblBRUFFPUVBRT1FQUU9RmiooKigVFRUUFBUVFCooFRUVFCkpFRQVFCooFhQVEyoVFCoUFBYUFBQWFBQVFRQpKRUVKSkVFBQWKCoUFRQVFBUUFigVFRQUFRUpFRQVFBUUFRQWFBQUFhQUFRUUAANxUFBQUVBQUFFQUU9RUFGZKSkqKRUUFRQVFBYTKikUFRUUKigVFRQVKSkUFRUUKhQVKRUUFRQVFBUVFBQWFCkpFRQqKBYUFBQqKRUUFRQVFBUVKRQWFBQUFigVFRQVFBUVFBQVFRQVFRQUFRUAA29QUFBRUFFPUVBRUFFPUZopKSkpFRQWFBQUFhQpKRUUFRQpKhQUFhQpKRUVFBUpFRQqFBQVFRQVFBUVFBQVKSoUFCopFBUVFCooFhQUFBYUFBUqFBQWFBQVKRQVFRQVFBYTFRQWFBQWFBQVFQADcFBRT1FQUU9RUFFPUk9RmikpKSkVFBUVFBQVFSkpFRQUFigqFBQWFCkpFRQWFCgWFCkVFBUUFRQVFBUVFBQqKRUUKigVFRUUKigUFhQUFRUVFCkVFBQWFBQqFBQWFBUUFRQVFBYUFBQWFBQVAANvUFBQUVBQUFFQUU9RUFGaKigqKBYUFBQWFBUVKSkUFRQVKSoUFBUVKSkVFBQVKRQWKBUVFRQVFBUUFRQVFCooFhQpKRUUFRUoKhQUFhQUFRUUKhQVFBYUFCoUFBUVFBUUFRUUFBUVFBUVFBQAA3FQUU9RUFFQUU9RUFFPUZoqKCooFhQVFBUUFRQqKBYUFBQqKRUUFRQqKhQUFRUpFBUpFBUVFBQWFBQVFRQUKikUFSkqFBQWFCkpFRQVFBUUFhQpFRQUFRUUKRUVFBQWFBQWFBQVFRQVFBUVFAADcU9QUFFPUVBRT1FQUVBRmSopKigVFRQUFRUVEyopFBUVFCooFhQUFSkpFRUUFCoUFSkVFBUUFRQVFRQUFhQqKBUVKSkUFRQVKSoUFBUVFBUUFSkUFhQUFRUoFhQVFBUUFRQVFRQUFhQUFBYUAANwUFBQUVBRT1FQUU9RUFGZKikpKRUUFRQVFRUUKigUFhQUKigVFRQVKSkUFhQUKhQVKRUUFRQVFBYUFBQWFCkpFRQqKBYUFBQqKRUUFRUUFRQVKRQWFBQUFigVFRQUFRUVFBQWFBQUFhQUFRUAA29QUFBRUFFPUVBRT1FQUZkpKSopFRQVFBUUFRQpKhQUFhQpKRUUFRUoKhQVFRQqFBQqFBQVFRUUFBUVFBUVKCoUFCopFBUVFCooFhQVFBUUFRQqFBQWFBQUKhUUFRQVFBUVFBUVFBQVFRQVFQADcVBQUFFPUVBRT1JPUU9RmikpKikVExUVFRQUFSopFBQVFSkpFRQVFSgqFBUVFCkVFSgVFRQUFhQUFRUUFRUpKRUUKSkUFhQUKigVFRUUFBUVFCoUFBUVFBUpFRQVFBUUFRUUFBYUFA=="
+          # Endestop = kendt reference for den relative nedkørsel (2026-09-23).
+          - service: input_number.set_value
+            target: {entity_id: input_number.gardin_spisestue_antaget_pos}
+            data: {value: 100}
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.gardin_spisestue_antaget_at}
+            data: {timestamp: "{{ as_timestamp(now()) | int }}"}
+        close_cover:
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: &spis_ned "b64:sMCwBAydBgAAAU3jUFFQUJoqKCooFRUUFCooKhUUFRUoKhQUKhQUKhQVFRQpKSkVFBUVFBUpFBUpFRQUFSkpKRQWFBQqKBYUFBUpFRQpKSoUFCooKhQVKRQWKBUVKBUVKQADbVBQUFBQUU9RUFBQUU9RmiooKigWExUUKikpFBYUFCkpFBYoFRUoFRUUFSkpKRUUFRUUFCoUFCoUFBYUKSkpFRQUFigqFBQVFSgVFSkpKRQWKCooFhQoFhQoFhQpFRQpAANvUFBQUU9RUFFPUU9RT1GaKSkpKRUUFhMpKigWFBQVKSkVFCkVFCkVFBUVKCopFBUVFBQVKRQWKBUVFBQqKCoUFRUUKSkVFBUUKRUUKSoqExUpKSoUFCoUFCoUFCoUFSkAA25QUFBRUFBQUU9RUFBQUZkqKCopFBUVFCooKhQVFBUoKhQVKRUUKhQUFRUoKigWFBQVFRQqFBQqFBUUFSkpKRQWFBQqKBQWFBUpFBUpKSkVFCooKhQUKhQVKRUVKRQVKAADcFBRUFBQUU9RUFFPUVBQmiooKikVFBUUKigqFBUUFSooFBYoFRUpFBUUFSkpKRUUFhQUFCoUFSkVFBUUKSooFRUUFigqFBQVGCUVFSkpKRQVKSooFhQoFhQpFRQpFRQpAANvUFBQUU9RUFBQUVBQUFGZKikpKRQUFhQpKSkVFRQUKikVFCkVFCoUFBUVKCopFBUVFBQWKBQWKBUVFBQqKSkUFRUVKCoUFBYUKBYUKSkqFBUpKSkVFCoUFCoUFCoUFSkAA29QUVBQUFFPUVBQUFFPUZoqKCooFRUVFCkpKhQUFBYoKhQVKRUUKhQUFRUoKigWFBQWFBQqFBQqFBQVFSkpKRQWFBQqKRUUFBUpFRQqKCoUFCopKRQVKRUVKRQVKRQVKQADb1BQUFFPUVBQUFFQUU9RmionKygWFBQVKSkpFBYUFSkpFBUpFBUpFBYUFCopKRUUFRQVFCoUFCoUFBYUKSkqFBUUFSkpFRQUFigUFikpKRUUKSkpFRQpFRUoFhQpFRQpAANxUFBQUU9RUFFPUU9RUFGZKikpKRUTFhQpKSkVFRQUKioUFCoUFCoUFRQVKSkpFBUVFBQWKBUVKBYUFRQqKCoUFBUVKCoUFhQUKhQUKigqFBUpKSkVFCoUFCoUFCoUFSkAA29QUFBRT1FQUU9RUFBQUZoqKCooFRQVFCooKhQVFRQpKhQUKhQUKhQVFRQpKSoUFBUVFBUqFBQqFBQVFSgqKRUUFBUpKRUVFBQqFBQqKSkUFSkqKBUVKRQWKBQWKBQWKAADcFBQUFFPUVBRT1FPUVBSmCooKykVFRMVKSkpFBYUFCkpFBYoFhQpFRQVFCkpKhQUFhQUFCoUFSkUFhQUKikpFBUUFSkqFBQUFigVFSkpKRUUKSooFhQoFhQoFhQqFBUpAANuUFBQUU9RUFBQUU9RUFGZKSkpKRUUFhQpKSkVFBUVKCoUFSkVFCkVFBQWKCooFRUUFBYUKRUUKRUUFRQqKCoUFRUUKSkVFRQVKRQVKigpFRQqKCoUFSkVFCkVFCoUFCoAA3BQUFBRT1FQUFBRT1FQUZkqKCopFBUVFCooKg=="
+          # Endestop = kendt reference for den relative nedkørsel (2026-09-23).
+          - service: input_number.set_value
+            target: {entity_id: input_number.gardin_spisestue_antaget_pos}
+            data: {value: 0}
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.gardin_spisestue_antaget_at}
+            data: {timestamp: "{{ as_timestamp(now()) | int }}"}
+        stop_cover:
+          # Position ukendt efter luk/stop → ugyldiggør referencen (2026-09-23).
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.gardin_spisestue_antaget_at}
+            data: {timestamp: 0}
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: &spis_stop "b64:sMCwBAydBgAAAU7jUFBQUZoqKCooFhQpFRQpKikpFBYUFBQWKCoUFSkpFBUVFCkVFCooFhQpFRQpKhQUFRUUFCopFRQUFSkpFRUoFhQUFRUUKhQUFRUUFSkVFCoUFCoUFCoUFRMAA1xQUFBQUFFQUFBRUFBQUZoqKCooFhQpFRQpKigqFBUVFBQVKSkVFSgqFBQWFCkVFCooFRUpFBUpKRUUFBYUFCooFRUUFSkpFRUoFhQUFBYUKRUUFBUVFCkVFSgWFCkVFCkVFBQAA11QUFBRT1FQUU9RUFFPUZoqKCooFRUpFBUpKSkqFBQUFhQVKSkUFSkqFBQVFSgWFCkpFBUpFRQpKRYUFBQWFCooFRUUFCopFBUpFBUVFBUVKBUVFBUUFSkUFSkVFSgWFCgWFBQAA1tQUU9RUFFPUVBRT1FQUJopKSkqFBQqFBUpKSkpFRUUFRUUKSkUFigqFBQVFSgVFSkpFRQqFBQqKBUVFBUVFCkqFBQVFSgqFBUpFRQVFBUUKhQUFRUUFSkUFigUFigVFSkUFRQAA1xRUFBRT1FQUU9RUFBQUZkqKSkpFRQqFBQpKSopFRQUFRUUKSoUFCooFhQUFSkVFCooFhMqFRQqKBQWFBQVFSgqFBUUFigqFBQqFBQVFRQVKRUUFRQVFCoUFCoUFSkVFCkVFBUAA1pQUFBRT1FQUU9RUFFPUZopKSooFRQrExUqKCooFRUUFRQVKSkVFCkqExYUFSkVEyopFRQpFRUoKhQUFhQUFSkpFRUUFCooFRUpFRQVFRQUKhQVFBUUFSkVFCkVFSkUFCoUFRMAA11QUFBRT1FQUU9RT1FQUZkrKCooFhQpFBUoKikpFRQVFRQUKigWFCgqFBYUFCoUFCopFBUpFBYoKhQUFRUUFSkpFBYUFCkpFhQoFhQVFBUUKRUUFRQVFSgWFCgWFCkVFCoUFRMAA1tRUFBQUFFPUVBRT1FQUZkqKCopFBUpFBYoKigqFBUUFhMVKigVFSgqFBUVFCkVFCkpFRQqFBUpKBYUFRQVFSkpFBUVFCkpFBYoFRUVFBQVKRQVFRQUGSUVFSgWFCkVFCkVFRMAA1xQUVBQUFFPUVBRT1FQUZkpKSkqFBQqFBUpKSkpFRUUFRQVKSkUFigqFBUUFSgVFSkpFRQqFBQqKRUUFBUVFCkqFBQVFSgqFBUpFBUVFBUUKRUUFRUUFSkUFSkUFigVFSgVFRQAA1tQUFBRT1FQUU9RT1FQUZooKikpFRMqFBUpKSkpFRUUFRUUKCoVFCkpFRUUFCoUFCopFRQpFRQqKRQVFBUUFigqFBQVFSkpFBUpFRQUFRUUKhQUFhQUFSkVFCoUFCoUFCoUFBUAA1xQUFBRT1FQUU9RT1FQUZoqKCooFhQpFRQpKSooFRUUFRQVKSoUFCooFRUUFSkUFSkpFRQpFRUoKhQVFRQUFSkpFRUUFCooFhQpFRQVFRQUKhQVFBUVFCkVFCoUFCoVFCkVFBMAA1xQUFBRUFBQUVBQUFFPUZoqKCopFRQpFRUoKikpFRQVFBUUKigWFCgqFBYUFSkUFSkpFBUpFBYoKhQVFBUUFSkpFBYUFCopFRQpFRQVFBUVKA=="
+
+        # === POSITIONS-SLIDER (2026-09-20, user-spec: soveværelsets
+        # gardin-knap — den med slider — skal gælde alle gardiner) ========
+        # RTS er ENVEJS: der findes ingen positions-MÅLING at styre efter, så
+        # slideren styres på TID, og tiden måles ALTID fra toppen. Enhver
+        # delvis position kører derfor først en fuld optur (motoren
+        # selv-stopper i top) og derefter ned i (100-mål) % af køretiden.
+        # Hvorfor re-home frem for en relativ kørsel fra HA's antagede
+        # position? Fordi antagelsen drifter lydløst hver gang nogen bruger
+        # den FYSISKE Somfy-fjernbetjening, som HA aldrig ser — og drift på
+        # en envejs-kanal kan ikke opdages, kun nulstilles. Samme valg som
+        # gardin_film_luk traf for vest, af samme grund. Prisen er ~30 s.
+        # 0 og 100 rammer motorens EGNE endestop → intet timet stop.
+        # Logikken bor i et `mode: queued`-script, ikke her: template-coverets
+        # egen action-kanal serialiserer IKKE (målt 2026-09-20 — to kald 6 s
+        # efter hinanden kørte BEGGE, uden "Already running"), og to
+        # overlappende kørsler sender OP/NED/STOP i forkert rækkefølge og
+        # efterlader gardinet et tilfældigt sted. ÉN queued-kanal pr. gardin
+        # (fejlklasse #2): anden dragning venter og re-homer bagefter, så
+        # facit altid er den SIDSTE position du valgte.
+        set_cover_position:
+          - service: script.gardin_spisestue_position
+            data:
+              maal: "{{ position | float(100) }}"
+# =============================================================================
+# Film-luk: ÉN vej ind for mørklægning (Dark Mode + Pre-Dark) — 2026-07-29
+# =============================================================================
+# Baggrund (user 2026-07-29): "dark mode glemte vest gardin stue lige nu. det er
+# stadig åbent." Begge mørklægninger filtrerede på `states(c) in ['open',
+# 'opening', 'unknown']` for at undgå at lukke vest TO gange (2. luk kører forbi
+# 85 %-stoppet og rammer bunden). Men RTS er ENVEJS: HA's state er et GÆT, ikke
+# en måling. Stod gættet på 'closed' mens gardinet fysisk var oppe (RF-miss,
+# fysisk Somfy-fjernbetjening, sommerforsvar der ikke nåede frem), blev gardinet
+# sprunget over — præcis det brugeren så.
+#
+# Fix: filtrér ikke på gættet — lad HVER cover få den behandling dens fysik
+# kræver:
+#   • syd + spisestue_vest → close er IDEMPOTENT (motoren selv-stopper i bund;
+#     et ekstra NED på et lukket gardin er en no-op) → luk altid.
+#     2026-08-29: for SYD holdt den påstand kun fordi ingen havde efterprøvet
+#     den — dens close_cover stoppede efter gardin_syd_ned_sekunder (22 s) og
+#     landede altså DELVIST lukket, hvorefter næste close kørte de næste 22 s
+#     ned i bunden = de "to omgange" user så ved filmstart (pre-dark lukker,
+#     dark_mode lukker igen). Coverets close_cover springer nu stoppet over når
+#     binary_sensor.filmmoerke_stue er on, så mørklægning altid lander i bund i
+#     ÉN kørsel. Påstanden om idempotens er sand nu, ikke bare skrevet.
+#   • sove (Zigbee) → ÆGTE positions-feedback = en MÅLING, ikke et gæt → luk kun
+#     hvis den faktisk står åben.
+#   • vest_1 → RE-HOME: OP (fuld optur, motoren selv-stopper i top) → vent hele
+#     køretiden → close. Landing = 85 % uanset hvor gardinet stod, og vi kan
+#     ALDRIG ramme bunden ("der står nogle ting"). Prisen er ~20 s ekstra ved
+#     filmstart; det er billigere end at køre ned i inventaret. Derefter et
+#     kort ekstra NED (gardin_vest_moerklaeg_ekstra_sekunder, 1 s) — KUN her,
+#     ikke i almindelige lukninger.
+# =============================================================================
+script:
+  # 2026-09-23 (#14): bogfør at et stue-gardin er startet/stoppet fra RODRET'en.
+  # Køretiderne læses af SAMME slidere som template-coverne selv bruger.
+  stue_rodret_koerer_saet:
+    alias: "Stue RODRET: bogfør gardin i bevægelse"
+    mode: queued
+    max: 6
+    fields:
+      gardin:
+        description: "syd, vest eller begge"
+      retning:
+        description: "up, down eller stop"
+    sequence:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.stue_rodret_koerer
+        data:
+          value: >-
+            {% set raw = states('input_text.stue_rodret_koerer') %}
+            {% set k = raw | from_json if raw.startswith('{') else {} %}
+            {% set nu = as_timestamp(now()) | round(0) %}
+            {% set syd_ned = states('input_number.gardin_syd_ned_sekunder') | float(22) %}
+            {% set syd_fuld = states('input_number.gardin_syd_fuld_sekunder') | float(25) %}
+            {% set vest_ned = states('input_number.gardin_vest_ned_sekunder') | float(14) %}
+            {% set t = {'syd': {'down': syd_ned if is_state('binary_sensor.filmmoerke_stue', 'off') else syd_fuld,
+                                'up': syd_fuld},
+                        'vest': {'down': vest_ned, 'up': vest_ned / 0.85}} %}
+            {% set ns = namespace(o={}) %}
+            {% for c in ['syd', 'vest'] %}
+              {% if gardin in [c, 'begge'] %}
+                {% if retning in ['up', 'down'] %}
+                  {% set ns.o = dict(ns.o, **{c: [(nu + t[c][retning] + 1) | round(0), retning]}) %}
+                {% else %}
+                  {% set ns.o = dict(ns.o, **{c: [0, '']}) %}
+                {% endif %}
+              {% else %}
+                {% set ns.o = dict(ns.o, **{c: k.get(c, [0, ''])}) %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.o | to_json }}
+
+  gardin_syd_position:
+    alias: "Gardin Syd: kør til position (timet)"
+    icon: mdi:arrow-expand-vertical
+    mode: queued
+    max: 4
+    fields:
+      maal:
+        description: "Mål-position i % (100 = helt oppe, 0 = helt nede)"
+        example: 50
+    sequence:
+      # Timet positionering på en ENVEJS-kanal: fuld optur (motorens eget
+      # endestop) + nedkørsel i (100-mål) % af køretiden. Re-home hver gang,
+      # fordi HA's antagede position drifter lydløst når nogen bruger den
+      # FYSISKE Somfy-fjernbetjening — drift kan ikke opdages på en envejs
+      # kanal, kun nulstilles. 0 og 100 rammer motorens egne endestop og får
+      # derfor INTET timet stop.
+      - variables:
+          pos: "{{ [[maal | default(100) | float(100), 0] | max, 100] | min | round(0) }}"
+          fuld: "{{ states('input_number.gardin_syd_fuld_sekunder') | float(25) }}"
+          ref: "{{ states('input_number.gardin_syd_antaget_pos') | float(-1) }}"
+          ref_alder: >-
+            {{ as_timestamp(now()) - (state_attr('input_datetime.gardin_syd_antaget_at', 'timestamp') | float(0)) }}
+      - choose:
+          - conditions:
+              - "{{ pos >= 99 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *syd_op
+          - conditions:
+              - "{{ pos <= 1 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *syd_ned
+          # 2026-09-23 (#14 "de nye sliders til gardiner i ha appen virker
+          # heller ikke som man regner med"): fra helt oppe til 50 % sendte
+          # re-homen OP til et gardin der allerede var oppe og ventede så hele
+          # køretiden + 4 s før noget synligt skete. Har DETTE script (eller et
+          # endestop) sat positionen inden for 4 t, køres kun differencen —
+          # begge retninger. Gammel/ukendt reference → re-home som før.
+          - conditions:
+              - "{{ ref >= 0 and ref_alder < 14400 and pos < ref - 1 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *syd_ned
+              - delay:
+                  seconds: "{{ ((ref - pos) / 100 * fuld) | round(1) }}"
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *syd_stop
+          - conditions:
+              - "{{ ref >= 0 and ref_alder < 14400 and pos > ref + 1 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *syd_op
+              - delay:
+                  seconds: "{{ ((pos - ref) / 100 * fuld) | round(1) }}"
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *syd_stop
+        default:
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: *syd_op
+          - delay:
+              seconds: "{{ (fuld + 4) | round(1) }}"
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: *syd_ned
+          - delay:
+              seconds: "{{ ((100 - pos) / 100 * fuld) | round(1) }}"
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: *syd_stop
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.gardin_syd_antaget_pos
+        data:
+          value: "{{ pos }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.gardin_syd_antaget_at
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+
+  gardin_vest_position:
+    alias: "Gardin Vest: kør til position (timet, min 15 %)"
+    icon: mdi:arrow-expand-vertical
+    mode: queued
+    max: 4
+    fields:
+      maal:
+        description: "Mål-position i % (100 = helt oppe, 0 = helt nede)"
+        example: 50
+    sequence:
+      # Timet positionering på en ENVEJS-kanal: fuld optur (motorens eget
+      # endestop) + nedkørsel i (100-mål) % af køretiden. Re-home hver gang,
+      # fordi HA's antagede position drifter lydløst når nogen bruger den
+      # FYSISKE Somfy-fjernbetjening — drift kan ikke opdages på en envejs
+      # kanal, kun nulstilles. 0 og 100 rammer motorens egne endestop og får
+      # derfor INTET timet stop.
+      # VEST-SÆRREGEL: under 15 % findes ikke ("der står nogle ting" —
+      # 85 % lukket ER bunden her), så målet klampes, og der er ingen
+      # ned-i-bund-gren. 15 % rammer præcis den eksisterende 85 %-tid, fordi
+      # køretiden udledes af SAMME slider som close_cover: ned/0.85.
+      - variables:
+          pos: "{{ [[maal | default(100) | float(100), 15] | max, 100] | min | round(0) }}"
+          fuld: "{{ (states('input_number.gardin_vest_ned_sekunder') | float(14) / 0.85) | round(1) }}"
+          ref: "{{ states('input_number.gardin_vest_antaget_pos') | float(-1) }}"
+          ref_alder: >-
+            {{ as_timestamp(now()) - (state_attr('input_datetime.gardin_vest_antaget_at', 'timestamp') | float(0)) }}
+      - choose:
+          - conditions:
+              - "{{ pos >= 99 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *vest_op
+          # 2026-09-23 (#14 "de nye sliders til gardiner i ha appen virker
+          # heller ikke som man regner med"): fra helt oppe til 50 % sendte
+          # re-homen OP til et gardin der allerede var oppe og ventede så hele
+          # køretiden + 4 s før noget synligt skete. Har DETTE script (eller et
+          # endestop) sat positionen inden for 4 t, køres kun differencen —
+          # begge retninger. Gammel/ukendt reference → re-home som før.
+          - conditions:
+              - "{{ ref >= 0 and ref_alder < 14400 and pos < ref - 1 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *vest_ned
+              - delay:
+                  seconds: "{{ ((ref - pos) / 100 * fuld) | round(1) }}"
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *vest_stop
+          - conditions:
+              - "{{ ref >= 0 and ref_alder < 14400 and pos > ref + 1 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *vest_op
+              - delay:
+                  seconds: "{{ ((pos - ref) / 100 * fuld) | round(1) }}"
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *vest_stop
+        default:
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: *vest_op
+          - delay:
+              seconds: "{{ (fuld + 4) | round(1) }}"
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: *vest_ned
+          - delay:
+              seconds: "{{ ((100 - pos) / 100 * fuld) | round(1) }}"
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: *vest_stop
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.gardin_vest_antaget_pos
+        data:
+          value: "{{ pos }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.gardin_vest_antaget_at
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+
+  gardin_spisestue_position:
+    alias: "Gardin Spisestue: kør til position (timet, ukalibreret)"
+    icon: mdi:arrow-expand-vertical
+    mode: queued
+    max: 4
+    fields:
+      maal:
+        description: "Mål-position i % (100 = helt oppe, 0 = helt nede)"
+        example: 50
+    sequence:
+      # Timet positionering på en ENVEJS-kanal: fuld optur (motorens eget
+      # endestop) + nedkørsel i (100-mål) % af køretiden. Re-home hver gang,
+      # fordi HA's antagede position drifter lydløst når nogen bruger den
+      # FYSISKE Somfy-fjernbetjening — drift kan ikke opdages på en envejs
+      # kanal, kun nulstilles. 0 og 100 rammer motorens egne endestop og får
+      # derfor INTET timet stop.
+      # ⚠️ Køretiden (gardin_spisestue_fuld_sekunder) er skønnet ud fra én
+      # observation 18/10 (16,5 s), ikke timet med stopur (📏).
+      #
+      # 2026-09-23 — RELATIV KØRSEL (mosbillede-reguleringen, user-spec
+      # "løbende hvert N'te minut"): en regulering der re-homer hver 10. min
+      # kører gardinet HELT OP og lukker solen ind på billedet hver gang. Har
+      # DETTE script eller et endestop sat positionen inden for de sidste 4 t,
+      # køres kun differencen (NED/OP → vent → STOP). Ved gammel/ukendt
+      # reference re-homes som før. Driften fra den fysiske fjernbetjening er
+      # dermed højst 4 t gammel, og hver fuld op/ned (endestop) nulstiller den.
+      - variables:
+          pos: "{{ [[maal | default(100) | float(100), 0] | max, 100] | min | round(0) }}"
+          fuld: "{{ states('input_number.gardin_spisestue_fuld_sekunder') | float(25) }}"
+          ref: "{{ states('input_number.gardin_spisestue_antaget_pos') | float(-1) }}"
+          ref_alder: >-
+            {{ as_timestamp(now()) - (state_attr('input_datetime.gardin_spisestue_antaget_at', 'timestamp') | float(0)) }}
+      - choose:
+          - conditions:
+              - "{{ pos >= 99 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *spis_op
+          - conditions:
+              - "{{ pos <= 1 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *spis_ned
+          # 2026-09-23 (#14 "de nye sliders til gardiner i ha appen virker
+          # heller ikke som man regner med"): fra helt oppe til 50 % sendte
+          # re-homen OP til et gardin der allerede var oppe og ventede så hele
+          # køretiden + 4 s før noget synligt skete. Har DETTE script (eller et
+          # endestop) sat positionen inden for 4 t, køres kun differencen —
+          # begge retninger. Gammel/ukendt reference → re-home som før.
+          - conditions:
+              - "{{ ref >= 0 and ref_alder < 14400 and pos < ref - 1 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *spis_ned
+              - delay:
+                  seconds: "{{ ((ref - pos) / 100 * fuld) | round(1) }}"
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *spis_stop
+          - conditions:
+              - "{{ ref >= 0 and ref_alder < 14400 and pos > ref + 1 }}"
+            sequence:
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *spis_op
+              - delay:
+                  seconds: "{{ ((pos - ref) / 100 * fuld) | round(1) }}"
+              - service: remote.send_command
+                target:
+                  entity_id: remote.broadlink_rm4_pro
+                data:
+                  command: *spis_stop
+        default:
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: *spis_op
+          - delay:
+              seconds: "{{ (fuld + 4) | round(1) }}"
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: *spis_ned
+          - delay:
+              seconds: "{{ ((100 - pos) / 100 * fuld) | round(1) }}"
+          - service: remote.send_command
+            target:
+              entity_id: remote.broadlink_rm4_pro
+            data:
+              command: *spis_stop
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.gardin_spisestue_antaget_pos
+        data:
+          value: "{{ pos }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.gardin_spisestue_antaget_at
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+  gardin_film_luk:
+    alias: "Gardin: luk til film (mørklægning)"
+    icon: mdi:theater
+    mode: queued
+    max: 5
+    fields:
+      covers:
+        description: "Komma-separeret liste af cover-entities"
+        example: "cover.gardin_stue_syd,cover.gardin_stue_vest_1"
+    sequence:
+      - variables:
+          liste: >-
+            {{ (covers | default('') | string).split(',')
+               | reject('eq', '') | list }}
+          # Alt undtagen vest lukkes i ÉT service-kald (parallelt) — sekventielt
+          # ville filmstart koste 20-60 s, fordi template-coverne blokerer hele
+          # deres delay ud.
+          simple: >-
+            {{ liste | reject('eq', 'cover.gardin_stue_vest_1')
+               | reject('in', ['cover.gardin_sovevaerelse']
+                              if states('cover.gardin_sovevaerelse')
+                                 in ['closed', 'closing'] else [])
+               | join(',') }}
+      # if/then — IKKE `condition:` — inde i parallel: en falsk condition ville
+      # stoppe hele scriptet, ikke kun sin egen gren.
+      - parallel:
+          - sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ simple != '' }}"
+                then:
+                  - service: cover.close_cover
+                    continue_on_error: true
+                    target:
+                      entity_id: "{{ simple.split(',') }}"
+          # Vest: re-home først, så 85 %-stoppet altid rammes fra toppen.
+          - sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ 'cover.gardin_stue_vest_1' in liste }}"
+                then:
+                  - service: cover.open_cover
+                    continue_on_error: true
+                    target:
+                      entity_id: cover.gardin_stue_vest_1
+                  # Fuld køretid = 85 %-tiden / 0.85, + margin. Læser samme
+                  # slider som close_cover → ingen ny helper at holde synk.
+                  - delay:
+                      seconds: >-
+                        {{ ((states('input_number.gardin_vest_ned_sekunder')
+                             | float(14) / 0.85) + 4) | round(1) }}
+                  # 2026-09-23 (user-bug 21/09 21:43: "brugte gardin knappen til
+                  # at stoppe gardinerne i stuen men det blev overrulet"): op-
+                  # trykket fritog stuen 21:43:10, men denne kørsel var allerede
+                  # i gang og lukkede vest 6 s senere. Re-tjek at stuen STADIG er
+                  # i en mørklægning før motoren vendes. Stopper kun resten af
+                  # vest-grenen.
+                  - wait_template: >-
+                      {{ (is_state('input_boolean.dark_mode', 'on')
+                          and 'stue' in states('input_text.dark_mode_rooms').split())
+                         or (is_state('input_boolean.predark_active', 'on')
+                             and 'stue' in states('input_text.predark_rooms').split()) }}
+                    timeout: 0
+                    continue_on_timeout: true
+                  - if:
+                      - condition: template
+                        value_template: "{{ not wait.completed }}"
+                    then:
+                      - stop: "Stuen er ikke længere mørklagt — vest lukkes ikke"
+                  - service: cover.close_cover
+                    continue_on_error: true
+                    target:
+                      entity_id: cover.gardin_stue_vest_1
+                  # Ekstra nedkørsel (user 2026-08-08): 85 %-stoppet efterlader
+                  # en lysstribe ved sofaen. close_cover kan ikke forlænges
+                  # undervejs (template-coverets eget STOP fyrer på slideren), så
+                  # vi venter til den kørsel er HELT færdig og giver et kort NED
+                  # oveni. Det afsluttende STOP fra første kørsel lander på et
+                  # gardin i hvile = no-op (vores My-kode er en lang-tryk-ramme
+                  # og trigger ikke preset i hvile — verificeret 2026-06-11).
+                  - if:
+                      - condition: template
+                        value_template: >-
+                          {{ states('input_number.gardin_vest_moerklaeg_ekstra_sekunder')
+                             | float(0) > 0 }}
+                    then:
+                      - delay:
+                          seconds: >-
+                            {{ ((states('input_number.gardin_vest_ned_sekunder')
+                                 | float(14)) + 2) | round(1) }}
+                      - service: cover.close_cover
+                        continue_on_error: true
+                        target:
+                          entity_id: cover.gardin_stue_vest_1
+                      - delay:
+                          seconds: >-
+                            {{ states('input_number.gardin_vest_moerklaeg_ekstra_sekunder')
+                               | float(1) }}
+                      - service: cover.stop_cover
+                        continue_on_error: true
+                        target:
+                          entity_id: cover.gardin_stue_vest_1

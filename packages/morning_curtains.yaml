@@ -1,0 +1,232 @@
+# =============================================================================
+# Morgen-gardiner — åbn open-plan ved akkumuleret bevægelse
+# =============================================================================
+# 2026-06-17 (item 2 user-spec): Open-plan-gardinerne (stue syd/vest + spisestue
+# vest) skal gå OP om morgenen når der har været akkumuleret bevægelse i
+# open-plan-rummet — UAFHÆNGIGT af om godnat/auto-godnat-flowet kørte. Bruger
+# observerede at gardinerne ikke gik op en morgen hvor auto-godnat var slået fra;
+# dette gør åbningen robust mod den slags.
+#
+#   - binary_sensor.open_plan_occupied  = stue ELLER spisestue ELLER køkken-Apollo
+#   - sensor.open_plan_active_recent     = history_stats (timer) for ovenstående,
+#                                          sidste 30 min (jf. faelles_aktivitet_30min)
+#   - input_number.morning_curtain_accum_minutes = tærskel (min), default 3
+#
+# 2026-07-28 (item 7): SOVE-gardinet har fået sin egen morgen-backstop i samme
+# fil — samme "familien er vågnet"-signal, men med et krav om at soveværelset
+# har været tomt et stykke tid (slider nedenfor). Se automations-filen.
+#
+# Automation: automations/morning_curtains.yaml
+# =============================================================================
+
+input_number:
+  morning_curtain_accum_minutes:
+    name: "Morgen-gardiner: akkumuleret bevægelse (min)"
+    icon: mdi:curtains
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+  # 2026-07-28 (user-spec, item 7): hvor længe soveværelset skal have været
+  # TOMT før morgen-backstoppen tør åbne sove-gardinet.
+  #
+  # 2026-08-22 — REKALIBRERET, og præmissen bag de gamle 15 min er væk. Det
+  # gamle tal hvilede på "radaren taber en stillliggende i ~110 s → alt over
+  # ~3 min er sikkert". Begge halvdele er målt forkerte:
+  #   • UOPNÅELIGT: sove-Apolloen blipper hele tiden i et TOMT rum. Målt 08-22
+  #     06:00-11:10 = 75 off-perioder, det LÆNGSTE tomme hul 11,7 min. Et krav
+  #     om 15 min sammenhængende ro kunne altså aldrig blive sandt — gardinet
+  #     stod lukket til user selv tog Somrig'en 08:13. (Med 5 min: 07:50.)
+  #   • USIKKERT ALLIGEVEL: samme nat kl. 02:00 lå der et 17,1 min hul MED en
+  #     sovende i sengen. Der findes derfor ingen værdi der både er opnåelig
+  #     og beviser fravær — metriken er en debounce, ikke et fraværs-bevis.
+  # Sikkerheden ligger et andet sted og gjorde det hele tiden: snoozen
+  # (`sovevaerelse_morgen_beskyttelse_aktiv`, user-spec 07-29 "godnat-knap om
+  # morgenen = sov videre"), open-plan-aktivitets-ankeret, manuel-ned-gracen og
+  # bad-gaten i script.sove_gardin_op. 5 min matcher husets ANDET sove-tomt-
+  # anker (`godnat_autooff_bedroom_empty_min`) → ét tal, ikke to (fejlklasse #2).
+  # NB: værdier over ~10 slår i praksis featuren fra, jf. det målte 11,7-loft.
+  sovevaerelse_gardin_morgen_tom_minutter:
+    name: "Sove-gardin morgen: rummet tomt i (min)"
+    icon: mdi:bed-clock
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+  # 2026-08-05 (user item 12: "gardiner kører op i stuerne om morgenen uden vi
+  # er gået derud i openplan"). Hvor langt FØR 06:00 et ON-forløb må være
+  # startet og stadig tælle som "familien er vågnet". Se
+  # binary_sensor.open_plan_occupied_frisk nedenfor for hvorfor.
+  morning_curtain_frisk_grace_minutter:
+    name: "Morgen-gardiner: frisk-vindue før 06:00 (min)"
+    icon: mdi:motion-sensor
+    min: 0
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+template:
+  - binary_sensor:
+      # Open-plan = stue + spisestue + køkken (ét fysisk rum, 3 zoner).
+      - name: "Open plan occupied"
+        unique_id: open_plan_occupied
+        device_class: occupancy
+        icon: mdi:sofa
+        state: >
+          {{ is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on')
+             or is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'on')
+             or is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'on') }}
+
+      # ⚠️ 2026-08-05 (user item 12) — LATCH-MASKE. Akkumulatoren nedenfor målte
+      # open-plan-OCCUPANCY, ikke bevægelse: stue-Apolloen latcher og står `on` i
+      # timevis (målt: 47 ON-forløb på 14 dage, LÆNGSTE 2132 min = 35,5 t; den
+      # stod `on` kl. 06:00 på 4 af de sidste 14 morgener). Fordi history_stats-
+      # vinduet er klampet til at starte 06:00, nåede en latchet sensor tærsklen
+      # præcis `tærskel` minutter efter 06:00 — HVER morgen, uden at nogen var
+      # stået op. Det er derfor gardinerne åbnede 06:03 (08-05), 06:24, 06:30,
+      # 06:46, 06:52, 06:56 osv.: klokkeslættet fulgte tærsklen, ikke familien.
+      #
+      # Maske: en zone tæller kun som "familien er vågnet" hvis dens ON-forløb
+      # BEGYNDTE tidligst (06:00 − grace). Kalibreret på 14 dages historik —
+      # ON-forløbenes alder kl. 06:00 var 1 / 65 / 156 / 580 / 1278 min, dvs. et
+      # ægte tidligt-morgen-signal (1 min) og fire nat-latches. Default 30 min
+      # ligger midt i kløften.
+      #
+      # NB: dette er en morgen-specifik maske. `open_plan_occupied` ovenfor er
+      # UÆNDRET — den har mange forbrugere der med rette vil vide om der er
+      # nogen i rummet lige nu, også når de sidder stille.
+      - name: "Open plan occupied frisk"
+        unique_id: open_plan_occupied_frisk
+        device_class: occupancy
+        icon: mdi:motion-sensor
+        state: >
+          {% set grace = states('input_number.morning_curtain_frisk_grace_minutter')
+                         | float(30) %}
+          {% set fra = today_at('06:00') - timedelta(minutes=grace) %}
+          {% set ns = namespace(frisk=false) %}
+          {% from 'rosters.jinja' import open_plan_occupancy %}{% for e in open_plan_occupancy
+                       %}
+            {% set s = states[e] %}
+            {% if s is not none and s.state == 'on' and s.last_changed >= fra %}
+              {% set ns.frisk = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.frisk }}
+        attributes:
+          maskerede_zoner: >
+            {% set grace = states('input_number.morning_curtain_frisk_grace_minutter')
+                           | float(30) %}
+            {% set fra = today_at('06:00') - timedelta(minutes=grace) %}
+            {% set ns = namespace(m=[]) %}
+            {% from 'rosters.jinja' import open_plan_occupancy %}{% for e in open_plan_occupancy
+                         %}
+              {% set s = states[e] %}
+              {% if s is not none and s.state == 'on' and s.last_changed < fra %}
+                {% set ns.m = ns.m + [e ~ ' (' ~ ((now() - s.last_changed).total_seconds()
+                                                  / 60) | round(0) | int ~ ' min)'] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.m }}
+
+      # 🚪 2026-08-05 (user item 4 + 12) — FÆLLES ANKER for auto-oprulning af
+      # open-plan-gardinerne. Ét sted, så morgen-gaten ikke kan divergere mellem
+      # de automations der åbner gardinerne (fejlklasse #2).
+      #
+      # BAGGRUND (item 4, "kritisk"): 08-04 + 08-05 rullede stue-gardinerne op
+      # kl. 06:00:00 præcis, uden alarm. Det var IKKE morgen-gardinerne — det var
+      # `summer_defense_active`s genåbnings-gren. Sommer-forsvaret er betinget af
+      # `godnat_any_active == off` og var derfor spærret hele natten; i det sekund
+      # godnat blev ryddet kl. 06:00 fyrede dens /15-tick (samme sekund) og rullede
+      # vest-gardinerne op. Blokeringen udskød altså ikke handlingen — den samlede
+      # den op og udløste den præcis i det øjeblik gaten åbnede.
+      #
+      # Regel: FØR 12:00 må auto-logik kun rulle open-plan-gardiner op når
+      # morgen-gaten er opfyldt (= familien er reelt vågnet). Fra 12:00 er
+      # sommer-/vinter-forsvaret frit stillet — dér handler det om varme og sol,
+      # ikke om at vække nogen.
+      - name: "Open-plan gardin-op tilladt"
+        unique_id: open_plan_gardin_op_tilladt
+        icon: mdi:curtains
+        state: >
+          {% if now() >= today_at('12:00') %}
+            true
+          {% else %}
+            {{ (states('sensor.open_plan_active_recent') | float(0) * 60)
+               >= (states('input_number.morning_curtain_accum_minutes') | float(3)) }}
+          {% endif %}
+        attributes:
+          grund: >
+            {% if now() >= today_at('12:00') %}
+              Efter 12:00 — morgen-gaten gælder ikke.
+            {% else %}
+              {{ (states('sensor.open_plan_active_recent') | float(0) * 60) | round(1) }}
+              / {{ states('input_number.morning_curtain_accum_minutes') | int(3) }}
+              min frisk open-plan-bevægelse siden 06:00.
+            {% endif %}
+
+  - sensor:
+      # Status-side gauge (item 2, 2026-06-23): hvor tæt er vi på at gardinerne
+      # selv ruller op om morgenen? State = % af tærsklen nået (akkumuleret
+      # open-plan-bevægelse ÷ tærskel). Attributter eksponerer rå min + tærskel
+      # + hvor mange open-plan-Apolloer der er online — så et stall pga. en
+      # offline sensor (akkumuleringen bygger kun fra de zoner der er online)
+      # bliver synligt på status-siden i stedet for at føles som en "bug".
+      - name: "Morgen-gardin fremgang"
+        unique_id: morgen_gardin_fremgang
+        unit_of_measurement: "%"
+        icon: mdi:curtains
+        state: >
+          {# 2026-06-28 (user): "fremgang mod auto-åbning" giver kun mening i
+             åbningsvinduet (06–12). Udenfor vinduet (aften/nat) → 0 %, ellers
+             viser barometeret vildledende aften-bevægelse. #}
+          {% if not (today_at('06:00') <= now() < today_at('12:00')) %}0
+          {% else %}
+            {% set acc = states('sensor.open_plan_active_recent') | float(0) * 60 %}
+            {% set thr = states('input_number.morning_curtain_accum_minutes') | float(3) %}
+            {% if thr <= 0 %}100
+            {% else %}{{ [ (acc / thr * 100) | round(0) | int, 100 ] | min }}{% endif %}
+          {% endif %}
+        attributes:
+          akkumuleret_min: >
+            {% if not (today_at('06:00') <= now() < today_at('12:00')) %}0.0
+            {% else %}{{ (states('sensor.open_plan_active_recent') | float(0) * 60) | round(1) }}{% endif %}
+          taerskel_min: >
+            {{ states('input_number.morning_curtain_accum_minutes') | int(3) }}
+          zoner_live: >
+            {% from 'rosters.jinja' import open_plan_occupancy %}{{ open_plan_occupancy
+               | reject('is_state', 'unavailable')
+               | reject('is_state', 'unknown') | list | count }}
+          zoner_offline: >
+            {% from 'rosters.jinja' import open_plan_occupancy %}{{ open_plan_occupancy
+               | select('is_state', 'unavailable') | list | count }}
+          # 2026-08-05: en zone der er maskeret som latch (står `on` fra i går)
+          # bidrager ikke til akkumuleringen — vises her så et stall er synligt
+          # i stedet for at føles som en bug.
+          zoner_latch_maskeret: >
+            {{ state_attr('binary_sensor.open_plan_occupied_frisk', 'maskerede_zoner')
+               | default([]) }}
+
+sensor:
+  # Akkumuleret open-plan-bevægelse (minutter on) i de sidste 30 min.
+  # history_stats type:time returnerer TIMER → automation ganger med 60.
+  # 2026-08-05: kilden er nu `_frisk`-varianten (latch-maskeret) — se dens
+  # kommentar ovenfor. Med den rå `open_plan_occupied` var denne sensor i praksis
+  # et ur: den nåede tærsklen `tærskel` minutter efter 06:00 hver morgen.
+  - platform: history_stats
+    name: "Open plan active recent"
+    unique_id: open_plan_active_recent
+    entity_id: binary_sensor.open_plan_occupied_frisk
+    state: "on"
+    type: time
+    # 2026-06-24 (user-spec): barometeret må IKKE tælle nat-occupancy. Klamp
+    # vinduets START til tidligst kl 06:00 i dag → rullende 30-min vindue, men
+    # aldrig før 06. Før 06 er start > end (now) → history_stats giver 0 (tomt
+    # barometer hele natten). Først efter 06 begynder det at fylde.
+    start: >-
+      {% set seks = now().replace(hour=6, minute=0, second=0, microsecond=0) %}
+      {% set rullende = now() - timedelta(minutes=30) %}
+      {{ max(seks, rullende) }}
+    end: "{{ now() }}"

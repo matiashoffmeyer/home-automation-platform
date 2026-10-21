@@ -1,0 +1,267 @@
+# =============================================================================
+# Robotstøvsuger — besparelse ved at LADE i off-peak-vinduet i stedet for straks
+# (user-spec 2026-08-22)
+# =============================================================================
+# User: "det faktum at robotstøvsugeren lader når strømmen normalt er billig
+# skal også med i el spare statistikken. estimer hvad vi sparer og få det med."
+#
+# MODELLEN (samme form som lys/cykel-lader, så de kan lægges sammen i
+# sensor.el_besparelse_total):
+#   faktisk  = ladeeffekt × all-in prisen i den time vi FAKTISK ladede (natten)
+#   baseline = ladeeffekt × all-in prisen da robotten DOKKEDE (dum dok = lader
+#              straks den kommer hjem)
+#   besparelse = baseline − faktisk, integreret over tid
+#
+# BASELINEN ER DOCK-TIDSPUNKTET, ikke et fast spidslast-vindue (modsat cykel-
+# laderen): cyklen sættes til på et forudsigeligt tidspunkt sidst på dagen, men
+# robotten dokker når den er færdig — målt 08-08→08-22 spreder det sig fra 09:34
+# til 19:35. Et fast vindue ville derfor gætte på noget vi rent faktisk kan måle.
+#
+# ⚠️ VINDUET ER KALIBRERET TIL EN VERDEN DER IKKE FINDES MERE (målt 2026-08-22).
+# Robotten står på Roborocks EGEN off-peak-ladning (`switch.s8_maxv_ultra_
+# off_peak_charging` = on, 00:00-06:00), og den virker: batteriet står stille
+# hele dagen og begynder at lade 00:02-00:07 hver nat, hver gang. Men natten er
+# ikke længere billig. Gennemsnit pr. time over 15 døgn (all-in kr/kWh):
+#   00-06 (lade-vinduet) 1,70   ← hverken dyrt eller billigt
+#   11-16 (solcelle-dyk)  1,05   ← dagens FAKTISK billige timer
+#   18-21 (aftenspids)    2,43
+# Derfor VAR besparelsen et lodtrækning: dokkede robotten i aftenspidsen sparede
+# udskydelsen penge, dokkede den midt på dagen KOSTEDE den penge. Målt på 12
+# ladninger: 6 positive, 6 negative, netto +0,046 kr = **+1,4 kr/år**.
+#
+# Vinduet er derfor gjort DYNAMISK samme dag: `packages/robot_lade_optimering.
+# yaml` lægger hver eftermiddag off-peak-vinduet på det billigste sammenhængende
+# blok i de næste 24 timer, i stedet for at tro på et fast natvindue. Samme data
+# giver +4,7 kr/år med et 11-16-vindue. Bemærk at ALLE tallene her er småpenge,
+# fordi hele ladeforbruget kun er ~10 kWh/år (~17 kr/år i strøm) — denne pakke
+# er lavet for at gøre statistikken komplet og for at kunne SE om vinduet sidder
+# rigtigt, ikke fordi der er en formue at hente.
+#
+# HVORFOR IKKE CLAMPET VED 0 (som cykel-laderen, modsat lyset): en negativ dag
+# betyder at udskydelsen flyttede strømmen fra en billig time til en dyrere, og
+# det er den vigtigste information hele denne pakke producerer. Skjules den, ser
+# et fejlkalibreret vindue ud som en gratis gevinst.
+#
+# ENERGIEN ER ESTIMERET — der er INGEN effektmåler på dokken.
+# `input_number.robot_lade_effekt_w` (default 25 W) × tiden der lades. De 25 W
+# er kalibreret mod 12 målte ladninger: batteriet er 5200 mAh × 14,4 V = 74,9 Wh,
+# altså ~0,75 Wh pr. procent, ~0,88 Wh fra stikkontakten ved ~85 % ladetab.
+# Kontrol: 08-13 lod 76→100 % (≈21 Wh) på 50 min → 25,4 W; 08-21 lod 50→100 %
+# (≈44 Wh) på 100 min → 26,5 W. Modellen rammer inden for ~5 %.
+#
+# HVORNÅR LADES DER? Dokkens `binary_sensor.s8_maxv_ultra_charging` duer IKKE
+# alene: den går ON i det sekund robotten kører op i dokken og bliver stående ON
+# hele dagen mens ladningen er udskudt. "Der løber strøm" kræver derfor tre ting
+# samtidig: charging ON + batteri < 100 % + vi er inde i off-peak-vinduet.
+# Vinduet læses LIVE fra `time.s8_maxv_ultra_off_peak_start`/`_end` (robottens
+# egne entities), så flytter man vinduet i Roborock-appen følger regnskabet med
+# uden en kodeændring. Er off-peak-switchen slået FRA, lader robotten straks →
+# så falder vindues-kravet bort, dock-prisen er lig lade-prisen, og besparelsen
+# bliver 0 af sig selv. Det er med vilje: featuren slukket = ingen besparelse.
+#
+# MOPPETØRRINGEN ER IKKE MED, og det er bevidst. Den er dokkens store forbruger
+# (~2 t varmluft efter en våd tur, målt 08-13 17:14→19:14 og 08-16 10:01→11:56),
+# men den starter i samme øjeblik robotten dokker og udskydes ikke. Den er altså
+# ikke load-shiftet og hører ikke i en besparelse. Skal den nogensinde tælles, er
+# det som FORBRUG, ikke som besparelse.
+#
+# FLERE RENGØRINGER SAMME DAG: dock-prisen stemples ved hver dokning, så den
+# SIDSTE dokning før midnat er den der gælder for nattens samlede ladning. En
+# dum dok ville have ladt efter hver tur; approksimationen koster præcision på
+# de få dage med flere ture (08-21 havde 7). Bevidst valgt frem for at føre
+# energi-vægtet bogholderi over noget der samlet er ~1 kr/år værd.
+#
+# AIRBNB: automatisk rengøring er allerede blokeret i AirBnB
+# (automation.airbnb_bloker_automatisk_stovsuger_clean_kun_manuel_tilladt), så
+# robotten kører sjældnere og tallene står næsten stille af sig selv. Ingen
+# ekstra gate: det er kroner, ikke tilstedeværelses-mønstre, så der er intet at
+# rydde ved mode-skift og intet der afslører familie-mønstre.
+# =============================================================================
+
+input_number:
+  # Antaget ladeeffekt fra stikkontakten mens robotten lader. Se header for
+  # kalibreringen — 25 W ramte 12 målte ladninger inden for ~5 %.
+  robot_lade_effekt_w:
+    name: "🤖 Robot: antaget ladeeffekt"
+    min: 5
+    max: 100
+    step: 1
+    unit_of_measurement: "W"
+    icon: mdi:robot-vacuum
+    mode: slider
+
+  # Stemplet all-in pris på DOCK-tidspunktet (= hvad en dum dok ville have
+  # betalt). Runtime-cursor: navnet indeholder "cursor" → holdes ude af
+  # helper-snapshottet. 0 = aldrig stemplet → baseline falder tilbage til
+  # prisen nu, og besparelsen bliver 0 i stedet for forkert.
+  robot_dock_pris_cursor:
+    name: "🤖 Robot: dock-pris, stemplet (cursor)"
+    min: 0
+    max: 100
+    step: 0.001
+    unit_of_measurement: "kr/kWh"
+    icon: mdi:cash-clock
+    mode: box
+
+template:
+  - sensor:
+      # --- Ladeeffekt (W) — kun når der FAKTISK løber strøm ------------------
+      # Tre krav samtidig, se header. Off-peak-vinduet læses live fra robottens
+      # egne time-entities og er wrap-aware, så det gerne må krydse midnat.
+      - name: "Robot lade effekt"
+        unique_id: robot_lade_effekt
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:robot-vacuum
+        state: >-
+          {% set s = states('time.s8_maxv_ultra_off_peak_start') %}
+          {% set e = states('time.s8_maxv_ultra_off_peak_end') %}
+          {% set gyldigt = s not in ['unknown', 'unavailable', 'none']
+                       and e not in ['unknown', 'unavailable', 'none'] and s != e %}
+          {% set udskyder = is_state('switch.s8_maxv_ultra_off_peak_charging', 'on')
+                            and gyldigt %}
+          {% set n = now().strftime('%H:%M:%S') %}
+          {% set ivindue = ((s <= n < e) if s < e else (n >= s or n < e))
+                           if gyldigt else true %}
+          {% set lader = is_state('binary_sensor.s8_maxv_ultra_charging', 'on')
+                     and (states('sensor.s8_maxv_ultra_battery') | float(100)) < 100
+                     and (ivindue if udskyder else true) %}
+          {{ (states('input_number.robot_lade_effekt_w') | float(25)) if lader else 0 }}
+
+      # --- Baseline-prisen der bruges i regnskabet ---------------------------
+      # Stemplet ved dokning. Uden stempel (frisk installation, eller robotten
+      # har ikke dokket siden HA blev sat op) bruges prisen nu → besparelse 0.
+      - name: "Robot lade baseline pris"
+        unique_id: robot_lade_baseline_pris
+        unit_of_measurement: "kr/kWh"
+        icon: mdi:cash-remove
+        state: >-
+          {% set stamp = states('input_number.robot_dock_pris_cursor') | float(0) %}
+          {{ stamp | round(3) if stamp > 0
+             else (states('sensor.elpris_allin_aktuel') | float(0) | round(3)) }}
+        attributes:
+          kilde: >-
+            {% set stamp = states('input_number.robot_dock_pris_cursor') | float(0) %}
+            {{ 'stemplet ved dokning' if stamp > 0 else 'fallback: pris nu' }}
+
+      # --- Omkostnings-RATES (kr/h): faktisk vs. baseline --------------------
+      - name: "Robot lade kost rate faktisk"
+        unique_id: robot_lade_kost_rate_faktisk
+        unit_of_measurement: "kr/h"
+        icon: mdi:cash-clock
+        state: >-
+          {{ ((states('sensor.robot_lade_effekt') | float(0)) / 1000
+              * (states('sensor.elpris_allin_aktuel') | float(0))) | round(6) }}
+
+      - name: "Robot lade kost rate baseline"
+        unique_id: robot_lade_kost_rate_baseline
+        unit_of_measurement: "kr/h"
+        icon: mdi:cash-remove
+        state: >-
+          {{ ((states('sensor.robot_lade_effekt') | float(0)) / 1000
+              * (states('sensor.robot_lade_baseline_pris') | float(0))) | round(6) }}
+
+  - sensor:
+      # --- Besparelse (kr) — akkumuleret og pr. dag --------------------------
+      # IKKE clampet ved 0: en negativ dag = udskudt fra en billig time til en
+      # dyrere, og det er hele pointen at kunne se det (se header).
+      - name: "Robot lade besparelse total"
+        unique_id: robot_lade_besparelse_total
+        unit_of_measurement: "kr"
+        state_class: total
+        icon: mdi:piggy-bank
+        state: >-
+          {{ ((states('sensor.robot_lade_kost_baseline_total') | float(0))
+              - (states('sensor.robot_lade_kost_total') | float(0))) | round(4) }}
+
+      - name: "Robot lade besparelse i dag"
+        unique_id: robot_lade_besparelse_i_dag
+        unit_of_measurement: "kr"
+        state_class: total
+        icon: mdi:piggy-bank
+        state: >-
+          {{ ((states('sensor.robot_lade_kost_baseline_i_dag') | float(0))
+              - (states('sensor.robot_lade_kost_i_dag') | float(0))) | round(3) }}
+        attributes:
+          sparet_pct: >-
+            {% set b = states('sensor.robot_lade_kost_baseline_i_dag') | float(0) %}
+            {% set f = states('sensor.robot_lade_kost_i_dag') | float(0) %}
+            {{ 0 if b <= 0 else (100 * (b - f) / b) | round(1) }}
+
+sensor:
+  # --- Riemann-integration af kost-rates (kr/h) → akkumuleret kr -------------
+  - platform: integration
+    name: "Robot lade kost total"
+    unique_id: robot_lade_kost_total
+    source: sensor.robot_lade_kost_rate_faktisk
+    method: left
+    unit_time: h
+    round: 6
+
+  - platform: integration
+    name: "Robot lade kost baseline total"
+    unique_id: robot_lade_kost_baseline_total
+    source: sensor.robot_lade_kost_rate_baseline
+    method: left
+    unit_time: h
+    round: 6
+
+  # --- Energi (kWh) brugt på ladning ----------------------------------------
+  # Estimeret, ikke målt (ingen effektmåler på dokken). Sammenlignelig 1:1 med
+  # kr-tallene ovenfor, fordi de deler kilde-effekt.
+  - platform: integration
+    name: "Robot lade energi"
+    unique_id: robot_lade_energi
+    source: sensor.robot_lade_effekt
+    method: left
+    unit_prefix: k
+    unit_time: h
+    round: 4
+
+# --- Dagsforbrug i kr: utility_meter på totalerne (rene dag-grænser) ---------
+utility_meter:
+  robot_lade_kost_idag:
+    source: sensor.robot_lade_kost_total
+    cycle: daily
+    name: "Robot lade kost i dag"
+  robot_lade_kost_baseline_idag:
+    source: sensor.robot_lade_kost_baseline_total
+    cycle: daily
+    name: "Robot lade kost baseline i dag"
+  robot_lade_energi_idag:
+    source: sensor.robot_lade_energi
+    cycle: daily
+    name: "Robot lade energi i dag"
+
+automation:
+  # ===========================================================================
+  # STEMPL all-in prisen når robotten dokker = "hvad ville en dum dok have
+  # betalt?". Flanken er pålidelig: charging går off→on 8-11 min efter robotten
+  # forlader dokken, dvs. når turen er slut og den er hjemme igen (målt over 7
+  # døgn, 22 dokninger).
+  # ===========================================================================
+  - id: robot_lade_stempl_dock_pris
+    alias: "Robot-lader: stempl dock-prisen"
+    description: >
+      Gemmer all-in prisen i det øjeblik robotten dokker. Den er baseline for
+      besparelsen, fordi en dok uden off-peak-udskydelse ville have ladet med
+      det samme. Ladningen sker først i off-peak-vinduet, hvor prisen typisk er
+      en anden — og natten er ikke nødvendigvis den billige ende (se header).
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.s8_maxv_ultra_charging
+        from: "off"
+        to: "on"
+    condition:
+      # Ingen prisdata → stempl ikke, hellere beholde det gamle stempel end at
+      # skrive et 0 der ville nulstille baselinen.
+      - condition: template
+        value_template: "{{ (states('sensor.elpris_allin_aktuel') | float(0)) > 0 }}"
+    action:
+      - service: input_number.set_value
+        target: {entity_id: input_number.robot_dock_pris_cursor}
+        data:
+          value: "{{ states('sensor.elpris_allin_aktuel') | float(0) | round(3) }}"

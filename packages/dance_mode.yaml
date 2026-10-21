@@ -1,0 +1,1589 @@
+# =============================================================================
+# Dance Mode — random farveloop på alle color-bulbs i stue+køkken+spisestue+terrasse
+# =============================================================================
+# Toggle input_boolean.dance_mode = on → hver bulb starter sin egen while-loop
+# med random hs_color + random transition (2-4s) + random delay (1-3s) =
+# usynkroniseret diskolys. Toggle off → alt stoppes og rummene gives tilbage.
+#
+# "Overruler ALT Auto": automation sætter de rum der DANSER til Manual mode ved
+# start (= room_drift_back + presence_lights respekterer Manual og rører ikke
+# lysene). Restoreres til Auto når dance_mode → off.
+#
+# ⚠️ SCOPE (2026-08-02): Manual sættes KUN på de rum hvis dance_room_* er on —
+# aldrig husdækkende. Indtil i dag satte begge start-veje alle seks room_modes
+# uanset rum-valg, så en fest i børneværelset lagde presence-lyset dødt i stue,
+# terrasse, soveværelse, bad og depot i hele sessionen (målt 39 min 15:02→15:41,
+# user: "alt lys er nede?"). Mappet toggle→room_mode ligger i attributten
+# `room_modes` på sensor.dance_active_bulbs (ÉN kilde), og scriptene
+# dance_room_modes_claim/_release er eneste skrivere.
+#
+# ⚠️ ASYMMETRISK PR. 2026-08-16d (user: "fuld auto mode når vi slukker
+# festlys"): CLAIM er stadig smalt (kun de dansende rum), men RELEASE er
+# husdækkende — alle 9 room_modes til Auto. Den gamle regel ("kvitteringen er
+# hele pointen: uden den river festens afslutning et rum brugeren SELV har sat
+# på Manual tilbage til Auto") er dermed bevidst omgjort: user vil hellere
+# rydde tavlen end trykke sig ud af låsen bagefter. Samme spec som mood-exit i
+# script.scene_toggle. input_text.dance_room_modes_claimed bruges nu KUN af
+# claim-siden (union ved rum-skift midt i festen).
+#
+# ⚠️ 2026-09-23 (user: "lyset virker buggy og uregelmæssigt og reagerer ikke
+# abrupt på de knapper jeg trykker på … og falder heller ikke tilbage til
+# auto"). Fire målte fejl, fire regler — bryd dem ikke uden at måle igen:
+#   1. SLUK STOPPER. script.dance_stop_bursts/_stop_alt dræber det kørende
+#      event på HVER vej ud (off, hot-swap, fest slut, depot-kontakten).
+#   2. EVENTS ER KLOKKE-STYREDE PR. PÆRE (dance_event_bulb). Et gruppe-kald
+#      venter på den langsomste pære — spisestue-loftet hang 5,5 s — og frøs
+#      hele showet; police kørte 52 s i stedet for 4.
+#   3. BAGGRUNDS-LOOPET SKRIVER ALDRIG OVEN I ET EVENT (før: hvert 15. s).
+#   4. FEST SLUT GENGIVER AUTO (dance_restore_auto): sluk + rummets egen
+#      tænd-automation hvis presence siger optaget. Før blev disko-farverne
+#      stående i tomme rum.
+#   5. (2026-10-11, B222) MATTER-PÆRER HAR TEMPO-GULV (`inv`): de deler én
+#      flaskehals (~0,15 s × antal pr. kommando), så de spiller hvert mm'te
+#      tick på det fælles ur i stedet for et tilfældigt udsnit af dem.
+#
+# Affected color-bulbs (verificeret xy-support 2026-05-25):
+#   spisestue_loft, stue_laesehygge, stue_sofa_lampe, stue_sofa_lampe_2, stue_hjoernelampe, koekken_lyskaede
+# 2026-08-28: open-plan er nu TRE selvstændige toggles (stue / spisestue /
+# køkken) — spisestue_loft lå før i stue-bucket'en, så man ikke kunne danse i
+# stuen uden også at tænde spiseloftet. Siden 2026-09-03d har de hvert sit
+# room_mode.
+# 2026-07-02: køkkenloftet → stue_laesehygge (Innr-farvepæren flyttet fysisk
+# til sofa-læselampen; køkkenloftet er pt. uden smart pære → ude af koekken-zonen).
+# Skipped (kun warm/cold white): spisestue_pendel (= soveloft fra 2026-06-05),
+# terrasse_paerelyskaede. NB: sove (voksensoveværelse) er IKKE en dance-option
+# længere — pendlen er CCT-only, og dance_room_sove blev fjernet 2026-06-05.
+# =============================================================================
+
+input_boolean:
+  dance_mode:
+    name: "Dance mode (diskolys — vælg rum nedenfor)"
+    icon: mdi:party-popper
+
+  # Internal flag: ON mens event-burst kører. Dance-bulb-loops pauser
+  # via wait_template så random-farver ikke fighter event-mønstret.
+  dance_strobe_active:
+    name: "Dance strobe active (internal)"
+    initial: false  # force OFF ved HA-restart så crash ikke efterlader stuck flag
+    icon: mdi:flash
+
+  # === Per-rum dance-aktivering (multi-select i diagnostik) ===
+  # Toggle disse for at vælge hvilke rum dance kører i. Mapping
+  # rum→bulbs er i sensor.dance_rum_kort nedenfor.
+  # 2026-09-23 (user-valg "a"): INGEN af rum-togglerne har `initial:` — de
+  # husker brugerens valg hen over HA-start. `initial:` PÅTVINGER værdien ved
+  # hver start: målt 23/9, user fravalgte terrasse 17:42:58, genstarten 18:05
+  # slog den til igen. Sæt det ALDRIG tilbage. (De interne flag længere nede
+  # har bevidst `initial: off` — dem SKAL en start nulstille.)
+  dance_room_stue:
+    name: "Dance i stue (4 bulbs)"
+    icon: mdi:sofa
+  # 2026-08-28 (user: "openplan er en enhed i festlys, det skal være 3 …
+  # så jeg kan styre hvor det kører"): spisestue_loft lå i stue-bucket'en, så
+  # open-plan var ÉT valg med tre fysiske zoner. Nu egen toggle.
+  dance_room_spisestue:
+    name: "Dance i spisestue (1 bulb)"
+    icon: mdi:silverware-variant
+  dance_room_koekken:
+    name: "Dance i køkken (1 bulb)"
+    icon: mdi:silverware-fork-knife
+  dance_room_terrasse:
+    name: "Dance på terrasse (1 bulb)"
+    icon: mdi:flower
+  # dance_room_sove FJERNET 2026-06-05: pendlen overtog soveloft og er CCT-only
+  # (ingen rgb/farve) → dance giver ingen mening for voksensoveværelset. Per
+  # user-request er dance ikke længere en option for sove.
+  dance_room_boern:
+    name: "Dance i børneværelse (3 bulbs)"
+    icon: mdi:teddy-bear
+  dance_room_bad:
+    name: "Dance i badeværelse (5 bulbs)"
+    icon: mdi:shower
+  dance_room_depot:
+    name: "Dance i depot (1 bulb)"
+    icon: mdi:tools
+  # Tilføjet 2026-08-21: entré-loftet er ikke længere CCT-only. Den gamle
+  # TRADFRI WS globe blev skiftet til en KAJPLATS E27 CWS globe (Matter/Thread,
+  # node 461) der kan hs/xy — derfor kan entréen nu danse med. Var `initial: on`
+  # ("gæsten SKAL møde farverne i døren") indtil user valgte at alle rum
+  # husker valget (2026-09-23).
+  dance_room_entre:
+    name: "Dance i entré (1 bulb)"
+    icon: mdi:door-open
+
+  # Internal flag: ON mens manual-event toggle er valgt (≠ off).
+  # Separat fra dance_strobe_active så dance-loops pauser stabilt selv
+  # når event-script internt toggler strobe_active mellem iterations.
+  dance_event_manual_active:
+    name: "Dance event manual active (internal)"
+    initial: false
+    icon: mdi:hand-pointing-up
+
+input_select:
+  # Manual event-vælger: overruler dance mode mens != "off".
+  # Hvert event kører i continuous loop indtil bruger sætter til "off"
+  # eller skifter til et andet event. Mode 'restart' i runner-automation
+  # giver clean hot-swap mellem events.
+  dance_manual_event:
+    name: "Manual event (kører i loop, overruler dance)"
+    icon: mdi:flash-auto
+    initial: "off"
+    options:
+      - "off"
+      - "strobe"
+      - "blackout"
+      - "warm"
+      - "pulse"
+      - "chase"
+      - "jump"
+      - "chase_comet"
+      - "split"
+      - "heartbeat"
+      - "police"
+      - "lightning"
+      - "breathe"
+      - "sparkle"
+      - "cascade"
+      - "fire"
+
+input_number:
+  # Hastighed på AMBIENT-loopet (dance_single_bulb) = hvor hurtigt hver pære
+  # skifter farve NÅR DER IKKE kører et event. 1 = langsom mood (~8 s/skift),
+  # 50 = baseline (~4-5 s), 100 = hurtig disko (~1 s/skift). Skalerer intervallet
+  # + transition i dance_single_bulb. Rører IKKE event-scriptenes egne hastigheder.
+  dance_speed:
+    name: "Festlys: hastighed (farveskift uden event)"
+    icon: mdi:speedometer
+    min: 1
+    max: 100
+    step: 1
+    mode: slider
+
+  # Hvor TIT auto-shuffle fyrer et special-event (strobe/police/chase…) mellem
+  # ambient-farveskiftene. 1 = næsten aldrig, 50 = baseline (30-150 s mellemrum),
+  # 100 = hyppigt (15-75 s). Skalerer delay'et i dance_event_scheduler. Gælder kun
+  # auto-shuffle (dance_mode on) — et manuelt låst event ignorerer den.
+  dance_event_frequency:
+    name: "Festlys: event-hyppighed (auto-shuffle)"
+    icon: mdi:flash-auto
+    min: 1
+    max: 100
+    step: 1
+    mode: slider
+
+  # 2026-08-07: LOFT på et LÅST manual-event. Loopet i dance_manual_event_runner
+  # havde ingen udgang andet end et bevidst "off" — målt 08-07 kørte cascade i
+  # depotet 31 min efter ét tryk på væg-kontakten, uden at nogen var i rummet.
+  # Ved loftet sættes dance_manual_event til "off" = normal cleanup-gren (og
+  # depotets rum-restore). Auto-shuffle (dance_mode) er IKKE berørt — den
+  # skifter selv event løbende og har sin egen sluk-vej.
+  # Min 5 (ikke 0): et "0 = ingen grænse"-sentinel er præcis fejlklasse #5;
+  # vil man reelt have en fest der ikke stopper, sættes den på 240.
+  dance_manual_event_max_minutter:
+    name: "Festlys: maks varighed på låst event"
+    icon: mdi:timer-sand
+    min: 5
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+input_text:
+  # Runtime-kvittering: hvilke room_modes dance FAKTISK satte til Manual ved
+  # start. Stop-grenen restorerer PRÆCIS dem — ikke alle seks — så et rum
+  # brugeren selv har låst på Manual ikke bliver revet tilbage til Auto af en
+  # fest i et andet rum. Comma-separeret entity-liste, tom = intet claimet.
+  # "claimed" i navnet → runtime, ude af helper-snapshottet.
+  dance_room_modes_claimed:
+    name: "Dance: claimede room_modes (internal)"
+    icon: mdi:lock-check
+    max: 255
+
+# =============================================================================
+# Festlys — template-lampe der eksponerer dance-events i den native Effects-knap
+# =============================================================================
+# Den native Effects-dropdown på en rigtig Zigbee-pære kan IKKE udvides (listen
+# kommer fra pærens firmware = kun 'colorloop'/'loop'). Denne template-lampe
+# eksponerer i stedet vores 15 dance-events som effekter, så lys-dashboardet får
+# en ægte "tap → Effects → vælg event"-oplevelse:
+#   - Tap tile (on)        → auto-shuffle (dance_mode = tilfældige events).
+#   - Tap → Effects → X    → låser til event X (continuous loop, hot-swap).
+#   - Off                  → stopper alt + restorer Auto-modes.
+# Scope styres af dance_room_* toggles. Default hvis ingen rum valgt = KUN Stue
+# (aldrig børneværelset — jf. prime directive om at boern-lys ikke auto-tænder).
+# Et kortvarigt dance_mode on→off ved effekt-valg giver nul lys-writes: per-pære
+# loopen guarder på dance_mode==on før første light.turn_on.
+template:
+  - light:
+      # unique_id bevaret ⇒ registry-entry'en genbruges ⇒ light.festlys
+      # beholder sit entity_id (som IKKE matcher `name:`s slug).
+      - name: "Festlys"
+        unique_id: festlys_dance_effects
+        icon: mdi:party-popper
+        state: >-
+          {{ is_state('input_boolean.dance_mode', 'on')
+             or not is_state('input_select.dance_manual_event', 'off') }}
+        effect_list: >-
+          {{ ['strobe', 'blackout', 'warm', 'pulse', 'chase', 'jump',
+              'chase_comet', 'split', 'heartbeat', 'police', 'lightning',
+              'breathe', 'sparkle', 'cascade', 'fire'] }}
+        effect: >-
+          {{ states('input_select.dance_manual_event')
+             if not is_state('input_select.dance_manual_event', 'off')
+             else none }}
+        turn_on:
+          # Sørg for mindst ét rum danser (ellers har events ingen bulbs).
+          # Default = kun Stue. Sæt rum FØR dance_mode, så dance_room_change_
+          # restart (guarded på dance_mode==on) ikke trigger unødvendig genstart.
+          - if: "{{ states('sensor.dance_active_bulbs') | int(0) == 0 }}"
+            then:
+              - service: input_boolean.turn_on
+                target: {entity_id: input_boolean.dance_room_stue}
+          # Tap uden effekt = auto-shuffle. Ved effekt-valg kalder HA turn_on
+          # FØRST (event stadig off → dance_mode on), derefter set_effect der
+          # slår dance_mode fra igen og låser event'et — så netto = låst event.
+          - service: input_boolean.turn_on
+            target: {entity_id: input_boolean.dance_mode}
+        turn_off:
+          - service: input_select.select_option
+            target: {entity_id: input_select.dance_manual_event}
+            data: {option: "off"}
+          - service: input_boolean.turn_off
+            target: {entity_id: input_boolean.dance_mode}
+        set_effect:
+          # Et bestemt event valgt → annullér auto-shuffle, lås event'et.
+          # RÆKKEFØLGE (2026-08-16d): event'et sættes FØR dance_mode slukkes.
+          # dance_mode_orchestrate's stop-gren gates på dance_manual_event ==
+          # 'off'; slukkede vi dance_mode først, kunne stop-grenen nå at læse
+          # et endnu-ikke-sat event og kalde release — som siden i dag rydder
+          # HELE huset til Auto. Et effekt-valg STARTER en fest, det slutter
+          # den ikke.
+          - service: input_select.select_option
+            target: {entity_id: input_select.dance_manual_event}
+            data: {option: "{{ effect }}"}
+          - service: input_boolean.turn_off
+            target: {entity_id: input_boolean.dance_mode}
+
+  - binary_sensor:
+      # SMOOTH MODE (2026-08-19, user-spec) — ikke et killswitch, men EFFEKTEN
+      # af at skrue begge sliders helt i bund. Ambient-loopet holder op med at
+      # springe (farven driver videre fra sin nuværende kulør, fade == interval,
+      # lysstyrken svinger kun 80-100 %) og auto-shufflens events fyrer slet
+      # ikke. ÉN definition, læst af både dance_single_bulb og
+      # dance_event_scheduler — reglen må ikke stå to steder (#2).
+      - name: "Dance smooth mode"
+        unique_id: dance_smooth_mode
+        icon: mdi:blur
+        state: >-
+          {{ (states('input_number.dance_speed') | float(50)) <= 1
+             and (states('input_number.dance_event_frequency') | float(50)) <= 1 }}
+
+  - sensor:
+      # RUM-KORTET — ÉN kilde til "hvilke pærer og hvilket room_mode hører til
+      # dance_room_X" (2026-09-23). Stod før hardkodet tre gange i sensoren
+      # herunder, og rum-skiftet midt i festen skal nu også kende et FRAVALGT
+      # rums pærer, for at give dem tilbage til Auto (#16). Ny pære/nyt rum:
+      # KUN her (+ dance_room_change_restart's trigger-liste ved nyt rum).
+      # sovevaerelse er bevidst IKKE med: pendlen er CCT-only.
+      - name: "Dance rum-kort"
+        unique_id: dance_rum_kort
+        icon: mdi:map-legend
+        state: "{{ 8 }}"
+        attributes:
+          rum: >-
+            {% from 'rosters.jinja' import bad_spots %}{{ {
+              'entre': {'paerer': ['light.entre_loft'], 'mode': 'input_select.room_mode_entre'},
+              'stue': {'paerer': ['light.stue_sofa_lampe', 'light.stue_sofa_lampe_2', 'light.stue_hjoernelampe',
+                                  'light.stue_laesehygge', 'light.stue_spot_1', 'light.stue_spot_2'],
+                       'mode': 'input_select.room_mode_stue'},
+              'spisestue': {'paerer': ['light.spisestue_loft'], 'mode': 'input_select.room_mode_spisestue'},
+              'koekken': {'paerer': ['light.koekken_lyskaede'], 'mode': 'input_select.room_mode_koekken'},
+              'terrasse': {'paerer': ['light.terrasse_paerelyskaede'], 'mode': 'input_select.room_mode_terrasse'},
+              'boern': {'paerer': ['light.boernevaerelse_loft', 'light.boernevaerelse_lampe',
+                                   'light.boernevaerelse_hygge_strip'],
+                        'mode': 'input_select.room_mode_boernevaerelse'},
+              'bad': {'paerer': bad_spots,
+                      'mode': 'input_select.room_mode_badevaerelse'},
+              'depot': {'paerer': ['light.depot_strip'], 'mode': 'input_select.room_mode_depot'}
+            } }}
+
+      # Festens pærer, udledt af rum-kortet + dance_room_* toggles.
+      #   valgte     = alle pærer i de valgte rum (løkkernes "er jeg stadig med?")
+      #   entity_ids = de af dem der SVARER — det events og loops spiller på
+      #   state      = antal levende
+      # 2026-09-23: entity_ids filtrerer unavailable fra. Stuens tre skab-pærer
+      # (B132) er permanent døde men står i rosteret — i police lå den ene
+      # halvdel af festen derfor på tre døde pærer + entréen, og comet/jump
+      # brugte slots på at "tænde" mørke pærer. `valgte` er ufiltreret, så en
+      # Thread-pære der flapper, ikke mister sit loop.
+      - name: "Dance active bulbs"
+        unique_id: dance_active_bulbs
+        icon: mdi:lightbulb-group
+        state: >-
+          {% set kort = state_attr('sensor.dance_rum_kort', 'rum') or {} %}
+          {% set ns = namespace(b=[]) %}
+          {% for room, v in kort.items() %}
+            {% if is_state('input_boolean.dance_room_' ~ room, 'on') %}
+              {% set ns.b = ns.b + v.paerer %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.b | reject('is_state', 'unavailable') | reject('is_state', 'unknown') | list | count }}
+        attributes:
+          valgte: >-
+            {% set kort = state_attr('sensor.dance_rum_kort', 'rum') or {} %}
+            {% set ns = namespace(b=[]) %}
+            {% for room, v in kort.items() %}
+              {% if is_state('input_boolean.dance_room_' ~ room, 'on') %}
+                {% set ns.b = ns.b + v.paerer %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.b }}
+          entity_ids: >-
+            {% set kort = state_attr('sensor.dance_rum_kort', 'rum') or {} %}
+            {% set ns = namespace(b=[]) %}
+            {% for room, v in kort.items() %}
+              {% if is_state('input_boolean.dance_room_' ~ room, 'on') %}
+                {% set ns.b = ns.b + v.paerer %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.b | reject('is_state', 'unavailable') | reject('is_state', 'unknown') | list }}
+          # Room_modes der skal på Manual = KUN de rum der faktisk danser.
+          room_modes: >-
+            {% set kort = state_attr('sensor.dance_rum_kort', 'rum') or {} %}
+            {% set ns = namespace(m=[]) %}
+            {% for room, v in kort.items() %}
+              {% if is_state('input_boolean.dance_room_' ~ room, 'on') and v.mode not in ns.m %}
+                {% set ns.m = ns.m + [v.mode] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.m }}
+
+script:
+
+  # === room_mode-ejerskab: ÉN kilde til "hvilke rum overtager festen?" ===
+  # Kaldes fra BÅDE dance_mode_orchestrate, dance_manual_event_runner og
+  # rum-skiftet, så reglen kun står ét sted (fejlklasse #2 — den stod før
+  # hardkodet fire steder og ramte alle seks rum uanset rum-valg).
+  dance_room_modes_claim:
+    alias: "Dance: sæt de dansende rum til Manual"
+    mode: queued
+    max: 5
+    sequence:
+      - variables:
+          claim: "{{ state_attr('sensor.dance_active_bulbs', 'room_modes') or [] }}"
+          # NB: en urørt input_text står på 'unknown' — en ren `| default('', true)`
+          # redder ikke det (strengen er truthy) og ville sende "unknown" med som
+          # entity_id. Derfor eksplicit sentinel-test.
+          stored: >-
+            {% set raw = states('input_text.dance_room_modes_claimed') %}
+            {{ raw.split(',') if raw not in ['unknown', 'unavailable', 'none', ''] else [] }}
+      # if/then frem for `condition:` — et kald via `service: script.X` må ikke
+      # kunne afbryde kalderens resterende trin (her: script.dance_lights_start).
+      - if:
+          - condition: template
+            value_template: "{{ claim | count > 0 }}"
+        then:
+          - service: input_select.select_option
+            target:
+              entity_id: "{{ claim }}"
+            data: {option: "Manual"}
+          # Kvittér hvad vi overtog. Union med et evt. eksisterende claim, så en
+          # rum-ændring midt i festen ikke efterlader et rum hængende på Manual.
+          - service: input_text.set_value
+            target: {entity_id: input_text.dance_room_modes_claimed}
+            data:
+              value: "{{ (claim + stored) | unique | list | join(',') }}"
+
+  # === FEST SLUT — det ENESTE sted festen afsluttes ===
+  # Kaldes af de to udgange (dance_mode → off uden låst event, låst event →
+  # off uden dance_mode). `single` + silent (2026-09-23): festlys-tilens sluk
+  # slår BEGGE dele fra i samme sekund, og kom begge udgange igennem, kørte
+  # tilbagefaldet to gange — og anden gang slukkede det lyset som første gang
+  # lige havde tændt i et optaget rum.
+  dance_room_modes_release:
+    alias: "Dance: fest slut = stop alt NU + ALLE rum tilbage til Auto"
+    mode: single
+    max_exceeded: silent
+    sequence:
+      # Stemplet FØRST: detektoren læser det for at kende brugerens oprydning
+      # efter festen fra en ægte overstyring (automations/manual_override.yaml).
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.fest_slut_stempel}
+        data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
+      # 2026-09-23 (user: "jeg forventer instant reaktion på de ting jeg trykker
+      # på derinde og stopper"): SLUK SKAL STOPPE. Før slap sluk kun flagene og
+      # lod det event der kørte, køre færdigt — målt 23/9 17:43: police kørte
+      # 25 s efter "off" og 9 s efter at festen var slukket, og et event der
+      # dræbes midtvejs efterlod dance_strobe_active hængende på on.
+      - service: script.dance_stop_alt
+      # 2026-08-16d (user: "når vi slukker for festlys så sæt alt på auto"):
+      # ALLE 9 rum, ikke kun de claimede. Auto er den neutrale tilstand (= at
+      # SLIPPE en blokering), derfor ingen AirBnB-gate — en gæst skal også
+      # kunne slippe ud.
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.all_rooms_manual}
+      - service: input_select.select_option
+        target:
+          entity_id: !include ../rosters/alle_rum_mode.yaml
+        data: {option: "Auto"}
+      - service: input_text.set_value
+        target: {entity_id: input_text.dance_room_modes_claimed}
+        data: {value: ""}
+      # 2026-09-23 (user: "lyset falder heller ikke tilbage til auto"): Auto-
+      # skiftet ovenfor SLIPPER kun blokeringen — det gengiver ingenting. Målt
+      # 23/9 17:47, 3½ min efter sluk: stuen/spisestuen/køkkenet stod stadig
+      # disko-røde og entréen blå, i fire TOMME rum. Presence-slukket var faldet
+      # mens rummene stod Manual og kommer aldrig igen (#4/#15).
+      - service: script.dance_restore_auto
+        data:
+          bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'valgte') or [] }}"
+
+      # 2026-08-21: dagslys-sluk er flanke-trigget og faldt MENS rummet stod
+      # Manual → re-kør de eksisterende sluk-automations (egne gates gælder,
+      # kun `for:`-hysteresen springes over). Rammer også de lys i rummene der
+      # IKKE dansede. Tænd-retningen ejes af dance_restore_auto, og kun for
+      # rum hvor presence selv siger "optaget".
+      - service: automation.trigger
+        data: {skip_condition: false}
+        target:
+          entity_id:
+            - automation.lysnet_stue_sluk_ved_lux_stigning
+            - automation.lysnet_kokken_spots_sluk_ved_dagslys
+            - automation.lysnet_sovevaerelse_sluk_ved_lux_stigning
+            - automation.lysnet_bornevaerelse_sluk_ved_lux_stigning
+
+  # === Festens pærer tilbage til det Auto VILLE vise (2026-09-23) ===
+  # Sluk → og re-kør rummets EGEN tænd-automation, men kun hvis rummets
+  # presence-kanal siger optaget. Looket (kelvin, lux-styrke, godnat, dark
+  # mode, elpris-blok …) bor dermed ét sted — i tænd-automationen — og kopieres
+  # ikke herind (#2). room_mode_apply duer ikke: den sender kun lysstyrke,
+  # aldrig kelvin, så en disko-farve ville blive stående.
+  #
+  # Occupancy-tjekket er HER og ikke i tænd-automationen, fordi spisestue-,
+  # sofa- og entré-tænd kun kræver presence i deres TRIGGER — et blindt
+  # automation.trigger ville tænde et tomt rum. Køkkenets kræver selv
+  # bevægelse i sine conditions.
+  #
+  # Tænd-reglen fra 2026-08-21 står stadig: "festen sluttede" er ikke i sig
+  # selv en tænd-grund. Et tomt rum forbliver slukket; kun rum presence ville
+  # have tændt alligevel, får lyset tilbage — nu i Auto-looket.
+  #
+  # Rører intet hvis en scene har overtaget (dance_scene_activation_stops_dance
+  # slukker festen fordi en scene lige har sat sit lys — dét må vi ikke slukke).
+  dance_restore_auto:
+    alias: "Dance: festens pærer tilbage til Auto-looket"
+    mode: queued
+    max: 10
+    fields:
+      bulbs:
+        description: "Pærerne der dansede"
+    sequence:
+      - variables:
+          b: >-
+            {% set raw = bulbs | default([]) %}
+            {{ ([raw] if raw is string else raw)
+               | reject('is_state', 'unavailable') | reject('is_state', 'unknown') | list }}
+          # [pærer der hører til tænd-vejen, tænd-automation, presence-kanal]
+          veje: >-
+            {{ [
+              [['light.spisestue_loft'],
+               'automation.lysnet_stue_taend',
+               'binary_sensor.spisestue_apollo_occupancy_filtered'],
+              [['light.stue_sofa_lampe', 'light.stue_sofa_lampe_2', 'light.stue_hjoernelampe',
+                'light.stue_laesehygge', 'light.stue_spot_1', 'light.stue_spot_2'],
+               'automation.lysnet_sofa_stue_taend',
+               'binary_sensor.stue_apollo_occupancy_filtered'],
+              [['light.koekken_lyskaede'],
+               'automation.lysnet_kokken_taend',
+               'binary_sensor.koekken_apollo_occupancy_filtered'],
+              [['light.entre_loft'],
+               'automation.entre_lys_taend_ved_bevaegelse',
+               'binary_sensor.entre_valhorn_occupancy']
+            ] }}
+          genoptaend: >-
+            {% set ns = namespace(a=[], p=[]) %}
+            {% for v in veje %}
+              {% if (v[0] | select('in', b) | list | count > 0) and is_state(v[2], 'on') %}
+                {% set ns.a = ns.a + [v[1]] %}
+                {% set ns.p = ns.p + v[0] %}
+              {% endif %}
+            {% endfor %}
+            {{ {'automations': ns.a, 'paerer': ns.p} }}
+      - condition: template
+        value_template: "{{ b | count > 0 and is_state('input_select.active_scene', 'none') }}"
+      - service: light.turn_off
+        continue_on_error: true
+        target: {entity_id: "{{ b }}"}
+        data: {transition: 1}
+      # Tænd-automationerne kræver at deres lys er SLUKKET (de er tænd-veje,
+      # ikke justér-veje) og tjekker det igen efter 500 ms. 2 s dækker den 1 s
+      # lange fade + ZHA's/Matters off-rapport.
+      - delay: {seconds: 2}
+      - if:
+          - condition: template
+            value_template: "{{ genoptaend.automations | count > 0 }}"
+        then:
+          - service: automation.trigger
+            data: {skip_condition: false}
+            target:
+              entity_id: "{{ genoptaend.automations }}"
+      # Sene frames: et event-kald der hang 5 s i radioen (målt: spisestue-
+      # loftet, 23/9) kan lande EFTER sluk og tænde pæren i disko-farve igen.
+      # Anden runde slukker kun pærer i rum vi IKKE tændte igen.
+      - delay: {seconds: 6}
+      - variables:
+          efternoelere: >-
+            {{ b | reject('in', genoptaend.paerer) | select('is_state', 'on') | list }}
+      - if:
+          - condition: template
+            value_template: "{{ efternoelere | count > 0 and is_state('input_boolean.dance_mode', 'off')
+                                and is_state('input_select.dance_manual_event', 'off') }}"
+        then:
+          - service: light.turn_off
+            continue_on_error: true
+            target: {entity_id: "{{ efternoelere }}"}
+            data: {transition: 1}
+
+  # === Stop alle kørende events NU (2026-09-23) ===
+  # ÉN liste over event-scriptene — stod før kopieret i runneren og to gange i
+  # depot-kontakten, mens dashboardets off-vej manglede den helt (#2/#16).
+  # script.turn_off afbryder scriptet før dets sidste trin, så flaget det selv
+  # skulle have slukket, slukkes her. Fanfaren ejer flaget mens den kører.
+  dance_stop_bursts:
+    alias: "Dance: stop det kørende event med det samme"
+    mode: parallel
+    max: 10
+    sequence:
+      - service: script.turn_off
+        target:
+          entity_id:
+            - script.dance_strobe_burst
+            - script.dance_blackout_burst
+            - script.dance_warm_burst
+            - script.dance_pulse_burst
+            - script.dance_chase_burst
+            - script.dance_jump_burst
+            - script.dance_chase_comet_burst
+            - script.dance_split_burst
+            - script.dance_heartbeat_burst
+            - script.dance_police_burst
+            - script.dance_lightning_burst
+            - script.dance_breathe_burst
+            - script.dance_sparkle_burst
+            - script.dance_cascade_burst
+            - script.dance_fire_burst
+            - script.dance_event_run
+            - script.dance_event_bulb
+      - if:
+          - condition: state
+            entity_id: script.fest_gaest_ankomst
+            state: "off"
+        then:
+          - service: input_boolean.turn_off
+            target: {entity_id: input_boolean.dance_strobe_active}
+
+  # Festen er slut: events, fanfare og baggrunds-loops stoppes på én gang.
+  # Loopene ville selv exitte på dance_mode=off, men en pære midt i et kald
+  # når at sende én farve mere OVEN I tilbagefaldet.
+  dance_stop_alt:
+    alias: "Dance: stop ALT lys-arbejde (fest slut)"
+    mode: parallel
+    max: 10
+    sequence:
+      - service: script.turn_off
+        target:
+          entity_id:
+            - script.fest_gaest_ankomst
+            - script.dance_single_bulb
+            - script.dance_lights_start
+      - service: script.dance_stop_bursts
+      - service: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.dance_strobe_active
+            - input_boolean.dance_event_manual_active
+
+  # Per-bulb dance loop. Kaldes parallelt fra dance_lights_start, én pr. pære.
+  # Exitter når dance_mode = off ELLER pærens rum vælges fra.
+  dance_single_bulb:
+    alias: "Dance: random-loop på én bulb"
+    mode: parallel
+    # 25, ikke 10: stue+bad+børn alene er 14 pærer, og max_exceeded slugte før
+    # tavst loopet for de sidste i listen.
+    max: 25
+    fields:
+      light_entity:
+        description: "Light entity til at danse"
+    sequence:
+      - repeat:
+          while:
+            - condition: state
+              entity_id: input_boolean.dance_mode
+              state: "on"
+            - condition: template
+              value_template: "{{ light_entity in (state_attr('sensor.dance_active_bulbs', 'valgte') or []) }}"
+          sequence:
+            # Stod et event (eller fanfaren) på, da vi kom hertil? Så er næste
+            # skridt en RETUR fra eventet og skal ses med det samme.
+            - variables:
+                pause_foer: >-
+                  {{ is_state('input_boolean.dance_strobe_active', 'on')
+                     or is_state('input_boolean.dance_event_manual_active', 'on') }}
+            # Parkér mens et event kører. 2026-09-23: timeouten var 15 s med
+            # continue_on_timeout, og loopet SKREV så en tilfældig farve oven i
+            # eventet — målt 23/9 17:43:49-52: alle ni loops brød ind i et låst
+            # police 16 s inde, og gjorde det igen hvert interval. Et låst event
+            # kører i op til 240 min. Nu: timeouten gen-tjekker kun udgangene;
+            # skrivningen nedenfor kræver at eventet faktisk er slut.
+            - wait_template: >-
+                {{ is_state('input_boolean.dance_mode', 'off')
+                   or light_entity not in (state_attr('sensor.dance_active_bulbs', 'valgte') or [])
+                   or (is_state('input_boolean.dance_strobe_active', 'off')
+                       and is_state('input_boolean.dance_event_manual_active', 'off')) }}
+              timeout: "00:01:00"
+              continue_on_timeout: true
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ is_state('input_boolean.dance_mode', 'off')
+                       or light_entity not in (state_attr('sensor.dance_active_bulbs', 'valgte') or []) }}
+              then:
+                - stop: "dance_mode off / rum fravalgt"
+            # Hastighed styres af input_number.dance_speed (1-100, 50=baseline).
+            # base-interval: spd 1→~8s, 50→~4.5s, 100→~1s. ±30% jitter per pære
+            # (usynkroniseret disko). transition = 55% af intervallet (blød morph).
+            - variables:
+                # Må vi skrive? Et låst event: aldrig. strobe-flaget: kun hvis
+                # intet event-script eller fanfaren kører — et hængende flag
+                # (script dræbt uden oprydning) må ikke fryse festen for evigt.
+                # 2026-10-05 (bug-hunt): to ejere over dance må den ikke male
+                # over — røgalarmens flugtlys (rang 1, ALLE pærer; dens egen
+                # interferens-vagt ser kun turn_off, så dance-farverne stod
+                # op til ~10 s ad gangen) og køkken-kædens register (regel 2:
+                # en låner skriver kun når sensor.koekken_lyskaede_ejer = dens
+                # id → timer-alarm/vejrvarsel vinder). Loopet fortsætter og
+                # danser videre i samme øjeblik de slipper.
+                fri: >-
+                  {{ is_state('input_boolean.dance_event_manual_active', 'off')
+                     and is_state('input_boolean.roegalarm_blink_active', 'off')
+                     and (light_entity != 'light.koekken_lyskaede'
+                          or is_state('sensor.koekken_lyskaede_ejer', 'dance'))
+                     and (is_state('input_boolean.dance_strobe_active', 'off')
+                          or states.script
+                             | selectattr('object_id', 'search', '^(dance_.*_burst|dance_event_run|fest_gaest_ankomst)$')
+                             | selectattr('state', 'eq', 'on') | list | count == 0) }}
+                smooth: "{{ is_state('binary_sensor.dance_smooth_mode','on') }}"
+                spd: "{{ [1, [100, states('input_number.dance_speed')|float(50)|round(0)|int]|min]|max }}"
+                base: "{{ 8.0 - (spd / 100.0) * 7.0 }}"
+                # FØRSTE SKRIDT ER ET STARTSIGNAL, IKKE EN DRIFT (user-spec
+                # 2026-09-17: "så var det meget forsinket ift hvornår jeg gav
+                # ordren"). Målt på "party time" 12:30:44: stemme-kæden leverede
+                # på 13 ms — forsinkelsen lå i smooth-mode'ens første kald, en
+                # 14-23 s fade til en kulør kun 25-70° fra den pæren stod på.
+                # 2026-09-23: samme regel for den NORMALE disko (user: "jeg
+                # forventer instant reaktion") — første skridt var en fade på
+                # 55 % af intervallet (~2,5 s), så et tryk på Festlys lignede
+                # ingenting. Nu snapper første skridt (og retur fra et event).
+                # Fixet hører HER: festen startes fra dashboard, stemme og
+                # gæste-fanfaren, og et startsignal i kun én vej er #2.
+                interval: >-
+                  {{ 2 if (smooth and repeat.index == 1)
+                     else ((range(14, 23)|random) if smooth
+                           else [1, (base * (range(70,131)|random) / 100.0)|round(0)|int]|max) }}
+                # Smooth: fade == hele intervallet, så pæren ALDRIG står stille
+                # og aldrig springer. Undtagen første skridt, hvor et spring er
+                # hele pointen. Smooth efter en pause glider (fanfaren forlader
+                # pærerne i en regnbue-tone, som driften skal fortsætte FRA).
+                trans: >-
+                  {% if smooth %}
+                    {{ 1 if repeat.index == 1 else (interval | float(4)) }}
+                  {% elif repeat.index == 1 %}0
+                  {% elif pause_foer %}0.3
+                  {% else %}{{ ((interval | float(4)) * 0.55) | round(2) }}{% endif %}
+                # Smooth: driv videre fra den kulør pæren står på (±25-70° pr.
+                # skridt) i stedet for et frit random-hop.
+                hue_ny: >-
+                  {% set hs = state_attr(light_entity, 'hs_color') %}
+                  {{ (((hs[0] | float(0)) + ([-1,1]|random) * (range(25,71)|random)) % 360)
+                     if (smooth and hs is not none and repeat.index > 1)
+                     else (range(0,360)|random) }}
+            - if:
+                - condition: template
+                  value_template: "{{ fri }}"
+              then:
+                - service: light.turn_on
+                  # Matter-pærer (entré, stue-spots) kan give CHIP-timeout, og
+                  # det aborterer ellers hele loopet → pæren fryser resten af
+                  # festen.
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ light_entity }}"
+                  data:
+                    # Hue 0-359, saturation 60-100 (= vibrant, ingen pastel-mudder).
+                    hs_color: >-
+                      {{ [hue_ny | float(0) | round(1),
+                          (range(70,86)|random) if smooth else (range(60,101)|random)] }}
+                    brightness_pct: >-
+                      {{ (range(80,101)|random) if smooth else (range(50,91)|random) }}
+                    transition: "{{ trans }}"
+            # Interruptibel pause: vågner straks hvis dance_mode slukkes eller
+            # pæren vælges fra, ellers dance_speed-styret rytme.
+            - wait_template: >-
+                {{ is_state('input_boolean.dance_mode','off')
+                   or light_entity not in (state_attr('sensor.dance_active_bulbs', 'valgte') or []) }}
+              timeout: "{{ interval if fri else 1 }}"
+              continue_on_timeout: true
+
+  # ===========================================================================
+  # EVENTS — KLOKKE-STYREDE, ÉN LØKKE PR. PÆRE (2026-09-23)
+  # ===========================================================================
+  # User 23/9: "lyset virker buggy og uregelmæssigt". Målt samme dag på et
+  # låst police (trace 17:43:33): designet til 4 s, kørte 52 s. Hvert swap var
+  # ÉT gruppe-kald, og et gruppe-kald returnerer først når den LANGSOMSTE pære
+  # har svaret: spisestue-loftet (ZHA) hang 5,4-5,6 s hvert 6.-8. kald
+  # (APS-retry), Matter-spotsene 1,5-2,4 s. Seks sådanne hæng = 33 af de 52 s,
+  # hvor HELE showet frøs.
+  #
+  # Nu: event-scriptet starter én løkke pr. pære (dance_event_bulb) på et
+  # FÆLLES ur (t0). Hver løkke udregner selv sin frame ud fra uret — police:
+  # rød hvis (tick + halvdel) er lige — og venter kun på SIN pære. Hænger en
+  # pære, misser den bare nogle slag og falder i takt igen; de andre danser
+  # videre. Eventet varer desuden sin designede tid i stedet for tick-antal ×
+  # radio-latens.
+  #
+  # Takten pr. pære er sat efter radioen, ikke efter det ønskede: ét kald
+  # tager 100-270 ms (målt p50), så en 100 ms police-takt var aldrig reel.
+  # Farven sendes kun i første frame hvor den er konstant (farvet kald = 2
+  # zigbee-frames, niveau-kald = 1).
+  #
+  # blackout, warm og breathe er ét langsomt gruppe-kald og kører som før.
+
+  # Starter løkkerne og holder til eventets slut. Kaldes BLOKERENDE af
+  # event-scriptene, så deres `on` stadig betyder "eventet kører".
+  dance_event_run:
+    alias: "Dance event: start klokke-løkker på festens pærer"
+    mode: parallel
+    max: 5
+    fields:
+      event:
+        description: "Event-navn (police, strobe, …)"
+      varighed:
+        description: "Sekunder"
+      p:
+        description: "Event-parametre (farve …)"
+    sequence:
+      - variables:
+          bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+          n: "{{ bulbs | count }}"
+          # Matter-pærerne deler ÉN flaskehals (OTBR/Thread): målt 11/10 under
+          # chase med begge stue-spots: ~5,6 kommandoer/s i alt, p50 193 ms /
+          # p90 297 ms pr. kommando (solo ~95 ms) ⇒ ~0,15 s × antal Matter-
+          # pærer pr. kommando (p90). Et farvet turn_on er TO kommandoer (farve
+          # + on/niveau). ZHA-pæren ved siden af: p50 114 ms pr. kald.
+          matter: "{{ bulbs | select('in', integration_entities('matter')) | list }}"
+          inv: "{{ 0.15 * (matter | count) }}"
+          # 150 ms frem, så alle løkker er startet før første tick.
+          t0: "{{ now().timestamp() + 0.15 }}"
+          slut: "{{ t0 + (varighed | default(6) | float(6)) }}"
+          # Delte tilfældige sekvenser (jump, lightning) trækkes ÉN gang her,
+          # så alle pærer følger samme koreografi.
+          pp: >-
+            {% set pp = p | default({}) %}
+            {% set pp = pp if pp is mapping else {} %}
+            {% set v = varighed | default(6) | float(6) %}
+            {% set nn = [1, n | int(1)] | max %}
+            {% if event == 'jump' %}
+              {% set ns = namespace(s=[]) %}
+              {% for _ in range((v / 0.13) | int + 1) %}
+                {% set ns.s = ns.s + [range(0, nn) | random] %}
+              {% endfor %}
+              {{ dict(pp, seq=ns.s) }}
+            {% elif event == 'lightning' %}
+              {% set ns = namespace(l=[], t=0.2) %}
+              {% for _ in range(60) %}
+                {% if ns.t < v %}
+                  {% set cnt = [range(1, 4) | random, nn] | min %}
+                  {% set dur = range(50, 151) | random %}
+                  {% set ns.l = ns.l + [[ns.t | round(3), (range(0, nn) | list | shuffle)[:cnt], dur]] %}
+                  {% set ns.t = ns.t + dur / 1000 + (range(200, 800) | random) / 1000 %}
+                {% endif %}
+              {% endfor %}
+              {{ dict(pp, lyn=ns.l) }}
+            {% else %}{{ pp }}{% endif %}
+      - condition: template
+        value_template: "{{ n > 0 }}"
+      - repeat:
+          for_each: "{{ bulbs }}"
+          sequence:
+            - service: script.turn_on
+              target: {entity_id: script.dance_event_bulb}
+              data:
+                variables:
+                  light_entity: "{{ repeat.item }}"
+                  event: "{{ event }}"
+                  idx: "{{ repeat.index - 1 }}"
+                  n: "{{ n }}"
+                  t0: "{{ t0 }}"
+                  slut: "{{ slut }}"
+                  p: "{{ pp }}"
+                  inv: "{{ inv if repeat.item in matter else 0 }}"
+      - delay:
+          milliseconds: "{{ [0, ((slut | float(0) - now().timestamp()) * 1000) | round(0) | int] | max }}"
+      # En pære midt i et 5 s radio-hæng må ikke holde eventet åbent.
+      - wait_template: "{{ is_state('script.dance_event_bulb', 'off') }}"
+        timeout: "00:00:01"
+      - service: script.turn_off
+        target: {entity_id: script.dance_event_bulb}
+
+  # Én pæres løkke i et event. `plan` = de skrivninger der hører til pærens
+  # næste tick, som [unix-tid, 'on'|'off', data] + hvornår næste tick starter.
+  # Alle tider er ABSOLUTTE på det fælles ur, så en pære der har hængt,
+  # springer de tabte ticks over i stedet for at spille dem forsinket.
+  dance_event_bulb:
+    alias: "Dance event: én pæres klokke-løkke"
+    mode: parallel
+    max: 30
+    max_exceeded: silent
+    fields:
+      light_entity:
+        description: "Pæren"
+      event:
+        description: "Event-navn"
+      idx:
+        description: "Pærens plads i eventets liste (0-baseret)"
+      n:
+        description: "Antal pærer i eventet"
+      t0:
+        description: "Fælles start (unix-tid)"
+      slut:
+        description: "Fælles slut (unix-tid)"
+      p:
+        description: "Event-parametre"
+      inv:
+        description: "Sekunder pr. Matter-kommando for DENNE pære (0 = ZHA)"
+    sequence:
+      - repeat:
+          while:
+            - condition: template
+              value_template: >-
+                {{ now().timestamp() < (slut | float(0))
+                   and light_entity in (state_attr('sensor.dance_active_bulbs', 'valgte') or []) }}
+          sequence:
+            - variables:
+                plan: >-
+                  {% set nu = now().timestamp() %}
+                  {% set T0 = t0 | float(0) %}
+                  {% set t = [0, nu - T0] | max %}
+                  {% set i = idx | int(0) %}
+                  {% set nn = [1, n | int(1)] | max %}
+                  {% set halv = 0 if i < (nn // 2) else 1 %}
+                  {% set pp = p if p is mapping else {} %}
+                  {% set foerste = repeat.index == 1 %}
+                  {% set sort = [[nu, 'off', {'transition': 0}]] if foerste else [] %}
+                  {# Tempo-gulv (11/10): en Matter-pære spiller kun hvert mm'te
+                     tick, så den kan nå sine kommandoer (inv pr. stk). Uden
+                     det nåede stue-spotsene 42 % af chase-ticks, i tilfældig
+                     rækkefølge = ustabilt. Tiderne er stadig på det fælles ur,
+                     så alle Matter-pærer rammer de SAMME ticks. #}
+                  {% set inv = inv | default(0) | float(0) %}
+                  {% if event == 'police' %}
+                    {% set mm = [1, (inv * 2 / 0.25 - 0.01) | round(0, 'ceil') | int] | max %}
+                    {% set P = 0.25 * mm %}{% set k = (t / P) | int %}
+                    {% set d = {'hs_color': ([0, 100] if (k + halv) % 2 == 0 else [240, 100]), 'transition': 0} %}
+                    {% if foerste %}{% set d = dict(d, brightness_pct=100) %}{% endif %}
+                    {{ {'trin': [[T0 + k * P, 'on', d]], 'naeste': T0 + (k + 1) * P} }}
+                  {% elif event == 'strobe' %}
+                    {# Hele rummet blitzer, så slukker `head` pærer én ad gangen
+                       (ripple) og resten på én gang; ripplen vandrer pr. tick. #}
+                    {% set mm = [1, (inv * 2 / 0.35 - 0.01) | round(0, 'ceil') | int] | max %}
+                    {% set P = 0.35 * mm %}{% set k = (t / P) | int %}
+                    {% set head = [4, nn] | min %}
+                    {% set pos = (i - k * head) % nn %}
+                    {% set off_s = 0.05 + (pos * 0.04 if pos < head else 0) %}
+                    {% set d = {'brightness_pct': 100, 'transition': 0} %}
+                    {% if foerste %}{% set d = dict(d, color_temp_kelvin=6500) %}{% endif %}
+                    {{ {'trin': [[T0 + k * P, 'on', d], [T0 + k * P + off_s, 'off', {'transition': 0}]],
+                        'naeste': T0 + (k + 1) * P} }}
+                  {% elif event == 'pulse' %}
+                    {% set mm = [1, (inv / 0.8 - 0.01) | round(0, 'ceil') | int] | max %}
+                    {% set P = 0.8 * mm %}{% set k = (t / P) | int %}
+                    {% set d = {'brightness_pct': (100 if k % 2 == 0 else 20), 'transition': (P - 0.1) | round(2)} %}
+                    {% if foerste %}{% set d = dict(d, hs_color=pp.farve | default([0, 100])) %}{% endif %}
+                    {{ {'trin': [[T0 + k * P, 'on', d]], 'naeste': T0 + (k + 1) * P} }}
+                  {% elif event == 'chase' %}
+                    {# Regnbue-sweep, alle i takt. 36°/0,3 s med overlappende fade. #}
+                    {# Farven følger det fælles ur (k × mm), så en langsom pære
+                       viser SAMME farve som de hurtige når den rammer. #}
+                    {% set mm = [1, (inv * 2 / 0.3 - 0.01) | round(0, 'ceil') | int] | max %}
+                    {% set P = 0.3 * mm %}{% set k = (t / P) | int %}
+                    {% set d = {'hs_color': [(k * mm * 36) % 360, 100], 'transition': P} %}
+                    {% if foerste %}{% set d = dict(d, brightness_pct=90) %}{% endif %}
+                    {{ {'trin': [[T0 + k * P, 'on', d]], 'naeste': T0 + (k + 1) * P} }}
+                  {% elif event == 'heartbeat' %}
+                    {% set mm = [1, (inv * 4 / 1.0 - 0.01) | round(0, 'ceil') | int] | max %}
+                    {% set P = 1.0 * mm %}{% set k = (t / P) | int %}{% set b0 = T0 + k * P %}
+                    {% set on = {'brightness_pct': 100, 'transition': 0} %}
+                    {% set on1 = dict(on, hs_color=[0, 100]) if foerste else on %}
+                    {{ {'trin': [[b0, 'on', on1], [b0 + 0.1, 'off', {'transition': 0}],
+                                 [b0 + 0.2, 'on', on], [b0 + 0.3, 'off', {'transition': 0}]],
+                        'naeste': b0 + P} }}
+                  {% elif event == 'split' %}
+                    {% set mm = [1, (inv * 2 / 0.8 - 0.01) | round(0, 'ceil') | int] | max %}
+                    {% set P = 0.8 * mm %}{% set k = (t / P) | int %}
+                    {% set d = {'hs_color': (pp.a if (k + halv) % 2 == 0 else pp.b), 'transition': 0.3} %}
+                    {% if foerste %}{% set d = dict(d, brightness_pct=90) %}{% endif %}
+                    {{ {'trin': [[T0 + k * P, 'on', d]], 'naeste': T0 + (k + 1) * P} }}
+                  {% elif event == 'chase_comet' %}
+                    {# Én pære ad gangen i rækkefølge; pæren venter på SIN tur. #}
+                    {% set P = 0.15 %}{% set s = (t / P) | int %}
+                    {% set km = s + ((i - s) % nn) %}{% set b0 = T0 + km * P %}
+                    {% set on = {'hs_color': [(km * 30) % 360, 100], 'brightness_pct': 100, 'transition': 0} %}
+                    {{ {'trin': sort + [[b0, 'on', on], [b0 + 0.13, 'off', {'transition': 0}]],
+                        'naeste': b0 + P} }}
+                  {% elif event == 'jump' %}
+                    {% set P = 0.13 %}{% set s = (t / P) | int %}{% set seq = pp.seq | default([]) %}
+                    {% set ns = namespace(k=-1) %}
+                    {% for j in range(s, seq | count) %}
+                      {% if ns.k < 0 and seq[j] == i %}{% set ns.k = j %}{% endif %}
+                    {% endfor %}
+                    {% if ns.k < 0 %}
+                      {{ {'trin': sort, 'naeste': slut | float(0)} }}
+                    {% else %}
+                      {% set b0 = T0 + ns.k * P %}
+                      {% set on = {'hs_color': pp.farve | default([0, 100]), 'brightness_pct': 100, 'transition': 0} %}
+                      {{ {'trin': sort + [[b0, 'on', on], [b0 + 0.1, 'off', {'transition': 0}]],
+                          'naeste': b0 + P} }}
+                    {% endif %}
+                  {% elif event == 'lightning' %}
+                    {% set ns = namespace(s=none) %}
+                    {% for s in pp.lyn | default([]) %}
+                      {% if ns.s is none and i in s[1] and T0 + s[0] >= nu - 0.02 %}{% set ns.s = s %}{% endif %}
+                    {% endfor %}
+                    {% if ns.s is none %}
+                      {{ {'trin': sort, 'naeste': slut | float(0)} }}
+                    {% else %}
+                      {% set b0 = T0 + ns.s[0] %}
+                      {{ {'trin': sort + [[b0, 'on', {'color_temp_kelvin': 6500, 'brightness_pct': 100, 'transition': 0}],
+                                          [b0 + ns.s[2] / 1000, 'off', {'transition': 0}]],
+                          'naeste': b0 + ns.s[2] / 1000 + 0.01} }}
+                    {% endif %}
+                  {% elif event == 'sparkle' %}
+                    {# Samme gennemsnitlige blitz-rate for rummet som før (~3/s),
+                       men hver pære trækker sin egen næste blitz. #}
+                    {% set b0 = nu + (range(20, 48) | random) / 100 * nn %}
+                    {{ {'trin': sort + [[b0, 'on', {'color_temp_kelvin': 6500, 'brightness_pct': 100, 'transition': 0}],
+                                        [b0 + 0.06, 'off', {'transition': 0}]],
+                        'naeste': b0 + 0.07} }}
+                  {% elif event == 'cascade' %}
+                    {# Fader ind én ad gangen, holder, alle ud sammen. Én runde. #}
+                    {{ {'trin': sort + [[T0 + i * 0.4, 'on', {'hs_color': pp.farve | default([0, 100]), 'brightness_pct': 90, 'transition': 0.8}],
+                                        [T0 + nn * 0.4 + 2, 'off', {'transition': 1.5}]],
+                        'naeste': slut | float(0)} }}
+                  {% elif event == 'fire' %}
+                    {# Bål: hver pære flakker for sig. Pr.-pære-intervallet vokser
+                       med antallet, så HELE festen holder ~5 skrivninger/s (HA's
+                       reelle loft) uanset rum-valg. 12 % gnist · 33 % glød ·
+                       55 % flamme. Alt i hs — en RGBW-strip SNAPPER mellem RGB
+                       og sin hvide kanal. #}
+                    {% set Pb = [0.4, nn * 0.2] | max %}
+                    {% if foerste %}
+                      {{ {'trin': [[nu, 'on', {'hs_color': [12, 96], 'brightness_pct': 30, 'transition': 1}]],
+                          'naeste': nu + 0.6 + (range(0, 60) | random) / 100 * Pb} }}
+                    {% else %}
+                      {% set roll = range(1, 101) | random %}
+                      {% set hue = range(30, 46) | random if roll <= 12
+                                   else (range(3, 13) | random if roll <= 45 else range(13, 33) | random) %}
+                      {% set sat = range(25, 51) | random if roll <= 12
+                                   else (range(94, 101) | random if roll <= 45 else range(78, 96) | random) %}
+                      {% set bri = range(88, 101) | random if roll <= 12
+                                   else (range(15, 31) | random if roll <= 45 else range(45, 76) | random) %}
+                      {% set tr = 0 if roll <= 12 else [0.3, [1.2, (Pb * 0.55) | round(2)] | min] | max %}
+                      {{ {'trin': [[nu, 'on', {'hs_color': [hue, sat], 'brightness_pct': bri, 'transition': tr}]],
+                          'naeste': nu + Pb * (range(60, 141) | random) / 100} }}
+                    {% endif %}
+                  {% else %}
+                    {{ {'trin': [], 'naeste': slut | float(0)} }}
+                  {% endif %}
+            - repeat:
+                for_each: "{{ plan.trin }}"
+                sequence:
+                  - delay:
+                      milliseconds: >-
+                        {{ [0, ((repeat.item[0] | float(0) - now().timestamp()) * 1000) | round(0) | int] | max }}
+                  # Fravalgt midt i et tick → rør den ikke; tilbagefaldet ejer den.
+                  - condition: template
+                    value_template: "{{ light_entity in (state_attr('sensor.dance_active_bulbs', 'valgte') or []) }}"
+                  # 2026-10-05: samme to ejere som dance_single_bulb's `fri`
+                  # (røgalarm + køkken-registret). Springer kun DETTE trin over —
+                  # eventet kører videre og skriver igen når de slipper.
+                  - if:
+                      - condition: template
+                        value_template: >-
+                          {{ is_state('input_boolean.roegalarm_blink_active', 'off')
+                             and (light_entity != 'light.koekken_lyskaede'
+                                  or is_state('sensor.koekken_lyskaede_ejer', 'dance')) }}
+                    then:
+                      - if:
+                          - condition: template
+                            value_template: "{{ repeat.item[1] == 'off' }}"
+                        then:
+                          - service: light.turn_off
+                            continue_on_error: true
+                            target: {entity_id: "{{ light_entity }}"}
+                            data: "{{ repeat.item[2] }}"
+                        else:
+                          - service: light.turn_on
+                            continue_on_error: true
+                            target: {entity_id: "{{ light_entity }}"}
+                            data: "{{ repeat.item[2] }}"
+            - delay:
+                milliseconds: >-
+                  {{ [0, (([plan.naeste | float(0), slut | float(0)] | min - now().timestamp()) * 1000) | round(0) | int] | max }}
+
+  # ===== 15 EVENT-SCRIPTS (scheduler picker random, runneren looper ét) =====
+  # Alle sætter dance_strobe_active=on ved start (= baggrunds-loops pauser)
+  # og off ved slut. Varighederne er uændrede fra før 2026-09-23 — de er bare
+  # nu TID i stedet for antal ticks.
+
+  dance_strobe_burst:
+    alias: "Dance event: hurtig strobe (white-flash + ripple blackout)"
+    mode: single
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data: {event: strobe, varighed: "{{ range(8, 13) | random }}"}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 2: blackout — alt mørkt 2-10 sek
+  dance_blackout_burst:
+    alias: "Dance event: blackout 1-5s"
+    mode: single
+    variables:
+      bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: light.turn_off
+        continue_on_error: true
+        target: {entity_id: "{{ bulbs }}"}
+        data: {transition: 0}
+      - delay:
+          seconds: "{{ range(2, 11) | random }}"
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 3: warm flood — alle bulbs 2400K @ 100%, 2-8 sek
+  dance_warm_burst:
+    alias: "Dance event: varm flood 1-4s"
+    mode: single
+    variables:
+      bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: light.turn_on
+        continue_on_error: true
+        target: {entity_id: "{{ bulbs }}"}
+        data:
+          brightness_pct: 100
+          color_temp_kelvin: 2400
+          transition: 0
+      - delay:
+          seconds: "{{ range(2, 9) | random }}"
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 4: synced pulse — samme random farve, 20 %↔100 % hvert 0,8 s.
+  dance_pulse_burst:
+    alias: "Dance event: synced color pulse 6-13s"
+    mode: single
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data:
+          event: pulse
+          varighed: "{{ range(6, 14) | random }}"
+          p: {farve: "{{ [range(0, 360) | random, range(70, 101) | random] }}"}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 5: rainbow sweep — alle i takt gennem hele hue-cirklen.
+  dance_chase_burst:
+    alias: "Dance event: synced rainbow sweep 4-10s"
+    mode: single
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data: {event: chase, varighed: "{{ range(4, 11) | random }}"}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 6: single-light jumps — én pære tændt ad gangen, tilfældig rækkefølge.
+  dance_jump_burst:
+    alias: "Dance event: single light jumps 5-10s"
+    mode: single
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data:
+          event: jump
+          varighed: "{{ range(5, 11) | random }}"
+          p: {farve: "{{ [range(0, 360) | random, range(70, 101) | random] }}"}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 7: comet — én pære ad gangen i rækkefølge, regnbuen cykler med.
+  dance_chase_comet_burst:
+    alias: "Dance event: comet chase 5-9s"
+    mode: single
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data: {event: chase_comet, varighed: "{{ range(5, 10) | random }}"}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 8: split halves — to halvdele i komplementære farver der bytter.
+  dance_split_burst:
+    alias: "Dance event: split halves komplementære farver 5-10s"
+    mode: single
+    variables:
+      base_hue: "{{ range(0, 360) | random }}"
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data:
+          event: split
+          varighed: "{{ range(5, 11) | random }}"
+          p:
+            a: "{{ [base_hue | int, 100] }}"
+            b: "{{ [(base_hue | int + 180) % 360, 100] }}"
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 9: heartbeat — lub-dub i rødt, ét slag i sekundet.
+  dance_heartbeat_burst:
+    alias: "Dance event: rød heartbeat 4-8s"
+    mode: single
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data: {event: heartbeat, varighed: "{{ range(4, 9) | random }}"}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 10: police — halvdelene skifter rød/blå, 4 skift/s.
+  dance_police_burst:
+    alias: "Dance event: police lights rød/blå 4-8s"
+    mode: single
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data: {event: police, varighed: "{{ range(4, 9) | random }}"}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 11: lightning storm — hvide glimt på tilfældige 1-3 pærer ad gangen.
+  dance_lightning_burst:
+    alias: "Dance event: lightning storm 6-10s"
+    mode: single
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data: {event: lightning, varighed: "{{ range(6, 11) | random }}"}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 12: breathe — alle bulbs slow fade ind/ud på varm hvid.
+  # Calm ambient kontrast til fast events. 1-2 breaths à ~8s = 8-16s.
+  dance_breathe_burst:
+    alias: "Dance event: slow breathe varm hvid 8-16s"
+    mode: single
+    variables:
+      bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+      breath_count: "{{ range(1, 3) | random }}"  # 1-2 vejrtræk
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      # Kuløren sættes her, hårdt, og røres ikke igen: vejrtrækningen er rene
+      # niveau-kald. En RGBW-strip der får color_temp midt i en 4 s transition
+      # snapper til sin hvide kanal i stedet for at fade.
+      - service: light.turn_on
+        continue_on_error: true
+        target: {entity_id: "{{ bulbs }}"}
+        data: {color_temp_kelvin: 2400, brightness_pct: 10, transition: 0}
+      - repeat:
+          count: "{{ breath_count }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target: {entity_id: "{{ bulbs }}"}
+              data: {brightness_pct: 80, transition: 4}
+            - delay: {seconds: 4}
+            - service: light.turn_on
+              continue_on_error: true
+              target: {entity_id: "{{ bulbs }}"}
+              data: {brightness_pct: 10, transition: 4}
+            - delay: {seconds: 4}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 13: sparkle — tilfældige hvide kamera-blitz.
+  dance_sparkle_burst:
+    alias: "Dance event: random kamera-flash sparkle 5-10s"
+    mode: single
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data: {event: sparkle, varighed: "{{ range(5, 11) | random }}"}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 14: cascade — fader ind én ad gangen, holder, alle ud sammen.
+  dance_cascade_burst:
+    alias: "Dance event: cascade fade-in then all-out 6-8s"
+    mode: single
+    variables:
+      n: "{{ [1, states('sensor.dance_active_bulbs') | int(1)] | max }}"
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data:
+          event: cascade
+          # ind (0,4 s/pære) + 2 s hold + 1,5 s ud
+          varighed: "{{ n * 0.4 + 3.6 }}"
+          p: {farve: "{{ [range(0, 360) | random, range(70, 101) | random] }}"}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 15: fire — bål/pejs, hver pære flakker for sig. Husets eneste event
+  # der kan køre 45 min i træk (låst), derfor rate-loftet i løkken.
+  dance_fire_burst:
+    alias: "Dance event: bål-flimmer 14-24s"
+    mode: single
+    variables:
+      bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+    sequence:
+      - condition: template
+        value_template: "{{ bulbs | count > 0 }}"
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data: {event: fire, varighed: "{{ range(14, 25) | random }}"}
+      # Lad bålet dø ned i stedet for at snappe over i næste event.
+      - service: light.turn_on
+        continue_on_error: true
+        target: {entity_id: "{{ bulbs }}"}
+        data: {hs_color: [8, 100], brightness_pct: 12, transition: 2}
+      - delay: {seconds: 2}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # Starter baggrunds-loopene. Uden `bulbs` = alle festens levende pærer;
+  # rum-skiftet sender kun det nyvalgte rums pærer med.
+  dance_lights_start:
+    alias: "Dance: start bulb-loops dynamisk fra sensor.dance_active_bulbs"
+    mode: queued
+    max: 10
+    fields:
+      bulbs:
+        description: "Valgfri: kun disse pærer (default = alle festens)"
+    sequence:
+      - variables:
+          liste: >-
+            {% set b = bulbs | default(state_attr('sensor.dance_active_bulbs', 'entity_ids')) %}
+            {{ ([b] if b is string else (b or []))
+               | reject('is_state', 'unavailable') | reject('is_state', 'unknown') | list }}
+      # script.turn_on (ikke service: script.X) = fire-and-forget så
+      # for_each spawn'er parallel-instances i stedet for at vente på hver.
+      - repeat:
+          for_each: "{{ liste }}"
+          sequence:
+            - service: script.turn_on
+              target:
+                entity_id: script.dance_single_bulb
+              data:
+                variables:
+                  light_entity: "{{ repeat.item }}"
+
+automation:
+  - id: dance_mode_orchestrate
+    alias: "Dance Mode: start/stop loops + Manual mode for de dansende rum"
+    description: >
+      Toggle dance_mode → starter loops + sætter DE VALGTE rum til Manual så
+      Auto ikke rører lysene. Toggle off (uden låst event) → fest slut: alt
+      stoppes, alle rum til Auto, festens pærer tilbage til Auto-looket.
+    mode: queued
+    max: 5
+    trigger:
+      - platform: state
+        entity_id: input_boolean.dance_mode
+        from: "off"
+        to: "on"
+        id: start
+      - platform: state
+        entity_id: input_boolean.dance_mode
+        from: "on"
+        to: "off"
+        id: stop
+    action:
+      - choose:
+          - conditions: "{{ trigger.id == 'start' }}"
+            sequence:
+              # 2026-08-02: KUN de rum der faktisk danser sættes til Manual.
+              - service: script.dance_room_modes_claim
+              - service: script.dance_lights_start
+          - conditions: "{{ trigger.id == 'stop' }}"
+            sequence:
+              # Fest slut KUN hvis manual event ikke er aktivt
+              # (ellers ville manual event tabe sin Manual-lock)
+              - condition: state
+                entity_id: input_select.dance_manual_event
+                state: "off"
+              - service: script.dance_room_modes_release
+
+  # Event-scheduler: fyrer 1 random event-script ud af 15 typer med
+  # random spacing 30-150 sek. While-condition exitter når dance_mode → off.
+  - id: dance_event_scheduler
+    alias: "Dance Mode: random event scheduler (15 event-typer)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.dance_mode
+        to: "on"
+    action:
+      - repeat:
+          while:
+            - condition: state
+              entity_id: input_boolean.dance_mode
+              state: "on"
+          sequence:
+            # Mellemrum styret af input_number.dance_event_frequency (1-100,
+            # 50=baseline 30-150s). scale = 50/freq: freq 100→0.5× (15-75s),
+            # freq 10→5× (2.5-12.5 min), freq 1→50× (næsten aldrig). Min 5s.
+            - variables:
+                freq: "{{ [1, [100, states('input_number.dance_event_frequency')|float(50)|round(0)|int]|min]|max }}"
+                scale: "{{ 50.0 / freq }}"
+            # Vågner straks hvis festen slukkes (før: sov den hele ventetiden
+            # ud, og en ny fest inden for de 2½ min fik ingen scheduler —
+            # mode: single smed den nye trigger væk).
+            - wait_template: "{{ is_state('input_boolean.dance_mode', 'off') }}"
+              timeout:
+                seconds: "{{ [5, (range(30, 151)|random * scale)|round(0)|int]|max }}"
+              continue_on_timeout: true
+            - condition: state
+              entity_id: input_boolean.dance_mode
+              state: "on"
+            # SMOOTH MODE (2026-08-19): begge sliders i bund = ingen bursts.
+            # if/then og IKKE en bar `condition:` — en fejlende condition inde
+            # i et repeat stopper HELE loopet. Et låst manual-event har også
+            # forrang: scheduleren må ikke skyde et tilfældigt event oven i det.
+            - if:
+                - condition: state
+                  entity_id: binary_sensor.dance_smooth_mode
+                  state: "off"
+                - condition: state
+                  entity_id: input_select.dance_manual_event
+                  state: "off"
+                - condition: template
+                  value_template: "{{ (states('sensor.dance_active_bulbs') | int(0)) > 0 }}"
+              then:
+                - variables:
+                    chosen: >-
+                      {{ [
+                        'script.dance_strobe_burst',
+                        'script.dance_blackout_burst',
+                        'script.dance_warm_burst',
+                        'script.dance_pulse_burst',
+                        'script.dance_chase_burst',
+                        'script.dance_jump_burst',
+                        'script.dance_chase_comet_burst',
+                        'script.dance_split_burst',
+                        'script.dance_heartbeat_burst',
+                        'script.dance_police_burst',
+                        'script.dance_lightning_burst',
+                        'script.dance_breathe_burst',
+                        'script.dance_sparkle_burst',
+                        'script.dance_cascade_burst',
+                        'script.dance_fire_burst'
+                      ] | random }}
+                # continue_on_error: et event der stoppes udefra (bruger
+                # skifter til et låst event) må ikke dræbe scheduleren.
+                - service: "{{ chosen }}"
+                  continue_on_error: true
+
+  # Manual event runner: starter continuous loop på valgt event,
+  # overruler dance mode mens aktiv. mode:restart giver clean hot-swap:
+  # - off → event X: starter loop på X
+  # - event X → event Y: stop X NU, start Y
+  # - event X → off: stop X NU, fest slut hvis dance_mode=off
+  - id: dance_manual_event_runner
+    alias: "Dance Manual Event: continuous loop med mutex hot-swap"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: input_select.dance_manual_event
+    action:
+      # 2026-09-23: stop det kørende event FØR alt andet — også på vej til
+      # "off". Før skete det kun ved skift mellem to events; på "off" kørte
+      # eventet færdigt (målt 17:44:00: police blev ved i 25 s efter "off").
+      - service: script.dance_stop_bursts
+      - choose:
+          # === BRANCH: event → off (cleanup) ===
+          - conditions: "{{ trigger.to_state.state == 'off' }}"
+            sequence:
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.dance_event_manual_active}
+              # Fest slut KUN hvis dance_mode er off
+              # (ellers genoptager auto-shufflen bare med det samme)
+              - condition: state
+                entity_id: input_boolean.dance_mode
+                state: "off"
+              - service: script.dance_room_modes_release
+        # === DEFAULT: event valgt → start loop ===
+        default:
+          - variables:
+              event_name: "{{ trigger.to_state.state }}"
+              # Tids-loft (2026-08-07). Beregnes ÉN gang her; while-conditionen
+              # sammenligner mod now() ved hver iteration.
+              loop_slut: >-
+                {{ now().timestamp()
+                   + (states('input_number.dance_manual_event_max_minutter')
+                      | float(45)) * 60 }}
+          - service: input_boolean.turn_on
+            target: {entity_id: input_boolean.dance_event_manual_active}
+          # Manual over presence/auto — men KUN i de rum der danser (2026-08-02).
+          - service: script.dance_room_modes_claim
+          # Loop event-script via script.turn_on (template-friendly target)
+          # + wait_template for script-completion (fire-and-forget ville spinne
+          # loopen mod mode:single rejection).
+          # NB: while bruger condition:template — condition:state med
+          # state:"{{ template }}" fejler stille (verificeret 2026-05-26).
+          - repeat:
+              while:
+                - condition: template
+                  value_template: "{{ states('input_select.dance_manual_event') == event_name }}"
+                - condition: template
+                  value_template: "{{ now().timestamp() < loop_slut | float(0) }}"
+              sequence:
+                - service: script.turn_on
+                  target:
+                    entity_id: "script.dance_{{ event_name }}_burst"
+                - wait_template: >-
+                    {{ is_state('script.dance_' ~ event_name ~ '_burst', 'off') }}
+                  timeout: "00:00:40"
+                  continue_on_timeout: true
+          # Faldt loopet ud på TID (ikke fordi brugeren skiftede)? Så sluk pænt:
+          # "off" kører cleanup-grenen ovenfor + depotets rum-restore.
+          - if:
+              - condition: template
+                value_template: "{{ states('input_select.dance_manual_event') == event_name }}"
+            then:
+              - service: input_select.select_option
+                target: {entity_id: input_select.dance_manual_event}
+                data: {option: "off"}
+              - service: logbook.log
+                data:
+                  name: "Festlys"
+                  message: >-
+                    Låst event '{{ event_name }}' stoppet på tids-loftet
+                    ({{ states('input_number.dance_manual_event_max_minutter') }} min).
+
+  # Rum-valg ændret mens festen kører → tilføj eller slip KUN det rum.
+  # 2026-09-23: før slog den dance_mode fra og til igen. Det gik gennem fest-
+  # slut, så ét tryk på en rum-toggle midt i festen satte alle ni rum Auto og
+  # — med tilbagefaldet — slukkede hele festen et øjeblik. Og et låst event
+  # fik slet ingen besked (conditionen krævede dance_mode on).
+  - id: dance_room_change_restart
+    alias: "Dance: rum-ændring mens festen kører → tilføj/slip rummet"
+    mode: queued
+    max: 10
+    trigger:
+      - platform: state
+        entity_id:
+          - input_boolean.dance_room_stue
+          - input_boolean.dance_room_spisestue
+          - input_boolean.dance_room_koekken
+          - input_boolean.dance_room_terrasse
+          - input_boolean.dance_room_boern
+          - input_boolean.dance_room_bad
+          - input_boolean.dance_room_depot
+          # Manglede siden entréen kom med 2026-08-21 (roster-drift, #16).
+          - input_boolean.dance_room_entre
+        from: ["on", "off"]
+        to: ["on", "off"]
+    condition:
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.dance_mode', 'on')
+             or not is_state('input_select.dance_manual_event', 'off') }}
+    action:
+      # sensor.dance_active_bulbs gen-renderer på SAMME state-skift — vent til
+      # den har det nye rum-valg, ellers claimer vi det gamle.
+      - delay: {milliseconds: 300}
+      - variables:
+          rum: "{{ trigger.entity_id.split('dance_room_')[1] }}"
+          kort: "{{ state_attr('sensor.dance_rum_kort', 'rum') or {} }}"
+          paerer: "{{ kort[rum].paerer if rum in kort else [] }}"
+          rum_mode: "{{ kort[rum].mode if rum in kort else '' }}"
+      - choose:
+          - conditions: "{{ trigger.to_state.state == 'on' }}"
+            sequence:
+              - service: script.dance_room_modes_claim
+              # Låst event: nye pærer kommer med ved eventets næste runde.
+              - if:
+                  - condition: state
+                    entity_id: input_boolean.dance_mode
+                    state: "on"
+                then:
+                  - service: script.dance_lights_start
+                    data:
+                      bulbs: "{{ paerer }}"
+          - conditions: "{{ trigger.to_state.state == 'off' }}"
+            sequence:
+              # Pærens løkker har set fravalget (de læser `valgte`) og rører
+              # den ikke mere. Rummet gives tilbage til Auto — og til looket.
+              - if:
+                  - condition: template
+                    value_template: "{{ rum_mode != '' }}"
+                then:
+                  - service: input_select.select_option
+                    target: {entity_id: "{{ rum_mode }}"}
+                    data: {option: "Auto"}
+              - service: script.dance_restore_auto
+                data:
+                  bulbs: "{{ paerer }}"
+
+  # Scene aktiveret → stop dance mode (loops fighter ellers mod scenen).
+  # Scener her sættes via script.scene_toggle → input_select.active_scene
+  # (IKKE scene.turn_on), så vi trigger på den. Tilbagefaldet i
+  # dance_restore_auto rører intet mens en scene er aktiv.
+  - id: dance_scene_activation_stops_dance
+    alias: "Dance: scene aktiveret → sluk dance mode"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.active_scene
+    condition:
+      - condition: state
+        entity_id: input_boolean.dance_mode
+        state: "on"
+      # Kun når der skiftes TIL en rigtig scene (ikke 'none' = scene ryddet)
+      - condition: template
+        value_template: >-
+          {{ trigger.to_state.state not in ['none','unknown','unavailable'] }}
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_mode}

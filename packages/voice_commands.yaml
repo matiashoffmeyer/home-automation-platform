@@ -1,0 +1,693 @@
+# =============================================================================
+# Talte genveje: "Party Time" og "Auto Mode"
+# =============================================================================
+# user-spec 2026-09-16: "hvis vi har fri mulighed for voice commands nu via
+# tapo skal vi også ha en der hedder 'Party Time' så når jeg siger det starter
+# der festlys i de rum med recent activity (last 60sec) og så 'Auto Mode' for
+# at slukke alt mood og party lys og få alle rum tilbage til auto."
+#
+# DER ER TO VEJE IND, og de kalder de samme scripts (fejlklasse #2).
+#
+# 1) ASSIST i Companion-appen. Telefonens egen tale-til-tekst klarer lyden, og
+#    HA matcher kun teksten. Virker overalt, kræver et tryk på knappen.
+# 2) KØKKEN-KAMERAETS MIKROFON, siden 2026-09-16. Forudsætningen holdt ikke
+#    første gang — dengang var der hverken lydsti eller STT-motor — men begge
+#    dele findes nu: shimmen (addons/gesture_frame_shim ≥ 0.7.0) klipper
+#    ytringer ud af kameraets RTSP-lydspor og spørger speech-to-phrase, og
+#    resultatet lander i `sensor.koekken_stemme_kommando`. Håndfri, men kun i
+#    køkkenet.
+#
+# HVORFOR EN ALLOWLIST OG IKKE BARE "hvad motoren hørte": speech-to-phrase
+# trænes ud fra HA's egne sætninger og indeholder derfor ALLE indbyggede
+# intents. Støj rammer altid ET eller andet gyldigt — målt på tomgang i
+# køkkenet: 'set the lights to yellow', 'pause', "what's the current time".
+# Shimmen oversætter derfor kun de tre sætninger vi selv har defineret og
+# smider resten væk; det er dén filtrering der gør en åben mikrofon forsvarlig.
+#
+# MEN ALLOWLISTEN BESKYTTER MOD FORKERTE HANDLINGER, IKKE MOD MISHØR. Motoren
+# er en FAST-SÆTNINGS-MATCHER uden "ved det ikke"-udgang: hver ytring snappes
+# til den nærmeste trænede sætning. Siger du "party time" fem gange og får ét
+# hit, er de fire andre ikke tabt i støj — de blev til 'pause', 'what is CO2',
+# 'time left on timer', altså ægte HA-kommandoer der konkurrerer i grafen.
+# GRAFEN BYGGES AF DE ENTITIES DER ER EKSPONERET TIL ASSIST, så knappen der
+# skruer ned for konkurrencen sidder i eksponeringen — ikke i shimmens tærskler.
+# 2026-09-17 (user-spec, "fjern alle ord der ikke relaterer til mine kommandoer"):
+# alle 158 af-eksponeret → ordforrådet faldt 408 → 247 ord og de 116 entity-navne
+# forsvandt helt. Kommando-sætningerne overlever, fordi de kommer fra
+# `platform: conversation`-triggers (ExtraSentences), ikke fra entity-navne.
+#   · værktøj:  `python3 scripts/assist_expose.py list|prune|expose <id>`
+#   · snapshot: `config_snapshots/assist_exposed_before_prune.txt`
+#   · PRISEN: telefon-Assist kan ikke længere styre entities ved navn. Skal én
+#     ting kunne igen, så `expose <entity_id>` — ikke hele listen tilbage.
+#   · NB eksponeringen lever i `.storage`, og NYE entities eksponeres SELV →
+#     kør `list` efter parring af nye devices, ellers vokser grafen igen (#16).
+#   · En ændring slår først igennem når ADD-ON'ET GENSTARTER: speech-to-phrase
+#     har ingen HA-integration (ingen config entry) og træner kun ved opstart.
+#
+# AFBRYDERNE ER I TO LAG (user-spec 2026-09-16, sliders+killswitches på
+# Tapo-siden): `voice_kommandoer_enabled` her i filen er hovedafbryderen, og
+# `input_boolean.voice_cmd_<ord>` i `packages/tapo_tuning.yaml` slår ÉT ord fra.
+# Begge er en `condition` på hver vej ind (#21) — men de sidder bevidst på
+# forskellige niveauer: ordene der også har en dashboard-knap (Party Time, Auto
+# Mode) er gatet på TRIGGERNE, så knappen stadig virker; timeren er gatet inde i
+# `script.koekken_timer_stemme`, fordi det script kun har stemme-veje ind.
+#
+# MIKROFONEN ER FORBUDT I AirBnB på samme måde som linsen (user-spec: kameraet
+# hives ud og pakkes væk). Shimmen stopper hele streamen i AirBnB, og
+# consumeren herunder har gaten igen — to lag, fordi den ene er kode vi
+# deployer og den anden er en add-on-version (fejlklasse #21).
+#
+# HVILKE RUM "recent activity" KAN BETYDE: kun de fem rum der overhovedet må
+# danse. Terrassen er bevidst ude (den skal stå STILLE på fuld — se
+# fest_ankomst.yaml), badet og børneværelset må aldrig auto-tænde, og
+# soveværelset røres slet ikke. Party Time kan derfor ikke vække nogen der
+# sover, og har af samme grund ingen godnat-gate: en talt kommando er et
+# eksplicit menneskeligt valg.
+#
+# VIDNERNE PR. RUM er ikke lige stærke. Stue/spisestue/køkken har netdrevne
+# Apolloer (online 100 %); entré og depot har batteridrevne VALLHORN'er, der
+# er blinde 10-18 % af tiden — og `unavailable` læses som off (fejlklasse #9).
+# Et blindt rum falder derfor stille ud af festen. Det er den rigtige
+# fejlretning her (et rum for lidt, aldrig et rum for meget), men det er
+# grunden til at et TOMT resultat falder tilbage på standard-rosteret: siger
+# man "Party Time", skal der ske noget.
+# =============================================================================
+
+input_boolean:
+  # Fejlklasse #21: kill-switchen skal være en condition på hver vej ind —
+  # både Assist-triggeren og en fremtidig Tapo-lydsti.
+  voice_kommandoer_enabled:
+    name: "Stemme: talte genveje aktive"
+    icon: mdi:microphone-message
+
+input_number:
+  # "last 60sec" fra user-spec'en. Slider frem for magic number, så vinduet
+  # kan udvides hvis man går fra rum til rum mens man siger det.
+  party_time_vindue_sek:
+    name: "Party Time: aktivitet tæller så mange sekunder tilbage"
+    icon: mdi:motion-sensor
+    min: 10
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+
+template:
+  - sensor:
+      # ENESTE sted "hvilke rum har aktivitet lige nu?" er defineret.
+      # Party Time læser den, og en fremtidig Tapo-vej skal læse den samme
+      # (fejlklasse #2).
+      #
+      # Listen står i STATE'en som kommasepareret streng — ikke i en attribut
+      # med et antal i state'en. Det var første udkast, og det er en fælde: en
+      # template-entity der læser sin egen attribut (`state_attr('sensor.
+      # party_rum_aktive', ...)`) læser den FORRIGE render, så state'en ville
+      # ligge én opdatering bagud. Sentinel 'ingen' frem for tom streng, fordi
+      # en tom state bliver til `unknown`.
+      - name: "Party rum aktive"
+        unique_id: party_rum_aktive
+        icon: mdi:speaker-multiple
+        state: >-
+          {% set vindue = states('input_number.party_time_vindue_sek') | float(60) %}
+          {% set kilder = {
+               'entre': 'binary_sensor.entre_valhorn_occupancy',
+               'stue': 'binary_sensor.stue_apollo_occupancy_filtered',
+               'spisestue': 'binary_sensor.spisestue_apollo_occupancy_filtered',
+               'koekken': 'binary_sensor.koekken_apollo_occupancy_filtered',
+               'depot': 'binary_sensor.depot_valhorn_occupancy' } %}
+          {% set ns = namespace(aktive=[]) %}
+          {% for navn, ent in kilder.items() %}
+            {% set s = states[ent] %}
+            {# `on` nu, ELLER faldt til off inden for vinduet. Den anden halvdel
+               er den vigtige: går man gennem køkkenet og siger det i stuen,
+               skal køkkenet stadig tælle med. `unavailable` tæller ikke —
+               en død kanal må ikke kunne påstå aktivitet. #}
+            {% if s is not none and s.state == 'on' %}
+              {% set ns.aktive = ns.aktive + [navn] %}
+            {% elif s is not none and s.state == 'off'
+                    and (now() - s.last_changed).total_seconds() <= vindue %}
+              {% set ns.aktive = ns.aktive + [navn] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.aktive | join(',') if ns.aktive | count > 0 else 'ingen' }}
+        attributes:
+          # Synlig diagnose: hvilke rum kunne overhovedet svare?
+          blinde: >-
+            {% set kilder = ['binary_sensor.entre_valhorn_occupancy',
+                             'binary_sensor.stue_apollo_occupancy_filtered',
+                             'binary_sensor.spisestue_apollo_occupancy_filtered',
+                             'binary_sensor.koekken_apollo_occupancy_filtered',
+                             'binary_sensor.depot_valhorn_occupancy'] %}
+            {{ kilder | reject('has_value') | list }}
+
+      # Dashboard-vinduet ind i stemme-kanalen. Grunden til at den findes:
+      # `sensor.koekken_stemme_kommando` er REST-pushet af shimmen og
+      # eksisterer SLET IKKE efter en HA-restart — ikke `unavailable`, væk —
+      # indtil nogen har talt i køkkenet. Et entities-kort viser derfor
+      # "Entity not found" i rød efter hver eneste reboot, hvilket ligner en
+      # defekt mikrofon. Denne sensor er yaml-defineret og findes altid, så
+      # kortet kan vise den rigtige besked: "ikke hørt siden genstart".
+      #
+      # Ingen `now()` nogen steder (fejlklasse #24) — tidspunktet formateres
+      # ud af kildens eget epoch-stempel, så sensoren kun skriver en DB-række
+      # når nogen faktisk har sagt noget.
+      - name: "Koekken stemme sidst"
+        unique_id: koekken_stemme_sidst
+        icon: mdi:microphone-message
+        state: >-
+          {% set s = states['sensor.koekken_stemme_kommando'] %}
+          {% if s is none or s.state in ['unknown', 'unavailable'] %}
+            ikke hørt siden genstart
+          {% else %}
+            {{ s.attributes.get('tekst', '') | default('hørt, men uden tekst', true) | truncate(200) }}
+          {% endif %}
+        attributes:
+          kommando: >-
+            {{ state_attr('sensor.koekken_stemme_kommando', 'kommando')
+               | default('—', true) }}
+          hvornaar: >-
+            {% set t = states('sensor.koekken_stemme_kommando') | int(0) %}
+            {{ t | timestamp_custom('%d/%m %H:%M:%S', true) if t > 0 else '—' }}
+          minutter: >-
+            {{ state_attr('sensor.koekken_stemme_kommando', 'minutter')
+               | default(0, true) | int(0) }}
+
+script:
+  # ===========================================================================
+  # KVITTERING — "jeg hørte dig"
+  # ===========================================================================
+  # User-spec 2026-09-17: "det er generelt vigtigt at der er et tydelig signal
+  # om at mine kommandoer høres ligesom vi har med timeren."
+  #
+  # Køkken-mikrofonen er husets ENESTE kommando-kanal uden svar-vej: Assist
+  # skriver et svar på telefonen, en knap flytter sig under fingeren, men et
+  # talt ord i køkkenet forsvinder ud i ingenting. Og de to kommandoer der
+  # findes er begge langsomme at SE — festen fader op, og "auto mode" er pr.
+  # definition at huset holder op med at gøre noget.
+  #
+  # FORMEN er valgt så den ikke kan forveksles med nedtællings-bursten, der
+  # BLINKER OP N gange for at fortælle et minuttal (script
+  # koekken_gestus_burst_once). Denne her går først OP og så HELT NED og
+  # tilbage — ét vink, ikke en optælling. Den skriver kun brightness:
+  # kæden kan stå i color_temp (madlavning) eller hs (hygge), og et farve-vink
+  # ville skulle gætte hvilken der skal restores — et gæt der ville efterlade
+  # kæden i det forkerte color_mode (samme fælde som B-restore i #2).
+  #
+  # 2026-09-18e: selve blinket ligger nu i køkkenets fælles signal-kanal
+  # (`script.koekken_lyskaede_signal`, packages/koekken_lyskaede.yaml), fordi
+  # tre uafhængige `mode: single`-scripts ikke udelukker hinanden — de er
+  # forskellige scripts. Kvitteringen kunne derfor starte MIDT i et
+  # nedtællings-burst, aflæse dykket som sin "base" og efterlade kæden mørk
+  # resten af nedtællingen. Kanalen er `mode: queued`: vinket venter på sin
+  # tur i stedet for at lægge sig oven i.
+  #
+  # ADVARSEL (2026-09-28, user-valgt): et DOBBELT vink når tallet kan være en
+  # -teen/-ty-forveksling. Kalibreret samme dag på køkken-mikrofonen: 16
+  # ytringer, 14 rigtige — de to fejl var 'fifteen'→50 og 'sixteen'→60, og et
+  # tidligere 'fifteen' svingede 16/18 ved replay. Stilhed foran/bagved og
+  # normaliseret niveau ændrede INTET tal (scripts/stemme_replay.py), så det
+  # er motorens akustik (8 kHz-mikrofonen taber '-n'et i -teen), ikke
+  # klipningen. Timeren startes som hørt; det dobbelte vink siger "tjek
+  # tallet" — forkert = knytnæve og sig det igen.
+  koekken_stemme_kvittering:
+    alias: "🎙️ Køkken: kvittér på et hørt ord"
+    icon: mdi:check-circle-outline
+    mode: single
+    max_exceeded: silent
+    fields:
+      advarsel:
+        description: "true = dobbelt vink (tallet kan være mishørt)."
+        example: false
+    sequence:
+      # ÉT kald, så begge vink ligger i samme kø-plads i signal-kanalen.
+      - action: script.koekken_lyskaede_signal
+        continue_on_error: true
+        data:
+          moenster: >-
+            {{ 'dobbeltvink' if advarsel | default(false) | bool(false)
+               else 'vink' }}
+
+  # ===========================================================================
+  # PARTY TIME
+  # ===========================================================================
+  party_time:
+    alias: "Stemme: Party Time (festlys i de rum der har aktivitet)"
+    icon: mdi:party-popper
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - variables:
+          aktive: >-
+            {% set s = states('sensor.party_rum_aktive') %}
+            {{ s.split(',') if s not in ['ingen', 'unknown', 'unavailable', ''] else [] }}
+          standard: ['entre', 'stue', 'spisestue', 'koekken', 'depot']
+      # Ingen rum svarede → festen skal stadig starte. Det er den ene fejl
+      # der ikke må ske: man siger "Party Time" og huset gør ingenting, fordi
+      # to batteri-sensorer tilfældigvis sov.
+      - variables:
+          rum_endelig: "{{ aktive if aktive | count > 0 else standard }}"
+      - service: script.fest_smooth_start
+        data:
+          rum: "{{ rum_endelig }}"
+      - service: logbook.log
+        data:
+          name: "Party Time"
+          message: >-
+            Startet på stemme — {{ rum_endelig | join(', ') }}
+            {{ '(aktivitet inden for '
+               ~ (states('input_number.party_time_vindue_sek') | int(60))
+               ~ ' s)' if aktive | count > 0
+               else '(INGEN rum meldte aktivitet — kørte standard-rosteret)' }}.
+            {% set blinde = state_attr('sensor.party_rum_aktive', 'blinde') or [] %}
+            {{ 'Blinde kanaler: ' ~ (blinde | join(', ')) ~ '.'
+               if blinde | count > 0 else '' }}
+
+  # ===========================================================================
+  # AUTO MODE — ren tavle
+  # ===========================================================================
+  # Rækkefølgen er ikke vilkårlig. Mood-exit'en i scene_toggle slukker lys og
+  # sætter rum til Auto; fest-stoppet gør det samme via dance_room_modes_release.
+  # Kører de i den forkerte rækkefølge, kan festens release sætte rum til Auto
+  # som mood-exit'en bagefter låser igen. Derfor: mood først, fest bagefter,
+  # og et ubetinget Auto-sweep til sidst som bagstopper for de veje ingen af
+  # dem dækker (fx rum der stod Manual FØR nogen af delene startede).
+  auto_mode:
+    alias: "Stemme: Auto Mode (slut på mood + fest, alle rum til Auto)"
+    icon: mdi:home-automation
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - variables:
+          scene: "{{ states('input_select.active_scene') }}"
+          fest: "{{ is_state('input_boolean.dance_mode', 'on') }}"
+      - if:
+          - condition: template
+            value_template: "{{ scene not in ['none', 'unknown', 'unavailable'] }}"
+        then:
+          # scene_toggle med den AKTIVE scenes navn rammer exit-grenen.
+          - service: script.scene_toggle
+            data:
+              name: "{{ scene }}"
+      - if:
+          - condition: template
+            value_template: "{{ fest }}"
+        then:
+          - service: script.fest_smooth_stop
+      # Bagstopper. Auto er den NEUTRALE tilstand — det er at slippe en
+      # blokering, ikke at påtvinge en — derfor ingen AirBnB-gate: en gæst
+      # skal også kunne sige sig ud af en lås hun ikke ved hun sidder i.
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.all_rooms_manual
+      - service: input_select.select_option
+        target:
+          entity_id: !include ../rosters/alle_rum_mode.yaml
+        data:
+          option: "Auto"
+      - service: logbook.log
+        data:
+          name: "Auto Mode"
+          message: >-
+            Ren tavle på stemme —
+            {{ ('mood "' ~ scene ~ '" lukket, ') if scene not in ['none', 'unknown', 'unavailable'] else '' }}
+            {{ 'festlys stoppet, ' if fest else '' }}alle ni rum sat til Auto.
+
+  # ---------------------------------------------------------------------------
+  # "Timer N minutes" (user-spec 2026-09-16)
+  # ---------------------------------------------------------------------------
+  koekken_timer_stemme:
+    alias: "Stemme: køkken-timer på N minutter"
+    icon: mdi:timer-outline
+    mode: queued
+    max: 3
+    description: >-
+      Eneste vej ind til timeren fra stemme. Kill-switch'en sidder HER og ikke
+      på triggeren — modsat Party Time og Auto Mode, som også har en
+      dashboard-knap der skal virke med stemmen slået fra. Dette script har
+      kun stemme-veje ind, så gaten hører i selve chokepunktet (#21).
+    fields:
+      minutter:
+        description: >-
+          1-60. Alle længder kører husets fulde køkken-timer: nedtælling i
+          lyskæden, lysalarm i rum med bevægelse, og en ét-sekunds timer på
+          telefonen når tiden er gået.
+        example: 20
+    sequence:
+      - condition: state
+        entity_id: input_boolean.voice_kommandoer_enabled
+        state: "on"
+      # Kill-switch pr. kommando-ord (packages/tapo_tuning.yaml). Her — og ikke
+      # kun på de to triggere — netop fordi dette script ER chokepunktet for
+      # ordet "timer": gestus-timeren går IKKE denne vej (den fyrer
+      # `koekken_gestus_start` direkte), så et off her rammer stemmen og lader
+      # fingrene være.
+      - condition: state
+        entity_id: input_boolean.voice_cmd_timer
+        state: "on"
+      # En gæst må ikke kunne sætte en timer på EJERENS telefon. Kameraet er
+      # ganske vist fysisk pakket væk i AirBnB (user-spec 2026-09-16), så
+      # lydvejen er umulig — men Assist-vejen er det ikke, og gaten koster
+      # intet. Samme ordlyd som koekken_gestus_start-automationen (#2).
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+
+      # ALLE længder går samme vej (user-spec 2026-09-17: "der skal ikke være
+      # forskel på timere over 10 min og under 10 min"). Her stod et `choose:`
+      # der sendte alt over 10 minutter direkte til telefonens ur — uden
+      # nedtælling, uden lysalarm og uden nogen mulighed for at annullere, fordi
+      # HA ikke kendte den timer. Vi fyrer den event kæden dokumenterer som sit
+      # indgangspunkt i stedet for at kalde dens indmad, så vi arver dens gates,
+      # dens overskriv-håndtering ("fortryd 3, sig 8") og dens ringe-til-sidst
+      # gratis. Validering af tallet hører i automationens egen 1-60-gate (#2) —
+      # en kopi her ville være et andet loft om et halvt år.
+      - event: koekken_gestus_start
+        event_data:
+          minutter: "{{ minutter | default(0) | int(0) }}"
+          kilde: stemme
+          # Ytringen ER beviset: en misset kommando står i loggen som en ANDEN
+          # ægte sætning, så tallet alene kan ikke afsløre en fejlmatch.
+          bevis: "{{ states('sensor.koekken_stemme_sidst') }}"
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Assist-sætningerne
+  # ---------------------------------------------------------------------------
+  # Triggerne gør INTET selv — de kalder scriptene ovenfor, så en fremtidig
+  # Tapo-lydsti kan kalde præcis det samme uden at adfærden kopieres.
+  - id: voice_party_time
+    alias: "Stemme: 'Party Time'"
+    description: >
+      Sig det til Assist i Companion-appen. Telefonens egen tale-til-tekst
+      klarer lyden; HA matcher kun teksten.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: conversation
+        command:
+          - "party time"
+          - "partytime"
+    condition:
+      - condition: state
+        entity_id: input_boolean.voice_kommandoer_enabled
+        state: "on"
+      # Ordet selv kan slås fra uden at tage de to andre med. Gaten sidder på
+      # TRIGGEREN og ikke i `script.party_time`, fordi scriptet også er en
+      # dashboard-knap der skal virke med stemmen slået fra.
+      - condition: state
+        entity_id: input_boolean.voice_cmd_party_time
+        state: "on"
+      # Familie-rutine — påtving den aldrig på en gæst.
+      - condition: template
+        value_template: >-
+          {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+    action:
+      # script.turn_on, IKKE `service: script.party_time`. Et direkte kald
+      # BLOKERER til scriptet er færdigt, og fest_smooth_start venter op til
+      # 2 minutter på at terrasse-pæren vågner efter strøm — så Assist ville
+      # stå og tygge i to minutter før den svarede. Svaret afhænger ikke af
+      # resultatet, så det skal afsendes med det samme.
+      - service: script.turn_on
+        target:
+          entity_id: script.party_time
+      - set_conversation_response: >-
+          {% set s = states('sensor.party_rum_aktive') %}
+          {{ 'Festlys i ' ~ s.replace(',', ', ')
+             if s not in ['ingen', 'unknown', 'unavailable', '']
+             else 'Festlys i hele huset — ingen rum meldte aktivitet.' }}
+
+  - id: voice_auto_mode
+    alias: "Stemme: 'Auto Mode'"
+    description: >
+      Ren tavle. Bevidst UDEN house_mode-gate: at slippe alle rum til Auto er
+      den neutrale handling, og en gæst skal også kunne komme ud af en lås.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: conversation
+        command:
+          - "auto mode"
+          - "automode"
+    condition:
+      - condition: state
+        entity_id: input_boolean.voice_kommandoer_enabled
+        state: "on"
+      # Samme sted som Party Time: på triggeren, ikke i scriptet — Auto Mode er
+      # også en knap, og en gæst skal kunne trykke sig ud af en lås selv om
+      # husets ejer har slået det talte ord fra.
+      - condition: state
+        entity_id: input_boolean.voice_cmd_auto_mode
+        state: "on"
+    action:
+      # Samme grund som ovenfor: mood-exit'en har egne fades.
+      - service: script.turn_on
+        target:
+          entity_id: script.auto_mode
+      - set_conversation_response: "Alle rum er tilbage på auto."
+
+  - id: voice_koekken_timer
+    alias: "Stemme: 'Timer N minutes'"
+    description: >
+      Kun engelske talord (user-spec 2026-09-16). Verificeret 2026-09-16 at
+      speech-to-phrase' ordforråd indeholder one…sixty, minute, minutes og
+      timer, så sætningen KAN genkendes — men det er ikke eftervist at det er
+      denne trigger der lagde dem der (HA's indbyggede timer-intents har dem
+      også). Tilføjer du et talord der ikke allerede er i ordforrådet, så
+      verificér i
+      /share/speech-to-phrase/train/en_US-rhasspy/graph/words.txt.
+      Filen har formatet "ord id" pr. linje — grep uden -x, ellers matcher
+      intet nogensinde.
+
+      "minute|minutes" er PÅKRÆVET, ikke valgfrit. Målt 2026-09-16 på
+      køkken-mikrofonen: tre gange "timer thirteen minutes" gav fire
+      transskriptioner, fordi VAD-vinduerne overlapper og et afkortet vindue
+      blev til 'timer one'. Talordet alene er altså ikke til at stole på —
+      det afsluttende "minute(s)" er det der beviser at hele sætningen er
+      hørt, og det er præcis den betingelse fragmentet ikke kan opfylde.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: conversation
+        command:
+          - >-
+            timer (one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|twenty|twenty five|thirty|thirty five|forty|forty five|fifty|fifty five|sixty) (minute|minutes)
+    condition:
+      # Autoriteten er script.koekken_timer_stemme, som har PRÆCIS de samme to
+      # gates (#21 — kill-switch'en skal sidde på hver vej ind). De står også
+      # her udelukkende for at Assist ikke svarer "timer sat" når intet skete.
+      # Ændres den ene, skal den anden med.
+      - condition: state
+        entity_id: input_boolean.voice_kommandoer_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.voice_cmd_timer
+        state: "on"
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+    action:
+      # "twenty five" summeres til 25, "forty five" til 45. Ingen
+      # list-comprehensions i HA-Jinja, derfor namespace + løkke.
+      - variables:
+          m: >-
+            {% set W = {'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,
+                        'seven':7,'eight':8,'nine':9,'ten':10,'eleven':11,
+                        'twelve':12,'thirteen':13,'fourteen':14,'fifteen':15,
+                        'twenty':20,'thirty':30,'forty':40,'fifty':50,
+                        'sixty':60} %}
+            {% set ns = namespace(t=0) %}
+            {% for p in (trigger.sentence | lower).split() %}
+            {% if p in W %}{% set ns.t = ns.t + W[p] %}{% endif %}
+            {% endfor %}
+            {{ ns.t }}
+      - service: script.koekken_timer_stemme
+        data:
+          minutter: "{{ m | int(0) }}"
+      - set_conversation_response: >-
+          Timer på {{ m | int(0) }} minutter.
+
+  - id: voice_koekken_timer_stop
+    alias: "Stemme: 'Stop the timer'"
+    description: >
+      Assist-siden af annulleringen, så de to stemme-kanaler ikke driver fra
+      hinanden (#2). Begge ender i script.koekken_gestus_kvittering, præcis som
+      knytnæven og Lovelace-knappen.
+
+      Sætningerne er ordret dem speech-to-phrase allerede er trænet på
+      (sentences.yaml:1072 + :1074), så køkken-mikrofonen kan udtale det samme
+      som telefonen. HA's INDBYGGEDE timer-intents kender kun Assist-skabte
+      timere og ville aldrig kunne røre timer.koekken_gestus — derfor er en
+      egen trigger nødvendig, ikke bare pænere.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: conversation
+        command:
+          - "(cancel|stop) [the|my] timer"
+          - "(cancel|stop) all [[of ](the|my)] timers"
+    condition:
+      # Samme to gates som script.koekken_timer_stemme (#21). Ændres den ene,
+      # skal den anden med.
+      - condition: state
+        entity_id: input_boolean.voice_kommandoer_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.voice_cmd_timer
+        state: "on"
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+    action:
+      - variables:
+          # Læs FØR kvitteringen, ellers er begge flag ryddet når vi svarer.
+          ringer: >-
+            {{ states('input_text.koekken_gestus_alarm').startswith('aktiv') }}
+          taeller: >-
+            {{ states('input_text.koekken_gestus_nedtael').startswith('aktiv') }}
+      - action: script.koekken_gestus_kvittering
+      - set_conversation_response: >-
+          {{ 'Alarmen er stoppet.' if ringer
+             else ('Nedtællingen er stoppet.' if taeller
+                   else 'Der kører ingen køkken-timer.') }}
+
+  # ---------------------------------------------------------------------------
+  # Køkken-kameraets mikrofon
+  # ---------------------------------------------------------------------------
+  - id: voice_koekken_mikrofon
+    alias: "Stemme: talt kommando fra køkken-kameraet"
+    description: >
+      Shimmen (gesture_frame_shim ≥ 0.7.0) klipper ytringer ud af kameraets
+      RTSP-lydspor, spørger speech-to-phrase og skriver resultatet her. Den
+      sender KUN de tre sætninger vi selv har defineret videre — motoren kender
+      også alle HA's indbyggede intents, så støj transskriberes altid til noget
+      gyldigt.
+
+      Handlingen ligger i de samme scripts som Assist-vejen bruger, så de to
+      kanaler ikke kan drive fra hinanden (fejlklasse #2).
+
+      Sensoren er REST-pushet og overlever ikke en HA-restart; den forsvinder
+      helt i stedet for at blive `unavailable`. Derfor er friskheds-tjekket på
+      selve tallet (epoch) og ikke på `last_changed`, som nulstilles ved boot.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: sensor.koekken_stemme_kommando
+    condition:
+      # Et epoch-stempel skrevet af shimmen. 20 s er rundhåndet nok til at
+      # rumme STT-latensen (målt median ~1,3 s, værst ~4,6 s) og stadig
+      # afvise alt der stammer fra en genstart eller et gen-push.
+      - condition: template
+        value_template: >-
+          {{ (now().timestamp() - (trigger.to_state.state | int(0))) | abs < 20 }}
+      - condition: state
+        entity_id: input_boolean.voice_kommandoer_enabled
+        state: "on"
+      # Mikrofonen er under samme forbud som linsen i AirBnB.
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+    action:
+      - variables:
+          kommando: "{{ trigger.to_state.attributes.get('kommando', '') }}"
+          minutter: "{{ trigger.to_state.attributes.get('minutter', 0) | int(0) }}"
+          hoert: "{{ trigger.to_state.attributes.get('tekst', '') }}"
+          # Kill-switchen pr. ord slår ikke logningen fra. Det er med vilje: er
+          # et ord slået fra, vil man stadig kunne se at det BLEV hørt — ellers
+          # ser en tavs mikrofon ud som en defekt mikrofon.
+          # -teen/-ty (og teen↔teen): de tal motoren målbart forveksler.
+          # 17-19 er med fordi et 'fifteen' blev til 18 ved replay; 70-90
+          # findes ikke (loftet er 60), så dén retning kan ikke ramme.
+          tvetydig: >-
+            {{ kommando == 'timer'
+               and (13 <= minutter <= 19 or minutter in [30, 40, 50, 60]) }}
+          slaaet_fra: >-
+            {% set m = {'party_time': 'input_boolean.voice_cmd_party_time',
+                        'auto_mode': 'input_boolean.voice_cmd_auto_mode',
+                        'timer': 'input_boolean.voice_cmd_timer',
+                        'stop_timer': 'input_boolean.voice_cmd_timer'} %}
+            {{ kommando in m and not is_state(m[kommando], 'on') }}
+      - action: logbook.log
+        data:
+          name: "Køkken-mikrofon"
+          message: >-
+            hørte {{ hoert }} → {{ kommando }}{{ ' (SLÅET FRA — intet udført)'
+            if slaaet_fra else '' }}{{ ' (tvetydigt tal — dobbelt vink)'
+            if tvetydig and not slaaet_fra else '' }}
+          entity_id: sensor.koekken_stemme_kommando
+      # Kvitteringen ligger FØR `choose:` og uden for den, så hvert ord — også
+      # et fremtidigt — arver den uden at signalet bliver kopieret ind i fire
+      # grene der så driver fra hinanden (#2). Et ord der er slået fra får
+      # bevidst INGEN kvittering: kvitteringen betyder "jeg gør det nu", ikke
+      # "jeg hørte lyden" — logbogs-linjen ovenfor er der til det.
+      # script.turn_on og ikke et blokerende kald: vinket tager ~0,5 s, og
+      # handlingen må ikke vente på lyset.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ not slaaet_fra
+                 and kommando in ['party_time', 'auto_mode', 'timer', 'stop_timer'] }}
+        then:
+          - action: script.turn_on
+            target:
+              entity_id: script.koekken_stemme_kvittering
+            data:
+              variables:
+                advarsel: "{{ tvetydig }}"
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ kommando == 'party_time' }}"
+              - condition: state
+                entity_id: input_boolean.voice_cmd_party_time
+                state: "on"
+            sequence:
+              # script.turn_on, ikke et direkte kald: fest_smooth_start venter
+              # op til 2 minutter på terrasse-pæren, og den ventetid må ikke
+              # holde automationen (mode: single) optaget imens.
+              - action: script.turn_on
+                target:
+                  entity_id: script.party_time
+          - conditions:
+              - condition: template
+                value_template: "{{ kommando == 'auto_mode' }}"
+              - condition: state
+                entity_id: input_boolean.voice_cmd_auto_mode
+                state: "on"
+            sequence:
+              - action: script.turn_on
+                target:
+                  entity_id: script.auto_mode
+          - conditions:
+              - condition: template
+                value_template: "{{ kommando == 'timer' and minutter > 0 }}"
+            sequence:
+              - action: script.koekken_timer_stemme
+                data:
+                  minutter: "{{ minutter }}"
+
+          # "stop the timer" — samme indgang som knytnæven (#2). Scriptet fyrer
+          # husets kvitterings-event, så stemmen arver hele afleveringen: stop
+          # af alarmen hvis den ringer, ellers annullering af nedtællingen.
+          # Kill-switch'en er `voice_cmd_timer` og ikke et nyt flag: den ejer
+          # ordet "timer", og er stemme-timeren slået fra, findes der ingen
+          # stemme-sat timer at annullere. En annullering kan kun de-eskalere,
+          # så den er den sikre retning at lade slippe igennem. Siden
+          # 2026-09-17 ejer HA nedtællingen uanset længde, så annulleringen
+          # dækker nu ALLE timere — også en på en time.
+          - conditions:
+              - condition: template
+                value_template: "{{ kommando == 'stop_timer' }}"
+              - condition: state
+                entity_id: input_boolean.voice_cmd_timer
+                state: "on"
+            sequence:
+              - action: script.koekken_gestus_kvittering

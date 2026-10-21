@@ -1,0 +1,1050 @@
+# =============================================================================
+# Thread / OTBR watchdog (2026-06-26; B51-refaktor 2026-07-14; "giv aldrig op"
+# 2026-10-09)
+# =============================================================================
+# Problem: Sonoff ZBDongle-E (Thread-RCP på NUC'ens USB) kan miste mesh'et →
+# bad-spots, dør-sensorer og resten af Thread forsvinder.
+#
+# 2026-10-09 — KATASTROFE-NATTEN 08/10 → 09/10 (user-spec: "det her må aldrig
+# ske igen … jeg accepterer ikke at systemet bare giver op"):
+#   - OTBR'en stod som ENSOM leder af sin egen partition i 9 t (routerCount 1),
+#     mens resten af mesh'et kørte videre i en anden. Den hørte de andre
+#     ("Different partition"), men de hørte den ikke godt nok til at flette
+#     (NoAck, LinkMarginLow). Hver OTBR-genstart og hvert chip-reset lavede bare
+#     en NY ensom partition.
+#   - Den gamle vagt kørte sin stige ÉN gang (21:29-21:42), og daemonen pushede
+#     "✅ self-healet" fordi CHIPPEN svarede — mesh'et var stadig delt. Så sluttede
+#     alt: ingen backstop, ingen gentagelse, beslutning #2b kun én gang pr. udfald.
+#   - Kun et fysisk genplug (power-on-reset) 06:27 samlede nettet (06:34).
+#
+# NY ARKITEKTUR:
+#   1) DETEKTOR fra border-routerens EGET perspektiv: sensor.otbr_routere (OTBR
+#      REST /node, 60 s) → binary_sensor.thread_border_router_nede = OTBR'en er
+#      afskåret (routerCount ≤ 1, ikke leader/router/child, eller REST død) OG
+#      et enheds-bevis (bad-spots eller hele vidne-nettet væk). Tre bad-pærer
+#      alene er IKKE et border-router-problem — en OTBR-genstart på et raskt net
+#      er skadelig (den re-former partitionen; 09/10 07:27 ville den gamle vagt
+#      have gjort det fordi ÉN spot var faldet af et net med 8 routere).
+#   2) STIGE der ALDRIG giver op: automation thread_otbr_aldrig_opgiv (flanke +
+#      /2-min-backstop + HA-start) kalder script.thread_otbr_eskaler så længe
+#      border-routeren er nede. Kurene roterer: TX-boost → chip-reset (daemon,
+#      flasher RTS/DTR + launch) → USB-genplug (sysfs-port disable/enable) → …
+#      Pause før forsøg n = min(10·(n-1) min, loft-slider). Ingen slutning.
+#   3) Pushes der NÅR FREM: ved første forsøg, efter en fuld runde (forsøg 3) og
+#      derefter max hver 6. t; "✅ oppe igen" kun når OTBR'en faktisk har
+#      routere igen (ikke når chippen svarer).
+#
+# HÅRD GRÆNSE (målt 2026-10-09): NUC'ens root-hub har INGEN port-strømstyring
+# (wHubCharacteristics 0x000a) → ingen software kan give donglen et ægte
+# power-on-reset. USB-genplugget er en logisk frakobling (en hub med per-port
+# power switching ville gøre det ægte — user køber den ikke, 2026-10-09).
+#
+# UDLØSEREN 08/10 var ikke donglen: stue-spotsene (bro-routere) blev trukket
+# ud, badet faldt af, og den gamle PÆRE-baserede vagt pin-resettede OTBR'en →
+# ensom partition. Derfor fyrer stigen KUN på routerCount, og en enkelt
+# hængende pære (zombie-router) kickes af scripts/thread_zombie_kick.py.
+#
+# STRØM-VIDNE (2026-07-01, uændret): bad-spots kan forsvinde fordi badet er
+# strømløst (gæst slukker vægkontakten). binary_sensor.badevaerelse_bad_strom_ok
+# (Zigbee-spot 4/5 på samme strøm) skelner — se pære-detektoren nederst.
+#
+# Tunables (Indstillinger → Thread): nede-tærskel, settle (pære-vejen), loft
+# for pausen mellem kure, on/off. FÆLLES killswitch med selfheal-daemonen:
+# input_boolean.thread_watchdog_enabled — condition på HVER vej (#21).
+# =============================================================================
+
+input_boolean:
+  thread_watchdog_enabled:
+    name: "Thread watchdog aktiv"
+    icon: mdi:radar
+
+  # 2026-09-03 — spor at emergency-lyset ejer spot_4/5 lige nu, så sluk-vejen
+  # ved Thread-genkomst kun rører DET vi tændte. Fase-enforceren i
+  # badevaerelse_faser.yaml er allerede gated med matter_spots_ok=on, så mens
+  # Thread er nede har den ikke rørt spot_4/5 — vi er single-owner (#1).
+  bad_zigbee_nodlys_aktiv:
+    name: "Bad Zigbee-nødlys aktivt (Thread nede)"
+    icon: mdi:lightbulb-alert
+
+input_number:
+  # Hvor længe border-routeren skal være afskåret (delay_on på
+  # binary_sensor.thread_border_router_nede) — og bad-spots væk (pære-
+  # detektoren) — før der handles. Skal være > en normal OTBR-genstart, der
+  # altid starter som ensom leder i ~1-7 min → default 3 min ER for kort til en
+  # OTBR-start alene, men nede-sensoren kræver OGSÅ at enhederne mangler.
+  thread_watchdog_down_minutes:
+    name: "Thread watchdog: nede-tærskel (min)"
+    icon: mdi:timer-alert
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-07-14 (B51): SETTLE-VINDUE. Efter detektor-trigger venter vi op til
+  # settle-minutter på at nettet stabiliseres (self-heal, strøm-tab bekræftes,
+  # eller timeout). Vinduet slår hurtigt tilbage til beslutning hvis
+  # matter_spots_ok kommer op ELLER bad_strom_ok falder — kun ægte hang betaler
+  # den fulde ventetid. Default 30 min = >>> gammel 5 min re-arm, mindre end
+  # den observerede 90 min self-heal-hale, men længe nok til at fange
+  # AirBnB-gæst-flap-clusters uden at eskalere for tidligt. Slider mode:box
+  # så bruger kan skrive 45/60 hvis han ser ny hale.
+  thread_watchdog_settle_minutes:
+    name: "Thread watchdog: settle-vindue (min)"
+    icon: mdi:timer-sand
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+  # LOFT på pausen mellem to kure (2026-10-09: var en cooldown efter ÉN
+  # genstart, hvorefter vagten gav op). Pausen før forsøg n er min(10·(n-1),
+  # loft) min: 0, 10, 20, 30, 40, 45, 45 … så længe nettet er nede.
+  thread_watchdog_cooldown_minutes:
+    name: "Thread watchdog: pause mellem kure, loft (min)"
+    icon: mdi:timer-sand-complete
+    min: 5
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Thread-kortet (sensor.thread_topologi): hvor tit scripts/otbr_rcp_stats.py
+  # spørger routerne over luften (meshdiag, ~15-20 udvekslinger pr. måling).
+  # 15/10: 30 → 4 min — RCP-resets/t var ens ved 2 og 30 min (p50 3).
+  # Trin på 2: daemonen tikker hvert 2. min, så et ulige tal rundes op.
+  thread_kort_maaling_minutter:
+    name: "Thread-kort: mål nettet hvert (min)"
+    icon: mdi:lan-check
+    min: 2
+    max: 60
+    step: 2
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Runtime-tæller (RUNTIME_NUMBERS i helpers_export.py): antal kure i den
+  # igangværende nedetid. Nulstilles KUN af thread_otbr_genoprettet.
+  thread_watchdog_forsoeg:
+    name: "Thread watchdog: forsøg i denne nedetid"
+    icon: mdi:counter
+    min: 0
+    max: 9999
+    step: 1
+    mode: box
+
+input_text:
+  thread_watchdog_sidste_kur:
+    name: "Thread watchdog: seneste kur"
+    icon: mdi:auto-fix
+    max: 40
+
+input_datetime:
+  thread_watchdog_last_restart:
+    name: "Thread watchdog sidste kur"
+    has_date: true
+    has_time: true
+  # Starten af den igangværende nedetid (sat ved forsøg 1) — til "nede siden"
+  # i pushes og "oppe efter X t" i genoprettet-pushen.
+  thread_watchdog_nede_siden:
+    name: "Thread watchdog nede siden"
+    has_date: true
+    has_time: true
+  # 2026-07-02 (B47): dedupe af "badet er strømløst"-pushen — en flappende
+  # strøm/availability-sensor må ikke spamme telefonen (max 1 push/time).
+  thread_watchdog_last_stromlos_push:
+    name: "Thread watchdog sidste strømløs-push"
+    has_date: true
+    has_time: true
+  # 2026-07-14 (B51): dedupe af "træk donglen ud"-pushen. Incident: gæst
+  # cyklede badets vægkontakt gentagne gange → watchdog kørte fuld recovery-
+  # kæde pr. cyklus (cooldown 20 min) → 2 hård-hang-pushes på én formiddag,
+  # mens familien var væk og intet kunne gøre. Max 1 push pr. 6 timer.
+  thread_watchdog_last_hard_push:
+    name: "Thread watchdog sidste status-push"
+    has_date: true
+    has_time: true
+  # 2026-08-01: dedupe af "cykl vægkontakten"-pushen (BESLUTNING #2b nedenfor).
+  thread_watchdog_last_paerer_push:
+    name: "Thread watchdog sidste pære-hang-push"
+    has_date: true
+    has_time: true
+  # B234 (14/10): dedupe af "enhed faldet af Thread"-pushen (max 1 pr. 12 t).
+  thread_watchdog_last_noder_push:
+    name: "Thread watchdog sidste enhed-væk-push"
+    has_date: true
+    has_time: true
+
+# =============================================================================
+# THREAD-VIDNE (2026-08-01) — "er selve Thread-nettet i live?"
+# =============================================================================
+# 💡 De TRE KAJPLATS-bad-spots (Matter node 75/206/234) er husets ENESTE
+# netdrevne Thread-ROUTERE. Alt andet Matter-udstyr er batteridrevne sleepy end
+# devices (MYGGSPRAY/MYGGBETT/TIMMERFLOTTE), som router GENNEM dem. Falder de tre
+# pærer af, mister de fjerneste SED'er deres rute og forsvinder som dominobrikker
+# — 08-01 røg entré-VALLHORN (27), baddør (22), terrassedør (37) og TIMMERFLOTTE
+# (434) med, mens kun de tre noder tættest på donglen (38 hoveddør, 263/435
+# bad-PIR'er) overlevede. Det ligner et OTBR-kollaps, men er det IKKE: donglen og
+# RCP'en har det fint, og en RCP-reset hjælper derfor ikke det mindste.
+#
+# Vidnet: er MINDST én anden Thread-node stadig available mens spots er nede,
+# så lever nettet → årsagen er pærerne selv (de skal have en strøm-cyklus på
+# vægkontakten), ikke donglen. `unavailable` er den eneste sande "væk"-tilstand
+# (fejlklasse #9) — `unknown` tælles ikke som levende.
+template:
+  - binary_sensor:
+      - name: "Thread net i live"
+        unique_id: thread_net_i_live
+        device_class: connectivity
+        icon: mdi:access-point-network
+        # 2026-09-03h: de tre oprindelige vidner er alle SLEEPY END DEVICES, og
+        # HA's subscription-timeout for en SED er ~30-40 min. Målt 09-03: hele
+        # Thread-nettet døde 16:07:16, men parasoll_hoveddoer stod available til
+        # 16:41:27 og inde_1 til 16:30:30 — vidnet sagde altså "nettet lever" i
+        # 34 minutter EFTER at alt var dødt, og watchdog'en stillede derfor den
+        # forkerte diagnose ("det er pærerne, ikke donglen") i præcis det vindue
+        # hvor den træffer sin beslutning. Et vidne der ikke kan melde død
+        # hurtigere end udfaldet varer, er ikke et vidne (slægtning til #14).
+        #
+        # `light.entre_loft` er husets FJERDE Thread-router (node 461, netdrevet,
+        # egen strømkreds, andet rum) og meldte unavailable 16:07:15 — 0,8 s FØR
+        # den første bad-spot. En router falder med det samme. Derfor er den en
+        # VETO-kanal, ikke endnu et OR-led: er den også væk, er alle fire routere
+        # væk, og så er det border-routeren, ikke badet. Forbehold: entré-pæren
+        # sidder på en vægkontakt (permanent faktum), så et manuelt sluk kan give
+        # et falsk "nettet er dødt" — det koster i værste fald ét cooldown-gatet
+        # reset-forsøg, mod de 34 min forkert diagnose vi havde før.
+        state: >
+          {% set vidner = ['binary_sensor.parasoll_hoveddoer',
+                           'binary_sensor.badevaerelse_inde_1_occupancy',
+                           'binary_sensor.badevaerelse_inde_2_occupancy'] %}
+          {% set seds_i_live = vidner | select('is_state', 'unavailable')
+                               | list | count < vidner | count %}
+          {{ seds_i_live and not is_state('light.entre_loft', 'unavailable') }}
+        attributes:
+          levende: >
+            {% set vidner = ['light.entre_loft',
+                             'binary_sensor.parasoll_hoveddoer',
+                             'binary_sensor.badevaerelse_inde_1_occupancy',
+                             'binary_sensor.badevaerelse_inde_2_occupancy'] %}
+            {{ vidner | reject('is_state', 'unavailable')
+               | map('replace', 'binary_sensor.', '') | map('replace', 'light.', '')
+               | list | join(', ') }}
+
+  - binary_sensor:
+      # on = border-routeren er afskåret fra mesh'et. KRÆVER to uafhængige
+      # beviser: OTBR'ens eget blik (ensom/detached/REST død) OG at enhederne
+      # faktisk mangler (bad-spots eller hele vidne-nettet). Ét REST-hikke eller
+      # én OTBR-genstart (der ALTID starter som ensom leder i ~1-7 min) må ikke
+      # starte stigen — derfor også delay_on = nede-tærsklen.
+      - name: "Thread border-router nede"
+        unique_id: thread_border_router_nede
+        device_class: problem
+        icon: mdi:access-point-network-off
+        delay_on: "{{ states('input_number.thread_watchdog_down_minutes') | int(3) * 60 }}"
+        state: >
+          {% set r = states('sensor.otbr_routere') %}
+          {% set st = state_attr('sensor.otbr_routere', 'state') %}
+          {% set afskaaret = r in ['unknown', 'unavailable']
+                             or st not in ['leader', 'router', 'child']
+                             or (r | int(0) <= 1 and st != 'child') %}
+          {% set enheder_vaek = is_state('binary_sensor.badevaerelse_matter_spots_ok', 'off')
+                                or is_state('binary_sensor.thread_net_i_live', 'off') %}
+          {{ afskaaret and enheder_vaek }}
+        attributes:
+          otbr: >
+            {{ state_attr('sensor.otbr_routere', 'state') }}, {{ states('sensor.otbr_routere') }} routere
+      # (B234-sensoren selv står som trigger-entry nederst i template-listen.)
+      # B234 (14/10): Matter-noder som matter-serveren ser som offline MENS
+      # border-routeren har sit mesh (ellers ejer stigen ovenfor sagen). Kilde:
+      # sensor.otbr_rcp_resets_1t (scripts/otbr_rcp_stats.py, daemonen hvert
+      # 2. min). 13-14/10: GRILLPLATS-pluggene sad ~14 t i en ANDEN partition
+      # ("Different partition (peer:870840965)" i otbr-loggen, NoAck på OTBR'ens
+      # rammer) — software heler det ikke (permanente fakta: kun et genplug).
+      # 30 min: en pære der genstarter eller en pære der trækkes ud et øjeblik
+      # skal ikke give push.
+      - name: "Thread enheder væk"
+        unique_id: thread_enheder_vaek
+        device_class: problem
+        icon: mdi:lan-disconnect
+        delay_on:
+          minutes: 30
+        state: >
+          {% set s = states.sensor.otbr_rcp_resets_1t %}
+          {{ s is not none
+             and (now() - s.last_updated).total_seconds() < 900
+             and (s.attributes.offline_noder | default([]) | count) > 0
+             and is_state('binary_sensor.thread_border_router_nede', 'off') }}
+        attributes:
+          noder: "{{ state_attr('sensor.otbr_rcp_resets_1t', 'offline_noder') | default([], true) | join(', ') }}"
+          split_minutter: "{{ state_attr('sensor.otbr_rcp_resets_1t', 'split_minutter') | int(0) }}"
+  # B234: Thread-helbred som tal, fodret af scripts/otbr_rcp_stats.py (daemonen,
+  # hvert 2. min) via eventet otbr_rcp_stats. Trigger-sensor, IKKE POST
+  # /api/states: en POST'et entity er FRAVÆRENDE efter hver restart
+  # (scripts_api.md); denne overlever med sin sidste værdi.
+  - trigger:
+      - platform: event
+        event_type: otbr_rcp_stats
+    sensor:
+      - name: "OTBR RCP-resets 1t"
+        unique_id: otbr_rcp_resets_1t
+        icon: mdi:access-point-network-off
+        unit_of_measurement: "resets"
+        state_class: measurement
+        state: "{{ trigger.event.data.resets | int(0) }}"
+        attributes:
+          resets_10m: "{{ trigger.event.data.resets_10m | default(0) }}"
+          seneste: "{{ trigger.event.data.seneste | default(none) }}"
+          otbr_uptime_t: "{{ trigger.event.data.otbr_uptime_t | default(none) }}"
+          split_peer: "{{ trigger.event.data.split_peer | default('') }}"
+          split_minutter: "{{ trigger.event.data.split_minutter | default(0) }}"
+          offline_noder: "{{ trigger.event.data.offline_noder | default([]) }}"
+      # 15/10 (user: "status thread siden siger spot 2 er nede. not true"):
+      # router-rækkerne viste lampens tænd/sluk, og stue-spotsene er ude af
+      # recorderen (B227) → ingen historik for HVORNÅR en router var væk. Denne
+      # er net-status pr. enhed fra daemonen: Matter-serveren først, OTBR'ens
+      # mesh-tabel som vidne ("i nettet, Matter svarer ikke" = zombie). State =
+      # antal routere der IKKE svarer; mangler listen (matter-WS fejlede), står
+      # den sidste værdi. Ingen tidsstempler i attributterne (#24).
+      - name: "Thread routere væk"
+        unique_id: thread_routere_vaek
+        icon: mdi:router-network-wireless
+        state_class: measurement
+        state: >
+          {% set r = trigger.event.data.routere | default(none) %}
+          {% if r is none %}{{ this.state | default(0) }}
+          {% else %}{{ r | rejectattr('status', 'in', ['forbundet', 'ikke i brug']) | list | count }}{% endif %}
+        attributes:
+          routere: "{{ trigger.event.data.routere | default(this.attributes.routere | default([])) }}"
+          sovende: "{{ trigger.event.data.sovende | default(this.attributes.sovende | default([])) }}"
+      # 15/10 (user: "tegn live nettet på thread på status siden, så jeg kan se
+      # ø'er og forbindelser"): hele partitionen fra OTBR'ens meshdiag —
+      # routere, links (kvalitet 1-3) og børn, + Matter-noder UDEN for
+      # partitionen. Tegnes af www/thread-net-card.js. State = routere i
+      # partitionen. Ude af recorderen (link-kvaliteterne skifter hvert tick;
+      # historikken bor i sensor.thread_routere_vaek).
+      - name: "Thread topologi"
+        unique_id: thread_topologi
+        icon: mdi:graph-outline
+        state: >
+          {% set t = trigger.event.data.topologi | default(none) %}
+          {{ t.routere | count if t is not none else this.state | default('unknown') }}
+        attributes:
+          routere: "{{ (trigger.event.data.topologi | default({})).routere | default(this.attributes.routere | default([])) }}"
+          uden_for: "{{ (trigger.event.data.topologi | default({})).uden_for | default(this.attributes.uden_for | default([])) }}"
+          maalt: "{{ (trigger.event.data.topologi | default({})).maalt | default(this.attributes.maalt | default(0)) }}"
+          split_peer: "{{ trigger.event.data.split_peer | default('') }}"
+          split_minutter: "{{ trigger.event.data.split_minutter | default(0) }}"
+
+# =============================================================================
+# BORDER-ROUTERENS EGET BLIK (2026-10-09) — OTBR REST /node hvert minut.
+# =============================================================================
+# routerCount = antal routere i den partition OTBR'en selv sidder i. 09/10 kl.
+# 07 (raskt): leader, 8 routere. Natten før: ensom leder = 1. /node indeholder
+# INGEN nøgler (dem har kun /node/dataset/active — rør den aldrig herfra).
+rest:
+  - resource: http://core-openthread-border-router:8081/node
+    scan_interval: 60
+    timeout: 10
+    sensor:
+      - name: "OTBR routere"
+        unique_id: otbr_routere
+        icon: mdi:router-network
+        state_class: measurement
+        value_template: "{{ value_json.routerCount | int(0) }}"
+        json_attributes:
+          - state
+          - leaderData
+
+# Ren DTR/RTS-puls (legacy-fallback når selfheal-daemonen er død) + det
+# digitale USB-genplug. Begge kører i HA-core-containeren og rører KUN
+# Sonoff-stikket (VID:PID 10c4:ea60), aldrig ZBT-2. Kalderen stopper addon'et
+# FØR (porten skal være fri) og starter det bagefter.
+shell_command:
+  otbr_rcp_reset: "python3 /config/scripts/otbr_rcp_reset.py"
+  otbr_usb_replug: "python3 /config/scripts/otbr_usb_replug.py"
+
+# =============================================================================
+# STIGEN — én kur pr. kald, aldrig en slutning (2026-10-09)
+# =============================================================================
+# Kaldes af automation thread_otbr_aldrig_opgiv. Tælleren
+# (input_number.thread_watchdog_forsoeg) nulstilles KUN af
+# thread_otbr_genoprettet når OTBR'en har haft routere i 10 min. Kur-rækkefølge
+# (roterer for evigt):
+#   1 TX-boost   — ikke-forstyrrende: daemonen hæver RCP'ens sendestyrke
+#                  (addon'et tvinger 6 dBm ved hver start). 08/10: mesh'et hørte
+#                  OTBR'en for svagt til at flette (NoAck, LinkMarginLow).
+#   2 chip-reset — daemonen: flasher RTS/DTR + launch app (+ TX-boost bagefter).
+#   3 USB-genplug — port disable/enable via sysfs; ny USB-opregning af donglen,
+#                  CP2102N-broen nulstilles (+ TX-boost bagefter).
+script:
+  thread_otbr_eskaler:
+    alias: "Thread watchdog: næste kur (giver aldrig op)"
+    icon: mdi:auto-fix
+    description: >
+      Kører den næste kur i rotationen TX-boost → chip-reset → USB-genplug,
+      tæller forsøget og pusher ved forsøg 1, 3 og derefter max hver 6. time.
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - condition: state
+        entity_id: input_boolean.thread_watchdog_enabled
+        state: "on"
+      - variables:
+          n: "{{ states('input_number.thread_watchdog_forsoeg') | int(0) + 1 }}"
+          kur: "{{ ['txboost', 'chip', 'usb'][(n - 1) % 3] }}"
+          daemon_ok: "{{ is_state('binary_sensor.otbr_selfheal_daemon_ok', 'on') }}"
+          kurnavn: >-
+            {{ {'txboost': 'TX-boost', 'chip': 'chip-reset', 'usb': 'USB-genplug'}[kur] }}
+      # Stempel + tæller FØR første handling: pausen gælder også hvis scriptet
+      # dør midtvejs eller HA genstarter.
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.thread_watchdog_forsoeg
+        data:
+          value: "{{ [n, 9999] | min }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.thread_watchdog_last_restart
+        data:
+          timestamp: "{{ now().timestamp() | int }}"
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.thread_watchdog_sidste_kur
+        data:
+          value: "{{ kurnavn }}"
+      - if:
+          - condition: template
+            value_template: "{{ n == 1 }}"
+        then:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.thread_watchdog_nede_siden
+            data:
+              timestamp: "{{ now().timestamp() | int }}"
+      - service: logbook.log
+        data:
+          name: "Thread watchdog"
+          message: >-
+            Border-router afskåret ({{ state_attr('binary_sensor.thread_border_router_nede', 'otbr') }})
+            → forsøg {{ n }}: {{ kurnavn }}{{ '' if daemon_ok else ' (daemon død → legacy-puls)' }}.
+          entity_id: binary_sensor.thread_border_router_nede
+
+      # Push FØR kuren — et chip-reset tager minutter, og nyheden må ikke vente.
+      - if:
+          - condition: template
+            value_template: >-
+              {% set sidst = state_attr('input_datetime.thread_watchdog_last_hard_push', 'timestamp') | float(0) %}
+              {{ n in [1, 3] or (n > 3 and now().timestamp() - sidst >= 6 * 3600) }}
+        then:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.thread_watchdog_last_hard_push
+            data:
+              timestamp: "{{ now().timestamp() | int }}"
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: thread
+              title: >-
+                {{ '🧵 Thread-nettet er nede' if n == 1 else '🧵 Thread stadig nede — forsøg ' ~ n }}
+              message: >-
+                {% set siden = state_attr('input_datetime.thread_watchdog_nede_siden', 'timestamp') | float(0) %}
+                {% if n == 1 %}Border-routeren er afskåret fra resten af Thread
+                ({{ state_attr('binary_sensor.thread_border_router_nede', 'otbr') }}).
+                Jeg prøver kure på skift — TX-boost, chip-reset, USB-genplug — og
+                giver ikke op. Bad-nødlyset tænder hvis nogen bruger badet.
+                {%- else %}Nede siden {{ siden | timestamp_custom('%H:%M') }}. Alle tre
+                kure er prøvet og prøves igen med op til
+                {{ states('input_number.thread_watchdog_cooldown_minutes') | int(45) }} min
+                mellemrum, til nettet er samlet. Kun et ægte strømtab på donglen er
+                stærkere — det kan NUC'ens USB-porte ikke give i software.{% endif %}
+              # Huset selv er i stykker → også i AirBnB (push_notify 2b).
+              kritisk: true
+              payload:
+                ttl: 0
+                priority: high
+
+      - choose:
+          # --- TX-BOOST (daemonen; ingen genstart, ingen ny partition)
+          - conditions:
+              - condition: template
+                value_template: "{{ kur == 'txboost' and daemon_ok }}"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.otbr_selfheal_txboost
+              - wait_template: "{{ is_state('input_boolean.otbr_selfheal_txboost', 'off') }}"
+                timeout:
+                  minutes: 5
+                continue_on_timeout: true
+          # --- CHIP-RESET via daemonen (flasher RTS/DTR + launch app)
+          - conditions:
+              - condition: template
+                value_template: "{{ kur == 'chip' and daemon_ok }}"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.otbr_selfheal_request
+              # Flaget slukkes når daemonen tager det (≤ 2 min); selve resettet
+              # + addon-start tager ~30-60 s derefter, og addon'ets egen start
+              # sætter 6 dBm → TX-boost først når det er overstået.
+              - wait_template: "{{ is_state('input_boolean.otbr_selfheal_request', 'off') }}"
+                timeout:
+                  minutes: 5
+                continue_on_timeout: true
+              - delay:
+                  minutes: 2
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.otbr_selfheal_txboost
+          # --- USB-GENPLUG (HA-containeren skriver sysfs selv)
+          - conditions:
+              - condition: template
+                value_template: "{{ kur == 'usb' }}"
+            sequence:
+              - service: hassio.addon_stop
+                continue_on_error: true
+                data:
+                  addon: core_openthread_border_router
+              - delay:
+                  seconds: 4
+              - service: shell_command.otbr_usb_replug
+                continue_on_error: true
+                response_variable: replug
+              - service: logbook.log
+                data:
+                  name: "Thread watchdog"
+                  message: >-
+                    USB-genplug: {{ (replug.stdout | default('') ~ ' ' ~ replug.stderr | default('')) | trim
+                                    if replug is defined else 'intet svar' }}
+                  entity_id: binary_sensor.thread_border_router_nede
+              - delay:
+                  seconds: 3
+              - service: hassio.addon_start
+                continue_on_error: true
+                data:
+                  addon: core_openthread_border_router
+              - delay:
+                  minutes: 2
+              - if:
+                  - condition: template
+                    value_template: "{{ daemon_ok }}"
+                then:
+                  - service: input_boolean.turn_on
+                    target:
+                      entity_id: input_boolean.otbr_selfheal_txboost
+        # --- daemonen død: legacy-pulsen er den eneste chip-kur HA har selv
+        default:
+          - service: hassio.addon_stop
+            continue_on_error: true
+            data:
+              addon: core_openthread_border_router
+          - delay:
+              seconds: 3
+          - service: shell_command.otbr_rcp_reset
+            continue_on_error: true
+          - delay:
+              seconds: 4
+          - service: hassio.addon_start
+            continue_on_error: true
+            data:
+              addon: core_openthread_border_router
+
+automation:
+  # ---------------------------------------------------------------------------
+  # GIV ALDRIG OP (2026-10-09). Flanke + /2-min-backstop + HA-start: stigen
+  # fortsætter så længe border-routeren er nede, uanset restarts, reloads og
+  # hvor mange kure der allerede er brugt. Pausen før forsøg n er
+  # min(10·(n-1), loft) min — loftet er slideren "Pause mellem kure (loft)".
+  # Første forsøg: straks (delay_on på detektoren ER ventetiden).
+  # ---------------------------------------------------------------------------
+  - id: thread_otbr_aldrig_opgiv
+    alias: "Thread watchdog: giv aldrig op"
+    description: >
+      Så længe binary_sensor.thread_border_router_nede er on: kør næste kur i
+      script.thread_otbr_eskaler, med voksende pause op til loft-slideren.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        id: nede
+        entity_id: binary_sensor.thread_border_router_nede
+        from: "off"
+        to: "on"
+      - platform: time_pattern
+        id: backstop
+        minutes: "/2"
+      - platform: homeassistant
+        id: start
+        event: start
+    condition:
+      - condition: state
+        entity_id: input_boolean.thread_watchdog_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.thread_border_router_nede
+        state: "on"
+      - condition: state
+        entity_id: script.thread_otbr_eskaler
+        state: "off"
+      - condition: template
+        value_template: >-
+          {% set n = states('input_number.thread_watchdog_forsoeg') | int(0) %}
+          {% set sidst = state_attr('input_datetime.thread_watchdog_last_restart', 'timestamp') | float(0) %}
+          {% set loft = states('input_number.thread_watchdog_cooldown_minutes') | float(45) %}
+          {% set pause = 0 if n == 0 else [10 * n, loft] | min %}
+          {{ now().timestamp() - sidst >= pause * 60 }}
+    action:
+      - service: script.turn_on
+        target:
+          entity_id: script.thread_otbr_eskaler
+
+  # ---------------------------------------------------------------------------
+  # OPPE IGEN — kun når OTBR'en har haft routere i 10 min (ikke når chippen
+  # svarer: 08/10 21:35 sagde daemonen "self-healet" 9 t for tidligt).
+  # Backstop: en restart dræber `for:` — tick'et måler selv tiden på stemplet.
+  # ---------------------------------------------------------------------------
+  - id: thread_otbr_genoprettet
+    alias: "Thread watchdog: border-router oppe igen"
+    description: >
+      Nulstil forsøgs-tælleren og push hvor længe nettet var nede, når
+      border-routeren har været samlet med mesh'et i 10 min.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        id: oppe
+        entity_id: binary_sensor.thread_border_router_nede
+        from: "on"
+        to: "off"
+        for:
+          minutes: 10
+      - platform: time_pattern
+        id: backstop
+        minutes: "/10"
+    condition:
+      - condition: numeric_state
+        entity_id: input_number.thread_watchdog_forsoeg
+        above: 0
+      - condition: state
+        entity_id: binary_sensor.thread_border_router_nede
+        state: "off"
+      - condition: numeric_state
+        entity_id: sensor.otbr_routere
+        above: 1
+      - condition: template
+        value_template: >-
+          {{ now().timestamp() - state_attr('input_datetime.thread_watchdog_last_restart', 'timestamp') | float(0) >= 600 }}
+      - condition: state
+        entity_id: script.thread_otbr_eskaler
+        state: "off"
+    action:
+      - variables:
+          n: "{{ states('input_number.thread_watchdog_forsoeg') | int(0) }}"
+          minutter: >-
+            {{ ((now().timestamp() - state_attr('input_datetime.thread_watchdog_nede_siden', 'timestamp') | float(0)) / 60) | int }}
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.thread_watchdog_forsoeg
+        data:
+          value: 0
+      - service: logbook.log
+        data:
+          name: "Thread watchdog"
+          message: >-
+            Border-router samlet med mesh'et igen ({{ states('sensor.otbr_routere') }} routere)
+            efter {{ n }} forsøg; seneste kur: {{ states('input_text.thread_watchdog_sidste_kur') }}.
+          entity_id: binary_sensor.thread_border_router_nede
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: thread
+          title: "✅ Thread er oppe igen"
+          message: >-
+            Border-routeren har {{ states('sensor.otbr_routere') }} routere igen efter
+            {{ minutter // 60 }} t {{ minutter % 60 }} min og {{ n }} forsøg
+            (seneste kur: {{ states('input_text.thread_watchdog_sidste_kur') }}).
+
+  # ---------------------------------------------------------------------------
+  # PÆRE-DETEKTOR (let, mode:restart) — bad-spots væk mens border-routeren har
+  # sit mesh. Rører ALDRIG OTBR'en (2026-10-09): det er pærerne eller badets
+  # strøm, og en OTBR-genstart på et raskt net er skadelig. Settle → push.
+  # mode:restart = en AirBnB-gæst der flapper vægkontakten kollapser til ÉN
+  # beslutning (B51).
+  # ---------------------------------------------------------------------------
+  - id: thread_otbr_watchdog_detect
+    alias: "Thread watchdog: bad-spots væk (pære/strøm)"
+    description: >
+      Bad-spots nede mens border-routeren er rask: vent settle-vinduet, skeln
+      strømløst bad fra hængte pærer, og push den rigtige besked. Ingen
+      OTBR-indgreb — dem ejer thread_otbr_aldrig_opgiv.
+    mode: restart
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        id: thread_nede
+        entity_id: binary_sensor.badevaerelse_matter_spots_ok
+        from: "on"
+        to: "off"
+        for:
+          minutes: >-
+            {{ states('input_number.thread_watchdog_down_minutes') | int(3) }}
+      # Re-arm efter strøm-tab (B47): ingen ny off-flanke når strømmen kommer
+      # tilbage uden at spots kommer med op.
+      - platform: state
+        id: strom_tilbage
+        entity_id: binary_sensor.badevaerelse_bad_strom_ok
+        from: "off"
+        to: "on"
+      # En restart dræber `for:`-ventetiden (permanent faktum).
+      - platform: homeassistant
+        id: start
+        event: start
+    condition:
+      - condition: state
+        entity_id: input_boolean.thread_watchdog_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_matter_spots_ok
+        state: "off"
+    action:
+      - service: logbook.log
+        data:
+          name: "Thread watchdog"
+          message: >-
+            Bad-spots nede ({{ trigger.id }}) — venter op til
+            {{ states('input_number.thread_watchdog_settle_minutes') | int(30) }} min
+            på self-heal / strøm-tab før besked.
+          entity_id: binary_sensor.badevaerelse_matter_spots_ok
+      - wait_template: >-
+          {{ is_state('binary_sensor.badevaerelse_matter_spots_ok', 'on')
+             or is_state('binary_sensor.badevaerelse_bad_strom_ok', 'off')
+             or is_state('binary_sensor.thread_border_router_nede', 'on') }}
+        timeout:
+          minutes: "{{ states('input_number.thread_watchdog_settle_minutes') | int(30) }}"
+        continue_on_timeout: true
+
+      - if:
+          - condition: state
+            entity_id: binary_sensor.badevaerelse_matter_spots_ok
+            state: "on"
+        then:
+          - stop: "Bad-spots kom selv op under settle."
+
+      # Border-routeren er afskåret → stigen ejer det (og pusher selv).
+      - if:
+          - condition: state
+            entity_id: binary_sensor.thread_border_router_nede
+            state: "on"
+        then:
+          - stop: "Border-router nede — thread_otbr_aldrig_opgiv overtager."
+
+      # Badet er STRØMLØST (Zigbee-spots også væk) → info-push, 1 t dedupe.
+      - if:
+          - condition: state
+            entity_id: binary_sensor.badevaerelse_bad_strom_ok
+            state: "off"
+        then:
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ now().timestamp() - state_attr('input_datetime.thread_watchdog_last_stromlos_push', 'timestamp') | float(0) >= 3600 }}
+            then:
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.thread_watchdog_last_stromlos_push
+                data:
+                  timestamp: "{{ now().timestamp() | int }}"
+              - service: script.push_notify
+                continue_on_error: true
+                data:
+                  notif_id: thread
+                  title: "🔌 Badet er strømløst"
+                  message: >-
+                    Bad-spots er nede fordi badet ikke har strøm (vægkontakt slukket
+                    eller HPFI slået fra?) — IKKE et Thread-problem. De tænder igen
+                    af sig selv når strømmen er tilbage.
+          - stop: "Bad-strøm-tab, ikke Thread."
+
+      # Border-routeren har sit mesh, badet har strøm → pærerne selv. 6 t dedupe.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ now().timestamp() - state_attr('input_datetime.thread_watchdog_last_paerer_push', 'timestamp') | float(0) >= 21600 }}
+        then:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.thread_watchdog_last_paerer_push
+            data:
+              timestamp: "{{ now().timestamp() | int }}"
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: thread
+              title: "💡 Bad-spot faldet af Thread"
+              message: >-
+                {% from 'rosters.jinja' import bad_kajplats %}{{ bad_kajplats
+                   | select('is_state', 'unavailable') | map('replace', 'light.badevaerelse_', '')
+                   | join(', ') }} svarer ikke, men resten af Thread-nettet kører
+                ({{ states('sensor.otbr_routere') }} routere) — så det er pæren, ikke
+                donglen. Den kan stå og lyse selvom appen siger slukket. Kur: sluk
+                og tænd badets vægkontakt én gang.
+
+  # ---------------------------------------------------------------------------
+  # B234 (14/10): en enhed er faldet af Thread i 30 min mens nettet ellers
+  # kører → sig HVILKEN og hvad kuren er. Split (OTBR'en hører en anden
+  # partition) = genplug af netop den enhed; ellers sluk/tænd. Max 1 pr. 12 t.
+  # Backstop hvert 30. min: restart dræber delay_on-ventetiden, og en ny enhed
+  # der falder af MENS sensoren allerede er on giver ingen ny flanke.
+  # ---------------------------------------------------------------------------
+  - id: thread_enheder_vaek_push
+    alias: "Thread watchdog: enhed faldet af Thread (push med kur)"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.thread_enheder_vaek
+        from: "off"
+        to: "on"
+      - platform: time_pattern
+        minutes: "/30"
+    condition:
+      - condition: state
+        entity_id: input_boolean.thread_watchdog_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.thread_enheder_vaek
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ now().timestamp() - state_attr('input_datetime.thread_watchdog_last_noder_push', 'timestamp') | float(0) >= 43200 }}
+    action:
+      - variables:
+          noder: "{{ state_attr('binary_sensor.thread_enheder_vaek', 'noder') }}"
+          split: "{{ state_attr('binary_sensor.thread_enheder_vaek', 'split_minutter') | int(0) >= 30 }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.thread_watchdog_last_noder_push
+        data:
+          timestamp: "{{ now().timestamp() | int }}"
+      - service: logbook.log
+        data:
+          name: "Thread"
+          message: "Enhed(er) faldet af Thread i ≥ 30 min: {{ noder }}{{ ' (split: anden partition)' if split }}."
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: thread
+          title: "🧩 Faldet af Thread: {{ noder }}"
+          message: >-
+            {% if split %}Den sidder fast i sit eget lille Thread-net (border-routeren hører
+            det, men de vil ikke smelte sammen — software kan ikke hele det).
+            Kur: træk den ud af stikket i 10 s og sæt den i igen.
+            {% else %}Den svarer ikke, mens resten af Thread kører
+            ({{ states('sensor.otbr_routere') }} routere). Kur: sluk og tænd den
+            (træk stikket / vægkontakten).{% endif %}
+
+  # ---------------------------------------------------------------------------
+  # RECOVERY-LOG: net kom tilbage (uanset kilde — auto eller manuel re-plug).
+  # ---------------------------------------------------------------------------
+  - id: thread_otbr_watchdog_recovered
+    alias: "Thread watchdog: net genoprettet"
+    description: >
+      matter_spots_ok off→on stabilt = Thread-net er oppe igen. Ren logbog-
+      markør så vi kan se frekvensen af hang/recovery over tid.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_matter_spots_ok
+        from: "off"
+        to: "on"
+        for:
+          seconds: 30
+    condition:
+      - condition: state
+        entity_id: input_boolean.thread_watchdog_enabled
+        state: "on"
+    action:
+      - service: logbook.log
+        data:
+          name: "Thread watchdog"
+          message: "Thread-net oppe (matter_spots_ok = on, stabilt 30 s)."
+          entity_id: binary_sensor.badevaerelse_matter_spots_ok
+
+  # ---------------------------------------------------------------------------
+  # BAD ZIGBEE-NØDLYS (2026-09-03, user-spec: "thread er nede — bad zigbee
+  # spots tændes fuldt ud for at redde badeværelset").
+  # ---------------------------------------------------------------------------
+  # De 3 Matter-KAJPLATS-spots (1-3) forsvinder når Thread hænger. Innr-spot_4
+  # + spot_5 sidder på SAMME bad-strøm men på ZIGBEE (separat radio) — de
+  # virker uafhængigt. Denne automation tænder dem 100 % som beredskabslys så
+  # snart Thread er nede + huset er aktivt.
+  #
+  # Scope: Normal + AirBnB + Home Vacation (user-spec: gælder ALLE modes).
+  # Fase-enforceren i badevaerelse_faser.yaml er allerede gated med
+  # matter_spots_ok=on (linje 341-343), så vi er single-owner af spot_4/5 mens
+  # Thread er nede. Når Thread kommer tilbage rydder søster-automation
+  # (bad_zigbee_nodlys_sluk) og fase-logikken overtager straks igen for aktive
+  # besøg (#1 undgået).
+  #
+  # Strøm-vidne: bad_strom_ok=on kræves. Er BADET strømløst (både Matter OG
+  # Zigbee unavailable) hjælper det ikke at kalde light.turn_on på Zigbee.
+  # ---------------------------------------------------------------------------
+  # 2026-10-09 (user: "sørg for at lyset slukker"): nødlyset er nu BESØGS-
+  # styret. Før tændte det 4+5 på 100 % når blot huset var aktivt, re-tændte
+  # hvert 5. min og vetoede alle 7 sluk-veje til ALLE tre KAJPLATS var tilbage —
+  # 09/10 06:57 med én død pære (spot_2) = badet tændt med ingen derinde, uden
+  # udløb. Nu: kun når badet er BLINDT (thread_lys_nede = ≥ 2 af 3 væk) OG
+  # nogen er derinde; søsteren slukker når besøget slutter eller Thread er
+  # tilbage. Presence-sensorerne er selv Thread → er de blinde (unavailable),
+  # er entré-VALLHORN (Zigbee) vidnet: bevægelse inden for 10 min.
+  - id: bad_zigbee_nodlys_taend
+    alias: "Bad: Zigbee-nødlys ON når Thread nede + huset aktivt"
+    description: >
+      Badet blindt (≥ 2 af 3 KAJPLATS væk) og nogen i badet: tænd de to
+      Zigbee-spots (4/5) fuldt som redning. Gælder Normal, AirBnB og Home
+      Vacation. Slukkes af bad_zigbee_nodlys_sluk.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        id: thread_nede
+        entity_id: binary_sensor.badevaerelse_thread_lys_nede
+        from: "off"
+        to: "on"
+        for:
+          minutes: 2
+      - platform: state
+        id: besoeg
+        entity_id: binary_sensor.badevaerelse_inde_occupancy
+        from: "off"
+        to: "on"
+      - platform: state
+        id: entre
+        entity_id: binary_sensor.entre_valhorn_occupancy
+        from: "off"
+        to: "on"
+      - platform: state
+        id: bliv_aktiv
+        entity_id: sensor.activity_state
+      # Restart-backstop + re-assert mod en sluk-vej der rammer MIDT i et besøg.
+      - platform: time_pattern
+        id: backstop
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_thread_lys_nede
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_bad_strom_ok
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ states('sensor.activity_state') not in
+             ['idle','away','unknown','unavailable','godnat','none',''] }}
+      # Nogen i badet — eller presence er selv blind og entré-Vallhorn så nogen.
+      - condition: template
+        value_template: >-
+          {% set occ = states('binary_sensor.badevaerelse_inde_occupancy') %}
+          {% set v = states.binary_sensor.entre_valhorn_occupancy %}
+          {{ occ == 'on'
+             or (occ not in ['on', 'off'] and v is not none
+                 and (v.state == 'on' or now() - v.last_changed < timedelta(minutes=10))) }}
+      - condition: template
+        value_template: >-
+          {% set b4 = state_attr('light.badevaerelse_spot_4','brightness') | int(0) %}
+          {% set b5 = state_attr('light.badevaerelse_spot_5','brightness') | int(0) %}
+          {{ not is_state('light.badevaerelse_spot_4','on')
+             or not is_state('light.badevaerelse_spot_5','on')
+             or b4 < 200 or b5 < 200 }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+      # Innr RS 242 C er RGBW — color_temp_kelvin snapper til hvid.
+      - service: light.turn_on
+        target:
+          entity_id:
+            - light.badevaerelse_spot_4
+            - light.badevaerelse_spot_5
+        data:
+          brightness: 254
+          color_temp_kelvin: 3000
+      - service: logbook.log
+        data:
+          name: "Bad Zigbee-nødlys"
+          message: >-
+            Badet blindt ({% from 'rosters.jinja' import bad_kajplats %}{{ bad_kajplats
+            | select('is_state', 'unavailable') | list | count }}/3 KAJPLATS væk), presence
+            {{ states('binary_sensor.badevaerelse_inde_occupancy') }} → spot_4/5 100 %.
+          entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+
+  - id: bad_zigbee_nodlys_sluk
+    alias: "Bad: Zigbee-nødlys OFF når Thread er tilbage"
+    description: >
+      Slip nødlyset når badet ikke længere er blindt, når besøget er slut
+      (presence off i 3 min), eller med blind presence når entré-Vallhorn
+      har været stille i 15 min.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        id: thread_oppe
+        entity_id: binary_sensor.badevaerelse_thread_lys_nede
+        from: "on"
+        to: "off"
+        for:
+          seconds: 30
+      - platform: state
+        id: tomt
+        entity_id: binary_sensor.badevaerelse_inde_occupancy
+        from: "on"
+        to: "off"
+        for:
+          minutes: 3
+      - platform: time_pattern
+        id: backstop
+        minutes: "/5"
+      - platform: homeassistant
+        id: start
+        event: start
+    condition:
+      - condition: state
+        entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set occ = states('binary_sensor.badevaerelse_inde_occupancy') %}
+          {% set o = states.binary_sensor.badevaerelse_inde_occupancy %}
+          {% set v = states.binary_sensor.entre_valhorn_occupancy %}
+          {% set occ_alder = (now() - o.last_changed).total_seconds() if o is not none else 0 %}
+          {% set v_stille = v is none or (v.state != 'on' and now() - v.last_changed >= timedelta(minutes=15)) %}
+          {{ is_state('binary_sensor.badevaerelse_thread_lys_nede', 'off')
+             or (occ == 'off' and occ_alder >= 180)
+             or (occ not in ['on', 'off'] and v_stille) }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+      # Thread tilbage MIDT i et besøg → fase-logikken overtager (enforceren
+      # re-tænder); ellers er badet tomt → sluk.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ not (is_state('binary_sensor.badevaerelse_thread_lys_nede', 'off')
+                      and is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')) }}
+        then:
+          - service: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: !include ../rosters/bad_spots.yaml
+            data:
+              transition: 2
+      - service: logbook.log
+        data:
+          name: "Bad Zigbee-nødlys"
+          message: >-
+            Nødlys slut ({{ 'Thread-lys tilbage' if is_state('binary_sensor.badevaerelse_thread_lys_nede', 'off')
+            else 'badet tomt' }}) — sluk-vejene er frie igen.
+          entity_id: input_boolean.bad_zigbee_nodlys_aktiv

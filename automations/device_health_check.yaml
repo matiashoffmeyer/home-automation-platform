@@ -1,0 +1,117 @@
+# =============================================================================
+# Device health check (A1)
+# =============================================================================
+# Kører ved HA start + dagligt kl 09:00. Tjekker at alle kendte Zigbee-
+# devices + Apollo'er rapporterer state (ikke "unavailable" / "unknown").
+# Hvis nogen er nede sendes notification.
+#
+# Hvorfor: efter flyttedag kan devices være ude af mesh-rækkevidde, batteri-
+# døde, eller ikke have re-paired korrekt. Stille fejl er svære at opdage.
+# Daglig health-check fanger problemet før familien står og banker på en
+# død knap.
+#
+# Listen herunder skal opdateres når nye devices pares — se device_inventory
+# for komplet sandhed.
+# =============================================================================
+
+- id: device_health_check
+  alias: "Health check: kendte devices online?"
+  description: >
+    Verificerer at alle paerede devices er available. Notification ved fejl
+    med liste af problem-devices. Trigger ved HA start + dagligt 09:00.
+  mode: single
+  trigger:
+    # A93 fix audit-5 2026-05-12: fjernet `homeassistant: event: start` trigger.
+    # Tidligere fyrede 17x/24h pga repeated HA restarts (en per deploy). Daglig
+    # 09:00 check er rigeligt — devices skal være available når familien står
+    # op, ikke 5 sek efter restart hvor mesh re-converger. Hvis user vil have
+    # ad-hoc check: manuel UI-trigger fra Settings → Automations.
+    - platform: time
+      at: "09:00:00"
+  variables:
+    # Liste af entities der SKAL være available. Ved fejl = device er
+    # offline / unpaired / batteri dødt / ude af mesh.
+    #
+    critical_entities:
+      # --- Apollo MSR-2 (alle 5 live post-flyt; B52 fix 2026-07-14: stue/
+      # spisestue/koekken var stadig udkommenteret som "unplugged pre-flyt") ---
+      - binary_sensor.sovevaerelse_apollo_occupancy
+      - binary_sensor.stue_apollo_occupancy
+      - binary_sensor.spisestue_apollo_occupancy
+      - binary_sensor.boernevaerelse_apollo_occupancy
+      - binary_sensor.koekken_apollo_occupancy
+      # --- Innr lights (Zigbee, mains-powered, fungerer ogsaa som routere) ---
+      # light.sovevaerelse_loft fjernet 2026-06-05 — sat på dvale (orphan reserve)
+      # efter pendlen overtog soveloft-rollen; dormant bulb sundheds-overvåges ikke.
+      - light.spisestue_loft
+      # Køkkenloftet NEDLAGT 2026-07-02 (helt droppet 07-28): Innr-farvepæren flyttet fysisk
+      # til sofa-læselampen (= light.stue_laesehygge, overvåges nedenfor);
+      # køkkenloftet har pt. ingen smart pære.
+      - light.stue_laesehygge
+      - light.spisestue_pendel   # = soveloft (pendel flyttet 2026-06-05)
+      - light.boernevaerelse_loft
+      - light.boernevaerelse_lampe
+      - light.stue_sofa_lampe
+      - light.stue_sofa_lampe_2
+      - light.stue_hjoernelampe
+      - light.depot_loft
+      - light.depot_strip
+      - light.entre_loft
+      - light.koekken_lyskaede
+      - light.terrasse_paerelyskaede
+      # --- Smart plugs ---
+      - switch.terrasse_plug
+      - switch.stue_plug    # GRILLPLATS (Thread) siden 15/10
+      - switch.sove_lyskaede   # Innr SP 240 (Zigbee) siden 15/10, før depot/stue
+      - switch.thread_router_koekken   # GRILLPLATS (Thread-router, altid tændt) fra 15/10
+      - switch.sove_plug
+      # --- Styrbar remotes (battery, kun batteri-sensor checkable) ---
+      - sensor.stue_styrbar_battery
+      - sensor.sovevaerelse_styrbar_battery
+      - sensor.boernevaerelse_styrbar_battery
+      - sensor.terrasse_styrbar_battery
+      - sensor.badevaerelse_styrbar_battery
+      # --- Somrig + Badring + Vallhorn (battery) ---
+      - sensor.entre_somrig_battery
+      - sensor.badevaerelse_badring_battery
+      - sensor.depot_valhorn_battery
+      - binary_sensor.depot_valhorn_occupancy
+      - binary_sensor.badevaerelse_badring  # B7.1 fix audit-runde 16: ZHA emit'er entity uden _water_leak suffix
+  action:
+    - variables:
+        unavailable_entities: >-
+          {% set ns = namespace(bad=[]) %}
+          {% for e in critical_entities %}
+            {% if states(e) in ['unavailable', 'unknown', 'none'] %}
+              {% set ns.bad = ns.bad + [e] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.bad }}
+        bad_count: "{{ unavailable_entities | length }}"
+    # User-request 2026-05-07: ingen notifikationer om devices offline (user
+    # gider det ikke længere). Konverteret fra persistent_notification +
+    # mobile push → silent logbook.log only. Behold daglig check som passive
+    # diagnostik — kan tjekkes via Logbook UI hvis user undrer sig.
+    # RE-BEKRÆFTET 2026-07-14 (B52, AskUserQuestion): user valgte "behold alt
+    # silent" selv efter 3-døgns-offline-incidenten — tilføj IKKE push her.
+    # Re-enable notifications: erstat logbook.log med tidligere persistent_+
+    # mobile_app_phone_a calls (se git blame for original code).
+    - choose:
+        - conditions: "{{ bad_count | int > 0 }}"
+          sequence:
+            - service: logbook.log
+              data:
+                name: "Device health check"
+                message: >-
+                  {{ bad_count }} device(s) offline:
+                  {{ unavailable_entities | join(', ') }}
+            # H1 dismiss legacy persistent (i tilfælde af gammel notification
+            # hænger fra før user disabled).
+            - service: persistent_notification.dismiss
+              data:
+                notification_id: device_health_check
+      default:
+        # Alt OK — dismiss eventuel tidligere alert
+        - service: persistent_notification.dismiss
+          data:
+            notification_id: device_health_check

@@ -1,0 +1,290 @@
+# =============================================================================
+# Apollo'ens onboard-RGB blinder sin EGEN lux-sensor — kompenseret rum-lux
+# =============================================================================
+# Apollo MSR-2'ens SK6812-LED sidder få mm fra LTR390'en. Tændes den, måler
+# lux-sensoren primært sit eget lys — sensoren er sin egen støjkilde.
+#
+# HVAD DET KOSTEDE FØR FIXET (begge verificeret i history 2026-07-30):
+#   - SOVE: presence-tænd-gaten (rum-lux < gate) kunne aldrig passere, og
+#     `presence_lux_sovevaerelse_off` slukkede tværtimod sove-lyset efter 5 min
+#     som om det var blevet dagslys. Soveværelset var reelt 5,9 lx = bælgmørkt.
+#   - KØKKEN: `sensor.open_plan_lux` = snit(køkken, spisestue) blev 359 i stedet
+#     for ~116 → køkken-spots (60 lx-gate) og alle open-plan-gates fejl-gatet.
+#
+# -----------------------------------------------------------------------------
+# MODEL (2026-07-30 runde 2, user-spec: "det der med led varsler der forandrer
+# lux skal fixes for ALLE varselsfarver ... og for ALLE apolloer der har varsler")
+# -----------------------------------------------------------------------------
+# Første udgave havde ÉN offset pr. rum × brightness/255, kalibreret på den blå
+# regn-LED. Den holdt kun præcis dén farve og dén styrke. Modellen er nu farve-,
+# styrke- og rum-opløst:
+#
+#   kanal(x) = (x / 255) ** gamma                  # x = rgb_color-komponent
+#   vaegt    = w_r·kanal(r) + w_g·kanal(g) + 1,0·kanal(b)
+#   fradrag  = offset_rum · vaegt · (brightness/255) ** gamma
+#   reel     = max(0, rå − fradrag)
+#
+# GAMMA er IKKE kosmetik. ESPHome's light-komponent gamma-korrigerer hver kanal
+# (default `gamma_correct: 2.8`), så en kanal kommanderet til 40 % lyser kun
+# ~7 % — og `brightness: 204` (80 %) giver ~52 % lys, ikke 80 %. Uden gamma
+# overvurderer man en dæmpet eller blandet farve GROFT. Effektiv gamma målt til
+# **2,87** på fire uafhængige Apolloer (spredning 2,868–2,895) — vi bruger 2,9.
+#
+# **w_b ≡ 1,0 pr. definition** — ren blå ved fuld styrke ER rum-offsetten, så der
+# findes ingen blå slider. w_r/w_g er LTR390'ens spektrale respons relativt til
+# blå og er en CHIP-egenskab (samme hardware i alle fem) → GLOBALE slidere.
+# Rum-offsetten er monterings-/rumafhængig → pr. rum.
+#
+# MÅLING 2026-07-30 (bracketet: slukket → farve → slukket, 105 s settle pr.
+# fase, alle fire levende Apolloer samtidig, brightness 204). Δ mod interpoleret
+# omgivelseslys:
+#              Δrød    Δgrøn    Δblå     w_r     w_g   offset(blå@255)
+#   sove        57,4    925,8   338,0   0,170   2,739       645
+#   køkken      90,7   1244,6   401,2   0,226   3,102       765
+#   spisestue   53,4    930,4   300,8   0,177   3,093       575
+#   børn        61,0    937,9   293,4   0,208   3,196       560
+#   → globale gennemsnit: w_r = 0,195   w_g = 3,033
+#
+# Grønt måles altså ~3× kraftigere end blåt og rødt kun ~1/5 — samme LED-styrke,
+# 16× forskel i målt lux. Derfor duer én enkelt offset ikke.
+#
+# VALIDERET mod den ÆGTE regn-LED (`hs_color: [alert_regn_hue=216, 100]` →
+# rgb (0,102,255) @ brightness 204), målt separat bagefter:
+#   sove +0,9 %  ·  køkken −0,7 %  ·  spisestue −0,7 %  ·  børn −1,6 %
+# Den røde batteri-LED rammer ±15 % (≈ ±10 lx absolut — uden betydning, fordi
+# rødt kun bidrager ~60 lx i alt).
+#
+# EFTER-JUSTERET i lukket sløjfe (LED tændt i regn-farven, `reel` sammenlignet
+# med interpoleret omgivelseslys, offset skaleret): 645→**640**, 765→**770**,
+# 575→**580**, 560→**570**. Residual derefter < 1 lx pr. rum. Børn betød mest:
+# −5,8 lx løftede et 12 lx-rum til 17,9 og lukkede dermed dens 15 lx-tænd-gate.
+# **Gentag denne sløjfe** hvis en Apollo flyttes eller får nyt monteringssted —
+# offsetten er geometri, ikke kun chip.
+#
+# ALLE FEM Apolloer får beregnet et fradrag her — også dem uden varselsrolle i
+# dag. Får de en i morgen, virker kompensationen med det samme (fejlklasse #16:
+# rosters drifter når roller flytter). Er LED'en slukket er `reel` == `rå`, så
+# en ubrugt LED koster ingenting og modellen kan ikke drifte.
+# UNDTAGELSE (2026-08-06): der er FIRE `_lux_reel`-sensorer her, ikke fem —
+# børneværelsets bor i `packages/room_lux_tuning.yaml` og er afledt af
+# open_plan_lux, fordi dens Apollo jævnligt står tildækket.
+#
+# ÉN KILDE TIL FARVE-MATEMATIKKEN: `sensor.apollo_led_lux_fradrag` regner
+# fradraget for alle fem rum i ÉN løkke og lægger dem i attributter; hver
+# `<rum>_lux_reel` trækker blot sin attribut fra sin rå-værdi (samme énvejs-kæde
+# som cykel-laderens prisdata-sensor). Fem kopier af udtrykket ville drifte
+# fra hinanden — fejlklasse #2.
+#
+# FRISKHEDS-GUARDEN (2026-08-26): fradraget gælder KUN hvis rå-samplet er taget
+# EFTER LED'en tændte (`raw.last_updated >= led.last_changed`). LTR390'en
+# rapporterer nemlig kun ~hvert 60. sekund (målt 59,8 s), mens varsels-blinket
+# er `flash: short` = 2 s — så under et blink er den rå værdi ÆLDRE end LED'en
+# og indeholder intet LED-lys at trække fra. Uden guarden blev køkkenets 184 lx
+# til 0,0 lx i 2 sekunder ad gangen, fire gange i minuttet, hele varslets
+# levetid; 25/08 kl. 19:01:06 ramte et occupancy-hit præcis ét af de vinduer og
+# tændte lyskæden (`0,0 < 45`) i et rum med 190 lx. Modellen er stadig rigtig —
+# den blev bare anvendt på et sample der lå før sin egen årsag.
+# Konsekvens: et LANGVARIGT tændt varsels-LED kompenseres som før (første sample
+# efter tænd er friskt), et kortvarigt blink slet ikke — hvilket er præcis hvad
+# chippen faktisk ser.
+#
+# FEJLRETNING: over-subtraktion klampes ved 0 (= "mørkt" → auto-lys TILLADT).
+# Under-subtraktion efterlader blot lidt rest. Er rå-sensoren unavailable, er
+# `reel` det også → forbrugernes `| float(default)` opfører sig som før.
+# NB: stue-Apolloens LTR390 døde 2026-05-05 → `sensor.stue_lux_reel` er
+# unavailable indtil chippen udskiftes. Sensoren står klar, og dens offset er
+# sat til husets gennemsnit (ikke målt) så en udskiftning virker med det samme.
+#
+# NYE FORBRUGERE: brug ALTID `sensor.<rum>_lux_reel` i adfærds-logik
+# (fejlklasse #2 — én lux-sandhed; gælder også børns, selvom dens kilde er en
+# anden). De rå `sensor.<rum>_apollo_lux` beholdes kun i diagnostik/inventar
+# hvor man vil se hvad chippen faktisk måler.
+# Recorder: `sensor.*_lux_reel` + fradrag-sensoren er exclude-globbet i
+# configuration.yaml (samme skrive-volumen som rå-sensoren); kun sove er
+# undtaget, fordi sommer-forsvaret kalibreres mod dens historik.
+# =============================================================================
+
+input_number:
+  # --- Globale chip-egenskaber (deles af alle fem Apolloer) ---
+  apollo_led_lux_vaegt_roed:
+    name: "Apollo LED — rød kanal-vægt (rel. blå)"
+    icon: mdi:invert-colors
+    min: 0
+    max: 5
+    step: 0.005
+    mode: box
+  apollo_led_lux_vaegt_groen:
+    name: "Apollo LED — grøn kanal-vægt (rel. blå)"
+    icon: mdi:invert-colors
+    min: 0
+    max: 5
+    step: 0.005
+    mode: box
+  apollo_led_lux_gamma:
+    name: "Apollo LED — gamma (ESPHome gamma_correct)"
+    icon: mdi:chart-bell-curve
+    min: 1
+    max: 3.5
+    step: 0.05
+    mode: box
+
+
+  # --- Pr. rum: LED-bidrag i lx ved FULD brightness på ren BLÅ (vægt 1,0) ---
+  apollo_led_lux_offset_sove:
+    name: "Apollo LED lux-offset — soveværelse"
+    icon: mdi:led-on
+    min: 0
+    max: 1500
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+  apollo_led_lux_offset_koekken:
+    name: "Apollo LED lux-offset — køkken"
+    icon: mdi:led-on
+    min: 0
+    max: 1500
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+  apollo_led_lux_offset_stue:
+    name: "Apollo LED lux-offset — stue"
+    icon: mdi:led-on
+    min: 0
+    max: 1500
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+  apollo_led_lux_offset_spisestue:
+    name: "Apollo LED lux-offset — spisestue"
+    icon: mdi:led-on
+    min: 0
+    max: 1500
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+  apollo_led_lux_offset_boern:
+    name: "Apollo LED lux-offset — børneværelse"
+    icon: mdi:led-on
+    min: 0
+    max: 1500
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+template:
+  - sensor:
+      # -----------------------------------------------------------------------
+      # ÉN kilde til farve-matematikken. State = antal Apolloer der lige nu
+      # blænder sig selv (0 = huset er "rent"); attributterne bærer fradraget
+      # i lx pr. rum, som <rum>_lux_reel læser.
+      # -----------------------------------------------------------------------
+      - name: "Apollo LED lux-fradrag"
+        unique_id: apollo_led_lux_fradrag
+        icon: mdi:led-on
+        unit_of_measurement: "Apolloer"
+        state: >
+          {% set rooms = ['sovevaerelse','koekken','stue','spisestue','boernevaerelse'] %}
+          {{ rooms | map('regex_replace', '^(.*)$', 'light.\\1_apollo_rgb_light')
+                   | select('is_state', 'on') | list | length }}
+        attributes:
+          fradrag: >
+            {% set g = states('input_number.apollo_led_lux_gamma') | float(2.9) %}
+            {% set wr = states('input_number.apollo_led_lux_vaegt_roed') | float(0.195) %}
+            {% set wg = states('input_number.apollo_led_lux_vaegt_groen') | float(3.033) %}
+            {% set slider = {
+              'sovevaerelse': 'input_number.apollo_led_lux_offset_sove',
+              'koekken': 'input_number.apollo_led_lux_offset_koekken',
+              'stue': 'input_number.apollo_led_lux_offset_stue',
+              'spisestue': 'input_number.apollo_led_lux_offset_spisestue',
+              'boernevaerelse': 'input_number.apollo_led_lux_offset_boern'
+            } %}
+            {% set ns = namespace(out={}) %}
+            {% for room, ent in slider.items() %}
+              {% set l = 'light.' ~ room ~ '_apollo_rgb_light' %}
+              {% set rgb = state_attr(l, 'rgb_color') %}
+              {% set raw_o = states['sensor.' ~ room ~ '_apollo_lux'] %}
+              {% set led_o = states[l] %}
+              {% set faerskt = raw_o is not none and led_o is not none
+                               and raw_o.last_updated >= led_o.last_changed %}
+              {% if is_state(l, 'on') and rgb is not none and rgb | length == 3 and faerskt %}
+                {% set b = ((state_attr(l, 'brightness') | float(0)) / 255) ** g %}
+                {% set vaegt = wr * ((rgb[0] | float(0)) / 255) ** g
+                             + wg * ((rgb[1] | float(0)) / 255) ** g
+                             +      ((rgb[2] | float(0)) / 255) ** g %}
+                {% set v = (states(ent) | float(0)) * vaegt * b %}
+              {% else %}
+                {% set v = 0 %}
+              {% endif %}
+              {% set ns.out = dict(ns.out, **{room: v | round(1)}) %}
+            {% endfor %}
+            {{ ns.out }}
+
+      # -----------------------------------------------------------------------
+      # Rum-sensorerne. Rent aftræk — al farve-logik bor i sensoren ovenfor.
+      # -----------------------------------------------------------------------
+      - name: "Sovevaerelse lux reel"
+        unique_id: sovevaerelse_lux_reel
+        icon: mdi:brightness-5
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state_class: measurement
+        state: >
+          {% set raa = states('sensor.sovevaerelse_apollo_lux') | float(0) %}
+          {% set f = (state_attr('sensor.apollo_led_lux_fradrag', 'fradrag') or {}).get('sovevaerelse', 0) | float(0) %}
+          {{ [raa - f, 0] | max | round(1) }}
+        availability: "{{ states('sensor.sovevaerelse_apollo_lux') | is_number }}"
+        attributes:
+          raa_lux: "{{ states('sensor.sovevaerelse_apollo_lux') | float(0) | round(1) }}"
+          led_fradrag: "{{ (state_attr('sensor.apollo_led_lux_fradrag', 'fradrag') or {}).get('sovevaerelse', 0) | float(0) | round(1) }}"
+
+      - name: "Koekken lux reel"
+        unique_id: koekken_lux_reel
+        icon: mdi:brightness-5
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state_class: measurement
+        state: >
+          {% set raa = states('sensor.koekken_apollo_lux') | float(0) %}
+          {% set f = (state_attr('sensor.apollo_led_lux_fradrag', 'fradrag') or {}).get('koekken', 0) | float(0) %}
+          {{ [raa - f, 0] | max | round(1) }}
+        availability: "{{ states('sensor.koekken_apollo_lux') | is_number }}"
+        attributes:
+          raa_lux: "{{ states('sensor.koekken_apollo_lux') | float(0) | round(1) }}"
+          led_fradrag: "{{ (state_attr('sensor.apollo_led_lux_fradrag', 'fradrag') or {}).get('koekken', 0) | float(0) | round(1) }}"
+
+      - name: "Stue lux reel"
+        unique_id: stue_lux_reel
+        icon: mdi:brightness-5
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state_class: measurement
+        state: >
+          {% set raa = states('sensor.stue_apollo_lux') | float(0) %}
+          {% set f = (state_attr('sensor.apollo_led_lux_fradrag', 'fradrag') or {}).get('stue', 0) | float(0) %}
+          {{ [raa - f, 0] | max | round(1) }}
+        availability: "{{ states('sensor.stue_apollo_lux') | is_number }}"
+        attributes:
+          raa_lux: "{{ states('sensor.stue_apollo_lux') | float(0) | round(1) }}"
+          led_fradrag: "{{ (state_attr('sensor.apollo_led_lux_fradrag', 'fradrag') or {}).get('stue', 0) | float(0) | round(1) }}"
+
+      - name: "Spisestue lux reel"
+        unique_id: spisestue_lux_reel
+        icon: mdi:brightness-5
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state_class: measurement
+        state: >
+          {% set raa = states('sensor.spisestue_apollo_lux') | float(0) %}
+          {% set f = (state_attr('sensor.apollo_led_lux_fradrag', 'fradrag') or {}).get('spisestue', 0) | float(0) %}
+          {{ [raa - f, 0] | max | round(1) }}
+        availability: "{{ states('sensor.spisestue_apollo_lux') | is_number }}"
+        attributes:
+          raa_lux: "{{ states('sensor.spisestue_apollo_lux') | float(0) | round(1) }}"
+          led_fradrag: "{{ (state_attr('sensor.apollo_led_lux_fradrag', 'fradrag') or {}).get('spisestue', 0) | float(0) | round(1) }}"
+
+      # BØRNEVÆRELSET har ingen `_lux_reel` her. 2026-08-06 blev rummets
+      # lux-kilde flyttet til `packages/room_lux_tuning.yaml` og afledt af
+      # open_plan_lux, fordi Apolloen jævnligt bliver stillet ting foran (målt
+      # tildækket 80 % af tiden, længste forløb 13,5 t). Fradraget herunder
+      # regnes stadig for `boernevaerelse` — det bruges som diagnostik-attribut
+      # dér, så en fremtidig rekalibrering kan sammenligne model mod chip.

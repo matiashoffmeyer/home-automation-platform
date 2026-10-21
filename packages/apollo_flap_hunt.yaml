@@ -1,0 +1,1416 @@
+# =============================================================================
+# Apollo flap-jagt — per-flap gate-log + auto-bump + throttled push (2026-07-10)
+# =============================================================================
+# User-spec: "vis hvilken gate der blev triggered, hvad tid og hvor længe den var
+# aktiv. Lav en feature (med kill switch) hvor der sendes en notifikation med den
+# info til min tlf ved hvert flap i huset, og bump automatisk den gate +2 opad på
+# sensitivity-slideren der rammer den triggered gate. Jeg slår det fra manuelt når
+# jeg er hjemme." + "så længe roborock kører skal notifikationer og auto-bump IKKE
+# sendes, og heller ikke imens gardiner kører ned."
+#
+# HVAD ER ET FLAP: `binary_sensor.{rum}_apollo_occupancy` går off→on. Når huset er
+# TOMT er hvert flap et near-field-spøgelse → vi (a) logger gaten, (b) gør netop
+# den gate MINDRE følsom (+2 på dens per-gate-slider = HØJERE tærskel), (c) sender
+# en samlet (throttled) push. Bruger slår `apollo_flap_hunt_enabled` FRA når han er
+# hjemme, så ægte tilstedeværelse ikke bumper gates eller spammer.
+#
+# GATE-UDLEDNING (uden engineering-mode): distance-sensorerne rapporterer cm.
+# gate = min(8, int(cm / 75)). ⚠️ Et still-flap på gate 0/1 er ALTID en
+# fejl-attribution og bumper/tæller/gulv-låser intet (`gate_dead`) — chippen
+# leverer ingen still-energi i de to bånd, og 66-67 cm er dens hvile-værdi.
+# Type = 'move' hvis moving_distance er numerisk,
+# ellers 'still' (fallback detection_distance). Slider-slug: sovevaerelse→sove,
+# øvrige = rumnavn → `input_number.{slug}_g{N}_{still|move}` (propageres til NVRAM
+# af {rum}_apollo_per_gate_write med value-compare + 2s debounce).
+#
+# MODPARTEN: `packages/apollo_gate_decay.yaml` sænker langsomt gatene (= mere
+# følsom) mens jagten kører. Bumpet her er dens stopklods: det sætter gatens GULV
+# via `script.apollo_gate_floor_set`, som decay aldrig går under. Sammen finder de
+# hver gates optimum = lige over den værdi hvor den sidst flappede.
+#
+# SPÆRHAGEN OG DENS PRIS (2026-08-17): gulve kan kun stige. Decay går aldrig under
+# dem, og den eneste vej ned er den manuelle knap på Indstillinger-fanen. Jagten
+# måler desuden kun ÉN fejltype — den tæller spøgelser i et tomt hus, men får
+# aldrig at vide at en gate blev så døv at den overså et menneske. En optimering
+# med ensidet tabsfunktion ender i sit eget yderpunkt, så hvert gulv skal koste
+# mere end ét datapunkt: `apollo_flap_hunt_floor_min_flaps` (default 3) flaps på
+# SAMME gate inden for `..._floor_window_hours` (default 24), talt i
+# `input_text.{slug}_gate_flapcount` med samme 18-slot-kodning som gulvene.
+# Selve slider-bumpet sker stadig ved hvert flap — det er reversibelt, for decay
+# ruller det tilbage når gaten ikke har et gulv. Vinduet forskydes IKKE af de
+# efterfølgende flaps (fejlklasse #20), så spredte enkeltflaps over uger ikke kan
+# summere sig til et permanent gulv.
+# ⚠️ `apollo_latch_detect.yaml` sætter stadig et gulv i ÉT spring (energi+margin)
+# uden gentagelses-krav. Det er husets største enkeltstående ratchet-skridt.
+#
+# CHIP-WEAR: hvert bump = 1 slider-skift → 1 NVRAM-write. Per-rum debounce
+# (`apollo_flap_hunt_gate_debounce_seconds`, default 30s) begrænser writes ved
+# hurtig-flappende spøgelser. 0 = bump ved bogstaveligt hvert flap.
+#
+# AUTO ON/OFF (user-spec 2026-07-28): jagten følger `input_select.house_state` —
+# ON ved Dormant (huset tomt = hvert flap er per definition et spøgelse), OFF ved
+# Active (folk hjemme = ægte presence må hverken bumpe gates eller spamme).
+# Manuel betjening virker stadig: tænder du selv midt i Active, slukker intet før
+# næste Active-flanke (ghost-pushens 2t-auto-off gælder fortsat, notif_actions).
+# AirBnB: auto-on er gatet til Normal/Home Vacation, og AirBnB-entry slukker
+# jagten — en gæsts bevægelse må ikke desensibilisere radaren for familien.
+#
+# SUPPRESSION: mens Roborock kører (`vacuum` cleaning/returning el. session-flaget)
+# ELLER et gardin kører, er occupancy-flanker IKKE ægte spøgelses-flap (robottens
+# egen bevægelse / gardin-motion). Så registreres INTET — hverken display-teksten,
+# auto-bumpet eller pushen (user-spec 2026-07-10: "det skal ikke tælle som flaps").
+# Ét anker: `binary_sensor.apollo_flap_suppress` (fejlklasse #2) — samme sensor
+# bruges også af spøgelses-alarmen i apollo_ghost_alert.yaml.
+# ⚠️ Suppression er PROSPEKTIV og kommer for sent: robottens status hentes fra
+# Roborocks sky, så HA ser "cleaning" 18-155 s (median 41) efter at robotten
+# fysisk er kørt. Det blinde hul lukkes RETROAKTIVT — se ROBOT-START-STEMPEL
+# nedenfor og `apollo_flap_hunt_robot_lag_sekunder`.
+#
+# HJEMKOMST-GRACE (2026-07-28b, user-spec "flap hunt skal lige afvente om det er
+# en hjemkomst"): et flap bumper IKKE gaten med det samme længere. Det lægges i en
+# kø (`input_text.apollo_flap_hunt_pending_bumps`) som PROVISORISK, og committes
+# først når der er gået `apollo_flap_hunt_arrival_grace_minutes` UDEN et hjemkomst-
+# signal. Kommer signalet (hoveddør åbnet, Parent A/Parent B GPS → hjemme) i vinduet,
+# smides hele køen væk — så var flappet ægte tilstedeværelse, ikke et spøgelse.
+# Dækker BEGGE retninger: flap efter døren (preventivt, køen fyldes ikke) og flap
+# 1-2 min FØR døren (kurativt, køen droppes). Ét anker for "hvornår kom nogen
+# hjem": `sensor.apollo_hjemkomst_sidst` (fejlklasse #2).
+# INCIDENT der udløste det (2026-07-28 15:21-15:24): dør åbnet 15:22:08, to flaps
+# 15:23:08 (sove g1 move 40→45) + 15:23:50 (køkken g4 still 32→37) blev bumpet som
+# spøgelser og LÅST som gulve — brugerens hjemkomst desensibiliserede radaren.
+#
+# ACTIVE-BACKSTOP (samme dag): auto-off'en er flanke-trigget på house_state →
+# Active. Ved incidenten var huset ALLEREDE Active (falsk Active kl. 13:00 mens
+# huset var tomt), så flanken kom aldrig igen → jagten kørte videre til brugeren
+# slukkede manuelt kl. 15:29 (fejlklasse #4). Backstoppen slukker jagten når
+# house_state er Active OG jagten blev tændt FØR den Active-flanke (= den tabte
+# flanke). Tændte brugeren selv efter flanken, røres jagten ikke — manuel
+# betjening i Active er stadig et understøttet valg (se AUTO ON/OFF).
+#
+# NAT-KALIBRERING (2026-08-16f, user-valg): jagten + decay krævede at HELE huset
+# var tomt — og det er dette hus næsten aldrig. Målt over 13,7 døgn: 23,1 t Dormant
+# = 7 %, og nul Dormant mellem 08-11 18:17 og 08-16 09:00. Med 742 skridt tilbage
+# til gulvet (køkken 294, stue 247) var konvergensen ~90 døgn væk.
+# Men stue/spisestue/køkken er bevisligt tomme 6-8 t HVER nat. Derfor et ANDET
+# vindue der ikke går gennem house_state: er voksen-godnat sat, rummet selv stille
+# i `apollo_natkalib_rum_stille_min`, og ingen menneskelig uro i `..._uro_min`,
+# så er et flap i det rum et spøgelse — uanset at familien er hjemme.
+#   Sove + børneværelse deltager ALDRIG: der ligger kroppe. Sove-Apolloen taber
+#   en person der ligger stille i 5-15 min (målt 08-11), så dens off→on-flanke er
+#   en sovende der vender sig — bumper vi den, gør vi radaren blind for præcis det
+#   den skal se.
+#   SIKKERHEDEN i vinduet: `godnat_voksne_active` ⇒ `godnat_common_active`, som er
+#   netop den gate fælles-rummenes presence-lys hænger på (presence_stue/
+#   presence_koekken). Et kalibrerings-spøgelse kl. 03 kan derfor ikke tænde lys —
+#   modsat Dormant, hvor et spøgelse vækker huset til Active. Betingelsen står
+#   EKSPLICIT i rosteret, så den ikke kan forsvinde i en fremtidig refaktor.
+#   MODBEVISET: nat-tokens bærer STORT rum-bogstav i køen og droppes ikke af
+#   "nogen er hjemme" (det er de jo alle sammen — de sover), men af
+#   `input_datetime.apollo_menneske_uro_sidst`: vedvarende occupancy i et dagrum,
+#   moving_target i et soverum, eller en yderdør. En natlig køkkentur bliver derfor
+#   stemplet inden hjemkomst-gracen udløber, og dens provisoriske bump droppes.
+#   Restrisiko: et menneskebesøg under 60 s stemples ikke og koster ét point på ét
+#   gate — bundet af at bump-skridtet er +1 og gulvet kun kan flytte sig ét hak.
+#
+# ÉT ROSTER (fejlklasse #2 + mønstret fra `sensor.mood_pause_rooms`):
+# `sensor.apollo_kalib_rum` er den ENESTE der afgør "må vi tolke flaps i dette rum
+# som spøgelser og sænke dets gates". Både flap-jagtens bump og gate-decay læser
+# den; hus-vejen (Dormant/bevisligt tomt) og nat-vejen er to grene i SAMME sensor.
+#
+# GARDIN-DETEKTION (rettet 2026-07-28): 3 af 4 gardiner er Somfy RTS med
+# `assumed_state` — de rammer ALDRIG 'opening'/'closing', men springer direkte
+# open↔closed ved kommandoen (verificeret i history). Den gamle
+# `state == 'closing'`-test fangede derfor kun sove-gardinet, og kun i de ~5 s det
+# holdt 'closing'. Nu: bevægelses-VINDUE på `last_changed` for alle 4 gardiner
+# (= kommando-tidspunktet), længde = `apollo_flap_suppress_gardin_seconds`, plus
+# de ægte opening/closing-states. Motoren kører ~20-40 s og radaren ser den.
+# =============================================================================
+
+template:
+  - binary_sensor:
+      - name: "Apollo flap suppress"
+        unique_id: apollo_flap_suppress
+        icon: mdi:robot-vacuum
+        # ON = ignorér occupancy-flanker som flap (robot rengør el. gardin kører).
+        # Robot: samme anker som resten af huset (house_modes/wasp) = vacuum-state
+        # cleaning/returning — 'returning' tæller med, robotten kører stadig rundt.
+        # Gardin: opening/closing (kun sove-gardinet rapporterer dem) ELLER et
+        # bevægelses-vindue efter sidste state-skift (= Somfy-kommandoen).
+        #
+        # 🤖 SESSIONS-FLAGENE ER IKKE BEVIS FOR BEVÆGELSE (2026-08-06): både
+        # `roborock_session_active` og `s8_maxv_ultra_cleaning` ryddes FØRST når
+        # robotten afslutter pænt (returning/charging uden fejl,
+        # roborock_session_completed). Sætter den sig fast — fejl → idle — hænger
+        # de til nogen kommer hjem. Målt over 21 dage: 3 sessioner med haler på
+        # 244 / 348 / 459 min hvor robotten stod bomstille. Suppressionen fulgte
+        # flaget, så flap-jagten og gate-decay var døde i HELE Dormant-vinduet:
+        # af 16,8 t suppression var kun 1,1 t ægte robot-drift = 93 % spild.
+        # Flagene tæller derfor kun så længe robotten FAKTISK har bevæget sig
+        # inden for `apollo_flap_suppress_robot_idle_minutter`. `now()` tvinger
+        # re-render hvert minut, så suppressionen falder af sig selv.
+        # Kalibrering: længste legitime pause midt i en kørsel (mop-vask) = 4,4
+        # min, længste normale hale efter afsluttet kørsel = 4,5 min; nærmeste
+        # hængte hale = 244 min. 15 min ligger midt i kløften (3,4× max legitim).
+        # NB: robotten er BEVIDST ikke-suppresserende mens den holder pause i
+        # morgen-udskydelsen (roborock_morgen_udskyd) — en parkeret robot laver
+        # ingen radar-uro, så flankerne dér er ægte.
+        state: >-
+          {% from 'rosters.jinja' import alle_gardiner %}{% set covs = alle_gardiner
+                         %}
+          {% set win = states('input_number.apollo_flap_suppress_gardin_seconds') | float(90) %}
+          {% set ns = namespace(gardin=false) %}
+          {% for c in covs %}
+            {% if states(c) in ['opening', 'closing'] %}
+              {% set ns.gardin = true %}
+            {% elif win > 0 and states[c] is not none
+                    and (now() - states[c].last_changed).total_seconds() < win %}
+              {% set ns.gardin = true %}
+            {% endif %}
+          {% endfor %}
+          {% set koerer = states('vacuum.s8_maxv_ultra') in ['cleaning', 'returning'] %}
+          {% set grace = states('input_number.apollo_flap_suppress_robot_idle_minutter')
+                         | float(15) %}
+          {% set v = states.vacuum.s8_maxv_ultra %}
+          {# Hvor længe har robotten stået stille? Ukendt entity → 0 = behandl som
+             lige stoppet, så flagene beholder deres gamle vægt (fejler sikkert). #}
+          {% set stille_min = 0 if (koerer or v is none)
+                              else (now() - v.last_changed).total_seconds() / 60 %}
+          {% set flag_frisk = koerer or grace <= 0 or stille_min < grace %}
+          {{ ns.gardin
+             or koerer
+             or (flag_frisk
+                 and (is_state('binary_sensor.s8_maxv_ultra_cleaning', 'on')
+                      or is_state('input_boolean.roborock_session_active', 'on'))) }}
+        attributes:
+          # Diagnostik: hvorfor er den on/off? Gør en hængt session synlig i UI.
+          robot_koerer: "{{ states('vacuum.s8_maxv_ultra') in ['cleaning', 'returning'] }}"
+          robot_stille_min: >-
+            {% set v = states.vacuum.s8_maxv_ultra %}
+            {{ 0 if (v is none or states('vacuum.s8_maxv_ultra') in ['cleaning', 'returning'])
+               else ((now() - v.last_changed).total_seconds() / 60) | round(1) }}
+          session_flag: "{{ is_state('input_boolean.roborock_session_active', 'on') }}"
+
+  - sensor:
+      # ÉT anker for "hvornår kom nogen sidst hjem" (fejlklasse #2) — læses både
+      # preventivt (flap efter hjemkomst → registrér ikke) og kurativt (flap FØR
+      # hjemkomsten → drop den provisoriske bump). Timestamp-sensor, så
+      # forbrugerne kan bruge as_timestamp() på en tz-BEVIDST streng.
+      #
+      # NB: `state_attr(..., 'timestamp')` på input_datetime — IKKE
+      # as_timestamp(states(...)), som fortolker den naive streng som UTC og
+      # giver +2 t skew (fejlklasse B67/#18).
+      - name: "Apollo hjemkomst sidst"
+        unique_id: apollo_hjemkomst_sidst
+        device_class: timestamp
+        icon: mdi:door-open
+        state: >-
+          {% set ns = namespace(t=0) %}
+          {% set d = state_attr('input_datetime.hoveddoer_last_open', 'timestamp') | float(0) %}
+          {% if d > ns.t %}{% set ns.t = d %}{% endif %}
+          {% set door = states.binary_sensor.parasoll_hoveddoer %}
+          {% if door is not none and door.state in ['on', 'off'] %}
+            {% set dc = door.last_changed.timestamp() %}
+            {% if dc > ns.t %}{% set ns.t = dc %}{% endif %}
+          {% endif %}
+          {% for p in ['input_boolean.parent_a_home', 'input_boolean.parent_b_home'] %}
+            {% set o = states[p] %}
+            {% if o is not none and o.state == 'on' and o.last_changed.timestamp() > ns.t %}
+              {% set ns.t = o.last_changed.timestamp() %}
+            {% endif %}
+          {% endfor %}
+          {{ (ns.t | as_datetime | as_local).isoformat() if ns.t > 0 else none }}
+
+      # ÉT roster over hvilke rum der lige nu må kalibreres — læses af BÅDE
+      # flap-jagtens bump og gate-decay (fejlklasse #2). To grene:
+      #   hus  — Dormant eller bevisligt tomt hus (`apollo_flap_hunt_enabled`).
+      #          Gælder alle fem rum: er huset tomt, er også soveværelset tomt.
+      #   nat  — kun stue/spisestue/køkken, mens de voksne beviseligt ligger i seng.
+      # Stille-kravet er PR. RUM, ikke globalt: spisestuen har sit eget
+      # (`apollo_natkalib_spisestue_stille_min`, 10 min) fordi det fælles krav på
+      # 25 min udelukkede præcis det rum der flapper mest — se sliderens note.
+      # `now()` tvinger re-render hvert minut, men STATEN skifter kun når roster-
+      # listen gør — ingen attribut afledes af tiden (fejlklasse #24).
+      # Rummets stilhed måles på `last_changed`, der nulstilles ved HA-restart
+      # (fejlklasse #5). Her er det bevidst: efter en restart ser hvert rum
+      # "lige skiftet" ud, så vinduet er lukket de første `stille`-minutter =
+      # fejler til den sikre side.
+      # Navnet SKAL slugify'e til unique_id — "kalibrerings-rum" ville give
+      # sensor.apollo_kalibrerings_rum og efterlade alle referencer tomme.
+      - name: "Apollo kalib rum"
+        unique_id: apollo_kalib_rum
+        icon: mdi:radar
+        state: >-
+          {% set mode_ok = states('input_select.house_mode')
+                           in ['Normal', 'Home Vacation'] %}
+          {% set supp = is_state('binary_sensor.apollo_flap_suppress', 'on') %}
+          {% set hus = is_state('input_boolean.apollo_flap_hunt_enabled', 'on') %}
+          {% set stille = states('input_number.apollo_natkalib_rum_stille_min')
+                          | float(25) * 60 %}
+          {% set stille_p = states('input_number.apollo_natkalib_spisestue_stille_min')
+                            | float(10) * 60 %}
+          {% set uro_min = states('input_number.apollo_natkalib_uro_min') | float(10) * 60 %}
+          {% set raw = states('input_datetime.apollo_menneske_uro_sidst') %}
+          {% set uro = 0 if (raw in ['unknown', 'unavailable', 'none', '']
+                             or raw[11:] == '00:00:00')
+                       else state_attr('input_datetime.apollo_menneske_uro_sidst',
+                                       'timestamp') | float(0) %}
+          {% set ro = uro == 0 or (now().timestamp() - uro) >= uro_min %}
+          {% set nat = is_state('input_boolean.apollo_natkalib_enabled', 'on')
+                       and is_state('input_boolean.godnat_voksne_active', 'on')
+                       and is_state('binary_sensor.godnat_common_active', 'on')
+                       and is_state('binary_sensor.sove_alarm_morgen_vindue', 'off')
+                       and ro %}
+          {% set ns = namespace(l=[]) %}
+          {% for slug, ent, natrum in [
+               ('stue', 'binary_sensor.stue_apollo_occupancy', true),
+               ('spisestue', 'binary_sensor.spisestue_apollo_occupancy', true),
+               ('koekken', 'binary_sensor.koekken_apollo_occupancy', true),
+               ('boernevaerelse', 'binary_sensor.boernevaerelse_apollo_occupancy', false),
+               ('sove', 'binary_sensor.sovevaerelse_apollo_occupancy', false)] %}
+            {% set krav = stille_p if slug == 'spisestue' else stille %}
+            {% if mode_ok and not supp %}
+              {% if hus %}
+                {% set ns.l = ns.l + [slug] %}
+              {% elif nat and natrum and is_state(ent, 'off') and states[ent] is not none
+                      and (now() - states[ent].last_changed).total_seconds() >= krav %}
+                {% set ns.l = ns.l + [slug] %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.l | join(' ') }}
+        attributes:
+          antal: "{{ states('sensor.apollo_kalib_rum').split() | count }}"
+          # Kategorisk (ingen tids-afledt værdi = ingen minut-churn, #24). Stopper
+          # ved nat-vejens armering; er den armeret og listen alligevel tom, er det
+          # rummenes egen stilhed eller uro-stemplet der mangler — begge er
+          # aflæselige direkte i UI'et, så de gentages ikke her (#2).
+          hvorfor: >-
+            {% if states('input_select.house_mode') not in ['Normal', 'Home Vacation'] %}
+              house_mode
+            {% elif is_state('binary_sensor.apollo_flap_suppress', 'on') %}
+              robot/gardin
+            {% elif is_state('input_boolean.apollo_flap_hunt_enabled', 'on') %}
+              hus tomt
+            {% elif not is_state('input_boolean.apollo_natkalib_enabled', 'on') %}
+              nat-kalibrering fra
+            {% elif not is_state('input_boolean.godnat_voksne_active', 'on') %}
+              afventer voksen-godnat
+            {% else %}
+              nat armeret
+            {% endif %}
+
+input_boolean:
+  apollo_flap_hunt_enabled:
+    name: "Apollo flap-jagt (auto-bump + push)"
+    icon: mdi:target-account
+    # 2026-07-10: INGEN initial: — user slår FRA når han er hjemme, og det skal
+    # overleve en restart. `initial: on` tvang den ON ved hver genstart → bumpede
+    # gates mens familien var hjemme (ægte presence = flaps). Fresh-install-default
+    # ON sættes af init_user_preferences (run-once). Spejler dvale-lås-mønstret.
+
+  apollo_natkalib_enabled:
+    name: "Apollo nat-kalibrering (dagrum mens I sover)"
+    icon: mdi:weather-night
+    # Egen kill-switch, adskilt fra flap-jagtens. Slår user jagten fra fordi han er
+    # hjemme, skal nat-vejen stadig kunne køre — den forudsætter jo netop at
+    # familien er hjemme og sover. Ingen initial: → overlever restart.
+
+input_number:
+  apollo_natkalib_rum_stille_min:
+    name: "Nat-kalibrering: rummet stille før vinduet åbner"
+    icon: mdi:sleep
+    min: 5
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+    # Hvor længe rummets egen occupancy skal have stået `off` før vi tør kalde
+    # dets flaps for spøgelser. Default 25 — langt over en normal gennemgang, og
+    # over Apollo-latchens `occupancy_stuck_on_minutes` (18).
+
+  apollo_natkalib_spisestue_stille_min:
+    name: "Nat-kalibrering: spisestuens stille-krav"
+    icon: mdi:silverware-fork-knife
+    min: 5
+    max: 240
+    step: 1
+    unit_of_measurement: "min"
+    mode: box
+    # 2026-08-17 (user valgte b): spisestuen er husets STØJENDE rum og blev derfor
+    # aldrig kalibreret — det fælles krav på 25 min er en catch-22 for netop det
+    # rum der har mest brug for jagten. Målt natten 16→17/8: 209 occupancy-skift
+    # 22:00-07:00, og ét eneste hul >= 25 min (25,1 min fra 00:08:51) som
+    # rosterets minut-render missede med 3 sekunder → spisestue optrådte 0 gange
+    # i `sensor.apollo_kalib_rum` hele natten. Ved 10 min havde den kvalificeret
+    # i mindst 5 vinduer (25,1 / 16,3 / 16,1 / 15,6 / 15,2 min).
+    # Kun spisestuen har sit eget krav; de øvrige rum læser fortsat
+    # `apollo_natkalib_rum_stille_min`. Sæt den = 25 for at fjerne undtagelsen.
+
+  apollo_natkalib_uro_min:
+    name: "Nat-kalibrering: karantæne efter menneskelig uro"
+    icon: mdi:walk
+    min: 1
+    max: 120
+    step: 1
+    unit_of_measurement: "min"
+    mode: box
+    # Hvor længe ALLE nat-vinduer holdes lukket efter sidste menneske-bevis
+    # (vedvarende occupancy i et dagrum, moving_target i et soverum, yderdør).
+    # Default 10 = samme størrelsesorden som hjemkomst-gracen.
+  apollo_flap_hunt_bump_step:
+    name: "Flap-jagt: bump-skridt pr. flap"
+    icon: mdi:arrow-up-bold
+    min: 0
+    max: 10
+    step: 1
+    mode: box
+    # Hvor meget den ramte gate hæves (= mindre følsom) pr. flap. Default 2.
+    # 0 = log + push men rør ikke sliderne.
+
+  apollo_flap_hunt_floor_min_flaps:
+    name: "Flap-jagt: flaps før et gulv låses"
+    icon: mdi:lock-clock
+    min: 1
+    max: 10
+    step: 1
+    mode: box
+    # Hvor mange flaps SAMME gate skal levere inden for vinduet, før spærhagen
+    # låser et gulv. Default 3. 1 = gammel adfærd (hvert flap ratcher).
+    # Gulve kan kun sænkes i hånden, så det er her prisen for en fejlbedømmelse
+    # afgøres — jagten ser kun spøgelser, aldrig et menneske den overså.
+
+  apollo_flap_hunt_floor_window_hours:
+    name: "Flap-jagt: bevis-vindue for gulv"
+    icon: mdi:calendar-clock
+    min: 1
+    max: 168
+    step: 1
+    unit_of_measurement: "t"
+    mode: box
+    # Hvor længe et flap tæller som bevis. Default 24. Går vinduet ud uden at
+    # tærsklen blev nået, nulstilles rummets tællere — spredte enkeltflaps over
+    # uger må ikke summere sig til et permanent gulv.
+
+  apollo_flap_hunt_gate_debounce_seconds:
+    name: "Flap-jagt: bump-debounce pr. rum"
+    icon: mdi:timer-cog-outline
+    min: 0
+    max: 600
+    step: 5
+    unit_of_measurement: "s"
+    mode: box
+    # Min. tid mellem to bumps i SAMME rum (chip-wear-guard). Default 30.
+    # 0 = bump ved hvert flap.
+
+  apollo_flap_suppress_gardin_seconds:
+    name: "Flap-jagt: gardin-pause efter kommando"
+    icon: mdi:curtains
+    min: 0
+    max: 600
+    step: 5
+    unit_of_measurement: "s"
+    mode: box
+    # Hvor længe efter et gardin-kommando radar-uro ikke tæller som flap. Somfy-
+    # gardinerne er assumed_state (ingen 'closing') → vinduet ER detektionen.
+    # Default 90 (motor ~20-40 s + settle). 0 = kun ægte opening/closing-states.
+
+  apollo_flap_suppress_robot_idle_minutter:
+    name: "Flap-jagt: robot-pause før session-flag ignoreres"
+    icon: mdi:robot-vacuum-off
+    min: 0
+    max: 240
+    step: 1
+    unit_of_measurement: "min"
+    mode: box
+    # Hvor længe robotten må stå stille før dens sessions-flag holder op med at
+    # suppresse flap-jagten. Flagene (roborock_session_active +
+    # s8_maxv_ultra_cleaning) ryddes kun ved en PÆN afslutning, så en robot der
+    # sætter sig fast hænger dem i timevis (målt: 244/348/459 min) og dræbte hele
+    # Dormant-vinduet for træneren. Default 15 (max legitim pause målt = 4,4 min
+    # mop-vask; nærmeste hængte hale = 244 min). 0 = gammel adfærd (stol blindt
+    # på flaget). Rører IKKE robottens egen drift — kun hvad der tæller som
+    # "radar-uro vi selv har lavet".
+    # ⚠️ Sætter du den højt, genindfører du blindheden: hele Dormant-vinduet kan
+    # igen gå tabt hvis robotten fejler tidligt på dagen.
+
+  apollo_flap_hunt_arrival_grace_minutes:
+    name: "Flap-jagt: hjemkomst-grace (provisorisk bump)"
+    icon: mdi:door-closed-lock
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: box
+    # Hvor længe et flap holdes PROVISORISK før gaten faktisk bumpes. Kommer der
+    # et hjemkomst-signal i vinduet (hoveddør/GPS), droppes bumpet — flappet var
+    # ægte tilstedeværelse. Default 10. 0 = bump straks (gammel adfærd).
+
+  apollo_flap_hunt_robot_lag_sekunder:
+    name: "Flap-jagt: robot-startens blinde vindue"
+    icon: mdi:robot-vacuum-variant
+    min: 0
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: box
+    # Robottens status kommer fra Roborocks SKY — HA ser den derfor først et stykke
+    # tid efter at robotten fysisk er kørt fra dokken, mens radaren ser den med det
+    # samme. I det hul er `apollo_flap_suppress` stadig off, så robottens EGEN
+    # bevægelse lander i den provisoriske kø som var den et spøgelse.
+    # Målt over 21 dage (n=30 kørsler): forsinkelsen fra robottens egen
+    # `last_clean_begin` til HA's status-skift er 18 s min / 41 s median / 155 s max.
+    # Default 180 = over det målte maksimum med margin. Tokens skrevet i vinduet
+    # [robot-start − dette] … [robot-start] droppes retroaktivt i commit.
+    # 0 = fra (gammel adfærd: kun prospektiv suppression).
+
+  apollo_flap_hunt_notify_throttle_minutes:
+    name: "Flap-jagt: push-throttle"
+    icon: mdi:timer-lock-outline
+    min: 1
+    max: 240
+    step: 1
+    unit_of_measurement: "min"
+    mode: box
+    # Max én samlet push pr. dette antal minutter (lister gates+antal+tider
+    # siden sidste push). Default 10.
+
+  # Runtime — antal flap siden sidste push. "cursor" i navnet holder den UDE af
+  # helpers_export-snapshot (den er ikke en konfig-værdi).
+  apollo_flap_hunt_pending_cursor:
+    name: "Flap-jagt: ventende antal"
+    icon: mdi:counter
+    min: 0
+    max: 99999
+    step: 1
+    mode: box
+
+input_datetime:
+  # Runtime — hvornår robotten SENEST blev set starte en kørsel (uanset hvem der
+  # startede den: HA, Roborock-appen eller robottens eget skema). Ankeret for det
+  # retroaktive drop; skrevet værdi frem for `last_changed`, som nulstilles ved
+  # HA-restart (fejlklasse #5). Ude af helper-snapshottet (ikke i DATETIME_CONFIG).
+  apollo_robot_start_at:
+    name: "Robot-start sidst set"
+    icon: mdi:robot-vacuum
+    has_date: true
+    has_time: true
+  # Runtime — hvornår et MENNESKE senest beviste sig om natten. Modbeviset mod et
+  # nat-token (jf. NAT-KALIBRERING i headeren). Skrevet stempel frem for
+  # `last_changed`, som nulstilles ved HA-restart (fejlklasse #5).
+  apollo_menneske_uro_sidst:
+    name: "Menneskelig uro sidst"
+    icon: mdi:walk
+    has_date: true
+    has_time: true
+  apollo_flap_hunt_last_push:
+    name: "Flap-jagt sidst pushed"
+    icon: mdi:clock-alert-outline
+    has_date: true
+    has_time: true
+  sove_apollo_flap_last_bump:
+    name: "Sove flap sidst bumpet"
+    has_date: true
+    has_time: true
+  stue_apollo_flap_last_bump:
+    name: "Stue flap sidst bumpet"
+    has_date: true
+    has_time: true
+  spisestue_apollo_flap_last_bump:
+    name: "Spisestue flap sidst bumpet"
+    has_date: true
+    has_time: true
+  koekken_apollo_flap_last_bump:
+    name: "Køkken flap sidst bumpet"
+    has_date: true
+    has_time: true
+  boernevaerelse_apollo_flap_last_bump:
+    name: "Børneværelse flap sidst bumpet"
+    has_date: true
+    has_time: true
+  # Vinduets START for bevis-kontoen (`*_gate_flapcount`). Er stemplet ældre end
+  # `apollo_flap_hunt_floor_window_hours`, nulstilles rummets tællere ved næste
+  # flap. Skrevet stempel, ikke `last_changed` (fejlklasse #5). Urørt = dagens
+  # midnat, så tidsdelen testes — ikke timestamp'en.
+  stue_flapcount_since:
+    name: "Stue flaptæller-vindue start"
+    has_date: true
+    has_time: true
+  spisestue_flapcount_since:
+    name: "Spisestue flaptæller-vindue start"
+    has_date: true
+    has_time: true
+  koekken_flapcount_since:
+    name: "Køkken flaptæller-vindue start"
+    has_date: true
+    has_time: true
+  boernevaerelse_flapcount_since:
+    name: "Børneværelse flaptæller-vindue start"
+    has_date: true
+    has_time: true
+  sove_flapcount_since:
+    name: "Sove flaptæller-vindue start"
+    has_date: true
+    has_time: true
+
+input_text:
+  # Runtime buffer over flap-tokens siden sidste push (bygges i push-teksten).
+  apollo_flap_hunt_buffer:
+    name: "Flap-jagt buffer"
+    max: 255
+  # Provisoriske bumps der afventer hjemkomst-grace. Tokens: `r|slot|val|epoch`
+  # adskilt af ',' — r = rum-bogstav (s=sove, t=stue, p=spisestue, k=køkken,
+  # b=børneværelse), slot 0-8 = still g0-g8, 9-17 = move g0-g8.
+  apollo_flap_hunt_pending_bumps:
+    name: "Flap-jagt: provisoriske bumps"
+    max: 255
+  # Per-rum "sidste flap" til Sensorer & lux-fanen: gate + type + tid + varighed.
+  sove_apollo_last_flap:
+    name: "Sove sidste flap"
+    max: 255
+  stue_apollo_last_flap:
+    name: "Stue sidste flap"
+    max: 255
+  spisestue_apollo_last_flap:
+    name: "Spisestue sidste flap"
+    max: 255
+  koekken_apollo_last_flap:
+    name: "Køkken sidste flap"
+    max: 255
+  boernevaerelse_apollo_last_flap:
+    name: "Børneværelse sidste flap"
+    max: 255
+  # BEVIS-KONTO for spærhagen (2026-08-17, user-valg "krav om gentagelse").
+  # Samme 18-slot-kodning som `*_gate_floors`: g0-g8 still, så g0-g8 move, 2 cifre
+  # pr. slot. Tæller flaps pr. gate inden for `apollo_flap_hunt_floor_window_hours`;
+  # først ved `..._floor_min_flaps` sættes et GULV. Bumpet af selve slideren sker
+  # stadig ved hvert flap — et enkeltstående flap må godt dæmpe gaten midlertidigt,
+  # det må bare ikke ratche den fast, for gulve kan kun sænkes i hånden.
+  # Skrives KUN af commit-automationen; nulstilles af script.apollo_gate_floors_reset.
+  stue_gate_flapcount:
+    name: "Stue gate-flaptællere"
+    max: 40
+  spisestue_gate_flapcount:
+    name: "Spisestue gate-flaptællere"
+    max: 40
+  koekken_gate_flapcount:
+    name: "Køkken gate-flaptællere"
+    max: 40
+  boernevaerelse_gate_flapcount:
+    name: "Børneværelse gate-flaptællere"
+    max: 40
+  sove_gate_flapcount:
+    name: "Sove gate-flaptællere"
+    max: 40
+
+automation:
+  # ---------------------------------------------------------------------------
+  # AUTO ON/OFF: jagten følger husets tilstand (user-spec 2026-07-28).
+  # Dormant = huset i ro/tomt → hvert flap er et spøgelse → jagt ON.
+  # Active   = folk hjemme → ægte presence ville bumpe gates forkert → jagt OFF.
+  # AirBnB-gate på ON-grenen (gæstens bevægelse må ikke tune radaren); OFF-grenen
+  # er bevidst U-gatet, så en jagt der kørte da mode skiftede altid kan stoppe.
+  #
+  # 🔓 DØDVANDET (2026-08-15c): jagten var KUN armeret i Dormant — men en Apollo
+  # der fantomerer holder huset Active. Præcis den sensor der har brug for
+  # kalibrering, forhindrer altså kalibreringen i at køre; huset stod Active i
+  # fire døgn i træk. Derfor en ANDEN indgang der ikke går gennem house_state:
+  # er begge voksne bevisligt væk (Parent A's tracker + Parent B's anker) og ingen
+  # børn hjemme i 45 min, så ER huset tomt — uanset hvad radaren påstår, og
+  # ethvert flap er pr. definition et spøgelse. Radaren er ikke sit eget vidne.
+  # ---------------------------------------------------------------------------
+  - id: apollo_flap_hunt_house_state_auto
+    alias: "Apollo flap-jagt: auto on ved Dormant / off ved Active"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_select.house_state
+        to: "Dormant"
+        id: "on"
+      - platform: state
+        entity_id: input_select.house_state
+        to: "Active"
+        id: "off"
+      # Tomt-hus-indgangen: tick + flanker, så den ikke kan misse sin egen kant
+      # (#4 — en ren flanke fyrer aldrig hvis den sker mens en gate blokerer).
+      - platform: time_pattern
+        minutes: "/15"
+        id: "tick"
+      - platform: state
+        entity_id: device_tracker.phone_a
+        to: "home"
+        id: "hjem"
+      - platform: state
+        entity_id: binary_sensor.parent_b_hjemme_anker
+        from: "off"
+        to: "on"
+        id: "hjem"
+      - platform: state
+        entity_id: binary_sensor.kids_home
+        from: "off"
+        to: "on"
+        id: "hjem"
+    action:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: "on"
+              - condition: template
+                value_template: >-
+                  {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.apollo_flap_hunt_enabled
+          - conditions:
+              - condition: trigger
+                id: "off"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.apollo_flap_hunt_enabled
+          # Nogen er kommet hjem mens huset stod Active → jagten skal stoppe
+          # her, for den `→ Active`-flanke ovenfor kommer aldrig.
+          - conditions:
+              - condition: trigger
+                id: "hjem"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.apollo_flap_hunt_enabled
+          - conditions:
+              - condition: trigger
+                id: "tick"
+              - condition: template
+                value_template: >-
+                  {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+              - condition: state
+                entity_id: device_tracker.phone_a
+                state: "not_home"
+                for: "00:45:00"
+              - condition: state
+                entity_id: binary_sensor.parent_b_hjemme_anker
+                state: "off"
+                for: "00:45:00"
+              - condition: not
+                conditions:
+                  - condition: state
+                    entity_id: binary_sensor.kids_home
+                    state: "on"
+              # Åben yderdør = nogen er hjemme uden telefon (samme veto som
+              # GPS-fast Dormant bruger).
+              - condition: state
+                entity_id: binary_sensor.parasoll_terrassedoer
+                state: "off"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.apollo_flap_hunt_enabled
+
+  # ---------------------------------------------------------------------------
+  # URO-STEMPEL (2026-08-16f): nat-vinduets modbevis. Et spøgelse rører ét rum
+  # kortvarigt; et menneske holder et rum besat eller bevæger sig i et soverum.
+  #   dagrum   — occupancy on i 60 s. Husets egen spøgelses-grænse er 40 s
+  #              (`apollo_ghost_flap_threshold`), så 60 s ligger sikkert over.
+  #   soverum  — moving_target, IKKE occupancy: en sovende ligger stille og taber
+  #              sin latch hvert 5.-15. min (målt 08-11), så dens occupancy-flanker
+  #              er søvn, ikke oprejsning. Et menneske der sætter sig op og går,
+  #              giver moving_target.
+  #   yderdør  — utvetydigt.
+  # Stempler kun mens nat-vejen kan være i spil, så vi ikke skriver en DB-række
+  # hver gang nogen sætter sig i sofaen om eftermiddagen (#24).
+  # ---------------------------------------------------------------------------
+  - id: apollo_kalib_uro_stamp
+    alias: "Apollo nat-kalibrering: stempl menneskelig uro"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.stue_apollo_occupancy
+          - binary_sensor.spisestue_apollo_occupancy
+          - binary_sensor.koekken_apollo_occupancy
+        from: "off"
+        to: "on"
+        for: "00:01:00"
+      - platform: state
+        entity_id:
+          - binary_sensor.sovevaerelse_apollo_radar_moving_target
+          - binary_sensor.boernevaerelse_apollo_radar_moving_target
+        from: "off"
+        to: "on"
+        for: "00:00:30"
+      - platform: state
+        entity_id:
+          - binary_sensor.parasoll_hoveddoer
+          - binary_sensor.parasoll_terrassedoer
+        to: "on"
+      # 2026-08-17 (user valgte a): PIR-VIDNER frem for radar-varighed.
+      # De tre occupancy-triggere ovenfor kræver `for: 1 min` og kan derfor ikke
+      # fyre på en nattur: målt natten 16→17/8 gav den ægte nattur stue 6 s + 5 s
+      # og køkken 19 s + 54 s — længste 54 s, seks sekunder for kort. Derfor stod
+      # `apollo_menneske_uro_sidst` stadig på sin usatte midnats-sentinel, og
+      # mennesket kl. 04:09:37 blev køet som spøgelse og committet som bump på
+      # stue kl. 04:20:00 — præcis den false-tuning værnet skulle forhindre.
+      # Varighed kan ikke skille dem ad (menneskets 6 s ligner spisestuens 5 s
+      # gust-blip), så vi skifter KILDE i stedet for at flytte tærsklen:
+      # entré-VALLHORN og bad-PIR er ikke-radar og kan ikke udløses af et
+      # blæsende gardin. Målt i samme sove-vindue (22:00-06:00) fyrede de
+      # TILSAMMEN kun under natturen (04:08:37 / 04:09:33 / 04:10:52 hhv.
+      # 04:08:41 / 04:09:30) og ikke ét sekund derudover — mod radarens 209
+      # flaps. Nul falske positiver på 8 timer → intet `for:` nødvendigt.
+      # `from: "off"` er påkrævet: VALLHORN er batteridrevet Matter/Thread og
+      # blind ~10 % af tiden, og en node der kommer tilbage genopstår med sin
+      # sidste kendte værdi — `unavailable → on` er et ekko, ikke bevægelse.
+      - platform: state
+        entity_id:
+          - binary_sensor.entre_valhorn_occupancy
+          - binary_sensor.badevaerelse_inde_occupancy
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.apollo_natkalib_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.godnat_voksne_active
+        state: "on"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.apollo_menneske_uro_sidst
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ---------------------------------------------------------------------------
+  # FLAP ON: occupancy off→on på en af de 5 Apolloer. Display opdateres ALTID;
+  # auto-bump + pending-tælling KUN når enabled + Roborock idle + intet gardin
+  # kører.
+  # ---------------------------------------------------------------------------
+  - id: apollo_flap_hunt_on
+    alias: "Apollo flap-jagt: flap on → log + bump"
+    mode: queued
+    max: 20
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.stue_apollo_occupancy
+        from: "off"
+        to: "on"
+        id: stue
+      - platform: state
+        entity_id: binary_sensor.spisestue_apollo_occupancy
+        from: "off"
+        to: "on"
+        id: spisestue
+      - platform: state
+        entity_id: binary_sensor.koekken_apollo_occupancy
+        from: "off"
+        to: "on"
+        id: koekken
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+        from: "off"
+        to: "on"
+        id: sovevaerelse
+      - platform: state
+        entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+        from: "off"
+        to: "on"
+        id: boernevaerelse
+    variables:
+      room: "{{ trigger.id }}"
+      slug: "{{ 'sove' if room == 'sovevaerelse' else room }}"
+      roomname: >-
+        {{ {'stue':'Stue','spisestue':'Spisestue','koekken':'Køkken',
+            'sovevaerelse':'Soveværelse','boernevaerelse':'Børneværelse'}.get(room, room) }}
+      md: "{{ states('sensor.' ~ room ~ '_apollo_radar_moving_distance') }}"
+      sd: "{{ states('sensor.' ~ room ~ '_apollo_radar_still_distance') }}"
+      dd: "{{ states('sensor.' ~ room ~ '_apollo_radar_detection_distance') }}"
+      # AFSTANDS-GUARD (2026-08-17): et mål i 0 cm findes ikke — 0 betyder "intet
+      # mål", præcis som unknown. Den gamle test (`>= 0`, og `dd|float(0)` som
+      # sidste udvej) gjorde begge dele til `dist = 0` → `gate = 0`, så HVER flap
+      # uden brugbar afstand blev skrevet på near-field-gaten. Det er netop den
+      # tilstand radaren er i når rummet er tomt = jagtens normale arbejdssituation.
+      # Målt: 5 af husets 7 gulve stod på gate 0, og spisestue move g0 klatrede
+      # 62→71 på én formiddag uden at flappene stoppede (gaten var ikke kilden).
+      # Nu: ingen brugbar afstand ⇒ INTET bump. Flappet tælles og vises stadig.
+      md_ok: "{{ md not in ['unknown','unavailable','none'] and md|float(0) > 0 }}"
+      sd_ok: "{{ sd not in ['unknown','unavailable','none'] and sd|float(0) > 0 }}"
+      dd_ok: "{{ dd not in ['unknown','unavailable','none'] and dd|float(0) > 0 }}"
+      typ: "{{ 'move' if md_ok else 'still' }}"
+      dist: >-
+        {{ (md|float(0)) if md_ok
+           else ((sd|float(0)) if sd_ok else ((dd|float(0)) if dd_ok else 0)) }}
+      dist_ok: "{{ md_ok or sd_ok or dd_ok }}"
+      gate: "{{ [8, (dist|float(0) / 75)|int]|min }}"
+      slider: "input_number.{{ slug }}_g{{ gate }}_{{ typ }}"
+      # DØD-GATE-GUARD (2026-08-24): LD2410'eren leverer INGEN still-energi for
+      # gate 0 og 1 — målt på køkkenet med engineering mode, 193 samples i træk:
+      # g0/g1 still = 0,0 hele vejen mens g2-g4 toppede på 75/100/100. En
+      # still-detektion kan derfor aldrig være krydset dér, uanset hvad
+      # afstands-sensoren siger. Og den siger netop 66-67 cm: det er radarens
+      # HVILE-værdi for "stationært mål" når der ikke er noget, så hvert
+      # artefakt-flap blev skrevet på `g0 still`. Det er samme fælde som
+      # afstands-guarden fra 08-17 lukkede for `0 cm` — sentinel'en var bare
+      # ikke 0. Konsekvens indtil nu: køkkenet havde 57 flaps og et PERMANENT
+      # gulv (99) på en gate der fysisk ikke kan fyre, mens de gates der
+      # faktisk krydsede (g2-g4, tærskel 26-27) aldrig blev rørt.
+      gate_dead: "{{ typ == 'still' and (gate | int(9)) <= 1 }}"
+      # Bumpet er en no-op når gaten allerede står på brugerens FRA-knap.
+      # Tavst indtil nu (se kommentaren ved bump-guarden) — nu vises det.
+      gate_pinned: "{{ states(slider) | int(0) >= 100 }}"
+      # Robot/gardin kører = ikke et ægte flap → registrér INTET.
+      suppress: "{{ is_state('binary_sensor.apollo_flap_suppress','on') }}"
+      # Hjemkomst lige før flappet = ægte tilstedeværelse, ikke spøgelse.
+      arrival_recent: >-
+        {% set g = states('input_number.apollo_flap_hunt_arrival_grace_minutes')|float(10) * 60 %}
+        {% set a = as_timestamp(states('sensor.apollo_hjemkomst_sidst'), 0) %}
+        {{ g > 0 and a > 0 and (now().timestamp() - a) < g }}
+      # Rosteret er ENESTE dommer over "må dette rums flaps tolkes som spøgelser"
+      # (fejlklasse #2) — det dækker både hus-vejen og nat-vejen.
+      kalib: "{{ slug in states('sensor.apollo_kalib_rum').split() }}"
+      # Åbnede rummet KUN via nat-vejen? Så bæres tokenet med STORT bogstav, og
+      # commit'en bedømmer det på uro-stemplet i stedet for "nogen er hjemme".
+      nat: >-
+        {{ kalib and not is_state('input_boolean.apollo_flap_hunt_enabled','on') }}
+      actions_ok: >-
+        {{ kalib and not suppress and not arrival_recent and dist_ok
+        and not gate_dead }}
+    action:
+      # Robot rengør el. gardin kører → dette tæller IKKE som flap (hverken
+      # display, bump eller push). Stop før noget registreres.
+      - if:
+          - condition: template
+            value_template: "{{ suppress }}"
+        then:
+          - stop: "Suppress aktiv (robot/gardin) — ikke et ægte flap"
+      # (1) Display.
+      - service: input_text.set_value
+        target:
+          entity_id: "input_text.{{ slug }}_apollo_last_flap"
+        data:
+          # ⚠️ Hold ALLE linjer på samme indryk: i en foldet `>-`-blok bevarer en
+          # dybere indrykket linje sit newline, og teksten knækkede i to (målt live).
+          value: >-
+            {{ roomname }}: {{ 'gate ukendt (ingen afstand)' if not dist_ok
+            else ('artefakt — still g' ~ gate ~ ' har ingen energi' if gate_dead
+            else ('g' ~ gate ~ ' ' ~ typ ~ (' (pinned)' if gate_pinned else ''))) }}
+            · {{ now().strftime('%H:%M:%S') }} · (aktiv)
+      # (2) PROVISORISK bump — kun når enabled og ingen nylig hjemkomst.
+      # Selve gate-skrivningen sker i commit-automationen efter hjemkomst-gracen;
+      # her lægges flappet blot i kø. Kommer der en hjemkomst i vinduet, droppes
+      # køen (så var flappet ægte tilstedeværelse — se HJEMKOMST-GRACE i headeren).
+      - if:
+          - condition: template
+            value_template: "{{ actions_ok }}"
+        then:
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.apollo_flap_hunt_pending_bumps
+            data:
+              value: >-
+                {% set old = states('input_text.apollo_flap_hunt_pending_bumps') %}
+                {% set old = '' if old in ['unknown','unavailable','none'] else old %}
+                {% set step = states('input_number.apollo_flap_hunt_bump_step')|float(2) %}
+                {% set cur = states(slider)|float(0) %}
+                {% set letter = {'sove':'s','stue':'t','spisestue':'p',
+                                 'koekken':'k','boernevaerelse':'b'}.get(slug, '?') %}
+                {% set letter = letter | upper if nat else letter %}
+                {% set tok = letter ~ '|' ~ (gate + (0 if typ == 'still' else 9))
+                             ~ '|' ~ ([99, cur + step]|min|round(0)|int)
+                             ~ '|' ~ (now().timestamp()|int) %}
+                {% set new = (old ~ ',' ~ tok) if old else tok %}
+                {{ new if new|length <= 250 else old }}
+
+  # ---------------------------------------------------------------------------
+  # ROBOT-START-STEMPEL (2026-08-07): ankeret for det RETROAKTIVE drop. Robottens
+  # status kommer fra Roborocks sky, så `apollo_flap_suppress` tænder 18-155 s
+  # (median 41, n=30 over 21 dage) EFTER at robotten fysisk er kørt fra dokken —
+  # og radaren ser den med det samme. Målt 2026-08-07: app-startet kørsel
+  # 11:33:01, stue-flap 11:33:15, suppress først 11:33:37 → flappet blev committet
+  # 11:44 og bumpede stue g2 move = præcis den "false tuning" user meldte.
+  # Vi kan ikke se starten før den sker; til gengæld kan vi ANGRE de tokens der
+  # ligger i det blinde vindue lige før. Uafhængigt af hvem der startede
+  # kørslen (HA, Roborock-appen, robottens eget skema).
+  # ---------------------------------------------------------------------------
+  - id: apollo_flap_robot_start_stamp
+    alias: "Apollo flap-jagt: stempl robot-start (retroaktivt drop-anker)"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      # vacuum-entity'en kollapser alle rengørings-varianter til 'cleaning';
+      # status-sensoren skelner dem. Begge tages med — de kommer fra samme
+      # coordinator-opdatering, og den første der lander vinder.
+      - platform: state
+        entity_id: vacuum.s8_maxv_ultra
+        to: "cleaning"
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_status
+        to:
+          - cleaning
+          - segment_cleaning
+          - zoned_cleaning
+          - spot_cleaning
+          - segment_mopping
+          - zoned_mopping
+          - robot_status_mopping
+    condition:
+      # Kun kørslens FØRSTE flanke: status skifter flere gange undervejs
+      # (segment_cleaning → washing_the_mop → segment_cleaning). En re-stempling
+      # er i sig selv harmløs (dens vindue ligger da inde i kørslen, hvor
+      # suppress for længst er on = der findes ingen tokens at droppe), men
+      # stemplet skal BETYDE "kørslens start".
+      - condition: template
+        value_template: >-
+          {% set raw = states('input_datetime.apollo_robot_start_at') %}
+          {% set lag = states('input_number.apollo_flap_hunt_robot_lag_sekunder')|float(180) %}
+          {% if raw in ['unknown', 'unavailable', 'none', ''] or raw[11:] == '00:00:00' %}
+            true
+          {% else %}
+            {{ (now().timestamp()
+                - (state_attr('input_datetime.apollo_robot_start_at', 'timestamp')|float(0)))
+               > ([lag, 60]|max) }}
+          {% endif %}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.apollo_robot_start_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ---------------------------------------------------------------------------
+  # COMMIT: gør provisoriske bumps permanente når hjemkomst-gracen er udløbet
+  # UDEN et hjemkomst-signal. Fire udfald pr. token:
+  #   hjemkomst efter flappet  → DROP (det var ægte tilstedeværelse)
+  #   robot-start lige efter   → DROP (det var robotten, set før skyen meldte den)
+  #   ældre end gracen         → COMMIT (slider + gulv + push-tæller)
+  #   ellers                   → BEHOLD (stadig provisorisk)
+  # Jagten slået fra imens = brugeren er hjemme → hele køen droppes.
+  # Chip-wear: skriver max ét slider-skift pr. flap som før (per-rum debounce
+  # gælder fortsat), men flaps der viser sig at være hjemkomst koster nu 0 writes.
+  # ---------------------------------------------------------------------------
+  - id: apollo_flap_hunt_commit
+    alias: "Apollo flap-jagt: commit provisoriske bumps efter hjemkomst-grace"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_text.apollo_flap_hunt_pending_bumps')
+             not in ['', 'unknown', 'unavailable', 'none'] }}
+    action:
+      # Jagt slukket MENS NOGEN ER HJEMME → flappene var sandsynligvis ægte
+      # tilstedeværelse → drop hele køen.
+      #
+      # 2026-08-06: dette var før en U-BETINGET tømning på `enabled == off`, og
+      # den gjorde hele op-retningen umulig. Ræsonnementet var cirkulært: ETHVERT
+      # occupancy off→on trigger `house_state_to_active`, som via
+      # `apollo_flap_hunt_house_state_auto` slukker jagten med det samme — så det
+      # flap der skulle bedømmes, slukkede selv den kontakt hvis OFF-tilstand
+      # blev brugt som bevis mod det. Køen blev tømt længe før de 10 minutters
+      # hjemkomst-grace kunne modnes. Facit: `input_text.apollo_flap_hunt_pending_
+      # bumps` var ALDRIG blevet skrevet siden den blev oprettet 07-28 17:06, og
+      # alle fem `*_gate_floors` stod stadig på 36 nuller.
+      #
+      # "Jagten er slukket" er altså ikke bevis for et menneske. Det ærlige bevis
+      # er hjemkomst-stemplet (som `ready`/`keep` nedenfor allerede bedømmer per
+      # token) og trackerne. Er huset tomt, er et flap pr. definition et spøgelse
+      # — så falder vi igennem til den normale grace-bedømmelse.
+      - variables:
+          # 2026-08-16f: dette var en U-BETINGET tømning af HELE køen. Den kan ikke
+          # længere stå som en tidlig `stop:`, for nat-tokens er pr. definition
+          # queued mens familien er hjemme — de ville blive tømt hvert minut.
+          # Nu er det et per-token-kriterie der kun gælder hus-vejens tokens
+          # (små bogstaver); nat-tokens (STORE) bedømmes på uro-stemplet.
+          #
+          # Parent B læses via ankeret: hendes tracker/person er permanent frossen
+          # på 'home' efter iOS-migrationen 08-15, så dette udtryk var altid sandt
+          # = hver eneste provisorisk bump blev droppet.
+          drop_hus: >-
+            {{ is_state('input_boolean.apollo_flap_hunt_enabled', 'off')
+               and (is_state('person.parent_a', 'home')
+                    or is_state('binary_sensor.parent_b_hjemme_anker', 'on')
+                    or is_state('binary_sensor.kids_home', 'on')) }}
+          # Menneskeligt modbevis mod et nat-token. Samme urørt-guard som rstart.
+          uro: >-
+            {% set raw = states('input_datetime.apollo_menneske_uro_sidst') %}
+            {% if raw in ['unknown', 'unavailable', 'none', ''] or raw[11:] == '00:00:00' %}
+              0
+            {% else %}
+              {{ state_attr('input_datetime.apollo_menneske_uro_sidst',
+                            'timestamp') | float(0) }}
+            {% endif %}
+          grace: >-
+            {{ states('input_number.apollo_flap_hunt_arrival_grace_minutes')|float(10) * 60 }}
+          arrival: "{{ as_timestamp(states('sensor.apollo_hjemkomst_sidst'), 0) }}"
+          rlag: >-
+            {{ states('input_number.apollo_flap_hunt_robot_lag_sekunder')|float(180) }}
+          # 0 = ikke sat. En URØRT input_datetime med has_date står på DAGENS
+          # midnat og ville ellers ligne et ægte stempel (jf. 08-02c's fælde) —
+          # derfor testes tidsdelen, ikke timestamp'en.
+          rstart: >-
+            {% set raw = states('input_datetime.apollo_robot_start_at') %}
+            {% if raw in ['unknown', 'unavailable', 'none', ''] or raw[11:] == '00:00:00' %}
+              0
+            {% else %}
+              {{ state_attr('input_datetime.apollo_robot_start_at', 'timestamp')|float(0) }}
+            {% endif %}
+          q: "{{ states('input_text.apollo_flap_hunt_pending_bumps') }}"
+          ready: >-
+            {% set ns = namespace(out=[]) %}
+            {% for t in q.split(',') %}
+              {% set p = t.split('|') %}
+              {% if p|length == 4 %}
+                {% set ts = p[3]|int(0) %}
+                {% set robot = rlag|float(0) > 0 and rstart|float(0) > 0
+                               and ts <= rstart|float(0)
+                               and (rstart|float(0) - ts) <= rlag|float(0) %}
+                {% set nat = p[0] in ['S', 'T', 'P', 'K', 'B'] %}
+                {% set lever = arrival|float(0) < ts and not robot
+                               and (uro|float(0) < ts if nat else not drop_hus) %}
+                {% if lever and (now().timestamp() - ts) >= grace %}
+                  {% set ns.out = ns.out + [t] %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out|join(',') }}
+          keep: >-
+            {% set ns = namespace(out=[]) %}
+            {% for t in q.split(',') %}
+              {% set p = t.split('|') %}
+              {% if p|length == 4 %}
+                {% set ts = p[3]|int(0) %}
+                {% set robot = rlag|float(0) > 0 and rstart|float(0) > 0
+                               and ts <= rstart|float(0)
+                               and (rstart|float(0) - ts) <= rlag|float(0) %}
+                {% set nat = p[0] in ['S', 'T', 'P', 'K', 'B'] %}
+                {% set lever = arrival|float(0) < ts and not robot
+                               and (uro|float(0) < ts if nat else not drop_hus) %}
+                {% if lever and (now().timestamp() - ts) < grace %}
+                  {% set ns.out = ns.out + [t] %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out|join(',') }}
+      # Køen opdateres FØRST: en langsom commit-løkke må ikke kunne dobbelt-
+      # committe hvis næste tick starter (mode: single dækker det, men køen skal
+      # også være ren hvis HA genstarter midt i løkken).
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.apollo_flap_hunt_pending_bumps
+        data:
+          value: "{{ keep }}"
+      - repeat:
+          for_each: "{{ ready.split(',') if ready else [] }}"
+          sequence:
+            - variables:
+                p: "{{ repeat.item.split('|') }}"
+                # |lower: nat-tokens bærer STORT bogstav (se NAT-KALIBRERING).
+                slug: >-
+                  {{ {'s':'sove','t':'stue','p':'spisestue','k':'koekken',
+                      'b':'boernevaerelse'}.get(p[0]|lower, '') }}
+                slot: "{{ p[1]|int(0) }}"
+                val: "{{ p[2]|int(0) }}"
+                ts: "{{ p[3]|int(0) }}"
+                gate: "{{ slot % 9 }}"
+                typ: "{{ 'still' if slot < 9 else 'move' }}"
+                slider: "input_number.{{ slug }}_g{{ gate }}_{{ typ }}"
+                cur: "{{ states(slider)|float(0) }}"
+                roomname: >-
+                  {{ {'sove':'Soveværelse','stue':'Stue','spisestue':'Spisestue',
+                      'koekken':'Køkken','boernevaerelse':'Børneværelse'}.get(slug, slug) }}
+                # state_attr(...,'timestamp') — IKKE as_timestamp(states(...)),
+                # der ville give +2 t skew på den naive streng (fejlklasse #18).
+                bump_ok: >-
+                  {% set lb = state_attr('input_datetime.' ~ slug ~ '_apollo_flap_last_bump',
+                                         'timestamp') | float(0) %}
+                  {% set db = states('input_number.apollo_flap_hunt_gate_debounce_seconds')|float(30) %}
+                  {{ lb == 0 or (now().timestamp() - lb) >= db }}
+            - if:
+                - condition: template
+                  value_template: "{{ slug != '' }}"
+              then:
+                # Kun opad, og aldrig over 99 (100 = brugerens manuelle FRA-knap).
+                #
+                # 2026-08-17 (user bekræftede intentet): de 100'er er SAT MED VILJE
+                # og må ikke "repareres" af en fremtidig session. Konkret eksempel er
+                # spisestuens `move g3` = 100, som er et enligt hul i en ellers aktiv
+                # move-række (g0=62 g1=32 g2=31 g4=33 g5=33): spisestuelampen HÆNGER
+                # i gate 3 (225-300 cm) og bevæger sig lidt hele tiden, så move-vejen
+                # dér producerer flaps uden mennesker — og rummet har ikke brug for
+                # move-detektion i netop det bånd. Læs 100 som "rør mig ikke", ikke
+                # som "her mangler der kalibrering".
+                #
+                # Konsekvens man skal kende: gaten vælges af aggregat-distancen på
+                # flap-tidspunktet (`*_radar_still_distance` / `_moving_distance`),
+                # og den peger på det stærkeste bånd — ikke nødvendigvis på det bånd
+                # der krydsede sin tærskel. Rammer den et pinned gate, dropper dette
+                # `if` bumpet: flappet er talt, men intet blev rettet. For
+                # spisestuen gælder det 7 af 9 still-gates og 4 af 9 move-gates, så
+                # en stor del af rummets flaps er no-ops. Det er ikke længere tavst
+                # — `gate_pinned` skriver "(pinned)" i display-teksten (2026-08-24).
+                - if:
+                    - condition: template
+                      value_template: "{{ bump_ok and val > cur and cur < 99 }}"
+                  then:
+                    - service: input_number.set_value
+                      target:
+                        entity_id: "{{ slider }}"
+                      data:
+                        value: "{{ [99, val]|min }}"
+                    - service: input_datetime.set_datetime
+                      target:
+                        entity_id: "input_datetime.{{ slug }}_apollo_flap_last_bump"
+                      data:
+                        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+                # BEVIS-KONTO (2026-08-17): tæl flappet på DENNE gate, og lås først
+                # gulvet når samme gate har leveret `floor_min_flaps` inden for
+                # vinduet. Ét flap må gerne dæmpe gaten midlertidigt (bumpet
+                # ovenfor, som decay kan rulle tilbage) — men gulvet er permanent,
+                # for kun en manuel knap sænker det. Jagten ser desuden kun den ene
+                # fejltype: den tæller spøgelser, men får aldrig at vide at den
+                # overså et menneske. Derfor skal beviset gentages, ikke gættes.
+                - variables:
+                    fc_win: >-
+                      {{ states('input_number.apollo_flap_hunt_floor_window_hours')
+                         | float(24) * 3600 }}
+                    # Urørt input_datetime står på DAGENS midnat → test tidsdelen,
+                    # ikke timestamp'en (fejlklasse #5).
+                    fc_since: >-
+                      {% set raw = states('input_datetime.' ~ slug ~ '_flapcount_since') %}
+                      {% if raw in ['unknown','unavailable','none',''] or raw[11:] == '00:00:00' %}
+                        0
+                      {% else %}
+                        {{ state_attr('input_datetime.' ~ slug ~ '_flapcount_since',
+                                      'timestamp') | float(0) }}
+                      {% endif %}
+                - variables:
+                    fc_fresh: >-
+                      {{ fc_since | float(0) > 0
+                         and (now().timestamp() - fc_since | float(0)) <= fc_win | float(0) }}
+                    # Liste af 18 to-tegns slots. Holdes som LISTE hele vejen: et
+                    # `variables:`-output af rene cifre literal_eval'es til et INT,
+                    # og indeksering i det kaster "'int' object is not subscriptable"
+                    # (samme fælde som gulv-strengen, se apollo_gate_decay.yaml).
+                    fc_cur: >-
+                      {% set s = states('input_text.' ~ slug ~ '_gate_flapcount') %}
+                      {% set s = '' if s in ['unknown','unavailable','none'] else s %}
+                      {% set s = (s ~ '0' * 36)[:36] %}
+                      {% set ns = namespace(o=[]) %}
+                      {% for i in range(18) %}{% set ns.o = ns.o + [s[i * 2:i * 2 + 2]] %}{% endfor %}
+                      {{ ns.o }}
+                - variables:
+                    # Udløbet vindue ⇒ start forfra med kun dette flap.
+                    fc_n: "{{ (fc_cur[slot | int] | int(0) + 1) if fc_fresh else 1 }}"
+                    fc_maal: >-
+                      {{ states('input_number.apollo_flap_hunt_floor_min_flaps') | int(3) }}
+                - service: input_text.set_value
+                  target:
+                    entity_id: "input_text.{{ slug }}_gate_flapcount"
+                  data:
+                    value: >-
+                      {% set base = fc_cur if fc_fresh else (['00'] * 18) %}
+                      {{ (base[:slot | int] + ['%02d' | format([99, fc_n | int] | min)]
+                          + base[slot | int + 1:]) | join }}
+                # Vinduet starter ved FØRSTE flap i serien og forskydes ikke af de
+                # følgende — ellers ville et flap hver 23. time holde vinduet åbent
+                # i det uendelige og summere sig til et gulv (fejlklasse #20).
+                - if:
+                    - condition: template
+                      value_template: "{{ not fc_fresh }}"
+                  then:
+                    - service: input_datetime.set_datetime
+                      target:
+                        entity_id: "input_datetime.{{ slug }}_flapcount_since"
+                      data:
+                        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+                # GULV til gate-decay: gaten flappede ved denne værdi → decay må
+                # aldrig under den igen. Sættes OGSÅ når slider-skrivningen blev
+                # sprunget over (debounce/allerede højere) — viden om flappet er
+                # uafhængig af om vi skrev NVRAM.
+                - if:
+                    - condition: template
+                      value_template: "{{ fc_n | int >= fc_maal | int }}"
+                  then:
+                    - service: script.apollo_gate_floor_set
+                      data:
+                        slug: "{{ slug }}"
+                        slot: "{{ slot }}"
+                        value: "{{ [99, val]|min }}"
+                - service: input_number.set_value
+                  target:
+                    entity_id: input_number.apollo_flap_hunt_pending_cursor
+                  data:
+                    value: >-
+                      {{ states('input_number.apollo_flap_hunt_pending_cursor')|int(0) + 1 }}
+                - service: input_text.set_value
+                  target:
+                    entity_id: input_text.apollo_flap_hunt_buffer
+                  data:
+                    value: >-
+                      {% set old = states('input_text.apollo_flap_hunt_buffer') %}
+                      {% set old = '' if old in ['unknown','unavailable','none'] else old %}
+                      {% set tok = roomname ~ ' g' ~ gate ~ typ[0] ~ ' '
+                                   ~ (ts|timestamp_custom('%H:%M')) %}
+                      {% set new = (old ~ '\n' ~ tok) if old else tok %}
+                      {{ new if new|length <= 230 else old }}
+
+  # ---------------------------------------------------------------------------
+  # BACKSTOP: auto-off'ens Active-flanke kan gå tabt (huset var allerede Active
+  # da jagten blev tændt — fx falsk Active mens huset var tomt, eller en reload
+  # efter flanken). Så slukker intet, og en hjemkomst bumper gates (incident
+  # 2026-07-28). Fyrer KUN når jagten blev tændt FØR den nuværende Active-flanke
+  # — tænder brugeren selv midt i Active, er det et bevidst valg og respekteres.
+  # ---------------------------------------------------------------------------
+  - id: apollo_flap_hunt_active_backstop
+    alias: "Apollo flap-jagt: backstop — sluk når huset er Active"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: input_boolean.apollo_flap_hunt_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: template
+        value_template: >-
+          {% set h = states.input_boolean.apollo_flap_hunt_enabled %}
+          {% set s = states.input_select.house_state %}
+          {{ h is not none and s is not none and h.last_changed < s.last_changed }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.apollo_flap_hunt_enabled
+      - service: logbook.log
+        data:
+          name: "Apollo flap-jagt"
+          message: >-
+            Backstop: huset er Active og jagten kørte videre fra før flanken →
+            slukket (provisoriske bumps droppes).
+
+  # ---------------------------------------------------------------------------
+  # FLAP OFF: occupancy on→off → udregn varighed og skriv den ind i display.
+  # (Ren info — ikke gated.)
+  # ---------------------------------------------------------------------------
+  - id: apollo_flap_hunt_off
+    alias: "Apollo flap-jagt: flap off → varighed"
+    mode: queued
+    max: 20
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.stue_apollo_occupancy
+        from: "on"
+        to: "off"
+        id: stue
+      - platform: state
+        entity_id: binary_sensor.spisestue_apollo_occupancy
+        from: "on"
+        to: "off"
+        id: spisestue
+      - platform: state
+        entity_id: binary_sensor.koekken_apollo_occupancy
+        from: "on"
+        to: "off"
+        id: koekken
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+        from: "on"
+        to: "off"
+        id: sovevaerelse
+      - platform: state
+        entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+        from: "on"
+        to: "off"
+        id: boernevaerelse
+    variables:
+      slug: "{{ 'sove' if trigger.id == 'sovevaerelse' else trigger.id }}"
+      dur: "{{ (as_timestamp(trigger.to_state.last_changed) - as_timestamp(trigger.from_state.last_changed))|int(0) }}"
+    action:
+      # Robot/gardin kører → ON-flanken blev ikke registreret (ingen '(aktiv)') →
+      # skip. Ellers fyld varigheden ind på det aktive display.
+      - if:
+          - condition: state
+            entity_id: binary_sensor.apollo_flap_suppress
+            state: "on"
+        then:
+          - stop: "Suppress aktiv — ingen varighed at skrive"
+      - service: input_text.set_value
+        target:
+          entity_id: "input_text.{{ slug }}_apollo_last_flap"
+        data:
+          value: >-
+            {% set cur = states('input_text.' ~ slug ~ '_apollo_last_flap') %}
+            {% set cur = '' if cur in ['unknown','unavailable','none'] else cur %}
+            {{ cur.replace(' (aktiv)', ' ' ~ dur ~ 's') if '(aktiv)' in cur else cur }}
+
+  # ---------------------------------------------------------------------------
+  # THROTTLED PUSH: samlet notifikation max hver N min. Gated på enabled +
+  # Roborock idle + intet gardin i bevægelse (samme suppression som bump).
+  # ---------------------------------------------------------------------------
+  - id: apollo_flap_hunt_notify
+    alias: "Apollo flap-jagt: throttled push → Parent A"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: state
+        entity_id: input_boolean.apollo_flap_hunt_enabled
+        state: "on"
+      - condition: template
+        value_template: "{{ states('input_number.apollo_flap_hunt_pending_cursor')|int(0) > 0 }}"
+      - condition: state
+        entity_id: binary_sensor.apollo_flap_suppress
+        state: "off"
+      - condition: template
+        value_template: >-
+          {% set t = states('input_datetime.apollo_flap_hunt_last_push') %}
+          {% set thr = states('input_number.apollo_flap_hunt_notify_throttle_minutes')|int(10) %}
+          {{ t in ['unknown','unavailable','none','']
+             or (now().timestamp() - (state_attr('input_datetime.apollo_flap_hunt_last_push', 'timestamp') | float(0))) >= thr * 60 }}
+    action:
+      - variables:
+          cnt: "{{ states('input_number.apollo_flap_hunt_pending_cursor')|int(0) }}"
+          step: "{{ states('input_number.apollo_flap_hunt_bump_step')|int(2) }}"
+          buf: >-
+            {% set b = states('input_text.apollo_flap_hunt_buffer') %}
+            {{ '' if b in ['unknown','unavailable','none'] else b }}
+      - service: script.push_notify
+        data:
+          notif_id: apollo
+          title: "👻 Apollo flap-jagt — {{ cnt }} flap"
+          message: >-
+            {{ cnt }} flap siden sidst{{ ' (gates bumpet +' ~ step ~ ')' if step > 0 else '' }}:
+            {{ buf }}
+          payload:
+            tag: apollo_flap_hunt
+            channel: "Apollo diagnostik"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.apollo_flap_hunt_last_push
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.apollo_flap_hunt_pending_cursor
+        data:
+          value: 0
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.apollo_flap_hunt_buffer
+        data:
+          value: ""
+      - service: logbook.log
+        data:
+          name: "Apollo flap-jagt"
+          message: "Samlet push sendt: {{ cnt }} flap siden sidste push."

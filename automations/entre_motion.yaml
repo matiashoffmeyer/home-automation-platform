@@ -1,0 +1,556 @@
+# =============================================================================
+# Entré Motion Lighting
+# =============================================================================
+# IKEA Vallhorn PIR triggers the hallway light when motion is detected.
+# Der findes ingen fælles fade-out-regel (system_design.md §4.2) — entré
+# er en gennemgangszone med kort timeout (input_number.entre_off_sekunder ×
+# global_absence_wait_factor) efter bevægelsen slipper. (Header rettet 2026-07-17c — "60-second" var stale, jf. fix #5.)
+#
+# Respects house Active/Dormant state.
+# All turn-ons use transition: 2 for a gentle fade-in.
+#
+# HARDWARE:
+#   binary_sensor.entre_valhorn_occupancy  — venter paa parring af en
+#   dedikeret Vallhorn til entré. Indtil da fejler denne automation
+#   stille (entity findes ikke), hvilket er OK.
+#
+#   Den foerste paerede Vallhorn (test-perioden, IEEE 8c:6f:b9:...) bliver
+#   permanent placeret i DEPOT som binary_sensor.depot_valhorn_occupancy.
+#   Se entities/sensors/valhorn.yaml for full inventory.
+# =============================================================================
+
+# Sprint 2026-05-23: detekt wall-cycle manuel tænd. Når user flipper wall-
+# switch (= cutter strøm), bulb går unavailable. Power tilbage → bulb wakes
+# på firmware-default → state on. Vi stampler timestamp så entre_motion_off
+# venter længere før auto-slukke (= "user vil have lyset, respekter intent").
+#
+# 2026-08-21 — DISKRIMINATOREN ER VENDT OM AF PÆRESKIFTET. Entré-loftet gik fra
+# ZHA (IKEA TRADFRI) til Matter/Thread (IKEA KAJPLATS), og de to radioer mener
+# stik modsat med `unavailable → on`:
+#   ZHA:    strøm væk → unavailable, strøm tilbage → on = ægte vægkontakt-flip.
+#   Matter: en node der kommer tilbage genopstår med sin SIDSTE KENDTE værdi,
+#           så `unavailable → on` er et rejoin-EKKO. Ingen har rørt noget.
+# Uændret ville hvert eneste Thread-drop derfor stemple et manuelt tænd og give
+# entré-lyset 5 minutters auto-sluk-grace — og Thread-drop er ikke sjældne
+# (VALLHORN'en i samme rum er blind 10,2 % af tiden).
+#
+# Ægte strømafbrydelse har stadig ét vidne et rejoin ikke kan forfalske:
+# VARIGHEDEN. Et Thread-rejoin er væk i sekunder; et menneske der slukker på
+# kontakten, ser sig omkring og tænder igen, er væk længere. Derfor kravet om
+# mindst 20 s borte. Rammer tærsklen skævt, koster det kun en grace der ikke
+# blev givet — aldrig et forkert sluk.
+- id: entre_loft_manual_on_detect
+  alias: "Entré: Detekt manuel tænd (væg / Styrbar / app)"
+  description: >
+    Stampler input_datetime.entre_loft_manual_on_at når et MENNESKE tændte
+    entré-loftet. entre_motion_off gater auto-sluk på stemplet i
+    global_entre_manual_grace_minutes.
+    2026-08-21: wall-cycle kræver at pæren har været unavailable i mindst 20 s,
+    så et Matter/Thread-rejoin (der genopstår `on` af sig selv) ikke tælles som
+    et menneske ved vægkontakten.
+    2026-08-28: de to ANDRE manuelle kanaler manglede. Målt 08-28 07:03:03 trykkede
+    user entré-Styrbar TOP → lyset slukkede igen 07:05:19 (2 min 16 s), fordi et
+    Styrbar-tryk kun havde entre_motion_off's 60 s-grace — og den grace blev bygget
+    til noget andet (give PIR'en tid til at re-trippe), ikke til at holde et bevidst
+    tryk. Alle tre manuelle kanaler stempler nu SAMME helper = ét hold, én slider.
+    Knap-tryk bærer ikke user_id (#3) → Styrbar kendes på et friskt
+    styrbar_last_press_entre-stempel i stedet.
+  mode: queued
+  trigger:
+    - platform: state
+      entity_id: light.entre_loft
+      from: "unavailable"
+      to: "on"
+      id: wall_cycle
+    - platform: state
+      entity_id: light.entre_loft
+      from: "off"
+      to: "on"
+      id: kald
+  condition:
+    - condition: template
+      value_template: >-
+        {% if trigger.id == 'wall_cycle' %}
+          {{ trigger.from_state is not none
+             and (trigger.to_state.last_changed
+                  - trigger.from_state.last_changed).total_seconds() >= 20 }}
+        {% else %}
+          {% set ts = state_attr('input_datetime.styrbar_last_press_entre', 'timestamp') %}
+          {# BUND-trykket ("sluk alt") stempler SAMME helper som TOP (somrig-filen,
+             linje ~385) — så et frisk stempel alene betyder "en knap blev trykket",
+             ikke "giv mig lys". entre_shutdown_grace skiller de to: den står on i
+             5 min efter BUND. Fejl LUKKET, ellers kunne et sluk-alt-tryk give
+             entréen et 15-min manuelt tændt-hold. #}
+          {{ trigger.to_state.context.user_id is not none
+             or (ts is not none and (now().timestamp() - ts) < 5
+                 and is_state('input_boolean.entre_shutdown_grace', 'off')) }}
+        {% endif %}
+  action:
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.entre_loft_manual_on_at
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - service: logbook.log
+      data:
+        name: "Entré manuel"
+        message: >-
+          Manuel tænd ({{ 'vægkontakt' if trigger.id == 'wall_cycle'
+            else ('app' if trigger.to_state.context.user_id is not none else 'Styrbar') }})
+          → entre_motion_off venter
+          {{ states('input_number.global_entre_manual_grace_minutes') }} min.
+
+- id: entre_motion_on
+  alias: "Entré: Lys tænd ved bevægelse"
+  description: >
+    Lights on in entré when motion detected during the day.
+    LUX threshold is slightly more generous than stue (60 vs 40) because
+    people often search for keys, shoes, bags here — needs reliable light.
+    Brightness is also kept a step higher than presence rooms for the same reason.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.entre_valhorn_occupancy
+      # 2026-10-15: from "off" — en VALLHORN der kommer tilbage fra
+      # unavailable genopstår med sin SIDSTE værdi (unavailable → on = ekko).
+      # Målt 14:20:48: ekkoet tændte entréen for en tom gang. Mens den er væk,
+      # dækker stedfortræder-pulsen herunder.
+      from: "off"
+      to: "on"
+    # 2026-10-15 (user-spec): VALLHORN'en væk → husets andre øjne tænder
+    # entréen i stedet (packages/thread_stedfortraedere.yaml). Pulsen er kun
+    # `on` mens VALLHORN'en er unavailable.
+    - platform: state
+      entity_id: binary_sensor.entre_stedfortraeder_bevaegelse
+      from: "off"
+      to: "on"
+  condition:
+    # 2026-09-27 (user-spec): gæst sover i open-plan (Sleep Over) → entréen
+    # tænder ikke af automatik (packages/sleepover.yaml; vagten er backstop).
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-06-10 (opg 4): Manual mode = bruger har selv indstillet lyset —
+    # auto-tænd blokeret indtil drift-back → Auto.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_entre', 'Manual') }}"
+    # 2026-06-23 (user-spec): robot-spærre gælder nu KUN når huset er Dormant
+    # (binary_sensor.roborock_blokerer_lys). Er huset Active må robottens motion
+    # gerne tænde lys — KUN early-detect spærres (se early-detect-rummene).
+    # Dormant-wake er robot-filtreret centralt i house_state_to_active.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    # 2026-05-05: gate på godnat-union. 2026-08-16g: skiftet any → common.
+    # Entré er et FÆLLES pass-through-rum: at børnene er puttet må ikke gøre
+    # gangen mørk for de voksne der stadig er oppe (samme fix som stue/køkken
+    # fik 2026-06-06 og sove 2026-07-02 — entré blev glemt).
+    - condition: state
+      entity_id: binary_sensor.godnat_common_active
+      state: "off"
+    # Sprint 2026-05-27: skip dag-mode hvis sove er i winddown (gang ved siden
+    # af sove → entre_motion_night overtager med 5% i stedet for full bright).
+    - condition: template
+      value_template: >-
+        {% set s = states('input_datetime.sove_winddown_at') %}
+        {% if s in ['unknown','unavailable','none',''] %}true
+        {% else %}
+          {{ (now() - strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() >= 28800 }}
+        {% endif %}
+    # A20 fix sprint 2026-05-06: bruger time_window_active_hours (05:00-23:00)
+    # i stedet for hardcoded 06:00-23:00. Single source of truth i constants.yaml.
+    - condition: state
+      entity_id: binary_sensor.time_window_active_hours
+      state: "on"
+    # 2026-05-21 fix: REMOVED sove still_target gate. Tidligere fix (2026-05-07)
+    # antog at hvis sove still_target=on, så var det bed-twist der bled through
+    # til Myggspray. MEN det blokerer legitim partner-sleeping scenario: én
+    # partner i seng (still_target on), anden walks i entré → entre tændte
+    # ikke. Trace 2026-05-21 morning bekræftede: 5/5 traces failed condition #4.
+    # User: "myggspray burde helt sikkert være triggered, det er en stor
+    # bevægelse lige foran den". Accept bed-twist false-positive (sjælden) for
+    # at få reliable entre-lighting når partner sover.
+    # Only turn on when it's actually dim enough to need artificial light.
+    # 2026-08-29d: læser `sensor.entre_lux_reel` = entréens EGEN VALLHORN, med
+    # open_plan_lux kun som fallback. Før målte gaten et andet rum: 29/8 13:39
+    # stod open-plan på 23,8 lx (over tærsklen 20) mens entréen selv målte 3 lx
+    # → lyset tændte ikke, user stod i mørke. Hvis lux unavailable: sun-elev.
+    - condition: or
+      conditions:
+        # Path A: lux er tilgaengelig OG under day-aware threshold
+        - condition: template
+          value_template: >-
+            {% set lux_raw = states('sensor.entre_lux_reel') %}
+            {% if lux_raw in ['unknown', 'unavailable', 'none'] %}false
+            {% else %}
+              {% set lux = lux_raw | float(50) %}
+              {# 2026-06-15: entré-specifik slider styrer tærsklen (var 30 dag /
+                 60 ellers × global factor). Lavere slider = tænder kun når mørkere. #}
+              {{ lux < (states('input_number.entre_lux_threshold') | float(40)) }}
+            {% endif %}
+        # Path B: lux unavailable — fallback til sun-elev (er det ude?)
+        - condition: and
+          conditions:
+            - condition: template
+              value_template: >
+                {{ states('sensor.entre_lux_reel') in ['unknown','unavailable','none'] }}
+            - condition: numeric_state
+              entity_id: sun.sun
+              attribute: elevation
+              below: 5
+    # 2026-06-16: entré NED-grace blokerer relight i 5 min (hele huset).
+    - condition: state
+      entity_id: input_boolean.entre_shutdown_grace
+      state: "off"
+  action:
+    # 500ms delay + light=off re-check: kort debounce, og spring over hvis
+    # lyset allerede blev tændt manuelt i mellemtiden.
+    - delay:
+        milliseconds: 500
+    - condition: state
+      entity_id: light.entre_loft
+      state: "off"
+    # 2026-08-16g (user-spec): lux-skaleret i stedet for ét fast tal.
+    # Retning: MØRKERE → SVAGERE (øjen-tilpasning). Lineær mellem kurvens
+    # to endepunkter; se packages/constants.yaml for rationalet.
+    #   lux >= tærskel → entre_brightness_taerskel (kraftigst)
+    #   lux = 0        → entre_brightness_moerke   (svagest)
+    # Lux unavailable = automationen kom hertil via Path B (sol under 5°),
+    # altså mørkt → mørke-enden er det rigtige fallback, ikke midten.
+    - variables:
+        maal_pct: >
+          {% set thr = states('input_number.entre_lux_threshold') | float(20) %}
+          {% set lo = states('input_number.entre_brightness_moerke') | float(9) %}
+          {% set hi = states('input_number.entre_brightness_taerskel') | float(25) %}
+          {% set lux_raw = states('sensor.entre_lux_reel') %}
+          {% if lux_raw in ['unknown', 'unavailable', 'none'] or thr <= 0 %}
+            {% set base = lo %}
+          {% else %}
+            {% set r = [[(lux_raw | float(0)) / thr, 1] | min, 0] | max %}
+            {% set base = lo + (hi - lo) * r %}
+          {% endif %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 1] | max }}
+    # ÉT KALD. Var to fra 2026-08-18 til 2026-08-21, fordi den daværende
+    # TRADFRI WS-pære fysisk landede på 2 % ved bri+ct+transition i samme kald
+    # (historikken står bevaret nedenfor). Entré-loftet er nu en IKEA KAJPLATS
+    # E27 CWS globe på Matter/Thread og har ikke quirken.
+    #
+    # To-trins-formen var ikke bare overflødig, den var blevet forkert: trin 2
+    # sendte med vilje INGEN color_temp, og siden 2026-08-21 kan entré-pæren
+    # stå i `hs` efter et festlys-event. Uden ct i kaldet ville bevægelse i
+    # entréen så skrue op for lysstyrken i en fest-farve i stedet for at give
+    # hvidt gang-lys. Ct hører derfor med i det kald der faktisk tænder.
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        # 2026-08-27b (user: "for gult"): entréen er koblet AF husets fælles
+        # sensor.auto_color_temp_evening (~2190 K om aftenen = stemningslys i
+        # et gennemgangsrum) og har sin egen slider. Nat-grenen længere nede
+        # har stadig sin egen 2000 K og er urørt.
+        color_temp_kelvin: "{{ states('input_number.entre_kelvin') | int(3200) }}"
+        brightness_pct: "{{ maal_pct }}"
+        transition: 3
+    # HISTORIK — gælder stadig for light.depot_loft_ikea, husets sidste
+    # TRADFRI WS globe (se packages/light_groups.yaml):
+    #
+    # 2026-08-18 (user: "entre lyset er stadig meget svagt trods justering i
+    # app"). Pæren er en IKEA TRADFRI E27 **WS** globe 1055lm, og på den er
+    # `brightness` + `color_temp` + `transition > 0` i SAMME kald ikke bare en
+    # forkert indrapportering — pæren lander fysisk på **5/255 (≈2 %)**,
+    # uanset hvad man beder om. Målt live 08-18 på netop denne pære:
+    #   bri 80 % + ct + transition 3  → brightness 5    ← produktionskaldet
+    #   bri 80 %      + transition 3  → brightness 204  ✅
+    #   ct først (transition 0), så bri + transition 3 → brightness 204  ✅
+    # F4-fixet 2026-05-22 satte derfor transition: 0; sprint 2026-05-28 rullede
+    # det tilbage til 3 i den tro at det kun var en falsk *rapport*, og
+    # accepterede "trade-off'et". Det var ikke en rapport. Fra 05-28 til 08-18
+    # har entré-loftet lyst med 2 % hver eneste gang, og de tre
+    # brightness-slidere har ikke kunnet gøre en forskel — derfor "trods
+    # justering i app".
+    # Pr. 2026-08-21 har kun light.depot_loft_ikea modellen tilbage.
+
+- id: entre_motion_off
+  alias: "Entré: Lys sluk efter bevægelse"
+  description: >
+    Entré is exempt from the global 5-minute fade rule — it is a
+    pass-through zone and returns to dark quickly.
+    2026-05-07 fix #5: shortened to 15s (var 30s, var 60s før). Real-life
+    test viste user oplevede 30s for længe efter nightwalk. 15s er nok til
+    finde nøgler/sko, men ikke nok at føle "for længe på" mid-natnight.
+    Sprint B.4 fix audit 2026-05-07: time_pattern fallback (mirror A55/A27).
+    State-trigger requires transition; orphan if entre_loft tændt via
+    arrival.yaml mens valhorn allerede off >15s.
+  mode: restart
+  trigger:
+    # Phase 4 sprint 2026-05-07 sen-PM: templated `for:` med Turn-Off Aggressiveness.
+    # 2026-08-19f: de 15 s er ikke længere hardkodet her (og igen i conditionen
+    # nedenfor) — basis er input_number.entre_off_sekunder, og det faktiske
+    # resultat kan AFLÆSES på sensor.entre_tom_sluk_sekunder (🔆 Rum for rum).
+    - platform: state
+      entity_id: binary_sensor.entre_valhorn_occupancy
+      to: "off"
+      for:
+        seconds: "{{ states('sensor.entre_tom_sluk_sekunder') | int(15) }}"
+    # 2026-10-15: stedfortræder-pulsen (VALLHORN'en væk) — samme ventetid.
+    - platform: state
+      entity_id: binary_sensor.entre_stedfortraeder_bevaegelse
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ states('sensor.entre_tom_sluk_sekunder') | int(15) }}"
+    # B.4: time_pattern fallback for orphan-light protection
+    - platform: time_pattern
+      minutes: "/2"
+      id: fallback_check
+  condition:
+    # B.4: only fire if entre light actually on (skip no-op time_pattern)
+    - condition: state
+      entity_id: light.entre_loft
+      state: "on"
+    # 2026-05-20 fix: fallback må KUN slukke hvis valhorn faktisk er off.
+    # Tidligere tjekkede den kun last_changed >= 15s — så hvis user stod
+    # stille i entréen >15s, fired fallback og slukkede mens motion=on.
+    # B.4: only fire if valhorn been off ≥15s siden last_changed.
+    # Audit-fix 2026-05-07: scale med global_absence_wait_factor (samme som
+    # state-trigger `for:`). Ellers slider=0 (factor=2) gør state-trigger 30s
+    # men time-pattern fallback fyrer ved 15s = inconsistent.
+    # 2026-10-15: er VALLHORN'en væk, er det stedfortræder-pulsen
+    # (packages/thread_stedfortraedere.yaml) der skal have været off — ellers
+    # kunne et stedfortræder-tændt lys aldrig slukke af sig selv.
+    - condition: template
+      value_template: >-
+        {% set v = 'binary_sensor.entre_valhorn_occupancy' %}
+        {% set e = v if states(v) in ['on', 'off']
+                   else 'binary_sensor.entre_stedfortraeder_bevaegelse' %}
+        {% set t = states[e].last_changed if states[e] is not none else none %}
+        {{ is_state(e, 'off') and t is not none
+           and (now() - t).total_seconds() >= (states('sensor.entre_tom_sluk_sekunder') | int(15)) }}
+    # F3 fix 2026-05-22: skip hvis entré Styrbar lige er trykket (eks. user
+    # presser TOP-quick welcome fra entré-zonen mens valhorn endnu er off).
+    # entre_somrig.yaml stamps styrbar_last_press_entre ved TOP quick/long.
+    # 60s skip = bruger har tid til at gå forbi valhorn der trigger occupancy
+    # → reset for: timer naturligt.
+    # 2026-06-16 FIX: brug STORED datetime-værdi (timestamp-attr), ikke
+    # entity'ens .last_changed. Sidstnævnte nulstilles til boot-tid ved HVER
+    # HA-restart → grace fremstod "lige trykket" i 60s efter hver restart.
+    - condition: template
+      value_template: >-
+        {% set ts = state_attr('input_datetime.styrbar_last_press_entre', 'timestamp') %}
+        {% if ts is none %}true
+        {% else %}
+          {{ (now().timestamp() - ts) > 60 }}
+        {% endif %}
+    # Sprint 2026-05-23: skip hvis user wall-cycled bulben for nylig.
+    # Manuel tænd på væggen = klart "vil have lyset" signal. Lad det stå.
+    # entre_loft_manual_on_detect (samme fil) stamps timestamp ved wake.
+    # Grace tunable via input_number.global_entre_manual_grace_minutes
+    # (default 15 min, Diagnostik dashboard Global Tuning section).
+    # 2026-06-16 FIX: brug STORED datetime-værdi (timestamp-attr), ikke
+    # .last_changed. .last_changed nulstilles til boot-tid ved HVER HA-restart
+    # → entré-auto-sluk blev blokeret i grace-minutter (default 15) efter hver
+    # restart, selv om bulben aldrig blev wall-cycled. Observeret 2026-06-16:
+    # entré stod tændt ved høj lux efter deploy-restart.
+    - condition: template
+      value_template: >-
+        {% set ts = state_attr('input_datetime.entre_loft_manual_on_at', 'timestamp') %}
+        {% if ts is none %}true
+        {% else %}
+          {% set grace = states('input_number.global_entre_manual_grace_minutes') | float(15) %}
+          {{ (now().timestamp() - ts) > (grace * 60) }}
+        {% endif %}
+    # 2026-09-12: /2-backstoppet må ikke genstarte en fade der allerede kører.
+    # Scriptet er mode: restart, så et nyt kald ville sende rampen tilbage til
+    # udgangsniveauet hvert 2. minut = en fade der aldrig når i mål (og et lys
+    # der "blusser op" uden at nogen har bevæget sig). Efter en HA-restart står
+    # scriptet off, så backstoppet fanger stadig et forældreløst tændt lys.
+    - condition: state
+      entity_id: script.entre_fade_ud
+      state: "off"
+  action:
+    # 2026-09-12 (user-spec): var `light.turn_off` med
+    # transition: sensor.fade_passage_effective. Entré-pæren er Matter, og HA
+    # videregiver ALDRIG transition til et Matter-turn_off — lyset knipsede ud
+    # med det samme, uanset hvad tallet stod på. Nedtoningen drives nu i trin
+    # af HA selv, hvilket samtidig er det der gør den afbrydelig: kommer der
+    # bevægelse midt i faden, blusser lyset op til det niveau det stod på.
+    # Se packages/entre_fade_ud.yaml for hele begrundelsen.
+    #
+    # script.turn_on, IKKE `service: script.entre_fade_ud`: sidstnævnte ville
+    # køre rampen INDE i denne automation, og da den er mode: restart ville
+    # /2-backstoppet så dræbe faden midtvejs hvert 2. minut.
+    - service: script.turn_on
+      target:
+        entity_id: script.entre_fade_ud
+
+# --- Night mode: dim warm light (23:00-06:00, or during godnat) ---
+# Sprint 2026-05-27: 3-trins brightness baseret på sove-state:
+#   - Hvis godnat_force_at <30 min siden: BLOCK helt (lang-ned = "ro nu",
+#     ingen nightlight de første 30 min)
+#   - Hvis godnat_any_active=on ELLER sove_winddown_at <8h siden: 5%
+#     (gang er lige op ad sove → minimalt for ikke at skinne ind)
+#   - Ellers (fx nat-toilet uden godnat): 10% som før
+- id: entre_motion_night
+  alias: "Entré: Svagt lys om natten"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.entre_valhorn_occupancy
+      # 2026-10-15: from "off" — en VALLHORN der kommer tilbage fra
+      # unavailable genopstår med sin SIDSTE værdi (unavailable → on = ekko).
+      # Målt 14:20:48: ekkoet tændte entréen for en tom gang. Mens den er væk,
+      # dækker stedfortræder-pulsen herunder.
+      from: "off"
+      to: "on"
+    # 2026-10-15 (user-spec): VALLHORN'en væk → husets andre øjne tænder
+    # entréen i stedet (packages/thread_stedfortraedere.yaml). Pulsen er kun
+    # `on` mens VALLHORN'en er unavailable.
+    - platform: state
+      entity_id: binary_sensor.entre_stedfortraeder_bevaegelse
+      from: "off"
+      to: "on"
+  condition:
+    # 2026-09-27 (user-spec): gæst sover i open-plan (Sleep Over) → entréen
+    # tænder ikke af automatik (packages/sleepover.yaml; vagten er backstop).
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: or
+      conditions:
+        - condition: time
+          after: "23:00:00"
+          before: "06:00:00"
+        # 2026-05-05: trigger night-mode under godnat-flags, ikke bare
+        # godnat_active. Sikrer at nightwalk efter somrig kort-ned giver dim
+        # rød i entre.
+        # 2026-08-16g: any → common. Ellers ejer nat-grenen entréen fra det
+        # øjeblik børnene puttes (~19:15), hvor dag-grenen nu er den rigtige —
+        # og de to ville race om det samme occupancy-flankekald.
+        - condition: state
+          entity_id: binary_sensor.godnat_common_active
+          state: "on"
+        # Sprint 2026-05-27: winddown er IKKE en godnat-flag, men entre skal
+        # alligevel være dæmpet i 8h efter kort-ned (gang ved siden af sove).
+        - condition: template
+          value_template: >-
+            {% set s = states('input_datetime.sove_winddown_at') %}
+            {% if s in ['unknown','unavailable','none',''] %}false
+            {% else %}
+              {{ (now() - strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() < 28800 }}
+            {% endif %}
+    # Sprint 2026-05-27: BLOCK helt i 30 min efter lang-ned (godnat_force).
+    # User-spec: force-godnat = "ro nu" → ingen entre-light overhovedet.
+    - condition: template
+      value_template: >-
+        {% set s = states('input_datetime.godnat_force_at') %}
+        {% if s in ['unknown','unavailable','none',''] %}true
+        {% else %}
+          {{ (now() - strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() >= 1800 }}
+        {% endif %}
+    # A36 fix sprint 2026-05-06 PM: skip hvis arrival lige har sat entre 8%.
+    # Tidligere ramte entre_motion_night entre lys 10% mens arrival_entre_light
+    # netop havde sat 8% under godnat → race, final state non-deterministic.
+    # Skip hvis hoveddøren netop er åbnet (last_changed <30s) — arrival ejer.
+    - condition: template
+      value_template: >
+        {% set hd = states.binary_sensor.parasoll_hoveddoer %}
+        {% if hd is none %}
+          true
+        {% else %}
+          {{ (now() - hd.last_changed).total_seconds() > 30 }}
+        {% endif %}
+    # 2026-05-21 fix: REMOVED sove still_target gate. Samme rationale som
+    # entre_motion_on (se ovenfor) — blokerede entré-light når partner sover.
+    # Night-mode bruger lav nok til at ikke vække partner gennem sove-dør.
+    # 2026-06-16: entré NED-grace blokerer relight i 5 min (hele huset).
+    - condition: state
+      entity_id: input_boolean.entre_shutdown_grace
+      state: "off"
+    # 2026-06-29 (user-spec): under godnat tænder MOTION kun entré hvis hoveddøren
+    # er åbnet indenfor sidste 60s (= nogen kommer sent hjem). Rene nat-toilet-ture
+    # (motion uden dør) skal IKKE tænde entré — voksen navigerer i mørke. Hjemkomst
+    # håndteres primært af arrival_entre_light (dør-trigger); denne gate sikrer at
+    # motion-pathen ikke bouncer entré op ved tisse-ture. Uden for godnat (ren tid
+    # 23-06 / winddown) urørt.
+    # 2026-08-16g: any → common. Dør-kravet findes for at en VOKSEN på
+    # nat-toilet ikke bouncer entréen op; er kun børnene puttet, er der ingen
+    # sovende voksen at skåne, og kravet ville bare holde gangen mørk 23-06.
+    - condition: template
+      value_template: >-
+        {% if is_state('binary_sensor.godnat_common_active', 'on') %}
+          {% set hd = states.binary_sensor.parasoll_hoveddoer %}
+          {% if hd is none or hd.state in ['unknown','unavailable'] %}
+            false
+          {% else %}
+            {{ (now() - hd.last_changed).total_seconds() <= 60 }}
+          {% endif %}
+        {% else %}
+          true
+        {% endif %}
+  action:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        # Sprint 2026-05-27: dæmpet under godnat/winddown (gang ved siden af sove),
+        # 10% under ren tidsbaseret nat (23-06 uden godnat). Light Aggressiveness
+        # factor anvendt på begge.
+        # 2026-06-24 (user-spec): godnat-brightness er nu slider-styret
+        # (input_number.entre_godnat_brightness, default 1%). Gulv = 1% (ikke det
+        # globale 2%) så slideren kan nå helt ned.
+        # 2026-08-16g brugte `any` her (sovende børn → dæmpet gang). 2026-10-06
+        # (user-spec: "det gør ikke noget at det lyser ind til børnene"): kun de
+        # voksnes godnat dæmper — samme anker som gatesne ovenfor og hjemkomsten.
+        brightness_pct: >-
+          {% set godnat = is_state('binary_sensor.godnat_common_active', 'on') %}
+          {% set s = states('input_datetime.sove_winddown_at') %}
+          {% if s in ['unknown','unavailable','none',''] %}{% set winddown = false %}
+          {% else %}{% set winddown = (now() - strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() < 28800 %}
+          {% endif %}
+          {% if godnat or winddown %}
+            {% set base = states('input_number.entre_godnat_brightness') | float(1) %}
+          {% else %}
+            {% set base = 10 %}
+          {% endif %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 1] | max }}
+        color_temp_kelvin: 2000
+        # F4 fix 2026-05-22: instant snap pga TRADFRI WS bulb-quirk.
+        transition: 0
+
+# =============================================================================
+# Sprint 2026-07-04 (Bug B): entré-loft firmware-spøgelses-"on" suppressor
+# =============================================================================
+# BORTFALDET 2026-08-21: "Entré: Undertryk firmware-spøgelses-tænd (TRADFRI)".
+# Automationen fandtes udelukkende for IKEA TRADFRI-pærens off→on-spøgelser
+# (verificeret i history 2026-06-29: 8 cyklusser på én aften). Den pære sidder
+# ikke længere i entréen — loftet er nu en KAJPLATS E27 CWS globe på
+# Matter/Thread, og entity_id'et light.entre_loft peger på DEN.
+#
+# Den blev ikke bare overflødig, den blev FARLIG, af to grunde:
+#   1. Diskriminatoren er vendt om på Matter. På ZHA var `unavailable → on` et
+#      ægte wall-cycle; på Matter er det en rejoin-EKKO af sidste kendte værdi
+#      (jf. "Permanente fakta"), altså ikke en hændelse.
+#   2. `context.parent_id is none` er ikke et menneske-filter (fejlklasse #3).
+#      Fest-fanfaren tænder entréen fra en dør-trigget automation, hvor både
+#      parent_id og user_id er none — suppressoren ville derfor have slukket
+#      ankomst-pæren 2 sekunder inde i kaskaden, hver gang VALLHORN'en
+#      tilfældigvis var blind (målt 10,2 % af tiden).
+#
+# Viser Matter-pæren en dag sit eget spøgelses-mønster: byg filteret forfra på
+# en diskriminator der passer til Matter — kopiér ikke denne.
+# =============================================================================

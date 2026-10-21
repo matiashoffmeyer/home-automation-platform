@@ -1,0 +1,345 @@
+# =============================================================================
+# Depot besøgs-STADIER ("detection-tæller" + stadie-skaleret sluk)
+# 2026-06-28 (user-spec)
+# =============================================================================
+# MÅL: depotet brændte ~2-3 t/dag tomt lys fordi ETHVERT Vallhorn-trip — også
+# et 5-sekunders kig-ind-og-tag-tøj — tændte depot_all 70-100 % og holdt det
+# tændt hele ophold-ventetiden (~5 min: 60 s PIR-on_time + 20 s clear + 300 s ×
+# Turn-Off-faktor). Vi klassificerer nu hvor seriøst besøget er og SKALÉRER
+# sluk-tiden — så et hurtigt besøg ikke holder lyset tændt længe. BRIGHTNESS er
+# urørt (funktionel 70-100 %, så man kan se tøjet) — kun SLUK-timingen skalerer.
+#
+# VIGTIG fysik-præmis: depot har KUN ÉN sensor — binary_sensor.depot_valhorn_
+# occupancy (IKEA Vallhorn, PIR, ingen still-radar). En PIR ser IKKE stilstand,
+# og holder occupancy "on" i on_time (~60 s) + clear-delay (~20 s) efter sidste
+# bevægelse, hvorefter den falder. Derfor er "detection" = en FRISK motion-burst
+# = en occupancy off→on-transition. Jo længere/mere aktivt et ophold, jo flere
+# bursts (man bevæger sig, står stille > clear-delay, bevæger sig igen).
+#
+# STADIER (input_select.depot_visit_stage) — eskalerer kun OPAD i et besøg,
+# nulstilles til Ingen når depot-lyset slukker:
+#   Ingen   = intet auto-besøg (eller manuelt/FoH/scene-tændt → bruger Long-sluk
+#             som sikker default).
+#   Quick   = 1 detection (depot_harry_potter_on tændte = første burst). Mistænkt
+#             hurtigt kig-ind. → sluk efter depot_quick_off_seconds (default 45 s).
+#   Medium  = 2 detections (PIR re-trippede én gang mens lyset var tændt). Et
+#             reelt men kort ophold. → sluk efter depot_medium_off_seconds (150 s).
+#   Long    = 3+ detections (vedvarende ophold, bevæger sig rundt). → sluk efter
+#             depot_long_off_seconds (2026-09-26, default 300 s; før den globale
+#             Turn-Off-ventetid clampet til 600 s, som altid bandt).
+#
+# Detection 1 (Ingen→Quick) sættes af depot_harry_potter_on når lyset faktisk
+# tændes (den har allerede alle de rigtige gates: Active, ikke Manual, lås idle,
+# grace, ikke-robot). Detection 2-3 håndteres af depot_stage_escalate herunder,
+# gated på at lyset ER tændt (race-frit: lyset er tændt fra detection 1).
+#
+# Sluk: tre parallelle off-automations (én pr. stadie, hver med sin egen `for:`),
+# alle gated på stadiet + lyset-on + lås-idle. Når PIR går off starter alle tre
+# timere; den der matcher det aktuelle stadie fyrer og slukker, resten no-op'er
+# (deres stadie-condition fejler). Plus en time_pattern-fallback (P2-mønstret)
+# der fanger lys tændt UDEN en off-transition (FoH/scene/gruppe-kald).
+#
+# Tunable sliders (packages/constants.yaml, tiles på Indstillinger):
+#   depot_quick_off_seconds   (45 s)  — Quick (1 detection) sluk efter PIR-ro
+#   depot_medium_off_seconds  (150 s) — Medium (2 detections) sluk efter PIR-ro
+#   depot_long_off_seconds    (300 s) — Long (3+ detections) + Ingen (2026-09-26)
+# =============================================================================
+
+input_select:
+  depot_visit_stage:
+    name: "Depot besøgs-stadie"
+    icon: mdi:stairs
+    options:
+      - "Ingen"
+      - "Quick"
+      - "Medium"
+      - "Long"
+
+automation:
+  # ---------------------------------------------------------------------------
+  # ESCALATE: detection 2-3 — PIR re-trippede mens depot-lyset var tændt.
+  # ---------------------------------------------------------------------------
+  # Detection 1 (Ingen→Quick) ejes af depot_harry_potter_on (sætter Quick når den
+  # tænder lyset). Hver efterfølgende frisk motion-burst (valhorn off→on) MENS
+  # lyset er tændt = endnu en detection → eskalér Quick→Medium→Long.
+  - id: depot_stage_escalate
+    alias: "Depot stadie: eskalér (detection 2-3)"
+    description: >
+      Frisk Vallhorn-burst mens depot-lyset er tændt = endnu en detection.
+      Quick→Medium (2 detections), Medium→Long (3+). Long bliver Long.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.depot_valhorn_occupancy
+        from: "off"
+        to: "on"
+    condition:
+      # Lyset er allerede tændt fra detection 1 → vi tæller en ægte oplyst-besøgs-
+      # burst (ikke en pre-lit approach-strip uden indgang).
+      - condition: state
+        entity_id: light.depot_all
+        state: "on"
+      # Tæl kun i det auto-styrede stadie-rum; Long er toppen, FoH-lås-on = Ingen.
+      - condition: state
+        entity_id: input_select.depot_visit_stage
+        state:
+          - "Quick"
+          - "Medium"
+      # FoH I-lås holder lyset tændt 15 min uafhængigt af besøg → tæl ikke.
+      - condition: state
+        entity_id: timer.depot_light_lock
+        state: idle
+      # 2026-08-12 (user-bug "vi sover"): eskalering er en BELØNNING for et
+      # grundigt besøg — men om natten betyder den at et par PIR-bursts på vej
+      # forbi hæver Long, og Long venter den fulde ophold-ventetid (op til 10
+      # min, absence-faktoren står 8,6). Facit 08-12: 21:14 tændt → Long 21:17
+      # → lyset brændte til godnat kl. 21:50. Under godnat bliver stadiet på
+      # Quick = slukket ~25 s efter man er gået.
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "off"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.depot_visit_stage
+        data:
+          option: >-
+            {{ 'Medium' if is_state('input_select.depot_visit_stage', 'Quick')
+               else 'Long' }}
+      - service: logbook.log
+        data:
+          name: "Depot stadie"
+          message: >-
+            → {{ 'Medium (2 detections)' if is_state('input_select.depot_visit_stage', 'Medium')
+                 else 'Long (3+ detections)' }}
+          entity_id: input_select.depot_visit_stage
+
+  # ---------------------------------------------------------------------------
+  # RESET → Ingen: besøget er slut (depot-lyset slukkede, uanset kilde).
+  # ---------------------------------------------------------------------------
+  # Stadiet beskriver det NUVÆRENDE oplyste besøg → nulstil når lyset bliver off,
+  # så NÆSTE besøg starter rent (ellers ville et kig-ind efter et langt ophold
+  # arve Long og holde lyset for længe). 2 s-debounce mod sluk-fade-transienter.
+  - id: depot_stage_reset
+    alias: "Depot stadie: → Ingen (lys slukket)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: light.depot_all
+        to: "off"
+        for:
+          seconds: 2
+    condition:
+      - condition: template
+        value_template: "{{ not is_state('input_select.depot_visit_stage', 'Ingen') }}"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.depot_visit_stage
+        data:
+          option: "Ingen"
+
+  # ---------------------------------------------------------------------------
+  # SLUK — Quick (1 detection): sluk hurtigt efter PIR er gået i ro.
+  # ---------------------------------------------------------------------------
+  - id: depot_off_quick
+    alias: "Depot sluk: Quick (1 detection)"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.depot_valhorn_occupancy
+        to: "off"
+        for:
+          seconds: "{{ states('input_number.depot_quick_off_seconds') | int(45) }}"
+    condition:
+      - condition: state
+        entity_id: input_select.depot_visit_stage
+        state: "Quick"
+      - condition: state
+        entity_id: light.depot_all
+        state: "on"
+      - condition: state
+        entity_id: timer.depot_light_lock
+        state: idle
+    action:
+      - service: light.turn_off
+        target:
+          entity_id: light.depot_all
+        data:
+          transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"
+      - service: logbook.log
+        data:
+          name: "Depot sluk"
+          message: "Quick (1 detection) — slukket efter kort ophold-ventetid"
+          entity_id: light.depot_all
+
+  # ---------------------------------------------------------------------------
+  # SLUK — Medium (2 detections): mellem-ventetid.
+  # ---------------------------------------------------------------------------
+  - id: depot_off_medium
+    alias: "Depot sluk: Medium (2 detections)"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.depot_valhorn_occupancy
+        to: "off"
+        for:
+          seconds: "{{ states('input_number.depot_medium_off_seconds') | int(150) }}"
+    condition:
+      - condition: state
+        entity_id: input_select.depot_visit_stage
+        state: "Medium"
+      - condition: state
+        entity_id: light.depot_all
+        state: "on"
+      - condition: state
+        entity_id: timer.depot_light_lock
+        state: idle
+    action:
+      - service: light.turn_off
+        target:
+          entity_id: light.depot_all
+        data:
+          transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"
+      - service: logbook.log
+        data:
+          name: "Depot sluk"
+          message: "Medium (2 detections) — slukket efter mellem-ventetid"
+          entity_id: light.depot_all
+
+  # ---------------------------------------------------------------------------
+  # SLUK — Long (3+ detections) ELLER Ingen (manuelt/FoH/scene): fuld ophold-
+  # ventetid = global Turn-Off-slider (uændret adfærd). Inkl. time_pattern-
+  # fallback (P2) for lys tændt uden off-transition.
+  # ---------------------------------------------------------------------------
+  - id: depot_off_long
+    alias: "Depot sluk: Long (3+ detections / fuld ophold)"
+    mode: restart
+    trigger:
+      # 2026-09-26: egen slider input_number.depot_long_off_seconds (default
+      # 300 s). Før: min(rum_tom_sluk_sekunder, 600), hvor 600 altid bandt (se
+      # slideren i constants.yaml). `for:`-template bindes ved load → restart.
+      - platform: state
+        entity_id: binary_sensor.depot_valhorn_occupancy
+        to: "off"
+        for:
+          seconds: "{{ states('input_number.depot_long_off_seconds') | int(300) }}"
+      # Fallback: tændes depot-lyset mens valhorn allerede er off (scene-restore,
+      # FoH-flow, gruppe-kald) kommer der ALDRIG en off-transition → uden dette
+      # ville lyset hænge. Fanger det hvert 5. min.
+      - platform: time_pattern
+        minutes: "/5"
+        id: fallback_check
+    condition:
+      - condition: state
+        entity_id: light.depot_all
+        state: "on"
+      - condition: state
+        entity_id: timer.depot_light_lock
+        state: idle
+      # Quick/Medium ejes af deres egne (hurtigere) off-automations; dette er kun
+      # for Long + Ingen (manuelt/FoH-lås-udløbet/scene → ukendt seriøsitet → fuld).
+      - condition: state
+        entity_id: input_select.depot_visit_stage
+        state:
+          - "Long"
+          - "Ingen"
+      # Fallback-gate: kun sluk hvis valhorn har været off længe nok (samme clampede
+      # ventetid som state-triggeren) — undgår at fallback'en slukker midt i et besøg.
+      - condition: template
+        value_template: >-
+          {% set s = states('binary_sensor.depot_valhorn_occupancy') %}
+          {% set t = states.binary_sensor.depot_valhorn_occupancy.last_changed %}
+          {% set wait = states('input_number.depot_long_off_seconds') | int(300) %}
+          {{ s == 'off' and t is not none and (now() - t).total_seconds() >= wait }}
+    action:
+      - service: light.turn_off
+        target:
+          entity_id: light.depot_all
+        data:
+          transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"
+      - service: logbook.log
+        data:
+          name: "Depot sluk"
+          message: >-
+            {{ 'Long (3+ detections)' if is_state('input_select.depot_visit_stage', 'Long')
+               else 'Ingen-stadie (manuelt/FoH/scene)' }} — fuld ophold-ventetid
+          entity_id: light.depot_all
+
+  # ---------------------------------------------------------------------------
+  # STRIP-ORPHAN WATCHDOG (2026-07-22, user-spec: "strip hænger stadig")
+  # ---------------------------------------------------------------------------
+  # ROOT CAUSE (logbook-bevist 07-22): depot_strip er en kendt Zigbee-flapper.
+  # Når en stadie-sluk kalder light.turn_off på GRUPPEN light.depot_all og
+  # strippen tilfældigvis er 'unavailable' i det øjeblik, dropper HA off-
+  # kommandoen for strippen — loftet slukker, strippen kommer tilbage 'on', og
+  # INTET re-fyrer: valhorn-off `for:`-triggeren er allerede brugt, og den
+  # eneste time_pattern-fallback (depot_off_long) er gated på Long/Ingen, så et
+  # Quick/Medium-besøg havde slet ingen fallback (fejlklasse #4 + #9). Set-case:
+  # ægte besøg 19:11 → loft off 19:50, strip hang til 20:22 (71 min, ryddet ved
+  # held af en senere approach-fast-clear).
+  #
+  # FIX: stadie-uafhængig watchdog der slukker STRIPPEN DIREKTE (ikke gruppen)
+  # når den er forældet. Diskriminator: light.depot_loft OFF = enten er hoved-
+  # sluk allerede kørt (besøg slut → strippen skal følge), ELLER det er en
+  # approach-pre-lys (kun strip). Begge skal væk når depot-valhorn har været i
+  # ro ≥3 min. Et AKTIVT besøg holder loftet tændt (depot_all) → condition
+  # fejler → watchdog rører ikke. FoH I-lås (depot_light_lock) = bevidst hold →
+  # skip. Direkte entity-target undgår gruppe-flap-droppet der skabte hanget.
+  - id: depot_strip_orphan_watchdog
+    alias: "Depot: strip-orphan sluk (loft slukket men strip hænger)"
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/2"
+      - platform: state
+        entity_id: binary_sensor.depot_valhorn_occupancy
+        to: "off"
+        for:
+          minutes: 3
+      - platform: state
+        entity_id: light.depot_loft
+        to: "off"
+        for:
+          minutes: 3
+    condition:
+      - condition: state
+        entity_id: light.depot_strip
+        state: "on"
+      # Loftet slukket = intet aktivt besøg (besøg tænder depot_all=loft+strip).
+      - condition: state
+        entity_id: light.depot_loft
+        state: "off"
+      # FoH I-lås holder strippen tændt bevidst → rør ikke.
+      - condition: state
+        entity_id: timer.depot_light_lock
+        state: idle
+      # Depot-valhorn i ro ≥3 min → ingen i depotet; enhver legitim strip-on
+      # (besøgs-flap-survivor ELLER approach uden indgang) er nu forældet.
+      - condition: template
+        value_template: >-
+          {% set t = states.binary_sensor.depot_valhorn_occupancy.last_changed %}
+          {{ is_state('binary_sensor.depot_valhorn_occupancy', 'off')
+             and t is not none and (now() - t).total_seconds() >= 180 }}
+    action:
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.depot_strip
+        data:
+          transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"
+      # Ryd approach-flaget defensivt (depot_approach_lit_clear fyrer også på
+      # strip→off, men vær robust hvis strippen var unavailable ved off).
+      - if:
+          - condition: state
+            entity_id: input_boolean.depot_approach_lit
+            state: "on"
+        then:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.depot_approach_lit
+      - service: logbook.log
+        data:
+          name: "Depot strip watchdog"
+          message: "Strip hang (loft slukket, valhorn i ro ≥3 min) → slukket direkte"
+          entity_id: light.depot_strip

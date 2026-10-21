@@ -1,0 +1,750 @@
+# =============================================================================
+# IKEA RODRET 2-button curtain remotes
+# =============================================================================
+# Sove: 2 LATCHENDE actions (op/ned) — tryk = kør til ende, tryk igen i samme
+# retning = stop. Har derfor hverken hold- eller release-handler; se
+# block-kommentaren ved somrig_sovevaerelse_curtain_open (2026-09-10).
+# Stue (8d:d2:98): SMART 2-gardin sekvens-state-machine (se block-kommentar
+# ved somrig_stue_curtain_click_smart) — styrer syd + vest med 2 knapper.
+# Stue Syd (8e:cc:e8): 5 standard-actions på syd alene.
+# Dark Mode (58:55:f0): OMKODET 2026-07-27 → DARK MODE toggle (ingen
+# gardin-styring). Hed "Boern" indtil 2026-08-02, fordi den fysisk ligger i
+# børneværelset — men den styrer intet dér (rummet har ingen gardin-motor), så
+# den er navngivet efter sin FUNKTION som de øvrige tre.
+# =============================================================================
+# 3 RODRET wireless dimmers paret 2026-05-05 (var oprindelig Somrig pre-flyt).
+#
+# DEVICE → ROOM → FUNKTION mapping:
+#   39:ed:51:54:13:58:b3:9d = sove   → cover.gardin_sovevaerelse (1 cover)
+#   NB: er Dark Mode tændt, fritager et OP-tryk på sove-/stue-RODRET rummet for
+#   mørklægningen (dark_mode_room_exempt_button i packages/dark_mode.yaml lytter
+#   på de samme events — ikke noget denne fil kalder).
+#   99:09:1d:84:7d:4e:c6:17 = stue   → cover.gardin_stue_syd + vest_1 + vest_2 (3 covers)
+#   7a:bf:91:6b:5f:7e:38:f0 = DARK MODE (ligger i børneværelset, styrer intet
+#                                      gardin) → input_boolean.dark_mode
+#                                      (op=ON, ned=OFF; mørklægning i
+#                                      packages/dark_mode.yaml)
+#
+# 5 ACTIONS PER ROOM (gælder STUE SYD; sove bruger den latchende 2-action-model):
+#   1. {room}_curtain_open      — top click           → cover.open_cover (100%)
+#   2. {room}_curtain_close     — bottom click        → cover.close_cover (0%)
+#   3. {room}_curtain_hold_up   — top hold start      → cover.open_cover (motor runs)
+#   4. {room}_curtain_hold_down — bottom hold start   → cover.close_cover (motor runs)
+#   5. {room}_curtain_stop      — release efter hold  → cover.stop_cover (B6.1 fix:
+#                                                       lytter på BÅDE stop_with_on_off
+#                                                       OG stop = top+bottom release)
+#
+# ZHA command mapping (IKEA Somrig E2213 / RODRET W2523):
+#   on                — top button short press   (= curtain_open)
+#   off               — bottom button short press (= curtain_close)
+#   move_with_on_off  — top hold start           (= curtain_hold_up)
+#   move              — bottom hold start         (= curtain_hold_down)
+#   stop_with_on_off  — release after top hold   (= curtain_stop)
+#   stop              — release after bottom hold (= curtain_stop, B6.1)
+#
+# Pre-flyt: cover entities er IKKE paret endnu (Matter Aqara curtain motors
+# ankommer post-flyt). Service calls fejler graceful (ingen continue_on_error
+# nødvendig fordi cover.* services accepterer manglende targets).
+#
+# Repetitive structure: 5 actions × 2 rum (sove + stue-syd) + stue-smart.
+# Hver standard-block er ~12 linjer (trigger + action). Nyt gardin-rum:
+# copy-paste 5 blocks + skift IEEE + cover entity_id + alias.
+# =============================================================================
+
+# 2026-09-10 (user-spec): "et tryk på op mens gardinet kører op stopper gardinet
+# hvor det er, og det næste op-tryk kører det så op igen. samme ned."
+# Knappen er altså LATCHENDE, ikke momentan: ét tryk = kør til ende, næste tryk i
+# SAMME retning = stop hvor den står, tryk igen = kør videre. Modsat retning
+# under kørsel vender som før.
+#
+# TO konsekvenser af den model, som begge er årsagen til at 07-30-specen aldrig
+# kom til at virke i praksis:
+#
+# 1. RELEASE-HANDLEREN ER FJERNET (var somrig_sovevaerelse_curtain_stop, der
+#    stoppede motoren på stop_with_on_off/stop). Så længe et SLIP stoppede
+#    motoren, kunne et tryk pr. definition aldrig betyde "kør til ende" —
+#    gardinet nåede kun så langt som fingeren blev holdt nede. Målt 09-05
+#    21:30-22:59: 84 events flyttede gardinet i 2-4 %-spring (14→16→12→12→34),
+#    fordi hvert eneste slip annullerede det løb trykket lige havde startet.
+# 2. HVER RETNING LYTTER PÅ BÅDE KLIK OG HOLD-START (on + move_with_on_off /
+#    off + move). RODRET'en sender `on` ved et kort klik og `move_with_on_off`
+#    ved et længere tryk — for brugeren er det ÉN intention ("op"), så begge
+#    event-former skal ind i samme regel. Lå stop-logikken kun på klik-formen
+#    (som før), var den usynlig for præcis de tryk brugeren faktisk lavede.
+#
+# Virker kun her fordi sove-gardinet er Zigbee og melder ægte `opening`/`closing`
+# under de ~30 s kørsel — de tre Somfy-gardiner er optimistiske template-covers
+# der springer direkte open↔closed og aldrig kan få den her adfærd.
+# mode: queued, så to hurtige tryk ikke tavst droppes (single = anden tryk tabt,
+# hvilket selv ville ligne "knappen reagerer ikke").
+- id: somrig_sovevaerelse_curtain_open
+  alias: "Somrig Soveværelse: gardin op (tryk) / stop hvis på vej op"
+  mode: queued
+  max: 3
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "39:ed:51:54:13:58:b3:9d"
+        command: "on"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "39:ed:51:54:13:58:b3:9d"
+        command: "move_with_on_off"
+  action:
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: cover.gardin_sovevaerelse
+              state: "opening"
+          sequence:
+            - service: cover.stop_cover
+              target:
+                entity_id: cover.gardin_sovevaerelse
+      default:
+        - service: cover.open_cover
+          target:
+            entity_id: cover.gardin_sovevaerelse
+
+- id: somrig_sovevaerelse_curtain_close
+  alias: "Somrig Soveværelse: gardin ned (tryk) / stop hvis på vej ned"
+  mode: queued
+  max: 3
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "39:ed:51:54:13:58:b3:9d"
+        command: "off"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "39:ed:51:54:13:58:b3:9d"
+        command: "move"
+  action:
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: cover.gardin_sovevaerelse
+              state: "closing"
+          sequence:
+            - service: cover.stop_cover
+              target:
+                entity_id: cover.gardin_sovevaerelse
+      default:
+        - service: cover.close_cover
+          target:
+            entity_id: cover.gardin_sovevaerelse
+        # 2026-10-06 (bug-hunt nat): et knaptryk bærer ingen user_id, så den
+        # generiske manuel-detektor ser det ikke. Uden stemplet rullede auto-
+        # åbneren gardinet op igen: målt 10-04 09:15:14 lukket med Somrig →
+        # 09:25 op igen. Samme kald som stue-RODRET (stue_rodret ned).
+        - service: script.gardin_mark_manual_down
+          data:
+            cover: cover.gardin_sovevaerelse
+
+# =============================================================================
+# Stue Gardin RODRET (8d:d2:98) — SMART 2-gardin sekvens (user-spec 2026-06-11)
+# =============================================================================
+# KORTE KLIK (sekvens-state i input_text.stue_rodret_seq, helpers i
+# packages/broadlink_gardiner.yaml):
+#   NED #1:  syd ned. NED #2 indenfor N min (slider stue_rodret_seq_minutes,
+#            default 5) uden mellemliggende OP-klik: vest ned (til 85%-stop).
+#   OP  #1:  vest op. OP #2 indenfor N min: syd op.
+#   MODSAT klik mens NOGET kører: STOP ALT der kører (2026-09-23 — "kører"
+#   måles pr. gardin fra dets egen start, input_text.stue_rodret_koerer).
+#   Stop-klik nulstiller sekvensen og tæller IKKE som klik #1 i ny retning.
+#   3. klik samme retning (efter komplet sekvens) starter forfra (klik #1).
+# LANGE TRYK: begge gardiner helt op/ned. Release stopper IKKE længere
+#   (spec: langt tryk = kør til ende) — stop via modsat kort klik (stopper
+#   BEGGE indenfor vinduet efter et hold).
+# RTS er envejs (ingen position-feedback) → "kører" detekteres via
+# tidsvindue: syd=gardin_syd_ned_sekunder, vest=gardin_vest_ned_sekunder,
+# begge=max. Samme vindue bruges for op-løb (≈ samme køretid).
+# NB: vest_2 eksisterer ikke endnu — tilføj i alle 3 automations når den
+# pares (grep somrig_stue_curtain).
+# =============================================================================
+# NB: cover-kald på template-coverne BLOKERER (close-scriptet indeholder
+# delay til My-stop, op til 30s). Derfor: (1) mode: parallel så et stop-klik
+# håndteres med det samme, (2) state-helpers skrives FØR cover-kaldet så
+# næste klik læser korrekt sekvens-state øjeblikkeligt.
+- id: somrig_stue_curtain_click_smart
+  alias: "Stue Gardin RODRET: smart klik (syd/vest-sekvens + stop)"
+  mode: parallel
+  max: 4
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "99:09:1d:84:7d:4e:c6:17"
+        command: "on"
+      id: up
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "99:09:1d:84:7d:4e:c6:17"
+        command: "off"
+      id: down
+  action:
+    - variables:
+        press: "{{ trigger.id }}"
+        seq: "{{ states('input_text.stue_rodret_seq') }}"
+        seq_age: >-
+          {% set t = states('input_datetime.stue_rodret_seq_at') %}
+          {% if t in ['unknown', 'unavailable', ''] %}999999
+          {% else %}{{ (now() - (t | as_datetime | as_local)).total_seconds() }}
+          {% endif %}
+        last_curtain: "{{ states('input_text.stue_rodret_last_curtain') }}"
+        # 2026-07-01 (user-spec): OP-klik #1 ruller det SIDST NEDRULLEDE gardin
+        # op igen. Vælg det sidst-nedrullede HVIS det faktisk er nede (closed);
+        # ellers det andet hvis DET er nede; ellers sidst-nedrullede (no-op når
+        # begge er oppe). last_lowered trackes af stue_curtain_track_last_lowered.
+        up1_target: >-
+          {% set last = states('input_text.stue_rodret_last_lowered') %}
+          {% set syd_down = is_state('cover.gardin_stue_syd', 'closed') %}
+          {% set vest_down = is_state('cover.gardin_stue_vest_1', 'closed') %}
+          {% if last == 'syd' and syd_down %}syd
+          {% elif last == 'vest' and vest_down %}vest
+          {% elif syd_down %}syd
+          {% elif vest_down %}vest
+          {% else %}{{ last if last in ['syd','vest'] else 'vest' }}{% endif %}
+        seq_window: "{{ states('input_number.stue_rodret_seq_minutes') | float(5) * 60 }}"
+        run_window: >-
+          {% set syd = states('input_number.gardin_syd_ned_sekunder') | float(30) %}
+          {% set vest = states('input_number.gardin_vest_ned_sekunder') | float(14) %}
+          {% if last_curtain == 'vest' %}{{ vest }}
+          {% elif last_curtain == 'syd' %}{{ syd }}
+          {% else %}{{ [syd, vest] | max }}{% endif %}
+        moving_dir: >-
+          {% if seq in ['down1', 'down2', 'hold_down'] %}down
+          {% elif seq in ['up1', 'up2', 'hold_up'] %}up
+          {% else %}none{% endif %}
+        # 2026-09-23 (#14, user: "Parent B regner med at hun kan stoppe et gardin
+        # halvvejs nede ved at trykke en ekstra gang på op efter hun har trykket
+        # ned. Men det virker vist ikke"). Målt 22/09 13:05: ned, ned, ned, op
+        # … inden for 15 s. Det gamle stop-tjek (a) målte "kører" fra SIDSTE
+        # TRYK i stedet for fra gardinets egen start, og (b) stoppede kun det
+        # SIDST styrede gardin — tredje ned-klik havde gjort syd til "sidste",
+        # så op-klikket stoppede syd mens vest kørte videre.
+        # NU: hvert gardin bogføres med sin egen kører-til-tid og retning
+        # (input_text.stue_rodret_koerer), og ET TRYK MODSAT AF NOGET DER KØRER
+        # STOPPER ALT DER KØRER. Samme retning mens noget kører = næste gardin i
+        # sekvensen, som før.
+        koerer_nu: >-
+          {% set raw = states('input_text.stue_rodret_koerer') %}
+          {% set k = raw | from_json if raw.startswith('{') else {} %}
+          {% set nu = as_timestamp(now()) %}
+          {% set ns = namespace(l=[]) %}
+          {% for c in ['syd', 'vest'] %}
+            {% set e = k.get(c, [0, '']) %}
+            {% if (e[0] | float(0)) > nu %}{% set ns.l = ns.l + [c ~ ':' ~ e[1]] %}{% endif %}
+          {% endfor %}
+          {{ ns.l | join(',') }}
+        is_stop_press: >-
+          {% set l = koerer_nu.split(',') | reject('eq', '') | list %}
+          {{ l | length > 0 and (l | map('regex_replace', '^.*:', '') | reject('eq', press) | list | length > 0) }}
+    # Stempl tryk-tid FØR cover-kald (de blokerer) — næste klik skal læse
+    # korrekt timing med det samme.
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.stue_rodret_seq_at
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - choose:
+        # ----- MODSAT KLIK under kørsel → stop det/de kørende gardin(er) -----
+        - conditions:
+            - condition: template
+              value_template: "{{ is_stop_press }}"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.stue_rodret_seq
+              data:
+                value: "stop"
+            - service: script.stue_rodret_koerer_saet
+              data:
+                gardin: begge
+                retning: stop
+            - service: cover.stop_cover
+              target:
+                entity_id: >-
+                  {% set l = koerer_nu.split(',') | reject('eq', '') | map('regex_replace', ':.*$', '') | list %}
+                  {{ l | map('regex_replace', '^syd$', 'cover.gardin_stue_syd')
+                       | map('regex_replace', '^vest$', 'cover.gardin_stue_vest_1') | list }}
+        # ----- NED-klik: syd først, vest ved klik #2 -----
+        - conditions:
+            - condition: template
+              value_template: "{{ press == 'down' }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ seq == 'down1' and seq_age | float(999999) < seq_window | float(300) }}"
+              then:
+                - service: input_text.set_value
+                  target:
+                    entity_id: input_text.stue_rodret_seq
+                  data:
+                    value: "down2"
+                - service: input_text.set_value
+                  target:
+                    entity_id: input_text.stue_rodret_last_curtain
+                  data:
+                    value: "vest"
+                - service: script.stue_rodret_koerer_saet
+                  data: {gardin: vest, retning: down}
+                - service: cover.close_cover
+                  target:
+                    entity_id: cover.gardin_stue_vest_1
+                - service: script.gardin_mark_manual_down
+                  data:
+                    cover: cover.gardin_stue_vest_1
+              else:
+                - service: input_text.set_value
+                  target:
+                    entity_id: input_text.stue_rodret_seq
+                  data:
+                    value: "down1"
+                - service: input_text.set_value
+                  target:
+                    entity_id: input_text.stue_rodret_last_curtain
+                  data:
+                    value: "syd"
+                - service: script.stue_rodret_koerer_saet
+                  data: {gardin: syd, retning: down}
+                - service: cover.close_cover
+                  target:
+                    entity_id: cover.gardin_stue_syd
+                - service: script.gardin_mark_manual_down
+                  data:
+                    cover: cover.gardin_stue_syd
+        # ----- OP-klik: sidst-nedrullede først, det andet ved klik #2 -----
+        # 2026-07-01 (user-spec): #1 ruller det gardin op der SIDST blev rullet
+        # ned; #2 ruller det andet op. (Var før: vest først, syd ved #2.)
+        - conditions:
+            - condition: template
+              value_template: "{{ press == 'up' }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ seq == 'up1' and seq_age | float(999999) < seq_window | float(300) }}"
+              then:
+                # OP #2: rul det ANDET gardin op (modsat af #1's mål — last_curtain
+                # blev sat til #1's mål af forrige tryk).
+                - variables:
+                    other: "{{ 'syd' if last_curtain == 'vest' else 'vest' }}"
+                - service: input_text.set_value
+                  target:
+                    entity_id: input_text.stue_rodret_seq
+                  data:
+                    value: "up2"
+                - service: input_text.set_value
+                  target:
+                    entity_id: input_text.stue_rodret_last_curtain
+                  data:
+                    value: "{{ other }}"
+                - service: script.stue_rodret_koerer_saet
+                  data:
+                    gardin: "{{ other }}"
+                    retning: up
+                - service: cover.open_cover
+                  target:
+                    entity_id: >-
+                      {{ 'cover.gardin_stue_syd' if other == 'syd'
+                         else 'cover.gardin_stue_vest_1' }}
+              else:
+                # OP #1: rul det SIDST NEDRULLEDE gardin op (up1_target beregnet
+                # i variables-blokken ovenfor).
+                - service: input_text.set_value
+                  target:
+                    entity_id: input_text.stue_rodret_seq
+                  data:
+                    value: "up1"
+                - service: input_text.set_value
+                  target:
+                    entity_id: input_text.stue_rodret_last_curtain
+                  data:
+                    value: "{{ up1_target }}"
+                - service: script.stue_rodret_koerer_saet
+                  data:
+                    gardin: "{{ up1_target }}"
+                    retning: up
+                - service: cover.open_cover
+                  target:
+                    entity_id: >-
+                      {{ 'cover.gardin_stue_syd' if up1_target == 'syd'
+                         else 'cover.gardin_stue_vest_1' }}
+
+# =============================================================================
+# Track sidst-nedrullede stue-gardin (user-spec 2026-07-01)
+# =============================================================================
+# OP-klik på stue-RODRET (somrig_stue_curtain_click_smart) ruller det SIDST
+# NEDRULLEDE gardin op igen. Vi tracker derfor hvilket af syd/vest der sidst gik
+# NED — uanset kilde (knap, winter/summer-defense, godnat). Somfy RTS er
+# optimistic (ingen positions-feedback), men ethvert close_cover-kald sætter
+# template-coverets state → 'closed', så et rent state-watch fanger ALLE
+# nedrulninger (user bruger aldrig den fysiske Somfy-fjernbetjening). Ved
+# hold-ned (begge) fyrer begge → den sidste (typisk vest, 14s vs syd 30s) vinder.
+# =============================================================================
+- id: stue_curtain_track_last_lowered
+  alias: "Stue Gardin: track sidst nedrullede (syd/vest)"
+  mode: queued
+  max: 6
+  trigger:
+    - platform: state
+      entity_id: cover.gardin_stue_syd
+      to: "closed"
+      # 2026-09-29 (B170): en restart/template.reload giver unavailable → closed
+      # = ingen nedrulning; må ikke omskrive "sidst nedrullede".
+      not_from: ["unavailable", "unknown"]
+      id: syd
+    - platform: state
+      entity_id: cover.gardin_stue_vest_1
+      to: "closed"
+      # 2026-09-29 (B170): en restart/template.reload giver unavailable → closed
+      # = ingen nedrulning; må ikke omskrive "sidst nedrullede".
+      not_from: ["unavailable", "unknown"]
+      id: vest
+    # B44-fix 2026-07-14: en auto-GENÅBNING (fx summer_defense-køling) ryddede
+    # ikke last_lowered → den kunne pege på et allerede-åbent gardin. Nu følger
+    # vi også open-flanken: åbnes det trackede gardin, flip til det andet HVIS
+    # det stadig er nede, ellers ryd ('' → up1 falder tilbage til closed-check/
+    # vest). Semantik: last_lowered = "sidst-nedrullede der STADIG er nede".
+    - platform: state
+      entity_id: cover.gardin_stue_syd
+      to: "open"
+      id: syd_open
+    - platform: state
+      entity_id: cover.gardin_stue_vest_1
+      to: "open"
+      id: vest_open
+  action:
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.id in ['syd', 'vest'] }}"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.stue_rodret_last_lowered
+              data:
+                value: "{{ trigger.id }}"
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ trigger.id == 'syd_open'
+                   and states('input_text.stue_rodret_last_lowered') == 'syd' }}
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.stue_rodret_last_lowered
+              data:
+                value: "{{ 'vest' if is_state('cover.gardin_stue_vest_1', 'closed') else '' }}"
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ trigger.id == 'vest_open'
+                   and states('input_text.stue_rodret_last_lowered') == 'vest' }}
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.stue_rodret_last_lowered
+              data:
+                value: "{{ 'syd' if is_state('cover.gardin_stue_syd', 'closed') else '' }}"
+
+- id: somrig_stue_curtain_hold_up
+  alias: "Stue Gardin RODRET: begge gardiner helt op (hold øverste)"
+  mode: single
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "99:09:1d:84:7d:4e:c6:17"
+        command: "move_with_on_off"
+  action:
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.stue_rodret_seq
+      data:
+        value: "hold_up"
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.stue_rodret_last_curtain
+      data:
+        value: "begge"
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.stue_rodret_seq_at
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - service: script.stue_rodret_koerer_saet
+      data: {gardin: begge, retning: up}
+    - service: cover.open_cover
+      target:
+        entity_id:
+          - cover.gardin_stue_syd
+          - cover.gardin_stue_vest_1
+
+- id: somrig_stue_curtain_hold_down
+  alias: "Stue Gardin RODRET: begge gardiner helt ned (hold nederste)"
+  mode: single
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "99:09:1d:84:7d:4e:c6:17"
+        command: "move"
+  action:
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.stue_rodret_seq
+      data:
+        value: "hold_down"
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.stue_rodret_last_curtain
+      data:
+        value: "begge"
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.stue_rodret_seq_at
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - service: script.stue_rodret_koerer_saet
+      data: {gardin: begge, retning: down}
+    # Syd kører helt i bund; vest stopper selv ved 85% (timet NED+My i
+    # template-coveret = vests "helt ned" per VEST-SÆRREGLEN).
+    - service: cover.close_cover
+      target:
+        entity_id:
+          - cover.gardin_stue_syd
+          - cover.gardin_stue_vest_1
+    - service: script.gardin_mark_manual_down
+      data:
+        cover: cover.gardin_stue_syd
+    - service: script.gardin_mark_manual_down
+      data:
+        cover: cover.gardin_stue_vest_1
+
+# NB: somrig_stue_curtain_stop (stop ved hold-release) er BEVIDST FJERNET
+# 2026-06-11 — user-spec: langt tryk skal køre begge gardiner HELT op/ned,
+# så release må ikke stoppe. Stop sker via modsat kort klik (se smart-klik).
+
+# =============================================================================
+# GÆSTE-RODRET — simpel tænd/sluk for open-plan + entré (2026-09-27, user-spec)
+# =============================================================================
+# IEEE e5:25:1f:46:bc:96:c8:dc. User: "den skal du kode til at være en simpel
+# tænd sluk knap for openplan og entre lys. vi giver den til gæster der sover i
+# stuen." Knappen var før "Stue Syd Gardin Rodret" (kun cover.gardin_stue_syd),
+# men lå ubrugt i et skab — user: "du kan droppe alt hvad den gjorde. legacy".
+# Stue-syd-gardinet styres stadig af den anden stue-RODRET (smart-klik ovenfor).
+#
+# I (øverst, klik ELLER hold) = TÆND (+ slipper Sleep Over): light.stue_all (spisestue-loft, køkken-
+#   lyskæde, sofa-lys, stue-spots) + entré-loft, 80 % 2700 K.
+#   Køkken-SPOTTENE (arbejdslys) tændes bevidst ikke.
+#   ⚠️ IKKE light.spisestue_pendel — det er SOVE-LOFTET (pendlen flyttet 06/2026,
+#   entity-navnet beholdt). Første version tog den med ud fra navnet og
+#   slukkede/tændte forældrenes soveværelse (målt 27/9 21:01 + 21:08).
+# O (nederst, klik ELLER hold) = SLUK: samme lys + køkken-spots (B153: grupperne
+#   rummer ikke switch.*) + terrassens pærelyskæde. 18-06 armerer O også Sleep Over ("gæst i nat") +
+#   sleepover_gaesteknap_at → mørket gælder STRAKS: ingen automatik tænder i
+#   open-plan, entré eller terrasse til I / Styrbar OP / morgen-bevægelse /
+#   10:00-backstop (packages/sleepover.yaml).
+# Slip-events (stop/stop_with_on_off) ignoreres.
+#
+# MED-EJERE (#1): tænd/sluk kommer fra en automation → parent_id sat, så
+# Sleep Over-vagten (packages/sleepover.yaml) og presence-sluk ville ellers
+# behandle gæstens tryk som automatik. Derfor stempler vi som et Styrbar-tryk
+# FØR lys-kaldet: styrbar_stamp_press → last_press (vagten respekterer 120 s) +
+# room_mode Manual for stue/spisestue/køkken ved O; ved I forbliver KØKKENET i Auto
+# (madlavnings-spottene er spærret i Manual — målt 28/9).
+# Entré sættes ALDRIG i Manual (kun timer-stempel): i Manual er entré-
+# bevægelses-tænd spærret mens entré-sluk kører videre → mørk gang (målt 28/9).
+# Virker i ALLE house_modes — den er lavet til gæster (AirBnB og familie).
+# =============================================================================
+- id: gaeste_rodret_openplan_taend
+  alias: "Gæste-RODRET: tænd open-plan + entré (I)"
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "e5:25:1f:46:bc:96:c8:dc"
+        command: "on"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "e5:25:1f:46:bc:96:c8:dc"
+        command: "move_with_on_off"
+  action:
+    - repeat:
+        for_each: [stue, spisestue]
+        sequence:
+          - service: script.styrbar_stamp_press
+            data:
+              room: "{{ repeat.item }}"
+    # 2026-09-28 (user: "nu mangler jeg spots her til morgen … i køkkenet" +
+    # "nu mangler gang … lys"): køkken og ENTRÉ stemples KUN (sleepover-vagtens
+    # 120 s), sættes IKKE i Manual — de er gennemgangsrum med bevægelses-lys.
+    # Målt 06:37:59: I satte køkkenet i Manual i samme sekund som madlavnings-
+    # spottene tændte; radaren tabte køkkenet 30 s → spots-sluk (ignorerer
+    # Manual) slukkede 06:38:44, og madlavnings-tænd (spærret af Manual) kunne
+    # ikke tænde igen. I tænder ikke spottene selv, så køkkenets arbejdslys skal
+    # blive på automatik.
+    - repeat:
+        for_each: [koekken, entre]
+        sequence:
+          - service: script.styrbar_stamp_press
+            data:
+              room: "{{ repeat.item }}"
+              set_manual: false
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.stue_all
+          - light.entre_loft
+      data:
+        brightness_pct: 80
+        color_temp_kelvin: 2700
+        transition: 1
+    # Gæstens UDGANG af Sleep Over (🏡 #2): I = "vi er oppe". Samme script som
+    # stue-Styrbar OP. Lyset er allerede tændt (knapper skal reagere straks);
+    # slip-scriptet sætter rummene i Auto efter 2 s, så vi stempler Manual
+    # igen bagefter, ellers slukker presence gæstens lys når hun sidder stille.
+    - if:
+        - condition: state
+          entity_id: input_boolean.sleepover_i_nat
+          state: "on"
+      then:
+        - service: script.sleepover_slip_hold
+          data:
+            grund: "Gæste-RODRET I"
+        - repeat:
+            for_each: [stue, spisestue]
+            sequence:
+              - service: script.styrbar_stamp_press
+                data:
+                  room: "{{ repeat.item }}"
+        - repeat:
+            for_each: [koekken, entre]
+            sequence:
+              - service: script.styrbar_stamp_press
+                data:
+                  room: "{{ repeat.item }}"
+                  set_manual: false
+    - service: logbook.log
+      data:
+        name: "Gæste-RODRET"
+        message: "TÆND: open-plan + entré (80 %, 2700 K), stue/spisestue i Manual (køkken + entré forbliver Auto), Sleep Over sluppet."
+
+- id: gaeste_rodret_openplan_sluk
+  alias: "Gæste-RODRET: sluk open-plan + entré (O)"
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "e5:25:1f:46:bc:96:c8:dc"
+        command: "off"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "e5:25:1f:46:bc:96:c8:dc"
+        command: "move"
+  # Kroppen bor i script.gaest_sover_sluk (packages/sleepover.yaml), som
+  # stue-Styrbar langt NED efter 20 også kalder (2026-10-17, #2).
+  # 2026-09-27 (user-spec: "hvis der trykkes ned på gæsteknappen skal du
+  # selvfølgelig også slå gæst i stuen til … så holdes openplan og entré
+  # mørkt natten over"). Kun aften/nat (18-06): et O midt på dagen er bare
+  # "sluk lyset", ikke "vi sover" (Sleep Over lukker også gardinerne).
+  action:
+    - service: script.gaest_sover_sluk
+      data:
+        kilde: "Gæste-RODRET O"
+        armer: "{{ now().hour >= 18 or now().hour < 6 }}"
+
+# =============================================================================
+# Dark Mode-RODRET (58:55:f0) → DARK MODE toggle (2026-07-27, user-spec)
+# =============================================================================
+# Op (klik + hold) = Dark Mode ON · Ned (klik + hold) = Dark Mode OFF.
+# OP TO GANGE indenfor input_number.dark_mode_dobbelttryk_sekunder (120 s) =
+# mørklæg ALLE TRE rum i stedet for det ene prioritets-stigen valgte (user-spec
+# 2026-08-02). Både tælling og handling ligger i script.dark_mode_button_up.
+# NED slukker mørklægningen i ALLE rum og sætter rummene tilbage til deres
+# normale auto (room_mode Manual → Auto + fritagelses-listen ryddes) — user-spec
+# 2026-07-28, implementeret i OFF-grenen af dark_mode_apply.
+# Selve mørklægningen (gardiner + lys + suppression) ligger i
+# packages/dark_mode.yaml (dark_mode_apply). Release-events (stop/
+# stop_with_on_off) ignoreres bevidst. Børneværelset har ingen gardin-motor
+# (droppet 2026-07-28) — mørklægning dér = lyset holdes slukket.
+# NAVN: knappen ligger fysisk i børneværelset, men er navngivet efter sin
+# FUNKTION (omdøbt 2026-08-02) — de øvrige tre RODRET'er hedder det gardin de
+# styrer, og denne styrer intet gardin. automation-id + entity_id beholder
+# bevidst den gamle 'boernevaerelse'-slug: et id-skift ville forældreløsgøre
+# registry-entryen og give en _2-dublet.
+# =============================================================================
+- id: somrig_boernevaerelse_dark_mode_on
+  alias: "Dark Mode-RODRET: Dark Mode ON (klik/hold øverste)"
+  mode: single
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "7a:bf:91:6b:5f:7e:38:f0"
+        command: "on"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "7a:bf:91:6b:5f:7e:38:f0"
+        command: "move_with_on_off"
+  condition:
+    # NED-SÅ-OP INDENFOR 3 s = ÉN fumlen, ikke to intentioner (2026-08-28).
+    # Ned på denne RODRET er en TAVS no-op når Dark Mode allerede er off, så
+    # brugeren tror knappen er død og prøver den anden — og tænder dermed
+    # præcis det han ville slukke. Målt to gange, begge ved sengetid og begge
+    # med utilsigtet Dark Mode til følge: 0,92 s (28/8 21:21) og 2,23 s
+    # (27/8 21:43). 28/8 rullede det de tre open-plan-gardiner ned da stuen
+    # fik et radar-blip 2 min senere (dark_mode_room_joins). NED er
+    # intentionen; et OP indenfor vinduet ignoreres. Tryk igen = tænder.
+    # last_triggered er en SKREVET værdi og opdateres også når ned-grenen er
+    # en no-op (sættes før action-body'en). Fejler ÅBENT: ukendt/manglende
+    # stempel tillader ON, så feature'n aldrig kan blive utilgængelig.
+    - condition: template
+      value_template: >-
+        {% set ned = state_attr(
+             'automation.borne_rodret_dark_mode_off_klik_hold_nederste',
+             'last_triggered') %}
+        {{ ned is none or (now() - ned).total_seconds() > 3 }}
+    # 2026-09-28 (AirBnB-audit, user-valg): OP er en familie-rutine (mørklæg
+    # open-plan + gardiner NED, ingen timeout) → spærret for gæster. NED er
+    # IKKE gatet, så et hængende Dark Mode altid kan slukkes. Projektorens
+    # pre-dark dækker gæstens film (packages/projektor_predark.yaml).
+    - condition: template
+      value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+  action:
+    # Al logik ligger i scriptet (packages/dark_mode.yaml): ét tryk = tænd
+    # (stigen vælger ét rum), to tryk indenfor vinduet = alle tre rum.
+    # Ét sted, så tryk-stemplet kun har én skriver (fejlklasse #1).
+    - service: script.dark_mode_button_up
+
+- id: somrig_boernevaerelse_dark_mode_off
+  alias: "Dark Mode-RODRET: Dark Mode OFF (klik/hold nederste)"
+  mode: single
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "7a:bf:91:6b:5f:7e:38:f0"
+        command: "off"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "7a:bf:91:6b:5f:7e:38:f0"
+        command: "move"
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.dark_mode

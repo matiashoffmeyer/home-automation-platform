@@ -1,0 +1,440 @@
+# =============================================================================
+# Badeværelse to-PIR besøgs-STADIER ("sok-filter" + stadie-skaleret sluk)
+# 2026-06-21 (user-spec)
+# =============================================================================
+# MÅL: nedkæmp at brænde lys af ved hurtige/falske toilet/bad-besøg. Klassificér
+# hvor seriøst et besøg er ud fra de to indre-bad PIR'er + wasp, og SKALÉR
+# sluk-tiden efter det — så et hurtigt besøg ikke holder lyset tændt længe.
+#
+# VIGTIG fysik-præmis (user 2026-06-21): en PIR ser IKKE stillestående presence.
+# Står man stille (på toilet / ved vask uden at bevæge sig) clearer PIR'en. Derfor
+# kan "hold" ikke bygge på kontinuerlig PIR — det bygger på TIMERE målt fra sidste
+# bevægelse + på dør-signalet (wasp / dør-åbning = man gik).
+#
+# De to indre-bad PIR'er (begge IKEA Myggspray, ~20-30 s clear-delay):
+#   - binary_sensor.badevaerelse_inde_1_occupancy = ved DØREN, mod vask/spejl.
+#     AMBIGUØS: fyrer ved enhver indgang, dør-sving OG en kastet sok.
+#   - binary_sensor.badevaerelse_inde_2_occupancy = ved GULVET, dybt inde, mod
+#     bad/toilet i fodhøjde. COMMITTENDE: en sok når den aldrig; ethvert ægte
+#     toilet-/brusebad-besøg trigger den.
+#  (binary_sensor.badevaerelse_inde_occupancy = OR-union, brugt af ~45 forbrugere.
+#   Denne fil rører IKKE union'en — den lægger et stadie-lag oven på.)
+#
+# STADIER (input_select.badevaerelse_visit_stage) — eskalerer kun OPAD i et besøg,
+# nulstilles til Ingen når lyset slukker / godnat:
+#   Ingen   = intet besøg.
+#   Quick   = dør-PIR (eller en enkelt blip) — mistænkt hurtigt besøg / sok.
+#             → lyset tænder kun på PROBE-brightness, sluk hurtigt.
+#   Medium  = ÉT klart commitment-signal: deep-PIR (inde_2) fyrede mindst én gang
+#             ELLER dør-PIR vedvarende > sustain-tærskel. Et reelt men kort besøg
+#             (tisse-tur med åben dør / hentede noget / tandbørstning).
+#             → lyset på memory-niveau, sluk efter medium-vindue.
+#   Fuld    = begge sensorer + WASP armeret (dør lukket + bevægelse indenfor =
+#             brusebad / committet besøg). → lyset på memory + ramp; hold mens
+#             døren er lukket (wasp-veto + min-hold mod stilstand), og sluk
+#             hurtigt når døren ÅBNES (man gik) — leave-off.
+#
+# Et afledt binary_sensor.badevaerelse_visit_serious = stage in [Medium, Fuld]
+# bruges af de eksisterende forbrugere (presence on-block, ramp, confirm-upgrade,
+# min-hold) som "committet besøg = ja".
+#
+# GÆLDER OGSÅ OM NATTEN (user-spec 2026-06-21): hele stadie-systemet (inkl. wasp/
+# Fuld + sluk-timing) kører nu OGSÅ under godnat — men brightness sænkes til
+# input_number.badevaerelse_godnat_brightness (default 8 %, mørke-only) for ALLE
+# stadier. Stadierne styrer SLUK-timingen om natten (Quick hurtig, Medium kort,
+# Fuld hold-til-dør), brightness er bare lav. Cardinal bevaret: nat-bad bliver
+# aldrig lyst (8 %) — beskytter nattesyn / vækker ikke baby. Efter solopgang
+# (stadig godnat) falder den igennem til dag-niveau (natlys gælder kun i mørke).
+#
+# Tunable sliders (packages/constants.yaml, tiles på Indstillinger):
+#   badevaerelse_serious_sustain_seconds  (40 s) — dør-PIR alene → Medium efter
+#   badevaerelse_probe_brightness         (55 %) — Quick-stadiets brightness
+#   badevaerelse_probe_grace_seconds      (20 s) — Quick sluk efter PIR-ro
+#   badevaerelse_medium_off_minutes       (3 min) — Medium sluk efter sidste bev.
+#   badevaerelse_leave_off_seconds        (25 s) — Fuld: sluk efter dør åbnes
+# =============================================================================
+
+input_select:
+  badevaerelse_visit_stage:
+    name: "Bad besøgs-stadie"
+    icon: mdi:stairs
+    options:
+      - "Ingen"
+      - "Quick"
+      - "Medium"
+      - "Fuld"
+
+input_boolean:
+  # 2026-06-24 (user-spec task 3): markør for "dagens første bad-besøg efter
+  # kl. 06 er brugt". Det første besøg efter 06:00 hver dag antages at være et
+  # DEEP besøg (morgen-toilet/vask = næsten altid ægte) → springer Quick/probe
+  # over og går direkte til Medium. Nulstilles ved midnat (per kalenderdag).
+  # Sættes ON af badevaerelse_stage_first_morning_deep. Ingen `initial:` →
+  # persisterer restarts (off-fallback er sikker: et ekstra deep-besøg).
+  badevaerelse_first_deep_today:
+    name: "Bad: dagens første deep-antagelse brugt"
+    icon: mdi:weather-sunset-up
+
+template:
+  - binary_sensor:
+      # Afledt "committet besøg"-signal (stage Medium eller Fuld). Bevarer det
+      # navn de eksisterende forbrugere refererer, så stadie-laget kan styre dem
+      # uden at re-pointe hvert call-site.
+      - name: "Badevaerelse Visit Serious"
+        unique_id: badevaerelse_visit_serious
+        device_class: occupancy
+        icon: mdi:account-check
+        state: >
+          {{ states('input_select.badevaerelse_visit_stage') in ['Medium', 'Fuld'] }}
+
+      # "Vi VED der sidder nogen i badet bag lukket dør" — samme udtryk som
+      # general-offs udvidede wasp-veto (presence_badevaerelse.yaml, 2026-07-08
+      # #5): wasp armeret ELLER committet besøg, OG parasoll=off (lukket).
+      # 2026-07-16 (user-spec): bruges af godnat-flowene til at SPRINGE badets
+      # lys over ved hel-hus-sluk — godnat må ikke mørklægge et optaget bad.
+      # Kan ikke brænde tomt: man åbner døren for at gå ud → sensor falder →
+      # badets egne sluk-flows (leave-off/medium/general + 45-min watchdog)
+      # slukker som normalt, også under godnat.
+      - name: "Badevaerelse Optaget Lukket Doer"
+        unique_id: badevaerelse_optaget_lukket_doer
+        device_class: occupancy
+        icon: mdi:door-closed-lock
+        state: >
+          {{ (is_state('input_boolean.badevaerelse_wasp_active', 'on')
+              or is_state('binary_sensor.badevaerelse_visit_serious', 'on'))
+             and is_state('binary_sensor.parasoll_badevaerelse', 'off') }}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # ESCALATE → Quick: en indre-PIR fyrede mens der intet besøg var.
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_stage_quick
+    alias: "Bad stadie: → Quick (indre-PIR fyrede)"
+    description: >
+      Første indre-PIR-aktivering i et nyt besøg = mistænkt hurtigt besøg /
+      muligvis sok. Sæt stadie Quick (lyset tænder på probe-brightness).
+      Fyrer deep-PIR'en samtidig løfter stage_medium_deep straks til Medium.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.badevaerelse_inde_1_occupancy
+          - binary_sensor.badevaerelse_inde_2_occupancy
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_select.badevaerelse_visit_stage
+        state: "Ingen"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      # 2026-06-21 (user-spec): stadie-klassificering gælder OGSÅ under godnat
+      # (smart system om natten, bare dæmpet).
+      # 2026-06-23 (user-spec): robotten spærrer KUN i Dormant
+      # (binary_sensor.roborock_blokerer_lys) — i Active eskalerer stadiet normalt.
+      # Rettede "bad stuck på probe (40%) mens robotten kørte": deep-PIR (inde_2)
+      # løfter nu Quick→Medium selv under en robot-runde.
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+      # 2026-06-24 (user-spec task 3): undertryk Quick for dagens FØRSTE besøg
+      # efter kl. 06 — det håndteres af badevaerelse_stage_first_morning_deep
+      # (→ direkte Medium). Mutuelt eksklusiv guard, ikke ordens-afhængig.
+      - condition: template
+        value_template: >-
+          {{ not (now().hour >= 6
+                  and is_state('input_boolean.badevaerelse_first_deep_today', 'off')) }}
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.badevaerelse_visit_stage
+        data:
+          option: "Quick"
+      - service: logbook.log
+        data:
+          name: "Bad stadie"
+          message: "→ Quick (indre-PIR fyrede — mistænkt hurtigt besøg)"
+          entity_id: input_select.badevaerelse_visit_stage
+
+  # ---------------------------------------------------------------------------
+  # ESCALATE → Medium (første morgenbesøg): dagens første bad-besøg efter kl. 06
+  # antages at være et DEEP besøg (user-spec 2026-06-24 task 3).
+  # ---------------------------------------------------------------------------
+  # Morgen-toilet/vask er næsten altid et ægte besøg — ikke en kastet sok. Spring
+  # derfor Quick/probe over og gå direkte til Medium på dagens første besøg efter
+  # 06:00, så lyset kommer på normal memory-brightness med det samme. Flaget
+  # sættes så de efterfølgende besøg igen får det normale Quick-først-filter.
+  # Nat-besøg (før 06:00) er URØRT — sok-filteret er vigtigst om natten.
+  - id: badevaerelse_stage_first_morning_deep
+    alias: "Bad stadie: → Medium (dagens første morgenbesøg = antaget deep)"
+    description: >
+      Dagens første bad-besøg efter kl. 06 → direkte Medium (antaget deep besøg).
+      Sætter badevaerelse_first_deep_today så resten af dagen bruger normal
+      Quick-først-klassificering. Nulstilles ved midnat.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.badevaerelse_inde_1_occupancy
+          - binary_sensor.badevaerelse_inde_2_occupancy
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_select.badevaerelse_visit_stage
+        state: "Ingen"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+      # Dagens første besøg EFTER kl. 06, endnu ikke brugt.
+      - condition: template
+        value_template: "{{ now().hour >= 6 }}"
+      - condition: state
+        entity_id: input_boolean.badevaerelse_first_deep_today
+        state: "off"
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.badevaerelse_first_deep_today
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.badevaerelse_visit_stage
+        data:
+          option: "Medium"
+      - service: logbook.log
+        data:
+          name: "Bad stadie"
+          message: "→ Medium (dagens første morgenbesøg — antaget deep)"
+          entity_id: input_select.badevaerelse_visit_stage
+
+  # ---------------------------------------------------------------------------
+  # RESET (midnat): nulstil dagens første-deep-markør, så næste dags første
+  # besøg efter kl. 06 igen antages deep.
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_first_deep_reset
+    alias: "Bad stadie: nulstil første-deep-markør (midnat)"
+    mode: single
+    trigger:
+      - platform: time
+        at: "00:00:00"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.badevaerelse_first_deep_today
+
+  # ---------------------------------------------------------------------------
+  # ESCALATE → Medium (deep): deep-PIR (inde_2) fyrede = du gik faktisk ind.
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_stage_medium_deep
+    alias: "Bad stadie: → Medium (deep-PIR fyrede)"
+    description: >
+      inde_2 (gulv, dybt inde mod toilet/bad) fanger KUN nogen der faktisk gik
+      ind — en kastet sok når den aldrig. Ergo committet besøg → Medium.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_inde_2_occupancy
+        to: "on"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_select.badevaerelse_visit_stage') in ['Ingen', 'Quick'] }}
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      # 2026-06-21 (user-spec): stadie-klassificering gælder OGSÅ under godnat
+      # (smart system om natten, bare dæmpet).
+      # 2026-06-23 (user-spec): robotten spærrer KUN i Dormant
+      # (binary_sensor.roborock_blokerer_lys) — i Active eskalerer stadiet normalt.
+      # Rettede "bad stuck på probe (40%) mens robotten kørte": deep-PIR (inde_2)
+      # løfter nu Quick→Medium selv under en robot-runde.
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.badevaerelse_visit_stage
+        data:
+          option: "Medium"
+      - service: logbook.log
+        data:
+          name: "Bad stadie"
+          message: "→ Medium (deep-PIR — committet besøg)"
+          entity_id: input_select.badevaerelse_visit_stage
+
+  # ---------------------------------------------------------------------------
+  # ESCALATE → Medium (sustain): dør-PIR vedvarende = reelt vask-ophold.
+  # ---------------------------------------------------------------------------
+  # inde_1 alene er ambiguøs (sok vs. tandbørstning). Diskriminanten er ON-
+  # VARIGHEDEN: en sok holder PIR'en tændt i clear-delay'en (~25 s) og falder; et
+  # reelt ophold ved vasken holder den uafbrudt tændt i minutter. Tærsklen ligger
+  # OVER clear-delay'en (default 40 s). `for:` binder slider-værdien ved load →
+  # fuld effekt efter HA-restart (samme som husets øvrige for:-sliders).
+  - id: badevaerelse_stage_medium_sustain
+    alias: "Bad stadie: → Medium (dør-PIR vedvarende)"
+    description: >
+      inde_1 (dør, mod vask/spejl) tændt uafbrudt > sustain-tærsklen = nogen
+      opholder sig ved vasken selvom de aldrig gik dybt ind → Medium.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_inde_1_occupancy
+        to: "on"
+        for:
+          seconds: >-
+            {{ states('input_number.badevaerelse_serious_sustain_seconds') | int(40) }}
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_select.badevaerelse_visit_stage') in ['Ingen', 'Quick'] }}
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      # 2026-06-21 (user-spec): stadie-klassificering gælder OGSÅ under godnat
+      # (smart system om natten, bare dæmpet).
+      # 2026-06-23 (user-spec): robotten spærrer KUN i Dormant
+      # (binary_sensor.roborock_blokerer_lys) — i Active eskalerer stadiet normalt.
+      # Rettede "bad stuck på probe (40%) mens robotten kørte": deep-PIR (inde_2)
+      # løfter nu Quick→Medium selv under en robot-runde.
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.badevaerelse_visit_stage
+        data:
+          option: "Medium"
+      - service: logbook.log
+        data:
+          name: "Bad stadie"
+          message: >-
+            → Medium (dør-PIR vedvarende >
+            {{ states('input_number.badevaerelse_serious_sustain_seconds') }} s)
+          entity_id: input_select.badevaerelse_visit_stage
+
+  # ---------------------------------------------------------------------------
+  # ESCALATE → Fuld: wasp armeret (dør lukket + bevægelse = brusebad/committet).
+  # ---------------------------------------------------------------------------
+  # wasp armeres KUN ved frisk inde-PIR off→on MENS døren er lukket (og ikke
+  # godnat) = man bevæger sig inde i en lukket boks. Det er husets stærkeste
+  # "rigtigt besøg bag lukket dør"-signal → Fuld. (Begge sensorer er reelt
+  # tripped når man er gået ind og lukket; wasp er den endelige bekræftelse.)
+  - id: badevaerelse_stage_full
+    alias: "Bad stadie: → Fuld (wasp armeret)"
+    description: >
+      Wasp-in-a-box armeret = dør lukket + bevægelse indenfor = committet besøg
+      (brusebad / toilet bag lukket dør). Eskalér til Fuld → fuld hold mens
+      døren er lukket; leave-off slukker hurtigt når døren åbnes.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.badevaerelse_wasp_active
+        to: "on"
+    condition:
+      # 2026-09-01: 'Ingen' tælles med NÅR en brusebad-session armerede wasp'en.
+      # Klima-signaturen (damp + varme) kan komme efter at en sluk-vej allerede
+      # har slukket lyset og nulstillet stadiet — netop det forløb der ramte
+      # user 09-01 kl. 06:21. Uden 'Ingen' ville sessionen stå uden stadie og
+      # fase-brightness returnere 0. Ejerskabet for "→ Fuld" bliver liggende
+      # her (fejlklasse #2) i stedet for at brusebad-pakken sætter stadiet selv.
+      - condition: template
+        value_template: >-
+          {% set stage = states('input_select.badevaerelse_visit_stage') %}
+          {{ stage in ['Quick', 'Medium']
+             or (stage == 'Ingen'
+                 and is_state('input_boolean.badevaerelse_brusebad_session', 'on')) }}
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.badevaerelse_visit_stage
+        data:
+          option: "Fuld"
+      - service: logbook.log
+        data:
+          name: "Bad stadie"
+          message: "→ Fuld (wasp armeret — committet bag lukket dør)"
+          entity_id: input_select.badevaerelse_visit_stage
+
+  # ---------------------------------------------------------------------------
+  # ESCALATE → Fuld: VEDVARENDE tilstedeværelse (dør-uafhængigt).
+  # ---------------------------------------------------------------------------
+  # 2026-06-26 (user-spec): Fuld skal OGSÅ kunne trigges af vedvarende ophold
+  # ved sensorerne — selv med ÅBEN dør (uden wasp). Union inde-occupancy (inde_1
+  # ELLER inde_2) uafbrudt tændt > tærsklen = nogen opholder sig reelt derinde
+  # (badebesøg/vask/ophold) uanset dørstatus → Fuld. Wasp-pathen (lukket dør)
+  # er urørt; denne er et ekstra, parallelt løft. Default 70 s.
+  # NB: union-occupancy holdes "on" af PIR-clear-delay'en mellem bevægelser, så
+  # tærsklen tæller reelt fra entrance så længe der er løbende bevægelse.
+  - id: badevaerelse_stage_full_sustained
+    alias: "Bad stadie: → Fuld (vedvarende ophold, dør-uafhængig)"
+    description: >
+      Union inde-occupancy tændt uafbrudt > full-sustain-tærsklen = committet
+      ophold derinde uanset dørstatus → Fuld. Parallel til wasp-pathen.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_inde_occupancy
+        from: "off"
+        to: "on"
+        for:
+          seconds: >-
+            {{ states('input_number.badevaerelse_full_sustain_seconds') | int(70) }}
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_select.badevaerelse_visit_stage') in ['Quick', 'Medium'] }}
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      # robotten spærrer KUN i Dormant; i Active eskalerer stadiet normalt.
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.badevaerelse_visit_stage
+        data:
+          option: "Fuld"
+      - service: logbook.log
+        data:
+          name: "Bad stadie"
+          message: >-
+            → Fuld (vedvarende ophold >
+            {{ states('input_number.badevaerelse_full_sustain_seconds') }} s,
+            dør-uafhængig)
+          entity_id: input_select.badevaerelse_visit_stage
+
+  # ---------------------------------------------------------------------------
+  # RESET → Ingen: besøget er slut (lyset slukkede) eller godnat startede.
+  # ---------------------------------------------------------------------------
+  # Stadiet beskriver det NUVÆRENDE oplyste besøg → nulstil når lyset bliver off
+  # (uanset kilde) så NÆSTE besøg starter rent (ellers ville en sok efter et
+  # rigtigt besøg arve et højt stadie og slippe forbi filteret). 2 s-debounce
+  # mod sluk-fade/healer-transienter.
+  # 2026-06-21: godnat-start-triggeren FJERNET — stadie-systemet kører nu OGSÅ
+  # under godnat, så et nat-besøg må ikke nulstilles når godnat tænder. Lyset-off
+  # er den eneste rene besøgs-slut (gælder dag som nat).
+  - id: badevaerelse_stage_reset
+    alias: "Bad stadie: → Ingen (lys slukket)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: light.badevaerelse_all
+        to: "off"
+        for:
+          seconds: 2
+        id: light_off
+    condition:
+      - condition: template
+        value_template: "{{ not is_state('input_select.badevaerelse_visit_stage', 'Ingen') }}"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.badevaerelse_visit_stage
+        data:
+          option: "Ingen"
+      - service: logbook.log
+        data:
+          name: "Bad stadie"
+          message: "→ Ingen (besøg slut, lys off)"
+          entity_id: input_select.badevaerelse_visit_stage

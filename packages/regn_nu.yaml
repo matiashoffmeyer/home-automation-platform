@@ -1,0 +1,368 @@
+# =============================================================================
+# Regn NU — OBSERVERET nedbør som nowcast (2026-08-28)
+# =============================================================================
+# INCIDENT 2026-08-28: der faldt 1,3 mm mellem 13:00 og 13:40 og 0,6 mm mellem
+# 14:40 og 15:10, mens switch.terrasse_plug stod ON hele vejen igennem.
+# binary_sensor.terrasse_regn_aktiv gik ALDRIG on. Årsag: begge dens kilder var
+# PROGNOSER, og de fejlede hver sin vej samtidig:
+#   - met.no (weather.forecast_home) stod 'cloudy' fra 09:22 og hele bygen ud —
+#     præcis den miss-klasse DMI HARMONIE i sin tid blev tilføjet for (B34).
+#   - DMI HARMONIE's mm_next3h stod 0,02 fra et fetch kl. 11:12. Endpointet har
+#     429'et lige siden (verificeret manuelt kl. 15:31), og sensoren bærer sin
+#     sidste gode værdi videre — så et "de næste 3 timer"-tal fra et vindue der
+#     udløb 14:12 blev læst som nowcast kl. 15:29.
+#
+# HVORFOR EN TREDJE KILDE OG IKKE EN JUSTERET TÆRSKEL: en prognose kan ikke
+# fejl-rettes med en slider. To modeller der begge kan misse den samme byge er
+# ikke to uafhængige kilder — de er to gæt. Denne fil tilføjer den eneste kilde
+# der ikke gætter: DMI's MÅLTE nedbør fra en rigtig vejrstation.
+#
+# parameterId=precip_past10min på station 06180 (Københavns Lufthavn, ~5,5 km).
+# Verificeret 2026-08-28: 10-minutters-opløsning, og bucket'en der lukkede
+# 15:30 lå i API'et da vi spurgte 15:31 — altså ~0-2 min forsinkelse. Med et
+# poll hvert 10. minut ville pluggen være slukket ved 13:10-bucket'en (0,7 mm),
+# dvs. i bygens første minutter i stedet for aldrig.
+#
+# Samme host og samme keyless v2-API som sensor.regn_faldet
+# (packages/regn_rapport.yaml) — se dén fils header for hvorfor metObs IKKE må
+# "moderniseres" til opendataapi.dmi.dk/v1 (der findes ingen metObs-collection).
+# Forskellen er kadence og formål: regn_faldet er DØGN-FACIT (1×/time, 10-36 t
+# vindue), regn_nu er NOWCAST (6×/time, 30 min vindue).
+#
+# STATIONEN ER 5,5 KM VÆK. Byger er lokale, så dette er "regn i området", ikke
+# i haven. Retningen er bevidst valgt: en falsk positiv koster at terrassens
+# lyskæder er strømløse en halv time, en falsk negativ koster en luftpumpe i
+# regnvejr. Vil du have havens eget tal, kræver det en fysisk regnmåler.
+#
+# INCIDENT 2026-09-12: pluggen stod tændt gennem regn IGEN — på den FØRSTE aften
+# hvor kilde 1 overhovedet eksisterede (syntaksfejlene blev rettet samme dag).
+# Der faldt 0,1 mm kl. 21:00 og 0,1 mm kl. 22:10, så 30-min-summen nåede aldrig
+# 0,2-tærsklen, og begge prognoser stod 'cloudy' indtil met.no vendte 21:58.
+# User slukkede selv kl. 21:07:53 — 3 minutter efter at måleren havde set regnen.
+#
+# MÅLT 2026-09-13 over 30 døgn på station 06180 (4346 buckets, 294 våde):
+#   - 127 af de 294 våde buckets (43 %) er enlige 0,1-udslag som en 0,2/30min-
+#     tærskel ALDRIG kan fange, uanset hvor længe det regner i det regime.
+#   - precip_dur_past10min duer IKKE som diskriminator: ALLE 0,1-buckets har
+#     dur = 1,0 min. Varigheden er mm i forklædning, ikke et uafhængigt vidne.
+#   - Vind og dugpunkt-spread duer heller IKKE: median 4,6 m/s og 0,7-0,8 °C i
+#     BEGGE grupper (ægte regn vs. enlige udslag) — de skelner ingenting.
+#   - SKYDÆKKET er den eneste diskriminator der findes: af 129 buckets med ægte
+#     regn havde NUL under 50 % skydække (p10 = 90 %), mens 30 af de 127 enlige
+#     udslag lå i klar himmel = dug på måleren. Regn kræver skyer; dug kræver
+#     udstråling til en klar himmel. Derfor gælder: under mm-tærsklen tæller et
+#     udslag som regn hvis DMI SAMTIDIG måler skydække over sky-slideren.
+#     I går 21:00: 90 % skydække og 6,7 m/s vind (dug fysisk umuligt) ⇒ pluggen
+#     var slukket 21:04 i stedet for aldrig.
+# =============================================================================
+
+rest_command:
+  dmi_metobs_precip10:
+    # limit=12 = de seneste 2 timer i 10-min-buckets. Vi bruger kun de seneste
+    # 30 min til state'en; resten er kontekst til `buckets`-attributten og
+    # giver luft hvis et par polls fejler.
+    # Host skiftet 12/9: dmigw.govcloud.dk er DNS-NEDLAGT (NXDOMAIN, verificeret
+    # med kontrol-curl). Samme keyless v2-metObs ligger på opendataapi.dmi.dk.
+    url: >-
+      https://opendataapi.dmi.dk/v2/metObs/collections/observation/items?stationId=06180&parameterId=precip_past10min&limit=12
+    method: GET
+    timeout: 30
+
+  dmi_metobs_cloud:
+    # Skydække fra SAMME station og samme keyless v2-API som nedbøren. Eneste
+    # formål: skelne let regn fra dug på måleren (se header). limit=3 = de
+    # seneste ~30 min; kun den nyeste bruges, resten er luft hvis et poll mangler.
+    url: >-
+      https://opendataapi.dmi.dk/v2/metObs/collections/observation/items?stationId=06180&parameterId=cloud_cover&limit=3
+    method: GET
+    timeout: 30
+
+input_number:
+  # Hvor meget der skal være målt i de seneste 30 min før det tæller som regn
+  # UDEN FLERE SPØRGSMÅL. Stationens opløsning er 0,1 mm, så min=0,1 er "ét
+  # udslag overhovedet". Default 0,2 = to udslag eller ét kraftigt.
+  # 2026-09-13: tærsklen er ikke længere et gulv, men grænsen for hvornår
+  # måleren tros BLINDT. Under den afgøres et udslag af skydækket
+  # (regn_nu_let_regn_sky_pct) i stedet for at blive kasseret — 43 % af alle
+  # våde buckets er enlige 0,1-udslag, og de fleste af dem er ægte let regn.
+  # Højere værdi = flere udslag skal igennem sky-tjekket, ikke "mindre følsom".
+  # Default ≠ min med vilje (fejlklasse #5: er sentinel-værdien lig den værdi vi
+  # vil køre med, hæver init-guarden slideren ved hver restart).
+  regn_nu_mm_threshold:
+    name: "Regn nu: tærskel (mm/30 min)"
+    icon: mdi:cup-water
+    min: 0.1
+    max: 3
+    step: 0.1
+    unit_of_measurement: "mm"
+    mode: slider
+
+  # Mindste MÅLTE skydække før et udslag UNDER mm-tærsklen tæller som ægte let
+  # regn i stedet for dug på måleren. Målt over 30 døgn (se header): nul af 129
+  # ægte-regn-buckets havde under 50 % skydække, så 50 er et bredt sikkerhedsmål
+  # — ægte regn lå på p10 = 90 %. 0 = slå sky-tjekket fra (alt målt tæller);
+  # 100 = kræv helt overskyet. Default 50, sentinel = min 0 (fejlklasse #5).
+  regn_nu_let_regn_sky_pct:
+    name: "Regn nu: mindste skydække for let regn"
+    icon: mdi:weather-cloudy
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Hvor længe sensoren BLIVER on efter sidste målte regn. Ligger oven i
+  # 30-min-vinduet i state-templaten, så samlet efterslæb ≈ 30 + denne.
+  # Formål: terrassen er stadig våd lige efter en byge, og byger kommer i
+  # klynger — pluggen skal ikke tænde i pausen mellem to skyer.
+  # min=5 (ikke 0) så sentinel-værdien ikke kolliderer med et gyldigt valg.
+  regn_nu_hold_minutter:
+    name: "Regn nu: hold efter sidste regn"
+    icon: mdi:timer-sand
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+input_datetime:
+  # Dedupe for stale-feed-varslet nedenfor. Runtime-stempel, ikke konfig →
+  # hører IKKE i helpers_export' allowlist.
+  regn_nu_stale_sidste_push:
+    name: "Regn nu: sidste stale-varsel"
+    has_date: true
+    has_time: true
+
+template:
+  - trigger:
+      - platform: homeassistant
+        event: start
+      # 6×/time. Offset fra de andre DMI/met-kald: dmi_weather :12,
+      # regn_rapport :22, vejr-varslerne :25/:55.
+      #
+      # SEKS SEPARATE TRIGGERS, ikke "4,14,24,...": time_pattern tager `*`, et
+      # tal eller `/N` — en komma-liste er ugyldig og væltede HELE `template:`-
+      # blokken i denne fil (begge sensorer fandtes aldrig, 28/8 → 12/9).
+      - platform: time_pattern
+        minutes: 4
+      - platform: time_pattern
+        minutes: 14
+      - platform: time_pattern
+        minutes: 24
+      - platform: time_pattern
+        minutes: 34
+      - platform: time_pattern
+        minutes: 44
+      - platform: time_pattern
+        minutes: 54
+      - platform: event
+        event_type: event_template_reloaded
+    action:
+      - service: rest_command.dmi_metobs_precip10
+        response_variable: resp
+        continue_on_error: true
+      - service: rest_command.dmi_metobs_cloud
+        response_variable: sky_resp
+        continue_on_error: true
+      - variables:
+          payload: >-
+            {% if resp is defined and resp.content is defined %}
+              {% if resp.content is mapping %}{{ resp.content }}
+              {% elif resp.content is string and resp.content[:1] == '{' %}{{ resp.content | from_json }}
+              {% else %}{{ {} }}{% endif %}
+            {% else %}{{ {} }}{% endif %}
+          ok: "{{ payload.get('features') is not none }}"
+          calc: >-
+            {% if not ok %}{{ {} }}{% else %}
+              {% set nowts = as_timestamp(now()) %}
+              {% set ns = namespace(mm30=0.0, mm60=0.0, senest=0, nyeste=0, linjer=[]) %}
+              {% for f in payload.features %}
+                {% set p = f.get('properties', {}) %}
+                {% set obs = p.get('observed') %}
+                {% if obs is not none %}
+                  {# observed = bucket'ens SLUT-tidspunkt #}
+                  {% set t = as_timestamp(obs | as_datetime, 0) %}
+                  {# value: null forekommer (stationen melder ikke) = 0, ikke et hul #}
+                  {% set mm = p.get('value') | float(0) %}
+                  {% if t > ns.nyeste %}{% set ns.nyeste = t %}{% endif %}
+                  {% if t > nowts - 1800 %}{% set ns.mm30 = ns.mm30 + mm %}{% endif %}
+                  {% if t > nowts - 3600 %}{% set ns.mm60 = ns.mm60 + mm %}{% endif %}
+                  {% if mm > 0 %}
+                    {% if t > ns.senest %}{% set ns.senest = t %}{% endif %}
+                    {% set ns.linjer = ns.linjer
+                       + [(t | timestamp_custom('%H:%M', true)) ~ ': ' ~ (mm | round(1)) ~ ' mm'] %}
+                  {% endif %}
+                {% endif %}
+              {% endfor %}
+              {{ {'mm30': ns.mm30 | round(2), 'mm60': ns.mm60 | round(2),
+                  'senest': ns.senest | int, 'nyeste': ns.nyeste | int,
+                  'linjer': ns.linjer | reverse | list} }}
+            {% endif %}
+          # Nyeste målte skydække i %. Parses helt uafhængigt af nedbøren: et
+          # fejlet sky-fetch må ikke kunne ugyldiggøre nedbørs-målingen (den er
+          # den vigtige af de to). 'none' = intet brugbart sample denne gang.
+          sky_pct: >-
+            {% if sky_resp is defined and sky_resp.content is defined %}
+              {% if sky_resp.content is mapping %}{% set sp = sky_resp.content %}
+              {% elif sky_resp.content is string and sky_resp.content[:1] == '{' %}
+                {% set sp = sky_resp.content | from_json %}
+              {% else %}{% set sp = {} %}{% endif %}
+            {% else %}{% set sp = {} %}{% endif %}
+            {% set ns = namespace(t=0, v=none) %}
+            {% for f in sp.get('features', []) %}
+              {% set p = f.get('properties', {}) %}
+              {% set obs = p.get('observed') %}
+              {% if obs is not none and p.get('value') is not none %}
+                {% set t = as_timestamp(obs | as_datetime, 0) %}
+                {% if t > ns.t %}{% set ns.t = t %}{% set ns.v = p.get('value') %}{% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.v if ns.v is not none else 'none' }}
+    sensor:
+      # State = mm målt i de seneste 30 minutter. this-fallback som i
+      # regn_rapport: et 429/timeout må ikke se ud som "det holdt op med at
+      # regne" (fejlklasse #9). Friskheden bevogtes i binary_sensoren nedenfor,
+      # som regner alderen ud LIVE — netop fordi en båret-videre værdi ellers
+      # ser evigt frisk ud (det var HARMONIE-fælden i incidentet ovenfor).
+      - name: "Regn nu"
+        unique_id: regn_nu
+        unit_of_measurement: "mm"
+        state_class: measurement
+        icon: mdi:weather-rainy
+        state: >-
+          {% if ok %}{{ calc.mm30 }}
+          {% elif this is defined and this.state is not none %}{{ this.state }}
+          {% else %}unavailable{% endif %}
+        attributes:
+          mm_60min: >-
+            {% if ok %}{{ calc.mm60 }}
+            {% elif this is defined %}{{ this.attributes.get('mm_60min') }}
+            {% else %}none{% endif %}
+          # Unix-timestamps, IKKE formaterede klokkeslæt: forbrugerne skal kunne
+          # regne alder ud selv. 0 = ingen observation / ingen regn i vinduet.
+          nyeste_obs_ts: >-
+            {% if ok %}{{ calc.nyeste }}
+            {% elif this is defined %}{{ this.attributes.get('nyeste_obs_ts') }}
+            {% else %}0{% endif %}
+          senest_vaad_ts: >-
+            {% if ok %}{{ calc.senest }}
+            {% elif this is defined %}{{ this.attributes.get('senest_vaad_ts') }}
+            {% else %}0{% endif %}
+          buckets: >-
+            {% if ok %}{{ calc.linjer }}
+            {% elif this is defined %}{{ this.attributes.get('buckets') }}
+            {% else %}none{% endif %}
+          # Målt skydække %. Bæres videre ved et fejlet sky-fetch: skydække
+          # ændrer sig langsomt, så sidste sample er et bedre gæt end ingenting.
+          # Forbrugeren (regn_nu_observeret) falder selv tilbage til 100 = "regn
+          # muligt" hvis attributten mangler helt.
+          skydaekke_pct: >-
+            {% if sky_pct != 'none' %}{{ sky_pct }}
+            {% elif this is defined %}{{ this.attributes.get('skydaekke_pct') }}
+            {% else %}none{% endif %}
+          station: "06180 Københavns Lufthavn"
+          fetched_at: >-
+            {% if ok %}{{ now().isoformat() }}
+            {% elif this is defined %}{{ this.attributes.get('fetched_at') }}
+            {% else %}none{% endif %}
+          last_attempt_ok: "{{ ok }}"
+
+  - binary_sensor:
+      # ÉN autoritet for "det regner lige nu, målt" (fejlklasse #2).
+      #
+      # Bevidst KUN `delay_off` og INTET `delay_on`: står begge på samme udtryk,
+      # bevogter de kun åbningen, og et enkelt sample kan re-arme holdet i det
+      # uendelige (permanent faktum, målt på koekken_menneske_bevist 27/8).
+      # Her er delay_off det eneste hold, og state-templaten er ren.
+      #
+      # Friskheds-gaten regnes ud fra now() mod et MÅLT timestamp — ikke fra en
+      # alder beregnet ved fetch. Dør feedet, vokser alderen videre og sensoren
+      # falder til off; en fetch-tid-beregnet alder ville fryse og se evigt
+      # frisk ud. Fail-open (= ingen regn = pluggen bliver PÅ) er valgt bevidst:
+      # vi må ikke holde terrassen strømløs i timer fordi DMI er nede. Prisen er
+      # at blindheden bliver tavs → derfor stale-varslet nedenfor.
+      - name: "Regn nu observeret"
+        unique_id: regn_nu_observeret
+        icon: mdi:weather-pouring
+        # SEKUNDER som skalar, ikke `minutes:`-mappingen: sub-nøglerne kræver en
+        # statisk float, mens den bare form gerne må være en template. Husets
+        # øvrige 27 templated delay_off gør det sådan — denne ene gjorde ikke,
+        # og fejlen væltede hele `template:`-blokken (se trigger-noten ovenfor).
+        delay_off: >-
+          {{ (states('input_number.regn_nu_hold_minutter') | int(30)) * 60 }}
+        state: >-
+          {% set nyeste = state_attr('sensor.regn_nu', 'nyeste_obs_ts') | int(0) %}
+          {% set mm30 = states('sensor.regn_nu') | float(-1) %}
+          {% set thr = states('input_number.regn_nu_mm_threshold') | float(0.2) %}
+          {% set alder_min = (as_timestamp(now()) - nyeste) / 60 %}
+          {% set frisk = nyeste > 0 and alder_min <= 30 %}
+          {# Under mm-tærsklen er et udslag tvetydigt: ægte let regn, eller dug
+             der har tippet måleren. Skydækket afgør — regn kræver skyer (nul af
+             129 ægte-regn-buckets under 50 % skydække, målt 30 døgn), dug
+             kræver en klar himmel at udstråle til. Uden sky-tal falder vi mod
+             ACCEPT (100): husets dyre fejl er den tændte plug i regn, ikke en
+             halv time uden lyskæde. #}
+          {% set sky = state_attr('sensor.regn_nu', 'skydaekke_pct') | float(100) %}
+          {% set sky_min = states('input_number.regn_nu_let_regn_sky_pct') | float(50) %}
+          {% set let_regn = mm30 > 0 and mm30 < thr and sky >= sky_min %}
+          {{ frisk and (mm30 >= thr or let_regn) }}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Stale-varsel: regn-beskyttelsen kan ikke se
+  # ---------------------------------------------------------------------------
+  # Incidentet 2026-08-28 var tavst i 4 timer: HARMONIE 429'ede fra 11:12, og
+  # ingenting sagde det. anomali_vagt'ens plug-vagt kunne strukturelt ikke fange
+  # det, fordi DEN betinger sig at terrasse_regn_aktiv er ON — altså beviser sin
+  # præmis med præcis den kanal der var i stykker (fejlklasse #23).
+  # Denne vagt læser derfor observations-feedets alder direkte.
+  #
+  # time_pattern + condition-template (ikke en flanke): en flanke-trigger på
+  # "feed dødt" ville aldrig re-fyre under en vedvarende episode (fejlklasse
+  # #13), og en HA-restart midt i et udfald ville tabe flanken (#4/#15).
+  - id: regn_nu_feed_stale_varsel
+    alias: "Regn nu: observations-feed dødt → varsel"
+    description: >
+      Pusher hvis DMI-observationerne er mere end 2 timer gamle. Så er
+      terrasse-pluggens regn-beskyttelse tilbage på de to prognose-kilder alene,
+      hvilket er præcis den tilstand der lod pluggen stå tændt gennem bygen
+      2026-08-28. Dedupe: max ét varsel pr. 12 timer.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "37"
+    condition:
+      - condition: template
+        value_template: >-
+          {% set nyeste = state_attr('sensor.regn_nu', 'nyeste_obs_ts') | int(0) %}
+          {{ nyeste > 0 and (as_timestamp(now()) - nyeste) > 7200 }}
+      - condition: template
+        value_template: >-
+          {% set s = states('input_datetime.regn_nu_stale_sidste_push') %}
+          {{ s in ['unknown', 'unavailable', 'none', '']
+             or (as_timestamp(now()) - (state_attr('input_datetime.regn_nu_stale_sidste_push', 'timestamp') | float(0))) > 43200 }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.regn_nu_stale_sidste_push
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - variables:
+          alder_t: >-
+            {% set nyeste = state_attr('sensor.regn_nu', 'nyeste_obs_ts') | int(0) %}
+            {{ ((as_timestamp(now()) - nyeste) / 3600) | round(1) }}
+      - service: logbook.log
+        data:
+          name: "Regn nu"
+          message: "DMI-observationer {{ alder_t }} t gamle — terrasse-pluggens regn-beskyttelse kører på prognose alene."
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: anomali_plug
+          title: "🌧️❓ Regn-målingen er død"
+          message: >-
+            DMI's observationer er {{ alder_t }} timer gamle. Terrasse-pluggen
+            beskyttes lige nu kun af prognoser (met.no + HARMONIE), og de missede
+            begge bygen 28/8. Tjek opendataapi.dmi.dk/v2/metObs.
+          payload:
+            tag: regn_nu_stale

@@ -1,0 +1,321 @@
+# =============================================================================
+# EJERSKABS-REGISTER — køkken-lyskæden (light.koekken_lyskaede)
+# =============================================================================
+# Denne fil ER prioritetslisten. `python3 scripts/ejerskab.py gen` bygger ud fra
+# den: sensor.koekken_lyskaede_ejer (+ låne-sensoren, genoptag-automationen) i
+# packages/ejerskab_koekken_lyskaede.yaml og kontrakten i
+# docs/auto/ejerskab/koekken_lyskaede.md. Pre-commit (`ejerskab.py lint`)
+# blokerer en skriver der ikke står her, og en linje her der ikke skriver mere.
+#
+# krav:      HØJESTE FØRST. Første aktive `naar` er ejeren; ingen aktive = 'hus'
+#            (= husets mål via enforceren). type: overlay = står i kontrakten på
+#            sin rang, men tager ikke ejerskab (kortvarige signaler i kø).
+#   aflevering: maal  → når kravet slipper til 'hus', maler enforceren husets mål
+#               ingen → lampen beholder sit udseende (som før registret)
+#   genoptag:   kaldes når lampen falder TILBAGE til kravet fra et højere krav
+# skrivere:  alle andre skrive-steder (tænd/sluk-veje, gruppe-sluk, recovery).
+#            dynamisk: true = templated mål scanneren ikke kan se.
+# huller:    kendte afvigelser fra reglerne. Listen må kun skrumpe.
+#
+# Rangen er user-spec 2026-10-04 ("madlavning vinder altid" over din hånd).
+# =============================================================================
+entity: light.koekken_lyskaede
+navn: Køkken-lyskæden
+ejer_sensor: sensor.koekken_lyskaede_ejer
+ejer_navn: Koekken lyskaede ejer
+laant_sensor: binary_sensor.koekken_lyskaede_laant
+laant_navn: Koekken lyskaede laant
+alias_grupper: [light.koekken_room]
+hus_modes: >-
+  dark_mode_stue > filmmoerke_koekken > madlavningslys/arbejdslys (morgen- og
+  hjemkomstlys) > maaltidslys > hygge (sliders × elpris). Styrke:
+  `sensor.koekken_lyskaede_target_brightness`; farve: `script.koekken_lyskaede_maal`.
+
+kanaler:
+  maler: packages/koekken_lyskaede.yaml#koekken_lyskaede_maal
+  signal: packages/koekken_lyskaede.yaml#koekken_lyskaede_signal
+  haandhaever: packages/koekken_lyskaede.yaml#koekken_lyskaede_enforce
+
+krav:
+  - id: roegalarm
+    navn: Røgalarm
+    kort: røgalarmen blinker (nødbelysning)
+    naar: is_state('input_boolean.roegalarm_blink_active', 'on')
+    aflevering: maal
+    skrivere:
+      - packages/roegalarm.yaml#roegalarm_blink_timeout
+      - packages/roegalarm.yaml#roegalarm_kvittering
+
+  # User-spec 2026-10-15: "det skal over rule alt" — under røgalarmen, som
+  # maler samme hvide (script.roegalarm_lys_hvidt) men blinker rødt ovenpå.
+  - id: noedlys
+    navn: Nødlys
+    kort: entré-Styrbarens nødlys (alt fuldt hvidt)
+    naar: is_state('input_boolean.noedlys_aktiv', 'on')
+    aflevering: maal
+    skrivere:
+      - {sted: packages/noedlys.yaml#noedlys_start, dynamisk: true}
+      - {sted: packages/noedlys.yaml#noedlys_loop, dynamisk: true}
+      - {sted: packages/noedlys.yaml#noedlys_overstyr_interferens, dynamisk: true}
+
+  - id: timer_alarm
+    navn: Timer-alarm
+    kort: gestus-timerens alarm ringer
+    naar: states('input_text.koekken_gestus_alarm').startswith('aktiv')
+    aflevering: maal
+    skrivere:
+      - {sted: packages/koekken_gestus_timer.yaml#koekken_gestus_alarm_burst, dynamisk: true}
+
+  - id: timer_nedtaelling
+    navn: Timer-nedtælling
+    type: overlay
+    kort: nedtælling kører — bursts via signal-kanalen; huset ejer udseendet
+    naar: states('input_text.koekken_gestus_nedtael').startswith('aktiv')
+    skrivere:
+      - packages/koekken_gestus_timer.yaml#koekken_gestus_nedtael_start
+      - packages/koekken_gestus_timer.yaml#koekken_gestus_nedtael_slut
+
+  - id: kvittering
+    navn: Kvitteringer
+    type: overlay
+    kort: vink/puls/burst/grøn — sekunder lange, køet i script.koekken_lyskaede_signal
+    naar: (state_attr('script.koekken_lyskaede_signal', 'current') | int(0)) > 0
+
+  - id: vejrvarsel
+    navn: Vejrvarsel
+    kort: et vejr-blink kører (rører ikke kæden siden 23/9, se huller)
+    naar: >-
+      (state_attr('automation.vejr_varsel_regn_bla_glimt_vind_hvid_blink_morgen_20min', 'current') | int(0)) > 0
+      or (state_attr('automation.vejr_varsel_aften_blink_push_for_nattens_vejr_16_30_17_00_18_30', 'current') | int(0)) > 0
+    aflevering: maal
+    skrivere:
+      - automations/rain_warning.yaml#vejr_morgen_regn_vind_blink
+      - automations/rain_warning.yaml#vejr_aften_nat_varsel
+
+  - id: dance
+    navn: Dance
+    kort: festlys danser i køkkenet (auto-shuffle ELLER låst event)
+    naar: >-
+      is_state('input_boolean.dance_room_koekken', 'on')
+      and (is_state('input_boolean.dance_mode', 'on')
+           or states('input_select.dance_manual_event') not in ['off', 'unknown', 'unavailable', ''])
+    aflevering: maal
+    skrivere:
+      - {sted: packages/dance_mode.yaml#dance_single_bulb, dynamisk: true}
+      - {sted: packages/dance_mode.yaml#dance_event_bulb, dynamisk: true}
+      - {sted: packages/dance_mode.yaml#dance_blackout_burst, dynamisk: true}
+      - {sted: packages/dance_mode.yaml#dance_warm_burst, dynamisk: true}
+      - {sted: packages/dance_mode.yaml#dance_breathe_burst, dynamisk: true}
+      - {sted: packages/dance_mode.yaml#dance_fire_burst, dynamisk: true}
+      - {sted: packages/dance_mode.yaml#dance_restore_auto, dynamisk: true}
+      - {sted: packages/fest_ankomst.yaml#fest_gaest_ankomst, dynamisk: true}
+
+  - id: cirkus
+    navn: Cirkus/fødselsdag
+    kort: cirkus- eller fødselsdags-scenen kører
+    naar: is_state('input_boolean.cirkus_active', 'on')
+    aflevering: maal
+    skrivere:
+      - script_pkg/scenes.yaml#scene_cirkus
+      - {sted: script_pkg/scenes.yaml#foedselsdag_apply, dynamisk: true}
+
+  - id: legetoejsdag
+    navn: Legetøjsdag
+    kort: disko-varslet kører
+    naar: (state_attr('automation.legetojsdag_disko_varsel_forste_abne_fredag_i_maneden_efter_vejrvarsler', 'current') | int(0)) > 0
+    aflevering: maal
+    skrivere:
+      - {sted: automations/legetoejsdag.yaml#legetoejsdag_disco_varsel, dynamisk: true}
+
+  # 2026-10-17 (user-spec): du skruer på farvetone/mætning/lysstyrke i
+  # Indstillinger → kæden viser værdien i N sekunder. Over din hånd/godnat
+  # (du ser lige på den), under alarmer, varsler og fest.
+  - id: farve_preview
+    navn: Farve-preview
+    kort: du skruer på kædens farve/mætning/lysstyrke (viser den i N sek.)
+    naar: states('input_text.koekken_lyskaede_preview') in ['taendt', 'slukket']
+    aflevering: maal
+    skrivere:
+      - packages/koekken_lyskaede.yaml#koekken_lyskaede_preview
+      - packages/koekken_lyskaede.yaml#koekken_lyskaede_preview_slut
+
+  - id: styrbar_farveloop
+    navn: Styrbar-farveloop
+    kort: du holder stue-Styrbar L/R (kæden kører farver)
+    naar: is_state('input_boolean.styrbar_lr_holding_stue', 'on')
+    aflevering: maal
+    skrivere:
+      - automations/styrbar_rooms.yaml#styrbar_universal_lr_hold
+
+  - id: haand
+    navn: Din hånd
+    kort: >-
+      du har selv sat udseendet (app-justering mens den lyser, sluppet farveloop,
+      valgt scene, fuldt lys) — slipper ved sluk eller når madlavning er i gang
+    naar: >-
+      not is_state('binary_sensor.koekken_madlavningslys', 'on')
+      and (is_state('binary_sensor.koekken_lyskaede_scene_laan', 'on')
+           or is_state('input_boolean.open_plan_fuldt_lys', 'on')
+           or (is_state('light.koekken_lyskaede', 'on')
+               and (states('input_text.koekken_lyskaede_haand_ts') | int(0))
+                   >= (as_timestamp(states.light.koekken_lyskaede.last_changed, 0) | int(0))))
+    aflevering: maal
+    skrivere:
+      - script_pkg/scenes.yaml#scene_blue
+      - script_pkg/scenes.yaml#scene_cyberpunk
+      - script_pkg/scenes.yaml#scene_full_bright
+      - script_pkg/scenes.yaml#scene_happy
+      - script_pkg/scenes.yaml#scene_hverdagsaften
+      - script_pkg/scenes.yaml#scene_party
+      - script_pkg/scenes.yaml#scene_private
+      - script_pkg/scenes.yaml#scene_spisestue_middag
+      - script_pkg/scenes.yaml#scene_sunset
+      - script_pkg/scenes.yaml#scene_winddown
+      - script_pkg/scenes.yaml#scene_zen
+      - {sted: script_pkg/scene_spread.yaml#apply_scene_with_spread, dynamisk: true}
+      - {sted: script_pkg/styrbar_helpers.yaml#styrbar_snap_full, dynamisk: true}
+
+  - id: velkomst
+    navn: AirBnB-velkomst
+    kort: gæste-velkomsten kører (gæstens eget tryk = din hånd, slipper den)
+    naar: is_state('input_boolean.airbnb_velkomst_active', 'on')
+    aflevering: maal
+    skrivere:
+      - packages/airbnb_velkomst.yaml#airbnb_velkomst_ceremoni
+
+  - id: sofa_zen
+    navn: Sofa Zen
+    kort: Sofa Zen låner kæden (køkkenet ikke i brug)
+    naar: is_state('binary_sensor.sofa_zen_laaner_kaeden', 'on')
+    aflevering: maal
+    genoptag:
+      action: script.sofa_zen_kaede_apply
+      data: {fade_s: 5}
+    skrivere:
+      - packages/sofa_zen_auto.yaml#sofa_zen_kaede_apply
+
+  - id: morgenrampe
+    navn: Morgenrampe
+    kort: morgenrampen kører (viger for madlavning)
+    naar: >-
+      is_state('binary_sensor.morgenrampe_aktiv', 'on')
+      and not is_state('binary_sensor.koekken_madlavningslys', 'on')
+    aflevering: ingen
+    skrivere:
+      - packages/morgen_opstigning_rampe.yaml#morgenrampe_step
+      - packages/morgen_opstigning_rampe.yaml#morgenrampe_slut
+
+  - id: nattur
+    navn: Godnat/nattur
+    kort: godnat er aktiv (nattur-lyset ejer kæden; viger for madlavning)
+    naar: >-
+      is_state('binary_sensor.godnat_common_active', 'on')
+      and not is_state('binary_sensor.koekken_madlavningslys', 'on')
+    aflevering: ingen
+    skrivere:
+      - automations/godnat_night.yaml#godnat_adult_nightwalk
+      - automations/godnat_night.yaml#godnat_adult_nightwalk_off
+      - packages/nattur_retur.yaml#nattur_retur_seng_sluk
+
+skrivere:
+  # --- tænd/sluk-beslutninger (rører ikke udseendet, eller lader enforceren male) ---
+  - {sted: automations/presence_koekken.yaml#presence_koekken_lyskaede_off, rolle: sluk, via: direkte}
+  - {sted: packages/room_lux_tuning.yaml#open_plan_dagslys_probe, rolle: sluk, via: direkte + koekken_room}
+  - {sted: packages/koekken_lyskaede.yaml#koekken_lyskaede_foerste_lys, rolle: taend, via: direkte (se huller)}
+  - {sted: automations/styrbar_rooms.yaml#styrbar_universal_instant, rolle: taend/sluk (hånd), via: direkte}
+  - {sted: script_pkg/room_logic.yaml#scene_toggle, rolle: sluk (scene-exit), via: alle_lys}
+  - {sted: automations/entre_somrig.yaml#entre_somrig_top_quick_dim_up, rolle: taend (hånd), via: stue_all + undo-restore}
+  - {sted: automations/entre_somrig.yaml#entre_styrbar_lr_mode_cycle, rolle: taend (hånd), via: alle_lys}
+  - {sted: automations/somrig_buttons.yaml#gaeste_rodret_openplan_taend, rolle: taend (gæst), via: stue_all}
+  - {sted: packages/sleepover.yaml#gaest_sover_sluk, rolle: sluk (gæst — gæste-RODRET O + stue-Styrbar langt NED 20-06), via: stue_all}
+  - {sted: automations/entre_somrig.yaml#entre_somrig_bund_quick_dim_down, rolle: sluk-hus, via: alle_lys}
+  # --- husdækkende sluk (dvale, godnat, sluk alt) ---
+  - {sted: automations/dormant_schedule.yaml#house_dormant_weekday_0930, rolle: sluk-hus, via: alle_indvendige}
+  - {sted: automations/dormant_schedule.yaml#house_dormant_weekend_candle, rolle: sluk-hus, via: alle_indvendige}
+  - {sted: packages/departure_dormant.yaml#house_departure_dormant_detect, rolle: sluk-hus, via: alle_indvendige}
+  - {sted: packages/dormant_idle.yaml#house_dormant_idle_daytime, rolle: sluk-hus, via: alle_indvendige}
+  - {sted: packages/entre_ned_dormant.yaml#entre_ned_dormant_fire, rolle: sluk-hus, via: alle_indvendige}
+  - {sted: packages/house_modes.yaml#house_manual_dormant, rolle: sluk-hus, via: "entity_id: all"}
+  - {sted: packages/house_modes.yaml#house_state_to_dormant, rolle: sluk-hus, via: alle_indvendige}
+  - {sted: packages/house_modes.yaml#house_state_to_dormant_flag_fast, rolle: sluk-hus, via: alle_indvendige}
+  - {sted: packages/house_modes.yaml#house_state_to_dormant_gps_fast, rolle: sluk-hus, via: alle_indvendige}
+  - {sted: packages/house_modes.yaml#house_state_to_dormant_physical, rolle: sluk-hus, via: alle_indvendige}
+  - {sted: script_pkg/house_routines.yaml#godnat, rolle: sluk-hus, via: direkte + alle_indvendige}
+  - {sted: script_pkg/house_routines.yaml#godnat_fuld, rolle: sluk-hus, via: alle_lys}
+  - {sted: script_pkg/house_routines.yaml#sluk_alt, rolle: sluk-hus, via: alle_lys}
+  - {sted: script_pkg/house_routines.yaml#entre_ned_sluk_alt, rolle: sluk-hus, via: alle_lys}
+  - {sted: packages/house_modes.yaml#airbnb_dormant_lys_sweep, rolle: sluk-hus (AirBnB), via: template, dynamisk: true}
+  - {sted: packages/airbnb_natmode.yaml#airbnb_natmode_auto_godnat, rolle: sluk-hus (AirBnB), via: template, dynamisk: true}
+  # --- vagter og recovery ---
+  - {sted: packages/sleepover.yaml#sleepover_moerke_vagt, rolle: sluk-vagt, via: template, dynamisk: true}
+  - {sted: automations/light_watchdog.yaml#nat_lysvagt_openplan, rolle: sluk-vagt, via: template, dynamisk: true}
+  # 2026-10-07: entré-velkomstens udgang — slukker kun hvis ingen er kommet ind
+  # i open plan siden velkomsten tændte (tænd-delen går via første-lys-vejen).
+  - {sted: packages/openplan_entre_velkomst.yaml#openplan_entre_velkomst_slut, rolle: sluk-vagt, via: stue_all}
+  - {sted: automations/light_watchdog.yaml#global_light_watchdog, rolle: sluk-vagt, via: template, dynamisk: true}
+  - {sted: packages/notif_actions.yaml#notif_action_anomali, rolle: taend/sluk (knap i push), via: template, dynamisk: true}
+  - {sted: automations/presence_resync_on_start.yaml#presence_resync_open_plan_on_start, rolle: recovery, via: template, dynamisk: true}
+  - {sted: automations/light_power_recovery.yaml#airbnb_power_recovery_all, rolle: recovery (AirBnB), via: template, dynamisk: true}
+  # --- rum-logik via stue_all (templated light.{{ room }}_all) ---
+  - {sted: script_pkg/room_logic.yaml#room_mode_apply, rolle: rum-logik, via: "stue_all; only_on springer styrede lamper over", dynamisk: true}
+  - {sted: script_pkg/styrbar_helpers.yaml#styrbar_brightness_step, rolle: hånd (stue-Styrbar), via: stue_all, dynamisk: true}
+  - {sted: script_pkg/styrbar_helpers.yaml#styrbar_snap_off, rolle: sluk (hånd), via: stue_all, dynamisk: true}
+  - {sted: script_pkg/styrbar_helpers.yaml#styrbar_reset_warm_white, rolle: hånd (stue-Styrbar), via: stue_all, dynamisk: true}
+
+huller:
+  - sted: packages/koekken_lyskaede.yaml#koekken_lyskaede_enforce
+    problem: >-
+      Signal-gaten (`signal current == 0`) står på AUTOMATION-niveau: enhver trigger
+      der lander mens et blink kører (cook_end, dark_on, måltid, tune, boot) tabes, og
+      intet re-armer når blinket slutter (#15).
+  - sted: packages/koekken_lyskaede.yaml#koekken_lyskaede_maal
+    problem: >-
+      Maleren har ingen ejer-gate. Gestus-afleveringer (nedtael_slut, alarm_stop) og
+      signal `groen` kalder den mens et andet krav kan holde (scene, Zen) → det krav
+      males over.
+  - sted: packages/koekken_gestus_timer.yaml#koekken_gestus_nedtael_start
+    problem: >-
+      Nedtællingen er et overlay: sluk-veje kan slukke kæden midt i en nedtælling, og
+      først næste burst tænder igen. Skal nedtællingen holde kæden tændt? (spørg user)
+  - sted: automations/legetoejsdag.yaml#legetoejsdag_disco_varsel
+    problem: Afleverer ved at restore et ~40 s gammelt snapshot (#27) i stedet for at slippe flaget.
+  - sted: packages/koekken_gestus_timer.yaml#koekken_gestus_alarm_stop
+    problem: Afleverer fra et frosset snapshot (styrke `base`/`pre` fra nedtællingens start, #27/#12).
+  - sted: packages/koekken_lyskaede.yaml#koekken_lyskaede_foerste_lys
+    problem: >-
+      Farvereglen er kopieret uden for maleren: enforcerens cook_start + dark_on,
+      foerste_lys og morgenrampe_step maler selv (defaults divergerer 193/98 vs 28/99, #2).
+  - sted: packages/koekken_lyskaede.yaml#koekken_lyskaede_target_brightness
+    problem: >-
+      To rækkefølger: styrken i target-sensoren (dark > film > madlavning > måltid >
+      hygge), farven i maleren (uden dark/film-grene). En ny mode skal ind begge steder.
+  - sted: automations/presence_koekken.yaml#presence_light_koekken_on
+    problem: Manuel-sluk-grace-templaten står 4 steder (#2) — ens i dag, intet holder dem ens.
+  - sted: packages/koekken_lyskaede.yaml#koekken_lyskaede_scene_laan
+    problem: >-
+      Bruger last_changed, som nulstilles ved restart; active_scene er klistret → efter
+      en restart med kæden tændt kan scene-lånet stå on uden at nogen valgte en scene.
+  - sted: automations/arrival.yaml#arrival_welcome_light
+    problem: Tre tænd-gate-varianter for samme lampe (lux_ok / kulsort / open_plan_haendelse_lux_gate + godnat_any).
+  - sted: automations/rain_warning.yaml#vejr_morgen_regn_vind_blink
+    problem: >-
+      Vejr-blinkene rører ikke kæden siden 2026-09-23, men holder stadig lånet ~30 s og
+      sluger dermed cook_start/dark_on. Kandidat til at fjerne kravet.
+  - sted: automations/presence_koekken.yaml#presence_koekken_lyskaede_off
+    problem: Grenene 'empty'/'rearm' kræver madlavningslys både off og on → kan aldrig handle; id 'bright' refereres stadig.
+  - sted: automations/light_power_recovery.yaml#airbnb_power_recovery_all
+    problem: Kædens recovery-look er død kode — enforcerens on_edge maler altid over det.
+  - sted: automations/presence_koekken.yaml#presence_koekken_lyskaede_off
+    problem: Sluk-vejene læser ikke ejeren og kan slukke en kæde et krav holder (scene, alarm, velkomst).
+  - sted: script_pkg/styrbar_helpers.yaml#styrbar_brightness_step
+    problem: Stue-Styrbar op/ned dæmper kæden via stue_all uden hånd-stempel → enforceren kan male den om senere.
+  - sted: packages/koekken_lyskaede.yaml#koekken_lyskaede_enforce
+    problem: >-
+      Genoptag findes kun for Sofa Zen. Afbrydes scene/fuldt lys/velkomst/hånd af et
+      højere krav, kommer deres udseende ikke tilbage — afleveringen maler husets mål.
+  - sted: packages/koekken_lyskaede.yaml#koekken_lyskaede_enforce
+    problem: >-
+      Enforcerens gate læser ejeren i SAMME event som cook_start/dark_on. Flytter den
+      flanke selv ejeren til 'hus' (madlavning bryder Zen/hånd), kan triggeren se den
+      gamle ejer og tabes; laant_slut redder kun en TÆNDT kæde (fandtes også før
+      registret, med _laant). Fix-kandidat: re-tjek efter et kort settle i tænd-grenene.

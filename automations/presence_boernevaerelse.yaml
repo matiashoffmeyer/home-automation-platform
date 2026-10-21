@@ -1,0 +1,445 @@
+# =============================================================================
+# Børneværelse Presence Lights — sengetids-bevidst
+# =============================================================================
+# To udseender:
+#   1. Før sengetid (sensor.boern_bedtime_hour, sliders i global_tuning), eller
+#      uden børn hjemme: lux-styret varm hvid (sensor.boernevaerelse_auto_lys_pct).
+#   2. Efter sengetid med børn hjemme: puttelys-UDSEENDET
+#      (script.puttelys_phase1_apply, saet_flag=false).
+#
+# Stamps input_datetime.boernevaerelse_last_off ved turn-off (læses af
+# lux-fald-vejen i presence_lights.yaml).
+#
+# Splittet ud fra presence_lights.yaml 2026-05-05 (Phase 2 refactor).
+# =============================================================================
+
+# 2026-10-07 (user-bug "rødt lys i børneværelset. klar bug!"): her stod fra
+# 05-05 en tredje gren — efter sengetid uden re-entry: 5 % DYB RØD "så en
+# forælder kan kigge til sovende børn". Dens præmis kunne aldrig opfyldes:
+# sovende børn = godnat_boern_active = godnat_any_active, som blokerer HELE
+# automationen. Grenen fyrede derfor KUN når børnene var VÅGNE — i vinduet
+# sengetid (19:15) → putning (19:30-21:44 målt 21 døgn). 10-07 19:16:05:
+# rødt loft, korte besøg derinde i 20 min. Re-entry-grenen (15 % 2040 K) var
+# kun en blødere udgave af det røde og forsvandt med det.
+# Efter sengetid er puttelyset nu det ene aften-udseende — det samme fase 1
+# giver når den er armeret, og som sen-hjemkomst bruger som presence-lys
+# (user-spec 10-06). Sover børnene, er godnat sat, og intet her fyrer.
+- id: presence_light_boernevaerelse_on
+  alias: "Lysnet: Børneværelse tænd"
+  description: >
+    Før sengetid (eller uden børn hjemme): lux-styret varm hvid. Efter sengetid
+    med børn hjemme: puttelys-udseendet (loft 30 % + strip lyserød + plug, uden
+    fase 1-flaget). godnat_any_active blokerer alt (børnene sover).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+      to: "on"
+    # 2026-09-23: ÆGTE bevægelse kan komme et sekund EFTER occupancy-flanken —
+    # og er det eneste der åbner døren når børnene ikke er hjemme (se gaten).
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_bevaegelse_frisk
+      from: "off"
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-05-05 KRITISK fix: gate på godnat_any_active (union)
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+    # Dark Mode (projektor-mørklægning) blokerer auto-tænd i børneværelset —
+    # cinema-gaten dækker kun open-plan. 2026-07-28: RUM-SCOPET
+    # (binary_sensor.filmmoerke_boern = dark_mode on OG nylig presence her).
+    - condition: state
+      entity_id: binary_sensor.filmmoerke_boern
+      state: "off"
+    # 2026-06-15 (user-bug): tænd ikke det TOMME børneværelse fra radar-falske-
+    # positiver når børnene ikke er hjemme. binary_sensor.kids_home dækker
+    # auto-detektion + manuelle overrides (kids_home_manual / _manual_off).
+    # 2026-09-23 (user-bug 22/09 19:17-19:22: "Børneværelsets lys tænder ikke
+    # trods presence og mørke. Børnene er ikke hjemme"): gaten gjorde en VOKSEN
+    # i rummet usynlig — tre ægte occupancy-flanker, intet lys, indtil Styrbar.
+    # Radar-spøgelserne 06-15 var STILLE mål; en voksen der går ind BEVÆGER sig.
+    # → uden børn hjemme kræves frisk moving_target (samme sensor som
+    # putning-vækningen bruger), ikke ingenting.
+    # 2026-10-05 (user-bug "for meget tændt med tomt rum"): den vej tændte 26
+    # gange på 12 døgn, 24 i takt med spisestuens radar — folk ved spisebordet
+    # set gennem væggen. Tænd-siden FILTRERES IKKE (user: "max 3 sek", og
+    # intet signal skiller inden for 3 s); i stedet slukker
+    # presence_light_boernevaerelse_off kort efter tomt rum når der ikke er
+    # børn hjemme. Måling + valg: packages/boernevaerelse_uden_boern.yaml.
+    - condition: template
+      value_template: >-
+        {{ is_state('binary_sensor.kids_home', 'on')
+           or is_state('binary_sensor.boernevaerelse_bevaegelse_frisk', 'on') }}
+    # 2026-06-06: gate mens den dynamiske puttelys-nedtrapning kører — ellers
+    # ville bevægelse under oplæsning relighte loftet og kæmpe mod nedtrapningen.
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    # 2026-06-10 (opg 4): Manual mode = bruger har selv indstillet lyset —
+    # auto-tænd blokeret indtil drift-back → Auto.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_boernevaerelse', 'Manual') }}"
+    # 2026-06-23 (user-spec): robot-spærre gælder nu KUN når huset er Dormant
+    # (binary_sensor.roborock_blokerer_lys). Er huset Active må robottens motion
+    # gerne tænde lys — KUN early-detect spærres (se early-detect-rummene).
+    # Dormant-wake er robot-filtreret centralt i house_state_to_active.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    # 2026-07-03 (user-bug/spec): gaten måler RUMMETS lux mod en rå tærskel
+    # (`boernevaerelse_lux_threshold`, 0 = aldrig auto-tænd; IKKE global-faktor-
+    # skaleret → forudsigelig "tænd når rummet er under N lux"). Rod-årsagen var
+    # at gaten målte open_plan_lux (~40 en lys sommeraften) mens rummet selv var
+    # ~14 → mørkt rum, slukket lys.
+    # 2026-08-06: `sensor.boernevaerelse_lux_reel` er IKKE længere rummets
+    # Apollo — den er open_plan_lux × andel (se room_lux_tuning.yaml). Apolloen
+    # står jævnligt tildækket. Gaten er uændret og rammer stadig 07-03-sagen:
+    # open-plan 40 × 35 % = 14 lx = under tærsklen.
+    # Morgen-vækning-grenen (adult-wakeup nedenfor) læser BEVIDST rå
+    # open_plan_lux som dagslys-vagt — se dens egen kommentar.
+    # 2026-08-19 (#2, user-bug "børneværelset brændte unødigt i morges"): gaten
+    # er nu KLAMPET af sensor.boernevaerelse_taend_lux_gate. Slideren (20) lå
+    # OVER morgen-sanity'ens sluk-tærskel omregnet til rum-lux (50 × 35 % =
+    # 17,5), så der fandtes et overlap hvor tænd- og sluk-reglen var sande
+    # samtidig: målt samme dag tændte loftet 08:14:24 og blev slukket 08:14:56,
+    # tændt igen 08:15:24 — indtil et menneske greb ind 08:15:26.
+    - condition: template
+      value_template: >-
+        {% set t = states('sensor.boernevaerelse_taend_lux_gate') | float(-1) %}
+        {% if t < 0 %}
+          {% set t = states('input_number.boernevaerelse_lux_threshold') | float(15) %}
+        {% endif %}
+        {{ t > 0
+           and (states('sensor.boernevaerelse_lux_reel') | float(999)) < t }}
+    - condition: time
+      after: "06:00:00"
+    # 2026-08-15 (user-spec): barn 1 står op, barn 2 sover videre. I morgen-
+    # vinduet (06:00 → slut, default 07:30) kræves ÆGTE bevægelse — den rå
+    # occupancy-flanke er ON også for et STILLE mål i sengen (målt 08-15
+    # 06:15:54: "g3 still" → loftet tændte over et sovende barn).
+    # Se packages/boernevaerelse_morgen_beskyttelse.yaml.
+    - condition: state
+      entity_id: binary_sensor.boernevaerelse_morgen_beskyttelse_aktiv
+      state: "off"
+    # Kun fyr hvis lyset faktisk er off — et tænd må ikke overskrive et
+    # manuelt sat niveau (audit-runde 5).
+    - condition: state
+      entity_id: light.boernevaerelse_loft
+      state: "off"
+    # 2026-06-16: entré NED-grace blokerer relight i 5 min (hele huset).
+    - condition: state
+      entity_id: input_boolean.entre_shutdown_grace
+      state: "off"
+    # 2026-06-19 (user-spec FULD LÅS): manuel sluk → ingen bevægelses-tænd før
+    # Styrbar OP. Se packages/boernevaerelse_manual_off_lock.yaml.
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_manual_off_lock
+      state: "off"
+  action:
+    # 500ms delay + light=off re-check: kort debounce, og spring over hvis
+    # lyset allerede blev tændt manuelt i mellemtiden.
+    - delay:
+        milliseconds: 500
+    - condition: state
+      entity_id: light.boernevaerelse_loft
+      state: "off"
+    # 2026-10-07 (fejlklasse #2, samme lampe i to scripts): puttelys fase 1
+    # og dette tænd fyrer på SAMME bevægelse. 10-05 19:03:26 tændte fase 1
+    # (flaget først, så loftet) — loftet meldte først "on" 19:03:31, så
+    # off-tjekket ovenfor så stadig slukket, og dette tænd skrev sit eget lys
+    # oven i puttelyset 5 s efter. Fase 1 sætter puttelys_phase1_fired FØR
+    # sit loft-kald → er flaget lige sat, eller kører scriptet, ejer det loftet.
+    # (last_changed nulstilles ved genstart: højst 60 s efter boot viger vi
+    # også for et gammelt flag — den ufarlige retning.)
+    - condition: template
+      value_template: >-
+        {% set f = states.input_boolean.puttelys_phase1_fired %}
+        {{ not is_state('script.puttelys_phase1_apply', 'on')
+           and not (f is not none and f.state == 'on'
+                    and (now() - f.last_changed).total_seconds() < 60) }}
+    - choose:
+        # ===== Efter sengetid med børn hjemme → puttelys-udseendet =====
+        # Uden børn hjemme er det en voksen, der skal have normalt lys (default).
+        - conditions:
+            - condition: template
+              value_template: >
+                {% set cutoff = states('sensor.boern_bedtime_hour') | float(19.5) %}
+                {{ now().hour + now().minute / 60 >= cutoff
+                   and is_state('binary_sensor.kids_home', 'on') }}
+          sequence:
+            # saet_flag=false: KUN udseendet — ingen strip-fredning, tom-sluk
+            # tager det som ethvert presence-lys (samme kald som sen hjemkomst
+            # i putning_auto_detect.yaml; udseendet bor ét sted, #2).
+            - service: script.puttelys_phase1_apply
+              data:
+                saet_flag: false
+      # ===== Default: før sengetid / uden børn → lux-styret warm white =====
+      default:
+        - service: light.turn_on
+          target:
+            entity_id: light.boernevaerelse_loft
+          data:
+            # Light Aggressiveness factor — multiply lux-styret base.
+            # 2026-09-29: formlen (lux 5/15 → 80/55/30 % × global-faktor) er
+            # flyttet uændret til sensor.boernevaerelse_auto_lys_pct, som
+            # morgen-nedtoningens overdragelse også læser (fejlklasse #2).
+            brightness_pct: "{{ states('sensor.boernevaerelse_auto_lys_pct') | int(30) }}"
+            color_temp_kelvin: 2700
+            transition: 3
+
+# =============================================================================
+# Adult-walks-in-to-wake-kids — moving-target gated, after 06:00, during godnat
+# =============================================================================
+# Scenario: adults vågner, går ind for at vække pigerne, men har ikke trykket
+# godmorgen. godnat_any_active=on → primary presence_light_boernevaerelse_on
+# blokerer (intentionelt: ingen lys mid-godnat). Resultat før: adult stepper
+# ind i mørkt rum.
+#
+# Fix: efter 06:00, trigger på radar MOVING target (= adult walking) — IKKE
+# still target (= kids sleeping). Kids in bed udløser still_target only;
+# moving_target kræver faktisk bevægelse gennem rummet.
+#
+# Brightness: 60% @ 2700K — matcher wakeup_kids Phase 3 ("comfortable reading
+# light"). Lyser nok til at adult kan se + vække pigerne, ikke chokerende.
+# =============================================================================
+- id: presence_light_boernevaerelse_adult_wakeup
+  alias: "Lysnet: Børneværelse adult-vækning under godnat (moving target)"
+  description: >
+    Tænder boern-loft 60% warm når en adult går ind i kids rum efter 06:00
+    mens godnat stadig er aktiv. Gated på moving_target (ikke still_target),
+    så sovende børn i seng ikke trigger det.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_radar_moving_target
+      to: "on"
+  condition:
+    # 2026-09-02 (AirBnB-audit, fejlklasse #16 roster-drift): de FIRE søskende
+    # lysnet_bornevaerelse_* står i airbnb_mode's lockdown-liste — denne femte
+    # gren blev tilføjet senere og kom aldrig med. Den er gatet på
+    # godnat_any_active, som AirBnB-natmoden SELV sætter, så en gæst der går
+    # gennem børneværelset efter 06:00 fik loftet tændt 60 %.
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: time
+      after: "06:00:00"
+      before: "11:00:00"
+    # Dark Mode holder børneværelset mørkt (enforce-backstoppen slukker alligevel,
+    # men gate ved kilden = ingen flicker). 2026-07-28: rum-scopet.
+    - condition: state
+      entity_id: binary_sensor.filmmoerke_boern
+      state: "off"
+    # Only during godnat — godnat=off path er håndteret af primary automation.
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "on"
+    # 2026-06-23 (user-spec, "ingen undtagelse"): robot-spærre gælder nu KUN i
+    # Dormant (binary_sensor.roborock_blokerer_lys). I praksis kører robotten
+    # ikke under godnat (folk hjemme = robot starter ikke), så dette er mest
+    # for konsistens med husets robot-politik.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    # Don't override if light already on (eg. adult tilbage fra short trip)
+    - condition: state
+      entity_id: light.boernevaerelse_loft
+      state: "off"
+    # 2026-06-19 (user-spec FULD LÅS): manuel sluk → ingen bevægelses-tænd før
+    # Styrbar OP. Se packages/boernevaerelse_manual_off_lock.yaml.
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_manual_off_lock
+      state: "off"
+    # 2026-06-27 fix (user-rapport: boern-loft tændte 60% om morgenen i dagslys).
+    # Simpel regel: er open_plan_lux højt (= dag/lyst ude), tænd IKKE børnelyset
+    # — kun putning-scenen må tænde i lyse timer (den er en separat automation,
+    # uberørt af denne gate). NB (2026-07-17): boern-primary skiftede 2026-07-03
+    # til rummets EGEN lux + rå tærskel — denne gren bruger BEVIDST fortsat
+    # open_plan_lux som dagslys-vagt (mørk vinter-morgen passerer, lys
+    # sommer-morgen blokeres). 2026-08-06: rum-sensoren er nu SELV afledt af
+    # open_plan_lux, så de to kilder er ikke længere uafhængige — men denne
+    # gren spørger bevidst "er det stadig mørkt UDE" (rå open-plan mod en
+    # 45 lx-gate), ikke "er rummet mørkt", og beholder derfor rå-værdien.
+    - condition: template
+      value_template: >-
+        {% set lux = states('sensor.open_plan_lux') | float(50) %}
+        {{ lux < (states('sensor.boernevaerelse_morgen_lux_gate') | float(30)) }}
+    # 2026-08-15 (user-spec): denne gren er den KRAFTIGSTE (60 %) og fyrer på
+    # moving_target — men et barn der selv står op er også et moving target.
+    # Samme anker som primary-vejen: i morgen-vinduet kræves akkumuleret
+    # bevægelse, ikke ét enkelt udslag. En voksen der går rundt i rummet
+    # passerer tærsklen på under et minut; haster det, vinder Styrbar altid.
+    - condition: state
+      entity_id: binary_sensor.boernevaerelse_morgen_beskyttelse_aktiv
+      state: "off"
+  action:
+    - service: light.turn_on
+      target:
+        entity_id: light.boernevaerelse_loft
+      data:
+        brightness_pct: >
+          {% set base = 60 %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+        color_temp_kelvin: 2700
+        transition: 2
+
+- id: presence_light_boernevaerelse_off
+  alias: "Lysnet: Børneværelse gradvis sluk"
+  description: >
+    5-minute absence rule (private-rum standard). Stamps input_datetime.boernevaerelse_last_off
+    when turning off so the re-entry grace period knows the light was
+    recently active. Fade lasts 30s.
+  mode: restart
+  trigger:
+    # Phase 4 sprint 2026-05-07 sen-PM: templated `for:` med Turn-Off Aggressiveness.
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+      to: "off"
+      for:
+        seconds: "{{ (states('sensor.rum_tom_sluk_sekunder') | float(300)) | int }}"
+    # P2 pattern fix audit 2026-05-07: time_pattern fallback (mirror A27/A55).
+    # Hvis boern bulb tændes via service-call mens Apollo allerede off >5 min
+    # (eg. nightlight kalde-flow), state-trigger fyrer aldrig → bulb stuck on.
+    # time_pattern fyrer hvert 5 min state-history-uafhængigt.
+    - platform: time_pattern
+      minutes: "/5"
+      id: fallback_check
+    # 2026-10-05: kort sluk når der IKKE er børn hjemme (gennem-væggen-
+    # tændinger brændte 6-75 min). Timing-conditionen nedenfor afgør om den
+    # korte eller lange regel gælder — triggeren må gerne fyre i begge tilfælde.
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+      to: "off"
+      for:
+        seconds: "{{ states('input_number.boernevaerelse_uden_boern_sluk_sekunder') | int(90) }}"
+      id: uden_boern
+    # 2026-10-05 aften: samme idé MED børn hjemme, men kun før sengetid —
+    # conditionen nedenfor afgør hvilken regel der gælder.
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+      to: "off"
+      for:
+        seconds: "{{ states('input_number.boernevaerelse_med_boern_sluk_sekunder') | int(300) }}"
+      id: med_boern
+  # Strippen er et natlys der IKKE må tom-slukkes: manuelt aften-hold (09-12)
+  # eller putning/godnat-natlys (09-28). Ét udtryk, læst af condition + action.
+  variables:
+    strip_fredet: >-
+      {% set h = now().hour %}
+      {{ states('input_text.boern_aften_niveau_hold').startswith('hold')
+         or is_state('input_boolean.godnat_boern_active', 'on')
+         or is_state('input_boolean.puttelys_descent_active', 'on')
+         or (is_state('input_boolean.puttelys_phase1_fired', 'on')
+             and (h >= 15 or h < 6)) }}
+    # 2026-10-06 (bug-hunt): pluggen FØLGER strippen (mirror'en tænder den når
+    # strippen tændes ≥ 10 %), så dit manuelle aften-hold freder den også.
+    # Målt 10-03 20:34:49 → 20:35:00: strippen sat (hold armeret), mirror'en
+    # tændte pluggen, /5-ticket slukkede den 9 s efter — strippen stod.
+    # Godnat/nedtrapning/fase-1-fredningen gælder IKKE pluggen: den er ikke en
+    # del af natlyset (nedtrapningen slukker den selv ved 85 %).
+    plug_fredet: >-
+      {{ states('input_text.boern_aften_niveau_hold').startswith('hold') }}
+  condition:
+    # 2026-09-02: DENNE automation slukkede vækningen 2 min inde (06:23 → 06:25).
+    # Et sovende barn giver ingen occupancy, så "tom i 5 min" er sandt hele
+    # natten og /5-ticket vinder altid kapløbet mod rampen.
+    - condition: state
+      entity_id: binary_sensor.boernevaerelse_vaekning_hold
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+      state: "off"
+    # P2 fix: only fade if light actually on (skip no-op time_pattern fires).
+    # 2026-06-26 (user-bug): hygge-strip + plug-lampe var ALDRIG koblet til tom-
+    # sluk → de brændte til godnat/manuel selv i tomt rum. Nu fyrer reglen hvis
+    # ÉN af de tre boern-lys er tændt.
+    # 2026-09-12: strippen tæller IKKE med når aften-holdet er armeret — ellers
+    # ville et manuelt sat natlys holde denne automation i gang hvert 5. minut
+    # og stemple `boernevaerelse_last_off` + slukke plug-lampen igen og igen,
+    # uden nogensinde at kunne slukke det den fyrede for.
+    # 2026-09-28 (user: "9 % nat-striben er slukket … den skal ha lov at køre"):
+    # putte-natlyset er også fredet — målt 27/9 21:35 (1 %, godnat_boern_active
+    # on) og 28/9 20:50 (9 %, nedtrapning) slukkede DENNE regel natlyset, fordi
+    # sovende børn giver "tomt rum". Samme undtagelse som luksus-suppressoren
+    # havde (phase1_fired/descent/godnat_boern); phase1_fired kun 15-06, da den
+    # står on til dagtimernes oprydning (godnat_subflag_safety).
+    - condition: template
+      value_template: >-
+        {{ is_state('light.boernevaerelse_loft', 'on')
+           or (is_state('light.boernevaerelse_hygge_strip', 'on') and not strip_fredet)
+           or (is_state('light.boernevaerelse_hyggelys', 'on') and not plug_fredet) }}
+    # P2 fix: time_pattern requires Apollo been off ≥5 min siden last_changed.
+    # Audit-fix 2026-05-07: scale med global_absence_wait_factor for consistency.
+    # 2026-10-05: uden børn hjemme (familie-mode, rummet ikke Manual) er kravet
+    # kun boernevaerelse_uden_boern_sluk_sekunder — der sover intet barn stille
+    # under radaren, så tomt ER tomt (packages/boernevaerelse_uden_boern.yaml).
+    # last_changed nulstilles ved genstart → kravet måles da fra boot (den
+    # konservative retning).
+    # 2026-10-05 aften: MED børn hjemme gælder boernevaerelse_med_boern_sluk_sekunder
+    # fra 06:00 til børnenes sengetid (sensor.boern_bedtime_hour) — et barn
+    # der sover om DAGEN skal ikke have loftet tændt, så tomt rum = sluk er
+    # ufarligt. Efter sengetid: den lange regel (sovende børn, puttelys).
+    - condition: template
+      value_template: >-
+        {% set t = states.binary_sensor.boernevaerelse_apollo_occupancy.last_changed %}
+        {% set f = states('sensor.global_absence_wait_factor') | float(1.0) %}
+        {% set familie = states('input_select.house_mode') in ['Normal', 'Home Vacation']
+           and not is_state('input_select.room_mode_boernevaerelse', 'Manual') %}
+        {% set cutoff = states('sensor.boern_bedtime_hour') | float(19.5) %}
+        {% set dag = 6 <= now().hour + now().minute / 60 < cutoff %}
+        {% if familie and is_state('binary_sensor.kids_home', 'off') %}
+          {% set krav = states('input_number.boernevaerelse_uden_boern_sluk_sekunder') | float(90) %}
+        {% elif familie and dag %}
+          {% set krav = states('input_number.boernevaerelse_med_boern_sluk_sekunder') | float(300) %}
+        {% else %}
+          {% set krav = 300 * f %}
+        {% endif %}
+        {{ t is not none and (now() - t).total_seconds() >= krav }}
+  action:
+    # Stamp the time before turning off (for re-entry grace period)
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.boernevaerelse_last_off
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    # Fade out loft + hygge-strip (dimbare). 2026-06-26: hygge-strip tilføjet så
+    # tomt rum også slukker hyggelyset — ikke kun loftet.
+    # 2026-09-12 (user-spec): DENNE automation er den målte årsag til at et
+    # manuelt sat natlys døde 78 s efter at det blev tændt — 13 gange på 14
+    # døgn. Holdet fjerner KUN strippen fra målet; loftet slukker som før.
+    # Gatede vi hele automationen, ville et manuelt natlys lade loftet brænde
+    # hele natten, hvilket er langt værre end fejlen vi retter.
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: "{{ ['light.boernevaerelse_loft'] + ([] if strip_fredet else ['light.boernevaerelse_hygge_strip']) }}"
+      data:
+        transition: "{{ states('sensor.fade_living_effective') | int(30) }}"
+    # Plug-lampen er non-dimmable (switch) → ingen transition. Eksplicit sluk her,
+    # fordi strip→off-mirror'en ikke fyrer hvis strippen er unavailable (Innr-flap).
+    # Fredet af dit aften-hold (plug_fredet, se variables).
+    - if:
+        - condition: template
+          value_template: "{{ not plug_fredet }}"
+      then:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id: light.boernevaerelse_hyggelys

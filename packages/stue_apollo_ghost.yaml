@@ -1,0 +1,138 @@
+# =============================================================================
+# stue_apollo_ghost.yaml — still-only debounce for stue-Apolloen (2026-08-19g)
+# =============================================================================
+# PROBLEM (ghost-sweep 08-19g, 6989 flaps over 14 døgn): stue var husets ENESTE
+# rum hvor maskin-spøgelser nåede helt frem til lyset. Køkkenet fik sit filter
+# samme dag, spisestue har haft ét siden 06-27 — stue havde intet, og rå
+# `binary_sensor.stue_apollo_occupancy` fodrede ~95 forbrugere direkte:
+# lys-veje, godnat, Dormant, house_modes, people_estimate, activity_state,
+# morning_curtains, wasp …
+#
+# MÅLINGEN: g2-still 429 udslag, g5-still 303, g0-still 59, g0-move 182 — og
+# 28-34 % af dem varede PRÆCIS `number.stue_apollo_radar_timeout` (5,0 s). Et
+# udslag på præcis timeouten er ét radar-hit uden gentagelse: et menneske
+# gen-detekteres inden timeouten udløber og forlænger udslaget, en maskine
+# giver ét hit og så stilhed. (Slægtning til B54: 93 flaps på én nat.)
+#
+# HVORFOR IKKE KØKKENETS MODEL: køkkenets TÆND-gate kræver et MOVING-target,
+# fordi et still-mål der 6 m inde i radarens felt lige så godt kan være en
+# person i sofaen. Den regel må ALDRIG kopieres hertil — i stuen ER det at
+# sidde stille tilstedeværelsen. Aksen er rum-specifik (CLAUDE.md 08-19g).
+#
+# LØSNING: still-only debounce.
+#   • Ser radaren BEVÆGELSE → filtered går ON med det samme (nul forsinkelse
+#     når du går ind i stuen). Hurtig-vejen er KLÆBRIG (20 s delay_off), så en
+#     blinkende moving_target ikke kan flappe filtered — se 08-21 nedenfor.
+#   • Er det KUN et still-target → detektionen skal overleve
+#     `stue_still_ghost_sekunder` (13 s > timeouten 5 s) før den tælles.
+# Slider på 0 = filteret helt fra.
+#
+# `binary_sensor.stue_apollo_occupancy_filtered` er hvad ALLE adfærds-forbrugere
+# læser. Rå occupancy beholdes bevidst i de rene diagnostik-pakker
+# (apollo_per_gate, apollo_flap_hunt, apollo_latch_detect, apollo_ghost_alert,
+# anomali_vagt, device_health_check) — de skal netop kunne SE spøgelserne.
+# =============================================================================
+
+input_number:
+  # Hvor længe et still-ONLY udslag skal holde uafbrudt før det tælles som en
+  # person. Skal være > number.stue_apollo_radar_timeout (5,0 s), ellers
+  # slipper enkelt-blip-spøgelserne igennem. 0 = filter fra.
+  stue_still_ghost_sekunder:
+    name: "Stue: still-spøgelse skal holde (s)"
+    icon: mdi:ghost-off-outline
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+template:
+  - binary_sensor:
+      # HURTIG-VEJ: "radaren har set ægte bevægelse for nylig".
+      # 2026-08-21: dette ERSTATTER `stue_apollo_still_kandidat`, som var et
+      # ØJEBLIKS-udtryk (`moving_target == off`) og derfor øjeblikkeligt i BEGGE
+      # retninger. Hver gang moving_target blinkede, skiftede hurtig-vejen, og
+      # `filtered` flappede med den: målt i morges gav ÉT rå occupancy-udslag
+      # 07:21:25 hele FEM filtered-flanker på 8 sekunder. Over det tomme vindue
+      # 07:25-09:42 leverede 11 rå episoder 12-13 filtered-flanker — filteret
+      # sendte altså MERE støj ud end ind, præcis den signatur 08-20d
+      # definerer som "i stykker", og de flanker holdt `credible_fast` i veto
+      # og dermed huset Active i over to timer med et tomt hus.
+      # Klæbrigheden (delay_off) er hele fixet: en flanke i moving_target må
+      # ikke kunne lukke hurtig-vejen før varigheds-beviset har overtaget.
+      # 20 s > kravet nedenfor, så der er ingen sprække imellem dem.
+      - name: "Stue Apollo bevaegelse frisk"
+        unique_id: stue_apollo_bevaegelse_frisk
+        device_class: motion
+        icon: mdi:motion-sensor
+        delay_off:
+          seconds: 20
+        state: >-
+          {{ is_state('binary_sensor.stue_apollo_radar_moving_target', 'on') }}
+
+      # Occupancy har holdt uafbrudt i hele vinduet = udslaget overlevede
+      # radar-timeouten, altså gen-detekteret = menneske. delay_off = 0 →
+      # falder straks når occupancy slipper.
+      #
+      # 2026-08-20: keyet på RÅ occupancy, ikke på kandidaten. Kandidaten falder
+      # hver gang moving_target blinker, og trak bekræftelsen med sig
+      # (delay_off 0), så `filtered` blankede et BEBOET rum i
+      # stue_still_ghost_sekunder ved HVER flanke. Kilden til de flanker var IKKE
+      # stuen: user oplyste at det var et barn der gyngede i ENTRÉEN — radarens
+      # 6 m rækkevidde (max_move/still_distance = gate 8) når derind, bekræftet
+      # ved at entre_valhorn_occupancy fyrede 6 gange 15:03-15:13 mens stue-
+      # occupancy stod uafbrudt on 9f:d0:a6-c1:f2:02. Den lækage er BEVIDST
+      # accepteret (user 08-20, B86: entréen er gennemgang til stuen, så "beboet"
+      # er det rigtige svar) — modsat køkken↔sofa 08-19g, hvor sofaen er en
+      # destination og køkkenet derfor forblev tomt. Uanset hvad ændrer det ikke
+      # at bekræftelsen ikke må hænge på en flanke-sensor.
+      # Målt 12:00-15:20: rå occupancy 20 skift, filtered 198 —
+      # filteret forstærkede støjen 10× i stedet for at dæmpe den (køkkenet samme
+      # dag: 82 rå → 32 filtreret). Køkkenet slipper fordi dets kandidat har en
+      # afstands-gate (< 75 cm = køleskabet) og derfor kun kan blive sand for én
+      # kendt maskine; stuens kandidat er ikke afgrænset af noget, så dens
+      # rigtige diskriminator er VARIGHED: et
+      # maskin-blip varer præcis number.stue_apollo_radar_timeout (5 s), et
+      # menneske gen-detekteres og holder udslaget. Den måling er uafhængig af
+      # moving_target. Hurtig-vejen ovenfor sørger stadig for at en GÅENDE
+      # ankomst slipper igennem uden forsinkelse.
+      #
+      # 2026-08-21 kalibrering 8 s → 13 s. Målt på rå occupancy-EPISODER: i det
+      # TOMME hus 07:25-09:42 varede spøgelserne 5,1 · 5,1 · 6,3 · 10,3 · 10,5 s
+      # (+ længere), mens hver eneste episode i det BEBOEDE vindue 05:40-07:15
+      # var ≥ 15,7 s. Tærsklen skal derfor ligge i hullet (10,5 ; 15,7) — 13 s
+      # har margin til begge sider. Det fjerner de fem korteste spøgelser uden
+      # at forsinke en ægte ankomst, som pr. konstruktion kommer ind ad
+      # hurtig-vejen. De LANGE spøgelser (18-376 s) kan varighed ikke skille
+      # fra et menneske — stuen har ingen kendt diskriminator for dem (B90).
+      - name: "Stue Apollo still bekraeftet"
+        unique_id: stue_apollo_still_bekraeftet
+        device_class: occupancy
+        icon: mdi:account-clock
+        delay_on: >-
+          {{ states('input_number.stue_still_ghost_sekunder') | int(8) }}
+        state: "{{ is_state('binary_sensor.stue_apollo_occupancy', 'on') }}"
+
+      # Filtreret occupancy — DET signal alle adfærds-forbrugere læser.
+      # availability-passthrough bevarer 'unavailable'-semantik for de
+      # tomheds-sæt der lister sensoren (#9).
+      # delay_on: 1 er IKKE kosmetik: når rå occupancy går ON evaluerer denne
+      # og hurtig-vej-sensoren i samme tick uden garanteret rækkefølge. Uden
+      # det ene sekund kan filtered nå at se en forældet hurtig-vej og lukke et
+      # spøgelse igennem i et enkelt tick.
+      - name: "Stue Apollo Occupancy Filtered"
+        unique_id: stue_apollo_occupancy_filtered
+        device_class: occupancy
+        icon: mdi:account-check
+        availability: >-
+          {{ states('binary_sensor.stue_apollo_occupancy') not in ['unknown', 'unavailable'] }}
+        delay_on: 1
+        # frossen ghost (packages/apollo_frossen_ghost.yaml): varigheds-kravet nedenfor
+        # tror på ALT der overlever radar-timeouten, også et møbel xray nu kan
+        # se. Findes sensoren ikke, er is_state False = ingen maskering.
+        state: >-
+          {{ is_state('binary_sensor.stue_apollo_occupancy', 'on')
+             and not is_state('binary_sensor.stue_apollo_frossen_ghost', 'on')
+             and ((states('input_number.stue_still_ghost_sekunder') | float(0)) <= 0
+                  or is_state('binary_sensor.stue_apollo_bevaegelse_frisk', 'on')
+                  or is_state('binary_sensor.stue_apollo_still_bekraeftet', 'on')) }}

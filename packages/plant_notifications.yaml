@@ -1,0 +1,90 @@
+# =============================================================================
+# Plante-notifikationer — Google Sheet → Parent A's telefon (2026-06-15)
+# =============================================================================
+# scripts/plant_notify.py poller plante-tracker-arket (CSV-export, ingen auth)
+# + met.no-forecast én gang i døgnet og sender to slags notifikationer via
+# script.push_notify (notif_id `planter`):
+#   1) GØDNING (frekvens, user-spec 2026-07-29 — "vi dropper brugen af
+#      Sidst Gødet-kolonnen"): sæsonen vælger 'Gødningsfrekvens <sæson> per
+#      måned', interval = ~30/frekvens dage, og scriptet husker SELV næste dato
+#      (`fert_next:<ID>`). Alle forfaldne planter samles i ÉN besked (44 planter
+#      med samme startdato gav ellers ~30 pushes samme morgen). freq 0 → ingen.
+#      KVITTERING (user-spec 2026-10-05: "action knap 'Done' … hvis jeg ikke
+#      trykker done skal den komme igen dagen efter"): datoen står stille til
+#      ✅ Gødet → ukvitteret = samme push igen næste morgen (højst én pr. dag).
+#      ✅ lægger næste runde et interval frem fra kvitterings-dagen. Planter-
+#      siden viser den seneste push' planter + status ("in case jeg glemmer det").
+#   2) VEJR-ADVARSLER (forecast): meget regn på vej → flyt krukker i ly; varmt
+#      + solrigt på vej → vand/skyg. Tærskler + cooldown i scriptets konstanter.
+# VANDING pushes IKKE (user-spec 2026-07-29: "det skal jeg nok selv gøre") —
+# arkets vandings-kolonner vises kun på Planter-siden via sensor.plant_overview.
+# Dedup via /config/.plant_notify_state.json.
+#
+# Arkitektur-note: HA POLLER arket udefra-ind (CSV-export virker uden auth fordi
+# arket er delt "anyone with link"). Derfor INGEN indgående webhook/Nabu Casa
+# nødvendig — vigtigt, da der ikke er HA Cloud på dette setup.
+#
+# SETUP-KRAV (ikke i git — secrets.yaml er .gitignored):
+#   /config/secrets.yaml skal indeholde (kontrakt: secrets.example.yaml):
+#     ha_api_token: <long-lived HA access token>
+#     plant_sheet_id: <Google Sheet-id'et; CSV-eksporten er en læse-nøgle>
+#
+# Automatik (poll-trigger): automations/plant_notifications.yaml
+# Notifikations-format: gødning "🌿 Gød N planter i dag" / "🌿 Stadig ikke
+# gødet: …" (grupperet pr. placering), vejr "🌧️/☀️ …".
+# =============================================================================
+input_boolean:
+  plant_notify_enabled:
+    name: "Plante-notifikationer aktiv"
+    icon: mdi:flower-tulip
+
+shell_command:
+  plant_notify_scan: "python3 /config/scripts/plant_notify.py"
+  # Kvittering (✅ done / 📅 snooze7; snooze1 = gammel 😴-knap) — kaldes KUN af
+  # script.planter_goedning_kvitter nedenfor, som whitelister act.
+  # Templated shell_command = exec uden shell → ingen injection.
+  plant_notify_fert_action: "python3 /config/scripts/plant_notify.py --fert-action {{ act }}"
+
+script:
+  # ÉN vej ind til kvitteringen (fejlklasse #2): push-knappen
+  # (notif_action_plant_fert) og Planter-sidens knapper kalder begge denne.
+  planter_goedning_kvitter:
+    alias: "Planter: kvittér gødning"
+    icon: mdi:check-circle-outline
+    mode: queued
+    max: 5
+    fields:
+      act:
+        description: "done = gødet i dag, snooze7 = +1 uge (snooze1 = gammel 😴-knap)"
+        required: true
+    sequence:
+      - variables:
+          # Valgfrit felt = udefineret hvis ikke sendt med (Jinja-gotcha).
+          a: "{{ (act if act is defined else '') | string | lower | trim }}"
+      - condition: template
+        value_template: "{{ a in ['done', 'snooze1', 'snooze7'] }}"
+      - service: shell_command.plant_notify_fert_action
+        data:
+          act: "{{ a }}"
+      # Tag pushen af BEGGE telefoner: kvitteres der fra siden eller fra den
+      # ene telefon, må den anden ikke stå tilbage med en løst opgave. En
+      # clear_notification er ingen besked → uden om push_notify og dens
+      # AirBnB-tavshed (samme mønster som parent_b_alarm.yaml).
+      - repeat:
+          for_each:
+            - mobile_app_phone_a
+            - mobile_app_phone_b
+          sequence:
+            - service: "notify.{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                message: clear_notification
+                data:
+                  tag: plant_fert
+      - service: logbook.log
+        data:
+          name: "Plante-gødning"
+          message: >-
+            {{ {'done': '✅ gødet', 'snooze7': '📅 udskudt en uge',
+                'snooze1': '😴 udskudt til i morgen'}[a] }} — gælder hele den
+            seneste gødnings-påmindelse.

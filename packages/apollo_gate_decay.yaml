@@ -1,0 +1,336 @@
+# =============================================================================
+# Apollo gate-decay — jagt mod MAX følsomhed uden flaps (user-spec 2026-07-28)
+# =============================================================================
+# User: "når flap hunt er aktiv skal vi ha en feature der langsomt skruer
+# følsomheden op (dvs skruer sliders ned) … kun de gates der bruges, ikke dem jeg
+# har sat til 100 … jeg skal kunne justere hvor store springene er … og
+# justeringen skal stoppe når den optimale indstilling er fundet, dvs. lige over
+# seneste flap-værdi men konsistent uden flaps => lock value."
+#
+# LUKKET SLØJFE sammen med apollo_flap_hunt.yaml:
+#   NED (her)  — hvert decay-tick sænker ÉT gate pr. rum med `decay_step`.
+#                Lavere tal = mere følsom (LD2410-logik).
+#   OP (jagten)— et flap bumper gaten +`bump_step` OG sætter gatens GULV til den
+#                bumpede værdi. Decay kommer aldrig under gulvet igen.
+#   => hver gate vandrer nedad indtil den flapper, ryger ét hak op, og LÅSES dér.
+#      Er der ingen flaps, står den låst for evigt (= "lock value"). Systemet
+#      konvergerer af sig selv mod "lige over seneste flap-værdi".
+#
+# HVILKE GATES ("kun dem der bruges"):
+#   - værdi 100 = brugerens manuelle FRA-knap → røres aldrig. Jagtens bump
+#     stopper derfor ved 99, så 100 forbliver et rent bruger-sentinel.
+#   - gate-indeks > radarens max_still/move_distance deltager ikke i detektion.
+#   - værdi under `decay_floor_min` = allerede så følsomt vi tør → stop.
+#
+# HVORNÅR (2026-08-16f): et rum sænkes kun mens det står i
+# `sensor.apollo_kalib_rum` — samme roster som jagtens bump læser, så op- og
+# ned-retningen ikke kan divergere (fejlklasse #2). Rosteret har to grene: hus
+# (Dormant / bevisligt tomt) og nat (dagrum mens de voksne sover). Før krævede
+# decay `house_state == Dormant`, og det var i praksis en spærre: 23,1 t Dormant
+# på 13,7 døgn = 7 %, mens der var 742 skridt tilbage til gulvet ≈ 90 døgns
+# konvergens. Nat-vejen giver de tre dagrum et vindue hver eneste nat.
+#
+# 🔥 CHIP-WEAR (Standing Instruction): hvert decay-skridt = 1 slider-skift =
+# 1 NVRAM-write. Derfor: MAX ét gate pr. rum pr. tick (5 writes), tick-interval
+# er en slider (default 30 min), og kun mens rummet står i rosteret + intet flap
+# i samme vindue. Værst tænkeligt ~10 writes/t for HELE huset — mod de ~3600
+# unødvendige writes/14 dage der kostede os 2 sensor-chips i maj. Nedstigningen
+# er MONOTON og bundet: antal writes = afstanden til gulvet, ikke en periodisk
+# gentagelse — derfor koster et hyppigere vindue ikke flere writes i alt.
+#
+# VALG AF GATE: den med størst afstand ned til sit gulv ("mest at give af").
+# Det giver en bred, jævn nedstigning uden en cursor der skal vedligeholdes.
+#
+# GULV-LAGER: ét input_text pr. rum, 18 slots à 2 cifre (00-99), rækkefølge
+# g0-g8 still, derefter g0-g8 move. 36 tegn — billigere end 90 helpers.
+# `script.apollo_gate_floor_set` er ENESTE skriver (fejlklasse #2).
+# =============================================================================
+
+input_boolean:
+  apollo_gate_decay_enabled:
+    name: "Apollo gate-decay (auto-følsomhed)"
+    icon: mdi:trending-down
+    # Ingen initial: — overlever restart. Fresh-install-default via
+    # init_user_preferences.
+
+input_number:
+  apollo_gate_decay_step:
+    name: "Gate-decay: spring pr. skridt"
+    icon: mdi:stairs-down
+    min: 1
+    max: 10
+    step: 1
+    mode: box
+    # Hvor mange point gaten sænkes pr. tick. 1 = fint og langsomt (default),
+    # højere = hurtigere konvergens men grovere optimum.
+
+  apollo_gate_decay_interval_minutes:
+    name: "Gate-decay: tid mellem skridt"
+    icon: mdi:timer-sand
+    min: 5
+    max: 720
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+    # Chip-wear-knappen. Default 30 = max 2 writes/rum/time under Dormant.
+
+  apollo_gate_decay_floor_min:
+    name: "Gate-decay: absolut gulv"
+    icon: mdi:arrow-collapse-down
+    min: 0
+    max: 60
+    step: 1
+    mode: box
+    # Ingen gate sænkes under dette uanset gulv-læring. Beskytter mod at hele
+    # huset ender i støj-territorium hvis flap-jagten er slået fra undervejs.
+
+input_text:
+  # 18 slots à 2 cifre pr. rum: g0-g8 still, så g0-g8 move. "00" = intet lært
+  # gulv endnu. Skrives KUN af script.apollo_gate_floor_set.
+  stue_gate_floors:
+    name: "Stue gate-gulve"
+    max: 40
+  spisestue_gate_floors:
+    name: "Spisestue gate-gulve"
+    max: 40
+  koekken_gate_floors:
+    name: "Køkken gate-gulve"
+    max: 40
+  boernevaerelse_gate_floors:
+    name: "Børneværelse gate-gulve"
+    max: 40
+  sove_gate_floors:
+    name: "Sove gate-gulve"
+    max: 40
+
+input_datetime:
+  apollo_gate_decay_last:
+    name: "Gate-decay sidste skridt"
+    icon: mdi:clock-fast
+    has_date: true
+    has_time: true
+
+template:
+  - sensor:
+      # Fremdrift på Indstillinger-siden: hvor mange gates leder stadig efter
+      # deres optimum, og hvor mange er låst lige over deres flap-værdi.
+      - name: "Apollo gate-decay status"
+        unique_id: apollo_gate_decay_status
+        icon: mdi:radar
+        state: >
+          {% set rooms = [('stue','stue'), ('spisestue','spisestue'),
+                          ('koekken','koekken'), ('boernevaerelse','boernevaerelse'),
+                          ('sove','sovevaerelse')] %}
+          {% set fmin = states('input_number.apollo_gate_decay_floor_min') | int(15) %}
+          {% set ns = namespace(search=0, lock=0, off=0) %}
+          {% for slug, dev in rooms %}
+            {% set s = states('input_text.' ~ slug ~ '_gate_floors') %}
+            {% set s = '' if s in ['unknown','unavailable','none'] else s %}
+            {% set fl = (s ~ '0' * 36)[:36] %}
+            {% set maxs = states('number.' ~ dev ~ '_apollo_radar_max_still_distance') | int(5) %}
+            {% set maxm = states('number.' ~ dev ~ '_apollo_radar_max_move_distance') | int(5) %}
+            {% for slot in range(18) %}
+              {% set g = slot % 9 %}
+              {% set typ = 'still' if slot < 9 else 'move' %}
+              {% set lim = maxs if slot < 9 else maxm %}
+              {% set v = states('input_number.' ~ slug ~ '_g' ~ g ~ '_' ~ typ) | int(-1) %}
+              {% set f = [fl[slot * 2:slot * 2 + 2] | int(0), fmin] | max %}
+              {% if v < 0 or v >= 100 or g > lim or (slot < 9 and g <= 1) %}
+                {% set ns.off = ns.off + 1 %}
+              {% elif v > f %}
+                {% set ns.search = ns.search + 1 %}
+              {% else %}
+                {% set ns.lock = ns.lock + 1 %}
+              {% endif %}
+            {% endfor %}
+          {% endfor %}
+          {{ ns.search }} søger · {{ ns.lock }} låst · {{ ns.off }} inaktive
+
+script:
+  # ---------------------------------------------------------------------------
+  # Sæt gulvet for ét gate. Eneste skriver af *_gate_floors (fejlklasse #2).
+  # Kaldes af flap-jagtens bump-gren. Gulvet kan kun stige (ratchet) — et lavere
+  # kald ignoreres, så et enkelt heldigt flap-frit vindue ikke kaster læringen væk.
+  # ---------------------------------------------------------------------------
+  apollo_gate_floor_set:
+    alias: "Apollo: sæt gate-gulv"
+    icon: mdi:lock-check
+    mode: queued
+    max: 20
+    fields:
+      slug:
+        description: "Rum-slug (stue/spisestue/koekken/boernevaerelse/sove)"
+        example: stue
+      slot:
+        description: "0-17: g0-g8 still, derefter g0-g8 move"
+        example: 3
+      value:
+        description: "Gulv-værdi 0-99"
+        example: 35
+    sequence:
+      - variables:
+          ent: "input_text.{{ slug }}_gate_floors"
+          # float→round→int: et kald med "3.0" (streng) ville give 0 med rent |int.
+          idx: "{{ [17, [0, slot | float(0) | round(0) | int] | max] | min }}"
+          # 💡 En `variables:`-template hvis output er RENE cifre uden foranstillet
+          # nul literal_eval'es af HA til et INT — gulv-strengen blev derfor et tal
+          # så snart slot 0 var sat (spisestue stod '9900…') og enhver indeksering
+          # kastede "'int' object is not subscriptable". Vi holder den som en LISTE
+          # af 18 to-tegns slots hele vejen: en liste parses altid som liste.
+          cur: >-
+            {% set s = states('input_text.' ~ slug ~ '_gate_floors') %}
+            {% set s = '' if s in ['unknown','unavailable','none'] else s %}
+            {% set s = (s ~ '0' * 36)[:36] %}
+            {% set ns = namespace(o=[]) %}
+            {% for i in range(18) %}{% set ns.o = ns.o + [s[i * 2:i * 2 + 2]] %}{% endfor %}
+            {{ ns.o }}
+      - variables:
+          old: "{{ cur[idx | int] | int(0) }}"
+          new: "{{ [99, [0, value | float(0) | round(0) | int] | max] | min }}"
+      - condition: template
+        value_template: >-
+          {{ slug in ['stue','spisestue','koekken','boernevaerelse','sove']
+             and (new | int) > (old | int) }}
+      - service: input_text.set_value
+        target:
+          entity_id: "{{ ent }}"
+        data:
+          value: >-
+            {{ (cur[:idx | int] + ['%02d' | format(new | int)]
+                + cur[idx | int + 1:]) | join }}
+
+  # Nulstil ALLE lærte gulve → hele huset genoptager jagten mod max følsomhed.
+  apollo_gate_floors_reset:
+    alias: "Apollo: nulstil gate-gulve (genstart jagten)"
+    icon: mdi:restore
+    mode: single
+    sequence:
+      - service: input_text.set_value
+        target:
+          entity_id:
+            - input_text.stue_gate_floors
+            - input_text.spisestue_gate_floors
+            - input_text.koekken_gate_floors
+            - input_text.boernevaerelse_gate_floors
+            - input_text.sove_gate_floors
+            # Bevis-kontoen ryddes MED gulvene: står tællerne tilbage på 2 af 3,
+            # ville det næste enkeltflap låse et nyt gulv med det samme, og
+            # nulstillingen ville ikke være den rene tavle den lover.
+            - input_text.stue_gate_flapcount
+            - input_text.spisestue_gate_flapcount
+            - input_text.koekken_gate_flapcount
+            - input_text.boernevaerelse_gate_flapcount
+            - input_text.sove_gate_flapcount
+        data:
+          value: "{{ '0' * 36 }}"
+      - service: logbook.log
+        data:
+          name: "Apollo gate-decay"
+          message: "Alle gate-gulve + flaptællere nulstillet — decay genoptager fra nuværende værdier."
+
+automation:
+  # ---------------------------------------------------------------------------
+  # DECAY-TICK: ét gate pr. rum, sænket med decay_step.
+  # /5-puls + interval-slider (så intervallet kan ændres uden reload).
+  # ---------------------------------------------------------------------------
+  - id: apollo_gate_decay_tick
+    alias: "Apollo gate-decay: ét skridt pr. rum"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: input_boolean.apollo_gate_decay_enabled
+        state: "on"
+      # 2026-08-16f: HVILKE rum der må sænkes afgøres nu PR. RUM af
+      # `sensor.apollo_kalib_rum` (apollo_flap_hunt.yaml) — samme roster som
+      # jagtens bump læser, så de to retninger ikke kan divergere (fejlklasse #2).
+      # Rosteret ejer alle de præmisser der før stod her: jagten armeret (= nogen
+      # bumper tilbage ved første spøgelse), huset tomt ELLER rummet bevisligt
+      # tomt om natten, robot/gardin i ro, og house_mode. Her testes kun at der
+      # OVERHOVEDET er et rum at arbejde på — selve udvælgelsen sker i loopet.
+      - condition: template
+        value_template: "{{ states('sensor.apollo_kalib_rum') | trim | length > 0 }}"
+      # Interval siden sidste skridt (B67: brug 'timestamp'-attributten).
+      - condition: template
+        value_template: >-
+          {% set t = state_attr('input_datetime.apollo_gate_decay_last', 'timestamp') %}
+          {% set iv = states('input_number.apollo_gate_decay_interval_minutes') | float(30) %}
+          {{ t is none or (now().timestamp() - (t | float(0))) >= iv * 60 }}
+      # Ro efter sidste flap: en igangværende spøgelses-storm skal bumpe færdig
+      # (og sætte sine gulve) før vi sænker noget nyt. Samme vindue som intervallet.
+      - condition: template
+        value_template: >-
+          {% set iv = states('input_number.apollo_gate_decay_interval_minutes') | float(30) %}
+          {% set ns = namespace(newest=0) %}
+          {% for s in ['stue','spisestue','koekken','boernevaerelse','sove'] %}
+            {% set t = state_attr('input_datetime.' ~ s ~ '_apollo_flap_last_bump', 'timestamp') %}
+            {% if t is not none and (t | float(0)) > ns.newest %}
+              {% set ns.newest = t | float(0) %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.newest == 0 or (now().timestamp() - ns.newest) >= iv * 60 }}
+    action:
+      - repeat:
+          for_each:
+            - {slug: stue, dev: stue}
+            - {slug: spisestue, dev: spisestue}
+            - {slug: koekken, dev: koekken}
+            - {slug: boernevaerelse, dev: boernevaerelse}
+            - {slug: sove, dev: sovevaerelse}
+          sequence:
+            - variables:
+                kalib: >-
+                  {{ repeat.item.slug in states('sensor.apollo_kalib_rum').split() }}
+                # ÉT scan finder gaten med størst afstand til sit gulv og
+                # returnerer "entity|målværdi" (foldet blok = streng → split).
+                pick: >-
+                  {% set slug = repeat.item.slug %}
+                  {% set dev = repeat.item.dev %}
+                  {% set stp = states('input_number.apollo_gate_decay_step') | int(1) %}
+                  {% set fmin = states('input_number.apollo_gate_decay_floor_min') | int(15) %}
+                  {% set maxs = states('number.' ~ dev ~ '_apollo_radar_max_still_distance') | int(5) %}
+                  {% set maxm = states('number.' ~ dev ~ '_apollo_radar_max_move_distance') | int(5) %}
+                  {% set s = states('input_text.' ~ slug ~ '_gate_floors') %}
+                  {% set s = '' if s in ['unknown','unavailable','none'] else s %}
+                  {% set fl = (s ~ '0' * 36)[:36] %}
+                  {% set ns = namespace(head=0, ent='', tgt=0) %}
+                  {% for slot in range(18) %}
+                    {% set g = slot % 9 %}
+                    {% set typ = 'still' if slot < 9 else 'move' %}
+                    {% set lim = maxs if slot < 9 else maxm %}
+                    {% set ent = 'input_number.' ~ slug ~ '_g' ~ g ~ '_' ~ typ %}
+                    {% set v = states(ent) | int(-1) %}
+                    {% set f = [fl[slot * 2:slot * 2 + 2] | int(0), fmin] | max %}
+                    {# still g0/g1 leverer 0 energi i chippen (målt 08-24) — at
+                       decaye dem koster NVRAM-writes uden at kunne ændre noget. #}
+                    {% if v >= 0 and v < 100 and g <= lim
+                    and not (slot < 9 and g <= 1) and (v - f) > ns.head %}
+                      {% set ns.head = v - f %}
+                      {% set ns.ent = ent %}
+                      {% set ns.tgt = [v - stp, f] | max %}
+                    {% endif %}
+                  {% endfor %}
+                  {{ ns.ent }}|{{ ns.tgt }}
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ kalib and (pick.split('|')[0] | trim) | length > 0 }}
+              then:
+                - service: input_number.set_value
+                  data:
+                    entity_id: "{{ pick.split('|')[0] | trim }}"
+                    value: "{{ pick.split('|')[1] | trim | int }}"
+                - service: logbook.log
+                  data:
+                    name: "Apollo gate-decay"
+                    message: >-
+                      {{ pick.split('|')[0] | trim | replace('input_number.', '') }}
+                      → {{ pick.split('|')[1] | trim }} (mere følsom).
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.apollo_gate_decay_last
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"

@@ -1,0 +1,293 @@
+# =============================================================================
+# GPS-watchdog — telefonen holder op med at rapportere position (2026-08-02)
+# =============================================================================
+# User-spec: "notificér KUN ved lange udfald" (+ kvittering når den er tilbage),
+# for begge telefoner. Baggrund: Parent B's iPhone stod frosset på Frederiksberg
+# fra 07-22 21:12 til 08-01 16:27 = 235 timer med BYTE-IDENTISKE koordinater
+# (samme par til sidste decimal). Ingen rapporter ankom overhovedet —
+# det var ikke et dårligt fix. Ingen opdagede det i 10 dage.
+#
+# HVORFOR DEN EKSISTERENDE VAGT IKKE FANGEDE DET:
+# automations/presence_gps_stale.yaml har `input_boolean.<person>_home == on`
+# som hård condition — den rydder et home-flag der står forkert oppe. Parent B
+# var VÆK da frysningen begyndte, så flaget var allerede off → automationen
+# fyrede aldrig én gang. Dens varsel er desuden en `persistent_notification`
+# (sidebar-klokken), ikke en push, og den rydder sig selv ved recovery. Denne
+# pakke dækker det modsatte hjørne: "telefonen er tavs, uanset hvor den er".
+#
+# 💡 HVORFOR IKKE `device_tracker.last_updated` (fejlklasse #5-familien):
+# den nulstilles ved HVER HA-restart, og huset genstarter flere gange dagligt.
+# gps_freshness.yaml's egen header dokumenterer det som en accepteret ~30-min
+# grace — harmløst ved 30 min, FATALT ved et døgn: en 30-timers tærsklen ville
+# aldrig nås, og featuren ville være tavs for altid. Friskhed skal derfor komme
+# fra en SKREVET værdi → `input_datetime.<person>_gps_sidst_rapport`, stemplet
+# af gps_watchdog_stempel nedenfor.
+#
+# 💡 KALIBRERING (14 dages recorder-historik, målt på ÆGTE positions-ændringer
+# — restart-artefakter filtreret fra ved at kræve at lat/lon faktisk flyttede):
+#   Parent A (Android, slukker telefonen hver nat):
+#     normale nat-huller 6,7 / 7,7 / 7,8 / 7,8 / 8,0 / 10,0 t
+#     LEGITIME lange:    16,6 / 20,3 / 20,6 t  (telefon slukket + stillestående
+#                        hjemme hele den følgende dag)
+#   Parent B (iPhone, significant-location-change = rapporterer sjældent):
+#     legitimt hul       16,25 t (hjemme, natten 08-01 21:52 → 08-02 14:07)
+#     frysningen         235,25 t
+# Kløften er enorm: værste legitime hul 20,6 t mod fejlens 235 t. Default er
+# derfor **30 timer** — ikke de 12 der først blev nævnt: 12 t ville fyre falsk
+# HVER ENESTE NAT for begge telefoner og gøre varslet til støj, hvilket er
+# præcis det user bad om at undgå. 30 t har 46 % luft over værste legitime hul
+# og fanger stadig en ægte frysning inden for halvandet døgn. Min. er 6 t.
+#
+# Push via script.push_notify (nid: gps_stale) → per-type toggles + AirBnB-gate
+# (default OFF i AirBnB, silent-reglen). BEVIDST ingen `notif_gps_stale_hjemme`:
+# et frosset GPS er mest kritisk netop mens man er ude, så varslet må ikke
+# udskydes til hjemkomst.
+# =============================================================================
+
+input_boolean:
+  notif_gps_stale_enabled:
+    name: "📵 GPS frosset — send"
+    icon: mdi:map-marker-off-outline
+  notif_gps_stale_parent_a:
+    name: "📵 GPS frosset — Parent A"
+    icon: mdi:cellphone
+  notif_gps_stale_parent_b:
+    name: "📵 GPS frosset — Parent B"
+    icon: mdi:cellphone
+  notif_gps_stale_airbnb:
+    name: "📵 GPS frosset — også i AirBnB"
+    icon: mdi:home-account
+
+input_number:
+  gps_watchdog_min_timer:
+    name: "📵 GPS-watchdog: min. timer tavs før varsel"
+    min: 6
+    max: 96
+    step: 1
+    unit_of_measurement: "t"
+    icon: mdi:timer-alert-outline
+
+input_datetime:
+  # RUNTIME-stempler (ikke config → ude af helper-snapshottet, jf.
+  # helpers_export.py::is_config som kun snapshotter DATETIME_CONFIG + notif_*).
+  # `initial` = sentinel LANGT før alt ægte brug: en helper der aldrig er skrevet
+  # starter ellers på DAGENS midnat, hvilket ville se ud som et 0-24 timers
+  # udfald og kunne fyre falsk. Scan-automationen sår sentinelen til now() ved
+  # første kørsel, så uret starter uden varsel (fejler ÅBENT).
+  parent_a_gps_sidst_rapport:
+    name: "Parent A GPS: sidste ægte rapport (stempel)"
+    icon: mdi:map-marker-check-outline
+    has_date: true
+    has_time: true
+    initial: "2000-01-01 00:00:00"
+  parent_b_gps_sidst_rapport:
+    name: "Parent B GPS: sidste ægte rapport (stempel)"
+    icon: mdi:map-marker-check-outline
+    has_date: true
+    has_time: true
+    initial: "2000-01-01 00:00:00"
+
+input_text:
+  # Runtime dedupe-store: hvilke personer vi allerede har varslet om, så
+  # /15-scannet ikke re-pusher under et vedvarende udfald (fejlklasse #13).
+  # Overlever restart via .storage → ingen re-push efter genstart.
+  gps_watchdog_varslet:
+    name: "GPS-watchdog: allerede varslet (personer)"
+    max: 64
+    icon: mdi:bell-check
+
+template:
+  # Trigger-baseret: ren tids-aldring, ingen kilde-entity der selv skifter →
+  # en state-baseret template ville aldrig re-rendere af sig selv.
+  - trigger:
+      - platform: time_pattern
+        minutes: "/15"
+      - platform: homeassistant
+        event: start
+      - platform: state
+        entity_id:
+          - input_datetime.parent_a_gps_sidst_rapport
+          - input_datetime.parent_b_gps_sidst_rapport
+          - input_number.gps_watchdog_min_timer
+          - input_boolean.parent_b_ios_geofence_enabled
+    sensor:
+      - name: "GPS frosne telefoner"
+        unique_id: gps_frosne_telefoner
+        icon: mdi:map-marker-off-outline
+        state: >
+          {% set thresh = states('input_number.gps_watchdog_min_timer') | float(30) %}
+          {% set ns = namespace(n=0) %}
+          {# Er iOS-geofencen autoritativ, er Parent B's tracker BEVIDST frossen
+             (app-tilladelsen står på "Kun mens appen bruges") → ikke et udfald.
+             Samme roster-udtryk i `personer` nedenfor — hold dem ens (#2). #}
+          {% for p in [('Parent A', 'input_datetime.parent_a_gps_sidst_rapport')]
+                      + ([] if is_state('input_boolean.parent_b_ios_geofence_enabled', 'on')
+                            else [('Parent B', 'input_datetime.parent_b_gps_sidst_rapport')]) %}
+            {% set ts = state_attr(p[1], 'timestamp') | float(0) %}
+            {% if ts > 946771200 and (as_timestamp(now()) - ts) > thresh * 3600 %}
+              {% set ns.n = ns.n + 1 %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.n }}
+        attributes:
+          # Ankeret: navne på personer hvis stempel er ældre end tærsklen.
+          personer: >
+            {% set thresh = states('input_number.gps_watchdog_min_timer') | float(30) %}
+            {% set ns = namespace(out=[]) %}
+            {% for p in [('Parent A', 'input_datetime.parent_a_gps_sidst_rapport')]
+                        + ([] if is_state('input_boolean.parent_b_ios_geofence_enabled', 'on')
+                              else [('Parent B', 'input_datetime.parent_b_gps_sidst_rapport')]) %}
+              {% set ts = state_attr(p[1], 'timestamp') | float(0) %}
+              {% if ts > 946771200 and (as_timestamp(now()) - ts) > thresh * 3600 %}
+                {% set ns.out = ns.out + [p[0]] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out }}
+          # Personer hvis stempel aldrig er skrevet (sentinel) → skal sås, ikke varsles.
+          usaaede: >
+            {% set ns = namespace(out=[]) %}
+            {% for p in [('Parent A', 'input_datetime.parent_a_gps_sidst_rapport'),
+                         ('Parent B', 'input_datetime.parent_b_gps_sidst_rapport')] %}
+              {% if (state_attr(p[1], 'timestamp') | float(0)) <= 946771200 %}
+                {% set ns.out = ns.out + [p[1]] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out }}
+          # Timer siden sidste ægte rapport pr. person (dashboard + besked).
+          timer: >
+            {% set ns = namespace(d={}) %}
+            {% for p in [('Parent A', 'input_datetime.parent_a_gps_sidst_rapport'),
+                         ('Parent B', 'input_datetime.parent_b_gps_sidst_rapport')] %}
+              {% set ts = state_attr(p[1], 'timestamp') | float(0) %}
+              {% if ts > 946771200 %}
+                {% set ns.d = dict(ns.d, **{p[0]: ((as_timestamp(now()) - ts) / 3600) | round(1)}) %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.d }}
+
+automation:
+  # --- Stempl hver ÆGTE positions-rapport ---
+  - id: gps_watchdog_stempel
+    alias: "GPS-watchdog: stempl ægte tracker-rapport"
+    description: >
+      Skriver `input_datetime.<person>_gps_sidst_rapport` når device_trackeren
+      leverer en position der FAKTISK har flyttet sig. Kravet om ændret lat/lon
+      er hele restart-immuniteten: ved HA-start tilføjes entiteten (from_state
+      is none) og mobile_app-integrationen kan re-publicere den sidst kendte
+      position uændret — begge dele ville ellers nulstille udfalds-uret og gøre
+      watchdoggen permanent tavs. Samme kriterium som kalibreringen blev målt
+      med, så tærskel og detektor måler præcis det samme.
+    mode: queued
+    max: 10
+    trigger:
+      - platform: state
+        entity_id: device_tracker.phone_a
+        id: parent_a
+      - platform: state
+        entity_id: device_tracker.phone_b
+        id: parent_b
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.from_state is not none
+             and trigger.to_state is not none
+             and trigger.to_state.state not in ['unknown', 'unavailable']
+             and (
+               trigger.to_state.attributes.get('latitude')
+                 != trigger.from_state.attributes.get('latitude')
+               or trigger.to_state.attributes.get('longitude')
+                 != trigger.from_state.attributes.get('longitude')
+             ) }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: "input_datetime.{{ trigger.id }}_gps_sidst_rapport"
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # --- Scan + varsel ---
+  - id: gps_watchdog_scan
+    alias: "GPS-watchdog: telefon tavs > tærskel (scan + varsel)"
+    description: >
+      /15-scan + reaktion på ændring i sensor.gps_frosne_telefoner. Nye tavse
+      telefoner → push; genoprettede (tidligere varslet, nu tilbage) →
+      kvittering. Dedupe-store i input_text så et vedvarende udfald ikke
+      re-pusher hvert kvarter (fejlklasse #13). Usåede stempler (sentinel fra
+      første boot) sås til now() i stedet for at blive varslet.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/15"
+      - platform: state
+        entity_id: sensor.gps_frosne_telefoner
+    variables:
+      stale: "{{ state_attr('sensor.gps_frosne_telefoner', 'personer') | default([], true) }}"
+      usaaede: "{{ state_attr('sensor.gps_frosne_telefoner', 'usaaede') | default([], true) }}"
+      timer_map: "{{ state_attr('sensor.gps_frosne_telefoner', 'timer') | default({}, true) }}"
+      varslet_raw: "{{ states('input_text.gps_watchdog_varslet') }}"
+      varslet: >
+        {{ (varslet_raw.split(',') | map('trim') | reject('eq', '') | list)
+           if varslet_raw not in ['unknown', 'unavailable', 'None', ''] else [] }}
+      nye: "{{ stale | reject('in', varslet) | list }}"
+      tilbage: "{{ varslet | reject('in', stale) | list }}"
+      trackers: >
+        {{ {'Parent A': 'device_tracker.phone_a',
+            'Parent B': 'device_tracker.phone_b'} }}
+    action:
+      # --- Så uskrevne stempler (første boot) → uret starter uden falsk varsel ---
+      - if:
+          - condition: template
+            value_template: "{{ usaaede | length > 0 }}"
+        then:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: "{{ usaaede }}"
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      # --- Nye tavse telefoner → varsel ---
+      - if:
+          - condition: template
+            value_template: "{{ nye | length > 0 }}"
+        then:
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: gps_stale
+              title: "📵 Telefon rapporterer ikke position"
+              message: >-
+                {% set ns = namespace(lines=[]) %}
+                {% for p in nye %}
+                  {% set t = timer_map.get(p, 0) | float(0) %}
+                  {% set zone = states(trackers.get(p, '')) %}
+                  {% set ns.lines = ns.lines + [
+                       '• ' ~ p ~ ': tavs i ' ~ (t / 24) | round(1) ~ ' døgn (sidst set: ' ~ zone ~ ')'] %}
+                {% endfor %}
+                {{ ns.lines | join('\n') }}
+
+                Positionen er frosset — huset regner stadig med den gamle placering.
+                Tjek Companion-appen: baggrunds-opdatering, lokations-tilladelse
+                "Altid", og at batterisparetilstand ikke har suspenderet den.
+              payload:
+                tag: gps_stale
+      # --- Genoprettet → kvittering ---
+      - if:
+          - condition: template
+            value_template: "{{ tilbage | length > 0 }}"
+        then:
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: gps_stale
+              title: "📶 Position rapporteres igen"
+              message: >-
+                {{ tilbage | join(', ') }}
+                {{ 'sender' if tilbage | length == 1 else 'sender' }}
+                position igen — huset følger den rigtige placering.
+              payload:
+                tag: gps_stale
+      # --- Gem aktuel tavs-liste som ny dedupe-store ---
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.gps_watchdog_varslet
+        data:
+          value: "{{ stale | join(',') }}"

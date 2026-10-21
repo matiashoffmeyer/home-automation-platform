@@ -1,0 +1,460 @@
+# =============================================================================
+# roborock_morgen_udskyd.yaml — manuel morgen-støvsugning venter på tomt hus
+# =============================================================================
+# 🛑 SLÅET FRA 2026-08-16 (user-spec: "det der med at den venter på at vi er
+# væk (dormant), det skal deaktiveres. ikke nødvendigt længere").
+# `input_boolean.roborock_morgen_udskyd_enabled` er sat OFF live og er fjernet
+# fra init-defaults, så den heller ikke kommer tilbage ved en fresh install.
+# Koden bliver stående: kill-switchen gater ALLE tre veje ind (arm, re-pause,
+# tick), og tick-grenen (a) slipper en ventende robot løs inden 2 min hvis
+# flaget slås fra midt i en ventetid — så featuren er inert, ikke halvdød.
+# Vil du have adfærden tilbage, tænd kontakten på Indstillinger.
+#
+# User-spec 2026-08-06: "en ting til morgener (07-10). hvis robotstøvsugning
+# startes manuelt så start den, vent 20 sek, så pause den (så kan jeg se at den
+# gik igennem) og så vent til huset går dormant og SÅ fortsætter den sin
+# støvsugning."
+#
+# HVORFOR: målt 08-06 startede brugeren robotten manuelt 07:38:52 (intet
+# roborock_manual_start_at-stempel → Roborock-app'en eller robottens egen knap)
+# og den støvsugede 35 min til 08:14 mens house_state stod ACTIVE = hele
+# familien var hjemme i morgenrutinen. De AUTOMATISKE cleans er gated på
+# Dormant + occupancy-veto (roborock.yaml §1), men manuel start er bevidst
+# u-gatet — derfor er der ingen bremse i morgenvinduet.
+#
+# MODEL — tre trin, ét stempel, én /2-tick:
+#   1) ARM: status → "cleaning" i vinduet (07-10) mens huset IKKE er Dormant
+#      → lad den køre `vis_sekunder` (20) så brugeren HØRER/SER at kommandoen
+#      gik igennem → vacuum.pause → stempel + venter-flag + push.
+#  1b) RE-PAUSE: huset forlader Dormant igen mens den genoptagne kørsel er i
+#      gang → pause og vent forfra (user-svar 2026-08-06: "ja re-pause").
+#   2) TICK (/2 min): Dormant stabilt i MAX(`dormant_settle_minutter` (6),
+#      `roborock_dormant_delay_minutter` (60)) → ryd flag → vacuum.start
+#      (= resume, se nedenfor) → push.
+#
+# 🎓 TRÆNER-KARANTÆNEN GÆLDER OGSÅ HER (user-valg 2026-08-06 "samme karantæne"):
+# Apollo flap-jagt og gate-decay kører KUN i Dormant og holder pause mens
+# robotten kører. Genoptog vi ved Dormant+6, åd den manuelle morgen-clean netop
+# de lange vinduer træneren lever af — morgen-udskydelsen udløses jo præcis på
+# dage hvor familien går. Vi læser derfor SAMME slider som den automatiske
+# Dormant-clean (roborock.yaml §1) i stedet for at kopiere tallet (fejlklasse
+# #2). Sæt den til 0 for at få den gamle Dormant+6-adfærd tilbage.
+#
+# 📅 Vinduet gælder ALLE ugedage, også weekend (user-svar 2026-08-06: "ja 07-10
+# også i weekenden") — der er bevidst ingen workday-condition. Weekendmorgener
+# er netop hvor hele familien er hjemme længst.
+#
+# ⏱️ Hvorfor 6 min settle og ikke 0: house_dormant_occupied_bounce
+# (automations/dormant_schedule.yaml) sender Dormant TILBAGE til Active efter
+# `for: minutes: 5` hvis occupancy-rosteret ser nogen hjemme. Venter vi 6 min,
+# har bounce'en haft sin chance → vi arver dens occupancy-veto gratis i stedet
+# for at kopiere rosteret hertil (fejlklasse #16: 8-sensor-rosteret er allerede
+# copy-pastet 4 steder).
+#
+# 🔁 vacuum.start på en PAUSET robot = RESUME, ikke ny clean: integrationens
+# async_start sender APP_START, og robotten fortsætter den afbrudte kørsel
+# (in_cleaning == 1). Zone-/segment-cleans har egne resume-kommandoer og
+# rammes ikke her — status er da `zoned_cleaning`/`segment_cleaning`, ikke
+# `cleaning`, så måltids-spot-cleanen (app_segment_clean, segment 16) og
+# app-zone-cleans armerer ALDRIG denne feature. Verificeret mod 3 døgns
+# status-historik.
+#
+# 🧹 Mop-vask midt i en FULL clean giver cleaning → washing_the_mop →
+# cleaning (målt 08-03: 4 gange på én time). Det kan altså RE-armere featuren
+# hvis huset i mellemtiden er gået Active igen (= familien kom hjem midt i
+# morgenvinduet) — det er bevidst og matcher husets øvrige politik
+# (roborock_hjemkomst_interrupt pauser+dokker ved hjemkomst).
+#
+# 🔌 Kill-switchen gater kun ARM-vejen. Slås den fra MENS robotten venter,
+# slipper tick'en robotten løs med det samme (inden 2 min) — en slukket
+# feature må ikke efterlade en robot paused for evigt (fejlklasse #21).
+#
+# GIV OP: har den ventet over `vent_max_minutter` (180) uden at huset blev
+# tomt, sendes robotten på dock via det eksisterende script.roborock_stop_dock
+# (rydder session-flag FØRST, så kørslen ikke bogføres som gennemført) + push.
+# Fra en start 07-10 er worst case 10:00 → 13:00. ⏳ Giv-op-uret holder pause
+# mens huset ER Dormant: dér venter vi kun på karantænen, og huset er beviseligt
+# tomt — at docke sekunder før en kørsel kunne starte ville være det modsatte af
+# formålet. Går huset Active igen, rammer giv-op ved næste tick som før.
+# =============================================================================
+
+input_boolean:
+  roborock_morgen_udskyd_enabled:
+    name: "🧹 Morgen: udskyd manuel støvsugning til huset er tomt"
+    icon: mdi:robot-vacuum-alert
+
+  # RUNTIME-flag (ikke config → ude af helper-snapshottet, ryddes ved AirBnB).
+  roborock_morgen_venter:
+    name: "🧹 Robot venter på tomt hus (morgen)"
+    icon: mdi:pause-octagon
+
+input_number:
+  roborock_morgen_vis_sekunder:
+    name: "🧹 Morgen: kvitterings-kørsel før pause"
+    min: 5
+    max: 60
+    step: 5
+    unit_of_measurement: "s"
+    icon: mdi:timer-play
+
+  roborock_morgen_dormant_settle_minutter:
+    name: "🧹 Morgen: Dormant skal holde i"
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:timer-sand
+
+  roborock_morgen_vent_max_minutter:
+    name: "🧹 Morgen: giv op efter"
+    min: 15
+    max: 480
+    step: 15
+    unit_of_measurement: "min"
+    icon: mdi:timer-off
+
+input_datetime:
+  roborock_morgen_udskyd_start:
+    name: "🧹 Morgen-vindue start"
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+
+  roborock_morgen_udskyd_slut:
+    name: "🧹 Morgen-vindue slut"
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+
+  # RUNTIME-stempel: hvornår pausen blev sat (ude af snapshot-allowlisten).
+  roborock_morgen_vent_start:
+    name: "🧹 Robot pauset (morgen) kl."
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+
+automation:
+  # ---------------------------------------------------------------------------
+  # 1) ARM: manuel morgen-clean → kvitterings-kørsel → pause → vent
+  # ---------------------------------------------------------------------------
+  - id: roborock_morgen_arm_udskyd
+    alias: "Roborock: manuel morgen-clean → pause og vent på tomt hus"
+    description: >
+      Hel-hus-rengøring startet i morgenvinduet mens huset er Active (familien
+      hjemme) → lad den køre nogle sekunder som kvittering, pause, og vent på
+      Dormant. Trigger er `cleaning` (hel hus) — zone- og segment-cleans har
+      egne statusser og rammes ikke. Flaget `roborock_morgen_venter` gør
+      re-arm umulig mens vi allerede venter.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_status
+        to: "cleaning"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roborock_morgen_udskyd_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Huset må IKKE være Dormant — er det tomt, skal robotten bare køre.
+      # Dette er samtidig guarden mod at vores EGET resume-kald (som kun sker
+      # i Dormant) armerer featuren igen.
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_state
+            state: "Dormant"
+      - condition: state
+        entity_id: input_boolean.roborock_morgen_venter
+        state: "off"
+      # Morgenvinduet (slidere på Indstillinger → wrap-sikker hvis start > slut).
+      - condition: template
+        value_template: >-
+          {% set sh = state_attr('input_datetime.roborock_morgen_udskyd_start', 'hour') %}
+          {% set sm = state_attr('input_datetime.roborock_morgen_udskyd_start', 'minute') %}
+          {% set eh = state_attr('input_datetime.roborock_morgen_udskyd_slut', 'hour') %}
+          {% set em = state_attr('input_datetime.roborock_morgen_udskyd_slut', 'minute') %}
+          {% if sh is none or eh is none %}false
+          {% else %}
+            {% set n = now().hour * 60 + now().minute %}
+            {% set s = sh * 60 + sm %}
+            {% set e = eh * 60 + em %}
+            {% if s == e %}false
+            {% elif s < e %}{{ s <= n < e }}
+            {% else %}{{ n >= s or n < e }}{% endif %}
+          {% endif %}
+    action:
+      - delay:
+          seconds: "{{ states('input_number.roborock_morgen_vis_sekunder') | int(20) }}"
+      # Efter kvitterings-kørslen: kører den stadig? (Brugeren kan have dokket
+      # den selv, eller robotten kan være løbet ind i en fejl.)
+      - condition: state
+        entity_id: sensor.s8_maxv_ultra_status
+        state: "cleaning"
+      - service: vacuum.pause
+        target: {entity_id: vacuum.s8_maxv_ultra}
+      # Stempel + flag sættes EFTER pausen — ellers kunne /2-tick'en se
+      # "venter=on + robotten kører" midt i delayet og rydde flaget, så en
+      # pauset robot stod tilbage uden nogen der ventede på den.
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_morgen_vent_start}
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.roborock_morgen_venter}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: >-
+            Manuel morgen-clean pauset efter
+            {{ states('input_number.roborock_morgen_vis_sekunder') | int(20) }} s
+            kvitterings-kørsel — fortsætter når huset går Dormant.
+      - service: script.push_notify
+        data:
+          notif_id: roborock
+          title: "⏸️ Robotten venter til I er gået"
+          message: >-
+            Støvsugningen er registreret og sat på pause — den fortsætter af sig
+            selv når huset går i dvale. Tryk Fortsæt i Roborock-app'en hvis den
+            skal køre nu alligevel.
+
+  # ---------------------------------------------------------------------------
+  # 1b) RE-PAUSE: huset vågnede igen mens den genoptagne kørsel var i gang
+  # ---------------------------------------------------------------------------
+  - id: roborock_morgen_repause
+    alias: "Roborock: huset vågnede under genoptaget morgen-clean → pause igen"
+    description: >
+      Arm-automationen kan ikke fange dette selv: den trigger på OVERGANGEN til
+      `cleaning`, og en kørsel der allerede er i gang skifter ikke status når
+      familien kommer tilbage. Eneste flanke er derfor at huset forlader
+      Dormant. `roborock_dormant_interrupt` i roborock.yaml dækker det ikke —
+      den kræver `roborock_session_active == on` (= HA-startet session) og
+      DOKKER robotten, mens en manuelt/app-startet kørsel har flaget off.
+      Derfor gater vi netop på `session_active == off`, så de to aldrig
+      kæmper om samme kørsel.
+      Scope = "den kørsel VI adopterede i dag": stemplet skal være fra i dag og
+      være sat (en urørt `input_datetime` med `has_date` står på dagens midnat
+      og ville ellers matche). Stemplet sættes forfra, så både giv-op-uret og
+      tick'ens 2-minutters annullerings-grace starter på ny.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.house_state
+        from: "Dormant"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roborock_morgen_udskyd_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.roborock_morgen_venter
+        state: "off"
+      - condition: state
+        entity_id: sensor.s8_maxv_ultra_status
+        state: "cleaning"
+      # HA-startede sessioner ejes af roborock_dormant_interrupt (som dokker).
+      - condition: state
+        entity_id: input_boolean.roborock_session_active
+        state: "off"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: template
+        value_template: >-
+          {% set s = states('input_datetime.roborock_morgen_vent_start') %}
+          {{ s[:10] == now().strftime('%Y-%m-%d') and s[11:] != '00:00:00' }}
+    action:
+      - service: vacuum.pause
+        target: {entity_id: vacuum.s8_maxv_ultra}
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_morgen_vent_start}
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.roborock_morgen_venter}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: >-
+            Huset vågnede under den genoptagne morgen-clean — robotten er pauset
+            igen og venter på næste Dormant.
+      - service: script.push_notify
+        data:
+          notif_id: roborock
+          title: "⏸️ Robotten venter igen"
+          message: >-
+            I er hjemme igen, så støvsugningen er sat på pause. Den fortsætter
+            af sig selv næste gang huset går i dvale.
+
+  # ---------------------------------------------------------------------------
+  # 2) TICK: genoptag / giv op / annullér
+  # ---------------------------------------------------------------------------
+  - id: roborock_morgen_vent_tick
+    alias: "Roborock: morgen-venter tick (genoptag ved Dormant)"
+    description: >
+      Ét tick ejer alle udgange af vente-tilstanden, så flaget aldrig kan hænge:
+      (a) kill-switch slået fra → slip robotten løs nu; (b) robotten er ikke
+      længere paused (brugeren fortsatte/dokkede den selv, eller fejl) →
+      annullér lydløst; (c) Dormant stabilt i settle-vinduet → resume;
+      (d) ventet for længe → dock + push. Tidsdrevet (ingen flanke at miste
+      ved HA-restart, jf. fejlklasse #4).
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/2"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roborock_morgen_venter
+        state: "on"
+    action:
+      - variables:
+          ventet_min: >-
+            {% set t = state_attr('input_datetime.roborock_morgen_vent_start', 'timestamp') %}
+            {{ 0 if t is none or (t | float(0)) <= 0
+               else ((as_timestamp(now()) - (t | float(0))) / 60) | round(1) }}
+          max_min: "{{ states('input_number.roborock_morgen_vent_max_minutter') | int(180) }}"
+          settle_min: "{{ states('input_number.roborock_morgen_dormant_settle_minutter') | int(6) }}"
+          # Træner-karantænen deles med den automatiske Dormant-clean
+          # (roborock.yaml §1) — ÉT tal, to veje (fejlklasse #2). Vi venter det
+          # LÆNGSTE af bounce-settle og karantæne, så ingen af de to formål kan
+          # underbydes af den anden slider.
+          karantaene_min: >-
+            {% set s = states('input_number.roborock_morgen_dormant_settle_minutter') | int(6) %}
+            {% set k = states('input_number.roborock_dormant_delay_minutter') | int(60) %}
+            {{ [s, k] | max }}
+          dormant_min: >-
+            {% set lc = states.input_select.house_state.last_changed %}
+            {{ 0 if lc is none else ((now() - lc).total_seconds() / 60) | round(1) }}
+          er_paused: "{{ is_state('vacuum.s8_maxv_ultra', 'paused') }}"
+      - choose:
+          # (a) Featuren er slået fra midt i ventetiden → slip robotten løs.
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.roborock_morgen_udskyd_enabled
+                state: "off"
+            sequence:
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.roborock_morgen_venter}
+              - if:
+                  - condition: template
+                    value_template: "{{ er_paused }}"
+                then:
+                  - service: vacuum.start
+                    target: {entity_id: vacuum.s8_maxv_ultra}
+              - service: logbook.log
+                data:
+                  name: "Roborock"
+                  message: >-
+                    Morgen-udskydelsen blev slået fra under ventetiden — robotten
+                    sluppet løs igen ({{ ventet_min }} min pauset).
+
+          # (b) Robotten er ikke længere paused → brugeren (eller robotten selv)
+          #     har overtaget. Ingen push: han gjorde det selv.
+          #     ⏱️ `ventet_min >= 2` er ikke pynt: Roborock-integrationens state
+          #     følger en coordinator-refresh, så vacuum-entity'en kan STADIG
+          #     stå 'cleaning' sekunder efter vores pause-kommando. Uden
+          #     grace-vinduet ville et tick lige efter arm annullere sig selv og
+          #     efterlade en pauset robot uden nogen der ventede på den.
+          - conditions:
+              - condition: template
+                value_template: "{{ not er_paused and (ventet_min | float(0)) >= 2 }}"
+            sequence:
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.roborock_morgen_venter}
+              - service: logbook.log
+                data:
+                  name: "Roborock"
+                  message: >-
+                    Morgen-ventetiden annulleret — robotten er ikke længere
+                    pauset ({{ states('vacuum.s8_maxv_ultra') }}).
+
+          # (c) Huset er tomt og stabilt → fortsæt støvsugningen.
+          - conditions:
+              - condition: state
+                entity_id: input_select.house_state
+                state: "Dormant"
+              - condition: template
+                value_template: "{{ (dormant_min | float(0)) >= (karantaene_min | int(60)) }}"
+            sequence:
+              # Flaget ryddes FØR start, så arm-automationen ikke kan se
+              # venter=on når status vender tilbage til cleaning.
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.roborock_morgen_venter}
+              # Samme forsigtig-mode som husets øvrige Dormant-starts.
+              - service: script.roborock_apply_forsigtig
+              - service: vacuum.start
+                target: {entity_id: vacuum.s8_maxv_ultra}
+              - service: logbook.log
+                data:
+                  name: "Roborock"
+                  message: >-
+                    Huset er Dormant ({{ dormant_min }} min) — morgen-clean
+                    genoptaget efter {{ ventet_min }} min pause.
+              - service: script.push_notify
+                data:
+                  notif_id: roborock
+                  title: "▶️ Robotten fortsatte støvsugningen"
+                  message: >-
+                    Huset gik i dvale efter {{ ventet_min }} min — den pausede
+                    morgen-støvsugning kører videre nu.
+
+          # (d) Ventet for længe → dock (uden at bogføre den som gennemført).
+          #     ⏳ Giver IKKE op mens træner-karantænen tæller ned: er huset
+          #     Dormant, er (c) allerede fyret ELLER vi venter kun på karantænen,
+          #     og så VED vi at huset er tomt — at docke dér ville kassere en
+          #     kørsel der er sekunder fra at starte. Går huset Active igen,
+          #     rammer giv-op-grenen ved næste tick som før.
+          - conditions:
+              - condition: template
+                value_template: "{{ (ventet_min | float(0)) >= (max_min | int(180)) }}"
+              - condition: not
+                conditions:
+                  - condition: state
+                    entity_id: input_select.house_state
+                    state: "Dormant"
+            sequence:
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.roborock_morgen_venter}
+              - service: script.roborock_stop_dock
+              - service: logbook.log
+                data:
+                  name: "Roborock"
+                  message: >-
+                    Morgen-clean opgivet efter {{ ventet_min }} min — huset blev
+                    ikke tomt. Robotten sendt til dock.
+              - service: script.push_notify
+                data:
+                  notif_id: roborock
+                  title: "🚫 Robotten nåede ikke at støvsuge"
+                  message: >-
+                    Den ventede {{ ventet_min }} min på at huset blev tomt og er
+                    nu kørt på dock. Start den igen når I er ude.
+
+  # ---------------------------------------------------------------------------
+  # 3) Backstop: flaget må ikke overleve natten
+  # ---------------------------------------------------------------------------
+  - id: roborock_morgen_vent_clear_nat
+    alias: "Roborock: ryd morgen-vente-flag ved midnat"
+    description: >
+      Sikkerhedsnet hvis tick'en aldrig nåede en udgang (fx HA nede hele dagen
+      med flaget sat): flaget må ikke stå on ind i næste morgen, hvor det ville
+      spærre arm-vejen.
+    mode: single
+    trigger:
+      - platform: time
+        at: "00:01:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roborock_morgen_venter
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.roborock_morgen_venter}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: "Morgen-vente-flag ryddet ved midnat (nåede aldrig en udgang)."

@@ -1,0 +1,163 @@
+# =============================================================================
+# Dvale-lås: kræv hoveddør (+GPS) for at vågne fra manuel Dormant (2026-07-10)
+# =============================================================================
+# User-spec: "Hvis jeg i appen erklærer Dormant, skal sensor-aktivitet IKKE gøre
+# huset Active uden at hoveddøren åbnes — for så er det helt sikkert flaps (hvis
+# det ikke er gardiner eller støvsuger). Samme hvis jeg med entré-Styrbar NED
+# erklærer Dormant og lukker hoveddøren: der skal en åbning af hoveddøren til for
+# at erklære Active." + fine-tune-sliders.
+#
+# PROBLEM (verificeret i historik 2026-07-09/10): huset gik Dormant → Active igen
+# efter ~2 min (nogle gange SAMME sekund) = radar-flaps trigger house_state_to_
+# active's `occupancy`/`physical_presence_recent`-triggers og vækker et tomt hus.
+#
+# LØSNING: en LÅS (`input_boolean.dormant_door_lock`, runtime — restores over
+# restart) der ENGAGES når DU manuelt sætter huset på Dormant, og som BLOKERER de
+# sensor-baserede vække-triggers i `house_state_to_active` (occupancy, physical_
+# presence_recent, terrassedør) indtil hoveddøren faktisk åbnes. Gaten + R8-
+# HA-start-tjekket bor i house_modes.yaml; her bor helpers + engage/frigiv-logik.
+#
+# VÆKKERE MENS LÅST (user-valg 2026-07-10): hoveddør-åbning + GPS-hjemkomst
+# (parent_a_home/parent_b_home). Terrassedør + al occupancy/flap er blokeret.
+# AUTO-FRIGIV: ingen — kun hoveddør (eller manuel Active) frigiver (user-valg).
+#
+# FINE-TUNE (kill-switches, snapshottes via *_enabled):
+#   - dormant_door_lock_enabled       : hele featuren til/fra (default ON)
+#   - dormant_door_lock_gps_enabled   : må GPS-hjemkomst også vække? (default ON)
+#   - dormant_door_lock_auto_enabled  : gælder låsen OGSÅ auto/GPS-dvale (idle/
+#                                       schedule), ikke kun manuel? (default ON
+#                                       pr. 2026-07-18 — robot-loop-fix, se init)
+#
+# ENGAGE-veje (kun i Normal-mode): (a) app-tile vælger house_state=Dormant
+# (context.user_id != none), (b) manuel dvale-knap (manual_dormant_override→on),
+# (c) entré-NED-Dormant (sat eksplicit i entre_ned_dormant.yaml), (d) enhver
+# Dormant hvis auto_enabled er ON. FRIGIV: house_state→Active (enhver vej),
+# hoveddør→on, eller featuren slås fra.
+# =============================================================================
+
+input_boolean:
+  dormant_door_lock_enabled:
+    name: "Dvale-lås: kræv hoveddør for at vågne"
+    icon: mdi:door-closed-lock
+    # Ingen initial: → user-fra overlever restart; fresh-install ON via init.
+
+  dormant_door_lock_gps_enabled:
+    name: "Dvale-lås: GPS-hjemkomst må også vække"
+    icon: mdi:map-marker-account
+    # ON = parent_a_home/parent_b_home→on vækker huset selv mens låst. OFF = kun
+    # hoveddør. (Gaten i house_modes læser denne.)
+
+  dormant_door_lock_auto_enabled:
+    name: "Dvale-lås: gælder også auto/GPS-dvale"
+    icon: mdi:home-clock
+    # OFF = låsen engages KUN ved manuel dvale-erklæring (app/entré-NED).
+    # ON (default pr. 2026-07-18) = enhver Dormant (også idle-timeout + GPS-væk)
+    # engager låsen. Ændret fra OFF for at stoppe Roborock-vække-loopet under
+    # auto-idle-dvale (robotten flapper radar 2 min efter Dormant). Se init_user_
+    # preferences.yaml + commit 8a38e58/5156563.
+
+  # Runtime-tilstand (IKKE _enabled → ikke i snapshot; restores over restart så en
+  # låst dvale overlever genstart).
+  dormant_door_lock:
+    name: "Dvale-lås aktiv"
+    icon: mdi:lock-alert
+
+automation:
+  # --- ENGAGE: manuel dvale-erklæring (eller enhver dvale hvis auto_enabled) ---
+  - id: dormant_door_lock_engage
+    alias: "Dvale-lås: aktivér ved dvale-erklæring"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_select.house_state
+        to: "Dormant"
+        id: state_dormant
+      - platform: state
+        entity_id: input_boolean.manual_dormant_override
+        to: "on"
+        id: manual_button
+    condition:
+      - condition: state
+        entity_id: input_boolean.dormant_door_lock_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Manuel knap = altid; app-tile = user_id != none; ellers kun hvis auto_enabled.
+      - condition: template
+        value_template: >-
+          {{ trigger.id == 'manual_button'
+             or (trigger.to_state is defined and trigger.to_state.context.user_id is not none)
+             or is_state('input_boolean.dormant_door_lock_auto_enabled', 'on') }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.dormant_door_lock
+      - service: logbook.log
+        data:
+          name: "Dvale-lås"
+          message: >-
+            Huset sat på Dormant → dvale-lås AKTIV. Kun hoveddør{{ ' + GPS'
+            if is_state('input_boolean.dormant_door_lock_gps_enabled','on') else '' }}
+            kan vække; sensor-flaps ignoreres.
+
+  # --- FRIGIV: hoveddør åbnet (den sanktionerede vækning) ---
+  - id: dormant_door_lock_clear_on_door
+    alias: "Dvale-lås: frigiv ved hoveddør"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_hoveddoer
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.dormant_door_lock
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.dormant_door_lock
+      - service: logbook.log
+        data:
+          name: "Dvale-lås"
+          message: "Hoveddør åbnet → dvale-lås frigivet, huset må vågne."
+
+  # --- FRIGIV: huset blev Active (enhver vej: GPS, knap, morgen, manuel) ---
+  - id: dormant_door_lock_clear_on_active
+    alias: "Dvale-lås: frigiv når huset bliver Active"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_select.house_state
+        to: "Active"
+    condition:
+      - condition: state
+        entity_id: input_boolean.dormant_door_lock
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.dormant_door_lock
+
+  # --- FRIGIV: featuren slås fra → lås op med det samme ---
+  - id: dormant_door_lock_clear_on_disable
+    alias: "Dvale-lås: frigiv når feature slås fra"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_boolean.dormant_door_lock_enabled
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.dormant_door_lock
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.dormant_door_lock

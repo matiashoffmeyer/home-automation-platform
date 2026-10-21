@@ -1,0 +1,238 @@
+# =============================================================================
+# Wasp-in-a-box — huset går ikke Dormant uden en ægte udgang (user-spec 2026-07-05)
+# =============================================================================
+# User: "huset må heller ikke erklæres Dormant uden at der har været en main-
+# door-open event. Fx jeg ligger stille i sofaen i 1 time — det må ikke føre
+# til Dormant uden et open-main-door-event, for så er jeg jo en wasp in a box
+# som ikke er gået ud."
+#
+# PROBLEM: de inaktivitets-baserede Dormant-paths (physical 3t / idle-dagsregel /
+# skema 09:30 / weekend-stearinlys) fyrer når radaren holder op med at se en
+# STILLE person (still-target tabes) → huset tror det er tomt og går Dormant
+# oven i hovedet på en der bare ligger stille. Radar ser ikke stilstand pålideligt.
+#
+# LØSNING (wasp-in-a-box på HUS-niveau): en person kan KUN have forladt huset ved
+# at åbne en yderdør. Vi "armer" derfor en exit-mulighed når en yderdør åbnes, og
+# "afvæbner" den igen så snart der er VEDVARENDE indendørs tilstedeværelse (= nogen
+# slog sig ned indenfor, de gik ikke ud). De inaktivitets-Dormant-paths må først
+# fyre når exit er armet.
+#
+#   binary_sensor.wasp_exit_armed  (input_boolean, latch):
+#     ON  = HOVEDDØREN er åbnet, og der har IKKE været vedvarende indendørs
+#           tilstedeværelse siden → nogen kan være gået ud → Dormant TILLADT.
+#     OFF = hoveddøren ikke åbnet siden sidste vedvarende ophold indenfor
+#           (= wasp in a box, stadig hjemme) → Dormant BLOKERET.
+#
+# ARM:     HOVEDDØR → on  ⇒ wasp_exit_armed = on. (KUN hoveddøren — user-spec
+#          2026-07-05: terrassedøren fører til terrasse/have = stadig hjemme,
+#          ikke "gået ud" → tæller ALDRIG som udgang.)
+# DISARM:  indendørs occupancy on i ≥ sustain-sek (robot-filtreret) ELLER et
+#          knap-tryk (menneske indenfor) ⇒ wasp_exit_armed = off.
+#          2026-08-08: occupancy tæller FØRST når hoveddøren har været lukket i
+#          wasp_exit_grace_seconds. Ellers afvæbner selve afgangen udgangen —
+#          entré-VALLHORN ser dig altid på vej ud, og en afgang tager længere
+#          end sustain. Målt 08-08: dør åbnet 13:49:02, entré on 13:50:41,
+#          disarm 13:50:51 MENS døren stod åben, dør lukket 13:52:09 → huset
+#          blev aldrig Dormant. Fejlen ramte HVER afgang siden 07-05 og var
+#          maskeret af GPS-bypasset; den dag telefonen var tavs 12:11→17:18,
+#          stod huset Active i 3½ time.
+#
+# Normal udgang: gå til hoveddør → åbn (arm on) → ud. Kort/ingen presence efter →
+#   arm bliver ON → Dormant tillades efter timeout. ✓
+# Hjemkomst/ophold: hoveddør (arm on) → gå rundt, occupancy on ≥ sustain → arm
+#   OFF → Dormant blokeres mens man er hjemme. ✓
+# Stille i sofaen ELLER havetur via terrassen (hoveddør ikke åbnet): arm OFF fra
+#   tidligere ophold → forbliver OFF → Dormant blokeres uanset radar/terrasse. ✓
+#
+# ESCAPE-HATCH (wasp_guard_gps_bypass, default ON): begge telefoner GPS-bekræftet
+# 'not_home' = de tog telefonen med ud = ægte udgang → Dormant tillades selv hvis
+# dør-sensoren missede event'et (ellers kunne huset hænge Active for evigt).
+# Slå OFF for at kræve et ægte dør-event uanset hvad.
+#
+# De TELEFON-væk-baserede Dormant-paths (house_state_to_dormant 3t, GPS-fast >1km,
+# flag-fast 30min) er URØRT: de kræver allerede telefon-væk = ægte udgang, og en
+# stille sofa-person har telefonen HOS sig (nogen_hjemme=on) → de fyrer aldrig på
+# wasp-scenariet. Kun de rene inaktivitets-paths guardes.
+# =============================================================================
+
+input_boolean:
+  wasp_dormant_guard_enabled:
+    name: "Wasp-guard: kræv dør-event før Dormant"
+    icon: mdi:door-closed-lock
+    initial: true
+    # Master kill-switch. OFF = gammel adfærd (inaktivitet alene kan give Dormant).
+
+  wasp_guard_gps_bypass:
+    name: "Wasp-guard: tillad GPS-væk som udgangsbevis"
+    icon: mdi:cellphone-marker
+    initial: true
+    # ON = begge telefoner bekræftet 'not_home' tillader Dormant selv uden dør-
+    # event (fail-safe mod stuck-Active). OFF = kræv altid et ægte dør-event.
+
+  wasp_exit_armed:
+    name: "Wasp: udgang armet (hoveddør åbnet siden sidste ophold)"
+    icon: mdi:door-open
+    # RUNTIME-latch (ingen initial → HA gendanner sidste state over restart).
+    # Default-fravær = off = Dormant blokeret indtil hoveddøren åbnes = SIKKER retning.
+
+input_number:
+  wasp_presence_sustain_seconds:
+    name: "Wasp: sekunder vedvarende ophold der afvæbner udgang"
+    icon: mdi:timer-sand
+    min: 1
+    max: 120
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+    # Hvor længe indendørs occupancy skal holde 'on' før det tæller som "slog sig
+    # ned indenfor" (= afvæbner udgangen). Lav værdi = mere beskyttende (huset
+    # bliver lettere Active); høj værdi = mere villig til Dormant efter dør-event.
+
+  wasp_exit_grace_seconds:
+    name: "Wasp: udgangs-vindue hvor bevægelse ikke afvæbner"
+    icon: mdi:door-sliding-open
+    min: 0
+    max: 600
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+    # 2026-08-08: SELVE AFGANGEN er bevægelse indenfor — entré-VALLHORN ser dig
+    # ALTID på vej ud. Occupancy afvæbner derfor først når hoveddøren har været
+    # LUKKET i dette vindue. Knap-tryk er undtaget (utvetydigt menneske).
+
+template:
+  - binary_sensor:
+      # Single authority: må de rene inaktivitets-Dormant-paths fyre lige nu?
+      - name: "Wasp dormant allowed"
+        unique_id: wasp_dormant_allowed
+        icon: mdi:home-export-outline
+        state: >
+          {% if not is_state('input_boolean.wasp_dormant_guard_enabled','on') %}
+            true
+          {% elif is_state('input_boolean.wasp_exit_armed','on') %}
+            true
+          {% elif is_state('input_boolean.wasp_guard_gps_bypass','on') %}
+            {# 2026-08-29 (#2 divergens): bypassen læste
+               device_tracker.phone_b, som har været PERMANENT
+               frossen på 'home' siden iOS-migrationen 08-15 → betingelsen
+               kunne aldrig blive sand, og hele fail-safe'en var død. Resten af
+               huset (house_modes' gps_fast) migrerede til ankeret; denne kopi
+               blev efterladt. Målt 29/8: waspen blokerede Dormant i 2½ time med
+               tomt hus, og bypassen kunne ikke redde det. #}
+            {{ states('device_tracker.phone_a') == 'not_home'
+               and is_state('binary_sensor.parent_b_hjemme_anker', 'off') }}
+          {% else %}
+            {{ false }}
+          {% endif %}
+        attributes:
+          reason: >
+            {% if not is_state('input_boolean.wasp_dormant_guard_enabled','on') %}
+              guard-fra
+            {% elif is_state('input_boolean.wasp_exit_armed','on') %}
+              hoveddør-åbnet-siden-ophold
+            {% elif is_state('input_boolean.wasp_guard_gps_bypass','on')
+                    and states('device_tracker.phone_a') == 'not_home'
+                    and is_state('binary_sensor.parent_b_hjemme_anker', 'off') %}
+              begge-telefoner-væk
+            {% else %}
+              wasp-in-a-box-blokerer
+            {% endif %}
+
+automation:
+  # --- ARM: HOVEDDØREN åbnes → ægte udgang plausibel ---
+  # KUN hoveddøren armer (user-spec 2026-07-05): terrassedøren fører til
+  # terrasse/have = STADIG hjemme, ikke "gået ud" → må ALDRIG tælle som udgang.
+  # Ellers ville en havetur (radar ser ingen indenfor) tillade fejl-Dormant.
+  - id: wasp_arm_on_exit_door
+    alias: "Wasp: armer udgang når hoveddøren åbnes"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_hoveddoer
+        to: "on"
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.wasp_exit_armed
+      - service: logbook.log
+        data:
+          name: "Wasp-guard"
+          message: "Hoveddør åbnet → udgang armet (Dormant nu tilladt indtil nogen slår sig ned indenfor)."
+
+  # --- DISARM: vedvarende ophold indenfor ELLER knap-tryk → ingen udgang ---
+  - id: wasp_disarm_on_indoor_presence
+    alias: "Wasp: afvæbner udgang ved vedvarende indendørs ophold"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      # Indendørs occupancy holdt 'on' i ≥ sustain-sek = nogen slog sig ned.
+      # (templated for = re-armer når slideren ændres.)
+      - platform: state
+        id: presence
+        entity_id: !include ../rosters/husets_occupancy.yaml
+        from: "off"
+        to: "on"
+        for:
+          seconds: "{{ [states('input_number.wasp_presence_sustain_seconds') | int(20), 1] | max }}"
+      # Et knap-tryk = utvetydigt menneske indenfor → afvæbn straks.
+      - platform: state
+        id: button
+        entity_id: !include ../rosters/styrbar_sidste_tryk.yaml
+      # 2026-08-08: én-gangs re-tjek når udgangs-vinduet udløber. Præsence-
+      # triggeren ovenfor er en FLANKE — fyrer den mens vinduet blokerer, er den
+      # tabt for altid (fejlklasse #15). Kommer man HJEM og sætter sig helt
+      # stille, laver radaren ingen ny on-flanke → uden dette tjek ville
+      # udgangen blive stående armet oven i hovedet på en der er hjemme.
+      - platform: state
+        id: grace_expiry
+        entity_id: binary_sensor.parasoll_hoveddoer
+        to: "off"
+        for:
+          seconds: "{{ [states('input_number.wasp_exit_grace_seconds') | int(90), 0] | max }}"
+    condition:
+      # Robotten ses af radar → dens egen bevægelse må ikke afvæbne (occupancy-
+      # grenen). Knap-tryk kan robotten ikke lave → altid tilladt.
+      - condition: template
+        value_template: >-
+          {{ (trigger.id | default('') if trigger is defined else '') == 'button'
+             or states('vacuum.s8_maxv_ultra') not in ['cleaning', 'returning'] }}
+      - condition: state
+        entity_id: input_boolean.wasp_exit_armed
+        state: "on"
+      # 2026-08-08: udgangs-vinduet. Occupancy under en igangværende afgang ER
+      # afgangen — den må ikke afvæbne. Se input_number.wasp_exit_grace_seconds.
+      - condition: template
+        value_template: >-
+          {% set tid = (trigger.id | default('') if trigger is defined else '') %}
+          {% set g = [states('input_number.wasp_exit_grace_seconds') | int(90), 0] | max %}
+          {% set s = [states('input_number.wasp_presence_sustain_seconds') | int(10), 1] | max %}
+          {% if tid == 'button' %}
+            true
+          {% elif tid == 'presence' %}
+            {{ is_state('binary_sensor.parasoll_hoveddoer', 'off')
+               and (now() - states.binary_sensor.parasoll_hoveddoer.last_changed).total_seconds() >= g }}
+          {% else %}
+            {# grace_expiry (eller manuel kørsel): er der nogen indenfor LIGE NU? #}
+            {% set ns = namespace(hit=false) %}
+            {% from 'rosters.jinja' import husets_occupancy %}{% for e in husets_occupancy
+                 %}
+              {% if is_state(e, 'on') and states[e] is not none
+                    and (now() - states[e].last_changed).total_seconds() >= s %}
+                {% set ns.hit = true %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.hit }}
+          {% endif %}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.wasp_exit_armed
+      - service: logbook.log
+        data:
+          name: "Wasp-guard"
+          message: >-
+            {% set tid = (trigger.id | default('') if trigger is defined else '') %}
+            {{ 'Knap-tryk' if tid == 'button'
+               else ('Nogen indenfor da udgangs-vinduet udløb' if tid == 'grace_expiry'
+                     else 'Vedvarende ophold') }}
+            indenfor → udgang afvæbnet (wasp in a box: nogen er hjemme, Dormant blokeret).

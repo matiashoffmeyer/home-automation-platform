@@ -1,0 +1,470 @@
+# =============================================================================
+# Vinter-forsvar (Winter Defense)
+# =============================================================================
+# TEMP-KILDE (2026-07-19, user-spec): alle temp-gates i denne fil bruger
+#   UDENDØRS vejr-temp fra met.no (sensor.udetemp = anker over
+#   weather.forecast_home, se packages/dmi_weather.yaml). DMI's 2m-temp blev
+#   prøvet men dens nøgle-løse endpoint 429-fejler ~konstant → user-valg: met.no.
+#   IKKE indendørs TIMMERFLOTTE — "der bliver aldrig så koldt indenfor, væggene
+#   er moderne 56cm tykke". Tunable via winter_heating_season_temp (default 12°C,
+#   fyrings-sæson) + winter_cold_snap_temp (default -6°C, ekstrem frost).
+#
+# TWO modes:
+#
+# DORMANT tier: Close all curtains to position 20 (80% closed) to retain
+#   heat when nobody is home and it's cold OUTSIDE (< heating-season slider).
+#   Plants still get some light through the 20% opening.
+#   Reopens when house returns to Active (house_state_to_active).
+#
+# SOLAR GAIN tier (Active, winter daytime): When the family is home and
+#   it's cold OUTSIDE but the sun is out (LUX 500-7000), open the south-facing
+#   stue curtain fully to collect solar heat gain. This passively warms
+#   the apartment without energy cost.
+#   Only fires between 10:00-16:00 (peak sun angle for south window).
+#   Closes again when sun drops (LUX < 200 for 20 min).
+#   Overridden by cinema_active (nu Dark Mode-flaget), cirkus, and summer defense.
+# =============================================================================
+
+- id: winter_defense_close
+  alias: "Vinter-forsvar: Rul gardiner ned ved Dormant"
+  description: >
+    Close curtains to 80% when Dormant and cold. B6.3 fix sprint 2026-05-06:
+    per-room lux check så vi ikke lukker rum der er sun-blasted (= solar gain
+    ønsket selv ved Dormant). Kun close hvis rummet faktisk er kold-zone (lav lux).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_select.house_state
+      to: "Dormant"
+      for:
+        minutes: 2
+  condition:
+    # Ferie-batterispar (2026-07-18): pauset efter langvarig dvale, se
+    # packages/gardin_dormant_pause.yaml. Slås til igen ved hoveddør-åbning.
+    - condition: state
+      entity_id: input_boolean.gardin_dormant_pause_active
+      state: "off"
+    # 2026-10-04 (B123, user-valg): vinter-forsvaret er FAMILIE-logik. Indtil
+    # nu blev det holdt ude af AirBnB af åbne-tæppet i `held`; luk-vejene læser
+    # nu `held_luk` (uden tæppet), så valget står her eksplicit.
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+    # UDENDØRS temp fra vejrudsigten (2026-07-19, user-spec): indendørs bliver
+    # aldrig så koldt (56cm mure) → indendørs-gaten var reelt død. Fyrings-sæson
+    # = udendørs < slider (default 12°C). unavailable → false = ingen luk (#9).
+    - condition: numeric_state
+      entity_id: sensor.udetemp
+      below: input_number.winter_heating_season_temp
+  action:
+    # ⚠️ 2026-09-20: DISSE KALD HAR ALDRIG VIRKET på de tre Somfy-gardiner.
+    # cover.set_cover_position kræver feature-bittet SET_POSITION, og
+    # template-coverne havde ingen set_cover_position-action → HA sprang dem
+    # tavst over, og `continue_on_error: true` slugte sporet. Somfy-gardinerne
+    # har altså IKKE deltaget i vinter-forsvaret indtil nu. De har fået en
+    # timet set_cover_position (packages/broadlink_gardiner.yaml), så kaldene
+    # her virker fra i dag — inkl. den fulde optur hver delvis position starter
+    # med. Bemærk at position 20 på syd nu koster ~45 s kørsel.
+    # `position: 20` er kun et LUK for et gardin der står højere end 20 — står
+    # det på 0, ÅBNER det 20 %. Derfor skal manuelt-ned-holdte gardiner springes
+    # over her på præcis samme måde som i winter_active_dark_close nedenfor;
+    # ellers er denne automation en auto-åbner i forklædning (fejlklasse #12:
+    # beskyttelsen sad kun på den ene af to søster-automations). LUK-listen
+    # `held_luk` (B123) — AirBnB holdes ude af mode-gaten nedenfor, ikke af
+    # åbne-tæppet i `held`.
+    # 2026-09-29 (bug-hunt): held dækker kun MANUELT nedrullede gardiner — et
+    # gardin aftenluk/winter_active_dark_close har lukket helt stod ikke i den,
+    # så Dormant efter mørkefald åbnede det 20 %. Nu springes ethvert gardin
+    # der allerede står ≤ 20 over; ukendt position (open-plan efter restart) →
+    # som før.
+    - variables:
+        held: "{{ state_attr('sensor.gardiner_manual_hold', 'held_luk') | default([]) }}"
+    # === Stue gardiner: 80% close hvis stue er kold + ikke sol-blast ===
+    - if:
+        - condition: numeric_state
+          entity_id: sensor.open_plan_lux
+          below: 8000
+      then:
+        - service: cover.set_cover_position
+          continue_on_error: true
+          target:
+            entity_id: >
+              {% set ns = namespace(l=[]) %}
+              {% from 'rosters.jinja' import open_plan_gardiner %}{% for e in open_plan_gardiner
+                           if e not in held %}
+              {% set p = state_attr(e, 'current_position') %}
+              {% if p is none or (p | float(100)) > 20 %}{% set ns.l = ns.l + [e] %}{% endif %}
+              {% endfor %}
+              {{ ns.l }}
+          data:
+            position: 20
+    # === Sove gardin: 80% close kun hvis sove er dim ===
+    # Sove-vinduet er SYD-vendt (user-bekræftet 2026-07-28) — samme side som
+    # stue syd. Per-room lux gate på rummets egen LTR390.
+    - if:
+        - condition: numeric_state
+          entity_id: sensor.sovevaerelse_lux_reel
+          below: 5000
+      then:
+        - service: cover.set_cover_position
+          continue_on_error: true
+          target:
+            entity_id: >
+              {% set p = state_attr('cover.gardin_sovevaerelse', 'current_position') %}
+              {{ ['cover.gardin_sovevaerelse'] | reject('in', held) | list
+                 if p is none or (p | float(100)) > 20 else [] }}
+          data:
+            position: 20
+    - service: notify.persistent_notification
+      data:
+        title: "Vinter-forsvar aktiveret"
+        message: >
+          Gardiner evalueret per-room (Dormant, ude {{ states('sensor.udetemp') }}°C).
+          Stue/spisestue: {{ states('sensor.open_plan_lux') }} lux.
+          Sove: {{ states('sensor.sovevaerelse_lux_reel') }} lux.
+
+# Re-open is NOT needed here. When house goes Active, the
+# house_state_to_active automation opens all curtains.
+
+# =============================================================================
+# Active + rigtig mørkt UDE + koldt → luk gardiner (gulv-kuldestrøm-forsvar)
+# =============================================================================
+# User-spec 2026-07-19: "vinterforsvar gardiner skal også aktiveres i Active når
+# det er rigtig mørkt udenfor (slider bestemmer sol-vinkel — genbrug den
+# eksisterende) — så beskytter vi mod kuldestrøm ved gulvet."
+#
+# SOL-VINKEL GENBRUGT: binary_sensor.natlys_sol_under_graense (sol <
+#   input_number.natlys_sol_elevation, default -6° = civil tusmørke-slut =
+#   genuint mørkt) — samme slider som natlys/auto-tænd. Ingen egen slider.
+#   (natlys-signalet er REN sol-position, aldrig lux → fyrer IKKE på en mørk
+#   stormfuld dag, kun når solen faktisk er nede = "rigtig mørkt".)
+#
+# LUK-POSITION (user-valg): helt lukket (0) for max luft-lomme mod ruden —
+#   UNDTAGEN stue-vest (position 20 = 80% luk) fordi der står noget under den
+#   der ikke må rammes.
+#
+# rising==false-gate: sol er negativ BÅDE ved daggry og skumring. Vi lukker KUN
+#   i skumrings→nat-fasen (rising false) så vi ALDRIG kæmper mod morning_curtains/
+#   wakeup der åbner i daggry-fasen (rising true). Genåbning ejes helt af
+#   morgen-rutinerne (open-plan: morning_curtains; sove/boern: wakeup) → ingen
+#   reopen-automation her (spejler Dormant-close, som house_state_to_active åbner).
+#
+# EDGE-triggers (ingen periodisk backstop = ingen morgen-fight): dusk-flanke +
+#   hjemkomst-i-mørke (house_state→Active) + kulde-flanke (dækker kilde-recovery
+#   fra unavailable, fejlklasse #9/#13 — en frisk below-flanke ved recovery lukker).
+# unavailable udetemp → numeric-condition false = ingen luk (#9). Manuelt åbnede
+#   gardiner respekteres via gardiner_manual_hold (samme reject-mønster som solar).
+# AirBnB: kører IKKE (user-valg 2026-10-04, B123 — kun sove-aftenluk lukker i
+#   AirBnB); eksplicit house_mode-gate. Ingen mobil-push her.
+# =============================================================================
+
+- id: winter_active_dark_close
+  alias: "Vinter: Luk gardiner ved mørkt+koldt (Active)"
+  description: >
+    Active + rigtig mørkt UDE (sol < natlys_sol_elevation) + koldt UDE
+    (sensor.udetemp < winter_heating_season_temp) → luk gardiner (stue-vest 80%,
+    resten helt) mod gulv-kuldestrøm. Sol-vinkel genbrugt fra natlys-slideren.
+  mode: single
+  trigger:
+    # Skumring falder (sol krydser natlys-tærsklen nedad)
+    - platform: state
+      entity_id: binary_sensor.natlys_sol_under_graense
+      from: "off"
+      to: "on"
+    # Hjemkomst i mørke: huset bliver Active mens det allerede er mørkt+koldt
+    - platform: state
+      entity_id: input_select.house_state
+      to: "Active"
+    # Kulde-flanke: udetemp falder under fyrings-tærsklen (dækker også
+    # kilde-recovery unavailable→below = frisk flanke, fejlklasse #9/#13)
+    - platform: numeric_state
+      entity_id: sensor.udetemp
+      below: input_number.winter_heating_season_temp
+  condition:
+    - condition: state
+      entity_id: input_boolean.winter_active_dark_close_enabled
+      state: "on"
+    # 2026-10-04 (B123, user-valg): vinter-forsvaret er FAMILIE-logik. Indtil
+    # nu blev det holdt ude af AirBnB af åbne-tæppet i `held`; luk-vejene læser
+    # nu `held_luk` (uden tæppet), så valget står her eksplicit.
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Rigtig mørkt UDE (sol under natlys-tærskel, genbrugt slider)
+    - condition: state
+      entity_id: binary_sensor.natlys_sol_under_graense
+      state: "on"
+    # Koldt UDE (fyrings-sæson). unavailable → false = ingen luk (#9).
+    - condition: numeric_state
+      entity_id: sensor.udetemp
+      below: input_number.winter_heating_season_temp
+    # Kun skumring→nat-fasen (ikke daggry) → aldrig fight mod morgen-åbning
+    - condition: template
+      value_template: "{{ state_attr('sun.sun', 'rising') == false }}"
+  action:
+    # Helt lukket (0) undtagen stue-vest (20 = 80%, noget står under den).
+    # Manuelt-ned-holdte gardiner springes over (gardiner_manual_hold — den
+    # holder også sove mens putning_sove_active er on).
+    - variables:
+        held: "{{ state_attr('sensor.gardiner_manual_hold', 'held_luk') | default([]) }}"
+    - service: cover.set_cover_position
+      continue_on_error: true
+      target:
+        entity_id: >
+          {{ ['cover.gardin_stue_syd', 'cover.gardin_spisestue_vest',
+              'cover.gardin_sovevaerelse']
+             | reject('in', held) | list }}
+      data:
+        position: 0
+    - service: cover.set_cover_position
+      continue_on_error: true
+      target:
+        entity_id: >
+          {{ ['cover.gardin_stue_vest_1'] | reject('in', held) | list }}
+      data:
+        position: 20
+    - service: notify.persistent_notification
+      data:
+        title: "Vinter-forsvar: mørkt+koldt luk (Active)"
+        message: >
+          Rigtig mørkt ude (sol < {{ states('input_number.natlys_sol_elevation') }}°)
+          + koldt ({{ states('sensor.udetemp') }}°C) → gardiner lukket mod
+          gulv-kuldestrøm. Stue-vest 80% (noget står under), resten helt.
+
+# =============================================================================
+# Solar gain: open south curtain on cold+sunny days (Active only)
+# =============================================================================
+
+- id: winter_solar_gain_open
+  alias: "Vinter: Sol-opvarmning (syd-gardin åbner)"
+  description: >
+    When Active and cold OUTSIDE (sensor.udetemp < heating-season slider,
+    default 12°C) + sunny (LUX 500-7000), open the south-facing stue curtain to
+    collect passive solar heat.
+    Only 10:00-16:00, not when cinema/cirkus/summer-defense would conflict.
+    The upper LUX limit (7000) prevents conflict with summer defense (>8000).
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.open_plan_lux
+      above: 500
+      for:
+        minutes: 10
+    # Fejlklasse #4/#12 (fundet 2026-07-18): uden dette re-arm åbnede solar-gain
+    # ALDRIG på en dag hvor lux krydsede 500 FØR solen nåede elevation 15°
+    # (shoulder-season morgen: lux stiger ved solopgang mens solen stadig er
+    # lav) — lux var allerede >500 når elevationen passerede 15°, så ingen frisk
+    # lux-flanke fyrede. Spejler winter_solar_gain_close's elevation-backstop
+    # (som havde en; open manglede den = asymmetri). Conditions gater stadig alt.
+    - platform: numeric_state
+      entity_id: sun.sun
+      attribute: elevation
+      above: 15
+  condition:
+    # Kill-switch (sprint 2026-05-17): toggle off hvis ikke ønsker auto solar gain.
+    - condition: state
+      entity_id: input_boolean.winter_solar_enabled
+      state: "on"
+    # 2026-06-30 (user undtagelse 3): INGEN auto-gardin-OP i AirBnB (solar-gain
+    # åbner syd-gardinet → gated fra i AirBnB).
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # UDENDØRS fyrings-sæson (2026-07-19): åbn syd-gardin for gratis solvarme kun
+    # når det faktisk er koldt UDE (< slider, default 12°C). Før: indendørs < 20
+    # = reelt aldrig sandt (56cm mure) → solar-gain fyrede aldrig.
+    - condition: numeric_state
+      entity_id: sensor.udetemp
+      below: input_number.winter_heating_season_temp
+    - condition: numeric_state
+      entity_id: sensor.open_plan_lux
+      above: 500
+    # Below summer defense threshold — no conflict
+    - condition: numeric_state
+      entity_id: sensor.open_plan_lux
+      below: 7000
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.cirkus_active
+      state: "off"
+    # B6.2 fix audit-runde 17: tidligere brugte hardcoded time 10:00-16:00.
+    # Erstatter med sun-elevation > 15° = sun-peak window. DST-immune,
+    # tilpasser sig vinter-sol-bane bedre.
+    - condition: numeric_state
+      entity_id: sun.sun
+      attribute: elevation
+      above: 15
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.winter_solar_active
+    - service: cover.open_cover
+      continue_on_error: true
+      target:
+        # Spring syd over hvis manuelt rullet ned (gardin_manual_grace).
+        entity_id: >
+          {{ ['cover.gardin_stue_syd']
+             | reject('in', state_attr('sensor.gardiner_manual_hold', 'held') | default([]))
+             | list }}
+
+- id: winter_solar_gain_close
+  alias: "Vinter: Sol-opvarmning slut (syd-gardin lukker)"
+  description: "Close south curtain when sun drops below solar-gain threshold"
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.open_plan_lux
+      below: 200
+      for:
+        minutes: 20
+    # B6.2: time backup → sun-elevation backup (DST-immune)
+    - platform: numeric_state
+      entity_id: sun.sun
+      attribute: elevation
+      below: 8
+  condition:
+    # Kill-switch (sprint 2026-05-17): same flag som winter_solar_gain_open.
+    - condition: state
+      entity_id: input_boolean.winter_solar_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # B61 fix (2026-07-19): temp-gaten FLYTTET herfra til kun position-restoren
+    # nedenfor. Før hang winter_solar_active on hvis det var mildt (rydningen
+    # sprang over) → position-50-restoren kunne fyre en dag forskudt. Flaget SKAL
+    # altid ryddes ved skumring; kun selve position-genoprettelsen gates nu på
+    # temp (udendørs fyrings-sæson, se if nedenfor).
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    # Only reset if solar gain actually opened the curtain (not Somrig)
+    - condition: state
+      entity_id: input_boolean.winter_solar_active
+      state: "on"
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.winter_solar_active
+    # Restore curtain to a comfortable mid-position (not fully closed) — kun
+    # hvis det stadig er fyrings-sæson UDE (< slider, default 12°C). Er det mildt
+    # ude, lades gardinet være hvor det er (flaget er allerede ryddet ovenfor =
+    # B61-fixet). 2026-07-19: udendørs vejr-temp, ikke indendørs (56cm mure).
+    - if:
+        - condition: numeric_state
+          entity_id: sensor.udetemp
+          below: input_number.winter_heating_season_temp
+      then:
+        - service: cover.set_cover_position
+          target:
+            entity_id: cover.gardin_stue_syd
+          data:
+            position: 50
+
+# =============================================================================
+# K1: Kuldeboelge-override — noed-luk syd-gardin ved EKSTREM UDENDOERS frost
+# =============================================================================
+# User-valg 2026-07-19: syd-gardinet er TYNDT → luk giver kun lidt varme-
+# retention, mens solar gain (gratis sol-varme) hjaelper mere. Derfor har SOL
+# hoej prioritet: kuldeboelge-luk fyrer KUN ved ekstrem udendoers frost
+# (sensor.udetemp fra met.no < winter_cold_snap_temp, default -6°C i 30 min) — IKKE
+# paa normale kolde-men-solrige vinterdage, hvor solen vinder. Temp-kilden er
+# UDENDOERS vejrudsigt: med 56cm mure bliver det aldrig koldt nok INDE til at
+# gaten var meningsfuld (user-spec) — den gamle indoor-proxy var reelt doed.
+#
+# BEVIDST edge (fejlklasse #4): flanke-triggeren fyrer ikke hvis udetemp
+# ALLEREDE er < taersklen naar solar-gain aabner (ingen frisk flanke). Det
+# ACCEPTERES her — sol har prioritet, saa "luk ikke" er den oenskede adfaerd.
+#
+# solar_active-flag slukkes foer luk saa solar_gain_open ikke fyrer igen til
+# lux>500. Kan IKKE fyre i dvale: winter_solar_flag_clear_on_dormant rydder
+# flaget ved Dormant-entry (B63) → ferie-gardin-pausen respekteres.
+# =============================================================================
+
+- id: winter_cold_snap_force_close
+  alias: "Vinter: Kuldeboelge override (force luk uanset solar)"
+  description: >
+    Ekstrem udendoers frost: hvis sensor.udetemp (met.no) < slider
+    (default -6°C) i 30 min trods aaben syd-gardin → noed-luk syd. Syd-gardinet
+    er tyndt, saa sol prioriteres normalt (se header) — kun genuin frost
+    overruler. 2026-07-19: udendoers vejr-temp erstatter den doede indoor-proxy
+    (56cm mure → aldrig koldt nok inde).
+  mode: single
+  trigger:
+    # UDENDØRS vejr-temp (2026-07-19, user-spec): ekstrem frost < slider (default
+    # -6°C). for:30min på en numeric_state TRIGGER er sustained-sikkert også for
+    # en analog sensor (HA tæller kontinuerlig-sand internt, ikke via last_changed
+    # → ikke fejlklasse #14). unavailable → ingen flanke = ingen force-luk (#9).
+    - platform: numeric_state
+      entity_id: sensor.udetemp
+      below: input_number.winter_cold_snap_temp
+      for:
+        minutes: 30
+  condition:
+    - condition: state
+      entity_id: input_boolean.winter_solar_active
+      state: "on"
+  action:
+    # Sluk solar-flag foer luk saa solar_gain_open ikke fyrer igen
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.winter_solar_active
+    - service: cover.close_cover
+      target:
+        entity_id: cover.gardin_stue_syd
+    - service: persistent_notification.create
+      data:
+        notification_id: cold_snap_override
+        title: "Kuldeboelge: solar-gain stoppet"
+        message: >
+          Udendoers temp faldt til {{ states('sensor.udetemp') }}°C
+          (ekstrem frost) trods aaben syd-gardin. Force-lukket for at holde paa varmen.
+
+# =============================================================================
+# Ryd winter_solar_active ved dvale (B63 + B61-slaegtning, 2026-07-19)
+# =============================================================================
+# winter_solar_active saettes kun i Active (solar_gain_open) og ryddes ved
+# skumring (solar_gain_close, Active-gated) / kuldeboelge / AirBnB-entry — men
+# IKKE naar huset gaar Dormant midt paa dagen med flaget on. Konsekvenser uden
+# denne rydning:
+#   - B63: kuldeboelge-override (eneste betingelse = flaget) kunne fyre i dvale
+#     og traekke syd-gardinet trods gardin-dvale-pausen (ferie-batterispar).
+#   - B61-slaegtning: en latent stale-flag der kunne give en dag-forskudt
+#     position-restore ved naeste Active-skumring.
+# Rydning ved Dormant-entry lukker begge huller. Roerer IKKE gardinet —
+# winter_defense_close ejer Dormant-gardin-positionen (og er selv pause-gated),
+# saa ferie-"ingen bevaegelse"-intentionen bevares.
+# =============================================================================
+
+- id: winter_solar_flag_clear_on_dormant
+  alias: "Vinter: Ryd sol-flag ved dvale"
+  description: >
+    Rydder winter_solar_active naar house_state gaar Dormant, saa kuldeboelge-
+    override ikke kan fyre i dvale (B63) + fjerner en latent stale-flag (B61).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_select.house_state
+      to: "Dormant"
+  condition:
+    - condition: state
+      entity_id: input_boolean.winter_solar_active
+      state: "on"
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.winter_solar_active

@@ -1,0 +1,149 @@
+# =============================================================================
+# AirBnB check-in-varsel — "Check-in succesfuld" push ved gæsters første ankomst
+# =============================================================================
+# User-spec 2026-07-11: Når AirBnB-mode aktiveres, skal jeg (Parent A) have én push
+# "Check-in succesfuld" på telefonen NÅR hoveddøren åbnes første gang — det er
+# gæsterne der ankommer. Kun én notifikation, INTET andet (ingen lys/handling).
+#
+# TIMING (bevidst): varslet ARMES først 1 time EFTER AirBnB-mode blev slået til
+# (så en sen klargøring/inspektion af mig selv umiddelbart efter mode-skift ikke
+# fejl-udløser check-in). Efter armering udløses varslet ved FØRSTE hoveddør-åbning.
+#
+# RE-ARM (bevidst): efter et check-in er sendt, må det IKKE udløses igen før
+# Normal-mode har været aktiv i mindst 24 timer OG AirBnB derefter slås til igen
+# (= et reelt nyt gæste-ophold). En kort flip Normal→AirBnB midt i et ophold
+# (< 24 t Normal) re-armerer IKKE — gæsterne er allerede tjekket ind.
+#
+# MEKANIK (restart-robust, timestamp-baseret — ingen 1t-delay der tabes ved reboot):
+#   - airbnb_normal_since   = stempel for hvornår Normal sidst blev sat (24t-uret).
+#   - airbnb_checkin_arm_at = hvornår varslet bliver aktivt (AirBnB-entry + 1 t).
+#   - airbnb_checkin_pending = et check-in forventes dette ophold, endnu ikke sendt.
+# Hoveddør: binary_sensor.parasoll_hoveddoer. Push: notify.mobile_app_phone_a.
+# =============================================================================
+
+input_boolean:
+  airbnb_checkin_pending:
+    name: "AirBnB: check-in afventer"
+    icon: mdi:account-clock
+  # 2026-09-04: velkomst-ceremonien (packages/airbnb_velkomst.yaml) armeres af
+  # SAMME regel som check-in-varslet — 1 t efter AirBnB-entry, kun efter 24 t
+  # Normal. Bevidst et selvstændigt flag og ikke en genbrug af
+  # `airbnb_checkin_pending`: de to forbrugere skal kunne fyre uafhængigt, så
+  # en fejlet/deaktiveret push ikke tager lyset med sig (fejlklasse #1).
+  airbnb_velkomst_pending:
+    name: "AirBnB: velkomst-ceremoni afventer"
+    icon: mdi:hand-wave
+
+input_datetime:
+  airbnb_normal_since:
+    name: "AirBnB: Normal-mode siden"
+    icon: mdi:home-clock
+    has_date: true
+    has_time: true
+  airbnb_checkin_arm_at:
+    name: "AirBnB: check-in armeres kl."
+    icon: mdi:clock-check
+    has_date: true
+    has_time: true
+
+automation:
+  # 1. Spor hvornår Normal-mode sidst blev sat (driver 24t re-arm-kravet).
+  - id: airbnb_checkin_track_normal
+    alias: "AirBnB check-in: spor Normal-mode start"
+    description: >
+      Stempler tidspunktet hver gang house_mode skifter TIL Normal. Bruges af
+      arm-reglen til at kræve mindst 24 t Normal før et nyt check-in kan armeres.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.house_mode
+        to: "Normal"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_normal_since
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # 2. Armér check-in ved AirBnB-entry — men kun hvis Normal har kørt >= 24 t.
+  - id: airbnb_checkin_arm
+    alias: "AirBnB check-in: armér 1 t efter mode-skift (kræver 24 t Normal)"
+    description: >
+      Ved skift TIL AirBnB: hvis Normal-mode har været aktiv i mindst 24 t (eller
+      første gang nogensinde), sæt arm_at = nu + 1 t og markér check-in som
+      afventende. En kort Normal-flip (< 24 t) midt i et ophold re-armerer IKKE.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.house_mode
+        to: "AirBnB"
+    condition:
+      - condition: template
+        value_template: >-
+          {% set ns = states('input_datetime.airbnb_normal_since') %}
+          {{ ns in ['unknown','unavailable','none','']
+             or (now().timestamp() - (state_attr('input_datetime.airbnb_normal_since', 'timestamp') | float(0))) >= 24*3600 }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_checkin_arm_at
+        data:
+          datetime: "{{ (now() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_boolean.turn_on
+        target:
+          entity_id:
+            - input_boolean.airbnb_checkin_pending
+            - input_boolean.airbnb_velkomst_pending
+
+  # 3. Send "Check-in succesfuld" ved første hoveddør-åbning efter armering.
+  - id: airbnb_checkin_notify
+    alias: "AirBnB check-in: push ved hoveddør-åbning"
+    description: >
+      Hoveddøren åbnes MENS vi er i AirBnB, check-in afventer, og de 1 t
+      armerings-forsinkelse er passeret → send én push til Parent A og ryd
+      afventende-flaget (fyrer ikke igen dette ophold).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_hoveddoer
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "AirBnB"
+      - condition: state
+        entity_id: input_boolean.airbnb_checkin_pending
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ now().timestamp()
+             >= (state_attr('input_datetime.airbnb_checkin_arm_at', 'timestamp') | float(0)) }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.airbnb_checkin_pending
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: airbnb
+          title: "✅ Check-in succesfuld"
+          message: "Hoveddøren blev åbnet — gæsterne er ankommet."
+
+  # 4. Ryd afventende-flaget når vi forlader AirBnB (stale-armering væk).
+  - id: airbnb_checkin_disarm
+    alias: "AirBnB check-in: ryd afventende ved skift fra AirBnB"
+    description: >
+      Forlades AirBnB (uanset om check-in nåede at fyre), ryddes afventende-
+      flaget. Sikrer at kun en kvalificeret ny AirBnB-entry (>= 24 t Normal)
+      kan armere igen — ikke en stale flag der overlever mode-skift.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.house_mode
+        from: "AirBnB"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.airbnb_checkin_pending
+            - input_boolean.airbnb_velkomst_pending

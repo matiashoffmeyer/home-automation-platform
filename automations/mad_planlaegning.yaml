@@ -1,0 +1,237 @@
+# =============================================================================
+# Mad-planlægning — scheduler + stemme-handler (2026-07-29)
+# =============================================================================
+# Kører scripts/mad_planner.py. Helpers + shell_commands i
+# packages/mad_planlaegning.yaml. Alle sliders bor på "Mad"-siden.
+#
+#   - dagens spørgsmål   → tidspunkt fra input_datetime.mad_spoergsmaal_tid
+#   - indkøbsliste       → tidspunkt fra input_datetime.mad_indkoeb_tid; scriptet
+#     gater selv på ugedag + uge-interval + anker (ét sted = én autoritet)
+#   - indkøb: morgen     → tidspunkt fra input_datetime.mad_indkoeb_morgen_tid;
+#     "skal der handles i dag?" med Ja/Nej/Udskyd-1-uge (kun Parent A's telefon)
+#   - påmindelser        → gensend ubesvarede spørgsmål når telefonen er hjemme
+#     (svar-knapper kræver hjemme-wifi/Tailscale — ellers tabes stemmen tavst)
+#   - stemme-handler     → mobile_app_notification_action fra begge telefoner
+#   - refresh            → HA-start + når en slider ændres (REST-publicerede
+#     sensorer overlever ikke en restart, og næste-indkøbsdato skal følge sliderne)
+# =============================================================================
+
+- id: mad_dagligt_spoergsmaal
+  alias: "Mad: dagens ret-spørgsmål"
+  description: >
+    Sender ÉN (eller flere, jf. input_number.mad_spoergsmaal_antal) ret til
+    både Parent A og Parent B med JA!/SUPERJA!/NIX!-knapper. Retten trækkes fra den
+    kombination af børnevenlig × sværhedsgrad der er mest underrepræsenteret i
+    den godkendte pulje, så puljen er balanceret når der skal købes ind.
+    Kill-switch + antal + genspørg-vindue gates i scriptet.
+  mode: single
+  trigger:
+    - platform: time
+      at: input_datetime.mad_spoergsmaal_tid
+  action:
+    - service: shell_command.mad_spoergsmaal
+
+- id: mad_indkoebsliste
+  alias: "Mad: indkøbsliste (hver N. ugedag)"
+  description: >
+    Fyrer dagligt på input_datetime.mad_indkoeb_tid; scriptet afgør om I DAG er
+    en indkøbsdag ud fra ugedag-select, uge-interval og anker-dato. Er der færre
+    godkendte retter end input_number.mad_retter_min sendes INGEN notifikation
+    (kun en logbook-linje).
+  mode: single
+  trigger:
+    - platform: time
+      at: input_datetime.mad_indkoeb_tid
+  action:
+    - service: shell_command.mad_indkoeb
+
+- id: mad_indkoeb_morgenspoergsmaal
+  alias: "Mad: morgenspørgsmål på indkøbsdage"
+  description: >
+    Spørger om morgenen — på selve indkøbsdagen — om listen skal laves i
+    eftermiddag, eller om køleskabet stadig er fyldt (user-spec 2026-08-26).
+    Fyrer dagligt på input_datetime.mad_indkoeb_morgen_tid; scriptet afgør selv
+    om I DAG er indkøbsdag (samme naeste_indkoeb() som selve listen = én
+    autoritet) og tier hvis dagen allerede er markeret sprunget.
+    Kun Parent A's telefon: notif_mad_indkoeb_morgen_parent_b står OFF, fordi
+    spørgsmålet ejer indkøbs-kadencen og to svar ville flytte ankeret to gange.
+  mode: single
+  trigger:
+    - platform: time
+      at: input_datetime.mad_indkoeb_morgen_tid
+  action:
+    - service: shell_command.mad_indkoeb_morgen
+
+- id: mad_indkoeb_morgen_svar
+  alias: "Mad: svar på indkøbsdag-morgenspørgsmålet"
+  description: >
+    Ja = ingen ændring (listen laves som planlagt). Nej = spring KUN dagens
+    liste over, kadencen er urørt. Udskyd = ankeret rykkes 7 dage frem, så hele
+    rytmen flytter en uge (user-spec: "snooze ... skal påvirke anker dato").
+  mode: queued
+  max: 5
+  trigger:
+    - platform: event
+      event_type: mobile_app_notification_action
+  condition:
+    - condition: template
+      value_template: >
+        {{ trigger.event.data.action | default('')
+           | regex_match('^MADBUY_(JA|NEJ|SNOOZE)$') }}
+  action:
+    - service: shell_command.mad_indkoeb_svar
+      data:
+        svar: "{{ trigger.event.data.action.split('_')[1] }}"
+
+- id: mad_paamind_ubesvarede
+  alias: "Mad: påmind om ubesvarede ret-spørgsmål"
+  description: >
+    Svar-knapper er et HTTP-kald tilbage til HA og virker kun på hjemme-wifi
+    eller med Tailscale — svarer man på mobildata uden VPN, forsvinder
+    notifikationen ved tryk, men stemmen når aldrig frem (user 2026-08-06).
+    Derfor gensendes ubesvarede spørgsmål.
+    ⏱️ Trigger nr. 1 er selve pointen: vi rammer det øjeblik telefonen KOMMER
+    HJEM, hvor svar-vejen med sikkerhed er åben. `for: 2 min` giver wifi tid
+    til at binde, så knapperne virker når notifikationen lander.
+    Time_pattern'en er backstoppen (fejlklasse #4) for dem der allerede ER
+    hjemme når spørgsmålet modner. Alle øvrige gates (kill-switch, timer,
+    max pr. ret, hjemme-krav, notifikations-gate) ligger i scriptet, så der
+    kun er ÉN autoritet.
+    2026-08-20: vagten leverer nu OGSÅ spørgsmål der aldrig blev sendt, fordi
+    personen ikke var hjemme da de blev stillet. Parent B's device_tracker er
+    permanent frossen på 'home' og kan derfor ikke give en hjemkomst-flanke —
+    hendes trigger er iOS-genvejens anker.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id:
+        - device_tracker.phone_a
+        - device_tracker.phone_b
+      to: "home"
+      for: "00:02:00"
+    - platform: state
+      entity_id: binary_sensor.parent_b_hjemme_anker
+      from: "off"
+      to: "on"
+      for: "00:02:00"
+    - platform: time_pattern
+      minutes: "/40"
+  condition:
+    - condition: state
+      entity_id: input_boolean.mad_paamind_enabled
+      state: "on"
+    # Ingen påmindelser om natten — spørgsmålet kan sagtens vente til i morgen.
+    - condition: time
+      after: "07:30:00"
+      before: "22:00:00"
+  action:
+    # 2026-10-06 (husvagt): /40-ticket lander på hver hel time — samme sekund
+    # som de tidsfaste kørsler (spørgsmålet 11:00, indkøbslisten 19:00), og de
+    # deler mad_planner-låsen. DEN REELLE VAGT ER SCRIPTET: --paamind tager låsen
+    # med vent=False og springer over hvis den er optaget (scripts/mad_planner.py
+    # state_lock), og alle mad-kald kører --detach (intet 60-s-drab). De 3 s her
+    # lader den tidsfaste kørsel nå låsen først, så det er påmind der viger.
+    # (Et tjek af automationernes `current` blev fjernet: med --detach står de på
+    # 0 inden for et sekund, mens barnet stadig arbejder — død kode, bug-hunt nat.)
+    - delay: "00:00:03"
+    - service: shell_command.mad_paamind
+
+- id: mad_stemme_modtaget
+  alias: "Mad: stemme fra notifikations-knap"
+  description: >
+    Fanger JA!/SUPERJA!/NIX! fra begge telefoner (MAASKE er kun legacy: den kan
+    ikke længere vælges, men gamle notifikationer kan stadig ligge i skuffen).
+    Personen er kodet ind i selve
+    action-id'et (MAD_<person>_<svar>_<id>) — så vi ikke skal gætte afsender ud
+    fra device_id, som har forskellig form på Android og iOS. Regex-gaten
+    validerer alle tre felter FØR de sendes videre til shell_command.
+  mode: queued
+  max: 10
+  trigger:
+    - platform: event
+      event_type: mobile_app_notification_action
+  condition:
+    - condition: template
+      value_template: >
+        {{ trigger.event.data.action | default('')
+           | regex_match('^MAD_(parent_a|parent_b)_(SUPERJA|JA|NIX|MAASKE)_[0-9]+$') }}
+  action:
+    - variables:
+        dele: "{{ trigger.event.data.action.split('_') }}"
+    - service: shell_command.mad_vote
+      data:
+        person: "{{ dele[1] }}"
+        svar: "{{ dele[2] }}"
+        ret_id: "{{ dele[3] }}"
+
+- id: mad_refresh
+  alias: "Mad: opdatér sensorer"
+  description: >
+    Genpublicerer sensor.mad_status / _naeste_indkoeb efter HA-start (REST-
+    publicerede states overlever ikke en restart) og når en indstilling ændres,
+    så "næste indkøbsliste" på Mad-siden altid matcher sliderne.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: homeassistant
+      event: start
+    - platform: state
+      entity_id:
+        - input_boolean.mad_spoergsmaal_enabled
+        - input_boolean.mad_indkoeb_enabled
+        - input_boolean.mad_basisvarer_filter_enabled
+        - input_number.mad_boernevenlig_pct
+        - input_number.mad_retter_min
+        - input_number.mad_retter_max
+        - input_number.mad_indkoeb_interval_uger
+        - input_select.mad_indkoeb_ugedag
+        - input_datetime.mad_indkoeb_anker
+  action:
+    - delay: "00:00:20"
+    - service: shell_command.mad_refresh
+
+- id: nemlig_kurv_refresh
+  alias: "Nemlig: genpublicér kurv-sensor efter start"
+  description: >
+    sensor.nemlig_kurv publiceres via REST og overlever ikke en restart, præcis
+    som mad-sensorerne. Denne genskaber den fra sidste kørsels GEMTE payload —
+    den kalder IKKE Nemlig. En rigtig kurv-kørsel koster ~44 søgninger mod
+    deres API, og det hører ikke hjemme i en opstart der kan ske flere gange
+    om dagen under et deploy.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: homeassistant
+      event: start
+  action:
+    # Samme 20 s som mad_refresh: REST-publicering før HA er helt oppe tabes.
+    - delay: "00:00:20"
+    - service: shell_command.nemlig_republish
+
+- id: nemlig_parring_svar
+  alias: "Nemlig: svar på parrings-spørgsmål"
+  description: >
+    Knapperne på parrings-notifikationen. Action-id'et bærer hele svaret
+    (NEMLIG_<ask_id>_<0|1|SKIP>) — der er ingen fri tekst, og regexet her er
+    første gate. Scriptet validerer EN GANG TIL, fordi en ukendt ask_id ikke
+    må skrive en parring der ikke kan slås op.
+
+    Kun Parent A's telefon spørges (se notif_nemlig_parent_b i pakken), men
+    handleren er ikke bundet til en afsender: svarer den anden telefon
+    alligevel, er valget lige gyldigt.
+  mode: queued
+  max: 10
+  max_exceeded: silent
+  trigger:
+    - platform: event
+      event_type: mobile_app_notification_action
+  condition:
+    - condition: template
+      value_template: >
+        {{ trigger.event.data.action | default('')
+           | regex_match('^NEMLIG_q[0-9]+_([0-9]+|SKIP)$') }}
+  action:
+    - service: shell_command.nemlig_svar
+      data:
+        action: "{{ trigger.event.data.action }}"

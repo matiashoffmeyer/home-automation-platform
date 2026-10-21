@@ -1,0 +1,1011 @@
+# =============================================================================
+# Parent B's iPhone-alarm → HA (item 4, 2026-07-28)
+# =============================================================================
+# User-spec: "parent_b har en iphone. send hende og mig en notifikation der
+# forklarer hvordan hun sætter sin HA + iphone op til at rapportere next alarm,
+# og hvorfor det er nyttigt."
+#
+# HVORFOR: den alarm-drevne vækning (automations/wakeup_alarm_driven.yaml) kører
+# på `sensor.phone_a_next_alarm` — en sensor KUN Android-companion-app'en har
+# ("Manage sensors → Next alarm"). iOS kan IKKE læse alarmer fra Ur-app'en, så
+# der findes ingen tilsvarende sensor på Parent B's iPhone. Konsekvens før
+# 2026-07-30: vækningen var gated på `input_boolean.parent_a_home`, så når Parent A
+# var væk fik Parent B INGEN solopgangs-ramp og intet gardin-flow overhovedet.
+#
+# LØSNINGEN på iPhone (der er ingen native vej — det SKAL være Genveje).
+# TRIN-FOR-TRIN OPSKRIFT: docs/parent_b_iphone_alarm.md. Kort fortalt:
+#   Genvejs-app'ens Ur-action "Hent alarmer" giver alarmerne; genvejen skriver
+#   sit eget tidsstempel + klokkeslæt OG gentagelses-dage for hver AKTIVERET
+#   alarm som ren tekst til `input_text.parent_b_alarm_genvej` via
+#   HA-companion-app'ens "Udfør handling" (`input_text.set_value`). HA regner
+#   selv næste forekomst — inkl. hvilken ugedag alarmen faktisk ringer.
+#   Kør den fra TO personlige automatiseringer (bælte + seler):
+#     1) "Når Ur lukkes"  → øjeblikkelig opdatering når hun sætter/ændrer alarm
+#     2) "Sengetid"/"Tid på dagen 22:30" → natlig backstop hvis (1) blev sprunget
+#   Begge SKAL have "Spørg før kørsel" slået FRA, ellers kører de ikke selv.
+#
+# GENTAGELSES-DAGE kommer MED i payloaden (user-valg 2026-07-30). Alternativet —
+# kun klokkeslæt — lod en aktiveret weekend-alarm se ud som en alarm i morgen og
+# ville rampe soveværelset på en hverdag hvor ingen skulle op. Dag-feltet er
+# FAIL-OPEN: genkender HA ikke tokenet (fx "hver dag"), bruges næste forekomst
+# af klokkeslættet — en alarm må aldrig forsvinde tavst.
+# Den manuelle/avancerede vej (skriv et helt tidspunkt til
+# `input_datetime.parent_b_next_alarm`) består uændret som fallback nedenfor.
+#
+# VALG AF MÅL: en helper — IKKE `POST /api/states/sensor.x`. En state skabt
+# direkte via API'et er virtuel og forsvinder ved HA-restart; en helper
+# overlever. Companion-app'ens action bruger desuden app'ens egen godkendte
+# forbindelse → intet long-lived token gemt på telefonen.
+#
+# Automation-patch: wakeup_alarm_driven.yaml læser nu `sensor.wakeup_alarm_next`
+# (fælles anker, se nedenfor) i stedet for Parent A's sensor direkte.
+#
+# Filen er dermed hjemsted for BEGGE fælles vækkeur-ankre:
+#   sensor.wakeup_alarm_next       — hvilken alarm må drive soveværelset nu
+#   binary_sensor.wakeup_alarm_imminent — ringer den lige om lidt (pre-alarm-værn)
+# =============================================================================
+
+input_number:
+  # 2026-07-29 (user: "alarmen jeg havde sat i går udløste ikke gardin og
+  # vækningslys"). Hvor længe FØR alarmen sove-/børne-radarens bevægelse ikke
+  # længere må rydde godnat-flagene. Se binary_sensor.wakeup_alarm_imminent.
+  # Default 45 min: den faktiske hændelse 2026-07-29 var moving-target 06:01 mod
+  # alarm 06:15 (14 min), og man vender sig typisk flere gange den sidste
+  # halve time før vækketid. 0 = slå pre-alarm-værnet fra.
+  wakeup_alarm_preguard_minutes:
+    name: "Vækning: fredet vindue før alarmen (min)"
+    icon: mdi:alarm-check
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-08-18 — aftenvarslets "+30 min"-knap lægger til her, ikke i
+  # wakeup_fallback_tid: en udskydelse gælder ÉN nat, klokkeslættet er varigt.
+  # Ryddes sammen med skip-flaget kl. 10:00.
+  wakeup_fallback_udskyd_min:
+    name: "Vækning: udskyd reserve-alarmen (kun i nat)"
+    icon: mdi:clock-plus-outline
+    min: 0
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+input_datetime:
+  # MANUEL/AVANCERET vej (og fallback for genvejen nedenfor): et absolut
+  # tidspunkt. has_date+has_time så vi kan skelne "i morgen 06:15" fra "i dag
+  # 06:15" (= allerede passeret → ingen vækning). Kan sættes med to tryk i
+  # HA-appen (🌅 Vækning på Indstillinger) = virker uden nogen iPhone-opsætning.
+  parent_b_next_alarm:
+    name: "Parent B næste alarm (manuel / avanceret genvej)"
+    icon: mdi:alarm
+    has_date: true
+    has_time: true
+
+  # 2026-08-05: RUNTIME-stempel — hvornår gik voksenalarmen faktisk af?
+  # (Ikke en indstilling → holdes ude af helper-snapshottet; input_datetime
+  # snapshottes kun via DATETIME_CONFIG-allowlisten i scripts/helpers_export.py.)
+  #
+  # HVORFOR ET STEMPEL OG IKKE BARE `sensor.wakeup_alarm_next`: ankeret RULLER
+  # VIDERE i selve ringe-øjeblikket — målt i history 07-28→08-05 går det til
+  # 'none' på minuttet (engangs-alarmer) eller frem til i morgen (gentagne).
+  # Et par minutter senere kan man derfor ikke længere se HVORNÅR alarmen gik af.
+  # `wakeup_alarm_ramp_faerdig_at` duer heller ikke som proxy: den skrives kun
+  # når voksen-rampen rent faktisk KØRTE (blokeres bl.a. af lux < 80 en
+  # sommermorgen — stemplet blev skrevet ÉN gang på 14 dage). Alt der skal
+  # tidsfæstes ift. alarmen (fx børnevækningen) læser derfor DETTE stempel.
+  wakeup_alarm_gaaet_af_at:
+    name: "Voksenalarm gik af (stempel)"
+    icon: mdi:alarm-bell
+    has_date: true
+    has_time: true
+
+  # 2026-08-25 (user-spec) — DAGENS VÆKNING SPRUNGET OVER.
+  # Runtime-stempel (holdes derfor ude af helper-snapshottet, som kun tager
+  # DATETIME_CONFIG-allowlisten). Sættes af godnat-knappen i morgenvinduet,
+  # ryddes af godmorgen-knappen. Se binary_sensor.wakeup_skip_i_dag.
+  #
+  # HVORFOR EN DATO OG IKKE ET input_boolean: et flag skal ryddes af nogen, og
+  # bliver det hængende, er næste morgens vækning væk — præcis den fejl der
+  # kostede en morgen 08-18. En dato udløber af sig selv ved midnat.
+  # has_time er med af to grunde: den viser hvornår der blev trykket, og den
+  # giver guarden mod fejlklasse #5 (et URØRT has_date-felt står på DAGENS
+  # midnat og ville ellers betyde "spring altid over").
+  wakeup_skip_dato:
+    name: "Vækning: dagens vækning sprunget over (stempel)"
+    icon: mdi:alarm-off
+    has_date: true
+    has_time: true
+
+  # 2026-08-18 — RESERVE-ALARMEN (se sensor.wakeup_fallback_alarm).
+  # has_time uden has_date: det er et klokkeslæt, ikke en dato. (Et urørt
+  # has_date-felt står i øvrigt på DAGENS midnat og ligner et friskt stempel,
+  # fejlklasse #5 — det problem findes ikke her.)
+  wakeup_fallback_tid:
+    name: "Vækning: reserve-alarm (hverdage)"
+    icon: mdi:alarm-plus
+    has_date: false
+    has_time: true
+
+input_boolean:
+  # 2026-08-18 — slå reserve-alarmen fra hvis huset KUN må vækkes af en rigtig
+  # telefon-alarm. Separat fra `wakeup_adults_enabled` (som slår hele
+  # vække-maskineriet fra): her beholder man den alarm-drevne vækning og
+  # fravælger kun nettet under den.
+  wakeup_fallback_enabled:
+    name: "Vækning: reserve-alarm aktiv"
+    icon: mdi:alarm-plus
+
+  # 2026-08-18 — ÉN nats afbud, sat fra aftenvarslets knap. Adskilt fra
+  # kill-switchen med vilje: et "ikke i morgen" må ikke kunne fjerne nettet
+  # permanent, for så er vi tilbage ved den morgen ingen blev vækket.
+  # Ryddes automatisk kl. 10:00 (efter vække-vinduet 04-10).
+  wakeup_fallback_skip:
+    name: "Vækning: spring reserve-alarmen over i nat"
+    icon: mdi:alarm-snooze
+
+  # 2026-08-19 — "aftenvarslet står stadig på telefonen og lover en reserve".
+  # Kl. 21 har vi typisk ikke sat morgendagens alarm endnu (og Parent B's genvej
+  # skriver først kl. 01), så varslet er et VARSEL, ikke en kendsgerning. Flaget
+  # gør det muligt at trække beskeden tilbage tavst når en rigtig alarm dukker op
+  # — uden at sende en ny push midt om natten.
+  wakeup_aftenvarsel_udestaaende:
+    name: "Vækning: aftenvarsel afventer en alarm"
+    icon: mdi:bell-alert-outline
+
+  # 2026-08-18 — egen notifikations-kategori til aftenvarslet. Den lå før på
+  # `gps_stale`, hvis scope er "en telefon er frosset" — slår man DEN fra for at
+  # slippe for GPS-støj, mister man også varslet om at vækningen står på reserve.
+  notif_vaekning_enabled:
+    name: "⏰ Vækning i aften — send"
+    icon: mdi:alarm-note
+  notif_vaekning_parent_a:
+    name: "⏰ Vækning i aften — Parent A"
+    icon: mdi:cellphone
+  notif_vaekning_parent_b:
+    name: "⏰ Vækning i aften — Parent B"
+    icon: mdi:cellphone
+  notif_vaekning_airbnb:
+    name: "⏰ Vækning i aften — også i AirBnB"
+    icon: mdi:home-account
+
+input_text:
+  # GENVEJENS skrive-mål (2026-07-30).
+  # Format:  "<ISO-8601 nu>|HH:MM@dage,HH:MM@dage,…"
+  #   1. felt = hvornår genvejen kørte (frisk-heds-bevis, se genvej_ok)
+  #   2. felt = HVER aktiveret alarm — ingen dato, ingen orden. `@dage` er
+  #             alarmens gentagelses-dage som Shortcuts staver dem; tomt/
+  #             udeladt = ringer næste gang klokkeslættet indtræffer.
+  #             Læses tolerant: dansk/engelsk navn (3-tegns præfiks er nok)
+  #             eller tal 1-7 (man=1), separator er vilkårlig — "man+tir",
+  #             "12345" og "Monday, Friday" virker alle.
+  #
+  # HVORFOR rå klokkeslæt i stedet for et færdigt tidspunkt: en iOS-alarm har
+  # KUN et klokkeslæt (Shortcuts udleverer dummy-datoen 2001-01-01), så "næste
+  # forekomst" skal beregnes — og at gøre det på telefonen kræver en betinget
+  # dato-justering PLUS en min-løkke over alarmerne. Her er det ét
+  # template-udtryk, som jeg kan teste. Genvejen bliver ~11 trin uden matematik.
+  #
+  # HVORFOR stemplet kommer fra TELEFONEN og ikke fra HA: (a) helper-
+  # `last_changed` nulstilles ved hver HA-restart, så alder målt i HA meldte
+  # "genvejen kører" om et felt der aldrig var skrevet (den bug, verificeret
+  # 07-30: værdien stod på init-defaulten og genvej_ok var true); (b) en
+  # HA-side stempel-automation duer heller ikke — skriver genvejen SAMME tider
+  # som i går (normalen!), fyrer HA `state_reported`, ikke `state_changed`,
+  # og automationen ville aldrig trigge. Et stempel i selve payloaden ændrer
+  # sig hver gang og overlever restart.
+  parent_b_alarm_genvej:
+    name: "Parent B alarm-genvej (rå payload fra iPhone)"
+    icon: mdi:cellphone-arrow-down
+    max: 255
+
+template:
+  - sensor:
+      # iOS-pendant til sensor.phone_a_next_alarm: ISO-8601-streng, eller 'none'.
+      # SELV-RYDDENDE: ligger stemplet i fortiden er alarmen brugt (eller
+      # genvejen holdt op med at køre) → 'none'. Dermed kan en glemt/stale
+      # helper aldrig fyre en vækning på et forkert tidspunkt.
+      - name: "Parent B next alarm"
+        unique_id: parent_b_next_alarm
+        icon: mdi:alarm
+        state: >-
+          {% set raw = states('input_text.parent_b_alarm_genvej') %}
+          {% set raw = '' if raw in ['unknown', 'unavailable', 'none'] else raw %}
+          {% set nu = as_timestamp(now()) %}
+          {% set da = ['man', 'tir', 'ons', 'tor', 'fre', 'lør', 'søn'] %}
+          {% set en = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] %}
+          {# 2026-08-05 (user item 5: "Parent B's alarm står også som aktiv hver dag
+             nu, 0615. vi satte den kun til one off med Shortcut"). Genvejen
+             skriver gentagelses-status som ja/nej, ikke som dage — hendes ægte
+             payload er `2026-08-02|06:15@Nej`. `Nej` matchede intet dag-token og
+             faldt derfor ud i FAIL-OPEN = "næste gang klokken er 06:15", hver
+             dag, for evigt (målt: sensoren rullede sig selv frem til næste dag
+             kl. 06:15:00 præcis den 08-03, 08-04 og 08-05).
+             Fail-open er stadig rigtigt for UKENDTE tokens — en ulæselig dag
+             må ikke slette alarmen tavst. Men "Nej" er ikke ukendt, det er et
+             eksplicit "gentages ikke", og så skal den respekteres.
+             ENGANGS-REGEL: alarmen kan kun ligge på stemplets dato eller dagen
+             efter (genvejen kører ved sengetid, så en alarm sat om aftenen
+             hører til næste morgen). Er begge passeret, er alarmen BRUGT →
+             sensoren melder none i stedet for at rulle frem. #}
+          {% set stempel_ts = as_timestamp((raw ~ '|').split('|')[0] | trim, 0) %}
+          {% set engangs_ord = ['nej', 'no', 'aldrig', 'never', 'once', 'engang',
+                                'engangs', 'en gang', 'ingen'] %}
+          {% set ns = namespace(best=0, post=0) %}
+          {% for post in (raw ~ '|').split('|')[1].split(',') %}
+            {% set tid = (post.strip() ~ '@').split('@')[0] | trim %}
+            {% set dage = (post.strip() ~ '@').split('@')[1] | trim | lower %}
+            {% set engangs = dage in engangs_ord %}
+            {% set hh = tid.split(':')[0] | int(-1) %}
+            {% set mm = (tid ~ ':').split(':')[1] | int(-1) %}
+            {% if 0 <= hh <= 23 and 0 <= mm <= 59 and engangs and stempel_ts > 0 %}
+              {# Kun stemplets dato + dagen efter er kandidater.
+                 2026-08-19: genvejen kører nu kl. 01:00, og stemplet er DATO-ONLY
+                 ("2026-08-19|06:01@Nej"). Efter alarmen havde ringet var dagen-efter
+                 stadig kandidat, så sensoren rullede frem til en FANTOM 08-20 06:01
+                 og påstod "Parent B har en alarm" resten af døgnet — hvilket slår
+                 både aftenvarslet og reserven fra. En engangs-alarm hører til den
+                 FØRSTE forekomst efter genvejen kørte, altså højst 24 t efter
+                 stemplet. Har stemplet et klokkeslæt (formatet headeren beskriver),
+                 er bindingen præcis; er det kun en dato, kender vi ikke
+                 skrive-øjeblikket, og så er kun stemplets egen dag kandidat. Den
+                 retning er den sikre: en fantom-alarm er tavshed, en manglende
+                 alarm er blot en reserve der ringer. #}
+              {% set stempel_har_tid = ':' in (raw ~ '|').split('|')[0] %}
+              {% set basis = (stempel_ts | as_datetime | as_local).replace(
+                               hour=hh, minute=mm, second=0, microsecond=0) %}
+              {% set ns.post = 0 %}
+              {% for d in [0, 1] %}
+                {% set ts = as_timestamp(basis + timedelta(days=d)) %}
+                {% if ts > nu
+                      and (d == 0 or (stempel_har_tid and ts - stempel_ts <= 86400))
+                      and (ns.post == 0 or ts < ns.post) %}
+                  {% set ns.post = ts %}
+                {% endif %}
+              {% endfor %}
+              {% if ns.post > 0 and (ns.best == 0 or ns.post < ns.best) %}
+                {% set ns.best = ns.post %}
+              {% endif %}
+            {% elif 0 <= hh <= 23 and 0 <= mm <= 59 %}
+              {# timedelta og IKKE +86400: sommertids-skiftet ville ellers flytte
+                 vækketiden en time den nat (as_timestamp-aritmetik er absolut,
+                 datetime-aritmetik holder vægur-tiden). #}
+              {% set basis = today_at('%02d:%02d' | format(hh, mm)) %}
+              {% set ns.post = 0 %}
+              {% for d in range(0, 8) %}
+                {% set k = basis + timedelta(days=d) %}
+                {% set ts = as_timestamp(k) %}
+                {% set wd = k.isoweekday() %}
+                {# Dag-tokens tages som de kommer fra Shortcuts: dansk eller
+                   engelsk navn (3-tegns præfiks er nok: "mandag"/"Monday"),
+                   eller tal 1-7 (man=1) — både "1+2" og "12345".
+                   Apple opsummerer nogle gange i stedet for at liste dagene
+                   ("Hverdage"/"Weekend") → oversæt dem, ellers ville netop de
+                   to hyppigste mønstre falde ud i fail-open og gøre hele
+                   dag-feltet formålsløst. NB "hver dag" (mellemrum) rammer
+                   IKKE 'hverdag' → den fail-opener korrekt til alle dage. #}
+                {% set passer = dage == ''
+                                or da[wd - 1] in dage or en[wd - 1] in dage
+                                or (wd | string) in dage
+                                or (('hverdag' in dage or 'weekday' in dage)
+                                    and wd <= 5)
+                                or ('weekend' in dage and wd >= 6) %}
+                {% if ts > nu and passer and (ns.post == 0 or ts < ns.post) %}
+                  {% set ns.post = ts %}
+                {% endif %}
+              {% endfor %}
+              {# FAIL-OPEN: matchede dag-feltet intet i 8 døgn, er formatet
+                 ukendt (fx "hver dag"/"ugentligt") — så bruges næste forekomst.
+                 En alarm må aldrig forsvinde TAVST fordi et token var ulæseligt;
+                 en overflødig ramp er billigere end en manglende vækning. #}
+              {% if ns.post == 0 %}
+                {% set ns.post = as_timestamp(basis if as_timestamp(basis) > nu
+                                              else basis + timedelta(days=1)) %}
+              {% endif %}
+              {% if ns.best == 0 or ns.post < ns.best %}{% set ns.best = ns.post %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          {# NB: (…).isoformat() — `| as_local.isoformat()` er IKKE et filter og
+             fejler hele sensoren. Den fejl lå latent her indtil 07-30, fordi
+             grenen kun rammes når der FAKTISK er en alarm (fejlklasse #6). #}
+          {% if ns.best > 0 %}{{ (ns.best | as_datetime | as_local).isoformat() }}
+          {% else %}
+            {# Ingen brugbar genvejs-payload → den manuelle helper. SELV-RYDDENDE:
+               ligger tidspunktet i fortiden er alarmen brugt → 'none', så en
+               glemt værdi aldrig kan fyre en vækning på et forkert tidspunkt. #}
+            {% set t = state_attr('input_datetime.parent_b_next_alarm', 'timestamp') %}
+            {% if t is none or (t | float(0)) <= 0
+                  or (t | float(0)) <= as_timestamp(now()) %}none
+            {% else %}{{ ((t | float(0)) | as_datetime | as_local).isoformat() }}{% endif %}
+          {% endif %}
+        attributes:
+          kilde: >-
+            {% set raw = states('input_text.parent_b_alarm_genvej') %}
+            {% set raw = '' if raw in ['unknown', 'unavailable', 'none'] else raw %}
+            {% if ':' in (raw ~ '|').split('|')[1] %}genvej
+            {% elif (state_attr('input_datetime.parent_b_next_alarm', 'timestamp')
+                     | float(0)) > as_timestamp(now()) %}manuel
+            {% else %}ingen{% endif %}
+          alarm_tider: >-
+            {% set raw = states('input_text.parent_b_alarm_genvej') %}
+            {% set raw = '' if raw in ['unknown', 'unavailable', 'none'] else raw %}
+            {{ (raw ~ '|').split('|')[1] | trim | default('-', true) }}
+          # 5-MIN-KVANTISERET (fejlklasse #24) — diagnostik-felt uden forbrugere
+          # der maaler paa det; friskheds-DOMMEN ligger i genvej_ok (36 t).
+          minutter_siden_genvej: >-
+            {% set raw = states('input_text.parent_b_alarm_genvej') %}
+            {% set ts = as_timestamp((raw ~ '|').split('|')[0] | trim, 0) %}
+            {% if ts <= 0 %}-1
+            {% else %}{{ (((as_timestamp(now()) - ts) / 300) | int) * 5 }}{% endif %}
+          genvej_ok: >-
+            {# Genvejen kører hver nat (bedtime) + hver gang Ur-appen lukkes →
+               et stempel ældre end 36 t betyder at automatiseringen er død eller
+               slået fra på iPhonen. Negativ alder tolereres i 3 t: vælger man
+               et dato-format UDEN tidszone, læser as_timestamp strengen som UTC
+               = 2 t "i fremtiden" (fejlklasse B67) — det er stadig en frisk
+               genvej, ikke en død. #}
+            {# Genvejen skriver i praksis kun DATOEN (målt 2026-08-02, første
+               ægte payload: "2026-08-02|06:15@Nej"). En bar dato parses som
+               00:00 UTC = 02:00 lokal, men kan være skrevet når som helst det
+               døgn → mål alderen fra det SENEST mulige skrive-tidspunkt, og lad
+               den aldrig blive negativ. Uden det ville flaget melde "genvejen er
+               død" hver eftermiddag på en pipeline der kører præcis som den skal
+               (stemplet ville se op til 24 t ældre ud end virkeligheden). #}
+            {% set raw = states('input_text.parent_b_alarm_genvej') %}
+            {% set stempel = (raw ~ '|').split('|')[0] | trim %}
+            {% set ts = as_timestamp(stempel, 0) %}
+            {% set dato_kun = ts > 0 and ':' not in stempel %}
+            {% set alder = as_timestamp(now()) - (ts + 79200 if dato_kun else ts) %}
+            {% set alder = ([alder, 0] | max) if dato_kun else alder %}
+            {{ ts > 0 and alder < 129600 and alder > -10800 }}
+
+      # ---------------------------------------------------------------------
+      # RESERVE-ALARM (2026-08-18) — nettet under de to telefon-kanaler.
+      #
+      # INCIDENT: hverdagsmorgen 08-18, ingen vækning overhovedet. Ikke ét
+      # fejlende led, men ALLE tre på én gang:
+      #   · Parent B's iOS-genvej havde ikke skrevet siden 08-15 10:56, og dens
+      #     sidste payload var `2026-08-15|` — et stempel med TOM alarm-liste.
+      #     `genvej_ok` stod false i 77 t uden at nogen fik besked.
+      #   · `sensor.phone_a_next_alarm` = unavailable (= ingen alarm sat).
+      #   · Den gamle faste 05:55-vej (`wakeup_adults.yaml`) blev slået fra i
+      #     audit-runde 19 da alarm-drevet overtog — `last_triggered` er aldrig
+      #     blevet sat. Der var altså INGEN vej tilbage.
+      # → `sensor.wakeup_alarm_next` har stået 'none' siden 08-13.
+      #
+      # Designet "ingen alarm = intet lys" er bevidst (se headeren i
+      # wakeup_alarm_driven.yaml) og rigtigt for ÉN glemt alarm. Det holder
+      # ikke når en INPUT-KANAL dør stille: så er tavsheden ikke et valg, den
+      # er et udfald. User-spec: "unødig solopgang > misset vækning".
+      #
+      # 05:55 er valgt, ikke 06:15: `sensor.wakeup_kids_maal` er alarm + 10 min
+      # og falder ellers tilbage på fast 06:05. Med 05:55 lander børnene på
+      # præcis de 06:05 de har i dag — reserven må ikke stille børnenes
+      # vækkeur senere som bivirkning.
+      #
+      # Kun HVERDAGE, og kun mens tidspunktet er forude: efter 05:55 melder
+      # den 'none' igen, så en /5-backstop ikke kan hive en solopgang ind midt
+      # på formiddagen. `arbejdsdag` testes for eksplicit 'off' (ikke "ikke
+      # on") — en død workday-sensor skal ikke kunne aflyse vækningen tavst.
+      # Alt det ØVRIGE værn ligger allerede i forbrugeren: godnat_active == on
+      # (= nogen gik faktisk i seng her), morgen-beskyttelsens 4-timers snooze,
+      # house_mode Normal og lux-loftet.
+      # 2026-08-21 (user: "føler at den kørte backup alarmen"): reserven er en
+      # dead-man's switch for en DØD input-kanal — den må ikke ringe efter at en
+      # rigtig alarm har ringet. Målt i morges: telefonalarmen gik af 06:05:00,
+      # `phone_a_next_alarm` gik `unavailable` 06:05:03, og ankeret faldt derfor
+      # igennem til reserven → `wakeup_alarm_next` meldte 06:40 resten af
+      # morgenen, `wakeup_alarm_imminent` gik ON igen, og stemplet blev skrevet
+      # en ekstra gang 06:40. Stemplet er husets eneste vidne om at en alarm
+      # FAKTISK ringede (ankeret ruller videre i selve ringe-øjeblikket), så
+      # det er også den rigtige gate her. `[11:] == '00:00:00'` = aldrig sat:
+      # et urørt has_date-felt står på DAGENS midnat (fejlklasse #5), og en
+      # ægte alarm kan ikke ringe kl. 00:00 i 04-10-vinduet.
+      - name: "Wakeup fallback alarm"
+        unique_id: wakeup_fallback_alarm
+        icon: mdi:alarm-plus
+        state: >-
+          {% set g = states('input_datetime.wakeup_alarm_gaaet_af_at') %}
+          {% set gik_af_i_dag = g[:10] == now().strftime('%Y-%m-%d')
+                                and g[11:] != '00:00:00' %}
+          {% if is_state('input_boolean.wakeup_fallback_enabled', 'off') %}none
+          {% elif is_state('input_boolean.wakeup_fallback_skip', 'on') %}none
+          {% elif is_state('binary_sensor.arbejdsdag', 'off') %}none
+          {% elif gik_af_i_dag %}none
+          {% else %}
+            {% set t = states('input_datetime.wakeup_fallback_tid') %}
+            {% if not (t | regex_match('^\d{2}:\d{2}')) %}none
+            {% else %}
+              {% set u = states('input_number.wakeup_fallback_udskyd_min') | int(0) %}
+              {% set maal = today_at(t[:5]) + timedelta(minutes=u) %}
+              {{ 'none' if maal <= now() else maal.isoformat() }}
+            {% endif %}
+          {% endif %}
+        attributes:
+          grund: >-
+            {% set u = states('input_number.wakeup_fallback_udskyd_min') | int(0) %}
+            {% set t = states('input_datetime.wakeup_fallback_tid') %}
+            {% set g = states('input_datetime.wakeup_alarm_gaaet_af_at') %}
+            {% set gik_af_i_dag = g[:10] == now().strftime('%Y-%m-%d')
+                                  and g[11:] != '00:00:00' %}
+            {% if is_state('input_boolean.wakeup_fallback_enabled', 'off') %}
+              Reserve-alarm slået fra.
+            {% elif is_state('input_boolean.wakeup_fallback_skip', 'on') %}
+              Sprunget over i nat — gælder kun denne ene morgen, ryddes kl. 10.
+            {% elif is_state('binary_sensor.arbejdsdag', 'off') %}
+              Ikke en arbejdsdag.
+            {% elif gik_af_i_dag %}
+              En rigtig telefon-alarm ringede kl. {{ g[11:16] }} — reserven
+              er ikke nødvendig i dag.
+            {% elif not (t | regex_match('^\d{2}:\d{2}')) %}
+              Reserve-tiden er ikke sat.
+            {% else %}
+              Reserve {{ (today_at(t[:5]) + timedelta(minutes=u)).strftime('%H:%M') }}
+              {%- if u > 0 %} (udskudt {{ u }} min, kun i nat){% endif %} —
+              bruges kun når ingen telefon melder en alarm.
+            {% endif %}
+
+      # ---------------------------------------------------------------------
+      # FÆLLES ANKER for den alarm-drevne vækning (fejlklasse #2: ét sted,
+      # ikke samme ejer-regel kodet i både trigger og conditions).
+      # Hvem må drive soveværelsets solopgang lige nu? SYMMETRISK (user-valg
+      # 2026-07-30): hver voksen der er HJEMME bidrager med sin alarm, og den
+      # TIDLIGSTE af dem vinder. Er kun én hjemme, gælder kun dennes alarm.
+      #   - Alarm-ejeren skal være hjemme: sensoren rapporterer alarmen uanset
+      #     telefonens fysiske position, så en alarm sat af en der er på rejse
+      #     må ikke vække den der sover hjemme (2026-05-21-fixet lever her).
+      #     HJEMME testes bredere end `input_boolean.<person>_home` — se
+      #     kommentaren i state nedenfor (GPS-staleness må ikke stjæle retten
+      #     til at vække).
+      #   - 07-28's konservative regel ("begge hjemme = kun Parent A's alarm, så
+      #     hendes tidligere alarm ikke tænder loftet over en sovende Parent A")
+      #     er FORLADT bevidst: user vil vækkes af den første alarm uanset hvem
+      #     der satte den. Escapen er godnat-knappens snooze (07-29b), som
+      #     udskyder vækning i soveværelset 4 timer.
+      # NB: reglen står BÅDE i state og i `ejer`-attributten — ret begge
+      # (fejlklasse #2). Attributten må ikke læse sensorens egen state.
+      # Formater: Androids sensor melder UTC ("…T04:15:00+00:00"), Parent B's
+      # lokal offset — begge bærer offset, så as_timestamp gør dem sammenlignelige.
+      # 2026-08-06 (user: "min alarm står til 6.15 på min tlf men 04.15 i ha!?
+      # kritisk"): ankeret videresendte den valgte streng ORDRET, så en
+      # Parent A-ejet alarm blev vist i UTC = to timer for tidligt i enhver UI der
+      # renderer state'n som tekst. Logikken var korrekt hele vejen (alle
+      # forbrugere bruger as_timestamp, og `minutter_til_alarm` målte 490 for en
+      # 06:15-alarm kl. 22:05) — men et anker man ikke tør stole på med øjnene,
+      # er værdiløst i en vække-kæde. State + `raa` normaliseres derfor til
+      # LOKAL ISO, og `lokal` giver den læsbare form til dashboards.
+      # Konverteringen er FAIL-OPEN: kan strengen ikke parses, sendes den
+      # uændret videre (en alarm må aldrig forsvinde på et formateringsproblem).
+      # ---------------------------------------------------------------------
+      - name: "Wakeup alarm next"
+        unique_id: wakeup_alarm_next
+        icon: mdi:alarm-multiple
+        state: >-
+          {# HJEMME-TESTEN er bevidst bredere end input_boolean.<person>_home.
+             Flaget slås nemlig OGSÅ fra af GPS-staleness (presence_gps_stale,
+             45 min i dagvinduet), og en iPhone der ligger stille er tavs i
+             timevis: målt 2026-08-02 meldte Parent B's telefon INTET fra 21:23 til
+             14:07 næste dag = 16 t 44 min. Falder flaget i dagvinduet (målt kl.
+             16:00) kan det først komme tilbage når telefonen pinger igen —
+             `presence_parent_b_arrive` kræver `parent_b_gps_fresh == on`, som er
+             off hele natten — så hendes alarm ville TAVST miste retten til at
+             vække, selvom hun ligger i sengen ved siden af.
+             `presence_*_leave` slukker kun flaget når trackeren står 'not_home',
+             så tracker == 'home' betyder "ingen registreret afgang" = flaget
+             faldt på staleness alene. Fejlen den anden vej (hun er reelt væk,
+             telefonen døde før den nåede at melde not_home) koster én unødig
+             solopgang med godnat-knappens 4-timers snooze som escape — mod at
+             MISTE vækningen helt, som er præcis den klage der startede både
+             07-29 og 07-30c. #}
+          {# 🔌 2026-08-05 (user item 11: "voksne vækning kill switch virker
+             ikke"). Killswitchen gatede KUN de to automations i
+             wakeup_alarm_driven.yaml — selve ankeret var u-gatet, så resten af
+             vække-maskineriet kørte videre med switchen slukket:
+             `binary_sensor.wakeup_alarm_imminent` gik stadig `on` 45 min før
+             alarmen og frøs godmorgen-auto-clearens radar-trigger, så huset
+             opførte sig som om en vækning var på vej. Ankeret er choke-pointet
+             — gates den her, følger ALLE forbrugere med (fejlklasse #21).
+             Den rå værdi bevares i attributten `raa` så Vækning-siden stadig
+             kan vise hvornår telefonerne ville have ringet. #}
+          {% if is_state('input_boolean.wakeup_adults_enabled', 'off') %}none
+          {% else %}
+          {% set m = states('sensor.phone_a_next_alarm') %}
+          {% set c = states('sensor.parent_b_next_alarm') %}
+          {% set tom = ['unknown', 'unavailable', 'none', ''] %}
+          {% set m_hjemme = is_state('input_boolean.parent_a_home', 'on')
+                            or is_state('device_tracker.phone_a', 'home') %}
+          {# 2026-08-18: ANKERET, ikke de rå kilder — samme rettelse i `lokal`
+             og `ejer` nedenfor (#2). `device_tracker`en er permanent frossen
+             efter permission-nedgraderingen: den stod `home` i dagevis og
+             siden `not_home`, altså nul evidens i BEGGE retninger, og OR'et
+             gjorde den til et selvsikkert svar. #}
+          {% set c_hjemme = is_state('binary_sensor.parent_b_hjemme_anker', 'on') %}
+          {% set m_ok = m_hjemme and m not in tom %}
+          {% set c_ok = c_hjemme and c not in tom %}
+          {% if m_ok and c_ok %}{% set valgt = m if as_timestamp(m, 0) <= as_timestamp(c, 0) else c %}
+          {% elif m_ok %}{% set valgt = m %}
+          {% elif c_ok %}{% set valgt = c %}
+          {# Ingen telefon melder en alarm → reserve-alarmen (2026-08-18).
+             Samme fald-igennem står i `lokal`, `raa` og `ejer` — ret ALLE
+             fire (fejlklasse #2). #}
+          {% else %}{% set fb = states('sensor.wakeup_fallback_alarm') %}
+                    {% set valgt = fb if fb not in tom else 'none' %}{% endif %}
+          {% set ts = as_timestamp(valgt, 0) %}
+          {# 🚫 2026-08-25 (user-spec): "trykker jeg på godnatknappen om morgenen
+             skal alle alarmvækninger springes over, ikke bare snoozes — alle tre
+             veje". Gaten sidder på ANKERET, ikke på de tre kilder: så følger
+             Parent A's telefon, Parent B's genvej, reserve-alarmen OG enhver fremtidig
+             kanal med af sig selv (fejlklasse #21, samme argument som
+             killswitchen ovenfor).
+             KUN alarmer der falder I DAG nulstilles. Ankeret ruller videre til i
+             morgen i selve ringe-øjeblikket, og et skip må aldrig kunne æde næste
+             morgens vækning — der er langt dyrere at misse end en unødig
+             solopgang. `raa` er bevidst u-gatet, så Vækning-siden stadig viser
+             hvornår telefonerne VILLE have ringet. #}
+          {% if ts > 0 and is_state('binary_sensor.wakeup_skip_i_dag', 'on')
+                and (ts | timestamp_custom('%Y-%m-%d', true)) == now().strftime('%Y-%m-%d') %}none
+          {% elif valgt == 'none' %}none
+          {% elif ts == 0 %}{{ valgt }}
+          {% else %}{{ (ts | as_datetime | as_local).isoformat() }}{% endif %}
+          {% endif %}
+        attributes:
+          slaaet_fra: >-
+            {{ is_state('input_boolean.wakeup_adults_enabled', 'off') }}
+          sprunget_over: >-
+            {{ is_state('binary_sensor.wakeup_skip_i_dag', 'on') }}
+          lokal: >-
+            {# Læsbar form til dashboards. Genberegner bevidst udvalget i stedet
+               for at læse sensorens egen state: en attribut der self-refererer
+               lagger ét render bagud og lytter på sig selv (jf. header-NB'et og
+               07-29e). Samme regel tre steder = ret ALLE (fejlklasse #2). #}
+            {% if is_state('input_boolean.wakeup_adults_enabled', 'off') %}slået fra
+            {% else %}
+            {% set m = states('sensor.phone_a_next_alarm') %}
+            {% set c = states('sensor.parent_b_next_alarm') %}
+            {% set tom = ['unknown', 'unavailable', 'none', ''] %}
+            {% set m_hjemme = is_state('input_boolean.parent_a_home', 'on')
+                              or is_state('device_tracker.phone_a', 'home') %}
+            {% set c_hjemme = is_state('binary_sensor.parent_b_hjemme_anker', 'on') %}
+            {% set m_ok = m_hjemme and m not in tom %}
+            {% set c_ok = c_hjemme and c not in tom %}
+            {% if m_ok and c_ok %}{% set valgt = m if as_timestamp(m, 0) <= as_timestamp(c, 0) else c %}
+            {% elif m_ok %}{% set valgt = m %}
+            {% elif c_ok %}{% set valgt = c %}
+            {% else %}{% set fb = states('sensor.wakeup_fallback_alarm') %}
+                      {% set valgt = fb if fb not in tom else 'none' %}{% endif %}
+            {% set ts = as_timestamp(valgt, 0) %}
+            {# Samme skip-gate som i state (fejlklasse #2 — ret ALLE fire). #}
+            {% if ts > 0 and is_state('binary_sensor.wakeup_skip_i_dag', 'on')
+                  and (ts | timestamp_custom('%Y-%m-%d', true)) == now().strftime('%Y-%m-%d') %}sprunget over i dag
+            {% elif ts == 0 %}—
+            {% else %}
+            {% set d = ts | as_datetime | as_local %}
+            {{ ['man', 'tir', 'ons', 'tor', 'fre', 'lør', 'søn'][d.weekday()] }}
+            {{- ' ' }}{{ ts | timestamp_custom('%d/%m %H:%M', true) }}
+            {% endif %}
+            {% endif %}
+          raa: >-
+            {# Hvad ankeret VILLE have meldt uden killswitchen — så en slukket
+               kontakt kan skelnes fra "ingen alarm sat". #}
+            {% set m = states('sensor.phone_a_next_alarm') %}
+            {% set c = states('sensor.parent_b_next_alarm') %}
+            {% set tom = ['unknown', 'unavailable', 'none', ''] %}
+            {% set m_ok = m not in tom %}
+            {% set c_ok = c not in tom %}
+            {% if m_ok and c_ok %}{% set valgt = m if as_timestamp(m, 0) <= as_timestamp(c, 0) else c %}
+            {% elif m_ok %}{% set valgt = m %}
+            {% elif c_ok %}{% set valgt = c %}
+            {% else %}{% set fb = states('sensor.wakeup_fallback_alarm') %}
+                      {% set valgt = fb if fb not in tom else 'none' %}{% endif %}
+            {% set ts = as_timestamp(valgt, 0) %}
+            {% if valgt == 'none' %}none
+            {% elif ts == 0 %}{{ valgt }}
+            {% else %}{{ (ts | as_datetime | as_local).isoformat() }}{% endif %}
+          ejer: >-
+            {# Samme hjemme-test som i state — ret BEGGE (fejlklasse #2). #}
+            {% if is_state('input_boolean.wakeup_adults_enabled', 'off') %}slået fra
+            {% else %}
+            {% set m = states('sensor.phone_a_next_alarm') %}
+            {% set c = states('sensor.parent_b_next_alarm') %}
+            {% set tom = ['unknown', 'unavailable', 'none', ''] %}
+            {% set m_hjemme = is_state('input_boolean.parent_a_home', 'on')
+                              or is_state('device_tracker.phone_a', 'home') %}
+            {% set c_hjemme = is_state('binary_sensor.parent_b_hjemme_anker', 'on') %}
+            {% set m_ok = m_hjemme and m not in tom %}
+            {% set c_ok = c_hjemme and c not in tom %}
+            {# Samme skip-gate som i state (fejlklasse #2 — ret ALLE fire).
+               Står ankeret allerede på i morgen, er ejeren stadig ægte. #}
+            {% if m_ok and c_ok %}{% set valgt = m if as_timestamp(m, 0) <= as_timestamp(c, 0) else c %}
+            {% elif m_ok %}{% set valgt = m %}
+            {% elif c_ok %}{% set valgt = c %}
+            {% else %}{% set fb = states('sensor.wakeup_fallback_alarm') %}
+                      {% set valgt = fb if fb not in tom else 'none' %}{% endif %}
+            {% set ts = as_timestamp(valgt, 0) %}
+            {% if ts > 0 and is_state('binary_sensor.wakeup_skip_i_dag', 'on')
+                  and (ts | timestamp_custom('%Y-%m-%d', true)) == now().strftime('%Y-%m-%d') %}sprunget over
+            {% elif m_ok and c_ok %}{{ 'parent_a' if as_timestamp(m, 0) <= as_timestamp(c, 0)
+                                     else 'parent_b' }}
+            {% elif m_ok %}parent_a
+            {% elif c_ok %}parent_b
+            {% elif states('sensor.wakeup_fallback_alarm') not in tom %}reserve
+            {% else %}ingen{% endif %}
+            {% endif %}
+
+  - binary_sensor:
+      # ---------------------------------------------------------------------
+      # DAGENS VÆKNING ER SPRUNGET OVER (2026-08-25, user-spec)
+      # ---------------------------------------------------------------------
+      # "hvis jeg trykker på godnatknappen om morgenen skal alle alarmvækninger
+      # springes over. ikke bare snoozes. alle tre veje."
+      #
+      # HVAD DER VAR GALT: godnat-knappen i morgenvinduet satte en 4-timers
+      # snooze (`sovevaerelse_morgen_beskyttelse_aktiv`), som kun SUPPRESSEDE
+      # soveværelset. Ankeret `sensor.wakeup_alarm_next` var u-rørt, og værre:
+      # `wakeup_alarm_driven_restart_recovery` har en trigger på snoozens
+      # on→off-flanke (fejlklasse #19 — en blokeret automation fyrer i samme
+      # sekund blokeringen ophæves). Trykkede man godnat kl. 06:30, udløb
+      # snoozen 10:30 → lys på 80% + gardin op. Vækningen kom altså altid,
+      # bare fire timer senere = "ikke bare snoozes".
+      #
+      # Skippet er BEVIDST en dato og ikke et input_boolean: et flag skal
+      # ryddes af nogen, og hænger det, forsvinder næste morgens vækning. En
+      # dato udløber ved midnat uanset hvad der ellers går galt — fail-open,
+      # som resten af vække-kæden (en unødig solopgang er billigere end en
+      # misset vækning). Tids-guarden er fejlklasse #5.
+      - name: "Wakeup skip i dag"
+        unique_id: wakeup_skip_i_dag
+        icon: mdi:alarm-off
+        state: >-
+          {% set s = states('input_datetime.wakeup_skip_dato') %}
+          {{ s[:10] == now().strftime('%Y-%m-%d') and s[11:] != '00:00:00' }}
+        attributes:
+          sat_kl: >-
+            {% set s = states('input_datetime.wakeup_skip_dato') %}
+            {% if s[:10] == now().strftime('%Y-%m-%d') and s[11:] != '00:00:00' %}{{ s[11:16] }}
+            {% else %}—{% endif %}
+
+      # ---------------------------------------------------------------------
+      # PRE-ALARM-VÆRN (2026-07-29) — "alarmen udløste ikke gardin og lys".
+      #
+      # ROOT CAUSE (verificeret i history 2026-07-29): alarmen stod til 06:15,
+      # ramp-vinduet åbnede 06:10 (lead 5 min) — men kl. 06:01:25 fyrede
+      # `godmorgen_auto_clear_on_activity` på sove-Apolloens moving-target
+      # (= han vendte sig i sengen) og slukkede godnat_active. Vækningen kræver
+      # godnat_active = on, så da ramp-vinduet åbnede 9 min senere var betingelsen
+      # allerede død → intet lys, intet gardin.
+      #
+      # Dette anker markerer "alarmen ringer lige om lidt" → i det vindue er
+      # PASSIVE signaler (radar-bevægelse i seng) IKKE bevis på at nogen er stået
+      # op. Deliberate signaler (knaptryk, vægkontakt) rydder fortsat godnat.
+      # ---------------------------------------------------------------------
+      - name: "Wakeup alarm imminent"
+        unique_id: wakeup_alarm_imminent
+        icon: mdi:alarm-note
+        state: >-
+          {% set alarm = states('sensor.wakeup_alarm_next') %}
+          {% if alarm in ['unknown', 'unavailable', 'none', ''] %}false
+          {% else %}
+            {% set guard = states('input_number.wakeup_alarm_preguard_minutes') | int(45) %}
+            {% set until = as_timestamp(alarm, 0) - as_timestamp(now()) %}
+            {{ guard > 0 and 0 < until <= (guard * 60) }}
+          {% endif %}
+        attributes:
+          minutter_til_alarm: >-
+            {% set alarm = states('sensor.wakeup_alarm_next') %}
+            {% if alarm in ['unknown', 'unavailable', 'none', ''] %}-1
+            {% else %}{{ ((as_timestamp(alarm, 0) - as_timestamp(now())) / 60) | round(0) | int }}{% endif %}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # GENVEJS-VAGT (2026-08-18) — en død input-kanal skal ikke kunne tie i dagevis
+  # ---------------------------------------------------------------------------
+  # `genvej_ok` fandtes allerede, men INGEN læste den. Målt 08-18: flaget havde
+  # stået false i 77 t (sidste payload `2026-08-15|` — et stempel uden alarm),
+  # og den eneste måde det viste sig på, var en morgen helt uden vækning.
+  # Reserve-alarmen fanger nu selve vækningen, men den kan kun gætte tidspunktet:
+  # sover Parent B til 07:30, vækker reserven hele huset 05:55. Kanalen skal
+  # altså stadig repareres — derfor et varsel, ikke en stille kompensation.
+  #
+  # 21:00 er valgt fordi genvejen kører ved sengetid: på det tidspunkt er det
+  # stadig muligt at åbne Ur-appen og få den til at fyre inden natten.
+  # Dedupe er implicit (én trigger i døgnet) + samme `tag` erstatter forrige.
+  # 2026-08-18b (user-spec): varslet dækker nu BEGGE ting og sender ÉN push.
+  # De to beskeder er samme fysiske episode set fra hver sin ende — "huset kender
+  # ikke din alarm" og "så ringer reserven kl. X" — og to pushes 21:00:00 ville
+  # være præcis den støj memoen `notifikations-stoej` advarer mod. Ringer
+  # reserven, er DEN beskeden (genvejen nævnes som årsag i samme tekst).
+  #
+  # HVORFOR `ejer` ER ORAKLET for "ingen telefon-alarm": kl. 21 peger begge
+  # telefon-sensorer allerede på i MORGEN tidlig, og ankeret kender som det
+  # eneste sted hjemme-testen. Reserve-sensorens egen state duer IKKE her — den
+  # melder kun i DAG's mål, som kl. 21 forlængst er passeret (= altid 'none').
+  # Derfor genberegnes reserve-tiden lokalt; det er den ENESTE kopi (#2), og den
+  # læser samme to helpers som sensoren.
+  - id: wakeup_aftenvarsel
+    alias: "Vækning: aftenvarsel 21:00 (reserve-alarm / død genvej)"
+    description: >
+      Kl. 21 er der stadig tid til at åbne Ur-appen. Varsler at reserve-alarmen
+      overtager i nat (med knapper: spring over / +30 min / slå helt fra), eller
+      — hvis en telefon-alarm findes, men Parent B's genvej er død — at huset ikke
+      kender hendes alarm.
+    mode: single
+    trigger:
+      - platform: time
+        at: "21:00:00"
+    action:
+      # "Er i morgen en arbejdsdag?" — binary_sensor.arbejdsdag svarer om I DAG.
+      # Fail-open: svigter kaldet, falder vi tilbage på ren ugedag, samme
+      # forsigtighed som selve arbejdsdags-sensoren.
+      - service: workday.check_date
+        continue_on_error: true
+        target:
+          entity_id: binary_sensor.workday_sensor
+        data:
+          check_date: "{{ (now() + timedelta(days=1)).strftime('%Y-%m-%d') }}"
+        response_variable: wd
+      - variables:
+          imorgen_arbejdsdag: >-
+            {% set svar = wd.get('binary_sensor.workday_sensor', {}).get('workday')
+                          if wd is defined and wd is mapping else none %}
+            {{ svar if svar is boolean else (now() + timedelta(days=1)).isoweekday() <= 5 }}
+          ejer: "{{ state_attr('sensor.wakeup_alarm_next', 'ejer') }}"
+          genvej_doed: >-
+            {{ state_attr('sensor.parent_b_next_alarm', 'genvej_ok') == false }}
+          # Kun eksplicit 'off' fritager — et sensorudfald må ikke skjule en død
+          # genvej (#9). Anker, ikke tracker: trackeren er permanent frossen.
+          parent_b_ude: "{{ is_state('binary_sensor.parent_b_hjemme_anker', 'off') }}"
+          udskyd: "{{ states('input_number.wakeup_fallback_udskyd_min') | int(0) }}"
+          reserve_tid: >-
+            {% set t = states('input_datetime.wakeup_fallback_tid') %}
+            {% if t | regex_match('^\d{2}:\d{2}') %}
+              {{ (today_at(t[:5]) + timedelta(minutes=udskyd)).strftime('%H:%M') }}
+            {% else %}—{% endif %}
+          boerne_tid: >-
+            {% set t = states('input_datetime.wakeup_fallback_tid') %}
+            {% set k = states('input_number.global_kids_wakeup_after_alarm_minutes') | int(10) %}
+            {% if t | regex_match('^\d{2}:\d{2}') %}
+              {{ (today_at(t[:5]) + timedelta(minutes=udskyd + k)).strftime('%H:%M') }}
+            {% else %}—{% endif %}
+          reserve_ringer: >-
+            {{ is_state('input_boolean.wakeup_fallback_enabled', 'on')
+               and is_state('input_boolean.wakeup_fallback_skip', 'off')
+               and is_state('input_select.house_mode', 'Normal')
+               and imorgen_arbejdsdag
+               and ejer in ['ingen', 'reserve'] }}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ reserve_ringer }}"
+            sequence:
+              # Flaget FØR pushen: går kaldet galt, er det billigere at have en
+              # udestående-markering uden besked (næste alarm rydder et tomt tag,
+              # hvilket er en no-op) end en besked uden markering, som så aldrig
+              # kan trækkes tilbage.
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.wakeup_aftenvarsel_udestaaende
+              - service: script.push_notify
+                continue_on_error: true
+                data:
+                  notif_id: vaekning
+                  title: "🆘 Reserve-alarmen vækker jer {{ reserve_tid }}"
+                  message: >-
+                    Ingen telefon melder endnu en alarm til i morgen tidlig, så
+                    huset vækker selv: soveværelset {{ reserve_tid }}, børnene
+                    {{ boerne_tid }}.
+                    {%- if udskyd > 0 %} (Allerede udskudt {{ udskyd }} min.){% endif %}
+
+                    Sætter I en alarm inden da — også Parent B's genvej kl. 01 —
+                    overtager den, og denne besked forsvinder af sig selv.
+                    {%- if genvej_doed and not parent_b_ude %}
+
+                    Parent B's alarm-genvej har ikke skrevet i
+                    {{ ((state_attr('sensor.parent_b_next_alarm', 'minutter_siden_genvej')
+                         | int(0)) / 60) | round(1) }} timer — sætter hun en alarm
+                    på iPhonen, kan huset ikke se den. Fix: åbn Genveje og tjek
+                    automatiseringen "ved sengetid".
+                    {%- endif %}
+                  payload:
+                    tag: wakeup_aftenvarsel
+                    actions:
+                      - action: WAKEUP_FB_SKIP
+                        title: Ikke i nat
+                      - action: WAKEUP_FB_UDSKYD30
+                        title: +30 min
+                      - action: WAKEUP_FB_OFF
+                        title: Slå helt fra
+          - conditions:
+              - condition: template
+                value_template: "{{ genvej_doed and not parent_b_ude }}"
+            sequence:
+              - service: script.push_notify
+                continue_on_error: true
+                data:
+                  notif_id: vaekning
+                  title: "⏰ Parent B's alarm-genvej har ikke kørt"
+                  message: >-
+                    Sidste payload er
+                    {{ ((state_attr('sensor.parent_b_next_alarm', 'minutter_siden_genvej')
+                         | int(0)) / 60) | round(1) }} timer gammel
+                    ({{ states('input_text.parent_b_alarm_genvej') }}) — huset kender
+                    ikke hendes alarm. I nat vækker
+                    {{ 'Parent A\' alarm' if ejer == 'parent_a' else 'reserve-alarmen ' ~ reserve_tid }}.
+
+                    Fix: åbn Genveje på iPhonen og tjek at automatiseringen
+                    "ved sengetid" stadig findes og har adgang til Ur-appen.
+                  payload:
+                    tag: wakeup_aftenvarsel
+
+  # ---------------------------------------------------------------------------
+  # AFTENVARSLET TRÆKKES TILBAGE NÅR EN RIGTIG ALARM DUKKER OP (2026-08-19)
+  # ---------------------------------------------------------------------------
+  # user-spec: "notifikationen skal være dependent på senere satte alarmer fra
+  # begge vores tlf. når notifikationen kører har vi ofte ikke sat alarmen for
+  # morgenen endnu." Kl. 21 er svaret strukturelt ukendt — Parent B's genvej
+  # skriver først kl. 01:00, og Parent A's alarm sættes typisk lige før han sover.
+  # Varslet kan derfor ikke gøres RIGTIGT ved at flytte klokkeslættet (kl. 01 kan
+  # ingen nå at reagere); det skal kunne fortryde sig selv.
+  #
+  # TAVST: en `clear_notification` er ingen besked, så den sendes uden om
+  # `script.push_notify` — dens stille-vindue ville ellers kunne blokere netop
+  # den oprydning der FJERNER støj, og en ny push kl. 01 ville være støjen selv.
+  # Begge telefoner ryddes: pushen kan være gået til begge, og et clear på et tag
+  # der ikke findes er en no-op.
+  #
+  # Backstop (#4/#15): en HA-restart dræber ventende triggers, og en attribut kan
+  # ændre sig uden at sensorens state gør. /10 i nat-vinduet er billigt og gør
+  # oprydningen uafhængig af at have set selve flanken.
+  - id: wakeup_aftenvarsel_ryd
+    alias: "Vækning: ryd aftenvarslet når en telefon-alarm dukker op"
+    description: >
+      Aftenvarslet kl. 21 lover reserve-alarmen. Melder en af telefonerne senere
+      på natten en rigtig alarm (Parent B's genvej kl. 01, eller Parent A's Ur-app),
+      fjernes beskeden tavst igen — ingen ny push.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: sensor.wakeup_alarm_next
+        attribute: ejer
+      - platform: state
+        entity_id:
+          - sensor.parent_b_next_alarm
+          - sensor.phone_a_next_alarm
+      - platform: time_pattern
+        minutes: "/10"
+    condition:
+      - condition: state
+        entity_id: input_boolean.wakeup_aftenvarsel_udestaaende
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ state_attr('sensor.wakeup_alarm_next', 'ejer')
+             in ['parent_a', 'parent_b'] }}
+    action:
+      - repeat:
+          for_each:
+            - mobile_app_phone_a
+            - mobile_app_phone_b
+          sequence:
+            - service: "notify.{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                message: clear_notification
+                data:
+                  tag: wakeup_aftenvarsel
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.wakeup_aftenvarsel_udestaaende
+      - service: logbook.log
+        data:
+          name: "Vækning"
+          message: >-
+            Aftenvarslet trukket tilbage — {{ state_attr('sensor.wakeup_alarm_next', 'ejer') }}
+            melder nu {{ state_attr('sensor.wakeup_alarm_next', 'lokal') }}.
+
+  # ---------------------------------------------------------------------------
+  # AFTENVARSLETS KNAPPER (2026-08-18b)
+  # ---------------------------------------------------------------------------
+  # "Slå den fra" er tvetydigt, så der er tre knapper: to der kun gælder i nat
+  # (og ryddes kl. 10 af automationen nedenfor) og én der rører kill-switchen.
+  # Kvitteringen er ikke pynt: et knapsvar er et HTTP-kald tilbage til HA, så
+  # uden svar kan man ikke se om trykket landede — og den viser hvad der nu
+  # gælder, så et fejltryk kan fortrydes med det samme.
+  - id: wakeup_aftenvarsel_svar
+    alias: "Vækning: aftenvarslets knapper"
+    mode: queued
+    max: 5
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.event.data.action | default('')
+             in ['WAKEUP_FB_SKIP', 'WAKEUP_FB_UDSKYD30', 'WAKEUP_FB_OFF'] }}
+    action:
+      - variables:
+          valg: "{{ trigger.event.data.action }}"
+      - choose:
+          - conditions: "{{ valg == 'WAKEUP_FB_SKIP' }}"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.wakeup_fallback_skip
+          - conditions: "{{ valg == 'WAKEUP_FB_UDSKYD30' }}"
+            sequence:
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.wakeup_fallback_udskyd_min
+                data:
+                  value: >-
+                    {{ [(states('input_number.wakeup_fallback_udskyd_min') | int(0)) + 30,
+                        180] | min }}
+          - conditions: "{{ valg == 'WAKEUP_FB_OFF' }}"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.wakeup_fallback_enabled
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: vaekning
+          title: >-
+            {% if valg == 'WAKEUP_FB_SKIP' %}✅ Reserve-alarmen springer i nat over
+            {% elif valg == 'WAKEUP_FB_UDSKYD30' %}✅ Reserve-alarmen udskudt
+            {% else %}✅ Reserve-alarmen er slået fra{% endif %}
+          message: >-
+            {% set t = states('input_datetime.wakeup_fallback_tid') %}
+            {% set u = states('input_number.wakeup_fallback_udskyd_min') | int(0) %}
+            {% set ny = (today_at(t[:5]) + timedelta(minutes=u)).strftime('%H:%M')
+                        if t | regex_match('^\d{2}:\d{2}') else '—' %}
+            {% if valg == 'WAKEUP_FB_SKIP' %}
+              Kun i nat — den er tilbage i morgen aften.
+            {% elif valg == 'WAKEUP_FB_UDSKYD30' %}
+              Ringer {{ ny }} i nat ({{ u }} min senere). Fast tid er uændret
+              {{ t[:5] }}; udskydelsen ryddes kl. 10.
+            {% else %}
+              Permanent: huset vækker IKKE længere når ingen telefon melder en
+              alarm. Slå den til igen på Indstillinger → 🌙 Søvn → Vækning.
+            {% endif %}
+          payload:
+            tag: wakeup_aftenvarsel
+
+  # Én-nats-overstyringerne må aldrig kunne hænge ind i næste nat — så er vi
+  # tilbage ved en tavs kanal. Ryddes kl. 10, efter vække-vinduet 04-10.
+  # HA-start-triggeren er backstoppen: en restart hen over kl. 10 sluger
+  # tidstriggeren (#15), og time-vinduet i conditionen sikrer at en genstart
+  # kl. 22 ikke annullerer et tryk der lige er sket.
+  - id: wakeup_fallback_override_ryd
+    alias: "Vækning: ryd reserve-alarmens én-nats-overstyringer (10:00)"
+    mode: single
+    trigger:
+      - platform: time
+        at: "10:00:00"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: template
+        value_template: "{{ 10 <= now().hour < 21 }}"
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.wakeup_fallback_skip', 'on')
+             or (states('input_number.wakeup_fallback_udskyd_min') | int(0)) > 0
+             or is_state('input_boolean.wakeup_aftenvarsel_udestaaende', 'on') }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          # 2026-08-19: udestående-flaget ryddes SAMME sted som de øvrige
+          # én-nats-overstyringer — to automations på 10:00 med hver sin liste
+          # ville drive fra hinanden (#2). Overlever flaget døgnet, ville en
+          # tilfældig alarm i morgen aften rydde et varsel der for længst er
+          # væk fra telefonen.
+          entity_id:
+            - input_boolean.wakeup_fallback_skip
+            - input_boolean.wakeup_aftenvarsel_udestaaende
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.wakeup_fallback_udskyd_min
+        data:
+          value: 0

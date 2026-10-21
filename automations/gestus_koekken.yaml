@@ -1,0 +1,495 @@
+---
+# =============================================================================
+# GESTUS-KAMERA → KØKKEN-TIMER (MQTT-oversætter + hold-to-confirm)
+#
+# Denne fil indeholder INGEN timer-adfærd. Hele timer- og alarm-kæden —
+# validering, 1-10-gaten, den røde blink-alarm, kvitteringen, AirBnB-gaten,
+# 15-min-cappen — ejes af `packages/koekken_gestus_timer.yaml`. Her sker kun
+# oversættelsen fra MQTT-payload til husets to gestus-events, præcis som
+# Lovelace-knapperne og telefon-widgetsene gør det. Ét anker, ikke to (#2).
+#
+# Det ENE stykke logik der bor her, er hold-to-confirm, fordi den kun giver
+# mening på frame-strømmen: knapperne og widgetsene er allerede ét bevidst
+# tryk og skal ikke holdes.
+#
+# Status 2026-09-12: MQTT-stakken (Mosquitto-addon + MQTT-integration) er LIVE,
+# men der publicerer endnu intet på emnet — kamera + hand-recognition-add-on
+# mangler (trin 0-2 i docs/gesture_recognition.md). Automationen er derfor
+# tavs indtil hardwaren findes, og koster nul: en MQTT-trigger uden trafik
+# vågner aldrig.
+# =============================================================================
+
+- id: gestus_koekken_fingre_til_timer
+  alias: "Gestus: fingre i køkkenet → køkken-timer"
+  description: >-
+    Oversætter MediaPipe-gestus til husets gestus-events, og kræver at den
+    samme gestus holdes i flere frames før den virker: 1-10 fingre = start en
+    timer på så mange minutter, knyttet hånd = annullér timeren / stop
+    alarmen. Al adfærd ejes af packages/koekken_gestus_timer.yaml.
+
+  # `queued`, IKKE `single`: hvert frame laver et læs-ret-skriv på
+  # `koekken_gestus_pending`, så tælleren er kun korrekt hvis frames behandles
+  # ét ad gangen OG ingen tabes undervejs. `single` ville droppe hele byger
+  # lydløst (= holdet bliver aldrig opfyldt), `parallel` ville lade to frames
+  # læse den samme værdi og skrive samme tal tilbage.
+  mode: queued
+  max: 10
+  max_exceeded: silent
+
+  triggers:
+    - trigger: mqtt
+      topic: hand-recognition/koekken
+
+  # Gestus-aflæsningen står på AUTOMATION-niveau (renderes før conditions), så
+  # både filtret nedenfor og hold-maskineriet i actions læser SAMME `kode` (#2).
+  variables:
+    # Knyttet hånd = annullér. Ellers summen af strakte fingre på BEGGE
+    # hænder, så 6-10 kan vises med to hænder.
+    gestures: >-
+      {{ [ trigger.payload_json.left.gesture | default('unknown'),
+           trigger.payload_json.right.gesture | default('unknown') ] }}
+    # Add-on'ets payload har KUN gesture/score/facing/rotation_deg — der
+    # findes INTET finger_count-felt (verificeret i add-on'ets
+    # mqtt_publisher.py, v0.3.27). Den tidligere aflæsning af
+    # `.finger_count` var derfor Undefined, blev maskeret af `| int(0)`, og
+    # gav tavst 0 for enhver hånd: 1-10-grenen kunne aldrig fyre, uanset
+    # hvor tydeligt kameraet så en hånd. Tallet udledes af gestus-NAVNET.
+    #
+    # Kun de fem entydige tælle-gestus har en værdi. rock_on/call_me/pinky
+    # har også strakte fingre, men ingen viser "3" som et horn — de er i
+    # praksis add-on'ets "ingen af delene" og skal blive ved med at være
+    # det, ellers starter en skævt vinklet hånd en forkert timer.
+    #
+    # 2026-10-15: en hånd tæller kun når den er nogenlunde OPREJST
+    # (|rotation_deg| ≤ input_number.gestus_max_rotation_grader; 0 = fra).
+    # Knivmagneten blev læst som `four_fingers` ved −115° (fingre ned) og
+    # startede en 4-min-timer 20:42 uden at nogen var i køkkenet — afstands-
+    # masken var på, men den sorte rombe med knivene under blev selv en hånd.
+    # Ingen viser et tal med fingrene pegende nedad; ægte hænder lå −58…+48°.
+    # Knytnæven gates IKKE: en falsk annullér koster intet (se nedenfor).
+    fingre: >-
+      {% set tal = {'pointing': 1, 'peace': 2, 'three_fingers': 3,
+                    'four_fingers': 4, 'open_palm': 5} %}
+      {% set maks = states('input_number.gestus_max_rotation_grader') | float(75) %}
+      {% set ns = namespace(sum=0) %}
+      {% for side in ['left', 'right'] %}
+        {% set h = trigger.payload_json[side] | default({}) %}
+        {% set rot = h.rotation_deg | default(none) %}
+        {% set oprejst = maks <= 0 or rot is none
+                         or (rot | float(0)) | abs <= maks %}
+        {% if oprejst %}
+          {% set ns.sum = ns.sum + tal.get(h.gesture | default('unknown'), 0) | int(0) %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.sum }}
+
+    # Knytnæven er husets ANNULLÉR (user-spec 2026-09-14). Den kræver at
+    # der ikke tælles samtidig: viser man en knytnæve OG to fingre, er det
+    # tallet 2, ikke en annullering — ellers kunne en hånd på vej op mod
+    # "7" med den ene næve knyttet aflyse den timer man var ved at sætte.
+    knytnaeve: "{{ 'fist' in gestures and fingre | int(0) == 0 }}"
+
+    # ÉN kode for begge veje, så hold-maskineriet nedenfor er fælles:
+    # -1 = knytnæve, 1-10 = fingertal, 0 = ingenting at handle på.
+    kode: "{{ -1 if knytnaeve else fingre | int(0) }}"
+
+  conditions:
+    # Gestus-kommandoernes kill-switch (packages/tapo_tuning.yaml). Den sidder
+    # BÅDE her på oversætteren og i scan-løkkens `while:` nedenfor: her fordi
+    # add-on'et også publicerer på andre triggere end vores egen løkke, dér
+    # fordi et flip midt i en madlavning skal stoppe bygerne med det samme.
+    # Ét af de to steder alene ville være pynt (#21).
+    - condition: state
+      entity_id: input_boolean.gestus_kommandoer_enabled
+      state: "on"
+    # 2026-10-05 (B195): kun frames med noget at handle på bliver en kørsel.
+    # Add-on'et publicerer HVERT frame (~1/s mens scan-løkken kører), og 99,9 %
+    # er kode 0 (ingen hånd / ingen tælle-gestus): målt 27 buffer-skrivninger
+    # mod ~69.000 state-rækker på automationen pr. døgn — husets største
+    # DB-skriver. Kode 0 rørte aldrig bufferen (ingen `choose`-gren matcher;
+    # holdet nulstilles af friskheds-vinduet, ikke af tomme frames), så filtret
+    # ændrer ingen adfærd. Samme mønster som koekken_stemme_arm_haand_op.
+    - condition: template
+      value_template: "{{ kode | int(0) != 0 }}"
+    # 2026-10-15 (user: "må ikke ske igen! især ikke når vi sover"): under
+    # fælles godnat starter fingre ALDRIG en timer — ingen laver mad med
+    # fagter når huset sover, og et falsk fingertal er dér husets dyreste
+    # fejl. Knytnæven (annullér) slipper igennem; stemme/knap er urørte.
+    # Børne-godnat gates bevidst ikke: voksne laver mad efter putning.
+    - condition: template
+      value_template: >-
+        {{ kode | int(0) == -1
+           or not is_state('binary_sensor.godnat_common_active', 'on') }}
+
+  # BEVIDST INGEN dedupe-condition her. Den tidligere 60-sekunders
+  # `last_triggered`-gate gjorde præcis det hold-to-confirm har brug for at
+  # undgå: den afviste frame nr. 2 og frem, så der aldrig fandtes to frames at
+  # sammenligne. Gentagelses-beskyttelsen ligger nu på selve AFFYRINGEN
+  # (`cooldown_ok` nedenfor) og bruger et SKREVET stempel — `last_triggered`
+  # sættes efter conditions men før action-body'en og ville læse sit eget
+  # stempel her (09-09e).
+
+  actions:
+    - variables:
+        # Bufferen: `<kode>:<epoch>:<frames>:<sidst_fyret_epoch>:<sidst_fyret_kode>`.
+        # En urørt input_text står på 'unknown' (truthy!), så gyldigheden testes
+        # på formen — antal kolon — aldrig på sandhedsværdien. Det femte felt er
+        # nyt 14/9: uden det gjaldt cooldownen ALLE tal, så "3 minutter — nej,
+        # 8" krævede at man ventede et minut. Nu deduplikerer den kun det SAMME
+        # tal. En buffer i det gamle 4-felts-format er dermed ugyldig og
+        # nulstilles harmløst ved første frame.
+        raw: "{{ states('input_text.koekken_gestus_pending') }}"
+        gyldig: "{{ raw.count(':') == 4 }}"
+        # -99, ikke -1: -1 ER en gyldig kode (knytnæven), så en ugyldig buffer
+        # må ikke kunne se ud som "forrige frame var også en knytnæve".
+        p_kode: "{{ (raw.split(':')[0] | int(-99)) if gyldig else -99 }}"
+        p_epoch: "{{ (raw.split(':')[1] | int(0)) if gyldig else 0 }}"
+        p_frames: "{{ (raw.split(':')[2] | int(0)) if gyldig else 0 }}"
+        p_fyret: "{{ (raw.split(':')[3] | int(0)) if gyldig else 0 }}"
+        p_fyret_kode: "{{ (raw.split(':')[4] | int(-99)) if gyldig else -99 }}"
+        nu: "{{ now().timestamp() | int }}"
+
+        # Hvor mange frames i træk det samme tal skal stå. En hånd der føres op
+        # passerer gennem 1, 2, 3 fingre, og add-on'et publicerer pr. frame —
+        # uden hold ville vejen op til "5" starte en 1-minuts-timer.
+        #
+        # KADENCEN ER MÅLT (14/9, add-on'et kørende): 1,05 s mellem frames
+        # inde i en byge. 2026-10-11: ~0,62 s (bygen er 7 × 0,5 s nu), så et
+        # krav på 3 frames ≈ 1,2 s bevidst hold — samme tid som 2 frames før.
+        #
+        # 2026-09-16 (user-bug "omkring kl 13 den 15. sep blev en 3 min timer
+        # startet. Parent B var hjemme. hun bevægede sig bare i køkkenet og
+        # udløste den uden at det var med vilje"): kravet var 3, og det er
+        # MÅLT for lavt. To utilsigtede fyringer 15/9, begge kode 2 (peace):
+        # 12:55:31 og 13:00:50. Begge ramte præcis 3 frames.
+        # Fordelingen af stribe-længder over 93 striber samme dag: hver eneste
+        # stribe på ≥ 4 frames faldt 07:11-07:42 — mit egen kontrollerede
+        # kalibrering. ALLE tilfældige køkken-hænder efter 08:00 toppede ved 3.
+        # Koderne 4 og 5 er ucensureret bevis for det samme: deres krav var
+        # allerede 6 fra 07:46, så deres striber blev aldrig afkortet af en
+        # fyring — og de oversteg alligevel aldrig 3 frames tilfældigt.
+        # 6 ligger altså over HELE den utilsigtede population, ikke bare over
+        # de to der nåede at fyre (📏-reglen: mål kanalen, gæt ikke tærsklen).
+        #
+        # Det er også den grænse 4 og 5 allerede havde af en anden grund (den
+        # anden hånd skal nå op), så kravet er nu ét tal for alle fingertal.
+        #
+        # Nu en SLIDER (user-spec 2026-09-16), men målingen ovenfor er stadig
+        # begrundelsen for defaulten — og slideren læses her i `variables:`, så
+        # den virker i samme sekund du slipper den. `| int(6)` er ikke pynt:
+        # helperen kan være `unknown` i sekunderne efter en restart, og et 0
+        # her ville gøre ethvert enkelt frame til en timer.
+        hold_frames: "{{ states('input_number.gestus_hold_frames') | int(4) }}"
+
+        # Knytnæven holdes kortere. Den skal kunne stoppe en alarm der kun
+        # varer 15 sekunder, så tre frames (~3,2 s) ville bruge en femtedel af
+        # hele alarmen på at blive genkendt. To frames er stadig ~2,1 s bevidst
+        # hold — nok til at en hånd der passerer gennem en knytnæve på vej op
+        # til et fingertal ikke rammer den, fordi vejen op tager ét frame.
+        hold_knytnaeve: >-
+          {{ states('input_number.gestus_hold_knytnaeve') | int(2) }}
+
+        # Hvorfor 6 også er rigtigt for 4 og 5 (den grund tallet OPRINDELIG
+        # fik, før den utilsigtede fyring 15/9 hævede alle de andre op til
+        # samme niveau): 4 og 5 er PRÆFIKSER for 6-10. MÅLT 15/9 i
+        # kontrolleret test, én gestus ad gangen: når to hænder er oppe, ses
+        # den STORE åbne hånd stort set hver gang, mens den mindre — den der
+        # bærer resten af tallet — kun ses i en brøkdel af framesne. Under et
+        # 7-forsøg (5+2) læste klassifikatoren `open_palm + unknown` = 5 i 13
+        # af 20 svar, heraf 5 frames i TRÆK inden peace-hånden var set én
+        # eneste gang. De observerede "på vej mod noget større"-striber var
+        # 2, 3 og 5 frames lange, så 6 rammer over dem alle med margin.
+        krav: >-
+          {{ hold_knytnaeve if kode | int(0) == -1 else hold_frames }}
+
+        # Et tabt frame midt i et hold må ikke koste hele holdet, men en hånd
+        # der forlod billedet for et halvt minut siden skal ikke tælle med.
+        # De 10 s er dét der gør scan-løkkens blinde hul harmløst: bygerne er
+        # 4,25 s med ~1,75 s mellemrum (målt 14/9), så et hold der begynder i
+        # slutningen af én byge overlever til den næste. Sænkes tallet under
+        # ~3 s, bliver holdet uopfyldeligt for alle andre end den der rammer
+        # midt i en byge — og fejlen ville se ud som "kameraet ser mig ikke".
+        # Derfor har slideren gulv 3 (packages/tapo_tuning.yaml), ikke 0.
+        frisk: >-
+          {{ nu | int(0) - p_epoch | int(0)
+             <= states('input_number.gestus_frisk_sek') | int(10) }}
+        frames_ny: >-
+          {{ (p_frames | int(0)) + 1
+             if (frisk and p_kode | int(-99) == kode | int(0)) else 1 }}
+
+        # Gentagelses-beskyttelsen gælder kun det SAMME tal. En byge på 10
+        # frames må ikke blive til tre ens timere — men "3 minutter … nej, 8"
+        # skal virke med det samme (user-spec 2026-09-14: "Et nyt antal fingre
+        # skal starte en timer på så mange minutter"). Derfor ét stempel PLUS
+        # hvad der blev fyret.
+        cooldown_ok: >-
+          {{ p_fyret_kode | int(-99) != kode | int(0)
+             or nu | int(0) - p_fyret | int(0)
+                > states('input_number.gestus_gentag_cooldown_sek') | int(60) }}
+
+    # Første frame af et nyt tal/knytnæve → "jeg ser dig"-blink (user
+    # 2026-10-11). `script.turn_on`, ikke et direkte kald: frame-køen må
+    # aldrig vente på et lys. Rate-loftet og blinket bor i scriptet.
+    - if:
+        - condition: template
+          value_template: "{{ frames_ny | int(0) == 1 }}"
+      then:
+        - action: script.turn_on
+          continue_on_error: true
+          target:
+            entity_id: script.koekken_gestus_set_signal
+
+    - choose:
+        # --- Knyttet hånd = annullér timeren / stop alarmen. INGEN cooldown:
+        # en misset annullering efterlader huset blinkende, så denne vej skal
+        # fejle mod at reagere. Et falsk positivt koster ingenting når der
+        # hverken er en timer eller en alarm. Bufferen nulstilles HELT (også
+        # fyrings-stemplet), så man kan aflyse en 3-minutters og straks sætte
+        # en ny 3-minutters — cooldownen må ikke ramme den vej.
+        - conditions:
+            - condition: template
+              value_template: "{{ kode | int(0) == -1 }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ frames_ny | int(0) >= krav | int(2) }}"
+              then:
+                - event: koekken_gestus_kvitter
+                - action: input_text.set_value
+                  target:
+                    entity_id: input_text.koekken_gestus_pending
+                  data:
+                    value: "0:0:0:0:0"
+              else:
+                - action: input_text.set_value
+                  target:
+                    entity_id: input_text.koekken_gestus_pending
+                  data:
+                    value: >-
+                      -1:{{ nu | int(0) }}:{{ frames_ny | int(0) }}:{{ p_fyret | int(0) }}:{{ p_fyret_kode | int(-99) }}
+
+        # --- 1-10 fingre: akkumulér holdet, og start kun når det er opfyldt.
+        - conditions:
+            - condition: template
+              value_template: "{{ kode | int(0) >= 1 and kode | int(0) <= 10 }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ frames_ny | int(0) >= krav | int(3)
+                       and cooldown_ok }}
+              then:
+                - event: koekken_gestus_start
+                  event_data:
+                    minutter: "{{ kode | int(0) }}"
+                    # Kilden bæres af HVER producent af eventet, så
+                    # sensor.koekken_trigger_log kan svare "fingre, stemme
+                    # eller knap?" uden at gætte på en context-kæde.
+                    kilde: fingre
+                    bevis: >-
+                      {{ frames_ny | int(0) }} frames à {{ kode | int(0) }} fingre
+                # Nulstil tællingen, men BEHOLD fyrings-stemplet OG tallet —
+                # det er dét der forhindrer resten af bygen i at starte den
+                # samme timer igen.
+                - action: input_text.set_value
+                  target:
+                    entity_id: input_text.koekken_gestus_pending
+                  data:
+                    value: "0:0:0:{{ nu | int(0) }}:{{ kode | int(0) }}"
+              else:
+                - action: input_text.set_value
+                  target:
+                    entity_id: input_text.koekken_gestus_pending
+                  data:
+                    value: >-
+                      {{ kode | int(0) }}:{{ nu | int(0) }}:{{ frames_ny | int(0) }}:{{ p_fyret | int(0) }}:{{ p_fyret_kode | int(-99) }}
+
+
+- id: gestus_koekken_scan_puls
+  alias: "Gestus: bevægelse i køkkenet → bed kameraet kigge efter fingre"
+  description: >-
+    Den anden halvdel af kamera-indgangen. Add-on'et kigger kun når nogen beder
+    om det, så uden denne automation er hele kæden tavs — BÅDE fingrene og
+    mikrofonen, for stemme-sporet deler ffmpeg-processen med bevægelses-
+    detektoren og lever kun mens der bliver bedt om billeder.
+
+    Radaren — ikke en person-detektor — åbner døren, så et tomt køkken koster
+    nul CPU. Men den holder den ikke åben alene: løkken kører videre så længe
+    radaren ELLER kameraets krop-kanal har vist livstegn inden for
+    `input_number.kamera_kigge_haleslaeb_sek` (user-spec 2026-09-17, 60 s),
+    ELLER så længe open plan er optaget + `input_number.kamera_openplan_hale_min`
+    efter (user-spec 2026-09-24, 5 min).
+
+  # `single` + `silent` ER gentagelses-beskyttelsen: kører løkken allerede,
+  # bliver både en ny radar-flanke og backstop-ticket droppet lydløst. Ingen
+  # stempler, ingen cooldown-helper.
+  mode: single
+  max_exceeded: silent
+
+  triggers:
+    # Den hurtige vej: nogen bevæger sig lige nu.
+    - trigger: state
+      entity_id: binary_sensor.koekken_apollo_radar_moving_target
+      from: "off"
+      to: "on"
+
+    # 2026-09-24 (user-spec): nogen i open plan = kameraet skal være varmt.
+    - trigger: state
+      entity_id: binary_sensor.open_plan_occupied
+      from: "off"
+      to: "on"
+
+    # Backstoppen. `from: "off"` ovenfor er påkrævet (et reload sender sensoren
+    # gennem `unavailable`, og `unavailable → on` er ellers en gyldig flanke),
+    # men den gør samtidig enhver restart-flanke usynlig: sensorer kommer
+    # tilbage som `unknown → on`. Står nogen i køkkenet præcis når HA genstarter
+    # — eller dør løkkens `delay` midt i en madlavning — er der ingen anden vej
+    # tilbage. 1440 tick/døgn, og betingelsen nedenfor dropper dem alle på nær
+    # dem hvor der faktisk er bevægelse OG løkken ikke allerede kører.
+    - trigger: time_pattern
+      minutes: "/1"
+
+  conditions:
+    # Kameraet er fysisk pakket væk i AirBnB (packages/kamera_airbnb_vagt.yaml),
+    # men gaten står her alligevel — pakker nogen det ud, må det stadig ikke
+    # begynde at fotografere en gæst. Home Vacation = familien hjemme (🏡 #1).
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+
+    # Slår man gestus fra, skal kameraet heller ikke BEDES om at kigge. Det er
+    # den halvdel af afbryderen der faktisk sparer CPU — oversætteren ovenfor
+    # ville bare kassere resultatet.
+    #
+    # MEN gestus-kommandoerne er ikke længere den eneste grund til at kigge
+    # (2026-09-17): hånd-op-armeringen af mikrofonen
+    # (packages/koekken_stemme_arm.yaml) læser de SAMME frames. Slog man gestus
+    # fra — som user bad om — holdt løkken op med at bede om billeder, og så
+    # kunne armeringen aldrig se en hånd. Derfor ELLER, ikke OG.
+    #
+    # Anker frem for en kopi: betingelsen gentages i løkkens `while:` nedenfor,
+    # og to håndskrevne udgaver af samme regel drifter ved næste justering (#2).
+    - &kamera_oensket
+      condition: template
+      value_template: >-
+        {{ is_state('input_boolean.gestus_kommandoer_enabled', 'on')
+           or (is_state('input_boolean.koekken_stemme_arm_enabled', 'on')
+               and is_state('input_boolean.voice_kommandoer_enabled', 'on')) }}
+
+    # Backstoppen skal selv bevise livstegnet; flanke-triggeren har det allerede.
+    #
+    # ET VINDUE, IKKE ET ØJEBLIKSBILLEDE (user-spec 2026-09-17). Her stod før
+    # `moving_target == on`, og den læsning har en indbygget modsigelse: de to
+    # ting kameraet er sat op til at opfange — en hånd der HOLDES stille i fire
+    # frames, og en person der STÅR STILLE og siger en kommando — er begge
+    # kendetegnet ved fravær af bevægelse. Løkken lukkede altså i samme sekund
+    # brugeren gik i gang med det den var bygget til at se.
+    #
+    # `unavailable` falder igennem af sig selv: den er hverken 'on' eller 'off'
+    # (#9), så en radio-udfald kan ikke påstå livstegn.
+    #
+    # Efter en HA-restart er `last_changed` = boot-tidspunktet, ikke en
+    # observation (#23) — så en sensor der booter `off` ser ud til lige at være
+    # gået off, og løkken kører ét vindue igennem. Bevidst accepteret: prisen er
+    # 60 s kamera efter en restart, og gevinsten er at et ophold der var i gang
+    # DA huset genstartede ikke er usynligt indtil næste bevægelse.
+    - condition: template
+      value_template: &livstegn >-
+        {% set vindue = states('input_number.kamera_kigge_haleslaeb_sek')
+                        | float(60) %}
+        {% set ns = namespace(set=false) %}
+        {% for e in ['binary_sensor.koekken_apollo_radar_moving_target',
+                     'binary_sensor.koekken_kamera_krop'] %}
+          {% set s = states[e] %}
+          {% if s is not none and (s.state == 'on' or (s.state == 'off'
+                 and (now() - s.last_changed).total_seconds() <= vindue)) %}
+            {% set ns.set = true %}
+          {% endif %}
+        {% endfor %}
+        {# 2026-09-24 (user-spec): open plan optaget + N min efter tomt
+           holder kameraet varmt, så første fagt ikke taber de ~17 s
+           RTSP-koldstart. 0 min = slået fra. #}
+        {% set op = states.binary_sensor.open_plan_occupied %}
+        {% set hale = states('input_number.kamera_openplan_hale_min') | float(5) * 60 %}
+        {% if hale > 0 and op is not none and (op.state == 'on' or (op.state == 'off'
+               and (now() - op.last_changed).total_seconds() <= hale)) %}
+          {% set ns.set = true %}
+        {% endif %}
+        {{ ns.set }}
+
+    # Husets eneste maskine/menneske-diskriminator. Et frosset ekko holder
+    # moving_target oppe uden at der er en hånd at fotografere, og det er den
+    # ENE situation hvor det er gratis at holde igen: er afstanden identisk til
+    # decimalen, er der pr. definition ingen levende krop at misse.
+    - condition: state
+      entity_id: binary_sensor.koekken_apollo_frossen_ghost
+      state: "off"
+
+  actions:
+    # BEVIDST EN LØKKE, IKKE ÉT PUBLISH PR. FLANKE. Add-on'ets byge er 5
+    # billeder over 5 s, mens moving_target bliver stående `on` gennem en hel
+    # madlavning. Et enkelt publish på flanken ville derfor kun kigge i de
+    # første 5 sekunder af et ophold, og en hånd der løftes to minutter inde
+    # ville aldrig blive set — flanken re-fyrer jo ikke mens tilstanden holder
+    # (#13). Løkken flytter kadencen fra "pr. flanke" til "så længe der er
+    # nogen", hvilket er dét fænomenet kræver.
+    - repeat:
+        sequence:
+          - action: mqtt.publish
+            data:
+              topic: house/gesture/scan
+              # `id` skal være unik pr. byge — add-on'et bruger den til at se
+              # om et event allerede er behandlet, så et fast "radar-trigger"
+              # ville gøre alt efter den første byge til en dublet.
+              payload: >-
+                {"camera":"koekken","id":"radar-{{ now().timestamp() | int }}","score":1}
+
+          # MÅLT 14/9 mod det kørende add-on, ikke gættet: en VARM byge var
+          # 4,25 s (5 billeder, første på 53 ms, derefter 1,05 s pr. billede).
+          # 2026-10-11 (user: "tog længere tid end jeg kan lide at holde hånden
+          # oppe"): bygen er nu 7 billeder à 0,5 s i add-on'ets config (målt
+          # ~0,62 s pr. billede → ~3,8 s), og løkken 5 s → blindt hul ~1,2 s.
+          # Hullet er harmløst, fordi hold-tælleren har et 10-sekunders
+          # friskheds-vindue og derfor akkumulerer HEN OVER hullet. Bygen SKAL
+          # være kortere end løkken: 8 billeder (~4,5 s) ville kollidere, og en
+          # droppet byge er et hul på 10 s.
+          #
+          # Fristelsen er at sætte den ned til ~2 s for at lukke hullet helt.
+          # Lad være: et publish under en igangværende byge bliver bevist
+          # droppet ("burst already in progress", målt), så en kortere delay
+          # køber ikke flere billeder — den køber kun at scanningen kører
+          # ~100 % af tiden i stedet for 71 %, og dét er ren CPU på en 2-kernet
+          # Broadwell der også bærer Matter, OTBR, ZHA og recorder.
+          - delay:
+              seconds: 5
+
+        while:
+          # YAML-anker frem for en kopi: reglen om hvornår der er livstegn i
+          # køkkenet må kun findes ét sted (#2). Skrevet to gange ville de to
+          # drifte fra hinanden ved næste justering, og en løkke der starter på
+          # én regel og stopper på en anden er umulig at læse i en trace.
+          - condition: template
+            value_template: *livstegn
+
+          # Gates fra `conditions:` gentages HER, ikke kun ved indgangen: flipper
+          # user til AirBnB midt i en madlavning, skal løkken stoppe med det
+          # samme — ellers ville et kill-switch være pynt på alt andet end den
+          # ene vej ind der så oplagt ud (#21).
+          - condition: state
+            entity_id: input_select.house_mode
+            state:
+              - "Normal"
+              - "Home Vacation"
+          - *kamera_oensket
+          - condition: state
+            entity_id: binary_sensor.koekken_apollo_frossen_ghost
+            state: "off"
+
+          # Loft på ~10 min pr. ophold. Ikke en optimering: uden det kan en
+          # sensor der hænger `on` holde ffmpeg og MediaPipe kørende i timevis.
+          # Backstoppen ovenfor starter løkken igen hvis der stadig er bevægelse,
+          # så et ægte langt ophold taber ingenting ved loftet.
+          - condition: template
+            value_template: "{{ repeat.index <= 100 }}"

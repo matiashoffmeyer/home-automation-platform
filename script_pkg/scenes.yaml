@@ -1,0 +1,999 @@
+# =============================================================================
+# script_pkg/scenes.yaml — house-wide mood scenes (11 scenes)
+# =============================================================================
+# Scenes: zen, sofa_laesning, spisestue_middag, cirkus, party,
+#         full_bright, private, blue, happy, sunset, cyberpunk.
+# (cinema-scenen fjernet 2026-07-27 — erstattet af Dark Mode, se
+#  packages/dark_mode.yaml. input_boolean.cinema_active LEVER dog videre som
+#  Dark Mode's interne suppression-flag som 30+ gates gater på.)
+#
+# ENTRY POINTS:
+#   - Dashboard tile → script.scene_toggle (room_logic.yaml) → her
+#   - Entré Styrbar L/R → script.scene_zen direkte (via L/R mode cycle —
+#     se automations/entre_somrig.yaml). De øvrige modes (auto/all_bright/
+#     all_off) bruger ikke scene-scripts men kalder light.alle_lys direkte.
+#   - REST API → direct script call
+#
+# ⚠️ GATING (A23 fix): scene_toggle gates på godnat_any_active=on.
+#   Individuelle scene scripts har IKKE gate (REST bypass OK).
+#
+# Adding a new scene? 3 steder (scene_drift validator catcher mismatch):
+#   1. Her (scene_<name> script)
+#   2. packages/scene_state.yaml (input_select option + binary_sensor)
+#   3. dashboards/scenes.yaml (tile)
+#
+# Cross-cutting refs + full chain: docs/cross_cutting_map.md (scenes section).
+# Per-scene rationale: hver scene har egen description-block med detaljer.
+# =============================================================================
+
+scene_zen:
+  alias: "Scene: Sofa Zen (stue-område + terrasse)"
+  mode: restart  # tap-to-takeover
+  description: >
+    2026-05-21 user-redesign: scope reduceret til kun stue-området +
+    spisestue + terrasse. Tidligere rørte zen børneværelse-lampe + alle
+    andre rums loft-lys — det matchede ikke user's mentale model af
+    "zen stemning i stueområdet". Nu lader Sofa Zen alle andre rum være
+    (børn/sove/bad/entré/depot-loft urørt).
+  sequence:
+    # Override-snapshot (Entré L/R-sti kalder dette script direkte, uden om
+    # scene_toggle): hvis brugeren har trykket "Overskriv" på Zen, anvend det
+    # gemte snapshot + stop. Ellers fald igennem til hardcoded mood nedenfor.
+    - if:
+        - condition: template
+          # scene-entity har state 'unknown' til første aktivering → tjek
+          # eksistens via subscript (None hvis snapshot ikke findes). Slettet
+          # snapshot lingrer som 'unavailable' (restored) → ekskludér så zen
+          # falder tilbage til hardcoded mood straks efter sletning.
+          value_template: >-
+            {{ states['scene.snap_zen'] is not none
+               and states('scene.snap_zen') != 'unavailable' }}
+      then:
+        - service: scene.turn_on
+          target:
+            entity_id: scene.snap_zen
+          data:
+            transition: 2
+        - stop: "Override-snapshot anvendt for zen"
+    # Slukker stue + køkken loft (zen = no harsh overhead i open-plan).
+    # Andre rum's loft-lys forbliver i deres state.
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        transition: 3
+    # Sofa-lamper + spisestue pendel = warm ambient over seating + dining
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/stue_sofa_lys.yaml
+      data:
+        brightness_pct: 15
+        color_temp_kelvin: 2200
+        transition: 3
+    # 2026-05-07 fix: depot_strip var [255, 120, 30] = bright orange-red
+    # → for rød per real-life test. Ændret til soft peach/warm-white tone
+    # for mere ægte "zen" feel. RGB [255, 215, 165] = blødt peach-cream.
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        brightness_pct: 20
+        rgb_color: [255, 215, 165]
+        transition: 3
+    # Terrasse: SUPER dæmpet varm-hvid 5% (matcher Zen's interior 2200K).
+    # Sprint 2026-05-23 v2: lux-gate genindført (open_plan_lux < 100).
+    # 5% lyskæde er invisible i fuld sol → spar bulb/strøm hvis indoor bright.
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ states('sensor.open_plan_lux') | float(0) < 100 }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.koekken_lyskaede
+              data:
+                color_temp_kelvin: 2200
+                brightness_pct: 5
+                transition: 3
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.terrasse_paerelyskaede
+              data:
+                brightness_pct: 5
+                transition: 3
+      default:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id:
+              - light.koekken_lyskaede
+              - light.terrasse_paerelyskaede
+          data:
+            transition: 3
+
+scene_cirkus:
+  alias: "Scene: Fælles Cirkus (stue + køkken + spisestue + depot + terrasse)"
+  mode: restart  # tap-to-takeover
+  description: >
+    Saetter cirkus-mood lys + cirkus_active flag (saa presence_lights og
+    drift-back ikke forstyrrer party-vibe). Scene-cyclen rydder begge mood-
+    flags foer denne scene koeres saa cirkus_active er rent on naar vi naar
+    slut. Terrasse: bruger lyskaede + paerelyskaede (Hue Lily droppet).
+
+    B2.1 fix audit-runde 17: skip hvis godnat_active=on (party giver ikke
+    mening under godnat).
+  sequence:
+    # B2.1 + A14 fix sprint 2026-05-06: gate på godnat_any_active (union flag)
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.godnat_any_active
+              state: "on"
+          sequence:
+            - service: persistent_notification.create
+              data:
+                notification_id: cirkus_blocked
+                title: "Cirkus blokeret"
+                message: "Godnat-flow er aktiv — kan ikke starte cirkus. Tryk Somrig op for at afslutte godnat foerst."
+            - stop: "A14: cirkus blokeret af godnat-flow"
+    # Terrasse: lyskaede dyb-rød (color-capable), paerelyskaede full brightness
+    # (warm-white only — ingen RGB support, naturligt warm passer til cirkus mood)
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.koekken_lyskaede
+      data:
+        rgb_color: [255, 0, 0]
+        brightness_pct: 100
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.terrasse_paerelyskaede
+      data:
+        brightness_pct: 100
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/open_plan_lys.yaml
+      data:
+        rgb_color: [255, 50, 0]
+        brightness_pct: 60
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+      data:
+        rgb_color: [200, 0, 100]
+        brightness_pct: 50
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        rgb_color: [255, 0, 50]
+        brightness_pct: 70
+        transition: 2
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.cirkus_active
+
+scene_party:
+  alias: "Scene: Hus Party (alle rum undt sove — forskellige farver)"
+  mode: restart  # tap-to-takeover
+  sequence:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.spisestue_loft
+      data:
+        hs_color: [240, 100]
+        brightness_pct: 70
+        transition: 1
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/stue_sofa_lys.yaml
+      data:
+        hs_color: [320, 100]
+        brightness_pct: 70
+        transition: 1
+    # 2026-09-23 (user-spec): sofastuens to Thread-spots er INDIVIDUELLE pærer
+    # under party — hver sin farve, ikke læselampens magenta (spejlet i
+    # packages/stue_spots.yaml holder pause mens party er aktiv). Hue 280 og
+    # 30 ligger i paletten huller ved siden af sofa-magentaen (320).
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.stue_spot_1
+      data:
+        hs_color: [280, 100]
+        brightness_pct: 70
+        transition: 1
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.stue_spot_2
+      data:
+        hs_color: [30, 100]
+        brightness_pct: 70
+        transition: 1
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.koekken_lyskaede
+      data:
+        hs_color: [0, 100]
+        brightness_pct: 80
+        transition: 1
+    # paerelyskaede er warm-white only — får kun brightness, ingen color
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.terrasse_paerelyskaede
+      data:
+        brightness_pct: 80
+        transition: 1
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.boernevaerelse_loft
+          - light.boernevaerelse_lampe
+      data:
+        hs_color: [60, 100]
+        brightness_pct: 60
+        transition: 1
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all   # group: loft + 5 spots (sprint 2026-05-10)
+      data:
+        hs_color: [180, 100]
+        brightness_pct: 70
+        transition: 1
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        hs_color: [200, 100]
+        brightness_pct: 80
+        transition: 1
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        # 2026-08-21: entréen fik farve. Indtil pæreskiftet var loftet en
+        # CCT-only TRADFRI WS, så festscenen måtte nøjes med 2700 K varmt hvidt
+        # midt i et hus fuld af kulører — på den ene lampe gæsten ser FØRST.
+        # KAJPLATS'en er hs-kapabel, så den er med nu.
+        # Hue 120 fylder paletten største hul: de øvrige rum bruger
+        # 0 / 60 / 180 / 200 / 240 / 320, og springet 60 → 180 var bredest.
+        # Entréen bliver dermed husets eneste grønne = den skiller sig ud i
+        # stedet for at ligne naborummet gennem døråbningen.
+        hs_color: [120, 100]
+        brightness_pct: 60
+        transition: 1
+
+scene_full_bright:
+  alias: "Scene: Alt Fuld Lys (ALT inkl sove + bad 100% warm hvid)"
+  mode: restart  # tap-to-takeover
+  sequence:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.alle_lys
+      data:
+        brightness_pct: 100
+        color_temp_kelvin: 2700
+        transition: 1
+
+scene_private:
+  alias: "Scene: Sove Private (sove + terrasse — andre rum urørt)"
+  description: >
+    Replaced scene_punk 2026-05-06 per user-request. Private mode rammer
+    KUN 2 ting:
+      1. Sove-lys: meget varm (orange-tinted), 10% brightness
+      2. Terrasse: dæmpet warm white 15%
+    Andre lys forbliver i nuværende state (= IKKE en hus-wide takeover).
+    Tap igen via dashboard = scene_toggle slukker (handles by scene_toggle).
+    godnat slukker scenen automatisk (cinema-pattern).
+  mode: restart  # tap-to-takeover
+  sequence:
+    # Sove: warm dim. 2026-06-05: pendel = soveloft (CCT-only) → rgb erstattet
+    # af varmeste hvid (color_temp_kelvin) i stedet for orange rgb.
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        color_temp_kelvin: 2200    # var rgb orange-warm; pendel kan kun CCT
+        brightness_pct: 10
+        transition: 3
+    # Terrasse-lyskæde: dæmpet warm (lyskæde supports color_temp + RGB)
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.koekken_lyskaede
+      data:
+        color_temp_kelvin: 2200       # warm hvid
+        brightness_pct: 15
+        transition: 3
+    # Pærelyskæde: warm-white only (color_temp ignoreres, kun brightness)
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.terrasse_paerelyskaede
+      data:
+        brightness_pct: 15
+        transition: 3
+
+scene_blue:
+  alias: "Scene: Fælles Blue (stue + køkken + spisestue + depot + terrasse — slukker børn/bad/entré)"
+  mode: restart  # tap-to-takeover
+  sequence:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        hs_color: [220, 100]
+        brightness_pct: 30
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/stue_sofa_lys.yaml
+      data:
+        hs_color: [240, 100]
+        brightness_pct: 25
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.boernevaerelse_loft
+          - light.boernevaerelse_lampe
+          - light.badevaerelse_all   # group: loft + 5 spots (sprint 2026-05-10)
+      data:
+        transition: 2
+    # lyskaede color, paerelyskaede kun brightness (warm-white only)
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.koekken_lyskaede
+      data:
+        hs_color: [200, 100]
+        brightness_pct: 35
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.terrasse_paerelyskaede
+      data:
+        brightness_pct: 35
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        hs_color: [260, 100]
+        brightness_pct: 30
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        transition: 2
+
+scene_happy:
+  alias: "Scene: Hus Happy (alle rum undt sove — varm sol-energi)"
+  mode: restart  # tap-to-takeover
+  sequence:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        rgb_color: [255, 220, 100]
+        brightness_pct: 85
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/stue_sofa_lys.yaml
+      data:
+        rgb_color: [255, 200, 80]
+        brightness_pct: 75
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.boernevaerelse_loft
+          - light.boernevaerelse_lampe
+      data:
+        rgb_color: [255, 230, 120]
+        brightness_pct: 80
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all   # group: loft + 5 spots (sprint 2026-05-10)
+      data:
+        color_temp_kelvin: 3300
+        brightness_pct: 85
+    # lyskaede color, paerelyskaede kun brightness (warm-white only)
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.koekken_lyskaede
+      data:
+        rgb_color: [255, 200, 50]
+        brightness_pct: 90
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.terrasse_paerelyskaede
+      data:
+        brightness_pct: 90
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        rgb_color: [255, 150, 0]
+        brightness_pct: 80
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        color_temp_kelvin: 3300
+        brightness_pct: 80
+
+scene_sunset:
+  alias: "Scene: Fælles Sunset (stue + køkken + spisestue + depot + terrasse — slukker børn/bad)"
+  mode: restart  # tap-to-takeover
+  sequence:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/open_plan_lys.yaml
+      data:
+        rgb_color: [255, 100, 0]
+        brightness_pct: 60
+    # lyskaede color (orange sunset), paerelyskaede kun brightness (warm-white only)
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.koekken_lyskaede
+      data:
+        rgb_color: [255, 80, 0]
+        brightness_pct: 80
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.terrasse_paerelyskaede
+      data:
+        brightness_pct: 80
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        rgb_color: [120, 0, 200]
+        brightness_pct: 50
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.boernevaerelse_loft
+          - light.boernevaerelse_lampe
+          - light.badevaerelse_all   # group: loft + 5 spots (sprint 2026-05-10)
+      data:
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        color_temp_kelvin: 2326
+        brightness_pct: 50
+
+# =============================================================================
+# Daily-life utility scenes (2026-05-21)
+# =============================================================================
+# Sofa Læsning + Spisestue Middag — added per user-request "mangler der scener".
+# Fylder gap mellem mood-scenes (zen/cinema) og bright-scenes (full_bright):
+# warm men bright nok til faktisk aktivitet (læsning, spisning).
+# =============================================================================
+
+scene_sofa_laesning:
+  alias: "Scene: Sofa Læsning (stue sofa-lamper bright warm)"
+  description: >
+    Daily reading scene. Slukker spisestue_loft (ingen harsh overhead glare),
+    tænder sofa-lamper 70% 2700K (bright nok til at læse tekst comfortably).
+    Depot strip soft accent. Alle andre rum forbliver urørt — det er en
+    fokuseret 1-aktivitet scene.
+  mode: restart
+  sequence:
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.spisestue_loft
+      data:
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/stue_sofa_lys.yaml
+      data:
+        brightness_pct: 70
+        color_temp_kelvin: 2700
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        brightness_pct: 30
+        rgb_color: [255, 215, 165]  # soft peach accent
+        transition: 2
+
+scene_spisestue_middag:
+  alias: "Scene: Spisestue Middag (spisestue_loft fokus + mild køkken + ambient stue)"
+  description: >
+    Daily dinner scene. 2026-06-05: pendlen flyttet til soveloft → spisestue_loft
+    er nu dining-fokus (50% 2400K) over spisebord, indtil nyt spisestue-armatur
+    sættes op post-flyt. Køkken_loft 30% (mild, undgår open-plan void når man
+    spiser). Stue sofa-lamper 20% 2200K = ambient mood. Depot strip 20%
+    peach accent. Terrasse 5% (aften).
+    Børn/sove/bad/entré urørt — lad andre rums automatik køre normalt.
+  mode: restart
+  sequence:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.spisestue_loft
+      data:
+        brightness_pct: 50
+        color_temp_kelvin: 2400
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/stue_sofa_lys.yaml
+      data:
+        brightness_pct: 20
+        color_temp_kelvin: 2200
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        brightness_pct: 20
+        rgb_color: [255, 215, 165]  # soft peach
+        transition: 2
+    # Terrasse warm dim. Sprint 2026-05-23 v2: lux-gate genindført.
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ states('sensor.open_plan_lux') | float(0) < 100 }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.koekken_lyskaede
+              data:
+                color_temp_kelvin: 2200
+                brightness_pct: 5
+                transition: 2
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.terrasse_paerelyskaede
+              data:
+                brightness_pct: 5
+                transition: 2
+      default:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id:
+              - light.koekken_lyskaede
+              - light.terrasse_paerelyskaede
+          data:
+            transition: 2
+
+scene_cyberpunk:
+  alias: "Scene: Hus Cyberpunk (alle rum undt sove — neon pink/cyan/lilla)"
+  mode: restart  # tap-to-takeover
+  sequence:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.spisestue_loft
+      data:
+        rgb_color: [255, 0, 150]
+        brightness_pct: 75
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/stue_sofa_lys.yaml
+      data:
+        rgb_color: [0, 255, 255]
+        brightness_pct: 70
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.boernevaerelse_loft
+      data:
+        rgb_color: [0, 200, 255]
+        brightness_pct: 65
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.boernevaerelse_lampe
+      data:
+        rgb_color: [255, 0, 220]
+        brightness_pct: 60
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all   # group: loft + 5 spots (sprint 2026-05-10)
+      data:
+        rgb_color: [100, 0, 255]
+        brightness_pct: 70
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.koekken_lyskaede
+      data:
+        rgb_color: [255, 0, 200]
+        brightness_pct: 90
+    # paerelyskaede er warm-white only — får kun brightness
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.terrasse_paerelyskaede
+      data:
+        brightness_pct: 85
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        rgb_color: [200, 0, 255]
+        brightness_pct: 80
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        color_temp_kelvin: 4000
+        brightness_pct: 60
+
+
+# =============================================================================
+# Daily-life scenes v2 (sprint 2026-05-22 PM)
+# =============================================================================
+# 3 nye scener for at fylde gap mellem fest-scener og specifik aktivitet:
+#   - madlavning:    køkken bright + ambient andre
+#   - hverdagsaften: balanced familie-baseline 55% 2700K i fælles-rum
+#   - winddown:      pre-godnat dim warm overalt (inkl. badeværelse/sove for path-lights)
+#
+# Comfort baseline (user-spec): 2500-2700K @ 40-60% er "normal aften".
+# Disse 3 scener er designet omkring den baseline (vs. zen=very-dim mood,
+# sofa_laesning=bright reading, cinema=dim red, spisestue_middag=dinner-focus).
+#
+# madlavning får spread (epicenter=koekken). Andre 2 dækker allerede whole-
+# common-area, så spread er ikke meningsfuldt.
+# =============================================================================
+
+scene_madlavning:
+  alias: "Scene: Køkken Madlavning (køkken bright, ambient resten)"
+  mode: restart
+  description: >
+    Køkken-fokus: bright 80% 3000K for farve-præcision (hakke grønt, læse
+    opskrift). Andre fælles-rum dimmet ambient så de ikke konkurrerer.
+    Bad/sove/børn untouched. Spread-enabled (epicenter=koekken).
+  sequence:
+    # Køkken: bright neutral
+    # Stue loft: ambient så folk på sofa ser noget
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.spisestue_loft
+      data:
+        brightness_pct: 30
+        color_temp_kelvin: 2700
+        transition: 2
+    # Stue sofa-lamper: varmere accent
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/stue_sofa_lys.yaml
+      data:
+        brightness_pct: 40
+        color_temp_kelvin: 2400
+        transition: 2
+
+scene_hverdagsaften:
+  alias: "Scene: Hverdagsaften (familietid, balanced)"
+  mode: restart
+  description: >
+    Default familie-aften — alle samles, lave forskellige ting.
+    Comfort baseline 55% 2700K på fælles-rum loft. Sofa-lamper varmere
+    accent. Entré åbent (welcoming). Terrasse warm glow hvis mørkt.
+    Børn/sove/bad untouched (egne dynamics).
+  sequence:
+    # Fælles-rum loft: balanced 2700K 55%
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        brightness_pct: 55
+        color_temp_kelvin: 2700
+        transition: 2
+    # Sofa-lamper: varmere accent
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/stue_sofa_lys.yaml
+      data:
+        brightness_pct: 50
+        color_temp_kelvin: 2400
+        transition: 2
+    # Depot strip: matching ambient
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        brightness_pct: 50
+        color_temp_kelvin: 2700
+        transition: 2
+    # Entré: welcoming
+    # F4 fix: entre_loft transition=0 (TRADFRI WS bulb quirk)
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        brightness_pct: 50
+        color_temp_kelvin: 2700
+        transition: 0
+    # Terrasse lyskæde warm glow. Sprint 2026-05-23 v2: lux-gate genindført.
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ states('sensor.open_plan_lux') | float(0) < 100 }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.koekken_lyskaede
+              data:
+                brightness_pct: 30
+                color_temp_kelvin: 2200
+                transition: 2
+
+scene_winddown:
+  alias: "Scene: Sen aften winddown (pre-godnat dim warm)"
+  mode: restart
+  description: >
+    Pre-godnat (kl 21-22): blødt overalt for at signalere "snart i seng".
+    Adskilt fra system-godnat — winddown er stadig aktivt liv. Path-lights
+    i bad/sove/entré, ikke off. Børnerum gentle 5% (ikke pitch black hvis
+    de stirrer). Terrasse off (vi er inde nu).
+  sequence:
+    # Fælles-rum loft: meget dim 2200K
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        brightness_pct: 18
+        color_temp_kelvin: 2200
+        transition: 3
+    # Sofa-lamper: varmest, dimmest accent
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/stue_sofa_lys.yaml
+      data:
+        brightness_pct: 20
+        color_temp_kelvin: 2000
+        transition: 3
+    # Depot strip: matching dim
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        brightness_pct: 15
+        color_temp_kelvin: 2200
+        transition: 3
+    # Sove loft (= pendel, flyttet 2026-06-05): path til seng
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        brightness_pct: 30
+        color_temp_kelvin: 2200
+        transition: 3
+    # Bad: tandbørste-lys (5 spots — loft-pære flyttet til stue 2026-05-31)
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all
+      data:
+        brightness_pct: 35
+        color_temp_kelvin: 2200
+        transition: 3
+    # Børn: gentle 5% MEN kun hvis kids IKKE allerede er i seng.
+    # Sprint 2026-05-22 PM fix: hvis godnat_boern_active=on → skip helt
+    # + sluk eksplicit (defensiv mod tidligere tændt lys).
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.godnat_boern_active
+              state: "off"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_loft
+              data:
+                brightness_pct: 5
+                color_temp_kelvin: 2200
+                transition: 3
+      default:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id:
+              - light.boernevaerelse_loft
+              - light.boernevaerelse_lampe
+          data:
+            transition: 3
+    # Entré: subtle path
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        brightness_pct: 25
+        color_temp_kelvin: 2200
+        transition: 0
+    # Depot loft: subtle
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.depot_loft
+      data:
+        brightness_pct: 15
+        color_temp_kelvin: 2200
+        transition: 3
+    # Terrasse: off (vi er inde)
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.koekken_lyskaede
+          - light.terrasse_paerelyskaede
+      data:
+        transition: 3
+
+# =============================================================================
+# Fødselsdag (2026-08-16, user-spec) — Dannebrog: skiftevis rød og hvid
+# =============================================================================
+# Farverne sidder på HVER ANDEN pære, og de to hold BYTTER hvert 5. minut
+# (automation foedselsdag_farveskift, packages/foedselsdag_mood.yaml).
+# Moden bliver stående til brugeren slukker den — tap på tilen igen
+# (script.scene_toggle rydder scenen + slukker lyset).
+#
+# Scope er bevidst SMALT (user-spec): kun de 10 lys herunder. Alt andet i
+# huset står som det stod — derfor slukker moden IKKE noget ved start.
+foedselsdag_apply:
+  alias: "Fødselsdag: anvend rød/hvid efter fase"
+  mode: restart
+  description: >
+    Eneste sted lys-rosteret findes (fejlklasse #2 — skiftet og starten deler
+    listerne). saet_a er rød i fase A, hvid i fase B; saet_b omvendt.
+  fields:
+    check_exit:
+      description: >
+        true = afslut moden hvis alle 10 lys er slukket (bruges af 5-min-
+        skiftet, så et manuelt "sluk alt" ikke bliver tændt igen for evigt).
+      example: true
+  variables:
+    # Start-fordelingen fra user-spec: disse fem er RØDE når moden tændes.
+    saet_a:
+      - light.spisestue_loft
+      - light.stue_laesehygge      # sofa-læselampen (Innr-farvepære, flyttet hertil 2026-07-02)
+      - light.badevaerelse_spot_3
+      - light.badevaerelse_spot_4
+      - light.boernevaerelse_hygge_strip
+    # ...og disse fem er HVIDE når moden tændes.
+    saet_b:
+      - light.koekken_lyskaede
+      - light.badevaerelse_spot_1
+      - light.badevaerelse_spot_2
+      - light.badevaerelse_spot_5
+      - light.boernevaerelse_loft
+    fase_b: "{{ is_state('input_boolean.foedselsdag_fase_b', 'on') }}"
+    roede: "{{ saet_b if fase_b else saet_a }}"
+    hvide: "{{ saet_a if fase_b else saet_b }}"
+  sequence:
+    - if:
+        - condition: template
+          value_template: >-
+            {{ check_exit | default(false)
+               and expand(saet_a + saet_b)
+                   | selectattr('state', 'eq', 'on') | list | count == 0 }}
+      then:
+        - service: input_select.select_option
+          target:
+            entity_id: input_select.active_scene
+          data:
+            option: "none"
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.cirkus_active
+        - stop: "Alle fødselsdags-lys var slukket → moden afsluttet"
+    # Dannebrog-rød = Pantone 186C ≈ RGB 198/12/48.
+    - service: light.turn_on
+      continue_on_error: true   # Matter-timeout må ikke aborte resten (CHIP 0x32)
+      target:
+        entity_id: "{{ roede }}"
+      data:
+        rgb_color: [198, 12, 48]
+        brightness_pct: 100
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ hvide }}"
+      data:
+        # 5000 K, ikke 4000: målt live 08-16 rendrede 4000 K som rgb
+        # 255/206/166 = synligt gul ved siden af den mættede røde. Inden for
+        # alle 10 pærers område (smalleste er 1798-6535 K).
+        color_temp_kelvin: 5000
+        brightness_pct: 100
+        transition: 2
+
+scene_foedselsdag:
+  alias: "Scene: Fødselsdag (Dannebrog rød/hvid, bytter hvert 5. min)"
+  mode: restart
+  description: >
+    Sætter fase A + skifte-stemplet og tænder de 10 lys. cirkus_active
+    tændes som mood-pause-flag (samme genbrug som Dark Mode gør af
+    cinema_active) — så presence-lys, drift-back, morgen-sanity og
+    luksus-besparelse holder fingrene væk mens festen kører.
+  sequence:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.foedselsdag_fase_b
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.foedselsdag_sidste_skift_ts
+      data:
+        value: "{{ now().timestamp() | round(0) }}"
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.cirkus_active
+    - service: script.foedselsdag_apply

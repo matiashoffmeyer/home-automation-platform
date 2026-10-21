@@ -1,0 +1,317 @@
+# =============================================================================
+# System-varsler — sikkerheds-push (døre) + backup-vagt + Apollo ESP-temp-canary
+# =============================================================================
+# Sprint 2026-07-15b (user: "der må være andre varsler der også er nyttige").
+# Tre huller lukket:
+#
+# 1) SIKKERHED (nid `sikkerhed`) — dør-varslerne i automations/security.yaml
+#    gik KUN til persistent_notification (HA UI, synlig for alle med login og
+#    aldrig på telefonen — Backlog F2). Nu push via script.push_notify:
+#      - Hoveddør åbnet under Dormant (ikke AirBnB — gæster ankommer til tomt hus)
+#      - Hoveddør glemt åben ≥ slider min
+#      - Terrassedør åbnet under Dormant (ikke AirBnB)
+#      - Terrassedør åben + kulde (stue-temp < slider, ≥ slider min)
+#      - NY: Terrassedør åben ≥ slider min mens det REGNER (terrasse_regn_aktiv)
+#    "Ankomst?"-pushen (hoveddør >30 min siden sidst, huset Active) er BEVIDST
+#    droppet — det ville pushe ved hver hjemkomst (spam). Logbook-sporet består.
+#    Selve automations bor fortsat i automations/security.yaml.
+#
+# 2) BACKUP-VAGT (nid `backup`) — daglig backup kl ~03 (backup_schedule) havde
+#    INGEN overvågning: fejler den stille, opdages det først når man skal bruge
+#    den. Dagligt tjek kl 10:00: seneste succesfulde backup ældre end slider-
+#    timer (eller sensor død = fejlklasse #9 → alarm) → push.
+#
+# 3) APOLLO ESP-TEMP-CANARY (genbruger nid `apollo`) — CLAUDE.md's regel "hold
+#    øje med *_apollo_esp_temperature > ~50°C steady-state" var manuel. Nu
+#    automation: en ESP-temp > slider i 15 min → push (6t dedupe-stempel).
+#    2 sensor-chips er allerede døde af varmestress — canary'en er billig.
+#
+# OBSERVERER KUN — rører intet. Alle push gennem push_notify-frameworket
+# (master + per-nid enable + tidsvindue + telefon-routing).
+# Runtime-stempler (`*_sidste_push`) er BEVIDST uden for snapshot-whitelisten.
+# =============================================================================
+
+input_boolean:
+  notif_sikkerhed_enabled:
+    name: "🚪 Sikkerhed (døre) — send"
+    icon: mdi:shield-home
+  notif_sikkerhed_parent_a:
+    name: "🚪 Sikkerhed (døre) — Parent A"
+    icon: mdi:cellphone
+  notif_sikkerhed_parent_b:
+    name: "🚪 Sikkerhed (døre) — Parent B"
+    icon: mdi:cellphone
+  notif_backup_enabled:
+    name: "💾 Backup mangler — send"
+    icon: mdi:backup-restore
+  notif_backup_parent_a:
+    name: "💾 Backup mangler — Parent A"
+    icon: mdi:cellphone
+  notif_backup_parent_b:
+    name: "💾 Backup mangler — Parent B"
+    icon: mdi:cellphone
+  # AirBnB-opt-in (2026-07-16): ON = send også i AirBnB-mode (gate i push_notify).
+  # NB: "dør åbnet i tomt hus"-pushen har derudover sin egen Dormant+ikke-AirBnB-
+  # behavior-gate i security.yaml (gæster ankommer til Dormant hus) — den styres
+  # IKKE af denne toggle.
+  notif_sikkerhed_airbnb:
+    name: "🚪 Sikkerhed (døre) — også i AirBnB"
+    icon: mdi:home-account
+  notif_backup_airbnb:
+    name: "💾 Backup mangler — også i AirBnB"
+    icon: mdi:home-account
+
+input_datetime:
+  notif_sikkerhed_start:
+    name: "🚪 Sikkerhed (døre) — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_sikkerhed_slut:
+    name: "🚪 Sikkerhed (døre) — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_backup_start:
+    name: "💾 Backup mangler — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_backup_slut:
+    name: "💾 Backup mangler — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  # Runtime dedupe-stempler (IKKE i snapshot — cursors)
+  sikkerhed_regn_doer_sidste_push:
+    name: "Runtime: sidste regn-dør-push"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+  sikkerhed_kulde_doer_sidste_push:
+    name: "Runtime: sidste kulde-dør-push"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+  apollo_esp_temp_sidste_push:
+    name: "Runtime: sidste ESP-temp-push"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+  sikkerhed_gulvvarme_spild_sidste_push:
+    name: "Runtime: sidste gulvvarme-spild-push"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+
+input_number:
+  sikkerhed_hoveddoer_glemt_minutter:
+    name: "🚪 Hoveddør glemt åben — min før push"
+    min: 2
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:door-open
+  sikkerhed_kulde_temp_graense:
+    name: "🥶 Terrassedør-kulde — stue-temp under (°C)"
+    min: 5
+    max: 25
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-alert
+  sikkerhed_kulde_doer_minutter:
+    name: "🥶 Terrassedør-kulde — min åben før push"
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:timer-sand
+  # --- Gulvvarme brænder for spurvene (2026-09-01, user-spec) ---------------
+  # Terrassedøren står åben, det er koldt UDE, og badets TIMMERFLOTTE ser
+  # temperaturen stige UDEN at fugten følger med = gulvvarmen har sat fuldt ind
+  # for at kompensere for den åbne dør. Fugt-loftet er det der skiller det fra
+  # et brusebad/en tørretumbler, som løfter BEGGE dele.
+  # Skelnes bevidst fra 🥶 Terrassedør-kulde ovenfor: DEN advarer når huset er
+  # ved at TABE kampen (inde-temp under grænsen). Denne advarer når huset
+  # VINDER den — og brænder energi af på det.
+  sikkerhed_gulvvarme_ude_temp_graense:
+    name: "🐦 Gulvvarme-spild — ude-temp under (°C)"
+    min: 0
+    max: 20
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:snowflake-thermometer
+  sikkerhed_gulvvarme_doer_minutter:
+    name: "🐦 Gulvvarme-spild — min dør åben før push"
+    min: 5
+    max: 60
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:timer-sand
+  sikkerhed_gulvvarme_temp_stigning:
+    name: "🐦 Gulvvarme-spild — bad-temp stiger (°C/20min)"
+    min: 0.1
+    max: 2
+    step: 0.1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-chevron-up
+  sikkerhed_gulvvarme_fugt_loft:
+    name: "🐦 Gulvvarme-spild — fugt må højst stige (point/10min)"
+    min: 0.5
+    max: 10
+    step: 0.5
+    unit_of_measurement: "point"
+    icon: mdi:water-off
+  sikkerhed_regn_doer_minutter:
+    name: "🌧️ Terrassedør i regn — min åben før push"
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:weather-pouring
+  backup_max_alder_timer:
+    name: "💾 Backup — max alder før push (timer)"
+    min: 6
+    max: 72
+    step: 1
+    unit_of_measurement: "t"
+    icon: mdi:backup-restore
+  apollo_esp_temp_graense:
+    name: "🌡️ Apollo ESP-temp — push over (°C)"
+    min: 45
+    max: 70
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:chip
+
+automation:
+  # ---------------------------------------------------------------------------
+  # 2) Backup-vagt — dagligt tjek kl 10:00 (backup kører ~03:00-03:30)
+  # ---------------------------------------------------------------------------
+  - id: backup_vagt_dagligt_tjek
+    alias: "Backup-vagt: seneste backup for gammel"
+    description: >
+      Pusher hvis seneste SUCCESFULDE automatiske backup er ældre end slideren
+      (default 26 t = én misset nat). Sensor unavailable/unknown regnes som
+      fejl (fejlklasse #9) — en død backup-integration skal også alarmere.
+    mode: single
+    trigger:
+      - platform: time
+        at: "10:00:00"
+    variables:
+      last_ok_raw: "{{ states('sensor.backup_last_successful_automatic_backup') }}"
+      last_ok_ts: "{{ as_timestamp(last_ok_raw, 0) }}"
+      age_h: "{{ ((now().timestamp() - last_ok_ts | float(0)) / 3600) | round(1) }}"
+      max_h: "{{ states('input_number.backup_max_alder_timer') | float(26) }}"
+    condition:
+      - condition: template
+        value_template: "{{ last_ok_ts | float(0) == 0 or age_h | float(999) > max_h }}"
+    action:
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: backup
+          title: "💾 Backup-problem"
+          message: >-
+            {% if last_ok_ts | float(0) == 0 %}
+            Backup-sensoren svarer ikke ({{ last_ok_raw }}) — kan ikke se
+            hvornår sidste backup lykkedes. Tjek Settings → System → Backups.
+            {% else %}
+            Seneste succesfulde backup er {{ age_h }} timer gammel
+            (grænse {{ max_h | int }} t). Sidste forsøg:
+            {{ states('sensor.backup_last_attempted_automatic_backup') }}.
+            Tjek Settings → System → Backups.
+            {% endif %}
+          payload:
+            tag: backup_vagt
+            # Knap → notif_action_backup_run (packages/notif_actions.yaml).
+            actions:
+              - action: "BACKUP_RUN_NU"
+                title: "▶️ Kør backup nu"
+      - service: logbook.log
+        data:
+          name: "Backup-vagt"
+          message: >-
+            Backup for gammel/ukendt (alder {{ age_h }} t, grænse
+            {{ max_h | int }} t) — push sendt.
+
+  # ---------------------------------------------------------------------------
+  # 3) Apollo ESP-temp-canary — chip-wear-varsling (jf. CLAUDE.md >50°C-reglen)
+  # ---------------------------------------------------------------------------
+  - id: apollo_esp_temp_canary
+    alias: "Apollo: ESP-temperatur for høj (chip-wear-canary)"
+    description: >
+      En Apollo-ESP over slider-grænsen i 15 min = noget hammer chippen
+      (engineering mode glemt on / tuner-loop / defekt). 2 sensor-chips er
+      allerede døde af varmestress. 6 t dedupe. Unavailable trigger ikke.
+      Backstop /30 (fejlklasse #4): numeric_state-flanken re-fyrer ALDRIG hvis
+      temp forbliver over grænsen → uden backstop kom push nr. 2 aldrig i en
+      vedvarende episode. Backstoppen er gated til stempel < 24 t (kun re-push
+      i en igangværende episode — NY episode kræver stadig 15-min-flanken;
+      analog last_changed kan ikke bevise "sustained", så den gate er nødvendig).
+    mode: single
+    trigger:
+      - platform: numeric_state
+        id: flanke
+        entity_id:
+          - sensor.sovevaerelse_apollo_esp_temperature
+          - sensor.stue_apollo_esp_temperature
+          - sensor.spisestue_apollo_esp_temperature
+          - sensor.boernevaerelse_apollo_esp_temperature
+          - sensor.koekken_apollo_esp_temperature
+        above: input_number.apollo_esp_temp_graense
+        for:
+          minutes: 15
+      - platform: time_pattern
+        id: backstop
+        minutes: "/30"
+    condition:
+      - condition: template
+        value_template: >-
+          {% set alder = now().timestamp() -
+             (state_attr('input_datetime.apollo_esp_temp_sidste_push', 'timestamp') | float(0)) %}
+          {{ alder > 6 * 3600 and (trigger.id != 'backstop' or alder < 24 * 3600) }}
+    action:
+      - variables:
+          graense: "{{ states('input_number.apollo_esp_temp_graense') | float(52) }}"
+          varme: >-
+            {% set ns = namespace(h=[]) %}
+            {% for e in ['sensor.sovevaerelse_apollo_esp_temperature',
+                         'sensor.stue_apollo_esp_temperature',
+                         'sensor.spisestue_apollo_esp_temperature',
+                         'sensor.boernevaerelse_apollo_esp_temperature',
+                         'sensor.koekken_apollo_esp_temperature'] %}
+              {% set v = states(e) | float(-1) %}
+              {% if v > graense | float %}
+                {% set ns.h = ns.h + [(state_attr(e, 'friendly_name') or e) ~ ' (' ~ v | round(1) ~ '°C)'] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.h | join(' · ') }}
+      - condition: template
+        value_template: "{{ varme | trim | length > 0 }}"
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: apollo
+          title: "🌡️ Apollo kører varm"
+          message: >-
+            {{ varme }} — over grænsen {{ graense | int }}°C
+            {{ 'i 15+ min' if trigger.id == 'flanke' else '(stadig, 6 t efter sidste push)' }}.
+            Noget hammer chippen — tjek engineering mode / tuner-loops
+            (jf. chip-wear-reglerne; 2 sensor-chips er allerede døde).
+          payload:
+            tag: apollo_esp_canary
+            actions:
+              - action: "APOLLO_ESP_SNOOZE24"
+                title: "🔕 Ro 24t"
+      - service: logbook.log
+        data:
+          name: "Apollo ESP-canary"
+          message: >-
+            {{ varme }} over {{ graense | int }}°C ({{ trigger.id }}) —
+            push sendt (6 t dedupe).
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.apollo_esp_temp_sidste_push
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"

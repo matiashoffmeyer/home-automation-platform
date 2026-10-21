@@ -1,0 +1,296 @@
+# =============================================================================
+# Bulb Firmware Defaults Dispatcher (audit-runde 14, O2 fix)
+# =============================================================================
+# Adaptiv start_up_current_level + start_up_color_temperature for ALLE paered
+# color bulbs baseret på sun-bracket + godnat.
+#
+# Bulb wake'r derefter direkte paa target-niveau (ingen 30%-blink).
+#
+# REFAKTOR (audit-runde 14): tidligere 2 hardcodede automations (bath + sove)
+# erstattet med ÉN dispatcher der itererer over bulb_configs liste.
+# Tilfojer ny bulb = tilfoj entry til bulb_configs (~7 linjer per bulb).
+#
+# Trigger:
+#   - sensor.sun_bracket aendres (sunrise, sunset, dusk, dawn boundaries)
+#   - input_boolean.godnat_active aendres
+#   - HA start (sync efter restart)
+#
+# CONFIG-FORMAT per bulb:
+#   - ieee: Zigbee MAC (find via Settings → Devices)
+#   - name: kort identifier til logbook
+#   - cluster_768: true hvis color bulb (RGB+W); false hvis WS-only
+#   - targets: per-bracket dict med {bri_pct, kelvin}
+#       godnat   = bedtime mode (uafhængig af bracket)
+#       day      = elev > 0
+#       twilight = elev -6 til 0
+#       night    = elev < -6
+#
+# CONVERSIONS:
+#   raw brightness (Innr 0-254) = bri_pct * 2.54
+#   color temp mireds          = 1000000 / kelvin
+#
+# BEMARK: bulben skal vaere reachable for at modtage Zigbee-attribut updates.
+# Hvis wall switch er off naar adaptive fyrer, opdateringen lander ikke.
+# light_power_recovery er fallback.
+# =============================================================================
+
+- id: bulb_firmware_defaults_dispatcher
+  alias: "Bulb FW: adaptiv start_up dispatcher (alle paerede color bulbs)"
+  description: >
+    Itererer over bulb_configs liste og opdaterer NVRAM-defaults for hver
+    paeret bulb. Erstatter tidligere bath_firmware_defaults_adaptive +
+    sove_firmware_defaults_adaptive (audit-runde 14, O2 fix).
+  mode: single
+  trigger:
+    # A92 fix audit-5 2026-05-12: `for: seconds: 30` debouncer state-flap
+    # under HA restart + rapid godnat sub-flag transitions. Tidligere fyrede
+    # 27x/24h (forventet 5-8). Cluster i 05:31-05:43 morning restart =
+    # restart-state-pop fires igennem. `for:` filtrerer transient ud uden
+    # at miste real bracket/godnat changes.
+    - platform: state
+      entity_id: sensor.sun_bracket
+      for:
+        seconds: 30
+    # A10 fix sprint 2026-05-06: trigger på godnat_any_active i stedet for
+    # kun master flag. Voksen-only godnat (somrig kort-ned) skal også opdatere
+    # NVRAM så bulbs vågner i godnat-target ved wall-switch flip mid-natnight.
+    - platform: state
+      entity_id: binary_sensor.godnat_any_active
+      for:
+        seconds: 30
+    - platform: homeassistant
+      event: start
+  variables:
+    # Liste af paerede bulbs. Tilfoj ny bulb post-flyt = tilfoj entry her.
+    # O14 fix audit-runde 19: godnat target er IKKE laengere i per-bulb
+    # config — den hentes nu fra input_number.godnat_brightness_pct +
+    # input_number.godnat_kelvin (single source of truth). Per-bulb targets
+    # gaelder kun day/twilight/night brackets der er rum-specifikke.
+    #
+    # A2 fix sprint 2026-05-06: tilføjet `light_entity` field per bulb. Bruges
+    # til skip-unavailable check så dispatcher ikke aborter ved første
+    # unavailable bulb (TimeoutError ved boern + 5 Tradfri WW). Tidligere
+    # kun bath+sove faktisk fik FW updates.
+    bulb_configs:
+      # Bath loft-pære (IEEE 86:99:0e:99:cf:02:ee:da) flyttet til stue som
+      # hyggelampe 2026-05-31 → ikke længere firmware-managed (accent-lampe,
+      # samme behandling som sofa-lamperne). Bath main-lys = de 5 spots nedenfor.
+      # Sprint 2026-05-10: 2 Innr RS 242 C GU10 spots (RGBW) i bath.
+      # IEEE = "00:00:00:00:00:00:00:00" placeholder = aldrig matcher real device
+      # → A2 skip-unavailable check fanger dem indtil paret. Update IEEE post-pair.
+      # Same firmware-pattern som bath_loft (Innr RGBW).
+      - ieee: "00:00:00:00:00:00:00:00"  # POST-PAIR: update til faktisk IEEE
+        name: "bath_spot_1"
+        light_entity: light.badevaerelse_spot_1
+        cluster_768: true
+        targets:
+          day:      {bri_pct: 70, kelvin: 2850}
+          twilight: {bri_pct: 50, kelvin: 2700}
+          night:    {bri_pct: 30, kelvin: 2326}
+      - ieee: "00:00:00:00:00:00:00:00"  # POST-PAIR: update til faktisk IEEE
+        name: "bath_spot_2"
+        light_entity: light.badevaerelse_spot_2
+        cluster_768: true
+        targets:
+          day:      {bri_pct: 70, kelvin: 2850}
+          twilight: {bri_pct: 50, kelvin: 2700}
+          night:    {bri_pct: 30, kelvin: 2326}
+      # bath_spot_3, _4, _5: TBD type — tilføj manuelt efter pairing når
+      # bulb model + IEEE er kendt. Hvis WW-only: cluster_768: false.
+      # Hvis RGBW: cluster_768: true (samme som spot_1/_2 ovenfor).
+      # 2026-06-05: light.sovevaerelse_loft (Innr RB 282 C, IEEE
+      # 59:9a:05:44:5d:df:25:9c) sat på dvale — pendlen (light.spisestue_pendel,
+      # CCT-only) overtog soveloft-rollen. Firmware-default for den parkerede
+      # bulb fjernet (skal ikke NVRAM-manages mens den er orphan reserve).
+      # TODO post-flyt: tilføj en firmware-default entry for pendlen (soveloft)
+      # når dens IEEE + cluster-support kan verificeres live. Pendlen er CCT-only;
+      # cluster_768 (color/CT-cluster) gælder for color_temp, men bekræft on-device
+      # før write (jf. firmware-write forsigtighed i CLAUDE.md).
+      # ⚠️ 2026-08-16d: pendlens StartUpOnOff stod på **Off** — som eneste rum-lys
+      # i huset (alle andre: On). Soveværelsets VÆGKONTAKT kunne derfor ikke tænde
+      # lyset: 14 dages historik viser 62 off→on, men 0 unavailable→on, dvs. den
+      # kom aldrig tilbage tændt efter strøm. Sat til **On** live (levelet stod
+      # allerede på 255 = previous, som køkken/spisestue). VED RE-PAIR /
+      # FACTORY-RESET: sæt select.spisestue_pendel_power_on_behavior = "On" igen —
+      # den lever i bulbens NVRAM, ikke i git. Bevidst IKKE lagt ind som en
+      # bulb_configs-entry: den her dispatcher skriver brightness-brackets
+      # periodisk, og pendlen skal ikke NVRAM-manages for én engangs-attribut.
+      # 2026-05-07 fix: boern bulb mesh-flickered 06:05 → woke at NVRAM
+      # 65% bright (day-bracket fra 05:17 sun_bracket change) → wakede kids.
+      # FIX: ALL brackets nu LAV (5%) for boern. Adaptive firmware giver
+      # ikke mening for kids' room — vi vil hellere have at en mesh-flicker
+      # IKKE wakeer kids. Når kids skal have bright lys, presence_*_on
+      # automation override eksplicit via service call.
+      - ieee: "7f:86:c8:78:a6:54:4c:7c"
+        name: "boern"
+        light_entity: light.boernevaerelse_loft
+        cluster_768: true
+        targets:
+          day:      {bri_pct: 5, kelvin: 2700}  # Mesh-flicker = subtle, ikke jolt
+          twilight: {bri_pct: 5, kelvin: 2400}
+          night:    {bri_pct: 5, kelvin: 2200}  # Næsten off om natten
+      # O2 fix: 5 Tradfri WW bulbs i standby (paret 2026-05-05 AM, ingen
+      # room-assignment endnu). cluster_768: false fordi de er WW-only.
+      # NB: når room-assigned, opdater 'name' til {room}_loft og juster targets
+      # baseret på rum-funktion. Indtil da bruges samme bracket for alle.
+      # A2 fix: skip-unavailable check fanger disse fordi de er permanent
+      # unavailable (no power), så ZHA TimeoutError undgås.
+      # ⚠️ 2026-07-02: pæren FYSISK udskiftet — IKEA'en (denne IEEE) ligger i
+      # skabet som light.reserve_hvid_1 (unavailable → skip-unavailable-checket
+      # springer den over). Læsehygge-rollen er nu Innr RB 282 C (ex "Køkken
+      # Loft", IEEE 6e:9b:c0:8f:dd:a6:78:5f) = light.stue_laesehygge — den har
+      # BEVIDST ingen firmware-defaults-entry (samme som de øvrige stue-sofa
+      # RB 282 C'er; ingen NVRAM-writes uden behov, jf. CLAUDE.md-paranoia).
+      # Reaper/poll-automations for IKEA-fantomet er fjernet fra
+      # presence_stue.yaml — genindfør dem hvis IKEA'en sættes i brug igen.
+      - ieee: "0e:db:76:1c:70:fa:90:4d"
+        name: "reserve_hvid_1"   # var tradfri_white_1 → stue_laesehygge 2026-06-02 → reserve 2026-07-02
+        # ⚠️ 2026-06-11: StartUpOnOff (cluster 6, attr 0x4003) manuelt sat til
+        # 255 (previous state) — IKKE 1 (On) som pairing-flowet sætter.
+        # Lampen står i stikkontakt uden wall-switch; Power-on=On fik den til
+        # at tænde spontant ved strøm-/rejoin-blips (nat-tænd 22:45 2026-06-10,
+        # + 07:12/09:14/13:25 2026-06-09 — alle context-løse i logbook).
+        # VED RE-PAIR: genskriv 255 (zha.set_zigbee_cluster_attribute,
+        # endpoint 1, cluster 6, attribute 16387, value 255).
+        # ⚠️ KORREKTION 2026-06-18: de "context-løse on@1"-events er IKKE reel
+        # selv-tænding via power-on. Bruger bekræftede pæren er FYSISK SLUKKET
+        # mens HA viser 'on' @ brightness 1 — klassisk IKEA off-with-transition-
+        # fantom (off-kommando m. transition efterlader on/off='on' på lvl 1).
+        # Hård turn_off (transition 0) rydder den (verificeret live). Reaper-net:
+        # automation 'stue_laesehygge_phantom_off' i presence_stue.yaml (fjernet
+        # 2026-07-02, pæren røg i skabet). StartUpOnOff-tweaket her er derfor
+        # sandsynligvis irrelevant for symptomet.
+        light_entity: light.reserve_hvid_1
+        cluster_768: false
+        targets:
+          day:      {bri_pct: 70, kelvin: 2850}
+          twilight: {bri_pct: 50, kelvin: 2700}
+          night:    {bri_pct: 30, kelvin: 2326}
+      - ieee: "9b:10:43:a6:67:62:2b:e0"
+        name: "tradfri_white_2"
+        light_entity: light.tradfri_white_2
+        cluster_768: false
+        targets:
+          day:      {bri_pct: 70, kelvin: 2850}
+          twilight: {bri_pct: 50, kelvin: 2700}
+          night:    {bri_pct: 30, kelvin: 2326}
+      - ieee: "d1:fd:b7:17:0f:33:55:54"
+        name: "tradfri_white_3"
+        light_entity: light.tradfri_white_3
+        cluster_768: false
+        targets:
+          day:      {bri_pct: 70, kelvin: 2850}
+          twilight: {bri_pct: 50, kelvin: 2700}
+          night:    {bri_pct: 30, kelvin: 2326}
+      - ieee: "b1:ce:2f:79:88:d7:16:df"
+        name: "tradfri_white_4"
+        light_entity: light.tradfri_white_4
+        cluster_768: false
+        targets:
+          day:      {bri_pct: 70, kelvin: 2850}
+          twilight: {bri_pct: 50, kelvin: 2700}
+          night:    {bri_pct: 30, kelvin: 2326}
+      - ieee: "a2:26:b6:bb:ed:cf:d0:7a"
+        name: "tradfri_white_5"
+        light_entity: light.tradfri_white_5
+        cluster_768: false
+        targets:
+          day:      {bri_pct: 70, kelvin: 2850}
+          twilight: {bri_pct: 50, kelvin: 2700}
+          night:    {bri_pct: 30, kelvin: 2326}
+      # Depot loft Hue White (paret 2026-06-02). LWE007 = Philips Hue White,
+      # 2700K fixed, brightness-only → cluster_768: false (kun start_up_current_
+      # _level skrives, ingen CT). Del af light.depot_loft gruppen (m. IKEA WS).
+      # kelvin-felterne er kun dokumentation her (skrives ikke pga cluster_768:false).
+      - ieee: "b7:cf:3b:1a:2e:76:14:77"
+        name: "depot_hue_1"
+        light_entity: light.depot_loft_hue_1
+        cluster_768: false
+        endpoint: 11   # Hue LWE007 eksponerer Level Control på endpoint 11 (ikke 1)
+        targets:
+          day:      {bri_pct: 70, kelvin: 2700}
+          twilight: {bri_pct: 50, kelvin: 2700}
+          night:    {bri_pct: 30, kelvin: 2700}
+      - ieee: "cf:06:10:ff:34:f6:9b:ad"
+        name: "depot_hue_2"
+        light_entity: light.depot_loft_hue_2
+        cluster_768: false
+        endpoint: 11   # Hue LWE007 eksponerer Level Control på endpoint 11 (ikke 1)
+        targets:
+          day:      {bri_pct: 70, kelvin: 2700}
+          twilight: {bri_pct: 50, kelvin: 2700}
+          night:    {bri_pct: 30, kelvin: 2700}
+  action:
+    - variables:
+        # A60 fix audit-3 2026-05-06 PM: fallback til 'night' hvis sun_bracket
+        # er unavailable. Tidligere ville KeyError aborte dispatcher hvis
+        # template_sensor failure → 'unavailable' value not in targets dict.
+        bracket_raw: "{{ states('sensor.sun_bracket') }}"
+        bracket: >
+          {% if bracket_raw in ['day', 'twilight', 'night'] %}
+            {{ bracket_raw }}
+          {% else %}
+            night
+          {% endif %}
+        # A10 fix sprint 2026-05-06: bruger godnat_any_active (union) i stedet
+        # for kun master flag. Voksen-only godnat skal også få godnat-NVRAM.
+        godnat: "{{ is_state('binary_sensor.godnat_any_active', 'on') }}"
+        # Key i targets dict — godnat handles separat (constants), bracket
+        # bruges kun for day/twilight/night.
+        target_key: "{{ 'godnat' if godnat else bracket }}"
+        # O14 fix audit-runde 19: godnat target fra constants (single source).
+        godnat_pct: "{{ states('input_number.godnat_brightness_pct') | int(30) }}"
+        godnat_kelvin: "{{ states('input_number.godnat_kelvin') | int(2326) }}"
+    - repeat:
+        for_each: "{{ bulb_configs }}"
+        sequence:
+          - variables:
+              cfg: "{{ repeat.item }}"
+              # O14: hvis godnat = aktiv, brug constants; ellers per-bulb cfg.
+              tgt: >-
+                {{ {'bri_pct': godnat_pct, 'kelvin': godnat_kelvin}
+                   if target_key == 'godnat'
+                   else repeat.item.targets[target_key] }}
+              bri_raw: "{{ (tgt.bri_pct * 2.54) | round(0) | int }}"
+              mireds: "{{ (1000000 / tgt.kelvin) | round(0) | int }}"
+          # A2 fix sprint 2026-05-06: wrap alle ZHA-calls i if-then så vi skipper
+          # bulb hvis light entity unavailable. Forhindrer ZHA TimeoutError der
+          # aborter dispatcher mid-loop (boern + 5 Tradfri WW = silent abort tidligere).
+          # `if` uden else = continue til næste bulb hvis condition false.
+          - if:
+              - condition: template
+                value_template: "{{ states(cfg.light_entity) not in ['unavailable', 'unknown'] }}"
+            then:
+              # Set start_up_current_level (cluster 8 attr 0x4000)
+              - service: zha.set_zigbee_cluster_attribute
+                continue_on_error: true
+                data:
+                  ieee: "{{ cfg.ieee }}"
+                  endpoint_id: "{{ cfg.endpoint | default(1) }}"
+                  cluster_id: 8
+                  cluster_type: in
+                  attribute: 0x4000
+                  value: "{{ bri_raw }}"
+              # Conditional: set start_up_color_temperature_mireds (cluster 768
+              # attr 0x4010) kun hvis bulb er color-capable (cluster_768: true)
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ cfg.cluster_768 | default(false) }}"
+                    sequence:
+                      - service: zha.set_zigbee_cluster_attribute
+                        continue_on_error: true
+                        data:
+                          ieee: "{{ cfg.ieee }}"
+                          endpoint_id: "{{ cfg.endpoint | default(1) }}"
+                          cluster_id: 768
+                          cluster_type: in
+                          attribute: 0x4010
+                          value: "{{ mireds }}"
+              - service: logbook.log
+                data:
+                  name: "{{ cfg.name | capitalize }} FW default"
+                  message: >
+                    Updated NVRAM: bri={{ bri_raw }} ({{ tgt.bri_pct }}%)
+                    ct={{ mireds }}mireds (~{{ tgt.kelvin }}K)
+                    [bracket={{ bracket }}, godnat={{ godnat }}, key={{ target_key }}]

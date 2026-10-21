@@ -1,0 +1,802 @@
+# =============================================================================
+# Regn-advarsel — Apollo RGB LED (2026-05-20 / 2026-06-07)
+# =============================================================================
+# 2026-08-16h FLYTTET. `regn_advarsel_apollo_rgb_on`/`_off` lå her indtil husets
+# tre RGB-varsler (dug, regn, batteri) gik over til blink med lange mørke
+# pauser. De tre skrev til de samme Apollo-LED'er og skelnede sig fra hinanden
+# på hue + brightness; da alle tre nu deler ÉN styrke-slider, kunne den
+# ejerskabs-test ikke længere holde (fejlklasse #1/#2). Nu ét sted:
+#
+#     packages/apollo_rgb_varsel.yaml
+#       sensor.apollo_rgb_varsel            → hvem vinder (Batteri > Regn > Dug)
+#       automation apollo_rgb_varsel_blink  → renderer vinderen som blink
+#
+# Regn-DELEN af gaten er uændret: input_boolean.weather_warning_enabled,
+# sensor.vejr_varsel_i_dag.is_rain (single source of truth, se
+# packages/weather_warning.yaml) og vinduet input_datetime.varsel_apollo_rgb_on
+# → varsel_apollo_rgb_off. Gates: Active + ikke AirBnB + batteri-rød vinder —
+# også uændret. Nyt oveni: godnat slukker varslet.
+#
+# Sluk-automationen er væk uden erstatning, og det er med vilje: et blink er et
+# `flash: short`, hvor ESP'en selv slukker efter 2 sek. Der findes ikke længere
+# en tilstand hvor LED'en kan hænge tændt, og dermed heller ikke noget at slukke.
+#
+# Morgen-varsels-BLINKENE i rummenes farvelamper nedenfor er en ANDEN feature
+# (rigtige pærer, ikke Apollo-LED'er) og er urørt.
+# =============================================================================
+# =============================================================================
+# Vejr-MORGENVARSEL i rum-farvelamper — regn / sne / vind / UV-glimt
+# =============================================================================
+# User-spec 2026-06-05 (udvider 2026-06-04 regn+vind): tydeligt morgen-vejrvarsel
+# via sekventielle farve-glimt i rummenes farvelamper. Hver 30 min mellem
+# 06:30-10:00 (kun Active + ikke AirBnB) læses sensor.vejr_varsel_i_dag (single
+# source of truth, packages/weather_warning.yaml) og hver matchende advarsel
+# afspilles ÉN ad gangen — de venter på hinanden, kører ALDRIG oven i hinanden,
+# og den sidste normaliserer til varm hvid. Tærsklerne er nu INTELLIGENTE og bor
+# i sensoren — her læser vi kun is_rain/is_snow/is_wind/is_uv + tal-attributter:
+#   - REGN (mængde ≥2mm timesum ELLER torden/byge ≥25% sandsynlighed): blå blink
+#     = "husk regntøj". 2 blink normalt, 5 blink ved meget regn (≥10mm/dag).
+#   - SNE ('snow' i en times condition): sprinklede hvide glimt over ~10 sek
+#     (hurtige, scattered flash — snefnug) = "sne på vej".
+#   - VIND (vindstød ≥50 km/h ELLER middelvind ≥36 km/h ≈ 10 m/s): 2 lange 2-sek
+#     hvide blink (langsomme, vedvarende — modsat snes hurtige sprinkle, så de to
+#     hvide varsler ikke forveksles) = "fortøjr ting på terrassen".
+#   - UV (EFFEKTIV skydække-justeret UV ≥4 — ikke klar-himmel; overskyede dage
+#     giver intet UV-varsel selv ved højt indeks): 3 orange blink = "solcreme på".
+#
+# Selve blinkene renderes af script.vejr_varsel_blink (script_pkg/
+# vejr_varsel_blink.yaml) — ÉN implementation for morgen OG aften, i stedet for
+# de 6 copy-pastede repeat-løkker der lå her indtil 2026-08-30. Farven sendes
+# kun på første blink; se scriptets header for målingen bag.
+#
+# Mekanik (2026-07-02, user-spec "bookends"): scene-snapshot → 5 sek VARM HVID
+# (= "her kommer varsler") → effekter i rækkefølge → 5 sek VARM HVID (= "varsler
+# slut") → restore. Bookenden erstatter det gamle 0-sek varm-finalize-blip (user:
+# forvirrende) og giver samme sidegevinst: SLUKKEDE lamper efterlades med 2700K
+# varm hvid som sidst-aktive farve, så en senere MANUEL tænd kommer op varmt
+# (Zigbee-pærer husker sidste farve). continue_on_error overalt: unavailable
+# lamper springes blot over.
+#
+# SCOPE (2026-07-03, user-spec): varsler kører KUN i OPEN-PLAN-rummet (stue +
+# spisestue + køkken). Entré (color_temp-kun → viste kun de hvide bookends uden
+# farvekode = "legacy start/stop blink"-rodet brugeren så) + depot + bad er
+# FJERNET fra alle varsler. Alle open-plan-lamper er farve-lamper, så der er
+# ikke længere behov for white_lamps/color_lamps-splittet — ét `lamps`-sæt.
+#
+# Tærskler bor i packages/weather_warning.yaml (ÉN definition for blå/blink/
+# push) — rediger dem dér hvis de skal justeres, ingen slider (vejr-grænser
+# ændres sjældent).
+# =============================================================================
+
+- id: vejr_morgen_regn_vind_blink
+  alias: "Vejr-varsel: regn/sne/vind/UV-glimt i farvelamper (morgen, 1x)"
+  description: >
+    ÉT blink pr. morgen, i det første minut inde i vinduet
+    varsel_morgen_blink_start → _blink_slut hvor huset kan SE at der er nogen i
+    open-plannet (binary_sensor.open_plan_varsel_publikum). Sekventielle
+    vejr-glimt i rummenes farvelamper — regn=blåt glimt, sne=hvide
+    sprinkle-glimt over 10s, vind=2 lange 2-sek hvide blink, UV=3 orange blink
+    (solcreme). Sessionen starter og slutter med 5 sek varm hvid (bookends =
+    "her kommer/slutter varsler") og restores derefter til pre-blink tilstand.
+    Gates: Active + ikke-AirBnB + publikum + dato-stempel.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: time_pattern
+      minutes: "/1"
+  condition:
+    - condition: state
+      entity_id: input_boolean.weather_warning_enabled
+      state: "on"
+    # VINDUE: samme to sliders som før — men uden modulo. Med ét blink pr. dag
+    # er vinduet blevet en "hvornår er det OK at afbryde"-ramme, ikke en
+    # gentagelses-plan: blinket fyrer i det FØRSTE minut hvor publikum-gaten er
+    # åben, og så aldrig mere i dag.
+    - condition: template
+      value_template: >-
+        {% set now_min = now().hour * 60 + now().minute %}
+        {% set sp = states('input_datetime.varsel_morgen_blink_start').split(':') %}
+        {% set start_min = sp[0]|int * 60 + sp[1]|int %}
+        {% set ep = states('input_datetime.varsel_morgen_blink_slut').split(':') %}
+        {% set slut_min = ep[0]|int * 60 + ep[1]|int %}
+        {# B209: et varsel der venter på begge-oppe må fyre ud over vinduets
+           slut — ellers sluger en afgang kort før slut dagens varsel. +30 min
+           giver publikum-gaten plads efter ventetiden. #}
+        {% set anker = state_attr('input_datetime.varsel_morgen_venter_fra', 'timestamp') | float(0) %}
+        {% set vent = (states('input_number.varsel_morgen_max_vent_minutter') | float(60)) * 60 %}
+        {{ start_min <= now_min <= slut_min
+           or (anker >= today_at('04:00').timestamp()
+               and now().timestamp() <= anker + vent + 1800) }}
+    # PUBLIKUM: akkumuleret + til stede NU. Definitionen bor i
+    # packages/alert_timing.yaml (delt med aften-blinket).
+    - condition: state
+      entity_id: binary_sensor.open_plan_varsel_publikum
+      state: "on"
+    # ÉN GANG PR. DAG. Stemplet SÆTTES nedenfor, efter at vi ved der ER et
+    # varsel — en rolig morgen må ikke brænde dagens ene blink.
+    - condition: template
+      value_template: >-
+        {{ states('input_text.varsel_blink_morgen_dato') != now().strftime('%Y-%m-%d') }}
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+  action:
+    - variables:
+        # LÅNE-VINDUETS START. Blink-sessionen varer ~25-40 s, og snapshottet
+        # herunder tages NU — men afleveres til sidst. Alt huset selv beslutter
+        # imens, ville et blindt scene.turn_on rulle tilbage (fejlklasse #27).
+        # Stemplet fanges i `variables:` FØR de mange `delay:`, fordi now() ellers
+        # ville rendere ved AFLEVERINGEN og vinduet blive nul sekunder langt.
+        laan_start: "{{ now().timestamp() }}"
+        # lamps = OPEN-PLAN farvelamper (stue + spisestue + køkken). Alle er
+        # xy/rgb-capable → kan vise blå/orange OG hvid (sne/vind) → ét sæt.
+        # 2026-09-23 (user-spec): "vejrvarsler skal ikke bruge køkkenlyskæden,
+        # men andre varsler må gerne" → lyskæden er TAGET UD af både `lamps` og
+        # ZHA-gruppen (zha.remove_group_members, group 2). Var med siden 07-02.
+        # stue_laesehygge = Innr-farvepæren i sofa-læselampen (fysisk swap
+        # 2026-07-02, ex "Køkken Loft") — deltager KUN i morgen-varsler,
+        # BEVIDST ikke i aften-varslet (user-valg).
+        # 2026-07-03: entré/depot/bad FJERNET (ikke open-plan) — se scope-note.
+        lamps:
+          - light.spisestue_loft
+          - light.stue_laesehygge
+          - light.stue_sofa_lampe
+          - light.stue_sofa_lampe_2
+          - light.stue_hjoernelampe
+        # BLINKENE sendes til ZHA-GRUPPEN, ikke til listen: ét groupcast-frame
+        # til alle pærer i stedet for N unicasts (bølge ≈ 0 ms — se headeren i
+        # script_pkg/vejr_varsel_blink.yaml). Gruppen "Vejrvarsel morgen"
+        # (zigbee.db group 2) har KUN de to der faktisk er på nettet:
+        # spisestue_loft, stue_laesehygge (køkken-lyskæden ude 2026-09-23).
+        # ⚠️ B91: kommer sofa-/hjørne-pærerne tilbage, skal de tilføjes GRUPPEN
+        # (zha/group/add) — at stå i `lamps` herover giver dem snapshot og
+        # restore, men IKKE blink.
+        blink_lamps: light.zbt_2_vejrvarsel_morgen
+    # INTELLIGENT vejr-logik bor nu i sensor.vejr_varsel_i_dag (packages/
+    # weather_warning.yaml): TIMEVIS forecast (fanger intraday-regn dagstallet
+    # runder væk), skydække-justeret EFFEKTIV UV (klar-himmel-UV × skyfaktor),
+    # regn på MÆNGDE (≥2mm) ELLER torden/byge-sandsynlighed (≥25%). Vi læser kun
+    # resultatet her — ÉN definition, ingen drift. Sensoren opdateres HH:25/HH:55,
+    # dvs. den kan være op til 30 min gammel når publikum-gaten åbner. Det er
+    # bevidst: varslet gælder HELE dagen, ikke det minut det vises.
+    - variables:
+        is_rain: "{{ state_attr('sensor.vejr_varsel_i_dag','is_rain') == true }}"
+        is_snow: "{{ state_attr('sensor.vejr_varsel_i_dag','is_snow') == true }}"
+        is_wind: "{{ state_attr('sensor.vejr_varsel_i_dag','is_wind') == true }}"
+        is_uv: "{{ state_attr('sensor.vejr_varsel_i_dag','is_uv') == true }}"
+        rain_blinks: "{{ state_attr('sensor.vejr_varsel_i_dag','rain_blinks') | int(2) }}"
+        today_precip: "{{ state_attr('sensor.vejr_varsel_i_dag','precip_mm') | float(0) }}"
+        wind_gust: "{{ state_attr('sensor.vejr_varsel_i_dag','wind_gust_kmh') | float(0) }}"
+        wind_mean: "{{ state_attr('sensor.vejr_varsel_i_dag','wind_mean_kmh') | float(0) }}"
+        today_uv: "{{ state_attr('sensor.vejr_varsel_i_dag','uv_effective') | float(0) }}"
+        today_cond: "{{ states('weather.forecast_home') }}"
+    # Stop hvis intet at varsle
+    - condition: template
+      value_template: "{{ is_rain or is_snow or is_wind or is_uv }}"
+    # B209 — VENT PÅ AT BEGGE VOKSNE ER OPPE (user-spec 2026-10-10: "vent med
+    # vejrvarsel til begge er oppe men vent højest 60 min efter en voksen er
+    # stået op"). 10-10 06:30 blev regn-sangen og oplæsningen tavst sprunget
+    # over, fordi den ene voksne sov — og blinket brændte dagens ene chance.
+    # Nu holdes HELE varslet tilbage (ingen dato-stempel endnu → /1-ticket
+    # prøver igen), til binary_sensor.sovevaerelse_voksne_oppe er on ELLER
+    # ventetiden fra afgangen er gået. Udløbet ventetid = fuldt varsel MED lyd.
+    # Ankeret er afgangen fanget sticky (se varsel_morgen_venter_fra).
+    # Uden registreret afgang venter vi på begge-oppe (ingen voksen-bevis =
+    # børnene i open-plannet må ikke starte uret).
+    - variables:
+        vent_s: "{{ (states('input_number.varsel_morgen_max_vent_minutter') | float(60)) * 60 }}"
+        voksne_oppe: "{{ is_state('binary_sensor.sovevaerelse_voksne_oppe', 'on') }}"
+        dagstart: "{{ today_at('04:00').timestamp() }}"
+        afgang: "{{ state_attr('input_datetime.sove_morgen_afgang_at', 'timestamp') | float(0) }}"
+        anker: "{{ state_attr('input_datetime.varsel_morgen_venter_fra', 'timestamp') | float(0) }}"
+    - if:
+        - condition: template
+          value_template: >-
+            {{ vent_s > 0 and not voksne_oppe and anker < dagstart and afgang >= dagstart }}
+      then:
+        - service: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.varsel_morgen_venter_fra
+          data:
+            timestamp: "{{ afgang | int }}"
+        - service: logbook.log
+          data:
+            name: "Vejr-varsel"
+            message: >-
+              Venter med morgen-varslet til begge voksne er oppe — højst til
+              {{ (afgang + vent_s) | timestamp_custom('%H:%M', true) }}
+              (afgang {{ afgang | timestamp_custom('%H:%M', true) }}).
+    - variables:
+        anker_ts: "{{ anker if anker >= dagstart else (afgang if afgang >= dagstart else 0) }}"
+        vent_udloebet: "{{ anker_ts > 0 and (now().timestamp() - anker_ts) >= vent_s }}"
+    - condition: template
+      value_template: "{{ vent_s == 0 or voksne_oppe or vent_udloebet }}"
+    - if:
+        - condition: template
+          value_template: "{{ vent_s > 0 and not voksne_oppe }}"
+      then:
+        - service: logbook.log
+          data:
+            name: "Vejr-varsel"
+            message: >-
+              Ventetiden er gået ({{ ((now().timestamp() - anker_ts) / 60) | int }} min
+              siden afgangen) — varsler nu, også med lyd.
+    # DEDUPE-STEMPEL — sættes FØR blink-sessionen (~25 s), så time_pattern-ticket
+    # et minut senere ikke starter et andet blink oven i dette.
+    - service: input_text.set_value
+      data:
+        entity_id: input_text.varsel_blink_morgen_dato
+        value: "{{ now().strftime('%Y-%m-%d') }}"
+    # Højttaleren læser dagens vejrudsigt op mens blinket kører (user-spec
+    # 2026-10-07, packages/hoejttaler_annoncering.yaml). script.turn_on blokerer
+    # ikke blinket, og scriptet har selv sine gates (kill-switch, højttaleren
+    # online, ingen voksen sover) — uden parret højttaler er det en no-op.
+    - service: script.turn_on
+      continue_on_error: true
+      target:
+        entity_id: script.hoejttaler_vejr_oplaesning
+      data:
+        variables:
+          periode: morgen
+          # B209: udløbet ventetid → oplæsningen må tale selvom en voksen sover.
+          vent_udloebet: "{{ vent_udloebet }}"
+    # B205: regnvarsel → "Regn" (Østen) via Music Assistant, EFTER oplæsningen.
+    # KUN morgen (user 09/10: "morning only") — aften-varslet har ingen sang.
+    # (scriptet venter selv på den). Sangen springes over hvis en telefons
+    # Spotify spiller, ved godnat/Sleep Over og hvis MA ikke kører.
+    - if:
+        - condition: template
+          value_template: "{{ is_rain }}"
+        - condition: state
+          entity_id: input_boolean.hoejttaler_regn_sang_enabled
+          state: "on"
+        # Som morgen-oplæsningen: ingen voksen må sove i soveværelset — med
+        # mindre B209-ventetiden er udløbet (så spiller den alligevel).
+        - condition: template
+          value_template: "{{ voksne_oppe or vent_udloebet }}"
+      then:
+        - service: script.turn_on
+          continue_on_error: true
+          target:
+            entity_id: script.hoejttaler_spil_sang
+          data:
+            variables:
+              uri: "spotify://track/55Z56AGM7ZmsNw2yu0JExG"
+              anledning: "regnvarsel"
+              # Samme niveau som oplæsningen (user 13/10: radioens volumen
+              # var "alt for lavt").
+              volumen: "{{ states('input_number.hoejttaler_annoncering_volumen') | int(45) }}"
+    # Snapshot så lamperne kan restores til deres on/off-tilstand efter flash
+    - service: scene.create
+      continue_on_error: true
+      data:
+        scene_id: vejr_flash_restore
+        snapshot_entities: "{{ lamps }}"
+    # --- BOOKEND START: 5 sek varm hvid = "her kommer varsler" (user 2026-07-02) ---
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ blink_lamps }}"
+      data:
+        color_temp_kelvin: 2700
+        brightness_pct: 70
+        transition: 0
+    - delay:
+        seconds: 5
+    # --- REGN: blå blink (farvelamper) — 2 ved lidt regn, 5 ved meget (≥10mm) ---
+    - if:
+        - condition: template
+          value_template: "{{ is_rain }}"
+      then:
+        - service: script.vejr_varsel_blink
+          data:
+            lamps: "{{ blink_lamps }}"
+            count: "{{ rain_blinks }}"
+            on_ms: 500
+            gap_ms: 400
+            hue: "{{ states('input_number.alert_regn_hue') | float(216) }}"
+        - service: logbook.log
+          data:
+            name: "Vejr-varsel"
+            message: "Regn-blå {{ rain_blinks }}x blink — {{ today_precip }}mm forventet i dag."
+    # --- SNE: sprinklede hvide glimt (farvelamper) ---
+    # Scattered flash (random 0.25-0.9s gap) = snefnug-fornemmelse. 6500K isnende
+    # kold hvid skiller den fra vindens 4600K neutrale, langsomme blink.
+    # ON-fasen på 120 ms var under unicast KORTERE end bølgen ud til pærerne
+    # (p90 275 ms målt 30/8) → sidste pære tændte efter at slukket var sendt,
+    # og sprinklen kunne ikke se synkron ud. Med groupcast (blink_lamps = ZHA-
+    # gruppe) er bølgen væk, og designværdien 120 ms er tilbage.
+    - if:
+        - condition: template
+          value_template: "{{ is_snow }}"
+      then:
+        - service: script.vejr_varsel_blink
+          data:
+            lamps: "{{ blink_lamps }}"
+            count: "{{ states('input_number.alert_sne_blinks') | int(11) }}"
+            on_ms: 120
+            gap_ms: 250
+            gap_ms_max: 900
+            kelvin: "{{ states('input_number.alert_sne_kelvin') | int(6500) }}"
+        - service: logbook.log
+          data:
+            name: "Vejr-varsel"
+            message: "Sne hvid sprinkle — '{{ today_cond }}' forventet i dag."
+    # --- VIND: 2 lange 2-sek hvide blink (farvelamper) ---
+    # Langsomme, vedvarende hold — modsat snes hurtige sprinkle (begge hvide).
+    - if:
+        - condition: template
+          value_template: "{{ is_wind }}"
+      then:
+        - service: script.vejr_varsel_blink
+          data:
+            lamps: "{{ blink_lamps }}"
+            count: "{{ states('input_number.alert_vind_blinks') | int(2) }}"
+            on_ms: 2000
+            gap_ms: 500
+            kelvin: "{{ states('input_number.alert_vind_kelvin') | int(5000) }}"
+        - service: logbook.log
+          data:
+            name: "Vejr-varsel"
+            message: >
+              Vind-hvid 2x langt blink — gust {{ wind_gust }} km/h / middel {{ wind_mean }} km/h.
+    # --- UV: 3 orange blink = solcreme (kun farvelamper — entré kan ikke orange) ---
+    - if:
+        - condition: template
+          value_template: "{{ is_uv }}"
+      then:
+        - service: script.vejr_varsel_blink
+          data:
+            lamps: "{{ blink_lamps }}"
+            count: "{{ states('input_number.alert_uv_blinks') | int(3) }}"
+            on_ms: 400
+            gap_ms: 400
+            hue: "{{ states('input_number.alert_uv_hue') | float(26) }}"
+        - service: logbook.log
+          data:
+            name: "Vejr-varsel"
+            message: "UV-orange 3x blink — UV-indeks {{ today_uv }} (solcreme på)."
+    # --- BOOKEND SLUT: 5 sek varm hvid = "varsler slut" → restore ---
+    # Erstatter det gamle 0-sek varm-finalize-blip. Dobbeltrolle: (1) tydelig
+    # slut-markør, (2) Zigbee-pærer husker sidst-aktive farve → slukkede lamper
+    # efterlades med 2700K varm hvid, så en senere MANUEL tænd kommer op varmt.
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ blink_lamps }}"
+      data:
+        color_temp_kelvin: 2700
+        brightness_pct: 70
+        transition: 0
+    - delay:
+        seconds: 5
+    - service: scene.turn_on
+      continue_on_error: true
+      target:
+        entity_id: scene.vejr_flash_restore
+      data:
+        transition: 0
+    # AFLEVERINGEN SPØRGER HUSET IGEN (fejlklasse #27, 2026-09-20 — user-bug
+    # "køkkenlyset har hængt i dag"). Snapshottet ovenfor er ~40 s gammelt når
+    # det afleveres, og det er DET SIDSTE kald, så det slår enhver beslutning
+    # huset traf imens. Dagslys-proben (packages/room_lux_tuning.yaml) slukker
+    # open-plannet for at skaffe et rent lux-sample og fyrer på /5 — altså inde
+    # i dette lånevindue de fleste morgener. MÅLT 20/09: proben slukkede
+    # lyskæden 07:45:05, restoren tændte den igen 07:45:27 fra snapshottet taget
+    # 07:45:00, og probens 45-minutters cooldown var brændt på et forsøg der
+    # aldrig fik lov at måle → huset stod blindt og lyset brændte til over 08:30.
+    # Er probens stempel NYERE end lånets start, gentager vi dens beslutning:
+    # den seneste autoritet vinder, ikke den ældste. NB entity_id'et er afledt
+    # af probens `alias:`, ikke af dens `id:` — rammer man forkert, giver
+    # state_attr None, as_timestamp(0) giver 0, og grenen fyrer ALDRIG.
+    - variables:
+        probe_ts: >
+          {{ state_attr(
+               'automation.open_plan_dagslys_probe_naar_samplet_er_laast_ude',
+               'last_triggered') | as_timestamp(0) }}
+    - if:
+        - condition: template
+          value_template: >-
+            {{ (probe_ts | float(0)) > (laan_start | float(0)) }}
+      then:
+        # Samme fire entity_ids som proben selv slukker — holdt bevidst identisk
+        # med listen i packages/room_lux_tuning.yaml (fejlklasse #16: ændrer
+        # probens scope sig, skal denne med i SAMME commit).
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id:
+              - light.koekken_room
+              - light.koekken_lyskaede
+              - light.spisestue_loft
+              - light.stue_room
+        - service: logbook.log
+          data:
+            name: "Vejr-varsel"
+            message: >
+              Restore rullede IKKE open-plannet tilbage — dagslys-proben
+              slukkede det under blinket, og dens beslutning er nyere end
+              snapshottet.
+            entity_id: sensor.open_plan_lux
+
+# =============================================================================
+# 06:30 PUSH til Parent A's tlf — dagens vejrvarsel (kun varsel-dage)
+# =============================================================================
+# User-spec 2026-06-07: send dagens vejrvarsel som push kl 06:30 hvis der er
+# mindst ét varsel. Bruger sensor.vejr_varsel_i_dag (packages/weather_warning
+# .yaml — opdateres kl 06:25, 5 min før). Sticky = bliver liggende til den
+# swipes væk. Gates: Active; AirBnB-undertrykkelse bor centralt i push_notify
+# (notif_vejr_airbnb, default off = uændret adfærd, 2026-07-16).
+# =============================================================================
+- id: vejr_varsel_morgen_push_parent_a
+  alias: "Vejr-varsel: 06:30 push til Parent A (kun varsel-dage)"
+  description: >
+    Kl 06:30 sender dagens vejrvarsel (sensor.vejr_varsel_i_dag) som sticky
+    push til Parent A's tlf (notify.mobile_app_phone_a) hvis der er mindst ét
+    varsel. Ingen push på stille dage. Gates: Active. AirBnB styres centralt
+    i push_notify (notif_vejr_airbnb-toggle).
+  mode: single
+  trigger:
+    - platform: time
+      at: input_datetime.varsel_morgen_push
+  condition:
+    - condition: state
+      entity_id: input_boolean.weather_warning_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # AirBnB-gate fjernet 2026-07-16 — bor nu centralt i push_notify.
+    # Kun hvis der faktisk er et varsel (state != Ingen/unknown/unavailable).
+    - condition: template
+      value_template: >-
+        {{ states('sensor.vejr_varsel_i_dag')
+           not in ['Ingen', 'unknown', 'unavailable'] }}
+  action:
+    - service: script.push_notify
+      data:
+        notif_id: vejr
+        title: "🌦️ Vejr-varsel i dag: {{ states('sensor.vejr_varsel_i_dag') }}"
+        message: "{{ state_attr('sensor.vejr_varsel_i_dag', 'forklaring') }}"
+        payload:
+          sticky: true
+          tag: vejr_varsel_morgen
+          notification_icon: mdi:weather-cloudy-alert
+    - service: logbook.log
+      data:
+        name: "Vejr-varsel"
+        message: >
+          06:30 push til Parent A — {{ states('sensor.vejr_varsel_i_dag') }}.
+
+# =============================================================================
+# AFTEN-VARSEL for NATTENS vejr — kl 16:30 / 17:00 / 18:30 (user-spec 2026-06-10)
+# =============================================================================
+# "Vejrvarselet skal udvides til at fyre om aftenen for nattens vejr, så
+#  terrassen kan lukkes ned og gøres klar til vildt/vådt vejr. KUN regn og vind."
+# Læser sensor.vejr_varsel_i_nat (packages/weather_warning.yaml — vindue 16:00
+# → i morgen 09:00, opdateres 10 min før hver fyring). Samme blink-sprog som
+# morgenvarslet: regn = blå blink, vind = 2 lange hvide blink. Push med fast
+# tag → 17:00/18:30 ERSTATTER forrige notifikation i stedet for at stable.
+# 2026-09-19: BLINKET fyrer ÉN gang i vinduet aften_1→aften_3, og kun når
+# publikum-gaten er åben. PUSHEN tjekker alle tre tider, men sender siden
+# 2026-10-20 kun igen når varslet har skiftet (vejr_aften_nat_push).
+# Gates blink: Active + ikke AirBnB (gæstehuset skal ikke blinke). Pushen er
+# 2026-07-16 flyttet til egen automation (vejr_aften_nat_push) UDEN AirBnB-gate
+# — AirBnB-undertrykkelse bor centralt i push_notify (notif_vejr_airbnb).
+# Ingen fyring på rolige nætter.
+# =============================================================================
+- id: vejr_aften_nat_varsel
+  alias: "Vejr-varsel: aften-blink for nattens vejr (1x, når vi er i open plan)"
+  description: >
+    ÉT blink pr. aften: i det første minut mellem varsel_aften_1 og
+    varsel_aften_3 (default 16:30→18:30) hvor huset kan se at der er nogen i
+    open-plannet, OG sensor.vejr_varsel_i_nat varsler regn/vind — blå/hvide
+    blink i farvelamperne, så terrassen kan lukkes ned i tide. Pushen bor i
+    vejr_aften_nat_push (2026-07-16): første tid med varsel, og derefter kun
+    når varslet skifter.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: time_pattern
+      minutes: "/1"
+  condition:
+    - condition: state
+      entity_id: input_boolean.weather_warning_enabled
+      state: "on"
+    # VINDUE: aften_1 = start, aften_3 = slut (aften_2 er kun en push-tid).
+    # Samme form som morgen-blinket — ét sted at forstå, to vinduer.
+    - condition: template
+      value_template: >-
+        {% set now_min = now().hour * 60 + now().minute %}
+        {% set sp = states('input_datetime.varsel_aften_1').split(':') %}
+        {% set start_min = sp[0]|int * 60 + sp[1]|int %}
+        {% set ep = states('input_datetime.varsel_aften_3').split(':') %}
+        {% set slut_min = ep[0]|int * 60 + ep[1]|int %}
+        {{ start_min <= now_min <= slut_min }}
+    - condition: state
+      entity_id: binary_sensor.open_plan_varsel_publikum
+      state: "on"
+    - condition: template
+      value_template: >-
+        {{ states('input_text.varsel_blink_aften_dato') != now().strftime('%Y-%m-%d') }}
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    - condition: template
+      value_template: "{{ state_attr('sensor.vejr_varsel_i_nat','any_warning') == true }}"
+  action:
+    - variables:
+        # Lånevinduets start — se morgen-blinket (fejlklasse #27). Aften-blinket
+        # får SAMME værn selv om kollisionen er sjældnere her: proben fyrer kun
+        # over husets dag-elevation, hvilket om sommeren stadig dækker
+        # aften-vinduet (fejlklasse #12 — samme fysik, samme beskyttelse).
+        laan_start: "{{ now().timestamp() }}"
+        is_rain: "{{ state_attr('sensor.vejr_varsel_i_nat','is_rain') == true }}"
+        is_wind: "{{ state_attr('sensor.vejr_varsel_i_nat','is_wind') == true }}"
+        # lamps = OPEN-PLAN farvelamper (2026-07-03: entré/depot fjernet).
+        # Køkken-lyskæden er UDE siden 2026-09-23 (user-spec, se morgen-varslet).
+        # stue_laesehygge (Innr-farvepæren i sofa-læselampen) er BEVIDST ikke
+        # med om aftenen — kun morgen-varsler (user-valg 2026-07-02).
+        lamps:
+          - light.spisestue_loft
+          - light.stue_sofa_lampe
+          - light.stue_sofa_lampe_2
+          - light.stue_hjoernelampe
+        # 2026-09-23: med køkken-lyskæden ude har "Vejrvarsel aften" (zigbee.db
+        # group 3) kun spisestue_loft tilbage — ZHA laver ingen gruppe-entity
+        # under 2 medlemmer, så aften-blinket går UNICAST til den ene pære.
+        # Én pære = ingen bølge at være usynkron i; gulvet på 120 ms holder.
+        # ⚠️ B91: kommer sofa-/hjørne-pærerne tilbage, tilføj dem group 3 og
+        # skift tilbage til light.zbt_2_vejrvarsel_aften.
+        blink_lamps: light.spisestue_loft
+    # DEDUPE-STEMPEL — sættes FØR blink-sessionen (se morgen-blinket).
+    - service: input_text.set_value
+      data:
+        entity_id: input_text.varsel_blink_aften_dato
+        value: "{{ now().strftime('%Y-%m-%d') }}"
+    # Højttaleren læser nattens vejr op (som morgen-blinket, se dér).
+    - service: script.turn_on
+      continue_on_error: true
+      target:
+        entity_id: script.hoejttaler_vejr_oplaesning
+      data:
+        variables:
+          periode: aften
+    # Snapshot → 5s varm bookend → blink → 5s varm bookend → restore (som morgen)
+    - service: scene.create
+      continue_on_error: true
+      data:
+        scene_id: vejr_aften_flash_restore
+        snapshot_entities: "{{ lamps }}"
+    # --- BOOKEND START: 5 sek varm hvid = "her kommer varsler" (user 2026-07-02) ---
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ blink_lamps }}"
+      data:
+        color_temp_kelvin: 2700
+        brightness_pct: 70
+        transition: 0
+    - delay:
+        seconds: 5
+    # --- REGN i nat: 2x blå blink ---
+    - if:
+        - condition: template
+          value_template: "{{ is_rain }}"
+      then:
+        - service: script.vejr_varsel_blink
+          data:
+            lamps: "{{ blink_lamps }}"
+            count: "{{ state_attr('sensor.vejr_varsel_i_nat','rain_blinks') | int(2) }}"
+            on_ms: 500
+            gap_ms: 400
+            hue: "{{ states('input_number.alert_regn_hue') | float(216) }}"
+    # --- VIND i nat: 2 lange 2-sek hvide blink ---
+    - if:
+        - condition: template
+          value_template: "{{ is_wind }}"
+      then:
+        - service: script.vejr_varsel_blink
+          data:
+            lamps: "{{ blink_lamps }}"
+            count: "{{ states('input_number.alert_vind_blinks') | int(2) }}"
+            on_ms: 2000
+            gap_ms: 500
+            kelvin: "{{ states('input_number.alert_vind_kelvin') | int(5000) }}"
+    # --- BOOKEND SLUT: 5 sek varm hvid = "varsler slut" → restore ---
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ blink_lamps }}"
+      data:
+        color_temp_kelvin: 2700
+        brightness_pct: 70
+        transition: 0
+    - delay:
+        seconds: 5
+    - service: scene.turn_on
+      continue_on_error: true
+      target:
+        entity_id: scene.vejr_aften_flash_restore
+      data:
+        transition: 0
+    # Samme aflevering-spørger-huset-igen som morgen-blinket (fejlklasse #27+#12).
+    - variables:
+        probe_ts: >
+          {{ state_attr(
+               'automation.open_plan_dagslys_probe_naar_samplet_er_laast_ude',
+               'last_triggered') | as_timestamp(0) }}
+    - if:
+        - condition: template
+          value_template: >-
+            {{ (probe_ts | float(0)) > (laan_start | float(0)) }}
+      then:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id:
+              - light.koekken_room
+              - light.koekken_lyskaede
+              - light.spisestue_loft
+              - light.stue_room
+        - service: logbook.log
+          data:
+            name: "Vejr-varsel"
+            message: >
+              Restore rullede IKKE open-plannet tilbage — dagslys-proben
+              slukkede det under blinket, og dens beslutning er nyere end
+              snapshottet.
+            entity_id: sensor.open_plan_lux
+
+# =============================================================================
+# AFTEN-PUSH for nattens vejr — samme triggers/gates som blinket, men UDEN
+# AirBnB-gate: undertrykkelsen bor centralt i push_notify (notif_vejr_airbnb,
+# default off = uændret adfærd; toggle ON = push også under AirBnB-ophold).
+# Splittet ud af vejr_aften_nat_varsel 2026-07-16 så blink kan forblive
+# AirBnB-gated mens pushen kan tilvælges. Tag = erstatter forrige aften-push.
+# =============================================================================
+- id: vejr_aften_nat_push
+  alias: "Vejr-varsel: aften-push for nattens vejr (16:30/17:00/18:30)"
+  description: >
+    Sticky push med nattens vejrvarsel (sensor.vejr_varsel_i_nat): ved den
+    første af de tre aften-tider med varsel, og ved de senere kun hvis
+    varslet har skiftet siden. Gates: Active + any_warning. AirBnB styres
+    centralt i push_notify (notif_vejr_airbnb-toggle).
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: time
+      at: input_datetime.varsel_aften_1
+    - platform: time
+      at: input_datetime.varsel_aften_2
+    - platform: time
+      at: input_datetime.varsel_aften_3
+  condition:
+    - condition: state
+      entity_id: input_boolean.weather_warning_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: template
+      value_template: "{{ state_attr('sensor.vejr_varsel_i_nat','any_warning') == true }}"
+    # 2026-10-20: ÉN push pr. aften — de senere tider sender kun igen når
+    # varslet har SKIFTET siden sidste push (fx Regn → Regn + Vind). Målt 8-16/10:
+    # 6 aftener med samme tekst kl. 16:30, 17:00 og 17:30, og 9/10 + 13/10 blev
+    # den swipet væk alle tre gange. Sensoren gen-renderes 10 min før hver tid,
+    # men last_changed flytter sig kun når state (kategorien) skifter.
+    # last_changed nulstilles ved restart/reload → højst én ekstra push.
+    - condition: template
+      value_template: >-
+        {% set sidst = this.attributes.last_triggered %}
+        {% set v = states.sensor.vejr_varsel_i_nat %}
+        {{ sidst is none or sidst < today_at('12:00')
+           or v is none or v.last_changed > sidst }}
+  action:
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: vejr
+        title: "🌙 Nattens vejr: {{ states('sensor.vejr_varsel_i_nat') }}"
+        message: "{{ state_attr('sensor.vejr_varsel_i_nat', 'forklaring') }}"
+        payload:
+          sticky: true
+          tag: vejr_varsel_nat
+          notification_icon: mdi:weather-night-partly-cloudy
+    - service: logbook.log
+      data:
+        name: "Vejr-varsel"
+        message: >
+          Aften-varsel ({{ now().strftime('%H:%M') }}) — nat:
+          {{ states('sensor.vejr_varsel_i_nat') }}.
+
+# =============================================================================
+# SEN DAG-VARSEL — varslet der dukker op EFTER morgenvinduet (2026-08-05)
+# =============================================================================
+# User-spørgsmål: "er regn varselsblink blevet slået fra eller missede jeg den
+# den 4. aug?" Facit fra history: hverken/eller. `sensor.vejr_varsel_i_dag`
+# stod på **Ingen** hele morgenen 08-04 (uændret siden 08-03 08:55) → både
+# morgen-blinket og 06:30-pushen exitede korrekt. Regn-varslet opstod først
+# **12:25** og forsvandt igen 14:25 — altså i et vindue hvor INGEN kanal
+# lytter: morgen-blinket er kørt (sidste slot ~08:30), og aften-sporet læser
+# `vejr_varsel_i_nat`, ikke `i_dag`. Et varsel der fødes midt på dagen blev
+# derfor aldrig leveret.
+#
+# Fejlklasse #4-familien: begge eksisterende veje er TIDS-triggede snapshots af
+# en tilstand der kan ændre sig hele dagen. Denne automation er den manglende
+# FLANKE — den lytter på selve overgangen Ingen → varsel.
+#
+# Kun PUSH, intet blink: midt på dagen er lamperne slukkede og huset lyst, så
+# et blink er både usynligt og påtrængende. Vinduet er afgrænset af de
+# EKSISTERENDE bruger-tider (ingen ny helper): efter `varsel_morgen_blink_slut`
+# og før `varsel_aften_1`, hvor aften-sporet tager over.
+#
+# Flap-guard (fejlklasse #12/#13): `for: 10 min` kræver at varslet HOLDER —
+# en prognose-re-render der vipper frem og tilbage leverer ikke en push pr.
+# vip. `from: "Ingen"` (IKKE unknown/unavailable, fejlklasse #9) sikrer at en
+# restart-blip ikke ser ud som et nyt varsel. Fast `tag` → en gentagelse
+# ERSTATTER i stedet for at stable.
+# =============================================================================
+- id: vejr_varsel_sen_dag_push
+  alias: "Vejr-varsel: sent dag-varsel (opstår efter morgenvinduet)"
+  description: >
+    Pusher dagens vejrvarsel hvis det først dukker op EFTER morgenvinduet —
+    hullet der gjorde at regn-varslet 2026-08-04 kl 12:25 aldrig blev leveret.
+    Kun mellem varsel_morgen_blink_slut og varsel_aften_1; aften-sporet
+    (vejr_varsel_i_nat) dækker resten af døgnet.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: sensor.vejr_varsel_i_dag
+      from: "Ingen"
+      for: "00:10:00"
+  condition:
+    - condition: state
+      entity_id: input_boolean.weather_warning_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Der SKAL være et varsel nu (og ikke bare en unavailable-blip).
+    - condition: template
+      value_template: >-
+        {{ states('sensor.vejr_varsel_i_dag')
+           not in ['Ingen', 'unknown', 'unavailable'] }}
+    # Vindue: efter morgen-blinkets sidste slot, før aften-sporet tager over.
+    - condition: template
+      value_template: >-
+        {% set n = now().hour * 60 + now().minute %}
+        {% set a = states('input_datetime.varsel_morgen_blink_slut').split(':') %}
+        {% set b = states('input_datetime.varsel_aften_1').split(':') %}
+        {{ n > (a[0] | int * 60 + a[1] | int)
+           and n < (b[0] | int * 60 + b[1] | int) }}
+  action:
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: vejr
+        title: "🌦️ Nyt vejr-varsel i dag: {{ states('sensor.vejr_varsel_i_dag') }}"
+        # 2026-10-20: "(opstod HH:MM — efter morgenvarslet)" fjernet — telefonen
+        # viser selv tidspunktet, og "Nyt" i titlen siger resten.
+        message: "{{ state_attr('sensor.vejr_varsel_i_dag', 'forklaring') }}"
+        payload:
+          sticky: true
+          tag: vejr_varsel_sen_dag
+          notification_icon: mdi:weather-cloudy-alert
+    - service: logbook.log
+      data:
+        name: "Vejr-varsel"
+        message: >
+          Sent dag-varsel ({{ now().strftime('%H:%M') }}) —
+          {{ states('sensor.vejr_varsel_i_dag') }}.

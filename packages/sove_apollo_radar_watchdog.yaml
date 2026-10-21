@@ -1,0 +1,308 @@
+# =============================================================================
+# Sove Apollo — radar hang-watchdog (2026-07-09, probe-redesign)
+# =============================================================================
+# Problem (bekræftet 2026-07-09): sove-Apolloens LD2410 kan HÆNGE — den låser et
+# still-target fast (occupancy stuck 'on') og IGNORERER alle gate-tærskler.
+# Bevis: still_target 'on' @ 211 cm / still_energy pinned 92 % i timevis; at hæve
+# ALLE g0-g5 still til 100 (max = mindst følsom) fjernede den IKKE. Kun
+# `button.sovevaerelse_apollo_restart_radar` (re-init af selve LD2410, ikke fuld
+# ESP-reboot) ryddede latchen (target→off, distance→unknown, occupancy→off).
+#
+# KRITISK OMLÆGNING (2026-07-09): energi-/gate-sensorerne (still_energy,
+# g0-g8 *_energy) streamer KUN når `switch.…radar_engineering_mode` er ON.
+# Engineering mode SKAL være OFF i drift (chip-slid/varme, se CLAUDE.md) → i
+# normal drift står still_energy FROSSET på sin sidste værdi (målt: 92 % siden
+# 05:30 mens rummet var tomt, uændret gennem to radar-genstarter). En passiv
+# "energi frossen i N min"-sensor ville derfor slå til på ENHVER ægte søvn
+# (target on > N min mens energien alligevel aldrig streamer) → genstarte
+# radaren hele natten. Vi kan IKKE bruge energi-friskhed passivt.
+#
+# EKSTRA FUND (2026-07-09): den AGGREGEREDE sensor.…radar_still_energy er en
+# DØD entity — den hænger permanent på 92 % og opdaterer ALDRIG, heller ikke i
+# engineering mode. De PER-GATE energier (g0-g8 *_still_energy) streamer derimod
+# fint (~1-2/s) når engineering mode er ON. Probe-diskriminatoren bruger derfor
+# gate-energierne, IKKE den døde aggregat-sensor.
+#
+# LØSNING (user-valg AskUserQuestion): KORT ENGINEERING-PROBE. Når still_target
+# har siddet 'on' UAFBRUDT > frozen_minutes (mistænkt hang), kør en probe:
+#   1. tænd engineering mode  → gate-still-energierne begynder at streame
+#   2. vent probe_seconds (default 12) — nok til at en live radar rykker mindst
+#      én gate-energi (ægte krop → åndedrag/mikro-Doppler; en hang fryser alt)
+#   3. AFLÆS om NOGEN gate-still-energi fik frisk last_changed under vinduet →
+#      live radar → INGEN genstart; ELLERS (alle gates frosset) → HANG → genstart
+#   4. sluk engineering mode igen (ALTID — også ved fejl)
+# = probe rører engineering mode få sekunder, kun når vi allerede har mistanke.
+# RE-PROBE (2026-07-09 review-fix): oprindeligt kun ÉN probe pr. still_target-
+# episode — men en hang der OPSTÅR MIDT i en episode (radaren latcher den
+# sovende krop kl 03 efter en godkendt 23:30-probe) ville så ALDRIG blive
+# re-probet: episoden ender aldrig, for den frosne sensor kan ikke flippe off.
+# Nu: probe når (a) episoden endnu ikke er probet, ELLER (b) sidste probe er
+# ældre end `sove_radar_reprobe_minutes` (default 120; 0 = kun én pr. episode).
+# En normal nat = probe ~30 min efter søvn + re-probe hver 2. time (~4-5 stk
+# à ~16 s engineering) → stadig chip-wear-forsvarligt; en midt-nats-hang
+# fanges senest ved næste re-probe. En ægte hang → probe bekræfter → genstart.
+#
+# Crash-loop-guard: cooldown mellem to auto-genstarter. Kill-switch +
+# frozen-min/probe-sek/re-probe/cooldown-sliders på Indstillinger (🎯).
+# Manuel: `button.sovevaerelse_apollo_restart_radar` ligger også som knap.
+# NB: probe-diskriminatoren er verificeret mod NORMAL drift (energi frosset →
+# ville korrekt fyre); selve HANG-under-engineering-adfærden bør bekræftes ved
+# næste ægte hang (forventet: energi forbliver frosset selv med eng-mode on).
+# =============================================================================
+
+input_boolean:
+  sove_radar_watchdog_enabled:
+    name: "Sove radar-watchdog aktiv"
+    icon: mdi:radar
+
+input_number:
+  # Hvor længe still_target skal have siddet 'on' UAFBRUDT før vi kører en hang-
+  # probe (mistanke-tærskel). En ægte sover er også 'on' så længe → derfor
+  # afgør PROBEN (ikke denne tid) om det er hang. For lavt = flere unødige
+  # probes; default 30 min.
+  sove_radar_frozen_minutes:
+    name: "Sove radar: mistanke-tærskel (min)"
+    icon: mdi:timer-alert
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Probe-vindue: hvor længe engineering mode er ON mens vi ser om still_energy
+  # fluktuerer. For kort = en meget rolig krop kan nå at se "frossen" (falsk
+  # hang → unødig genstart); for langt = længere engineering-stream. Default 12s.
+  sove_radar_probe_seconds:
+    name: "Sove radar: probe-vindue (sek)"
+    icon: mdi:radar
+    min: 5
+    max: 60
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Re-probe-interval: hvor gammel sidste probe skal være før en STADIG låst
+  # still_target-episode probes IGEN (fanger hang der opstår midt i natten
+  # efter en "ægte sover"-godkendt probe — episoden ender aldrig af sig selv
+  # når sensoren er frosset). 0 = kun én probe pr. episode (gammel adfærd).
+  # Default 120 min.
+  sove_radar_reprobe_minutes:
+    name: "Sove radar: re-probe interval (min)"
+    icon: mdi:timer-refresh
+    min: 0
+    max: 480
+    step: 15
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Minimum tid mellem to auto-genstarter (crash-loop-guard). Er én genstart ikke
+  # nok venter vi mindst så længe før næste forsøg. Default 15 min.
+  sove_radar_watchdog_cooldown_minutes:
+    name: "Sove radar: cooldown (min)"
+    icon: mdi:timer-sand
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+input_datetime:
+  # Runtime-trackere (IKKE config → ikke i snapshot).
+  sove_radar_watchdog_last_restart:
+    name: "Sove radar watchdog: sidste genstart"
+    has_date: true
+    has_time: true
+  # Sidste probe — bruges til KUN at probe én gang pr. still_target-episode
+  # (probe kun hvis last_probe ligger FØR den nuværende on-episodes start).
+  sove_radar_watchdog_last_probe:
+    name: "Sove radar watchdog: sidste probe"
+    has_date: true
+    has_time: true
+
+template:
+  - binary_sensor:
+      # "Mistænkt hang" = still_target har siddet 'on' UAFBRUDT > mistanke-
+      # tærsklen. Dette er KUN mistanke (en ægte sover ser ens ud) → en probe
+      # afgør. Driver dashboard-tile + automationens trigger. Re-render/min.
+      - name: "Sove radar mistænkt hang"
+        unique_id: sove_radar_frossen
+        icon: mdi:radar-off
+        state: >-
+          {% set t = states.binary_sensor.sovevaerelse_apollo_radar_still_target %}
+          {% set n = states('input_number.sove_radar_frozen_minutes') | float(30) %}
+          {{ t is not none and t.state == 'on'
+             and (now() - t.last_changed).total_seconds() > (n * 60) }}
+        attributes:
+          # Hvor længe still_target har været låst 'on' (min), i 5-min-trin.
+          # To bevidste valg — begge for at holde recorderen fri:
+          # (1) 0 når target IKKE er on. Før målte den "minutter siden sidste
+          #     skift" uanset tilstand, hvilket navnet ikke lover, og skrev en
+          #     ny DB-række hvert eneste minut i al evighed.
+          # (2) 5-min-kvantisering: tærsklen er 30 min, så minut-præcision har
+          #     ingen diagnostisk værdi, men koster en række pr. minut mens en
+          #     krop faktisk ligger stille.
+          # Rå still_target er ekskluderet fra recorderen (configuration.yaml);
+          # uden de to valg smugler denne attribut dens churn tilbage i
+          # databasen — målt 5403 rækker/døgn, husets mest skrivende entity,
+          # hvoraf kun ~10 var ægte tilstandsskift.
+          on_since_min: >-
+            {% set t = states.binary_sensor.sovevaerelse_apollo_radar_still_target %}
+            {{ ((((now() - t.last_changed).total_seconds() / 300) | int) * 5)
+               if (t is not none and t.state == 'on') else 0 }}
+          # 2026-10-06: `last_energy` (spejl af still_energy) er FJERNET. Den var
+          # ikke "typisk stale" som kommentaren påstod — målt 3.330 ændringer på
+          # 6 t (natten, en sover), 3.410 af entityens 3.423 rækker/døgn, og
+          # ingen læste den. Rå-værdien står stadig live på sensoren.
+
+      # RECORDER-SPEJL af moving_target (2026-08-19d). Rå-entity'en er
+      # ekskluderet fra recorderen, og det gjorde no-motion-watchdoggens ENESTE
+      # input umuligt at efterprøve: da dens slider skulle kalibreres, kunne
+      # "hvor længe ligger et menneske stille?" kun besvares indirekte.
+      # Samme trick som børneværelsets morgen-spejl — og af samme grund scopet,
+      # her til "sove-lyset er tændt", dvs. præcis de timer watchdoggen kan
+      # fyre. Uden scopet ville den smugle radarens fulde døgn-churn ind i
+      # databasen (jf. still_target-målingen ovenfor: 5403 rækker/døgn).
+      - name: "Sove bevaegelse mens lys taendt"
+        unique_id: sove_bevaegelse_mens_lys_taendt
+        icon: mdi:run
+        device_class: motion
+        state: >-
+          {{ is_state('light.spisestue_pendel', 'on')
+             and is_state('binary_sensor.sovevaerelse_apollo_radar_moving_target', 'on') }}
+
+script:
+  # Kør ÉN hang-probe: engineering mode på i probe_seconds, aflæs om
+  # still_energy skiftede værdi, sluk engineering mode, genstart KUN ved frossen.
+  sove_radar_hang_probe:
+    alias: "Sove radar: hang-probe (engineering-sample)"
+    mode: single
+    variables:
+      probe_s: "{{ states('input_number.sove_radar_probe_seconds') | int(12) }}"
+    sequence:
+      # Stemp probe-tidspunkt FØR alt (så vi ikke re-prober samme episode selv
+      # hvis noget crasher midt i).
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.sove_radar_watchdog_last_probe
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: switch.turn_on
+        target:
+          entity_id: switch.sovevaerelse_apollo_radar_engineering_mode
+      # Warmup: lad engineering-streamen komme i gang før vi sætter mål-punktet.
+      # 4 s (var 2): gate-sensorerne transitionerer unknown→værdi når engineering
+      # tændes — lander den transition EFTER t_mark ville selv en FROSSEN radar
+      # se "frisk" ud (falsk live-verdict). 4 s giver margin til langsom opstart.
+      - delay:
+          seconds: 4
+      # Mål-punkt: alt hvad der streamer EFTER dette = live radar.
+      - variables:
+          t_mark: "{{ as_timestamp(now()) }}"
+      - delay:
+          seconds: "{{ probe_s }}"
+      # VIGTIGT: den AGGREGEREDE sensor.…radar_still_energy er en DØD entity
+      # (hænger fast på 92 %, opdaterer aldrig — heller ikke i engineering mode).
+      # De PER-GATE energier (g0-g8 still_energy) streamer derimod ~1-2/s når
+      # radaren er live. Liveness = mindst én gate-still-energi har fået frisk
+      # last_changed efter t_mark. En hængt LD2410 fryser sit interne udlæs →
+      # ingen gate rykker → energy_moved false → hang.
+      - variables:
+          energy_moved: >-
+            {% set ns = namespace(fresh=false) %}
+            {% for i in range(6) %}
+              {% set e = states.sensor['sovevaerelse_apollo_g' ~ i ~ '_still_energy'] %}
+              {% if e is not none and e.state not in ['unknown','unavailable']
+                    and as_timestamp(e.last_changed) > t_mark %}
+                {% set ns.fresh = true %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.fresh }}
+      # Sluk engineering mode ALTID (chip-slid) — også hvis vi genstarter under.
+      - service: switch.turn_off
+        target:
+          entity_id: switch.sovevaerelse_apollo_radar_engineering_mode
+      - choose:
+          # Energien fluktuerede → ægte krop → lad radaren være.
+          - conditions: "{{ energy_moved }}"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Sove radar watchdog"
+                  message: >-
+                    Probe: still_energy fluktuerede under engineering-sample
+                    ({{ states('input_number.sove_radar_probe_seconds') }}s) →
+                    ægte tilstedeværelse, ingen genstart.
+                  entity_id: binary_sensor.sovevaerelse_apollo_radar_still_target
+        # Energien stod FROSSET trods engineering-stream → hang → genstart.
+        default:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.sove_radar_watchdog_last_restart
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - service: logbook.log
+            data:
+              name: "Sove radar watchdog"
+              message: >-
+                Probe: still_energy FROSSET under engineering-sample mens
+                still-target var låst → LD2410 hang bekræftet → genstarter radar.
+              entity_id: binary_sensor.sovevaerelse_apollo_radar_still_target
+          - service: button.press
+            target:
+              entity_id: button.sovevaerelse_apollo_restart_radar
+          - service: script.push_notify
+            data:
+              notif_id: sove_radar
+              title: "🛠️ Sove-radar auto-genstartet"
+              message: >-
+                LD2410 hang bekræftet via engineering-probe (still-energi
+                frosset mens still-target var låst). Genstartede radaren.
+
+automation:
+  - id: sove_apollo_radar_watchdog
+    alias: "Sove Apollo radar watchdog (probe ved mistænkt hang)"
+    mode: single
+    trigger:
+      # Poll: still_target låst længe → mistanke. /5 fanger både første gang
+      # tærsklen krydses OG re-forsøg efter cooldown (fejlklasse #4).
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: input_boolean.sove_radar_watchdog_enabled
+        state: "on"
+      # Mistænkt hang: still_target on uafbrudt > mistanke-tærskel.
+      # NB: entity_id beholder den GAMLE slug (sove_radar_frossen) trods ny name
+      # (registry-rename-gotcha) — unique_id uændret.
+      - condition: state
+        entity_id: binary_sensor.sove_radar_frossen
+        state: "on"
+      # Probe hvis (a) episoden endnu ikke er probet (last_probe FØR episodens
+      # start), ELLER (b) re-probe: sidste probe er ældre end reprobe-slideren
+      # (fanger hang der opstår MIDT i en episode efter en godkendt probe —
+      # den frosne sensor kan aldrig selv afslutte episoden). reprobe=0 = kun (a).
+      - condition: template
+        value_template: >-
+          {% set lp = states('input_datetime.sove_radar_watchdog_last_probe') %}
+          {% set t = states.binary_sensor.sovevaerelse_apollo_radar_still_target %}
+          {% if lp in ['unknown','unavailable',''] or t is none %}
+            true
+          {% else %}
+            {% set lp_dt = strptime(lp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo) %}
+            {% set rp = states('input_number.sove_radar_reprobe_minutes') | float(120) %}
+            {{ lp_dt < t.last_changed
+               or (rp > 0 and (now() - lp_dt).total_seconds() >= rp * 60) }}
+          {% endif %}
+      # Cooldown: kun ét genstart-forsøg pr. vindue (crash-loop-guard).
+      - condition: template
+        value_template: >-
+          {% set ts = states('input_datetime.sove_radar_watchdog_last_restart') %}
+          {% set cd = states('input_number.sove_radar_watchdog_cooldown_minutes') | float(15) %}
+          {% if ts in ['unknown','unavailable',''] %}
+            true
+          {% else %}
+            {{ (now() - strptime(ts, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds()
+               >= cd * 60 }}
+          {% endif %}
+    action:
+      - service: script.sove_radar_hang_probe

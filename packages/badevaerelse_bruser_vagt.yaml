@@ -1,0 +1,295 @@
+# =============================================================================
+# Bruser-vagt: to personer i badet → den ene går, den anden står i bruseren
+# (2026-08-13, user-spec)
+# =============================================================================
+# PROBLEMET (målt 08-13, user var i bad): kl. 06:52:58 slukkede
+# "leave-off (Fuld + dør åben + ro)" badet 110 s efter begge inde-PIR'er var
+# clearet — user stod i bruseren, hvor ingen PIR kan se ham, og måtte stikke
+# foden ud (inde_2 kl. 06:53:06) for at få lyset tilbage. Samme forløb ramte
+# 06:32:04 (leave-off) og 06:39:10 (Medium-sluk): tre sluk på 25 min, hver
+# gang vækket igen 8-20 s senere af en fod.
+#
+# SIGNATUREN vi kan se det på: kl. 62:14:37-f0:28:d2 var ALLE andre rum tomme
+# mens badet var optaget, og people_estimate = 2 → begge hjemmeværende var i
+# badet. Da den ene gik ud (spisestue-blip 06:30:33), så huset et "tomt" bad —
+# men det var kun person nr. 2 der var usynlig i bruseren.
+#
+# LØSNINGEN: når signaturen har holdt i bekraeft_sekunder, armeres vagten, og
+# ALLE badets sluk-veje får deres ventetid ganget med bruser_off_faktor
+# (default 2,0). Samme mekanik som sensor.badevaerelse_airbnb_off_factor —
+# ét delt RESULTAT, ikke en kopieret regel (fejlklasse #2).
+#
+# AFGRÆNSNING (user-spec): kun morgen, default 06:00-09:00, justerbart via
+# input_datetime-parret nedenfor. Max-on watchdog (40 min) er BEVIDST ikke
+# skaleret — den er backstoppen der garanterer at vagten aldrig kan brænde
+# badet i timevis, uanset hvor højt faktoren sættes.
+#
+# FALSK ARMERING koster ~2-6 min ekstra lys i et tomt bad om morgenen; en
+# manglende armering koster mørke midt i et brusebad. Vi vælger bevidst den
+# første fejl. Derfor kræver signaturen at alle andre rum står EKSPLICIT 'off'
+# (ikke unavailable) — en blind sensor er ikke bevis for et tomt rum (#9).
+# =============================================================================
+
+input_number:
+  # Ventetids-multiplikator for badets sluk-veje mens vagten er armeret.
+  # 1,0 = fra (som før), 2,0 = user-spec default. Rammer: generel gradvis sluk,
+  # Medium-sluk, leave-off (både dør-åbnet og ro-grenen) og godnat-hurtigsluk.
+  badevaerelse_bruser_off_faktor:
+    name: "Bad: bruser-vagt tids-faktor"
+    icon: mdi:shower
+    min: 1
+    max: 5
+    step: 0.1
+    unit_of_measurement: "×"
+    mode: slider
+
+  # Hvor længe "alle hjemme er i badet"-signaturen skal holde før vagten armeres.
+  # Kalibreret mod 9 morgeners historik: signatur-spans var 89/219/100/49/212 s
+  # på de morgener hvor begge var oppe — 45 s fanger dem alle uden at armere på
+  # et tilfældigt 10-20 s sammenfald.
+  badevaerelse_bruser_vagt_bekraeft_sekunder:
+    name: "Bad: bruser-vagt bekræftelses-tid"
+    icon: mdi:timer-sand
+    min: 10
+    max: 180
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Hård levetid på en armeret vagt (fra stemplet). Selv hvis lyset bliver ved
+  # med at være tændt, giver vagten slip her — et brusebad varer ikke en time.
+  badevaerelse_bruser_vagt_maks_minutter:
+    name: "Bad: bruser-vagt maks varighed"
+    icon: mdi:clock-alert-outline
+    min: 5
+    max: 60
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+input_datetime:
+  # Morgen-vinduet vagten gælder i (user-spec: "kun til morgener, for nu i hvert
+  # fald"). Sammenlignes som HH:MM:SS-strenge — as_timestamp() på et
+  # input_datetime læser state'en som UTC og rammer 2 t forkert (CLAUDE.md).
+  badevaerelse_bruser_vagt_start:
+    name: "Bad: bruser-vagt start"
+    icon: mdi:weather-sunset-up
+    has_date: false
+    has_time: true
+  badevaerelse_bruser_vagt_slut:
+    name: "Bad: bruser-vagt slut"
+    icon: mdi:weather-sunset-down
+    has_date: false
+    has_time: true
+
+  # Armerings-stempel. SKREVET værdi — last_changed nulstilles ved HA-restart og
+  # duer ikke som friskheds-mål (fejlklasse #5).
+  badevaerelse_bruser_vagt_stempel:
+    name: "Bad: bruser-vagt armeret kl."
+    icon: mdi:timer-outline
+    has_date: true
+    has_time: true
+
+input_boolean:
+  # Kill-switch. Konsumeres KUN i faktor-sensoren nedenfor = ét sted, så der
+  # ikke findes en u-gatet vej ind (fejlklasse #21).
+  badevaerelse_bruser_vagt_enabled:
+    name: "Bad: bruser-vagt aktiv"
+    icon: mdi:shower-head
+
+  # Selve armeringen.
+  badevaerelse_bruser_vagt:
+    name: "Bad: bruser-vagt armeret"
+    icon: mdi:shield-account
+
+template:
+  - binary_sensor:
+      # SIGNATUR: alle hjemmeværende er i badet lige nu.
+      # Roster = husets kanoniske occupancy-liste (house_modes.yaml) minus badet;
+      # spisestue i den roborock-filtrerede variant. Tilføjes et nyt rum til
+      # huset, skal det med her (fejlklasse #16).
+      - name: "Badevaerelse alle hjemme i bad"
+        unique_id: badevaerelse_alle_hjemme_i_bad
+        icon: mdi:account-group
+        state: >-
+          {% set andre = [
+            'binary_sensor.stue_apollo_occupancy_filtered',
+            'binary_sensor.spisestue_apollo_occupancy_filtered',
+            'binary_sensor.koekken_apollo_occupancy_filtered',
+            'binary_sensor.sovevaerelse_apollo_occupancy',
+            'binary_sensor.boernevaerelse_apollo_occupancy',
+            'binary_sensor.depot_valhorn_occupancy',
+            'binary_sensor.entre_valhorn_occupancy'
+          ] %}
+          {# 2026-08-13d: settle-guard på hoveddøren. people_estimate læner sig på
+             adults_home, og de flag følger GPS'en med minutters forsinkelse — målt
+             i dag: Parent B gik ud ad døren 08:31:26, parent_b_home faldt først
+             08:41:57. Vagten armerede 08:32:48 på et estimat der stadig sagde 2 og
+             meldte "alle 2 hjemmeværende var i badet", mens den ene sad i bilen.
+             Huset HAVDE beviset 82 s før: hoveddøren havde åbnet. Vi kræver derfor
+             at døren har været lukket i zone-sustain-tiden (samme settle-guard som
+             people_floor_raise, samme slider — ét tal, ikke en kopieret regel #2).
+             Stemplet er en SKREVET værdi (security.yaml) = restart-sikker, i
+             modsætning til sensorens last_changed (#5). Aldrig sat → gammelt
+             stempel → gaten fejler åbent, som før. #}
+          {% set settle = states('input_number.people_zone_sustain_seconds') | float(300) %}
+          {% set hd_aabnet = state_attr('input_datetime.hoveddoer_last_open', 'timestamp') | float(0) %}
+          {{ (states('sensor.people_estimate') | int(0)) >= 2
+             and is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+             and not is_state('binary_sensor.parasoll_hoveddoer', 'on')
+             and (now().timestamp() - hd_aabnet) >= settle
+             and andre | map('states') | select('ne', 'off') | list | count == 0 }}
+
+      # Morgen-vinduet.
+      - name: "Badevaerelse bruser vagt vindue"
+        unique_id: badevaerelse_bruser_vagt_vindue
+        icon: mdi:clock-outline
+        state: >-
+          {% set nu = now().strftime('%H:%M:%S') %}
+          {% set fra = states('input_datetime.badevaerelse_bruser_vagt_start') %}
+          {% set til = states('input_datetime.badevaerelse_bruser_vagt_slut') %}
+          {% if fra in ['unknown', 'unavailable'] or til in ['unknown', 'unavailable'] %}
+            false
+          {% elif fra <= til %}
+            {{ fra <= nu < til }}
+          {% else %}
+            {{ nu >= fra or nu < til }}
+          {% endif %}
+
+  - sensor:
+      # DELT RESULTAT: den faktor badets sluk-veje ganger deres ventetid med.
+      # 1,0 = vagten sover = adfærd præcis som før. Konsumeres i CONDITIONS og
+      # ACTION-delays — aldrig i trigger-for:, som binder ved load.
+      - name: "Badevaerelse bruser off factor"
+        unique_id: badevaerelse_bruser_off_factor
+        icon: mdi:shower-head
+        state: >-
+          {% if is_state('input_boolean.badevaerelse_bruser_vagt', 'on')
+                and is_state('input_boolean.badevaerelse_bruser_vagt_enabled', 'on') %}
+            {{ states('input_number.badevaerelse_bruser_off_faktor') | float(2.0) | round(2) }}
+          {% else %}
+            1.0
+          {% endif %}
+        attributes:
+          armeret_kl: >-
+            {{ states('input_datetime.badevaerelse_bruser_vagt_stempel') }}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # ARMÉR
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_bruser_vagt_arm
+    alias: "Bad: bruser-vagt armér (alle hjemme var i badet)"
+    description: >-
+      Signaturen (people ≥ 2 + bad optaget + alle andre rum eksplicit tomme) har
+      holdt i bekræftelses-tiden inde i morgen-vinduet → armér vagten, så badets
+      sluk-veje venter bruser_off_faktor gange så længe.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_alle_hjemme_i_bad
+        from: "off"
+        to: "on"
+        for:
+          seconds: >-
+            {{ states('input_number.badevaerelse_bruser_vagt_bekraeft_sekunder') | int(45) }}
+      # Backstop: fanger både en flanke der faldt mens vinduet var lukket
+      # (fejlklasse #4) og en slider-ændring som det bundne for: ikke ser.
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_bruser_vagt_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.badevaerelse_bruser_vagt
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_bruser_vagt_vindue
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_alle_hjemme_i_bad
+        state: "on"
+      # Binær sensor → last_changed er et gyldigt "har holdt i N s"-mål (#14).
+      - condition: template
+        value_template: >-
+          {% set t = states.binary_sensor.badevaerelse_alle_hjemme_i_bad.last_changed %}
+          {% set n = states('input_number.badevaerelse_bruser_vagt_bekraeft_sekunder') | int(45) %}
+          {{ t is not none and (now() - t).total_seconds() >= n }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.badevaerelse_bruser_vagt_stempel
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.badevaerelse_bruser_vagt
+      - service: logbook.log
+        data:
+          name: "Bad bruser-vagt"
+          message: >-
+            Armeret — alle {{ states('sensor.people_estimate') }} hjemmeværende var i
+            badet. Sluk-ventetider ×{{ states('input_number.badevaerelse_bruser_off_faktor') }}
+            til lyset slukker eller
+            {{ states('input_number.badevaerelse_bruser_vagt_maks_minutter') | int(25) }} min.
+          entity_id: light.badevaerelse_all
+
+  # ---------------------------------------------------------------------------
+  # AFVÆBN
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_bruser_vagt_disarm
+    alias: "Bad: bruser-vagt afvæbn"
+    description: >-
+      Vagten falder når episoden er slut: lyset har været slukket i 2 min, eller
+      maks-varigheden er nået.
+      2026-08-28: morgen-vinduet er IKKE længere en afvæbnings-grund. Vinduet
+      gater hvem der må ARMERE (alle-hjemme-i-bad-vejen), men vagten armeres nu
+      også af fortryd-vejen (packages/besoeg_fortryd.yaml), som er gyldig døgnet
+      rundt — med vindue-klausulen her ville en fortryd-armering blive afvæbnet
+      igen af /1-tikket inden for 60 s. Vagten er stadig bundet af begge de
+      tilbageværende klausuler (lys slukket 2 min / maks_minutter).
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: light.badevaerelse_all
+        to: "off"
+        for:
+          minutes: 2
+      - platform: state
+        entity_id: input_boolean.badevaerelse_bruser_vagt_enabled
+        to: "off"
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_bruser_vagt
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set stempel = states('input_datetime.badevaerelse_bruser_vagt_stempel') %}
+          {% set maks = (states('input_number.badevaerelse_bruser_vagt_maks_minutter') | int(25)) * 60 %}
+          {# 'timestamp'-attributten er lokal-bevidst pr. stempel. as_timestamp()
+             på state-strengen læser den som UTC og skal kompenseres med
+             offsettet DA STEMPLET BLEV SKREVET — ikke offsettet nu (permanent
+             faktum; B127). #}
+          {% set t = state_attr('input_datetime.badevaerelse_bruser_vagt_stempel',
+                                'timestamp') | float(0) %}
+          {% set alder = as_timestamp(now()) - t %}
+          {% set lys = states.light.badevaerelse_all %}
+          {% set lys_slukket_laenge = lys is not none and lys.state == 'off'
+                                      and (now() - lys.last_changed).total_seconds() >= 120 %}
+          {{ lys_slukket_laenge
+             or is_state('input_boolean.badevaerelse_bruser_vagt_enabled', 'off')
+             or (stempel not in ['unknown', 'unavailable'] and alder >= maks) }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.badevaerelse_bruser_vagt
+      - service: logbook.log
+        data:
+          name: "Bad bruser-vagt"
+          message: "Afvæbnet — episoden er slut, sluk-ventetider tilbage til normal."
+          entity_id: light.badevaerelse_all

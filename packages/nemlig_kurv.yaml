@@ -1,0 +1,196 @@
+# =============================================================================
+# nemlig_kurv.yaml — Nemlig.com-kurv fra mad-planlægningens indkøbsliste
+# =============================================================================
+# FASE 2 er live: scripts/nemlig_kurv.py lægger den AKTUELLE indkøbsliste i
+# kurven. Første ægte kørsel 2026-08-31: 9 retter / 44 varer -> 35 produkter,
+# 1064 kr, ryddet igen. Se docs/nemlig_kurv.md.
+#
+# Endnu IKKE koblet til mad_indkoeb-automationen — kurven bygges kun manuelt
+# fra knappen, indtil et par runder er læst igennem i tørkørsel.
+#
+# HVAD DER ER BEVIST (live mod nemlig.com 2026-08-31, ikke antaget):
+#   login → søgning m. lagerstatus → GetBasket → AddToBasket → fjern igen.
+#   Kurven blev testet med en ægte vare, som blev fjernet igen. Ingen ordre.
+#
+# ⚠️ TO INVARIANTER (de er dyre at genopdage — se scripts/nemlig_api.py):
+#   1. AddToBasket.quantity er ABSOLUT, ikke et delta. quantity=0 fjerner
+#      linjen. Derfor er kurv-opbygningen IDEMPOTENT: kører den to gange,
+#      fordobles indkøbet ikke. Al logik skal sende ØNSKET SLUT-ANTAL.
+#   2. Lagerstatus ligger allerede i søgesvaret — aldrig et opslag pr. vare.
+#
+# ⚠️ DER AFGIVES ALDRIG EN ORDRE HERFRA. Integrationen fylder kun kurven;
+#    checkout (leveringstid, betaling) sker af et menneske i Nemligs egen app.
+#    Der findes bevidst ingen kode-sti til at bestille — en fejl i en matcher
+#    må kunne koste en forkert vare i kurven, aldrig en gennemført handel.
+#
+# AFHÆNGIGHEDER:
+#   scripts/nemlig_api.py
+#   /config/secrets.yaml:  nemlig_user, nemlig_password   (git-ignoreret)
+#   Runtime (git-ignoreret): /config/.nemlig_session.json  (cookies, chmod 600)
+#                            /config/.nemlig_varer.json    (lært parring)
+#
+# AIRBNB: kurv-opbygningen er IKKE gatet på house_mode — hverken her eller i
+#   automations/mad_planlaegning.yaml (verificeret 12/9; denne blok påstod det
+#   modsatte i månedsvis). Det eneste AirBnB-lag er NOTIFIKATIONERNE, via
+#   `gate_ok` i scripts/mad_planner.py: står house_mode på AirBnB, kræver hvert
+#   nid sit eget `input_boolean.notif_<nid>_airbnb`. User-spec 12/9: mad og
+#   nemlig SKAL kunne bruges under et gæsteophold (han handler hjem på vej hjem
+#   fra ferie), så de fire gates står ON — rør dem ikke uden at spørge.
+# =============================================================================
+
+input_boolean:
+  # --- notifikations-nid `nemlig` (jf. packages/notifikationer.yaml) ---------
+  # Spørgsmålene går KUN til Parent A (user-spec 2026-08-31). Parent B-kontakten
+  # findes for symmetriens skyld men står OFF: svaret skriver en PERMANENT
+  # parring i .nemlig_varer.json, og to personer der svarer hver sin vej ville
+  # skiftevis overskrive hinandens valg uden at nogen af dem opdagede det.
+  notif_nemlig_enabled:
+    name: "🛒 Nemlig-kurv — send"
+    icon: mdi:cart-arrow-down
+  notif_nemlig_parent_a:
+    name: "🛒 Nemlig-kurv — Parent A"
+    icon: mdi:cellphone
+  notif_nemlig_parent_b:
+    name: "🛒 Nemlig-kurv — Parent B"
+    icon: mdi:cellphone
+  # Gæster skal ikke spørges om husets indkøb.
+  notif_nemlig_airbnb:
+    name: "🛒 Nemlig-kurv — også i AirBnB"
+    icon: mdi:home-account
+
+  # --- fase 4: indkøbs-præferencer -----------------------------------------
+  # Præferencerne anvendes KUN på varer vi selv parrer. Et lært valg (dit svar
+  # på et parrings-spørgsmål) overtrumfes aldrig af en øko- eller tilbudsregel.
+  nemlig_foretraek_oeko:
+    name: "Nemlig — foretræk økologisk"
+    icon: mdi:sprout
+  nemlig_foretraek_tilbud:
+    name: "Nemlig — foretræk tilbud"
+    icon: mdi:sale
+  # nemlig_kurv_enabled fjernet (B215): kurven bygges kun fra knapperne, som
+  # sender --force — kill-switchen blev aldrig læst.
+  # Adskilt fra kill-switchen med vilje: man skal kunne lade fase 2 KØRE og
+  # rapportere hvad den VILLE lægge i kurven, uden at den rører kontoen.
+  # Første rigtige kørsel bør ske med denne OFF, så matchene kan læses igennem.
+  nemlig_auto_tilfoej_enabled:
+    name: "Nemlig — tilføj rigtigt (ikke kun tørkørsel)"
+    icon: mdi:cart-check
+
+input_datetime:
+  # 00:00/00:00 = intet tidsvindue (dispatchen læser det som "altid").
+  notif_nemlig_start:
+    name: "🛒 Nemlig-kurv — fra"
+    has_time: true
+    has_date: false
+  notif_nemlig_slut:
+    name: "🛒 Nemlig-kurv — til"
+    has_time: true
+    has_date: false
+
+input_number:
+  # Under denne score spørger vi i stedet for at gætte. 0,99 = "hele varenavnet
+  # blev genkendt". Målt 2026-08-31: "pasta" gav 0,00 mod "Penne rigate" —
+  # relevant produkt, men intet i navnet bekræfter det, og en forkert vare
+  # opdages først ved leveringen.
+  # Loft på hvor mange parrings-spørgsmål ÉN kørsel må sende. Første ægte
+  # kørsel havde 9 uafklarede varer; ni notifikationer på én gang er en mur,
+  # ikke en samtale. Resten spørges der om ved næste kørsel — og hvert svar
+  # er permanent, så bunken tømmer sig selv over et par runder.
+  nemlig_spoerg_max:
+    name: "Nemlig — max spørgsmål pr. kørsel"
+    min: 0
+    max: 20
+    step: 1
+    mode: box
+    icon: mdi:comment-question-outline
+
+  # Hvor meget dyrere øko må være PR. ENHED før vi vælger konventionelt.
+  # 100 = op til dobbelt pris (user-spec 2026-08-31). Målt eksempel: øko hakket
+  # oksekød 164,70 kr/kg mod konventionel 94,88 kr/kg = +74 % -> øko vinder.
+  # Sammenligningen sker altid på ENHEDSPRIS med samme enhed: kr/kg mod kr/stk
+  # er et meningsløst regnestykke, og uden det tjek ville loftet afvise på et
+  # falsk grundlag.
+  nemlig_oeko_loft_pct:
+    name: "Nemlig — øko må koste op til (% mere)"
+    min: 0
+    max: 300
+    step: 5
+    mode: box
+    unit_of_measurement: "%"
+    icon: mdi:sprout-outline
+
+  # Hvor meget dyrere en TIDLIGERE KØBT vare (Nemligs `Favorite`) må være pr.
+  # enhed end den billigste tilsvarende vare, før den billigste vinder
+  # (2026-10-01). Målt over 465 råvarer slog en favorit en billigere
+  # tilsvarende vare i 99 af dem — værst 1 dl madlavningsvin som en 150 kr
+  # flaske (5,2×). 100 = op til dobbelt pris. Øko-favoritter skal desuden
+  # under øko-loftet ovenfor, og vin følger aldrig favoritter (madlavning).
+  # Læses af scripts/nemlig_kurv.py (default NA.FAVORIT_LOFT_PCT).
+  nemlig_favorit_loft_pct:
+    name: "Nemlig — tidligere køb må koste op til (% mere)"
+    min: 0
+    max: 500
+    step: 10
+    mode: box
+    unit_of_measurement: "%"
+    icon: mdi:history
+
+  nemlig_match_min_score:
+    name: "Nemlig — min. match-score for auto-kurv"
+    min: 0.5
+    max: 1.15
+    step: 0.01
+    mode: box
+    icon: mdi:target
+
+# ⚠️ HA's shell_command har en HÅRD timeout på 60 sekunder (COMMAND_TIMEOUT i
+# homeassistant/components/shell_command). En fuld kurv-kørsel tager ~95 s:
+# 44 råvarer × (0,7 s høflig pause + svartid) plus kurv-kaldene. Trykkede man
+# på knappen, blev processen derfor DRÆBT midt i løkken — varer nåede i
+# kurven, men køerselsfilen, spørgsmålene og sensoren blev aldrig skrevet.
+# Værst: en tom køerselsfil betyder at "Fjern vores varer" ikke kan rydde op
+# efter det der nåede i kurven.
+#
+# Derfor er de lange kommandoer DETACHEDE (`nohup … &`): shell_command
+# returnerer straks, og arbejdet kører færdigt uafhængigt af HA. Fremdrift
+# aflæses på sensor.nemlig_kurv, fejl i /config/.nemlig_kurv.log.
+# Kun --ping og --republish er korte nok til at køre synkront.
+shell_command:
+  # Verificér at login + kurv svarer. Bruges af tilen på Mad-siden og som
+  # røgtest efter en Nemlig-ændring i deres eget API.
+  nemlig_ping: "python3 /config/scripts/nemlig_api.py --ping"
+  # Byg kurven af den aktuelle indkøbsliste. --force springer kill-switchen
+  # over (knappen ER intentionen), men IKKE tørkørsels-switchen: den afgør
+  # stadig om kontoen røres.
+  nemlig_kurv_nu: >-
+    nohup python3 /config/scripts/nemlig_kurv.py --kurv --force
+    >> /config/.nemlig_kurv.log 2>&1 &
+  # Læg den FASTE basiskurv i (mælk, smør, ost, bananer, cherrytomater) —
+  # uafhængigt af hvilke retter der står på indkøbslisten. Samme matcher,
+  # samme spørgsmål, samme øko-/tilbudsregler; kun kilden er en anden, og den
+  # følger varen ud i sensoren så siden kan vise de to grupper hver for sig.
+  nemlig_basis: >-
+    nohup python3 /config/scripts/nemlig_kurv.py --basis --force
+    >> /config/.nemlig_kurv.log 2>&1 &
+  # Parr listen og rapportér uden at skrive noget som helst.
+  nemlig_kurv_vis: >-
+    nohup python3 /config/scripts/nemlig_kurv.py --vis
+    >> /config/.nemlig_kurv.log 2>&1 &
+  # Fjern KUN det integrationen selv lagde i — brugerens egne varer bliver.
+  nemlig_kurv_ryd: >-
+    nohup python3 /config/scripts/nemlig_kurv.py --ryd-vores
+    >> /config/.nemlig_kurv.log 2>&1 &
+  # sensor.nemlig_kurv publiceres via REST og dør ved restart. Denne genskaber
+  # den fra sidste kørsels gemte payload UDEN at kalde Nemlig — en rigtig
+  # kørsel koster 44 søgninger og hører ikke hjemme i en opstart.
+  nemlig_republish: "python3 /config/scripts/nemlig_kurv.py --republish"
+  # Svaret er regex-gatet i action-handleren (NEMLIG_<id>_<ciffer|SKIP>) og
+  # valideres EN GANG TIL i scriptet — action-strengen kommer fra en telefon,
+  # og en ukendt ask_id må aldrig skrive en parring vi ikke kan slå op.
+  nemlig_svar: "python3 /config/scripts/nemlig_kurv.py --svar {{ action }}"
+  # TØM HELE kurven — også varer du selv har lagt i. Adskilt fra
+  # nemlig_kurv_ryd, som kun fjerner integrationens egne linjer. Går via
+  # nemlig_kurv.py (B221), så regnskab og sensor også tømmes.
+  nemlig_toem_alt: >-
+    nohup python3 /config/scripts/nemlig_kurv.py --toem-alt
+    >> /config/.nemlig_kurv.log 2>&1 &

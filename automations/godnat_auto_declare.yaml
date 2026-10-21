@@ -1,0 +1,172 @@
+# =============================================================================
+# Godnat Auto-Declare — fallback for forgotten Somrig press
+# =============================================================================
+# Per user-request 2026-05-04. Konservativt design der auto-declarer godnat
+# hvis presence har været KUN i soveværelser (sove + boern) i 2 timer i
+# nat-vinduet (21:00-07:00).
+#
+# DESIGNFILOSOFI: ikke aggressivt — lange soak-times + bred bedroom-only
+# check forhindrer "vi læser i seng" eller "kids er i deres rum"-falske.
+#
+# CLAUDE.md history: tidligere auto-detection fjernet pga false triggers.
+# Denne version er mere konservativ:
+# 1. 2-timer soak (vs tidligere kortere)
+# 2. ALLE non-bedroom rum SKAL være tomme (vs evt. partial check)
+# 3. Kun aktiv 21-07 (vs døgnet rundt)
+# 4. Kill-switch via input_boolean.auto_godnat_enabled
+# 5. Notification ved fire (synlig audit-trail)
+#
+# 2026-08-26e — HVORFOR DEN ALDRIG FYREDE (last_triggered: 2026-05-27):
+# soak'en målte et sammensat udtryk med `for:`, og senge-halvdelen læste RÅ
+# sove-occupancy, som taber en stille krop hvert kvarter. Længste ubrudte
+# strækning natten 25→26/8: 26,8 min mod et krav på 90 — uopnåeligt, ikke bare
+# stramt. Målingen bor nu i binary_sensor.godnat_auto_kandidat; hele
+# argumentet + replay står i packages/godnat_auto_declare.yaml.
+#
+# POST-FLYT EDGE CASES:
+#   - Bath visit midt i 2-timer soak: template flipper false → timer
+#     resetter. Korrekt — bath = active person, ikke sovende.
+#   - Kids i deres rum tidlig (19:30) + parents i stue: rest_empty=false
+#     → ikke fire. Korrekt.
+#   - Parents går i seng kl 22, kids sover allerede: bedrooms=true,
+#     rest_empty=true. Soak fra 22 → fire 24:00. Late but acceptable.
+# =============================================================================
+
+- id: godnat_auto_declare
+  alias: "Godnat: auto-declare efter 2t kun-soveværelse presence"
+  description: >
+    Auto-fallback hvis Somrig godnat-knap ikke trykkes. Kører script.godnat
+    (samme behavior som manual press) plus notification. Konservative
+    conditions for at undgå false-positives.
+  mode: single
+  trigger:
+    # 2026-08-26e: soak'en hang på et rå sammensat udtryk og var derfor
+    # matematisk uopnåelig — sove-Apolloens drop-outs gav max 26,8 min ubrudt
+    # mod et krav på 90, og et køkken-spøgelse nulstillede resten. Målingen
+    # bor nu i binary_sensor.godnat_auto_kandidat (packages/
+    # godnat_auto_declare.yaml), hvor hver halvdel har sin egen bro.
+    - platform: state
+      entity_id: binary_sensor.godnat_auto_kandidat
+      from: "off"
+      to: "on"
+      # Audit-5 2026-05-12: slider-tunable (var hardcoded 2h).
+      # input_number.global_auto_godnat_minutes default 120.
+      for:
+        minutes: "{{ states('input_number.global_auto_godnat_minutes') | int(120) }}"
+      id: kandidat
+    # 2026-10-04 (user-spec, KRITISK): "ellers skal mørket bare blive til
+    # godnat mode af sig selv". Den KORTE vej: aften-låsen er armeret (loftet
+    # slukket i aften-vinduet af dig eller en automatik), alle i seng, resten
+    # tomt, ingen film — se binary_sensor.sove_moerke_godnat_kandidat.
+    - platform: state
+      entity_id: binary_sensor.sove_moerke_godnat_kandidat
+      from: "off"
+      to: "on"
+      for:
+        minutes: "{{ states('input_number.sove_moerke_godnat_minutter') | int(15) }}"
+      id: moerke
+    # BACKSTOP (permanent fakta: en HA-restart dræber et `to: X for: N` der
+    # venter på en flanke der allerede er sket — og en restart midt om natten
+    # er netop hvornår det her skal virke). Måler tiden med et
+    # condition-template i stedet for at vente på flanken. /5 (var /15) så
+    # mørke-vejens korte soak ikke forsinkes et helt kvarter efter en genstart.
+    - platform: time_pattern
+      minutes: "/5"
+      id: backstop
+  variables:
+    # Hvilken vej fyrede? Backstop'en kan opfylde begge — mørke-vejen vinder,
+    # fordi den ikke er bundet til auto-godnat-vinduet (låsen ER aften-vinduet).
+    moerke_vej: >-
+      {% set m = states.binary_sensor.sove_moerke_godnat_kandidat %}
+      {{ trigger.id == 'moerke'
+         or (trigger.id == 'backstop' and m is not none and m.state == 'on'
+             and (now() - m.last_changed).total_seconds()
+                 >= (states('input_number.sove_moerke_godnat_minutter') | float(15)) * 60) }}
+  condition:
+    - condition: template
+      value_template: >-
+        {{ trigger.id != 'backstop' or moerke_vej
+           or (is_state('binary_sensor.godnat_auto_kandidat', 'on')
+               and (now() - states.binary_sensor.godnat_auto_kandidat.last_changed).total_seconds()
+                   >= (states('input_number.global_auto_godnat_minutes') | float(120)) * 60) }}
+    # Kandidaten har 120 s bro over spøgelses-blip. Den bro må ikke kunne
+    # koste et menneske lyset i ansigtet: her kræves RÅ tomhed i fyrings-
+    # sekundet.
+    - condition: template
+      value_template: >-
+        {% set rest = [
+          'binary_sensor.stue_apollo_occupancy_filtered',
+          'binary_sensor.spisestue_apollo_occupancy_filtered',
+          'binary_sensor.koekken_apollo_occupancy_filtered',
+          'binary_sensor.badevaerelse_inde_occupancy',
+          'binary_sensor.entre_valhorn_occupancy',
+          'binary_sensor.depot_valhorn_occupancy',
+        ] %}
+        {{ rest | map('states') | reject('eq', 'on') | list | count
+           == rest | count }}
+    # Er huset beviseligt tomt, er det ikke godnat men fravær. Fyrer vi
+    # alligevel, kommer familien hjem til et hus hvor godnat-flaget spærrer
+    # presence-lyset — de går ind i mørke der ikke tænder.
+    - condition: state
+      entity_id: binary_sensor.hus_bevist_tomt
+      state: "off"
+
+    # Nat-vindue: slider-tunable (sprint 2026-05-17, var hardcoded 21-07).
+    # input_number.global_auto_godnat_start_hour default 21
+    # input_number.global_auto_godnat_end_hour default 7
+    # Logikken haandterer cross-midnight: aktivt hvis hour >= start OR hour < end.
+    # Mørke-vejen er undtaget: aften-låsen kan kun være armeret i aften-vinduet
+    # (input_datetime.sove_manual_off_lock_start → 05:00).
+    - condition: template
+      value_template: >
+        {% set start_h = states('input_number.global_auto_godnat_start_hour') | int(21) %}
+        {% set end_h = states('input_number.global_auto_godnat_end_hour') | int(7) %}
+        {% set h = now().hour %}
+        {{ moerke_vej or h >= start_h or h < end_h }}
+    # Don't re-declare hvis allerede godnat
+    - condition: state
+      entity_id: input_boolean.godnat_active
+      state: "off"
+    # Production mode only (skip vacation, AirBnB)
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "Normal"
+    # Kill-switch: bruger kan disable hvis false-positives
+    - condition: state
+      entity_id: input_boolean.auto_godnat_enabled
+      state: "on"
+    # 2026-07-22 (user-spec): putning i voksen-værelset (tilen; godnat-knap-
+    # vejen fjernet 2026-09-30) → resten af huset skal køre NORMALT. Auto-
+    # godnat må ikke overrule det (børn der ligger stille i sove ligner ellers
+    # præcis "kun-soveværelse presence").
+    - condition: state
+      entity_id: input_boolean.putning_sove_active
+      state: "off"
+    # Sensor-gate: skip hvis Apollo/Vallhorn offline (forhindrer fejl-fire
+    # baseret på stale state ved mesh-disturbance)
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+  action:
+    # Run godnat (samme som Somrig-knap)
+    - service: script.godnat
+    # Audit trail + opportunity for user at oversave hvis fejl
+    - service: persistent_notification.create
+      data:
+        notification_id: godnat_auto_declared
+        title: "Godnat auto-declared"
+        message: >
+          {% if moerke_vej %}
+          Soveværelset har været mørkt i
+          {{ states('input_number.sove_moerke_godnat_minutter') | int(15) }} min
+          efter at lyset blev slukket i aften, med alle i seng.
+          {% else %}
+          {{ states('input_number.global_auto_godnat_minutes') | int(120) }} min
+          med kun-soveværelse presence detekteret.
+          {% endif %}
+          Godnat-rutinen kører automatisk (gardin lukker, lys slukker).
+
+          Hvis dette er en fejl: tap Godnat-tile på dashboard for at slå fra
+          ELLER tap "God morgen" tile for fuld morgen-rutine.
+
+          Disable auto-detection helt: toggle input_boolean.auto_godnat_enabled OFF.

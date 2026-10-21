@@ -1,0 +1,1346 @@
+# =============================================================================
+# AI-trænere — push-spørgsmål der logger facit mod systemets gæt (2026-07-17)
+# =============================================================================
+# User-spec: "sæt andre notifikationer op med spørgsmål til parent_a tlf som
+# træner systemet ved at spørge om systemets gæt på noget var rigtigt …
+# så kører log af det over nogle uger og laver så kodning på baggrund af
+# resultaterne."
+#
+# Spejler people_estimate-trænerens mønster (packages/people_estimate.yaml):
+# ask-linje logges STRAKS med fuld signal-kontekst, svar-linje joines på id.
+# JSONL via base64 + shell_command (quoting-sikkert) til
+# /config/ai_feedback/<slug>_feedback.jsonl — fil, IKKE recorder (overlever
+# AirBnB-purge; committes til git). En senere Claude-session kalibrerer
+# koden mod loggene når der er ~2 ugers svar.
+#
+# INTENSITET (2026-07-24, user: "skru op for niveauet af spørgsmål + slider"):
+# input_number.trainer_intensitet (1-200, 50 = 07-17c-niveauet) modulerer ALLE
+# trænere (også people-træneren i people_estimate.yaml):
+#   > 50: ekstra aktivitets-asks (gap 300/(i-50) timer), Sherlock-cooldown
+#         skaleres ×50/i, dug-min-score skaleres ×(100-i)/50 (100 → spørg altid),
+#         dormant-trænerens gap-timer = konstant/i.
+#         Konkret gap for de to tik-drevne trænere: i=100 → 6,0 t (aktivitet) /
+#         6,5 t (dormant); i=125 → 4,0 / 5,2 t; i=200 → 2,0 / 3,25 t.
+#   < 50: daglige/event-asks (aktivitet, dug, måltid, people) samples ned med
+#         sandsynlighed i×2 % (50+ = altid). Event-trænere kan ikke fyre MERE
+#         end deres events — over 50 er de uændrede.
+#
+# 6 TRÆNERE (valgt som de mest fejlbare/kalibrérbare gæt i systemet).
+# En 6. træner (LYS — "passer lysstyrken?") blev droppet 2026-07-25 (user:
+# beskrev ikke hvilke lys der var tændt + lyset var ofte slukket inden svar);
+# historik-loggen ai_feedback/lys_feedback.jsonl er beholdt.
+#   1. AKTIVITET  — "lige nu tror jeg I laver X" → kalibrerer
+#                   sensor.activity_state's regel-træ (op_count-tærskler,
+#                   tidsvinduer, cooking-vs-social-skel).
+#                   TVIVLS-GATE (2026-10-20, user-spec: "spørg ikke om
+#                   ligegyldige ting når der ikke er tvivl — kun edge cases"):
+#                   spørger KUN når binary_sensor.traener_aktivitet_spoerg er
+#                   on = gættet er IKKE i sensor.traener_aktivitet_sikre_gaet
+#                   (scripts/trainer_tvivl.py: seneste N svar ≥ X % rigtige)
+#                   OG har holdt i stabil_min. Målt 20/10: terrasse+inde 29/29,
+#                   sofa 16/18 (8/8 siden juli), hjemmearbejde 9/9 → aldrig
+#                   spurgt igen; cooking 4/8, social_party 0/5, bedroom_only
+#                   1/4 er de egentlige edge cases. 25 af 60 asks siden 27/9
+#                   ramte et gæt der havde holdt < 1 min (activity_state
+#                   skifter ~480×/døgn) → svaret gjaldt et blip.
+#   2. SHERLOCK   — event-drevet når binary_sensor.likely_on_terrasse har
+#                   deduceret "nogen er på terrassen" i 2 min (cooldown-slider):
+#                   præcisions-måling af terrasse-deduktionen (netop skærpet
+#                   2026-07-17b — er dør-tjekkene nok?). Svaret skelner
+#                   "nej — vi GIK UD" (hoveddørs-suppression fejlede) fra
+#                   "nej — vi er INDE" (ghost-flap) = to forskellige fixes.
+#                   BEVIDST ingen Active-gate: falsk Sherlock mod Dormant-
+#                   overgangen er præcis fejlklassen vi vil fange.
+#   3. DUG        — morgen-facit: aften-stempel (5 min efter dug-pushen, som
+#                   selv følger input_datetime.dug_varsel_tid)
+#                   gemmer nattens score; næste morgen (tid tunable, kun ved
+#                   score ≥ min-slider så også NÆR-misser trænes) spørges
+#                   "hvor vådt blev der ude?" → kalibrerer
+#                   dug_varsel_sensitivitet, dug_overflade_ekstra_afkoeling og
+#                   de to met.no-bias-slidere (packages/dug_varsel.yaml).
+#                   ⚠️ TO OBJEKT-SKIFT, filtrér på payloadens 'objekt':
+#                   før 2026-08-02 = ruder/bil/græs; 08-02→08-12 = 'hynder';
+#                   fra 2026-08-12 = 'ude' (terrassen som helhed, fordi user
+#                   tager hynderne IND når han får varsel — se den lange note
+#                   ved trainer_dug_ask). Bland aldrig æraerne i én kalibrering.
+#   4. MÅLTID     — event-drevet lige når maaltid_hjemmearbejde_beslutning
+#                   (eller direkte-måltid-pathen) har klassificeret →
+#                   "hjemmearbejde eller måltid?" — forkert klassifikation
+#                   koster auto-støvsug/falsk støvsug (maaltid_detektion.yaml).
+#   5. DORMANT    — house_state → Dormant sustained 5 min (dagtimer) →
+#                   "var huset reelt i ro?" — falsk Dormant = lys slukker på
+#                   folk; kalibrerer absence-waits + sensor-følsomhed.
+#   6. TIMER      — event-drevet når køkken-nedtællingen er OVRE (færdig eller
+#                   annulleret, efter alarmen er kvitteret): "var den timer
+#                   din?" → kalibrerer input_number.gestus_hold_frames mod
+#                   MÅLTE falske positiver. Svaret skelner "utilsigtet" (hånd-
+#                   artefakt → hæv frames) fra "forkert tal" (bevidst gestus,
+#                   forkert tælling → et andet fix). Levetiden logges med, fordi
+#                   en utilsigtet timer annulleres efter få sekunder.
+#
+# Alle ask-pushes: KUN ikke-AirBnB (telefon kan være hos gæster) + respekterer
+# input_boolean.notifikationer_master_enabled + egen kill-switch pr. træner.
+# Trænerne går udenom push_notify-dispatcheren (interaktive knapper + egne
+# tider/killswitches — samme valg som people-træneren).
+# Svar-automations har pending-guard (dobbelt-tap/stale notifikation logger
+# ikke duplikat-linjer — 2026-07-17b-mønstret).
+# =============================================================================
+
+input_boolean:
+  trainer_aktivitet_enabled:
+    name: "Træner: aktivitets-gæt aktiv"
+    icon: mdi:school
+  trainer_sherlock_enabled:
+    name: "Træner: Sherlock-terrasse aktiv"
+    icon: mdi:magnify
+  trainer_dug_enabled:
+    name: "Træner: dug-facit aktiv"
+    icon: mdi:water
+  trainer_maaltid_enabled:
+    name: "Træner: måltid/hjemmearbejde aktiv"
+    icon: mdi:silverware-fork-knife
+  trainer_dormant_enabled:
+    name: "Træner: Dormant-check aktiv"
+    icon: mdi:sleep
+  trainer_timer_enabled:
+    name: "Træner: køkken-timer ægte? aktiv"
+    icon: mdi:timer-alert
+
+input_datetime:
+  trainer_aktivitet_tid:
+    name: "Træner: aktivitets-push klokkeslæt"
+    has_date: false
+    has_time: true
+    icon: mdi:clock-outline
+  trainer_dug_tid:
+    name: "Træner: dug-facit klokkeslæt (morgen)"
+    has_date: false
+    has_time: true
+    icon: mdi:weather-sunset-up
+  # Runtime cooldown-stempler (IKKE i snapshot — cursors)
+  trainer_sherlock_sidste_push:
+    name: "Runtime: sidste Sherlock-træner-push"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+  trainer_aktivitet_sidste_push:
+    name: "Runtime: sidste aktivitets-træner-push"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+  trainer_dormant_sidste_push:
+    name: "Runtime: sidste Dormant-træner-push"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+
+input_number:
+  # 50 = 07-17c-baseline. Se header for præcis skalering pr. træner.
+  # 2026-08-13 (user: "skru op … dobbelt op"): loftet hævet 100 → 200, fordi
+  # slideren HAVDE stået på 100 = i bund mod loftet, så der ikke var mere at
+  # skrue på. Alle forbrugere skalerer monotont videre over 100 (gap-timer
+  # 300/(i-50) og 650/i falder; Sherlock-cooldown ×50/i falder; dug-min-score
+  # er allerede klampet ved 0 via `[(100 - i), 0] | max`). Ned-samplingen
+  # `[i*2, 100] | min` er mættet fra i = 50 og er uændret.
+  trainer_intensitet:
+    name: "Trænere: spørge-intensitet (alle trænere)"
+    min: 1
+    max: 200
+    step: 1
+    icon: mdi:tune-vertical
+    mode: slider
+  trainer_sherlock_cooldown_timer:
+    name: "Træner: Sherlock cooldown (timer)"
+    min: 0
+    max: 24
+    step: 0.5
+    unit_of_measurement: "t"
+    icon: mdi:timer-sand
+    mode: box
+  trainer_dug_min_score:
+    name: "Træner: dug-facit min. score (spørg også nær-misser)"
+    min: 0
+    max: 100
+    step: 5
+    icon: mdi:gauge-low
+    mode: box
+  # Tvivls-gaten (2026-10-20), fælles for aktivitets- og Dormant-træneren. Et
+  # gæt er SIKKERT når dets seneste <svar> svar inden for <dage> dage har
+  # ≥ <pct> % rigtige → spørges der ikke om. 8/90: aktivitetens tre gæt med
+  # 8/8 bliver sikre, terrasse_only (6/8) og dining (5/6) ikke; Dormant (33/33)
+  # bliver sikker. Ældes et svar ud af <dage>, spørges der ÉN gang igen.
+  trainer_sikker_svar:
+    name: "Træner: sikker efter antal svar"
+    min: 3
+    max: 30
+    step: 1
+    icon: mdi:counter
+    mode: box
+  trainer_sikker_pct:
+    name: "Træner: sikker ved træfsikkerhed"
+    min: 50
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    icon: mdi:bullseye-arrow
+    mode: box
+  trainer_sikker_dage:
+    name: "Træner: svar tæller i"
+    min: 14
+    max: 365
+    step: 1
+    unit_of_measurement: "d"
+    icon: mdi:calendar-range
+    mode: box
+  # 5 min: 09-22 holder cooking ≥ 5 min ~2,7×/døgn, dining ~3,0, bedroom_only
+  # ~1,3 (målt 27/9-20/10) — nok edge cases at spørge om, uden de < 1 min-blips.
+  trainer_aktivitet_stabil_min:
+    name: "Træner: gæt skal have holdt i"
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:timer-check-outline
+    mode: box
+
+input_text:
+  trainer_aktivitet_pending:
+    name: "Træner: aktivitet afventende id (runtime)"
+    max: 40
+  trainer_sherlock_pending:
+    name: "Træner: Sherlock afventende id (runtime)"
+    max: 40
+  trainer_dug_pending:
+    name: "Træner: dug afventende id (runtime)"
+    max: 40
+  trainer_maaltid_pending:
+    name: "Træner: måltid afventende id (runtime)"
+    max: 40
+  trainer_dormant_pending:
+    name: "Træner: Dormant afventende id (runtime)"
+    max: 40
+  trainer_timer_pending:
+    name: "Træner: køkken-timer afventende id (runtime)"
+    max: 40
+  # "score|ja-nej|afkøl|underskud|skyer|vind|spænd|peak|soak|regn|ekstra"
+  # stemplet 5 min efter dug-varslets push (dug_varsel_tid) —
+  # sensor.dug_score_i_nat peger om morgenen på den KOMMENDE nat (vindue
+  # 21→09), så morgen-spørgsmålet SKAL læse aftenens stempel, ikke sensoren
+  # (fejlklasse #8-familien). Mellemregningerne er med fra 2026-08-02, så en
+  # fremtidig kalibrerings-runde kan re-fitte modellen på JSONL'en ALENE i
+  # stedet for at rekonstruere nattens forhold ud af recorderen.
+  trainer_dug_nat_stempel:
+    name: "Træner: dug nat-stempel score|varsel|fysik (runtime)"
+    # 120, ikke 80: v3 (2026-08-02) lagde soak|regn|overflade-offset til
+    # feltlisten. En for kort max afvises TAVST af input_text.set_value →
+    # morgenens spørgsmål ville udeblive uden fejlbesked.
+    max: 120
+
+shell_command:
+  # base64-payload = ingen quoting/shlex-fælder; slug regex-valideres i scriptet.
+  ai_feedback_append: "python3 /config/scripts/ai_feedback_append.py {{ log_slug }} {{ payload_b64 }}"
+
+# Tvivls-gatens hukommelse: hvilke aktivitets-gæt (og om Dormant-gættet) der
+# er SIKRE nok til ikke at spørge om. Genberegnes hver time + straks efter hvert svar og hver slider-
+# ændring (trainer_sikre_refresh). Ingen tidsstempel-attribut —
+# state/attributter ændrer sig kun når et svar flytter en track record (#24).
+command_line:
+  - sensor:
+      name: traener_aktivitet_sikre_gaet
+      unique_id: traener_aktivitet_sikre_gaet
+      command: >-
+        python3 /config/scripts/trainer_tvivl.py aktivitet
+        {{ states('input_number.trainer_sikker_svar') | int(8) }}
+        {{ states('input_number.trainer_sikker_pct') | int(90) }}
+        {{ states('input_number.trainer_sikker_dage') | int(120) }}
+      value_template: "{{ value_json.antal_sikre }}"
+      json_attributes:
+        - sikre
+        - record
+      scan_interval: 3600
+      icon: mdi:school-outline
+  - sensor:
+      name: traener_dormant_sikre_gaet
+      unique_id: traener_dormant_sikre_gaet
+      command: >-
+        python3 /config/scripts/trainer_tvivl.py dormant
+        {{ states('input_number.trainer_sikker_svar') | int(8) }}
+        {{ states('input_number.trainer_sikker_pct') | int(90) }}
+        {{ states('input_number.trainer_sikker_dage') | int(120) }}
+      value_template: "{{ value_json.antal_sikre }}"
+      json_attributes:
+        - sikre
+        - record
+      scan_interval: 3600
+      icon: mdi:sleep
+
+template:
+  - binary_sensor:
+      # ON = aktivitets-gættet lige nu er en EDGE CASE værd at spørge om:
+      # ikke i sikre-listen OG har holdt i stabil_min. now() re-renderer hvert
+      # minut, men staten skifter kun når dommen gør (ingen now()-attribut, #24).
+      # Restart nulstiller activity_state's last_changed → spørger tidligst
+      # stabil_min efter boot (harmløst, kun forsinkelse).
+      - name: traener_aktivitet_spoerg
+        unique_id: traener_aktivitet_spoerg
+        icon: mdi:help-circle-outline
+        state: >-
+          {% set a = states.sensor.activity_state %}
+          {% set sikre = state_attr('sensor.traener_aktivitet_sikre_gaet', 'sikre') or [] %}
+          {{ a is not none
+             and a.state not in ['unknown', 'unavailable', '']
+             and a.state not in sikre
+             and (now() - a.last_changed).total_seconds()
+                 >= (states('input_number.trainer_aktivitet_stabil_min') | float(5)) * 60 }}
+
+script:
+  # Delt af daglig ask + intensitets-ekstra-ask (identisk push/log — kun
+  # trigger-mekanikken er forskellig). Sætter selv pending + gap-stempel.
+  trainer_aktivitet_send:
+    alias: "Træner: send aktivitets-gæt (delt push+log)"
+    sequence:
+      - variables:
+          fb_id: "{{ now().strftime('%Y%m%d%H%M%S') }}"
+          guess: "{{ states('sensor.activity_state') }}"
+          labels:
+            cooking: "madlavning"
+            social_dining: "fælles spisning/samvær"
+            social_party: "mange samlet / fest"
+            sofa_relax: "sofahygge"
+            dining: "ophold ved spisebordet"
+            hjemmearbejde: "hjemmearbejde ved spisebordet"
+            bedroom_only: "kun i soveværelserne"
+            bath_visit: "badeværelsesbesøg"
+            transit: "gennemgang (entré)"
+            terrasse_only: "på terrassen"
+            terrasse_with_indoor: "terrasse + inde"
+            nightwalk: "nattevandring"
+            idle: "ingen aktivitet (stille)"
+            godnat: "godnat"
+            away: "ingen hjemme"
+            active: "aktivitet (uspecifik)"
+          label: "{{ labels.get(guess, guess) }}"
+          # 2026-10-20: spørgsmålet ER gættet (ét tryk = svar), og knap 2 er
+          # den forveksling klassifikatoren typisk laver for netop dette gæt,
+          # så et "nej" også logger hvad det VAR (svar-feltet 'sand').
+          # [titel, besked, alternativ-nøgle, alternativ-knap] — tom nøgle =
+          # ingen mellem-knap.
+          spoergsmaal:
+            cooking: ["🍳 Laver I mad?", "Køkkenet er i brug.", "dining", "🍽️ Vi spiser"]
+            dining: ["🍽️ Sidder I ved spisebordet?", "Kun spisestuen er i brug.", "cooking", "🍳 Laver mad"]
+            social_dining: ["🍽️ Spiser I sammen?", "Flere zoner i stue/køkken er i brug.", "cooking", "🍳 Laver mad"]
+            social_party: ["🎉 Har I gæster?", "Folk i mange zoner og mindst 4 personer.", "kun_familie", "👨‍👩‍👧‍👦 Kun os"]
+            sofa_relax: ["🛋️ Er I i stuen?", "Kun stuen er i brug.", "idle", "🤫 Ingen i stuen"]
+            hjemmearbejde: ["💻 Arbejder du hjemme?", "Spisestuen er i brug på en hjemmearbejdsdag.", "dining", "🍽️ Vi spiser"]
+            bedroom_only: ["🛏️ Er I kun på værelserne?", "Ingen i stue, køkken eller på terrassen.", "sofa_relax", "🛋️ Vi er i stuen"]
+            bath_visit: ["🚿 Er nogen på badeværelset?", "Kun badeværelset er i brug.", "", ""]
+            transit: ["🚪 Er nogen på vej ind eller ud?", "Kun entréen er i brug.", "bath_visit", "🚿 På badet"]
+            nightwalk: ["🚶 Gik nogen fra soveværelset ud på badet?", "Soveværelse og bad i brug, stuen tom.", "bath_visit", "🚿 Bare på badet"]
+            terrasse_only: ["🌳 Er I alle ude på terrassen?", "Ingen inde i stue/køkken.", "terrasse_with_indoor", "🏠 Nogen er inde"]
+            terrasse_with_indoor: ["🌳 Er nogen ude og nogen inde?", "Terrassen og stuen er i brug.", "terrasse_only", "🌳 Alle er ude"]
+            idle: ["🤫 Er her helt stille?", "Jeg kan ikke se nogen nogen steder.", "sofa_relax", "🛋️ Vi er i stuen"]
+            godnat: ["😴 Er I gået i seng?", "Godnat er slået til.", "oppe", "🚶 Stadig oppe"]
+            away: ["🏠 Er alle ude af huset?", "Jeg kan ikke se nogen hjemme.", "hjemme", "🏠 Vi er hjemme"]
+          sp: "{{ spoergsmaal.get(guess, ['🧠 Hvad laver I?', 'Jeg kan ikke placere jer.', '', '']) }}"
+          record: "{{ (state_attr('sensor.traener_aktivitet_sikre_gaet', 'record') or {}).get(guess, '') }}"
+          grund: >-
+            {% if record == '' %}Jeg har ingen svar på det gæt endnu.
+            {%- else %}{% set p = record.split('/') %}Det gæt har ramt {{ p[0] }} af de seneste {{ p[1] }} gange.{% endif %}
+          # konfidens_pct + blinde (2026-08-13): uden dem kan man ikke skelne
+          # "modellen tænkte forkert" fra "modellen var blind" — begge de
+          # forkerte sofa_relax-gæt (07-31, 08-02) faldt inde i terrassedørens
+          # 59-timers Thread-udfald, hvilket kun kunne udledes bagefter ved at
+          # grave i recorder-DB'en. NB: kommentaren SKAL stå her og ikke inde
+          # i {{ }} — et '#' i et Jinja-print-udtryk er en syntaksfejl, der
+          # disabler hele scriptet tavst (fejlklasse #22, selvforskyldt her).
+          payload_b64: >-
+            {{ {
+              'type': 'ask',
+              'id': fb_id,
+              'ts': now().isoformat(),
+              'guess': guess,
+              'people_estimate': states('sensor.people_estimate') | int(0),
+              'zones_now': states('sensor.people_zones_now') | int(0),
+              'hour': now().hour,
+              'konfidens_pct': states('sensor.presence_signal_confidence') | int(0),
+              'blinde': state_attr('sensor.presence_signal_confidence', 'blinde'),
+              'record_foer': record,
+              'holdt_s': ((now() - states.sensor.activity_state.last_changed).total_seconds() | round(0) | int)
+                         if states.sensor.activity_state is not none else -1,
+              'signals': {
+                'stue': states('binary_sensor.stue_apollo_occupancy_filtered'),
+                'spisestue': states('binary_sensor.spisestue_apollo_occupancy_filtered'),
+                'koekken': states('binary_sensor.koekken_apollo_occupancy_filtered'),
+                'sove': states('binary_sensor.sovevaerelse_apollo_occupancy'),
+                'boern': states('binary_sensor.boernevaerelse_apollo_occupancy'),
+                'bad': states('binary_sensor.badevaerelse_inde_occupancy'),
+                'entre': states('binary_sensor.entre_valhorn_occupancy'),
+                'depot': states('binary_sensor.depot_valhorn_occupancy'),
+                'terrasse': states('binary_sensor.terrasse_active'),
+                'terrassedoer': states('binary_sensor.parasoll_terrassedoer')
+              }
+            } | to_json | base64_encode }}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_aktivitet_pending}
+        data: {value: "{{ fb_id }}"}
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.trainer_aktivitet_sidste_push}
+        data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: aktivitet, payload_b64: "{{ payload_b64 }}"}
+      # Knap 2 = typisk forveksling (svar 'forkert' + 'sand'); uden kendt
+      # forveksling kun Ja/Nej. "Delvist" droppet 20/10 (1 af 98 svar).
+      - service: notify.mobile_app_phone_a
+        data:
+          title: "{{ sp[0] }}"
+          message: "{{ sp[1] }} {{ grund }}"
+          data:
+            tag: trainer_aktivitet
+            actions: >-
+              {% set ja = {'action': 'TRAINER_ACT_RIGTIG', 'title': '✅ Ja'} %}
+              {% set nej = {'action': 'TRAINER_ACT_FORKERT', 'title': '❌ Noget andet' if sp[2] else '❌ Nej'} %}
+              {% if sp[2] %}
+                {{ [ja, {'action': 'TRAINER_ACT_SAND_' ~ (sp[2] | upper), 'title': sp[3]}, nej] }}
+              {% else %}
+                {{ [ja, nej] }}
+              {% endif %}
+
+automation:
+  # ===========================================================================
+  # 1) AKTIVITET — gæt på hvad familien laver lige nu, KUN ved tvivl
+  # ===========================================================================
+  # Begge asks kræver binary_sensor.traener_aktivitet_spoerg (tvivls-gaten):
+  # et sikkert eller et < stabil_min gammelt gæt spørges der aldrig om. Den
+  # daglige tid er derfor et TILBUD, ikke en garanti — er gættet sikkert kl.
+  # 17:30, kommer der ingen push den dag fra denne vej.
+  - id: trainer_aktivitet_ask
+    alias: "Træner: aktivitets-gæt (push + svar-knapper)"
+    trigger:
+      - platform: time
+        at: input_datetime.trainer_aktivitet_tid
+    condition:
+      - condition: state
+        entity_id: input_boolean.trainer_aktivitet_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.traener_aktivitet_spoerg
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.notifikationer_master_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      # Intensitet < 50 → sampl ned (i×2 % chance); ≥ 50 → altid.
+      - condition: template
+        value_template: >-
+          {{ range(1, 101) | random
+             <= [(states('input_number.trainer_intensitet') | int(50)) * 2, 100] | min }}
+      # Dublet-guard mod ekstra-asken (begge sætter stemplet i scriptet).
+      # timestamp-attr, IKKE as_timestamp(states(...)): state-strengen er naiv
+      # og parses som UTC → 2t skew (fundet 2026-07-24).
+      - condition: template
+        value_template: >-
+          {{ (as_timestamp(now())
+              - (state_attr('input_datetime.trainer_aktivitet_sidste_push', 'timestamp') | float(0)))
+             > 3 * 3600 }}
+    action:
+      - service: script.trainer_aktivitet_send
+
+  # Intensitet > 50: ekstra aktivitets-asks udover den faste daglige.
+  # Gap-timer = 300/(i-50): 60→30t, 75→12t (~1-2 ekstra/dag), 100→6t.
+  # 2026-10-20: fyrer når en edge case HAR holdt stabil_min (spoerg off→on),
+  # i stedet for et blindt :42-tik der ramte < 1 min gamle blips 25/60 gange.
+  # /15-tikket er re-arm (#4/#13): en edge case der holder ud over gap-
+  # udløbet har ingen ny flanke.
+  - id: trainer_aktivitet_ekstra_ask
+    alias: "Træner: aktivitets-gæt EKSTRA (intensitet > 50)"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.traener_aktivitet_spoerg
+        from: "off"
+        to: "on"
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: state
+        entity_id: input_boolean.trainer_aktivitet_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.traener_aktivitet_spoerg
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.notifikationer_master_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: time
+        after: "09:00:00"
+        before: "21:30:00"
+      - condition: template
+        value_template: "{{ (states('input_number.trainer_intensitet') | int(50)) > 50 }}"
+      - condition: template
+        value_template: >-
+          {{ (as_timestamp(now())
+              - (state_attr('input_datetime.trainer_aktivitet_sidste_push', 'timestamp') | float(0)))
+             > (300 / ([(states('input_number.trainer_intensitet') | int(50)) - 50, 1] | max))
+               * 3600 }}
+    action:
+      - service: script.trainer_aktivitet_send
+
+  - id: trainer_aktivitet_answer
+    alias: "Træner: aktivitets-svar → log JSONL"
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default('')).startswith('TRAINER_ACT_') }}
+      - condition: template
+        value_template: >-
+          {{ states('input_text.trainer_aktivitet_pending')
+             not in ['', 'unknown', 'unavailable'] }}
+    action:
+      - variables:
+          raa: "{{ trigger.event.data.action | replace('TRAINER_ACT_', '') }}"
+          # TRAINER_ACT_SAND_<GÆT> = "nej, det var <gæt>" (knap 2, 2026-10-20)
+          # → 'forkert' + 'sand', så trainer_tvivl.py tæller den som en fejl.
+          # DELVIST findes kun på gamle notifikationer.
+          answer: "{{ 'forkert' if raa.startswith('SAND_') else raa | lower }}"
+          sand: "{{ raa[5:] | lower if raa.startswith('SAND_') else '' }}"
+          # 2026-08-13: svar-forsinkelsen logges nu. Målt på de eksisterende
+          # linjer var medianen 12,5 min og maks 179,6 min, og gættet havde
+          # nået at ændre sig inden svaret i 26 % af tilfældene — dommen gjaldt
+          # altså et andet øjebliksbillede end ask-linjens råsignaler, uden at
+          # noget i filen røbede det. ID'et ER push-tidsstemplet
+          # (%Y%m%d%H%M%S), så forsinkelsen kan udledes uden en ekstra helper.
+          forsinkelse_s: >-
+            {% set pid = states('input_text.trainer_aktivitet_pending') %}
+            {% if pid | length == 14 and pid | int(0) > 0 %}
+              {{ (now() - strptime(pid, '%Y%m%d%H%M%S').replace(tzinfo=now().tzinfo))
+                 .total_seconds() | round(0) | int }}
+            {% else %}-1{% endif %}
+          payload_b64: >-
+            {{ {
+              'type': 'answer',
+              'id': states('input_text.trainer_aktivitet_pending'),
+              'ts': now().isoformat(),
+              'answer': answer,
+              'sand': sand,
+              'svar_forsinkelse_s': forsinkelse_s | int(-1),
+              'guess_at_answer': states('sensor.activity_state'),
+              'konfidens_pct': states('sensor.presence_signal_confidence') | int(0)
+            } | to_json | base64_encode }}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: aktivitet, payload_b64: "{{ payload_b64 }}"}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_aktivitet_pending}
+        data: {value: ""}
+      # Ingen "🧠 Tak!"-push længere (2026-10-20): knap-trykket fjerner selv
+      # notifikationen, og Tak'en blev swipet væk 2-15 s efter (målt i
+      # recorderen) = ren støj. Svaret skal i stedet flytte track recorden.
+      - service: homeassistant.update_entity
+        target: {entity_id: sensor.traener_aktivitet_sikre_gaet}
+        continue_on_error: true
+
+  # Swipet væk uden svar → 'afvist'-linje (tæller ikke i track recorden, men
+  # måler hvor mange spørgsmål der opleves som ligegyldige). Knap-tryk sender
+  # IKKE cleared (målt: 0 af 118 actions), og en ny push med samme tag
+  # erstatter uden cleared — 60 s-guarden er forsikring mod det modsatte.
+  - id: trainer_aktivitet_afvist
+    alias: "Træner: aktivitets-spørgsmål swipet væk → log 'afvist'"
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_cleared
+        event_data:
+          tag: trainer_aktivitet
+    condition:
+      - condition: template
+        value_template: >-
+          {% set pid = states('input_text.trainer_aktivitet_pending') %}
+          {{ pid | length == 14 and pid | int(0) > 0
+             and (now() - strptime(pid, '%Y%m%d%H%M%S').replace(tzinfo=now().tzinfo))
+                 .total_seconds() > 60 }}
+    action:
+      - variables:
+          pid: "{{ states('input_text.trainer_aktivitet_pending') }}"
+          payload_b64: >-
+            {{ {
+              'type': 'answer',
+              'id': pid,
+              'ts': now().isoformat(),
+              'answer': 'afvist',
+              'svar_forsinkelse_s': (now() - strptime(pid, '%Y%m%d%H%M%S').replace(tzinfo=now().tzinfo))
+                                    .total_seconds() | round(0) | int,
+              'guess_at_answer': states('sensor.activity_state')
+            } | to_json | base64_encode }}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: aktivitet, payload_b64: "{{ payload_b64 }}"}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_aktivitet_pending}
+        data: {value: ""}
+
+  # Sikre-listerne genberegnes straks når en tvivls-slider flyttes, og efter
+  # boot (command_line kører ved setup, muligvis før sliderne er gendannet).
+  - id: trainer_sikre_refresh
+    alias: "Træner: genberegn sikre gæt (slider/boot)"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id:
+          - input_number.trainer_sikker_svar
+          - input_number.trainer_sikker_pct
+          - input_number.trainer_sikker_dage
+      - platform: homeassistant
+        event: start
+    action:
+      - delay: "00:00:30"
+      - service: homeassistant.update_entity
+        target:
+          entity_id:
+            - sensor.traener_aktivitet_sikre_gaet
+            - sensor.traener_dormant_sikre_gaet
+        continue_on_error: true
+
+  # ===========================================================================
+  # 2) SHERLOCK — er der faktisk nogen på terrassen når deduktionen fyrer?
+  # ===========================================================================
+  - id: trainer_sherlock_ask
+    alias: "Træner: Sherlock-terrasse-deduktion (push + svar-knapper)"
+    trigger:
+      # 2 min sustained = flap-guard; deduktionen selv-falser efter 10 min
+      # (since_emptied > 600), så vinduet er reelt 2-10 min efter tømning.
+      - platform: state
+        entity_id: binary_sensor.likely_on_terrasse
+        from: "off"
+        to: "on"
+        for: "00:02:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.trainer_sherlock_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.notifikationer_master_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Effektiv cooldown = slider × 50/intensitet (i=100 → halv, i=25 → dobbelt).
+      # 2026-07-24: timestamp-attr i stedet for as_timestamp(states(...)) —
+      # state-strengen parses som UTC → cooldown var reelt 2t længere end sat.
+      - condition: template
+        value_template: >-
+          {{ (as_timestamp(now())
+              - (state_attr('input_datetime.trainer_sherlock_sidste_push', 'timestamp') | float(0)))
+             > (states('input_number.trainer_sherlock_cooldown_timer') | float(4)) * 3600
+               * (50 / ([states('input_number.trainer_intensitet') | int(50), 1] | max)) }}
+    action:
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.trainer_sherlock_sidste_push}
+        data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
+      - variables:
+          fb_id: "{{ now().strftime('%Y%m%d%H%M%S') }}"
+          payload_b64: >-
+            {{ {
+              'type': 'ask',
+              'id': fb_id,
+              'ts': now().isoformat(),
+              'guess': 'on_terrasse',
+              'house_state': states('input_select.house_state'),
+              'signals': {
+                'terrassedoer': states('binary_sensor.parasoll_terrassedoer'),
+                'terrassedoer_s_siden': (as_timestamp(now()) - as_timestamp(states.binary_sensor.parasoll_terrassedoer.last_changed, as_timestamp(now()))) | int,
+                'hoveddoer': states('binary_sensor.parasoll_hoveddoer'),
+                'hoveddoer_s_siden': (as_timestamp(now()) - as_timestamp(states.binary_sensor.parasoll_hoveddoer.last_changed, as_timestamp(now()))) | int,
+                'stue': states('binary_sensor.stue_apollo_occupancy_filtered'),
+                'spisestue': states('binary_sensor.spisestue_apollo_occupancy_filtered'),
+                'koekken': states('binary_sensor.koekken_apollo_occupancy_filtered'),
+                'terrasse_lights': states('binary_sensor.terrasse_lights_on')
+              }
+            } | to_json | base64_encode }}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_sherlock_pending}
+        data: {value: "{{ fb_id }}"}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: sherlock_terrasse, payload_b64: "{{ payload_b64 }}"}
+      - service: notify.mobile_app_phone_a
+        data:
+          title: "🕵️ Er der nogen på terrassen?"
+          message: "Jeg deducerer at nogen gik derud (open-plan tømt, dør-mønster passer). Rigtigt? (træner terrasse-deduktionen)"
+          data:
+            tag: trainer_sherlock
+            actions:
+              - action: "TRAINER_SHERLOCK_JA"
+                title: "✅ Ja"
+              - action: "TRAINER_SHERLOCK_NEJ_UDE"
+                title: "❌ Nej, vi gik ud"
+              - action: "TRAINER_SHERLOCK_NEJ_INDE"
+                title: "❌ Nej, vi er inde"
+
+  - id: trainer_sherlock_answer
+    alias: "Træner: Sherlock-svar → log JSONL"
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default('')).startswith('TRAINER_SHERLOCK_') }}
+      - condition: template
+        value_template: >-
+          {{ states('input_text.trainer_sherlock_pending')
+             not in ['', 'unknown', 'unavailable'] }}
+    action:
+      - variables:
+          answer: "{{ trigger.event.data.action | replace('TRAINER_SHERLOCK_', '') | lower }}"
+          payload_b64: >-
+            {{ {
+              'type': 'answer',
+              'id': states('input_text.trainer_sherlock_pending'),
+              'ts': now().isoformat(),
+              'answer': answer,
+              'sherlock_at_answer': states('binary_sensor.likely_on_terrasse'),
+              'house_state_at_answer': states('input_select.house_state')
+            } | to_json | base64_encode }}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: sherlock_terrasse, payload_b64: "{{ payload_b64 }}"}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_sherlock_pending}
+        data: {value: ""}
+      # Ingen Tak-push (2026-10-20): knap-trykket fjerner selv notifikationen.
+
+  # ===========================================================================
+  # 3) DUG — morgen-facit mod aftenens forudsigelse
+  # ===========================================================================
+  - id: trainer_dug_nat_stempel
+    alias: "Træner: dug nat-stempel (5 min efter varsel-pushen)"
+    # 2026-08-05: fulgte før hardkodet 21:35. Varsels-tidspunktet er nu en
+    # slider (input_datetime.dug_varsel_tid) — et fast klokkeslæt ville stemple
+    # FØR pushen så snart brugeren flyttede varslet senere, og aliasets
+    # "efter varsel-pushen" ville blive en løgn (fejlklasse #3).
+    trigger:
+      - platform: time
+        at:
+          entity_id: input_datetime.dug_varsel_tid
+          offset: "00:05:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.trainer_dug_enabled
+        state: "on"
+      - condition: template
+        value_template: "{{ states('sensor.dug_score_i_nat') | is_number }}"
+    action:
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_dug_nat_stempel}
+        data:
+          value: >-
+            {% set s = 'sensor.dug_score_i_nat' %}
+            {{ states(s) | int(0) }}|{{ 'ja'
+               if state_attr('sensor.dug_varsel_i_nat', 'is_dug') == true else 'nej'
+            }}|{{ state_attr(s,'afkoeling_c') | float(0) }}|{{ state_attr(s,'underskud_c') | float(0)
+            }}|{{ state_attr(s,'peak_cloud_pct') | int(0) }}|{{ state_attr(s,'peak_wind_kmh') | float(0)
+            }}|{{ state_attr(s,'peak_spread_c') | float(0) }}|{{ state_attr(s,'peak_time') | default('', true)
+            }}|{{ state_attr(s,'soak_timer') | float(0) }}|{{ state_attr(s,'regn_mm') | float(0)
+            }}|{{ state_attr(s,'overflade_ekstra_c') | float(0)
+            }}|{{ state_attr(s,'fald_c') | float(0) }}|{{ state_attr(s,'potentiale_c') | float(0) }}
+
+  - id: trainer_dug_ask
+    alias: "Træner: dug-facit (morgen-push + svar-knapper)"
+    trigger:
+      - platform: time
+        at: input_datetime.trainer_dug_tid
+    condition:
+      - condition: state
+        entity_id: input_boolean.trainer_dug_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.notifikationer_master_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: template
+        value_template: >-
+          {{ states('input_text.trainer_dug_nat_stempel')
+             not in ['', 'unknown', 'unavailable'] }}
+      # Spørg kun ved score ≥ min (default 35 < varsel-tærsklen ved følsomhed
+      # 50 = tærskel 50) → vi får facit på BÅDE varsel-nætter og nær-misser.
+      # Ingen Active-gate: spørgsmålet handler om i nat, ikke om nu.
+      # Intensitet skalerer tærsklen ×(100-i)/50: i=50 → ×1, i=100 → 0 (spørg
+      # ALLE morgener), i=25 → ×1.5. Plus lav-ende-sampling (i×2 % under 50).
+      #
+      # v4 (2026-08-07): stikprøve på de tørre morgener tilføjet ved siden af
+      # min-score-gaten, så falske negativer (modellen siger tørt, men
+      # hynderne var våde) kan blive opdaget: intensitet/5 % (ved 75 = 15 %,
+      # ca. hver 7. tør morgen) → uden at brugeren spørges hver tørvejrsdag.
+      # (Et tredje ben her, "reservoiret er ikke tomt", er rullet tilbage
+      # 2026-08-10 sammen med resten af vådheds-reservoiret.)
+      #
+      # 2026-08-12 — SPØRGSMÅLET MÅTTE LAVES OM, ikke gaten. User: "jeg lader
+      # jo ikke hynderne ligge ude når jeg får varsler, men lægger dem ind."
+      # Det gamle spørgsmål ("hvor våde er hynderne?") kan derfor pr.
+      # konstruktion IKKE besvares på de nætter hvor modellen varslede — og
+      # det er præcis de nætter facit er noget værd. Værre: den nemme udvej
+      # er "☀️ Tørre", så jo BEDRE varslet blev, jo flere "modellen tog fejl"-
+      # labels ville det tjene ind, og en kalibrering ville skrue tærsklen op
+      # til varslet tav. En træner hvis måling ødelægges af den handling den
+      # selv udløser, måler sin egen adfærd i stedet for vejret.
+      # Spørgsmålet handler nu om VEJRET på terrassen (hynder hvis de lå ude,
+      # ellers bord/gulv/havemøbler) — altid observerbart fra døren, uanset
+      # hvad der skete med hynderne. Payload-markør: objekt='ude' (før
+      # 'hynder', og før 2026-08-02 ruder/bil/græs) — bland ikke æraerne i en
+      # kalibrering. Android-appen viser max 3 action-knapper, så en fjerde
+      # "📥 tog dem ind"-knap var ikke en mulighed; den ville desuden give en
+      # tom label frem for en brugbar.
+      - condition: template
+        value_template: >-
+          {% set sc = states('input_text.trainer_dug_nat_stempel').split('|')[0] | int(0) %}
+          {% set i = states('input_number.trainer_intensitet') | int(50) %}
+          {% set mini = (states('input_number.trainer_dug_min_score') | int(35))
+                        * ([(100 - i), 0] | max) / 50 %}
+          {{ sc >= mini
+             or ((range(1, 101) | random) <= ((i / 5) | round(0) | int)) }}
+      - condition: template
+        value_template: >-
+          {{ range(1, 101) | random
+             <= [(states('input_number.trainer_intensitet') | int(50)) * 2, 100] | min }}
+    action:
+      - variables:
+          fb_id: "{{ now().strftime('%Y%m%d%H%M%S') }}"
+          st: "{{ states('input_text.trainer_dug_nat_stempel').split('|') }}"
+          score: "{{ st[0] | int(0) }}"
+          varsel: "{{ st[1] | default('nej') }}"
+          payload_b64: >-
+            {# Mellemregningerne er kun med i stempler skrevet efter 2026-08-02
+               (model v2) — ældre/korte stempler giver none, ikke en fejl.
+               OBJEKT-MARKØR ('objekt' nedenfor) = tre epoker, som IKKE må
+               blandes i en kalibrering: felt mangler = ruder/bil/græs (før
+               2026-08-02), 'hynder' = terrassens hynder (08-02 → 08-12),
+               'ude' = terrassen som helhed (fra 08-12) — se kommentaren over
+               trainer_dug_ask for hvorfor hynde-spørgsmålet var ubesvarligt.
+               NB: en Jinja-kommentar kan IKKE stå INDE i et print-udtryk —
+               kommentarer er statement-niveau, så en kommentar mellem to
+               dict-nøgler er en TemplateSyntaxError der deaktiverer HELE
+               automationen (kostede 4 tabte dug-morgener 08-02 → 08-06). #}
+            {{ {
+              'type': 'ask',
+              'id': fb_id,
+              'ts': now().isoformat(),
+              'nat_score': score | int,
+              'varsel_sendt': varsel == 'ja',
+              'sensitivitet': states('input_number.dug_varsel_sensitivitet') | int(0),
+              'afkoeling_c': (st[2] | float(0)) if st | length > 2 else none,
+              'underskud_c': (st[3] | float(0)) if st | length > 3 else none,
+              'skyer_pct': (st[4] | int(0)) if st | length > 4 else none,
+              'vind_kmh': (st[5] | float(0)) if st | length > 5 else none,
+              'spaend_c': (st[6] | float(0)) if st | length > 6 else none,
+              'peak_time': st[7] if st | length > 7 else none,
+              'soak_timer': (st[8] | float(0)) if st | length > 8 else none,
+              'regn_mm': (st[9] | float(0)) if st | length > 9 else none,
+              'overflade_ekstra_c': (st[10] | float(0)) if st | length > 10 else none,
+              'fald_c': (st[11] | float(0)) if st | length > 11 else none,
+              'potentiale_c': (st[12] | float(0)) if st | length > 12 else none,
+              'morgen_temp': state_attr('weather.forecast_home', 'temperature'),
+              'morgen_fugt': state_attr('weather.forecast_home', 'humidity'),
+              'objekt': 'ude'
+            } | to_json | base64_encode }}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_dug_pending}
+        data: {value: "{{ fb_id }}"}
+      # Ryd stemplet — næste morgen kræver et nyt aften-stempel.
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_dug_nat_stempel}
+        data: {value: ""}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: dug, payload_b64: "{{ payload_b64 }}"}
+      - service: notify.mobile_app_phone_a
+        data:
+          title: "💧 Hvor vådt blev det i nat?"
+          message: >-
+            Jeg gav våd-score {{ score }}/100
+            ({{ 'varsel sendt' if varsel == 'ja' else 'intet varsel' }}).
+            Hvor vådt er der UDE — bord, gulv, havemøbler, hynder der
+            lå fremme? Svar for terrassen, ikke for det du nåede at
+            redde ind. Det er VEJRET jeg kalibrerer.
+          data:
+            tag: trainer_dug
+            actions:
+              - action: "TRAINER_DUG_JA"
+                title: "💦 Gennemvådt"
+              - action: "TRAINER_DUG_LIDT"
+                title: "💧 Lidt fugtigt"
+              - action: "TRAINER_DUG_NEJ"
+                title: "☀️ Helt tørt"
+
+  - id: trainer_dug_answer
+    alias: "Træner: dug-svar → log JSONL"
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default('')).startswith('TRAINER_DUG_') }}
+      - condition: template
+        value_template: >-
+          {{ states('input_text.trainer_dug_pending')
+             not in ['', 'unknown', 'unavailable'] }}
+    action:
+      - variables:
+          answer: "{{ trigger.event.data.action | replace('TRAINER_DUG_', '') | lower }}"
+          payload_b64: >-
+            {{ {
+              'type': 'answer',
+              'id': states('input_text.trainer_dug_pending'),
+              'ts': now().isoformat(),
+              'answer': answer
+            } | to_json | base64_encode }}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: dug, payload_b64: "{{ payload_b64 }}"}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_dug_pending}
+        data: {value: ""}
+      # Ingen Tak-push (2026-10-20): knap-trykket fjerner selv notifikationen.
+
+  # ===========================================================================
+  # 4) MÅLTID — var klassifikationen hjemmearbejde vs måltid rigtig?
+  # ===========================================================================
+  - id: trainer_maaltid_ask
+    alias: "Træner: måltid/hjemmearbejde-klassifikation (push + svar-knapper)"
+    trigger:
+      # Fyrer i SAMME øjeblik beslutningen tages (frisk hukommelse hos user):
+      # hjemmearbejde-flaget tændes ELLER måltid registreres (begge paths i
+      # maaltid_detektion.yaml sætter maaltid_sidst_registreret).
+      - platform: state
+        entity_id: input_boolean.maaltid_hjemmearbejde_dag
+        from: "off"
+        to: "on"
+        id: hjemmearbejde
+      - platform: state
+        entity_id: input_datetime.maaltid_sidst_registreret
+        id: maaltid
+    condition:
+      - condition: state
+        entity_id: input_boolean.trainer_maaltid_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.notifikationer_master_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Restart-restore-guard: kun ægte værdi→værdi-skift (ikke unknown→X).
+      - condition: template
+        value_template: >-
+          {{ trigger.from_state is not none
+             and trigger.from_state.state not in ['unknown', 'unavailable'] }}
+      # Intensitet < 50 → sampl klassifikations-events ned (i×2 % chance).
+      - condition: template
+        value_template: >-
+          {{ range(1, 101) | random
+             <= [(states('input_number.trainer_intensitet') | int(50)) * 2, 100] | min }}
+    action:
+      - variables:
+          fb_id: "{{ now().strftime('%Y%m%d%H%M%S') }}"
+          guess: "{{ 'hjemmearbejde' if trigger.id == 'hjemmearbejde' else 'maaltid' }}"
+          payload_b64: >-
+            {{ {
+              'type': 'ask',
+              'id': fb_id,
+              'ts': now().isoformat(),
+              'guess': guess,
+              'hour': now().hour,
+              'signals': {
+                'spisestue_bekraeft_min': states('sensor.maaltid_spisestue_bekraeft_min_i_vindue') | float(-1),
+                'madlavning_min': states('sensor.maaltid_madlavning_min_i_vindue') | float(-1),
+                'spisning_min': states('sensor.maaltid_spisning_min_i_vindue') | float(-1),
+                'oprydning_min': states('sensor.maaltid_oprydning_min_i_vindue') | float(-1),
+                'bekraeft_vindue_min': states('input_number.maaltid_hjemmearbejde_bekraeft_minutter') | float(-1),
+                'hjemmearbejde_ophold_min': states('sensor.hjemmearbejde_ophold_min_i_vindue') | float(-1),
+                'hjemmearbejde_taerskel': states('input_number.hjemmearbejde_ophold_minutter') | float(-1)
+              }
+            } | to_json | base64_encode }}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_maaltid_pending}
+        data: {value: "{{ fb_id }}"}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: maaltid, payload_b64: "{{ payload_b64 }}"}
+      - service: notify.mobile_app_phone_a
+        data:
+          title: "🍽️ {{ 'Hjemmearbejde ved bordet?' if guess == 'hjemmearbejde' else 'Måltid afsluttet?' }}"
+          message: >-
+            {{ 'Jeg vurderede lige: HJEMMEARBEJDE (ingen auto-støvsug resten af arbejdsvinduet).'
+               if guess == 'hjemmearbejde'
+               else 'Jeg vurderede lige: MÅLTID afsluttet (evt. auto-støvsug).' }}
+            Rigtigt? (træner måltids-detektionen)
+          data:
+            tag: trainer_maaltid
+            actions:
+              - action: "TRAINER_MAALTID_RIGTIG"
+                title: "✅ Rigtigt"
+              - action: "TRAINER_MAALTID_FORKERT"
+                title: "❌ Forkert"
+              - action: "TRAINER_MAALTID_VEDIKKE"
+                title: "🤷 Ved ikke"
+
+  - id: trainer_maaltid_answer
+    alias: "Træner: måltid-svar → log JSONL"
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default('')).startswith('TRAINER_MAALTID_') }}
+      - condition: template
+        value_template: >-
+          {{ states('input_text.trainer_maaltid_pending')
+             not in ['', 'unknown', 'unavailable'] }}
+    action:
+      - variables:
+          answer: "{{ trigger.event.data.action | replace('TRAINER_MAALTID_', '') | lower }}"
+          payload_b64: >-
+            {{ {
+              'type': 'answer',
+              'id': states('input_text.trainer_maaltid_pending'),
+              'ts': now().isoformat(),
+              'answer': answer,
+              'hjemmearbejde_dag_at_answer': states('input_boolean.maaltid_hjemmearbejde_dag')
+            } | to_json | base64_encode }}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: maaltid, payload_b64: "{{ payload_b64 }}"}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_maaltid_pending}
+        data: {value: ""}
+      # Ingen Tak-push (2026-10-20): knap-trykket fjerner selv notifikationen.
+
+  # ===========================================================================
+  # 5) DORMANT — var huset reelt i ro da vi gik i Dormant? (2026-07-24)
+  # Falsk Dormant = lys slukker på folk (den dyre fejl). 5 min sustained =
+  # flap-guard; dagtimer-vindue så pushen ikke vækker nogen om natten.
+  # Gap-timer = 650/intensitet: 50→13t (~1/dag max), 100→6.5t.
+  # ===========================================================================
+  - id: trainer_dormant_ask
+    alias: "Træner: Dormant-check (push + svar-knapper)"
+    trigger:
+      - platform: state
+        entity_id: input_select.house_state
+        to: "Dormant"
+        for: "00:05:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.trainer_dormant_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.notifikationer_master_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: time
+        after: "08:00:00"
+        before: "21:30:00"
+      # Tvivls-gaten (2026-10-20): 33/33 svar var "rigtig" — et sikkert gæt
+      # spørges der ikke om. Ældes et svar ud, spørges der én gang igen.
+      - condition: template
+        value_template: >-
+          {{ 'dormant' not in (state_attr('sensor.traener_dormant_sikre_gaet', 'sikre') or []) }}
+      - condition: template
+        value_template: >-
+          {{ (as_timestamp(now())
+              - (state_attr('input_datetime.trainer_dormant_sidste_push', 'timestamp') | float(0)))
+             > (650 / ([states('input_number.trainer_intensitet') | int(50), 1] | max))
+               * 3600 }}
+    action:
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.trainer_dormant_sidste_push}
+        data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
+      - variables:
+          fb_id: "{{ now().strftime('%Y%m%d%H%M%S') }}"
+          payload_b64: >-
+            {{ {
+              'type': 'ask',
+              'id': fb_id,
+              'ts': now().isoformat(),
+              'guess': 'dormant',
+              'hour': now().hour,
+              'people_estimate': states('sensor.people_estimate') | int(0),
+              'zones_now': states('sensor.people_zones_now') | int(0),
+              'parent_a_home': states('input_boolean.parent_a_home'),
+              'parent_b_home': states('input_boolean.parent_b_home'),
+              'signals': {
+                'stue': states('binary_sensor.stue_apollo_occupancy_filtered'),
+                'spisestue': states('binary_sensor.spisestue_apollo_occupancy_filtered'),
+                'koekken': states('binary_sensor.koekken_apollo_occupancy_filtered'),
+                'sove': states('binary_sensor.sovevaerelse_apollo_occupancy'),
+                'boern': states('binary_sensor.boernevaerelse_apollo_occupancy'),
+                'bad': states('binary_sensor.badevaerelse_inde_occupancy'),
+                'entre': states('binary_sensor.entre_valhorn_occupancy'),
+                'depot': states('binary_sensor.depot_valhorn_occupancy'),
+                'terrasse': states('binary_sensor.terrasse_active')
+              }
+            } | to_json | base64_encode }}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_dormant_pending}
+        data: {value: "{{ fb_id }}"}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: dormant, payload_b64: "{{ payload_b64 }}"}
+      - service: notify.mobile_app_phone_a
+        data:
+          title: "😴 Er her tomt eller helt stille?"
+          message: >-
+            Jeg har ikke set nogen bevæge sig i 5 min, så huset er gået i
+            Dormant. Passer det?
+          data:
+            tag: trainer_dormant
+            actions:
+              - action: "TRAINER_DORMANT_RIGTIG"
+                title: "✅ Ja"
+              - action: "TRAINER_DORMANT_FORKERT"
+                title: "❌ Nej, vi er her"
+              - action: "TRAINER_DORMANT_VEDIKKE"
+                title: "🤷 Ved ikke"
+
+  - id: trainer_dormant_answer
+    alias: "Træner: Dormant-svar → log JSONL"
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default('')).startswith('TRAINER_DORMANT_') }}
+      - condition: template
+        value_template: >-
+          {{ states('input_text.trainer_dormant_pending')
+             not in ['', 'unknown', 'unavailable'] }}
+    action:
+      - variables:
+          answer: "{{ trigger.event.data.action | replace('TRAINER_DORMANT_', '') | lower }}"
+          payload_b64: >-
+            {{ {
+              'type': 'answer',
+              'id': states('input_text.trainer_dormant_pending'),
+              'ts': now().isoformat(),
+              'answer': answer,
+              'house_state_at_answer': states('input_select.house_state')
+            } | to_json | base64_encode }}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: dormant, payload_b64: "{{ payload_b64 }}"}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_dormant_pending}
+        data: {value: ""}
+      # Ingen Tak-push (2026-10-20): knap-trykket fjerner selv notifikationen.
+      - service: homeassistant.update_entity
+        target: {entity_id: sensor.traener_dormant_sikre_gaet}
+        continue_on_error: true
+
+  # ===========================================================================
+  # 6) KØKKEN-TIMER — var nedtællingen ÆGTE? (2026-09-19, user-spec)
+  # ===========================================================================
+  # Kameraets finger-kanal har ingen sikkerheds-score: en hånd der tilfældigt
+  # holder fire fingre i nok frames starter en rigtig nedtælling med husdækkende
+  # lysalarm. Vi kan SE hvor mange frames der var, men ikke om mennesket MENTE
+  # det — det kan kun user svare på. Derfor denne træner: facit mod
+  # `input_number.gestus_hold_frames` (og de to andre gestus-slidere), så en
+  # senere session kan hæve tærsklen på MÅLTE falske positiver i stedet for på
+  # noten "3 er målt farligt, prøv 5".
+  #
+  # SPØRGER FØRST NÅR EPISODEN ER OVRE, ikke ved start:
+  #   · ved start kender vi ikke udfaldet, og en push midt i en ægte
+  #     madlavning er ren støj.
+  #   · levetiden ER diskriminatoren: en utilsigtet timer bliver annulleret
+  #     efter få sekunder, en ægte kører til ende. Spørger vi først bagefter,
+  #     kan den feature logges sammen med facit.
+  # Spørger på BEGGE udfald (færdig OG annulleret), fordi et negativ-sæt man
+  # kun samler på annulleringer er poseret (📏-reglen): kalibreringen skal se
+  # hele kontinuummet, ikke kun dem der allerede så forkerte ud.
+  #
+  # Start-konteksten kommer fra `sensor.koekken_trigger_log`s `sidste_*`-
+  # attributter (packages/tapo_tuning.yaml) — samme stempel som Tapo-sidens
+  # log, så kilde og bevis kun har ÉN ejer (#2).
+  - id: trainer_timer_ask
+    alias: "Træner: var køkken-timeren ægte? (push + svar-knapper)"
+    mode: queued
+    max: 5
+    trigger:
+      - platform: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.koekken_gestus
+        id: faerdig
+      - platform: event
+        event_type: timer.cancelled
+        event_data:
+          entity_id: timer.koekken_gestus
+        id: annulleret
+    condition:
+      - condition: state
+        entity_id: input_boolean.trainer_timer_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.notifikationer_master_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Intensitet < 50 → sampl ned (i×2 % chance), som de andre event-trænere.
+      - condition: template
+        value_template: >-
+          {{ range(1, 101) | random
+             <= [(states('input_number.trainer_intensitet') | int(50)) * 2, 100] | min }}
+    action:
+      # Stempl slut-tidspunktet FØR ventetiden: alarmen kan ringe i minutter, og
+      # den tid hører ikke til nedtællingens levetid.
+      - variables:
+          slut_ts: "{{ as_timestamp(now()) }}"
+          start_ts: >-
+            {{ as_timestamp(state_attr('sensor.koekken_trigger_log', 'sidste_ts')
+                            | default('', true), 0) | float(0) }}
+      # En færdig timer ringer husdækkende lysalarm; spørgsmålet skal ikke lande
+      # oven i den. Annullerede timere har ingen alarm og passerer med det samme.
+      - wait_template: >-
+          {{ not states('input_text.koekken_gestus_alarm').startswith('aktiv') }}
+        timeout: "00:06:00"
+        continue_on_timeout: true
+      # Mode kan være flippet til AirBnB mens alarmen ringede (gæst ankommet).
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - variables:
+          fb_id: "{{ now().strftime('%Y%m%d%H%M%S') }}"
+          udfald: "{{ trigger.id }}"
+          # Varigheden kommer fra TIMEREN SELV, ikke fra log-sensoren: `duration`
+          # overlever både restart og et reload, og den kan ikke komme til at
+          # beskrive en anden episode.
+          varighed_sek: >-
+            {% set p = (state_attr('timer.koekken_gestus', 'duration')
+                        | default('0:00:00', true) | string).split(':') %}
+            {{ (p[0] | int(0)) * 3600 + (p[1] | int(0)) * 60 + (p[2] | int(0)) }}
+          minutter: "{{ ((varighed_sek | int(0)) / 60) | round(0) | int(0) }}"
+          # Log-sensorens stempel RESTORERES over reload og genstart, så et
+          # gammelt `sidste_kilde` ville ellers blive hæftet på en episode det
+          # ikke hører til. Er stemplet ældre end selve nedtællingen (+2 min
+          # slack), er kilden ukendt — og det skal stå i loggen som ukendt, ikke
+          # som et gæt (en forkert etiket er værre end et hul).
+          stempel_alder_sek: >-
+            {{ ((slut_ts | float(0)) - (start_ts | float(0))) | round(0)
+               if (start_ts | float(0)) > 0 else -1 }}
+          kilde: >-
+            {{ state_attr('sensor.koekken_trigger_log', 'sidste_kilde') | default('ukendt', true)
+               if (stempel_alder_sek | int(-1)) >= 0
+                  and (stempel_alder_sek | int(-1)) <= (varighed_sek | int(0)) + 120
+               else 'ukendt' }}
+          bevis: >-
+            {{ state_attr('sensor.koekken_trigger_log', 'sidste_bevis') | default('—', true)
+               if kilde != 'ukendt' else '—' }}
+          # -1 = intet brugbart start-stempel (HA genstartede midt i
+          # nedtællingen, eller timeren blev sat før denne feature gik live).
+          levetid_sek: >-
+            {{ stempel_alder_sek | int(-1) if kilde != 'ukendt' else -1 }}
+          payload_b64: >-
+            {{ {
+              'type': 'ask',
+              'id': fb_id,
+              'ts': now().isoformat(),
+              'guess': 'timer_aegte',
+              'hour': now().hour,
+              'signals': {
+                'kilde': kilde,
+                'bevis': bevis,
+                'minutter': minutter | int(0),
+                'udfald': udfald,
+                'levetid_sek': levetid_sek | int(-1),
+                'varighed_sek': varighed_sek | int(0),
+                'andel_koert': ((levetid_sek | float(-1)) / (varighed_sek | float(1))) | round(3)
+                               if (varighed_sek | int(0)) > 0 and (levetid_sek | float(-1)) >= 0 else -1,
+                'hold_frames': states('input_number.gestus_hold_frames') | float(-1),
+                'hold_knytnaeve': states('input_number.gestus_hold_knytnaeve') | float(-1),
+                'frisk_sek': states('input_number.gestus_frisk_sek') | float(-1),
+                'gentag_cooldown_sek': states('input_number.gestus_gentag_cooldown_sek') | float(-1),
+                'kamera_krop': states('binary_sensor.koekken_kamera_krop'),
+                'house_mode': states('input_select.house_mode')
+              }
+            } | to_json | base64_encode }}
+      # Kun FINGER-startede timere (2026-10-20): træneren kalibrerer finger-
+      # tærsklen, og stemme-/knap-timere er ikke i tvivl — målt 19/9-11/10:
+      # 6 stemme- og 5 ukendt-kilde-spørgsmål, 0 svar; fingre 7 af 13 svaret.
+      - condition: template
+        value_template: "{{ kilde == 'fingre' }}"
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_timer_pending}
+        data: {value: "{{ fb_id }}"}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: timer, payload_b64: "{{ payload_b64 }}"}
+      - service: notify.mobile_app_phone_a
+        data:
+          title: >-
+            ⏲️ {{ minutter }} min-timeren {{ 'kørte til ende' if udfald == 'faerdig'
+                                             else 'blev annulleret' }} — var den din?
+          message: >-
+            Kameraet så fingre ({{ bevis }}), og den kørte
+            {{ ((levetid_sek | int(0) / 60) | round(1) | string) | replace('.', ',') }} min.
+          data:
+            tag: trainer_timer
+            actions:
+              - action: "TRAINER_TIMER_RIGTIG"
+                title: "✅ Min egen"
+              - action: "TRAINER_TIMER_UTILSIGTET"
+                title: "🖐️ Utilsigtet"
+              - action: "TRAINER_TIMER_FORKERTTAL"
+                title: "🔢 Forkert tal"
+
+  - id: trainer_timer_answer
+    alias: "Træner: køkken-timer-svar → log JSONL"
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default('')).startswith('TRAINER_TIMER_') }}
+      - condition: template
+        value_template: >-
+          {{ states('input_text.trainer_timer_pending')
+             not in ['', 'unknown', 'unavailable'] }}
+    action:
+      - variables:
+          answer: "{{ trigger.event.data.action | replace('TRAINER_TIMER_', '') | lower }}"
+          payload_b64: >-
+            {{ {
+              'type': 'answer',
+              'id': states('input_text.trainer_timer_pending'),
+              'ts': now().isoformat(),
+              'answer': answer,
+              'hold_frames_at_answer': states('input_number.gestus_hold_frames') | float(-1)
+            } | to_json | base64_encode }}
+      - service: shell_command.ai_feedback_append
+        data: {log_slug: timer, payload_b64: "{{ payload_b64 }}"}
+      - service: input_text.set_value
+        target: {entity_id: input_text.trainer_timer_pending}
+        data: {value: ""}
+      # Ingen Tak-push (2026-10-20): knap-trykket fjerner selv notifikationen.

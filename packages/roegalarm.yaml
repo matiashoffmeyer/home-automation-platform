@@ -1,0 +1,556 @@
+# =============================================================================
+# Røgalarm i entréen — strøm-afbrydelse + hvid nødbelysning med rødt blink
+# =============================================================================
+# User 2026-07-28: "hvis røgalarmen går af skal smartplugget slukkes så vi
+# undgår lithium brænde og notifikation sendes og lejligheden (all lights)
+# blinker rødt hvert 20. sek indtil man trykker på entre styrbar (en hvilken
+# som helst knap)."
+#
+# User 2026-09-12 (ændrer lys-delen): "ret også at røg alarmen får huset til at
+# blinke rødt. det skal i stedet tænde alt lys bright hvid med rødt blink hvert
+# 10. sek så man kan finde ud. og det ligger over ALLE andre ting i
+# prioriteten."
+#
+# HARDWARE: Tuya TS0601 (_TZE284_mqaeyix5), parret 2026-07-28, hænger i entréen
+# OVER cykel-batterierne. Sensoren findes kun fordi vi selv skrev en ZHA-quirk
+# (custom_zha_quirks/ts0601_smoke.py) — uden den eksponerer ZHA kun en
+# firmware-entity. Kun DP 1 (røg) er implementeret; der er INGEN batteri- eller
+# tamper-entity på denne enhed, så batteri-watchdoggen kan ikke se den.
+#   binary_sensor.entre_roegalarm   (device_class: smoke)
+#
+# TRIGGER-VALG: `to: "on"` — IKKE `from: "off"`. Tuya-røgalarmer rapporterer
+# kun ved ændring, så sensoren står `unknown` indtil enheden har sendt første
+# gang; en from-off-trigger ville misse alarmen efter en HA-restart.
+#
+# HANDLINGS-RÆKKEFØLGE (bevidst): strømmen til laderen ryger FØRST, før
+# notifikation og lys. Alt efter trin 1 kan fejle uden at et lithium-batteri
+# bliver ved med at trække strøm i en brand.
+#
+# HÅRD LÅS: `input_boolean.cykel_lader_alarm_lock` sættes og ryddes ALDRIG
+# automatisk — ikke ved at røgen forsvinder, ikke ved mode-skift, ikke ved
+# kvittering på blinket. En lithium-brand må ikke kunne genoptage ladning af
+# sig selv. Brugeren rydder låsen manuelt på Indstillinger → El & pris.
+#
+# NOTIFIKATION GÅR *IKKE* GENNEM script.push_notify (bevidst undtagelse fra
+# husets ellers ufravigelige dispatch-regel): push_notify kan droppe en besked
+# på master-kontakten, type-toggle, tidsvindue, AirBnB-opt-in eller lægge den i
+# hjemkomst-køen. Ingen af de gates må kunne sluge en brandalarm. Derfor kaldes
+# begge telefoner direkte, med kritisk prioritet (Android alarm_stream_max =
+# alarm-volumen selv i lydløs; iOS critical = bryder Fokus/DND).
+#
+# NØDBELYSNINGEN er BEVIDST IKKE mode-gatet — en brand rammer også en
+# AirBnB-gæst. Men gæsten kender ikke entré-Styrbaren, så der SKAL være en
+# automatisk udgang: `roegalarm_blink_max_minutter` (30) stopper den af sig selv
+# (jf. CLAUDE.md's AirBnB-regel #2 om suppressorer/enforcere uden escape-vej).
+#
+# LYS-ADFÆRDEN (user-spec 2026-09-12, ændret fra det oprindelige røde blink):
+# hele lejligheden tændes FULDT HVIDT og bliver det — det er flugtvejslyset,
+# "så man kan finde ud". Oven på det blinker de farve-kapable pærer RØDT i
+# 1,5 s hvert 10. sekund som alarm-signal; de rene hvide pærer blinker bevidst
+# IKKE med, så der altid er konstant lys at gå efter. Tidligere stod hele
+# lejligheden dæmpet rød (26/255) mellem blinkene, hvilket er det modsatte af
+# at kunne se en udgang.
+#
+# PRIORITET: røgalarmen ligger over ALT andet lys. Det håndhæves ikke med
+# gates i husets 53 sluk-kaldere (urealistisk + evig drift, #16), men med en
+# `call_service`-event-trigger der fanger enhver sluk-vej og re-asserterer
+# inden for ~0,5 s — se automation 2b. 10-sekunders-loopet er andet lag.
+#
+# Listerne beregnes DYNAMISK fra `light.alle_lys` ved hvert kald, så
+# nye/afmonterede pærer og `unavailable` enheder håndteres uden at vedligeholde
+# et roster (fejlklasse #16).
+# =============================================================================
+
+input_boolean:
+  # Killswitch — gater KUN det RØDE BLINK. Strøm-afbrydelsen, notifikationen og
+  # den hvide nødbelysning kan ikke slås fra: det er livssikkerhed, ikke
+  # komfort. (Indtil 2026-09-12 gatede den også lyset; det var forkert — man
+  # skal ikke kunne slå sin egen flugtvejsbelysning fra.)
+  roegalarm_blink_enabled:
+    name: "🚨 Røgalarm: rødt blink oven på nødbelysningen"
+    icon: mdi:alarm-light
+  # Runtime: nødbelysningen kører lige nu og venter på kvittering. Flaget er
+  # også det der giver røgalarmen forrang over al anden lys-logik (automation
+  # 2b), så det sættes uanset om det røde blink er slået fra.
+  roegalarm_blink_active:
+    name: "🚨 Røgalarm: nødbelysning kører (runtime)"
+    icon: mdi:alarm-light-outline
+
+input_number:
+  # Automatisk udgang — se AirBnB-begrundelsen i headeren.
+  roegalarm_blink_max_minutter:
+    name: "🚨 Røgalarm: nødbelysning stopper selv efter (min)"
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:timer-off
+    mode: box
+
+input_datetime:
+  # Runtime-stempel. Nødvendigt fordi en restart giver restaurerede booleans et
+  # NYT last_changed → en `for:`-trigger ville starte sin nedtælling forfra og
+  # kunne forlænge blinket i det uendelige (fejlklasse #4-familien).
+  roegalarm_blink_start:
+    name: "🚨 Røgalarm: nødbelysning startet"
+    icon: mdi:clock-alert
+    has_date: true
+    has_time: true
+
+script:
+  # ---------------------------------------------------------------------------
+  # NØDBELYSNING — hele lejligheden tændt, fuldt HVIDT. Dette ER flugtvejslyset
+  # (user-spec 2026-09-12: "tænde alt lys bright hvid ... så man kan finde ud"),
+  # og det køres derfor UDEN killswitch-gate. Killswitchen gater kun det røde
+  # blink ovenpå — man skal ikke kunne slå sin egen flugtvejsbelysning fra.
+  #
+  # TRE kurve, fordi "hvid" ikke er én kommando: en pære med color_temp får
+  # kelvin, en ren farvepære får rgb-hvid, og en on/off-pære får kun brightness.
+  # Sendes rgb_color til en ct-pære (eller omvendt) fejler kaldet. Listerne
+  # beregnes DYNAMISK ved hvert kald, så nye/afmonterede pærer og `unavailable`
+  # enheder håndteres uden at vedligeholde et roster (fejlklasse #16).
+  #
+  # Entity-lister holdes som CSV-strenge og splittes først i target: et
+  # >-foldet Jinja-block giver en STRENG, ikke en liste (kendt Jinja-fælde).
+  #
+  # `transition: 0` overalt er IKKE kosmetik: brightness + color_temp +
+  # transition > 0 i samme kald lander TRADFRI WS-pæren (light.depot_loft_ikea)
+  # på 2 % (målt 2026-08-18) — og 2 % er den værst tænkelige fejl under en brand.
+  # ---------------------------------------------------------------------------
+  roegalarm_lys_hvidt:
+    alias: "🚨 Røgalarm: alt lys fuldt hvidt (flugtvej)"
+    icon: mdi:lightbulb-on-outline
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - variables:
+          hvid_ct: >-
+            {% set ns = namespace(t=[]) %}
+            {% for l in expand('light.alle_lys') %}
+              {% if l.state not in ['unavailable', 'unknown']
+                    and 'color_temp' in (l.attributes.get('supported_color_modes') or []) %}
+                {% set ns.t = ns.t + [l.entity_id] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.t | join(',') }}
+          hvid_rgb: >-
+            {% set ns = namespace(t=[]) %}
+            {% for l in expand('light.alle_lys') %}
+              {% if l.state not in ['unavailable', 'unknown'] %}
+                {% set m = l.attributes.get('supported_color_modes') or [] %}
+                {% if 'color_temp' not in m
+                      and ('hs' in m or 'rgb' in m or 'xy' in m or 'rgbw' in m or 'rgbww' in m) %}
+                  {% set ns.t = ns.t + [l.entity_id] %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.t | join(',') }}
+          hvid_bri: >-
+            {% set ns = namespace(t=[]) %}
+            {% for l in expand('light.alle_lys') %}
+              {% if l.state not in ['unavailable', 'unknown'] %}
+                {% set m = l.attributes.get('supported_color_modes') or [] %}
+                {% if 'color_temp' not in m
+                      and not ('hs' in m or 'rgb' in m or 'xy' in m or 'rgbw' in m or 'rgbww' in m) %}
+                  {% set ns.t = ns.t + [l.entity_id] %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.t | join(',') }}
+      - if:
+          - condition: template
+            value_template: "{{ hvid_ct | length > 0 }}"
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ hvid_ct.split(',') }}"
+            data:
+              color_temp_kelvin: 4000
+              brightness: 255
+              transition: 0
+      - if:
+          - condition: template
+            value_template: "{{ hvid_rgb | length > 0 }}"
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ hvid_rgb.split(',') }}"
+            data:
+              rgb_color: [255, 255, 255]
+              brightness: 255
+              transition: 0
+      - if:
+          - condition: template
+            value_template: "{{ hvid_bri | length > 0 }}"
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ hvid_bri.split(',') }}"
+            data:
+              brightness: 255
+              transition: 0
+
+  # ---------------------------------------------------------------------------
+  # ÉT RØDT BLINK ovenpå nødbelysningen: farve-kapable pærer går fuldt røde i
+  # 1,5 s og vender så tilbage til hvid. 1,5 s er ikke et pænt tal — det er et
+  # GULV: et farvet light.turn_on er TO zigbee-frames pr. pære, og et blink hvis
+  # ON-fase er kortere end radio-bølgen kan aldrig se synkront ud (CLAUDE.md,
+  # målt 30/8). Med husets ~11 farve-pærer og HA's ~5-10 lys-kald/sek er under
+  # ét sekund for kort.
+  #
+  # Rene hvide pærer blinker BEVIDST ikke med: de er den eneste konstante
+  # lyskilde mens farve-pærerne står røde, og en brand er ikke tidspunktet at
+  # gøre gangarealet mørkere. Blinket er signalet, hvidt lys er flugtvejen.
+  # ---------------------------------------------------------------------------
+  roegalarm_blink_once:
+    alias: "🚨 Røgalarm: ét rødt blink"
+    icon: mdi:alarm-light
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - variables:
+          farve: >-
+            {% set ns = namespace(t=[]) %}
+            {% for l in expand('light.alle_lys') %}
+              {% if l.state not in ['unavailable', 'unknown'] %}
+                {% set m = l.attributes.get('supported_color_modes') or [] %}
+                {% if 'hs' in m or 'rgb' in m or 'xy' in m or 'rgbw' in m or 'rgbww' in m %}
+                  {% set ns.t = ns.t + [l.entity_id] %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.t | join(',') }}
+      - if:
+          - condition: template
+            value_template: "{{ farve | length > 0 }}"
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ farve.split(',') }}"
+            data:
+              rgb_color: [255, 0, 0]
+              brightness: 255
+              transition: 0
+          - delay:
+              milliseconds: 1500
+      # Tilbage til hvidt — også hvis der ikke var farve-pærer at blinke med,
+      # for så virker kaldet som en gratis re-assert af flugtvejslyset.
+      - service: script.roegalarm_lys_hvidt
+
+automation:
+  # ===========================================================================
+  # 1) ALARMEN GÅR: strøm af → notifikation → blink.
+  # ===========================================================================
+  - id: roegalarm_udloest
+    alias: "🚨 Røgalarm: sluk lader, varsl, start rødt blink"
+    description: >
+      Røg i entréen over cykel-batterierne. Strømmen ryger først, så varsel til
+      begge telefoner (uden om push_notify-gates), så det røde husblink.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.entre_roegalarm
+        to: "on"
+    action:
+      # --- 1. STRØM AF (må ikke kunne blokeres af noget) ---
+      - service: switch.turn_off
+        target:
+          entity_id: switch.entre_cykel_lader_plug
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.cykel_lader_alarm_lock
+
+      # --- 2. KRITISK VARSEL til begge telefoner, uden om alle gates ---
+      - service: notify.mobile_app_phone_a
+        data:
+          title: "🚨 RØGALARM I ENTRÉEN"
+          message: >-
+            Røg detekteret over cykel-batterierne. Ladepluggen er slukket og
+            spærret. Alt lys er tændt fuldt hvidt og blinker rødt hvert 10. sek
+            — tryk på en knap på entré-Styrbaren for at kvittere.
+          data:
+            channel: alarm_stream_max
+            importance: high
+            priority: high
+            ttl: 0
+            tag: roegalarm
+            color: red
+            persistent: true
+      - service: notify.mobile_app_phone_b
+        data:
+          title: "🚨 RØGALARM I ENTRÉEN"
+          message: >-
+            Røg detekteret over cykel-batterierne. Ladepluggen er slukket og
+            spærret. Alt lys er tændt fuldt hvidt og blinker rødt hvert 10. sek
+            — tryk på en knap på entré-Styrbaren for at kvittere.
+          data:
+            push:
+              sound:
+                name: default
+                critical: 1
+                volume: 1.0
+            interruption-level: critical
+            tag: roegalarm
+      - service: persistent_notification.create
+        data:
+          notification_id: roegalarm
+          title: "🚨 Røgalarm i entréen"
+          message: >-
+            Udløst {{ now().strftime('%d-%m %H:%M:%S') }}. Cykel-laderen er
+            slukket og HÅRDT spærret (`cykel_lader_alarm_lock`) — ryd den
+            manuelt under Indstillinger → 🏠 Hus → Røgalarm når batterierne er tjekket.
+
+      # --- 3. NØDBELYSNING: alt lys fuldt hvidt, øjeblikkeligt og UDEN gates.
+      # Hverken killswitch eller house_mode. Flugtvejslys er livssikkerhed på
+      # linje med strøm-afbrydelsen og varslet ovenfor, og en gæst der ikke
+      # kender lejligheden har allermest brug for at kunne se udgangen.
+      # Stemplet og runtime-flaget sættes FØR lyset: flaget er det der holder
+      # alt andet lys-logik væk (se automation 2b), og det må ikke kunne
+      # mangle i det sekund lyset tændes.
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.roegalarm_blink_start
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.roegalarm_blink_active
+      - service: script.roegalarm_lys_hvidt
+
+      # --- 4. RØDT BLINK ovenpå (killswitch-gated, ikke mode-gated).
+      # Blink med det samme — vent ikke på loopets første interval.
+      #
+      # Men FØRST 1,2 s settle: en Matter-pære der kommer fra `off` bruger
+      # ~1,1 s på at nå op (målt 12/9 på `light.entre_loft`, KAJPLATS: 1,21 s
+      # fra slukket, men kun 0,19 s når den allerede lyser). Uden pausen lander
+      # det første røde blink midt i koldstarten på præcis de langsomme pærer —
+      # og entré-loftet ER flugtvejen. Fra 2. blink og frem er lyset oppe, så
+      # loopets 8,5 s-delay behøver ikke samme margin.
+      - delay:
+          milliseconds: 1200
+      - if:
+          - condition: state
+            entity_id: input_boolean.roegalarm_blink_enabled
+            state: "on"
+        then:
+          - service: script.roegalarm_blink_once
+
+  # ===========================================================================
+  # 2) BLINK-LOOPET. `mode: single` gør /1-min-triggeren gratis: kører loopet
+  # allerede, droppes den lydløst. Dør loopet på en HA-restart, starter samme
+  # trigger det igen inden for et minut (en time_pattern-trigger overlever, en
+  # kørende sekvens gør ikke).
+  # ===========================================================================
+  - id: roegalarm_blink_loop
+    alias: "🚨 Røgalarm: hvid nødbelysning + rødt blink hvert 10. sekund"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_boolean.roegalarm_blink_active
+        to: "on"
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      # KUN runtime-flaget. Killswitchen gater det røde blink inde i loopet,
+      # ikke loopet selv: den hvide re-assert er flugtvejslys og skal køre
+      # også når nogen har slået blinket fra.
+      - condition: state
+        entity_id: input_boolean.roegalarm_blink_active
+        state: "on"
+    action:
+      - repeat:
+          # 10 sek er user-spec (2026-09-12) og står som tal ÉT sted: en
+          # time_pattern kan ikke templates, så loopet er valgt netop for at
+          # holde intervallet samlet og samtidig være restart-genstartbart.
+          # 8,5 s + blinkets egne 1,5 s = en periode på 10 s.
+          sequence:
+            - delay:
+                seconds: 8
+                milliseconds: 500
+            - if:
+                - condition: state
+                  entity_id: input_boolean.roegalarm_blink_active
+                  state: "on"
+              then:
+                - if:
+                    - condition: state
+                      entity_id: input_boolean.roegalarm_blink_enabled
+                      state: "on"
+                  then:
+                    - service: script.roegalarm_blink_once
+                  else:
+                    # Blinket er slået fra, men lyset skal stadig re-asserteres
+                    # — ellers kunne en anden automation slukke flugtvejen.
+                    - service: script.roegalarm_lys_hvidt
+          while:
+            - condition: state
+              entity_id: input_boolean.roegalarm_blink_active
+              state: "on"
+
+  # ===========================================================================
+  # 2b) PRIORITET: røgalarmen ligger over ALT andet lys (user-spec 2026-09-12).
+  #
+  # Huset har 53 filer der kalder `light.turn_off` — en gate i dem alle ville
+  # være både urealistisk og evigt drivende (#16). I stedet detekteres
+  # INTERFERENSEN direkte: HA fyrer et `call_service`-event for HVERT
+  # service-kald, så én event-trigger fanger enhver sluk-vej i huset uden at
+  # kende et eneste entity-navn — og uden at kunne drifte fra et roster.
+  #
+  # Ingen feedback-løkke: vi kalder kun `light.turn_on` (og `script.*`), aldrig
+  # turn_off/toggle, så vi kan ikke trigge os selv. `mode: single` +
+  # max_exceeded kollapser en byge af sluk-kald til én re-assert.
+  #
+  # De 400 ms er bevidste: uden dem kunne vores turn_on lande FØR det turn_off
+  # vi reagerer på, og så ville slukningen vinde alligevel.
+  #
+  # Dette erstatter ikke 10-sekunders-loopet — det forkorter blot værste
+  # tilfælde fra ~10 s mørke til ~0,5 s.
+  # ===========================================================================
+  - id: roegalarm_overstyr_interferens
+    alias: "🚨 Røgalarm: overstyr alt andet lys øjeblikkeligt"
+    description: >-
+      Under en aktiv røgalarm gen-tænder ethvert sluk-kald fra resten af huset
+      straks flugtvejslyset. Livssikkerhed vinder over al anden lys-logik.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: light
+          service: turn_off
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: light
+          service: toggle
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: homeassistant
+          service: turn_off
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: scene
+          service: turn_on
+    condition:
+      - condition: state
+        entity_id: input_boolean.roegalarm_blink_active
+        state: "on"
+    action:
+      - delay:
+          milliseconds: 400
+      - service: script.roegalarm_lys_hvidt
+
+  # ===========================================================================
+  # 3) KVITTERING: en HVILKEN SOM HELST knap på entré-Styrbaren (user-spec).
+  # Ingen `command:`-filter → alle former fanges (on/off/move/stop og den gamle
+  # quirks `press`), så en fysisk knap ikke kan misse fordi event-formen
+  # skifter med en quirk-opdatering.
+  # ===========================================================================
+  - id: roegalarm_kvittering
+    alias: "🚨 Røgalarm: kvittér blink med entré-Styrbar"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "8d:72:8b:88:07:4a:d1:aa"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roegalarm_blink_active
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.roegalarm_blink_active
+      # Efterlad IKKE lejligheden dæmpet rød: sæt fuldt, neutralt lys så man
+      # kan se hvad der foregår. Lyset slukkes bevidst ikke — husets normale
+      # presence-/mode-logik tager over derfra.
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.alle_lys
+        data:
+          brightness: 255
+          color_temp_kelvin: 3000
+          transition: 1
+      # bri+ct+transition lander TRADFRI WS-pæren på 2 % (2026-08-18) — se
+      # packages/light_groups.yaml. Under en røgalarm er 2 % den værst
+      # tænkelige fejl. Entréen er UDE af listen siden 2026-08-21: husets
+      # flugtvejs-loft er nu en KAJPLATS på Matter, uden quirken.
+      - service: script.tradfri_ws_bri_fix
+        data:
+          entity_id:
+            - light.depot_loft_ikea
+          brightness_pct: 100
+      - service: logbook.log
+        data:
+          name: "Røgalarm"
+          message: >-
+            Blink kvitteret på entré-Styrbaren. Laderen er FORTSAT spærret
+            (ryddes manuelt).
+
+  # ===========================================================================
+  # 4) AUTOMATISK UDGANG. To triggere: `for:`-flanken i normal drift, og en
+  # /5-backstop der måler på STEMPLET — en restart giver restaurerede booleans
+  # et nyt last_changed, så flanken alene kunne forlænge blinket i det
+  # uendelige.
+  # ===========================================================================
+  - id: roegalarm_blink_timeout
+    alias: "🚨 Røgalarm: stop blink automatisk"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_boolean.roegalarm_blink_active
+        to: "on"
+        for:
+          minutes: "{{ states('input_number.roegalarm_blink_max_minutter') | int(30) }}"
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roegalarm_blink_active
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set ts = state_attr('input_datetime.roegalarm_blink_start', 'timestamp') | float(0) %}
+          {% set maks = states('input_number.roegalarm_blink_max_minutter') | float(30) * 60 %}
+          {{ ts > 0 and (as_timestamp(now()) - ts) > maks }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.roegalarm_blink_active
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.alle_lys
+        data:
+          brightness: 255
+          color_temp_kelvin: 3000
+          transition: 1
+      # bri+ct+transition lander TRADFRI WS-pæren på 2 % (2026-08-18) — se
+      # packages/light_groups.yaml. Under en røgalarm er 2 % den værst
+      # tænkelige fejl. Entréen er UDE af listen siden 2026-08-21: husets
+      # flugtvejs-loft er nu en KAJPLATS på Matter, uden quirken.
+      - service: script.tradfri_ws_bri_fix
+        data:
+          entity_id:
+            - light.depot_loft_ikea
+          brightness_pct: 100
+      - service: logbook.log
+        data:
+          name: "Røgalarm"
+          message: >-
+            Blink stoppet automatisk efter
+            {{ states('input_number.roegalarm_blink_max_minutter') }} min uden
+            kvittering. Laderen er FORTSAT spærret.

@@ -1,0 +1,293 @@
+# =============================================================================
+# Stue: ilden starter mørke morgener — læselampen fader ind bagefter
+# (2026-10-13, user-spec)
+# =============================================================================
+# User: "på mørke morgener må ilden i stuen gerne starte op lige før du
+# forudser vi går ind i open plan. se på historik vores mønstre er ok stabile.
+# i starten skal læselampen holdes slukket og så skal den fade langsomt ind
+# over 15 min, men hurtigere hvis der er meget bevægelse lige foran apollo stue"
+#
+# FORUDSIGELSEN (målt 28/9-12/10, 16 morgener i recorderen): morgenen går
+# soveværelse → entré (+ bad) → open plan. Første entré-flanke efter godnat er
+# ryddet kom 0,3 · 2,9 · 7,5 · 3,1 · 2,9 · 2,1 · 16,9 · 18,3 · 14,9 · 2,5 ·
+# 17,4 min før første ophold ≥ 30 s i stue/spisestue/køkken (median ~3 min),
+# og der KOM nogen ind efter hver eneste af dem. Godnat-clear (alarm/
+# soveværelse) ligger 1-100 min før — for spredt. Klokkeslættet alene
+# (05:41-07:22) endnu mere. Entré-flanken er derfor "lige før":
+# presence_light_sofa_on fyrer allerede på den en mørk morgen
+# (moerk_morgen_nabo) og via entré-velkomsten — begge omdirigeres hertil.
+#
+# FORLØBET:
+#   1. Ild-fasen: spotsene gløder op (orange, lav styrke) og stue_spots_ild
+#      tager over; læselampen er SLUKKET. input_boolean.stue_ild_morgen_aktiv
+#      erstatter læselampen som spejlets og ildens "kilde" (stue_spots.yaml,
+#      stue_spots_ild.yaml).
+#   2. Fade-fasen starter når nogen er inde i open plan (stue/spisestue/køkken
+#      filtered): læselampen 1 → morgen-niveauet (samme mål som sofa-zonens
+#      mørk-morgen-tænding: morgenrampe_stue_pct under læselampe-loftet ×
+#      el-pris) over stue_ild_morgen_fade_minutter. Kurven er p² — lige meget
+#      synligt løft pr. minut, i stedet for et lineært spring i starten.
+#   3. Hurtigere ved bevægelse: hvert 5. s tjekkes stue-Apolloens rå
+#      moving_target + moving_distance ≤ stue_ild_morgen_naer_cm; et "nært"
+#      sample tæller stue_ild_morgen_hurtigere gange. Konstant bevægelse
+#      foran radaren = fade / hurtigere; ingen = den fulde tid.
+#      ⚠️ naer_cm (150 = slutningen af radarens zone 2) er IKKE målt — distance
+#      og moving_target står ikke i recorderen. Logbogen skriver pr. morgen
+#      hvor stor en andel af tiden der var bevægelse, og hvor meget af den der
+#      lå inden for grænsen → kalibrér på det (📏).
+#   4. Kommer ingen ind i openplan_entre_velkomst_tom_minutter (samme slider
+#      som velkomstens udgang), slukkes flaget → spejlet slukker spotsene.
+#
+# EJERSKAB (#1/#2/#27):
+# - Læselampen: kun dette script skriver den mens flaget er on. En fremmed
+#   skrivning (context med parent/user_id — sofa-sluk, appen, Styrbar) eller
+#   en slukket/unavailable lampe (vægkontakten = user) stopper faden, og
+#   flaget ryddes. Manual (manual_override) lukker gaten → stop.
+# - Spotsene: tændes af scriptet (glød) og ejes derefter af ilden; spejlet
+#   rører kun slukkede spots mens ilden er aktiv.
+# - Skabs-pærerne (B132) og hygge-pluggen tændes ikke her (pluggen var allerede
+#   ude af morgenen 2026-10-11).
+# Restart/reload dræber scriptet midt i faden → stue_ild_morgen_genoptag
+# starter det igen; det genoptager fra læselampens aktuelle styrke.
+# AirBnB: gaten kræver familie-mode (via stue_spots_ild_mulig) → et hængende
+# flag ryddes af genoptag-automationen (scriptet rydder det når gaten er off).
+# =============================================================================
+
+input_boolean:
+  # Kill switch. Ingen `initial:` — sat on via API ved deploy.
+  stue_ild_morgen_enabled:
+    name: "Stue: ild på mørke morgener"
+    icon: mdi:fire
+  # Runtime (eksporteres ikke). On fra ilden tænder til læselampen er fuldt
+  # oppe, faden afbrydes, eller ingen kom ind.
+  stue_ild_morgen_aktiv:
+    name: "Stue ild-morgen: kører"
+    icon: mdi:fire-alert
+
+input_number:
+  stue_ild_morgen_fade_minutter:
+    name: "Ild-morgen: læselampe fader ind over"
+    icon: mdi:transition
+    min: 3
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+  # 3 = konstant bevægelse foran radaren giver 15 → 5 min. Gæt (user: "hurtigere").
+  stue_ild_morgen_hurtigere:
+    name: "Ild-morgen: hurtigere ved bevægelse (×)"
+    icon: mdi:run-fast
+    min: 1
+    max: 6
+    step: 0.5
+    unit_of_measurement: "×"
+    mode: slider
+  stue_ild_morgen_naer_cm:
+    name: "Ild-morgen: bevægelse tæller inden for"
+    icon: mdi:signal-distance-variant
+    min: 50
+    max: 600
+    step: 10
+    unit_of_measurement: "cm"
+    mode: slider
+
+template:
+  - binary_sensor:
+      # ÉT anker (#2): læses af sofa-zonens to mørk-morgen-tændveje
+      # (presence_stue.yaml, presence_lights.yaml) og af scriptet.
+      - name: "Stue ild morgen mulig"
+        unique_id: stue_ild_morgen_mulig
+        icon: mdi:fire
+        state: >-
+          {# ild-kontakten eksplicit: ild_mulig åbner også for Spotify alene (17/10) #}
+          {{ is_state('input_boolean.stue_ild_morgen_enabled', 'on')
+             and is_state('input_boolean.stue_spots_ild', 'on')
+             and is_state('binary_sensor.stue_spots_ild_mulig', 'on')
+             and is_state('binary_sensor.open_plan_mork_morgen', 'on') }}
+
+script:
+  stue_ild_morgen:
+    alias: "Stue: ild på mørk morgen — læselampen fader ind"
+    icon: mdi:fire
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('binary_sensor.stue_ild_morgen_mulig', 'on') }}"
+        then:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.stue_ild_morgen_aktiv
+          - stop: "Ikke en mørk ild-morgen"
+      - variables:
+          tick: 5
+          T: "{{ [states('input_number.stue_ild_morgen_fade_minutter') | float(15), 1] | max * 60 }}"
+          B: "{{ [states('input_number.stue_ild_morgen_hurtigere') | float(3), 1] | max }}"
+          naer_cm: "{{ states('input_number.stue_ild_morgen_naer_cm') | float(150) }}"
+          # Sofa-zonens mørk-morgen-niveau (presence_light_sofa_on, `morgen`)
+          # i rå 0-255.
+          maal: >-
+            {% set pf = [states('sensor.elpris_dim_factor') | float(1.0), 1.0] | min %}
+            {% set loft = states('input_number.stue_laeselampe_auto_max_pct') | float(80) %}
+            {% set m = states('input_number.morgenrampe_stue_pct') | float(60) %}
+            {% set pct = [([m, loft] | min * pf) | round(0) | int, 2] | max %}
+            {{ (pct * 2.55) | round(0) | int }}
+          kelvin: "{{ states('sensor.auto_color_temp_evening') | int(2700) }}"
+          # Genoptag (restart midt i faden): fortsæt fra lampens styrke.
+          p: >-
+            {% set b = state_attr('light.stue_laesehygge', 'brightness') | int(0) %}
+            {{ ([b / maal, 1] | min) ** 0.5 if is_state('light.stue_laesehygge', 'on') else 0 }}
+          n: 0
+          n_bev: 0
+          n_naer: 0
+      # 1. Ilden: spotsene gløder op fra slukket; stue_spots_ild_start ser
+      #    off→on og overtager efter open plans fade-ind + 6 s.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ ['light.stue_spot_1', 'light.stue_spot_2'] | select('is_state', 'on') | list | count == 0 }}
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id:
+                - light.stue_spot_1
+                - light.stue_spot_2
+            data:
+              hs_color: [8, 97]
+              brightness: 20
+              transition: "{{ states('sensor.open_plan_fade_ind_effektiv') | int(3) }}"
+          # Flaget efter spotsene: ellers tænder spejlet (flag-triggeren) en
+          # spot der endnu ikke har meldt `on` — i din farve.
+          - wait_template: >-
+              {{ ['light.stue_spot_1', 'light.stue_spot_2'] | select('is_state', 'on') | list | count > 0 }}
+            timeout: 5
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.stue_ild_morgen_aktiv
+      # 2. Vent til nogen er inde i open plan.
+      - wait_template: >-
+          {{ not is_state('input_boolean.stue_ild_morgen_aktiv', 'on')
+             or not is_state('binary_sensor.stue_ild_morgen_mulig', 'on')
+             or ['binary_sensor.stue_apollo_occupancy_filtered',
+                 'binary_sensor.spisestue_apollo_occupancy_filtered',
+                 'binary_sensor.koekken_apollo_occupancy_filtered']
+                | select('is_state', 'on') | list | count > 0 }}
+        timeout: "{{ states('input_number.openplan_entre_velkomst_tom_minutter') | int(25) * 60 }}"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: >-
+              {{ not (is_state('input_boolean.stue_ild_morgen_aktiv', 'on')
+                      and is_state('binary_sensor.stue_ild_morgen_mulig', 'on')
+                      and ['binary_sensor.stue_apollo_occupancy_filtered',
+                           'binary_sensor.spisestue_apollo_occupancy_filtered',
+                           'binary_sensor.koekken_apollo_occupancy_filtered']
+                          | select('is_state', 'on') | list | count > 0) }}
+        then:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.stue_ild_morgen_aktiv
+          - service: logbook.log
+            data:
+              name: "Ild-morgen"
+              message: >-
+                {{ 'ingen kom ind i open plan — ilden slukket'
+                   if not wait.completed else 'stoppet før nogen kom ind (gaten lukkede)' }}
+          - stop: "Ingen i open plan"
+      # 3. Læselampen fader ind.
+      - variables:
+          t2: "{{ now().timestamp() }}"
+      - repeat:
+          sequence:
+            # Fremmed skrivning eller slukket lampe (efter vi har tændt den) =
+            # nogen andre har taget over.
+            - variables:
+                fremmed: >-
+                  {% set s = states.light.stue_laesehygge %}
+                  {{ 1 if p | float(0) > 0
+                        and (s is none or s.state != 'on'
+                             or (s.context.id != context.id
+                                 and (s.context.parent_id is not none or s.context.user_id is not none)))
+                     else 0 }}
+            - if:
+                - condition: template
+                  value_template: "{{ fremmed | int(0) == 1 }}"
+              then:
+                - service: input_boolean.turn_off
+                  target:
+                    entity_id: input_boolean.stue_ild_morgen_aktiv
+                - service: logbook.log
+                  data:
+                    name: "Ild-morgen"
+                    message: >-
+                      læselampen overtaget af en anden ved {{ (p | float(0) * 100) | round(0) | int }} % af faden
+                - stop: "Læselampen overtaget"
+            - variables:
+                bev: "{{ 1 if is_state('binary_sensor.stue_apollo_radar_moving_target', 'on') else 0 }}"
+                naer: >-
+                  {% set d = states('sensor.stue_apollo_radar_moving_distance') %}
+                  {{ 1 if bev | int(0) == 1 and d | is_number and d | float <= naer_cm | float else 0 }}
+            - variables:
+                n: "{{ n | int(0) + 1 }}"
+                n_bev: "{{ n_bev | int(0) + bev | int(0) }}"
+                n_naer: "{{ n_naer | int(0) + naer | int(0) }}"
+                p: "{{ [p | float(0) + tick / T | float * (1 + (B | float - 1) * naer | int(0)), 1] | min }}"
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.stue_laesehygge
+              data:
+                brightness: "{{ [(maal | int * p | float ** 2) | round(0) | int, 1] | max }}"
+                color_temp_kelvin: "{{ kelvin }}"
+                transition: "{{ tick }}"
+            - delay:
+                seconds: "{{ tick }}"
+          until:
+            - condition: template
+              value_template: >-
+                {{ p | float(0) >= 1
+                   or not is_state('input_boolean.stue_ild_morgen_aktiv', 'on')
+                   or not is_state('binary_sensor.stue_ild_morgen_mulig', 'on') }}
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.stue_ild_morgen_aktiv
+      - service: logbook.log
+        data:
+          name: "Ild-morgen"
+          message: >-
+            {% set nn = [n | int(0), 1] | max %}
+            {{ 'læselampen fuldt oppe' if p | float(0) >= 1 else 'faden stoppet ved ' ~ ((p | float(0) * 100) | round(0) | int) ~ ' % (gaten lukkede)' }}
+            efter {{ ((now().timestamp() - t2 | float) / 60) | round(1) }} min —
+            bevægelse foran stue-Apolloen {{ (100 * n_bev | int(0) / nn) | round(0) | int }} % af tiden,
+            inden for {{ naer_cm | int }} cm {{ (100 * n_naer | int(0) / nn) | round(0) | int }} %
+
+automation:
+  - id: stue_ild_morgen_genoptag
+    alias: "Stue: genoptag ild-morgen efter genstart/reload"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: homeassistant
+        event: start
+        id: start
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: input_boolean.stue_ild_morgen_aktiv
+        state: "on"
+      - condition: state
+        entity_id: script.stue_ild_morgen
+        state: "off"
+    action:
+      # Template-sensorer og lys står unknown de første sekunder efter en start.
+      - delay:
+          seconds: "{{ 60 if (trigger.id if trigger is defined else '') == 'start' else 0 }}"
+      - condition: state
+        entity_id: script.stue_ild_morgen
+        state: "off"
+      - service: script.turn_on
+        target:
+          entity_id: script.stue_ild_morgen

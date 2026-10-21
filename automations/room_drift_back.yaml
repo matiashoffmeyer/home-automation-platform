@@ -1,0 +1,390 @@
+# =============================================================================
+# Room Mode Drift-back — presence-driven (Holy Grail v2 + I2 perf refactor)
+# =============================================================================
+#
+# Naar et rum er i Manual / Off mode, drifter det tilbage til
+# Auto via to mekanismer (2026-07-25, user-spec: tomt rum VINDER altid —
+# den gamle manual_hold_ok-gate der lod taendte lys blokere empty-drift i
+# 3h er fjernet):
+#
+#   1. PRIMAER (presence-drevet): state-trigger pa hver sensor naar den har
+#      vaeret 'off' i N min straight (N = input_number.global_drift_back_empty_
+#      minutes, den ENESTE brugervendte slider — settings-siden). Baade trigger
+#      OG condition-gaten laeser samme slider (matchede tidligere IKKE — se
+#      empty_threshold_min). Drifter rummet tilbage til Auto med 10-min smooth
+#      fade — UANSET om lyset er taendt.
+#
+#   2. FALLBACK "man bliver i rummet" (time-pattern hver 15 min): ceiling_hit
+#      naar der er gaaet occupied_hold_h siden sidste tryk (global:
+#      room_manual_on_hold_hours, sove: sovevaerelse_manual_on_hold_hours,
+#      bad: badevaerelse_manual_til_auto_minutes) — daekker cases hvor
+#      sensoren ER on, men mode bor drifte alligevel. Plus hard_24h_fallback
+#      (rum sat fast i ikke-Auto i 24h+, målt på input_datetime.
+#      room_mode_<rum>_ikke_auto_siden) som ultimativ backstop.
+#      (Det gamle 12h-loft room_mode_hold_hours er slettet 2026-07-25 —
+#      occupied-fallbacken fyrer altid foerst.)
+#
+# I2-refactor (2026-04-29): switched fra time_pattern minutes:/1 (1440
+# fyringer/dag) til state-triggers + 15-min backup. Estimeret ~150 fyringer/
+# dag — 90% reduktion.
+#
+# Cinema, cirkus, guest_mode og enkelte activity-states blokerer watcher'en.
+# =============================================================================
+
+- id: room_drift_back_watcher
+  alias: "Room mode: drift-back watcher (state-triggered + time backup)"
+  description: >
+    Primaer trigger: state-trigger pa hver presence-sensor naar den har vaeret
+    off i 20 min. Backup: time_pattern hver 15 min for ceiling/24h fallback.
+  mode: parallel
+  max: 10
+  trigger:
+    # Primaer: state-trigger paa hver presence-sensor.
+    # Sprint 2026-05-17: 'for:' nu template-driven fra
+    # input_number.global_drift_back_empty_minutes (default 20).
+    # Tuning af input_number kraever HA restart for at trigger picker det op
+    # (HA evaluerer `for:` templates ved automation-init, ikke realtime).
+    - platform: state
+      entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.global_drift_back_empty_minutes') | int(20) }}"
+      id: sensor_off
+    # 2026-10-01 (B173 "a)"): de tre open-plan-rum bruger deres EGEN tom-tid
+    # (input_number.open_plan_drift_back_empty_minutes, packages/room_modes.yaml).
+    - platform: state
+      entity_id: binary_sensor.stue_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.open_plan_drift_back_empty_minutes') | int(15) }}"
+      id: sensor_off
+    - platform: state
+      entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.open_plan_drift_back_empty_minutes') | int(15) }}"
+      id: sensor_off
+    # 2026-09-03d: køkkenet er et selvstændigt mode-rum nu og skal have sin egen
+    # flanke — /15-backstoppet alene ville forsinke drift-back op til 15 min.
+    - platform: state
+      entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.open_plan_drift_back_empty_minutes') | int(15) }}"
+      id: sensor_off
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.global_drift_back_empty_minutes') | int(20) }}"
+      id: sensor_off
+    # 2026-06-12 (user-spec): bad bruger sin EGEN drift-tid (default 15 min)
+    # i stedet for den globale — bad er kort-besøgs-rum, manuel dim skal
+    # ikke holde i timer.
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      from: "on"
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.badevaerelse_manual_til_auto_minutes') | int(15) }}"
+      id: sensor_off
+    - platform: state
+      entity_id: binary_sensor.depot_valhorn_occupancy
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.global_drift_back_empty_minutes') | int(20) }}"
+      id: sensor_off
+    - platform: state
+      entity_id: binary_sensor.entre_valhorn_occupancy
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.global_drift_back_empty_minutes') | int(20) }}"
+      id: sensor_off
+    # 2026-10-07 (B198): terrassen har INGEN presence-sensor — den gamle
+    # binary_sensor.terrasse_valhorn_occupancy fandtes ikke, så terrassen kunne
+    # kun drifte via fallback. binary_sensor.terrasse_active er husets egen
+    # terrasse-definition (lys tændt + frisk tryk/Sherlock, ELLER Sherlock,
+    # ELLER terrassedøren åben — packages/activity_state.yaml), samme kilde
+    # som activity_state. Template-entity → `from:` (b103).
+    - platform: state
+      entity_id: binary_sensor.terrasse_active
+      from: "on"
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.global_drift_back_empty_minutes') | int(20) }}"
+      id: sensor_off
+    # Backup: hver 15 min — fanger ceiling/24h-fallback der ikke kan
+    # detekteres via sensor-state-trigger.
+    - platform: time_pattern
+      minutes: "/15"
+      id: backup_tick
+  variables:
+    # SKAL matche trigger'ens `for:` (global_drift_back_empty_minutes) — ellers
+    # blokerer condition-gaten en tidlig trigger-fyring, og den brugervendte
+    # slider virker ikke under 20 min (fejlklasse #2, fixet 2026-07-18c). Den
+    # gamle `room_empty_drift_minutes` var ikke eksponeret paa noget dashboard.
+    empty_threshold_min: "{{ states('input_number.global_drift_back_empty_minutes') | float(20) }}"
+    # 2026-09-17: hvilke rum en aktivitet FAKTISK handler om. Scopet er taget
+    # ordret fra definitionerne i packages/activity_state.yaml (linje 10-25),
+    # ikke gættet: sofa_relax = "kun stue", cooking = "køkken-zonen er aktiv",
+    # social_dining = "≥2 open-plan-subzoner", terrasse_with_indoor =
+    # "terrasse + folk inde i open-plan". social_party er ægte hus-bredt
+    # ("4+ zoner incl. terrasse + depot, people_estimate ≥ 4") og beholder
+    # derfor alle rum. Aktiviteter der IKKE står her pauser ingenting.
+    aktivitets_rum:
+      sofa_relax: [stue]
+      cooking: [koekken, spisestue, stue]
+      social_dining: [koekken, spisestue, stue]
+      terrasse_with_indoor: [terrasse, koekken, spisestue, stue]
+      social_party:
+        [
+          sovevaerelse,
+          stue,
+          spisestue,
+          koekken,
+          boernevaerelse,
+          badevaerelse,
+          depot,
+          entre,
+          terrasse,
+        ]
+    presence_map:
+      sovevaerelse:
+        - binary_sensor.sovevaerelse_apollo_occupancy
+      # 2026-09-03d: open-plan splittet i tre selvstændige mode-rum. Hvert rum
+      # drifter nu tilbage på SIT eget felt — ellers ville et køkken der aldrig
+      # bliver tomt (spisestuens felt rækker ind i det) holde de andre låst.
+      # Køkkenet var slet ikke repræsenteret her før splittet.
+      stue:
+        - binary_sensor.stue_apollo_occupancy_filtered
+      spisestue:
+        - binary_sensor.spisestue_apollo_occupancy_filtered
+      koekken:
+        - binary_sensor.koekken_apollo_occupancy_filtered
+      boernevaerelse:
+        - binary_sensor.boernevaerelse_apollo_occupancy
+      badevaerelse:
+        - binary_sensor.badevaerelse_inde_occupancy
+      depot:
+        - binary_sensor.depot_valhorn_occupancy
+      entre:
+        - binary_sensor.entre_valhorn_occupancy
+      terrasse:
+        - binary_sensor.terrasse_active
+    # Reverse-mapping: sensor → room. Bruges naar state-trigger fyrer
+    # for at finde det affected rum (uden at iterere alle 7).
+    sensor_to_room:
+      binary_sensor.sovevaerelse_apollo_occupancy: sovevaerelse
+      binary_sensor.stue_apollo_occupancy_filtered: stue
+      binary_sensor.spisestue_apollo_occupancy_filtered: spisestue
+      binary_sensor.koekken_apollo_occupancy_filtered: koekken
+      binary_sensor.boernevaerelse_apollo_occupancy: boernevaerelse
+      binary_sensor.badevaerelse_inde_occupancy: badevaerelse
+      binary_sensor.depot_valhorn_occupancy: depot
+      binary_sensor.entre_valhorn_occupancy: entre
+      binary_sensor.terrasse_active: terrasse
+  condition:
+    - condition: state
+      entity_id: input_boolean.drift_back_enabled
+      state: "on"
+    # Mood scenes overrider drift-back — laad cinema/cirkus styre selv.
+    # cirkus-gaten er flyttet NED i rum-loopet (2026-08-16) som
+    # binary_sensor.mood_pause_<rum>: en mood der kun ejer 3 rum holdt
+    # ellers de øvrige 4 låst på Manual hele sessionen = mørke.
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    # Guest mode (auto-set ved social activity 30+ min) pause'r drift-back.
+    - condition: state
+      entity_id: input_boolean.guest_mode
+      state: "off"
+    # 2026-09-17: activity-checket LÅ HER som en hus-bred condition og er
+    # flyttet NED i rum-loopet som `aktivitet_pause` — nøjagtig samme fix som
+    # mood-gaten fik 2026-08-16, og nøjagtig samme fejl: en aktivitet der kun
+    # ejer ét rum holdt alle de andre låst på Manual. Målt 2026-09-17: et
+    # app-"sluk alt" kl. 08:58:35 stemplede alle 8 rum Manual (bevidst,
+    # user-spec 2026-08-01). Depotet stod derefter tomt 09:31-10:18 = 47 min,
+    # men de eneste chancer for at slippe det var /15-tickene: 10:00 kom 2 min
+    # for tidligt (28 min tomt mod 30-min tærsklen), og 10:15 blev blokeret af
+    # `sofa_relax` — en tilstand der pr. definition kun handler om STUEN.
+    # Da user gik ind i depotet 10:18 var rummet stadig Manual → intet lys.
+  action:
+    - variables:
+        # Hvis state-trigger: kun det rum sensor'en tilhoerer.
+        # Hvis time-tick: alle rum (catches ceiling/24h cases).
+        rooms_to_check: >
+          {% if trigger.id == 'sensor_off' %}
+            {{ [sensor_to_room.get(trigger.entity_id, '')] | reject('eq', '') | list }}
+          {% else %}
+            {{ presence_map.keys() | list }}
+          {% endif %}
+    - repeat:
+        for_each: "{{ rooms_to_check }}"
+        sequence:
+          - variables:
+              room: "{{ repeat.item }}"
+              mode: "{{ states('input_select.room_mode_' ~ room) }}"
+              sensors: "{{ presence_map[room] | default([]) }}"
+              # 2026-06-12 (user-spec): BAD har sin egen manuel→Auto-tid
+              # (input_number.badevaerelse_manual_til_auto_minutes, default
+              # 15). For bad overstyres ALLE tre globale gates (empty-
+              # threshold, 30-min race-vindue, occupied-fallback) — ellers
+              # ville de globale værdier gøre en kort bad-slider
+              # virkningsløs.
+              bad_drift_min: >-
+                {{ states('input_number.badevaerelse_manual_til_auto_minutes') | float(15) }}
+              # 2026-10-01 (B173 "a)"): open plan har sin egen tom-tid, og
+              # race-vinduet følger den ned (samme regel som badet). Målt: de
+              # 5 mørke Manual-rum på 14 døgn var ALLE blokeret af det faste
+              # 30-min race-vindue — en lavere tom-tid alene havde reddet 0.
+              op_drift_min: >-
+                {{ states('input_number.open_plan_drift_back_empty_minutes') | float(15) }}
+              room_empty_min: >-
+                {% if room == 'badevaerelse' %}{{ bad_drift_min }}
+                {% elif room in ['stue', 'spisestue', 'koekken'] %}{{ op_drift_min }}
+                {% else %}{{ empty_threshold_min }}{% endif %}
+              race_window_min: >-
+                {% if room == 'badevaerelse' %}{{ [30, bad_drift_min | float(15)] | min }}
+                {% elif room in ['stue', 'spisestue', 'koekken'] %}{{ [30, op_drift_min | float(15)] | min }}
+                {% else %}30{% endif %}
+              last_ts: "{{ states('input_datetime.styrbar_last_press_' ~ room) }}"
+              last_epoch: >-
+                {{ (state_attr('input_datetime.styrbar_last_press_' ~ room, 'timestamp') | float(0)) if last_ts not in ['unknown','unavailable',''] else 0 }}
+              elapsed_h: >-
+                {{ ((as_timestamp(now()) - last_epoch) / 3600) if last_epoch > 0 else 0 }}
+              # Alle sensorer skal vaere 'off' (eller behandles som off) OG
+              # have vaeret det laenge nok.
+              # F2 fix 2026-05-22: behandl unavailable/unknown sensor som "off"
+              # hvis sensoren har vaeret stale >30 min. Pre-flyt har 3 Apollos
+              # offline, hvilket tidligere blokerede drift-back permanent (rum
+              # stuck Manual i timer). Hvis sensor lige er flickeret unavailable
+              # (<30 min siden last_changed), behandl som "occupied" (safe
+              # default — vent paa sensor recovery).
+              empty_long_enough: >-
+                {% set ns = namespace(ok=true) %}
+                {% if sensors | length == 0 %}
+                  {% set ns.ok = false %}
+                {% endif %}
+                {% for s in sensors %}
+                  {% set st = states(s) %}
+                  {% set last_chg = states[s].last_changed if states[s] else none %}
+                  {% set since = (as_timestamp(now()) - as_timestamp(last_chg)) if last_chg else 0 %}
+                  {% if st == 'on' %}
+                    {% set ns.ok = false %}
+                  {% elif st in ['unavailable', 'unknown', 'none'] %}
+                    {# Sensor offline: tæller som off hvis stale >30 min. #}
+                    {% if since < 1800 %}
+                      {% set ns.ok = false %}
+                    {% endif %}
+                  {% else %}
+                    {# state == 'off' #}
+                    {% if since < (room_empty_min | float * 60) %}
+                      {% set ns.ok = false %}
+                    {% endif %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.ok }}
+              # 2026-07-25 (user-spec): occupied-fallback — "man bliver i
+              # rummet". Naar der er gaaet occupied_hold_h siden sidste tryk,
+              # drifter rummet til Auto OGSAA selvom sensoren stadig er on.
+              # Genbruger de gamle manual-hold-slidere (global 3h default,
+              # sove 1h, bad = bad-sliderens minutter) — de gate'r IKKE
+              # laengere empty-drift.
+              occupied_hold_h: >-
+                {% if room == 'badevaerelse' %}
+                  {{ (bad_drift_min | float(15)) / 60 }}
+                {% elif room == 'sovevaerelse' %}
+                  {{ states('input_number.sovevaerelse_manual_on_hold_hours') | float(1) }}
+                {% else %}
+                  {{ states('input_number.room_manual_on_hold_hours') | float(3) }}
+                {% endif %}
+              ceiling_hit: >-
+                {{ last_epoch > 0 and elapsed_h >= (occupied_hold_h | float(3)) }}
+              # Race-protection (D2): skip hvis seneste tryk var <30 min siden
+              # (bad: brug bad-sliderens tid hvis den er kortere, 2026-06-12)
+              recent_press: >-
+                {{ last_epoch > 0 and elapsed_h * 60 < (race_window_min | float) }}
+              # 2026-10-05 (bug-hunt): et rum dance selv har sat i Manual
+              # (input_text.dance_room_modes_claimed) drifter IKKE tilbage midt
+              # i festen. Målt 10-05: drift-back gav køkkenet Auto kl. 10:00:04
+              # under dance, køkkenets tom-sluk slukkede kæden 10:01:10 og
+              # 10:06:22, og dance tændte den igen 5-9 s efter = blink midt i
+              # festen. dance_room_modes_release giver selv alle rum Auto ved
+              # slut; 24-t-fallbacken slipper stadig et glemt flag.
+              dance_claim: >-
+                {{ (is_state('input_boolean.dance_mode', 'on')
+                    or states('input_select.dance_manual_event') not in ['off', 'unknown', 'unavailable', ''])
+                   and ('input_select.room_mode_' ~ room)
+                       in states('input_text.dance_room_modes_claimed').split(',') }}
+              # Rum-scopet activity-pause (2026-09-17, se noten ved condition:).
+              aktivitet_pause: >-
+                {{ room in (aktivitets_rum.get(states('sensor.activity_state'), [])) }}
+              # Hard 24h fallback (E3): mode != Auto i 24h+ uanset hvad.
+              # 2026-10-07 (B198): målte før room_mode's last_changed, som
+              # nulstilles ved HVER restart — med daglige restarts fyrede den
+              # aldrig. Nu det SKREVNE stempel fra room_mode_ikke_auto_stempel
+              # (nedenfor). Urørt helper = dagens midnat → ugyldig, fyrer ikke.
+              # Dens unikke rolle: at slippe et glemt dance-claim (ceiling_hit
+              # overstyrer ikke dance_claim).
+              hard_24h_fallback: >-
+                {% set dt = 'input_datetime.room_mode_' ~ room ~ '_ikke_auto_siden' %}
+                {% set t = state_attr(dt, 'timestamp') %}
+                {{ mode != 'Auto' and t is not none
+                   and states(dt)[11:] != '00:00:00'
+                   and (as_timestamp(now()) - (t | float(0))) > 24 * 3600 }}
+          # 2026-09-23: open-plan fuldt lys-hold (packages/open_plan_fuldt_lys.yaml)
+          # — de tre open-plan-rum slippes SAMLET af hold-pakken når hele
+          # open-plan er tom, ikke enkeltvis her. Loft + 24 t gælder stadig.
+          # if/then frem for `condition:` — en bar condition i en repeat-sequence
+          # stopper HELE loopet, så et rum der ikke skal drifte ville skjule
+          # alle efterfølgende rum i listen. Blev akut da mood-pausen blev
+          # rum-scopet: under en fest rammer den første pause altid.
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ mode != 'Auto'
+                     and not recent_press
+                     and not aktivitet_pause
+                     and not is_state('binary_sensor.mood_pause_' ~ room, 'on')
+                     and not (dance_claim and not hard_24h_fallback)
+                     and not (room == 'sovevaerelse'
+                              and is_state('input_boolean.sove_evening_hold', 'on'))
+                     and not (room in ['stue', 'spisestue', 'koekken']
+                              and is_state('input_boolean.open_plan_fuldt_lys', 'on')
+                              and not ceiling_hit and not hard_24h_fallback)
+                     and (empty_long_enough or ceiling_hit or hard_24h_fallback) }}
+            then:
+              - service: script.room_drift_back
+                data:
+                  room: "{{ room }}"
+
+# ---------------------------------------------------------------------------
+# Stempel: hvornår forlod rummet Auto? (2026-10-07, B198)
+# ---------------------------------------------------------------------------
+# room_mode's last_changed nulstilles ved hver restart (CLAUDE.md, Permanente
+# fakta), så 24-t-fallbacken ovenfor kunne aldrig nå 24 t. Et SKREVET stempel
+# overlever restart (input_datetime uden initial). Kun overgangen FRA Auto
+# stempler — Manual → Off flytter det ikke ("ikke-Auto i 24 t" måles fra
+# første afvigelse). En restart udsender ingen state-ændring på et restoret
+# input_select, så stemplet røres ikke af den.
+- id: room_mode_ikke_auto_stempel
+  alias: "Room mode: stempl hvornår et rum forlod Auto"
+  description: >
+    Skriver input_datetime.room_mode_<rum>_ikke_auto_siden når et rum går fra
+    Auto til Manual/Off. Læses af room_drift_back_watcher's 24-t-fallback.
+  mode: queued
+  max: 20
+  trigger:
+    - platform: state
+      entity_id: !include ../rosters/alle_rum_mode.yaml
+      from: "Auto"
+      not_to: ["Auto", "unknown", "unavailable"]
+  action:
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: "input_datetime.{{ trigger.entity_id.split('.')[1] }}_ikke_auto_siden"
+      data:
+        timestamp: "{{ as_timestamp(now()) | int }}"

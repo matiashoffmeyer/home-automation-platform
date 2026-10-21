@@ -1,0 +1,217 @@
+# =============================================================================
+# Robotstøvsuger — flyt ladningen til dagens FAKTISK billigste timer
+# (user-spec 2026-08-22: "lyder som om vi skal ha flyttet ladetiderne hvis vi
+# kan? optimer!")
+# =============================================================================
+# PROBLEMET (målt 2026-08-22, 15 døgn): robotten stod på Roborocks off-peak-
+# ladning 00:00-06:00 — en indstilling der giver mening i en verden hvor natten
+# er billig. Det er den ikke længere. Gennemsnit pr. time, all-in kr/kWh:
+#   00-06 (det gamle vindue) 1,70     11-16 (solcelle-dykket) 1,05
+#   18-21 (aftenspidsen)     2,43
+# Nettoresultatet af udskydelsen var +1,4 kr/år: 6 ladninger sparede penge, 6
+# KOSTEDE penge, fordi robotten lige så tit dokker midt på dagen (billigt) som i
+# aftenspidsen (dyrt). Regnskabet for det ligger i
+# packages/robot_lader_besparelse.yaml.
+#
+# HVORFOR IKKE BARE SÆTTE VINDUET TIL 11-16: fordi det er præcis samme fejl en
+# sæson forskudt. Solcelle-dykket midt på dagen er et SOMMER-fænomen; i december
+# er natten billigst igen. Et fast vindue er en antagelse der rådner. Derfor
+# vælges vinduet HVER DAG ud fra Energi Data Service' faktiske timepriser.
+#
+# HVORFOR VINDUETS START ER DET DER TÆLLER: robotten begynder at lade i det
+# sekund vinduet åbner og er færdig efter 20-100 min (målt: 50 min for 24 %,
+# 100 min for 50 %). Den fordeler ikke ladningen ud over vinduet. Vi leder
+# derfor efter det billigste SAMMENHÆNGENDE `vindue_timer`-blok og lægger
+# vinduet dér — så lander hele ladningen i de billige timer, ikke et gennemsnit.
+#
+# INTET SIKKERHEDSNET PÅ BATTERINIVEAUET — bevidst fravalgt (user 2026-08-22:
+# "det gør ikke noget at den starter på lavt batteri, har aldrig været tæt på at
+# den løb tør fordi lejligheden er lille"). Et middagsvindue betyder at robotten
+# kan møde morgenens tur på 75-90 % i stedet for 100 %, og det er rigeligt: målt
+# forbrug er 4-25 % på en normal tur og 63 % på den dyreste fulde tur i 21 døgn.
+# Bygger nogen alligevel et net her senere, så husk at det koster besparelsen på
+# præcis de dage det udløser.
+#
+# KILL-SWITCH (fejlklasse #21): `input_boolean.robot_lade_optimering_enabled` er
+# condition på BEGGE skrive-veje (daglig optimering + genstart-recovery). Slås
+# den fra, rulles vinduet tilbage til 00:00-06:00, så "fra" betyder en kendt
+# tilstand og ikke bare "det sidste jeg nåede at sætte".
+#
+# ENHEDS-WRITES: `time.set_value` går til Roborocks SKY, ikke til lokal hardware.
+# Derfor skrives der KUN ved reel ændring (typisk 0-1 gang i døgnet), og aldrig
+# mens robotten faktisk lader — et vindue der flytter sig under en igangværende
+# ladning ville afbryde den.
+#
+# AIRBNB: rent kroner-optimering af en enhed gæsten ikke rører, og automatisk
+# rengøring er allerede blokeret i AirBnB. Ingen mode-gate, intet at rydde.
+# =============================================================================
+
+input_boolean:
+  # Kill-switch. Fra = robotten passer sig selv med et fast 00:00-06:00-vindue.
+  # Bevidst INTET `initial:` — se CLAUDE.md: initial PÅTVINGER ved hver HA-start
+  # i stedet for at restore, og det her er en ægte brugerpræference.
+  robot_lade_optimering_enabled:
+    name: "🤖 Robot: optimér ladetidspunkt efter elprisen"
+    icon: mdi:cash-clock
+
+input_number:
+  # Vinduets længde. Ladningen tager max ~1,7 t, så 3 t giver rigelig slæk uden
+  # at sprede vinduet ud over timer der ikke er billige.
+  robot_lade_vindue_timer:
+    name: "🤖 Robot: længde på ladevindue"
+    min: 2
+    max: 8
+    step: 1
+    unit_of_measurement: "t"
+    icon: mdi:timer-sand
+    mode: slider
+
+template:
+  - sensor:
+      # --- LED 1: rå-resultat af søgningen, pakket som "start|slut|gns_pris" --
+      # Pakket som streng frem for attributter, fordi en attribut der læser sin
+      # EGEN entity er en self-reference (render'er én cyklus forsinket og kan
+      # trippe HA's "Template loop detected") — samme énvejs-kæde som
+      # prisdata → gns → baseline i packages/cykel_lader_besparelse.yaml.
+      #
+      # Kun timer fra og med den indeværende time og 25 t frem, så der altid er
+      # dækning indtil næste daglige kørsel. Blokke der spænder over hullet
+      # mellem raw_today og raw_tomorrow afvises via et eksplicit varigheds-
+      # tjek — kontinuitet kan ikke antages når to lister sættes sammen.
+      - name: "Robot lade vindue data"
+        unique_id: robot_lade_vindue_data
+        icon: mdi:database-clock
+        state: >-
+          {% set n = states('input_number.robot_lade_vindue_timer') | int(3) %}
+          {% set raw = (state_attr('sensor.energi_data_service', 'raw_today') or [])
+                     + (state_attr('sensor.energi_data_service', 'raw_tomorrow') or []) %}
+          {% set t0 = now().replace(minute=0, second=0, microsecond=0) %}
+          {% set ns = namespace(t=[], p=[]) %}
+          {% for r in raw %}
+            {% set h = r.hour | as_datetime %}
+            {% if h is not none and h >= t0 and h < t0 + timedelta(hours=25) %}
+              {% set ns.t = ns.t + [h] %}
+              {% set ns.p = ns.p + [r.price | float(0)] %}
+            {% endif %}
+          {% endfor %}
+          {% set best = namespace(i=-1, sum=None) %}
+          {% for i in range((ns.t | count) - n + 1) %}
+            {% set blok = namespace(sum=0) %}
+            {% for j in range(n) %}
+              {% set blok.sum = blok.sum + ns.p[i + j] %}
+            {% endfor %}
+            {% if (ns.t[i + n - 1] - ns.t[i]).total_seconds() == (n - 1) * 3600
+                  and (best.sum is none or blok.sum < best.sum) %}
+              {% set best.i = i %}
+              {% set best.sum = blok.sum %}
+            {% endif %}
+          {% endfor %}
+          {% if best.i < 0 %}
+            ukendt
+          {% else %}
+            {# Sluttidspunktet er start + vinduets længde, modulo 24 så et
+               vindue der krydser midnat får et gyldigt klokkeslæt — Roborock
+               håndterer selv wrap. #}
+            {% set s = ns.t[best.i] %}
+            {{ s.strftime('%H:%M:00') ~ '|'
+               ~ ('%02d:00:00' | format((s.hour + n) % 24)) ~ '|'
+               ~ ((best.sum / n) | round(4)) }}
+          {% endif %}
+
+      # --- LED 2: det vinduet faktisk er — start i state, slut som attribut ---
+      - name: "Robot lade bedste vindue"
+        unique_id: robot_lade_bedste_vindue
+        icon: mdi:cash-clock
+        state: >-
+          {% set d = states('sensor.robot_lade_vindue_data').split('|') %}
+          {{ d[0] if d | count == 3 else 'ukendt' }}
+        attributes:
+          slut: >-
+            {% set d = states('sensor.robot_lade_vindue_data').split('|') %}
+            {{ d[1] if d | count == 3 else 'ukendt' }}
+          # Spot-gennemsnit (ex tariffer/moms) for de valgte timer — kun til
+          # aflæsning; udvælgelsen er monoton i spotprisen, så all-in ville
+          # rangere timerne præcis ens.
+          gns_spotpris: >-
+            {% set d = states('sensor.robot_lade_vindue_data').split('|') %}
+            {{ (d[2] | float(0)) if d | count == 3 else 0 }}
+
+automation:
+  # ===========================================================================
+  # 1) DAGLIG OPTIMERING — læg robottens off-peak-vindue på dagens billigste
+  #    blok. Kl. 14 fordi Energi Data Service har morgendagens priser fra ~13,
+  #    så horisonten dækker helt frem til næste kørsel.
+  # ===========================================================================
+  - id: robot_lade_optimer_vindue
+    alias: "Robot-lader: læg ladevinduet på dagens billigste timer"
+    description: >
+      Skriver robottens off-peak-vindue til det billigste sammenhængende blok i
+      de næste 24 timer. Skriver kun ved reel ændring (kaldet går til Roborocks
+      sky) og aldrig mens robotten lader, da et vindue der flytter sig under en
+      igangværende ladning ville afbryde den.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time
+        at: "14:00:00"
+      # Genstarts-recovery: et vindue sat før en flere-døgns nedetid er stale.
+      - platform: homeassistant
+        event: start
+        id: boot
+    condition:
+      - condition: state
+        entity_id: input_boolean.robot_lade_optimering_enabled
+        state: "on"
+    action:
+      # EDS og Roborock-integrationen skal være oppe før vi læser dem.
+      - if:
+          - condition: trigger
+            id: boot
+        then:
+          - delay: {minutes: 5}
+      - variables:
+          start: "{{ states('sensor.robot_lade_bedste_vindue') }}"
+          slut: "{{ state_attr('sensor.robot_lade_bedste_vindue', 'slut') }}"
+      - condition: template
+        value_template: >-
+          {{ start not in ['ukendt', 'unknown', 'unavailable']
+             and slut not in ['ukendt', 'unknown', 'unavailable', none] }}
+      # Ikke mens der faktisk løber strøm — se header.
+      - condition: template
+        value_template: "{{ (states('sensor.robot_lade_effekt') | float(0)) <= 0 }}"
+      # Kun ved reel ændring (hvert kald går til Roborocks sky).
+      - condition: template
+        value_template: >-
+          {{ states('time.s8_maxv_ultra_off_peak_start') != start
+             or states('time.s8_maxv_ultra_off_peak_end') != slut }}
+      - service: time.set_value
+        target: {entity_id: time.s8_maxv_ultra_off_peak_start}
+        data: {time: "{{ start }}"}
+      - service: time.set_value
+        target: {entity_id: time.s8_maxv_ultra_off_peak_end}
+        data: {time: "{{ slut }}"}
+      # Uden selve udskydelsen er vinduet pynt.
+      - service: switch.turn_on
+        target: {entity_id: switch.s8_maxv_ultra_off_peak_charging}
+
+  # ===========================================================================
+  # 2) KILL-SWITCH SLÅET FRA → rul vinduet tilbage til 00:00-06:00, så "fra"
+  #    betyder en kendt tilstand og ikke bare det sidste vi nåede at sætte.
+  # ===========================================================================
+  - id: robot_lade_optimering_rul_tilbage
+    alias: "Robot-lader: rul ladevinduet tilbage når optimeringen slås fra"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.robot_lade_optimering_enabled
+        from: "on"
+        to: "off"
+    action:
+      - service: time.set_value
+        target: {entity_id: time.s8_maxv_ultra_off_peak_start}
+        data: {time: "00:00:00"}
+      - service: time.set_value
+        target: {entity_id: time.s8_maxv_ultra_off_peak_end}
+        data: {time: "06:00:00"}
+      - service: switch.turn_on
+        target: {entity_id: switch.s8_maxv_ultra_off_peak_charging}

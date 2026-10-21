@@ -1,0 +1,259 @@
+# =============================================================================
+# Godnat auto-off — akkumuleret fælles-aktivitet + voksen-soveværelse tomt
+# =============================================================================
+# User-spec 2026-06-14: "en godnat auto off feature som skal være baseret på
+# akkumuleret aktivitet af bevægelse i lejligheden og soveværelset (voksne)
+# som bliver tomt."
+#
+# Tredje godnat-clear-vej (komplementær til de to i godmorgen_godnat.yaml):
+#   - godmorgen_auto_detect:           entré-blip → fuld ramp + gardiner.
+#   - godmorgen_auto_clear_on_activity: moving-target/wall-switch/knap → flags.
+#   - DENNE (godnat_auto_off_aktivitet): SUSTAINED akkumuleret bevægelse i
+#     fælles-rum OG voksen-soveværelset tomt → "husstanden er reelt oppe og i
+#     gang". Stærkere/mere bevidst signal end et enkelt blip; fanger weekender
+#     hvor entré-vejen er workday-gated.
+#
+# Måling:
+#   binary_sensor.faelles_areal_aktiv  = ON hvis nogen fælles-rum-sensor on.
+#   sensor.faelles_aktivitet_30min     = history_stats (timer) for ovenstående
+#                                        over sidste 30 min. Automationen ganger
+#                                        med 60 → minutter, sammenlignet med
+#                                        input_number.godnat_autooff_activity_min.
+#
+# INCIDENT 2026-08-01 05:07 — NAT-TUREN ER SIT EGET BEVIS (user: "katastrofe")
+# -----------------------------------------------------------------------------
+# Auto-off ryddede godnat kl. 05:07 mens den ENE voksne hjemme var på nat-tur
+# (op 04:55, bad, ind til pigerne 05:18, tilbage i seng 05:20). 12 min senere
+# lyste huset op: køkken, bad, entré og — det brugeren klagede over —
+# soveværelsets pendel via gang-early-detect, hvis eneste nat-spærre er netop
+# godnat-flaget. Børnenes natlys var i mellemtiden slukket 05:11 af samme
+# falske morgen.
+#
+# Fejlen er STRUKTUREL, ikke en tærskel der sad forkert: begge halvdele af
+# beviset produceres AF nat-turen selv.
+#   • `faelles_areal_aktiv` indeholder entré + bad = præcis de to rum en
+#     nat-tur nødvendigvis går igennem. Stue-Apolloen stod oven i købet latchet
+#     `on` fra 04:55:12 uafbrudt (radar-trailing efter én gennemgang), så
+#     30-min-akkumulatoren passerede 6-min-tærsklen på ren transit.
+#   • "Voksen-soveværelset tomt" er trivielt sandt under en nat-tur — det er
+#     tomt FORDI den der skulle sove er ude at gå.
+# Ingen tærskel-justering kan skille de to fra hinanden; en tur på toilettet og
+# en morgen ser ens ud i disse signaler. Det eneste der reelt skiller dem er
+# TIDSPUNKTET, og vinduet startede 05:00 — headerens egen "guard mod nat-toilet"
+# holder til 02:00-turen, men ikke til den der krydser 05:00.
+#
+# Derfor: `input_datetime.godnat_autooff_tidligst` (default 06:00). Det stiller
+# denne vej på linje med husets TO andre godnat-clear-veje, som allerede starter
+# 06:00 (hverdag) / 07:30 (weekend) — auto-off var den eneste der kunne erklære
+# morgen før kl. 6, og dermed den eneste dør ind til hullet. Intet tabt: den
+# alarm-drevne vækning og hverdags-rampen 05:55 rydder selv godnat, og denne vej
+# findes for WEEKEND-morgener, hvor ingen står op kl. 05.
+# Anden forsvarslinje (samme sprint): `sove_morgen_moerklagt` blev udvidet
+# 06→05, så det mørklagte soveværelse er hård-gatet i samme time — se
+# packages/sove_alarm_morgen.yaml.
+#
+# HARDWARE-NOTE (2026-06-14 → opdateret 2026-06-17): sove-Apollo
+# (binary_sensor.sovevaerelse_apollo_occupancy) er pt. UNAVAILABLE. User-spec
+# 2026-06-17: indtil den er oppe ANTAGES soveværelset tomt efter kl. 06:15 →
+# binary_sensor.sovevaerelse_empty_effective håndterer dette (real occupancy når
+# online, tids-antagelse når offline). Automationen i godmorgen_godnat.yaml
+# bruger den i stedet for rå occupancy == 'off'.
+# =============================================================================
+
+input_boolean:
+  # Kill-switch (default ON, mønster som auto_putning_enabled).
+  godnat_autooff_enabled:
+    name: "Godnat auto-off (aktivitet + soveværelse tomt) aktiveret"
+    icon: mdi:weather-night-partly-cloudy
+    initial: true
+
+input_datetime:
+  # Tidligste tidspunkt auto-off må erklære morgen. Se INCIDENT-afsnittet i
+  # headeren: en nat-tur leverer SELV begge halvdele af beviset, så det eneste
+  # der reelt skiller nat fra morgen her er uret.
+  godnat_autooff_tidligst:
+    name: "Godnat auto-off: tidligst"
+    icon: mdi:clock-alert-outline
+    has_date: false
+    has_time: true
+
+input_number:
+  # Hvor mange minutters akkumuleret fælles-rum-bevægelse (i sidste 30 min)
+  # der kræves før husstanden regnes som "oppe og i gang". Lav = mere følsom.
+  godnat_autooff_activity_min:
+    name: "Godnat auto-off: akkumuleret fælles-aktivitet (min/30min)"
+    icon: mdi:run
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Hvor længe hele "oppe"-tilstanden (fælles-aktivitet over threshold MENS
+  # voksen-soveværelset er tomt) skal holde før godnat ryddes. Guard mod
+  # kortvarige morgen-toilet-ture.
+  godnat_autooff_bedroom_empty_min:
+    name: "Godnat auto-off: tilstand holdt før clear"
+    icon: mdi:bed-empty
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-09-05 (user-bug: "burde køkkenlys være tændt nu? har gået 10 min i
+  # køkkenet ... det har været SÅ tydeligt at vi er stået op"). UAFBRUDT ophold
+  # i ét open-plan-rum — den fjerde clear-vej, og den eneste der ikke er ankret
+  # i soveværelset. Se godmorgen_auto_clear_on_activity for hvorfor de tre
+  # øvrige veje alle missede den morgen.
+  godmorgen_openplan_oppe_minutter:
+    name: "Godmorgen: uafbrudt ophold i open plan før godnat-clear"
+    icon: mdi:silverware-fork-knife
+    min: 1
+    max: 15
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-09-13 (user-bug: "og nu står jeg igen i mørke i køkkenet"): ophold-vejen
+  # ovenfor kræver UAFBRUDT occupancy i ét rum — og en voksen der lige er stået
+  # op går RUNDT (entré → bad → køkken → entré), så den kan ikke kvalificere.
+  # Denne vej måler det modsatte: ANTAL entré-passager i et 5-min vindue. Målt
+  # over 14 døgn (05:30-08:00), 3 passager/5 min:
+  #   • fyrer 9 af 14 morgener — men weekend-morgener i 06:00+-vinduet ramte den
+  #     PRÆCIS de to brugeren selv klagede over (05/9 06:10, 13/9 07:05) og ingen
+  #     andre. Nul falske positiver på de øvrige weekender.
+  #   • nat-bursts findes (04:11, 04:21, 04:27 = nat-tur) og er derfor alene
+  #     holdt ude af 06:00-gaten i binary_sensor.entre_morgen_passager_nok.
+  #   • hverdage: godnat er typisk ryddet 06:00-06:07 af de øvrige veje, så
+  #     grenen er en ren backstop dér (godnat_any_active-conditionen blokerer).
+  godmorgen_entre_passager_antal:
+    name: "Godmorgen: entré-passager (5 min) før godnat-clear"
+    icon: mdi:door-open
+    min: 2
+    max: 10
+    step: 1
+    unit_of_measurement: "stk"
+    mode: slider
+
+  # 2026-09-13 (user: "you can tell that i didnt go back to bed by apollo sove").
+  # Hvor længe en registreret voksen-afgang fra soveværelset stadig gælder som
+  # "han er oppe". En afgang ALENE er ikke bevis (kl. 02 er det en nat-tur), så
+  # stemplet bevæbner kun: et aktivitets-signal UDEN FOR soveværelset inden for
+  # vinduet rydder godnat.
+  # Dette er alders-vinduets ØVRE grænse. Den NEDRE er
+  # `godmorgen_openplan_oppe_minutter` (samme slider som ophold-grenen) og er det
+  # der skiller en morgen fra en nat-tur — se den lange begrundelse i
+  # automations/godmorgen_godnat.yaml's voksen_op-gren.
+  # Målt 13/9 på sensor.sove_doerzone_stempel: første dørzone-krydsning 07:03:05,
+  # første entré-flanke 07:03:14 = 9 SEKUNDER. Over 8 morgener er medianen 3 s
+  # (maks 1640 s). Så hullet er næsten altid små sekunder, og 30 min default er
+  # rigelig luft — vinduet findes ikke for at nå aktiviteten, men for at et
+  # stempel ikke kan hænge hele morgenen hvis retur-sweepet misses.
+  godmorgen_sove_afgang_vindue_min:
+    name: "Godmorgen: voksen-afgang gælder i"
+    icon: mdi:bed-clock
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+input_text:
+  # Epoch (sekunder, som streng) for seneste RETNINGSBESTEMTE voksen-afgang fra
+  # soveværelset — eller sentinel når ingen gælder. `input_text` med vilje:
+  # `input_text.reload` er husets eneste gratis helper-reload, så stemplet kan
+  # deployes uden restart. NB urørt `input_text` står på 'unknown', som er
+  # TRUTHY → forbrugeren SKAL teste sentinel eksplicit.
+  #
+  # Hvorfor dette ikke er input_datetime.sove_morgen_afgang_at (som findes):
+  # det stempel kræver entré-bekræftelse inden for 180 s og bærer gardin-/
+  # to-oppe-logikken (08-06: gardinet åbnede 21 min før alarmen da kravet var
+  # slækket). Det må IKKE udvides. Dette er et separat, bredere stempel med
+  # samme fysik men en anden forbruger.
+  sove_voksen_afgang:
+    name: "Soveværelse: voksen-afgang (epoch)"
+    icon: mdi:bed-outline
+    max: 32
+
+template:
+  - binary_sensor:
+      # ON hvis MINDST ÉT fælles-rum (ikke-soveværelse) har occupancy on.
+      # Unavailable/unknown tæller som off. Nye fælles-rum-Apollos kan tilføjes
+      # her — så bidrager de automatisk til akkumuleret-aktivitet-målingen.
+      - name: "Faelles areal aktiv"
+        unique_id: faelles_areal_aktiv
+        icon: mdi:home-search
+        state: >
+          {% set sensors = [
+            'binary_sensor.stue_apollo_occupancy_filtered',
+            'binary_sensor.spisestue_apollo_occupancy_filtered',
+            'binary_sensor.koekken_apollo_occupancy_filtered',
+            'binary_sensor.entre_valhorn_occupancy',
+            'binary_sensor.badevaerelse_inde_occupancy',
+          ] %}
+          {% set ns = namespace(active=false) %}
+          {% for s in sensors %}
+            {% if is_state(s, 'on') %}{% set ns.active = true %}{% endif %}
+          {% endfor %}
+          {{ ns.active }}
+
+      # 2026-06-17 (item 4 user-spec): "soveværelset tomt"-signal der virker selv
+      # mens sove-Apollo er offline. Online → brug rå occupancy. Offline
+      # (unavailable/unknown) → antag tomt EFTER kl. 06:15 (men IKKE før, så
+      # nat-toilet 02:00 ikke fejl-clearer godnat). Self-heal når Apollo kommer op.
+      - name: "Sovevaerelse empty effective"
+        unique_id: sovevaerelse_empty_effective
+        icon: mdi:bed-empty
+        state: >
+          {% set occ = states('binary_sensor.sovevaerelse_apollo_occupancy') %}
+          {% if occ == 'off' %}
+            true
+          {% elif occ == 'on' %}
+            false
+          {% else %}
+            {{ now().hour > 6 or (now().hour == 6 and now().minute >= 15) }}
+          {% endif %}
+
+      # 2026-09-13: "nok entré-passager til at nogen er OPPE" — morgenvinduet er
+      # bevidst kodet HER og IKKE som en time-condition i
+      # godmorgen_auto_clear_on_activity (#2: samme regel to steder divergerer).
+      # Grunden er RE-ARM (#19/#4): tæller-sensoren er allerede over tærsklen når
+      # kl. 06:00 passeres på en tidlig morgen, og en flanke der er sket FØR
+      # vinduet åbnede kommer aldrig igen — passage nr. 4 ændrer ikke state.
+      # Med timetjekket inde i sensoren BLIVER 06:00:00 selv flanken.
+      # 12:00 er samme øvre grænse som de øvrige clear-veje.
+      - name: "Entre morgen passager nok"
+        unique_id: entre_morgen_passager_nok
+        icon: mdi:door-open
+        state: >
+          {% set n = states('sensor.entre_passager_5min') | int(0) %}
+          {% set krav = states('input_number.godmorgen_entre_passager_antal') | int(3) %}
+          {{ n >= krav and 6 <= now().hour < 12 }}
+
+sensor:
+  # Akkumuleret tid (timer) hvor fælles-areal var aktivt i sidste 30 min.
+  # Mønster som boern_occupancy_4h i packages/activity_state.yaml.
+  - platform: history_stats
+    name: "Faelles aktivitet 30min"
+    unique_id: faelles_aktivitet_30min
+    entity_id: binary_sensor.faelles_areal_aktiv
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      minutes: 30
+
+  # Antal entré-passager ('til-on'-flanker) i rullende 5-min vindue. Mønster som
+  # de 5 ghost-flap-tællere i packages/apollo_ghost_alert.yaml. Vinduet er STATISK
+  # med vilje: history_stats' `duration` tager ikke templates, så kun ANTALLET er
+  # slider-styret (input_number.godmorgen_entre_passager_antal).
+  - platform: history_stats
+    name: "Entre passager 5min"
+    unique_id: entre_passager_5min
+    entity_id: binary_sensor.entre_valhorn_occupancy
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      minutes: 5

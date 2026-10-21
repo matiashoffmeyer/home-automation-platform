@@ -1,0 +1,230 @@
+# =============================================================================
+# Estimeret strømforbrug + pris for lys-setuppet (2026-06-19, user-spec)
+# =============================================================================
+# lys_kpi.yaml måler KUN tændt-TID (om lyset var on). Denne pakke estimerer
+# hvor MEGET strøm der faktisk bruges = brightness-vægtet effekt × tid → kWh,
+# og oversætter til kr/dag (AltidEnergi). Føder Statistik-siden.
+#
+# MODEL (estimat på alt undtagen lys på målende plugs — sofa-hyggelampen og
+#        sove-lyskæden, se watt-kortets `maalt`):
+#   effekt_w  = Σ over alle pærer: max-watt × (brightness/255) når tændt,
+#               PLUS de målende plugs' effekt (ægte måling, nederst i templaten).
+#               Non-dimbare pærer (onoff) eller pærer der ikke melder brightness
+#               regnes som fuld effekt når on. Lineær dæmpning er en simplificering
+#               (LED-effekt er ikke helt lineær) men god nok til et estimat.
+#               Thread-spots (KUN bad 1-3; spot 4-5 er Zigbee): når Thread er nede
+#               (matter_spots_ok=off) melder HA 1-3 'unavailable' (= 0 W) selv om
+#               de fysisk stadig lyser → forbruget ville undervurderes. Derfor
+#               antages bad-spot 1-3 ON 100% i de minutter Thread er nede
+#               (worst-case, user-spec 2026-06-29).
+#   energi    = Riemann-integration af effekt_w over tid → kWh (total_increasing,
+#               nulstiller aldrig → rene dag-søjler via statistics `change`).
+#   i dag     = utility_meter (cycle daily) på energi-totalen.
+#   pris      = energi × input_number.elpris_kr_kwh.
+#
+# Max-watt pr. pære er fysiske LED-spec-skøn (juster hvis du kender de rigtige).
+# Grafer bygger FREMAD fra i dag (LTS findes ikke bagud, kan ikke backfilles).
+# =============================================================================
+
+# 2026-06-21: input_number.elpris_kr_kwh (flad elpris-slider) FJERNET — legacy.
+# Prisen bygges nu dynamisk komponent-vis i packages/setup_cost.yaml
+# (sensor.elpris_allin_aktuel = spot + nettarif + elafgift + leverandør × moms).
+
+template:
+  - sensor:
+      # --- Watt-kortet: ÉN ejer af max-watt pr. pære -------------------------
+      # 2026-09-10: både total-effekten og spøgelses-effekten skal bruge de
+      # SAMME max-watt. To kopier af listen ville drifte fra hinanden ved næste
+      # pære (fejlklasse #2/#16), så kortet står her og læses via state_attr.
+      # Templaten refererer ingen entities → renderes én gang ved boot/reload,
+      # nul recorder-churn (fejlklasse #24). Lys på en MÅLENDE plug står
+      # SEPARAT i `maalt` (lys → [effekt-sensor, fallback-W]): de har en ægte
+      # effektmåler og må ikke tælle med i pære-løkken; fallback-watten bruges
+      # kun når pluggen er tavs eller spøger. 2026-09-24: stue_spot_1/2
+      # (KAJPLATS GU10 470lm = samme model som bad-spotsene, 5 W) og
+      # sove-lyskæden (GRILLPLATS, målt 2,0-2,6 W, median 2,5 W 09-23/24) ind.
+      # Sove-lyskæden sidder på en Innr SP 240 fra 15/10 (første sample 3,0 W).
+      - name: "Lys watt kort"
+        unique_id: lys_watt_kort
+        icon: mdi:table-large
+        state: "ok"
+        attributes:
+          watt: >-
+            {{ {
+              'light.stue_sofa_lampe': 6,
+              'light.stue_sofa_lampe_2': 6,
+              'light.stue_hjoernelampe': 9,
+              'light.stue_laesehygge': 10,
+              'light.stue_spot_1': 5,
+              'light.stue_spot_2': 5,
+              'light.koekken_lyskaede': 5,
+              'light.spisestue_loft': 12,
+              'light.spisestue_pendel': 9,
+              'light.boernevaerelse_loft': 9,
+              'light.boernevaerelse_hygge_strip': 10,
+              'light.badevaerelse_spot_4': 5,
+              'light.badevaerelse_spot_5': 5,
+              'light.depot_loft_ikea': 11,
+              'light.depot_loft_hue_1': 9,
+              'light.depot_loft_hue_2': 9,
+              'light.depot_strip': 10,
+              'light.entre_loft': 9,
+              'light.terrasse_paerelyskaede': 6 } }}
+          maalt: >-
+            {{ {
+              'light.stue_plug': ['sensor.stue_plug_power', 39],
+              'light.sove_lyskaede': ['sensor.sove_lyskaede_power', 2.5] } }}
+
+      # --- 👻 Spøgelses-effekt (W): hvad de UNAVAILABLE pærer koster ---------
+      # 2026-09-10 (user-spec): "i graferne skal jeg kunne se hvad der kommer
+      # fra unavailable lys". Tallet lå før begravet inde i total-effekten;
+      # her er det sin egen sensor med state_class → long-term statistics →
+      # egen søjle på Statistik-siden. Total-effekten LÆSER denne sensor, så
+      # spøgelses-reglen kun findes ét sted (fejlklasse #2) og identiteten
+      # total = rene pærer + spøgelser holder pr. konstruktion.
+      #
+      # Bad-spot 1-3 står bevidst IKKE i watt-kortet: de dækkes af thread_down
+      # nedenfor, som har et ægte strøm-vidne (bad_strom_ok). Står de alligevel
+      # på spøgelses-listen, giver kort.get() 0 = ingen dobbelt-tælling.
+      # Brightness kan ikke læses på en unavailable entity → fuld wmax (let
+      # over-estimat på en dæmpet pære, user-valgt frem for at undervurdere).
+      - name: "Lys estimat effekt spoegelser"
+        unique_id: lys_estimat_effekt_spoegelser
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:ghost-outline
+        state: >-
+          {% set kort = state_attr('sensor.lys_watt_kort', 'watt') or {} %}
+          {% set maalt = state_attr('sensor.lys_watt_kort', 'maalt') or {} %}
+          {% set ghosts = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {% set ns = namespace(w=0.0) %}
+          {% for e in ghosts %}
+            {% set ns.w = ns.w + (maalt[e][1] | float(0) if e in maalt
+                                  else kort.get(e, 0) | float(0)) %}
+          {% endfor %}
+          {{ ns.w | round(1) }}
+        attributes:
+          entities: >-
+            {{ state_attr('sensor.lys_spoegelser', 'entities') or [] }}
+
+  # --- Instantan estimeret effekt for HELE lys-setuppet (W) ----------------
+  # 2026-10-05 (DB-oprydning): TRIGGER-baseret, højst én opdatering pr. 10 s.
+  # Som state-baseret template renderede den på HVER brightness-rapport fra
+  # ~25 pærer: 8.600 rækker/døgn (×4 med de tre kost-rater der følger den),
+  # 93 % af dem < 10 s efter forrige (fades, dance). Målt 3 døgn før ændringen.
+  # 10 s forsinkelse ændrer Riemann-integralet med < 0,1 Wh pr. tænd/sluk.
+  # De tre afledte rater (lys_kost_rate_faktisk/_baseline, setup_kost_rate)
+  # og integrationerne følger automatisk med.
+  - trigger:
+      - platform: time_pattern
+        seconds: "/10"
+      - platform: homeassistant
+        event: start
+      - platform: event
+        event_type: event_template_reloaded
+    sensor:
+      - name: "Lys estimat effekt"
+        unique_id: lys_estimat_effekt_w
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:lightning-bolt
+        state: >-
+          {% set bulbs = (state_attr('sensor.lys_watt_kort', 'watt') or {}).items() | list %}
+          {# Matter-over-Thread spots = KUN bad 1-3 (spot 4-5 er Zigbee, ses normalt
+             ovenfor). Når Thread er nede er 1-3 'unavailable' i HA (= 0 W) men lyser
+             fysisk → antag dem ON 100% mens Thread er nede. Gated på bad_strom_ok:
+             er bad-strømmen VÆK er spots fysisk slukkede (0 W, ikke +15 W). #}
+          {% set thread_spots = [
+            ['light.badevaerelse_spot_1', 5],
+            ['light.badevaerelse_spot_2', 5],
+            ['light.badevaerelse_spot_3', 5] ] %}
+          {% set thread_down = states('binary_sensor.badevaerelse_matter_spots_ok') == 'off'
+             and states('binary_sensor.badevaerelse_bad_strom_ok') == 'on' %}
+          {% set ns = namespace(w=0.0) %}
+          {% for e, wmax in bulbs %}
+            {% if states(e) == 'on' %}
+              {% set bri = state_attr(e, 'brightness') %}
+              {% set frac = (bri | float(255) / 255) if bri is not none else 1.0 %}
+              {% set ns.w = ns.w + wmax * frac %}
+            {% endif %}
+          {% endfor %}
+          {% for e, wmax in thread_spots %}
+            {% if thread_down %}
+              {% set ns.w = ns.w + wmax %}
+            {% elif states(e) == 'on' %}
+              {% set bri = state_attr(e, 'brightness') %}
+              {% set frac = (bri | float(255) / 255) if bri is not none else 1.0 %}
+              {% set ns.w = ns.w + wmax * frac %}
+            {% endif %}
+          {% endfor %}
+          {# 👻 Spøgelser (2026-08-13): en pære der tabte radioen MENS den lyste
+             står 'unavailable' = 0 W her, men lyser fysisk videre og trækker
+             stadig strøm (depot_strip: 15 t den 08-12). Delt latch:
+             sensor.lys_spoegelser (packages/light_watchdog.yaml). Selve
+             beregningen ejes af sensor.lys_estimat_effekt_spoegelser ovenfor
+             (2026-09-10) — den er også sin egen graf-serie på Statistik. #}
+          {% set ns.w = ns.w
+             + (states('sensor.lys_estimat_effekt_spoegelser') | float(0)) %}
+          {# 🔌 Målende plugs (watt-kortets `maalt`): sofa-hyggelampen
+             (light.stue_plug, GRILLPLATS siden 15/10 — før Innr SP 240) og sove-lyskæden
+             (light.sove_lyskaede, Innr SP 240 siden 15/10 — før GRILLPLATS, ~2,5 W). Målingen er derfor primær
+             og konstanten kun fallback når pluggen er unavailable. Pæren er en
+             GLØDEPÆRE, ikke LED — målt 2026-07-31: 39 W median (36-41 over 14
+             dages historik) mod de 15 W dette estimat antog. #}
+          {# PLUG-GATE (målt 2026-07-31, samme quirk som cykel-laderen): pluggens
+             effekt-sensor er DELTA-rapporteret og hænger på sin sidste værdi
+             ~15-20 s efter sluk — uden gaten ville de sekunder bogføres som 40 W,
+             og en sensor der fryser på en høj værdi ville tælle i det uendelige.
+             Slukket plug = 0 W, punktum; kun mens den er tændt læses målingen. #}
+          {% for e, m in (state_attr('sensor.lys_watt_kort', 'maalt') or {}).items() %}
+            {% set plug_w = states(m[0]) | float(-1) %}
+            {% set ns.w = ns.w + (0 if not is_state(e, 'on')
+               else (plug_w if plug_w >= 0 else m[1] | float(0))) %}
+          {% endfor %}
+          {# DØDBÅND 1 W (2026-10-05): den målende plugs glødepære svinger
+             ±0,3 W, og 45 % af alle skrivninger var < 1 W. 0 W slår altid
+             igennem, så "alt slukket" aldrig hænger på en rest. #}
+          {% set ny = ns.w | round(1) %}
+          {% set gl = this.state | float(-1) if this is defined else -1 %}
+          {{ gl if (gl >= 0 and ny > 0 and (ny - gl) | abs < 1) else ny }}
+
+# 2026-06-21: lys_estimat_pris_total/idag (energi × FLAD pris) FJERNET — de var
+# unøjagtige (samme pris på al energi). Lys-prisen vises nu PRIS-VÆGTET via
+# sensor.lys_kost_faktisk_i_dag (elpris_styring.yaml: effekt × all-in time-pris,
+# integreret) → energi i dyre timer koster mere = ægte regning.
+
+sensor:
+  # --- Riemann-integration: effekt (W) → energi (kWh), nulstiller aldrig -----
+  - platform: integration
+    name: "Lys estimat energi total"
+    unique_id: lys_estimat_energi_total
+    source: sensor.lys_estimat_effekt
+    method: left
+    unit_prefix: k
+    unit_time: h
+    round: 3
+
+  # Samme integration for spøgelses-andelen alene → egen søjle i grafen.
+  # left-metoden matcher total-integrationen, så spøgelses-kWh er en ægte
+  # delmængde af lys-kWh og de to søjler kan sammenlignes direkte.
+  - platform: integration
+    name: "Lys spoegelser energi total"
+    unique_id: lys_spoegelser_energi_total
+    source: sensor.lys_estimat_effekt_spoegelser
+    method: left
+    unit_prefix: k
+    unit_time: h
+    round: 3
+
+# --- Dagsforbrug: utility_meter på energi-totalen (rene dag-grænser) --------
+utility_meter:
+  lys_estimat_energi_idag:
+    source: sensor.lys_estimat_energi_total
+    cycle: daily
+    name: "Lys estimat energi i dag"
+  lys_spoegelser_energi_idag:
+    source: sensor.lys_spoegelser_energi_total
+    cycle: daily
+    name: "Lys spoegelser energi i dag"

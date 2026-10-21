@@ -1,0 +1,236 @@
+# =============================================================================
+# Regn-FACIT: hvor meget regn der FALDT (2026-08-01, user-spec)
+# =============================================================================
+# USER: "hver morgen kan du sende en notifikation til min tlf hvis der rent
+# faktisk endte med at falde regn? inkl. hvor meget regn der faldt."
+#
+# HVORFOR EN NY KILDE: alt eksisterende regn-data i huset er FORECAST —
+# sensor.dmi_regn_forecast (HARMONIE-model), weather.forecast_home (met.no) og
+# binary_sensor.terrasse_regn_aktiv (afledt af de to). En prognose kan ikke
+# svare på "endte det med at regne"; det kræver en MÅLING. Denne fil henter
+# derfor DMI's metObs-OBSERVATIONER fra en rigtig vejrstation.
+#
+# STATION 06180 = Københavns Lufthavn (12,6454 / 55,614) ≈ 5,5 km fra huset.
+# Nærmeste station med brugbar nedbør: 06186 (Landbohøjskolen) er testet og
+# leverer INGEN precip-observationer overhovedet. Byger er lokale, så tallet er
+# "hvad der faldt i området", ikke i haven — det er den bedste kilde vi har
+# uden en fysisk regnmåler. Vil du have havens eget tal, kræver det hardware.
+#
+# API: opendataapi.dmi.dk/**v2**/metObs — keyless. (Hosten hed dmigw.govcloud.dk
+# indtil 12/9, hvor den viste sig DNS-nedlagt; se rest_command nedenfor.)
+# NB: VERSIONEN hører til produktet — /v1 på samme host er HARMONIE-prognosen,
+# som dmi_weather.yaml bruger, og den har INGEN metObs-collection (404 på både
+# /v1/metObs/collections). De to DMI-kilder lever derfor bevidst på hver sin
+# host — det er ikke en forglemmelse, og v2-URL'en må ikke "moderniseres".
+#
+# parameterId=precip_past1h: nedbør i den time der SLUTTER på `observed`.
+# observed=23:00Z betyder altså regn i 00:00-01:00 lokal tid (UTC+2).
+# Ingen datetime-range i URL'en — vi henter de seneste 40 observationer
+# (nyeste først) og filtrerer på alder i templaten. Det holder URL'en fri for
+# tidsstempel-encoding og gør vindues-slideren til eneste autoritet.
+#
+# `value: null` forekommer (station melder ikke) — det tælles som 0, IKKE som
+# et hul der afbryder summen.
+#
+# LEVERING: gennem script.push_notify med nid `regn_rapport`, så 🔔-toggles,
+# AirBnB-opt-in og hjemkomst-køen virker som for alle andre varsler.
+# =============================================================================
+
+rest_command:
+  dmi_metobs_precip:
+    # Host skiftet 12/9: dmigw.govcloud.dk er DNS-NEDLAGT (NXDOMAIN, verificeret
+    # med kontrol-curl). Sensoren så rask ud hele vejen — `this.state`-fallbacken
+    # bar sidste gode værdi videre uden ét rødt flag, præcis som dmi_udefugt 10/9.
+    # Samme keyless v2-metObs ligger på opendataapi.dmi.dk.
+    url: >-
+      https://opendataapi.dmi.dk/v2/metObs/collections/observation/items?stationId=06180&parameterId=precip_past1h&limit=40
+    method: GET
+    timeout: 45
+
+input_boolean:
+  regn_rapport_enabled:
+    name: "Regn-facit: morgenrapport"
+    icon: mdi:weather-pouring
+
+input_number:
+  regn_rapport_vindue_timer:
+    name: "Regn-facit: vindue (timer)"
+    icon: mdi:clock-outline
+    min: 3
+    max: 36
+    step: 1
+    unit_of_measurement: "t"
+    mode: slider
+
+  # Under denne grænse pushes der ikke. Min er 0,1 (stationens opløsning) og
+  # ikke 0: 0 ville give en daglig "der faldt 0 mm"-besked, altså det modsatte
+  # af det brugeren bad om. Default 0,2 = to udslag på vippen — én enkelt kan
+  # komme af kraftig dug/tåge. Default ≠ min med vilje (fejlklasse #5:
+  # sentinel-værdien SKAL adskille sig fra den værdi vi faktisk vil køre med,
+  # ellers hæver init-guarden slideren ved hver restart).
+  regn_rapport_min_mm:
+    name: "Regn-facit: minimum for at sende (mm)"
+    icon: mdi:cup-water
+    min: 0.1
+    max: 10
+    step: 0.1
+    unit_of_measurement: "mm"
+    mode: slider
+
+input_datetime:
+  regn_rapport_tid:
+    name: "Regn-facit: rapport-tid"
+    icon: mdi:clock-time-seven-outline
+    has_date: false
+    has_time: true
+
+template:
+  - trigger:
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        # :22 — offset fra dmi_weather's :12 og vejr-varslernes :25/:55, så de
+        # tre DMI/met-kald ikke lander oven i hinanden.
+        minutes: 22
+      - platform: event
+        event_type: event_template_reloaded
+      # Morgen-rapporten fyrer denne FØR den læser sensoren. Et rest_command-
+      # kald udefra gør INTET ved sensoren (svaret lander i automationens egen
+      # context, ikke i templatens `resp`) — kun en af DISSE triggers får
+      # action-blokken til at køre og state-templaten til at re-render.
+      - platform: event
+        event_type: regn_rapport_refresh
+    action:
+      - service: rest_command.dmi_metobs_precip
+        response_variable: resp
+        continue_on_error: true
+      - variables:
+          payload: >-
+            {% if resp is defined and resp.content is defined %}
+              {% if resp.content is mapping %}{{ resp.content }}
+              {% elif resp.content is string and resp.content[:1] == '{' %}{{ resp.content | from_json }}
+              {% else %}{{ {} }}{% endif %}
+            {% else %}{{ {} }}{% endif %}
+          ok: "{{ payload.get('features') is not none }}"
+          calc: >-
+            {% if not ok %}{{ {} }}{% else %}
+              {% set vindue = states('input_number.regn_rapport_vindue_timer') | float(24) %}
+              {% set cutoff = as_timestamp(now()) - vindue * 3600 %}
+              {% set ns = namespace(sum=0.0, maxh=0.0, n=0, senest=0, linjer=[]) %}
+              {% for f in payload.features %}
+                {% set p = f.get('properties', {}) %}
+                {% set obs = p.get('observed') %}
+                {% if obs is not none %}
+                  {% set t = as_timestamp(obs | as_datetime, 0) %}
+                  {% if t > cutoff %}
+                    {% set mm = p.get('value') | float(0) %}
+                    {% set ns.sum = ns.sum + mm %}
+                    {% set ns.n = ns.n + 1 %}
+                    {% if mm > ns.maxh %}{% set ns.maxh = mm %}{% endif %}
+                    {% if t > ns.senest and mm > 0 %}{% set ns.senest = t %}{% endif %}
+                    {% if mm > 0 %}
+                      {# observed = timens SLUT → vis intervallet [t-1t, t] lokalt #}
+                      {% set slut = (t | timestamp_custom('%H', true)) %}
+                      {% set start = ((t - 3600) | timestamp_custom('%H', true)) %}
+                      {% set ns.linjer = ns.linjer
+                         + [start ~ '-' ~ slut ~ ': ' ~ (mm | round(1)) ~ ' mm'] %}
+                    {% endif %}
+                  {% endif %}
+                {% endif %}
+              {% endfor %}
+              {{ {'sum': ns.sum | round(1), 'maxh': ns.maxh | round(1),
+                  'n': ns.n, 'senest': ns.senest,
+                  'linjer': ns.linjer | reverse | list} }}
+            {% endif %}
+    sensor:
+      - name: "Regn faldet"
+        unique_id: regn_faldet
+        unit_of_measurement: "mm"
+        state_class: measurement
+        icon: mdi:weather-pouring
+        # this-fallback: et 429/timeout må ikke nulstille facit lige inden
+        # rapporten sendes (fejlklasse #9 — unavailable ≠ "det regnede ikke").
+        state: >-
+          {% if ok %}{{ calc.sum }}
+          {% elif this is defined and this.state is not none %}{{ this.state }}
+          {% else %}unavailable{% endif %}
+        attributes:
+          max_time_mm: >-
+            {% if ok %}{{ calc.maxh }}
+            {% elif this is defined %}{{ this.attributes.get('max_time_mm') }}
+            {% else %}none{% endif %}
+          timer: >-
+            {% if ok %}{{ calc.linjer }}
+            {% elif this is defined %}{{ this.attributes.get('timer') }}
+            {% else %}none{% endif %}
+          obs_antal: >-
+            {% if ok %}{{ calc.n }}
+            {% elif this is defined %}{{ this.attributes.get('obs_antal') }}
+            {% else %}none{% endif %}
+          senest_regn: >-
+            {% if ok %}
+              {{ calc.senest | timestamp_custom('%H:%M', true) if calc.senest > 0 else 'ingen' }}
+            {% elif this is defined %}{{ this.attributes.get('senest_regn') }}
+            {% else %}none{% endif %}
+          vindue_timer: >-
+            {% if ok %}{{ states('input_number.regn_rapport_vindue_timer') | float(24) | round(0) | int }}
+            {% elif this is defined %}{{ this.attributes.get('vindue_timer') }}
+            {% else %}none{% endif %}
+          station: "06180 Københavns Lufthavn"
+          fetched_at: >-
+            {% if ok %}{{ now().isoformat() }}
+            {% elif this is defined %}{{ this.attributes.get('fetched_at') }}
+            {% else %}none{% endif %}
+          last_attempt_ok: "{{ ok }}"
+
+automation:
+  - id: regn_rapport_morgen
+    alias: "Vejr: morgen-facit — faldt der regn i nat?"
+    description: >
+      Sender KUN når der faktisk blev målt regn over minimums-grænsen — en
+      daglig "det regnede ikke"-besked er ikke det brugeren bad om. Henter
+      friske observationer FØR den læser sensoren, så rapporten aldrig bygger
+      på et op til en time gammelt tal.
+    mode: single
+    trigger:
+      - platform: time
+        at: input_datetime.regn_rapport_tid
+    condition:
+      - condition: state
+        entity_id: input_boolean.regn_rapport_enabled
+        state: "on"
+    action:
+      # Frisk hentning + settle. Eventen (ikke et direkte rest_command-kald)
+      # er det der får trigger-templaten til at hente OG re-render sin state —
+      # ellers læste vi et op til en time gammelt tal fra :22-tikket.
+      - event: regn_rapport_refresh
+      - delay: "00:00:20"
+      - condition: template
+        value_template: >-
+          {{ states('sensor.regn_faldet') | float(-1)
+             >= (states('input_number.regn_rapport_min_mm') | float(0.1)) }}
+      - variables:
+          mm: "{{ states('sensor.regn_faldet') | float(0) }}"
+          vindue: "{{ states('input_number.regn_rapport_vindue_timer') | float(24) | round(0) | int }}"
+          linjer: "{{ state_attr('sensor.regn_faldet', 'timer') | default([], true) }}"
+          maxh: "{{ state_attr('sensor.regn_faldet', 'max_time_mm') | float(0) }}"
+      - service: script.push_notify
+        data:
+          notif_id: regn_rapport
+          # 2026-10-20: én linje i stedet for en time-liste (7 linjer à 0,1 mm
+          # 8/10) — HVOR MEGET og HVORNÅR mest; listen står på sensorens
+          # `timer`-attribut. Dansk decimal-komma; tag = erstatter gårsdagens.
+          title: "🌧️ Der faldt {% from 'tekst.jinja' import tal %}{{ tal(mm) }} mm regn"
+          message: >-
+            {% from 'tekst.jinja' import tal %}
+            {% set ns = namespace(top='') %}
+            {% for l in linjer %}
+              {% if not ns.top and (l.split(': ')[-1] | replace(' mm', '') | float(0)) >= maxh %}
+                {% set ns.top = l.split(':')[0] %}
+              {% endif %}
+            {% endfor %}
+            {{- ('Mest kl. ' ~ ns.top ~ ' (' ~ tal(maxh) ~ ' mm). ' if ns.top and maxh > 0 else '')
+                ~ 'Regn i ' ~ (linjer | length) ~ ' af de seneste ' ~ vindue
+                ~ ' timer, målt i Københavns Lufthavn.' -}}
+          payload:
+            tag: regn_rapport

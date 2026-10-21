@@ -1,0 +1,1002 @@
+# =============================================================================
+# Dug-varsel i nat — "bliver terrassens hynder og madrasser for våde i nat?"
+# =============================================================================
+# User-spec 2026-06-28: "advarsel ved højt dugniveau over natten, slider for
+# sensitivitet, kun til Parent A's telefon. Kræver måske ny integration? Tjek."
+# → INGEN ny integration: met.no's TIMEVISE forecast (weather.forecast_home)
+#   leverer temperature + humidity + cloud_coverage + wind_speed pr. time.
+#
+# MÅLET ER OMDEFINERET 2026-08-02 (v3), user: "det er puder og madrasser jeg
+# vil beskytte. juster ift overfladetemp effekt hvis nødvendigt. der skal
+# basically komme varsel hvis de bliver for våde af at ligge ude."
+# Beskyttelses-objektet er altså IKKE længere ruder/bil/græs, men et STYKKE
+# ABSORBERENDE TEKSTIL PÅ TERRASSEN — og det ændrer tre ting i modellen (v3,
+# nederst). Aften-varslet svarer nu på ét spørgsmål: skal de ind inden du
+# går i seng?
+#
+# =============================================================================
+# MODEL v2 (2026-08-02) — omskrevet efter user: "dug prediction refined … fix
+# problemet med at forudsigelsen ændrer sig meget i løbet af dagen. i nat var
+# der nok dug til at det var et problem."
+# =============================================================================
+# v1's fire fejl (alle målt, ikke gættet):
+#
+# 1) VINDUES-DRÆN = hovedårsagen til at tallet "ændrer sig i løbet af dagen".
+#    met.no's hourly forecast indeholder KUN FREMTIDIGE timer. Fra ~21:00
+#    forsvinder nattens timer én ad gangen ud af 21:00→09:00-vinduet, og en
+#    MAX-over-timer falder derfor mekanisk hen over natten. Målt 08-02:
+#    00:30=39 → 03:30=38 → 06:00=40 → 07:00=32 → 08:00=20 → 09:00=47 (ny nat).
+#    Et manuelt morgen-tjek viste altså en meningsløs rest af natten.
+# 2) MAX-over-timer er skrøbelig: met.no's cloud_coverage springer 13→16→48→95 %
+#    mellem nabotimer, så én enkelt klar time satte hele nattens score.
+#    Målt whiplash 07-31: 09:00=24 → 09:30=9 (Δ15 på 30 min).
+# 3) SKALAEN VAR KLEMT: højeste score nogensinde observeret = 47, så "Kraftig
+#    ≥ 70" var uopnåelig. Alle tre BEKRÆFTEDE dug-nætter i træner-loggen
+#    (07-21=40, 07-31=36, 08-02=34) blev meldt som "Let" — inkl. natten user
+#    klagede over. Slideren skulle stå på 70 bare for at virke.
+# 4) FYSIKKEN var tre uafhængige faktorer ganget sammen. Skyer og vind styrer
+#    i virkeligheden hvor meget overfladen NEDKØLES under lufttemperaturen —
+#    de er ikke selvstændige "dug-faktorer".
+#
+# NY FYSIK (energibalance i stedet for faktor-produkt):
+#   afkoeling = 8.0 × (1 − 0.70 × skydække) / (1 + vind_kmh / 9.0)   [°C]
+#   (koefficienten stod 0.80 fra v2 til v5 — se v5 punkt 2 nedenfor)
+#   underskud = afkoeling − (T − Td)      ← positiv = overfladen når dugpunktet
+#   intensitet = clamp((underskud + 3.0) / 5.0, 0, 1)
+#   score = 100 × (0.5 × peak-intensitet + 0.5 × middel af top-3 timer)
+#
+#   Formens (1−0.8c)/(1+w/w0) er FITTET på 770 nat-samples fra DMI Kastrup
+#   (06180): observeret græs-depression = 2.3×(1−0.70c)/(1+w/5.9), RMSE 0.55 °C.
+#   Amplituden er skaleret op fra lufthavnens blæste 5 cm-skærm til en LÆ-have
+#   (8.0 °C ved helt klart+vindstille), og vind-konstanten løftet 5.9→9.0 km/h
+#   fordi haven er mere afskærmet end en åben landingsbane.
+#
+#   Skydække og vind glattes over et CENTRERET 3-timers vindue, så met.no's
+#   time-støj dæmpes ved KILDEN (fejl 2).
+#
+# =============================================================================
+# MODEL v3 (2026-08-02) — objektet er hynder/madrasser, ikke ruder og græs
+# =============================================================================
+# Timeberegningen (afkøling → underskud → intensitet) er UÆNDRET. Tre ting
+# ovenpå den er lavet om, fordi et stykke skumfyldt tekstil opfører sig
+# fundamentalt anderledes end en rude:
+#
+# 1) OVERFLADE-OFFSET (det user eksplicit inviterede til). Referencen 8.0 °C
+#    er skaleret til en LÆ-have på GRÆS. En hynde ligger på møbler med
+#    LUFT UNDER SIG — ingen varmeledning op fra jorden — den har meget lav
+#    varmekapacitet pr. areal og ε ≈ 0,95. Den følger altså strålings-
+#    balancen både hurtigere og dybere end græs. Derfor en tunbar
+#    input_number.dug_overflade_ekstra_afkoeling (°C), der lægges oven i de
+#    8.0. Den er et SLIDER og ikke en konstant, fordi vi ikke har en
+#    overfladetemperatur-måler på terrassen at fitte den mod (jf. den
+#    eksisterende regel: ægte måling = primær, model = fallback).
+#
+# 2) SOAK FREM FOR PEAK. v2's score var 0.5·peak + 0.5·top-3, altså "hvor
+#    intens er dugfaldet i det værste øjeblik". Det er det rigtige spørgsmål
+#    for en forrude (dugget = dårligt udsyn = et ØJEBLIK). Det er det FORKERTE
+#    spørgsmål for en hynde: den bliver våd af at OPSAMLE vand time efter time.
+#    v3 summerer derfor intensiteten over hele natten:
+#       soak = Σ intensitet   [time-ækvivalenter ved fuld dugrate]
+#       dug-score = 100 × min(soak / 6.0, 1)
+#    Ankeret 6.0: dugfald på en godt udstrålende overflade ligger på
+#    ~0,05–0,07 mm/h, så 6 timer ved fuld rate ≈ 0,3–0,4 mm vand = et betræk
+#    der er tydeligt vådt at røre ved. "Gennemvåd" er altså en fysisk størrelse,
+#    ikke en normeret skala.
+#
+# 3) INGEN FORDAMPNINGS-FRADRAG. En rude tørrer af sig selv når solen rammer;
+#    skum og betræk holder på vandet i timer. Modellen trækker derfor IKKE
+#    morgentørring fra det akkumulerede soak — vandet der er lagt, bliver
+#    liggende. (Målt på DMI-obs ville et fradrag have fjernet ~2/3 af soaken
+#    på blæsende morgener, hvilket ville være direkte forkert for tekstil.)
+#
+# 4) REGN TÆLLER MED — og vejer tungest. v2 sprang regntimer over med
+#    begrundelsen "det er regn-varslets bord". Men der findes ikke noget
+#    aften-regnvarsel: weather_warning.yaml varsler REGN I DAG kl 06:30, og
+#    binary_sensor.terrasse_regn_aktiv er en nowcast til terrasse-pluggen.
+#    Ingen af dem svarer på "skal hynderne ind inden sengetid". For et
+#    absorberende objekt er regn desuden 3× værre end en hel nats dug:
+#       regn-score = 100 × min(mm_i_vinduet / 1.0, 1)
+#    → 1 mm regn = gennemvåd. Den publicerede score = MAX(dug, regn), og
+#    attributten `aarsag` siger hvad der driver den.
+#
+# KALIBRERING — ÆRLIG STATUS: ikke kalibreret endnu, og det gamle facit duer
+# ikke. ai_feedback/dug_feedback.jsonl's 9 besvarede morgener spurgte "var der
+# dug på ruder/bil/græs?" = et andet objekt. Efterregnet mod DMI Kastrup-
+# OBSERVATIONER (06180, ikke prognose) skiller de svar sig i øvrigt slet ikke
+# rent på v2-modellen: nat 07-29 (facit "nej") scorer 69,5 mens 07-21 (facit
+# "ja") kun scorer 58,5 — kløften i v2-headeren ovenfor stammer fra met.no's
+# PROGNOSE, ikke fra observationer, og overlever ikke et efter-tjek.
+# → Træneren er derfor omskrevet til at spørge om HYNDERNE (packages/
+#   ai_trainer.yaml), og stemplet bærer nu soak + regn med. Tærsklen er
+#   PROVISORISK indtil ~2 ugers nyt facit. Svar i JSONL'en FØR 2026-08-02
+#   handler om ruder/græs og må ikke blandes ind i en soak-kalibrering.
+#   Niveauer: Gennemvåde ≥ 75, Våde ≥ 55, ellers Fugtige.
+#
+# =============================================================================
+# v4 (2026-08-07) — met.no er systematisk for tør om natten; RAMPEN var forkert
+# =============================================================================
+# User: "dug varslet var forkert i går. der er vådt udenfor... kalibrer."
+# v4 tilføjede oprindeligt også et flerdages "vådheds-reservoir" der lod
+# hynderne blive husket som våde på tværs af døgn — det er RULLET TILBAGE
+# 2026-08-10 (user: "jeg vil kun ha varsel hvis der falder dug eller regn
+# den nat, som originalt tiltænkt"). Varslet svarer nu udelukkende på
+# DENNE nats vejr (dug + regn i vinduet 21–09, jf. v3 punkt 4 ovenfor) —
+# ingen tilstand bæres videre fra i går. De to nedenstående kalibrerings-
+# fixes (met.no-bias, fysisk korrekt rampe) er UAFHÆNGIGE af reservoiret og
+# er bevaret.
+#
+# 1) MET.NO ER MÅLT FOR TØR OM NATTEN. 21 dage × recorder-attributter mod DMI
+#    06180 (n=181 nat-samples): temperatur +0,73°, dugpunkt −0,41°, **spænd
+#    (T−Td) +1,14° i middel / +0,80° median**, fugtighed **−6,05 point**, skyer
+#    +22,2 point, vind −0,80 km/h. Et for stort spænd = for lidt dug, hver nat.
+#    Korrektionen sker ÉT sted (input_number.dug_metno_fugt_bias_pct, default 6)
+#    og er i FUGT-point, ikke grader: RH er selv inputtet til Magnus-formlen, så
+#    +6 point løfter dugpunktet ~1,05-1,15° ved 15-20° = præcis den målte
+#    spænd-bias. 0 = stol rå på met.no.
+#
+# 2) RAMPEN VAR FYSISK FORKERT. v3 gav dug-kredit ved `deficit ≥ −3`, dvs. også
+#    når overfladen lå op til 3° OVER dugpunktet — hvor der pr. definition ikke
+#    kondenserer noget. Kørt på OBSERVATIONER varslede v3 derfor 21 ud af 23
+#    nætter; at brugeren ikke drukner i pushes skyldes alene at prognosens
+#    tørhed (punkt 1) tilfældigvis trak den anden vej. Nu: `inten =
+#    clamp(deficit/3, 0, 1)` (dug kræver deficit > 0) og soak-ankeret 6,0 → 3,0 t.
+#    Efterregnet på observationer med punkt 1 aktiv: 15/23 nætter varsler; de
+#    tre facit-"ja"-nætter scorer 42/100/100, facit-"nej"-nætterne 10/38/29
+#    (undtagen 07-29 = 75). De to øvrige "nej"-nætter er REGN-nætter (8,1 og
+#    2,6 mm) — for en rude er de tørre kl. 08:30, for en hynde er de gennemvåde,
+#    så de tæller ikke som falske positive. Ensidet holdepunkt: er der ikke dug
+#    på GRÆSSET (det mest dugudsatte), er der heller ikke dug på hynderne.
+#
+# =============================================================================
+# v5 (2026-08-12) — fysikken var rigtig, INPUTTET var forkert
+# =============================================================================
+# Kørt på DMI-OBSERVATIONER rammer modellen de facit-våde nætter (08-08 = 75,
+# 08-10 = 98) — men på met.no's PROGNOSE sagde den 0 og 3 de samme nætter.
+# Fejlen sad altså ikke i rampen eller i ankeret, men i skydækket:
+#
+# 1) SKY-BIAS (ny slider, default 10). met.no minus DMI 06180 på nat-timer:
+#    +25 point i middel — men betinget af virkeligheden er den ENSIDET:
+#    DMI < 25 % skyer → met.no +43 point; DMI > 75 % → −7. Altså er prognosen
+#    kun forkert på KLARE nætter = præcis dug-nætterne. Rå-eksempler (met.no/
+#    DMI): 91/10, 92/10, 94/10, 99/0. Uafhængig bekræftelse den 10-08: målt
+#    spænd (T−Td) 0,3° kl. 01 = luften nåede mætning = himlen VAR klar,
+#    mens met.no meldte 82 % skyer og modellen derfor score 3 (facit: "ja,
+#    våde"). Default 25 = den FULDE middelfejl (user-valg samme dag; startede
+#    på 10, fordi en del af forskellen er cirrus som met.no tæller og
+#    ceilometeret ikke ser — men 08-10's 82 %/mættet-luft afgjorde at også de
+#    HØJE met.no-tal er oppustede). Bivirkning: på ægte overskyede nætter er
+#    met.no allerede 7 point for LAV, så −25 gør dem ~1,7 °C for kolde. Ser vi
+#    varsler på grå, stille nætter, er det dét der sker → sæt slideren ned.
+# 2) SKY-KOEFFICIENTEN 0.80 → 0.70 = tilbage til det målte fit. Se kommentaren
+#    ved `cool` — 0.80 kom ind i v2 uden begrundelse, og en for stærk dæmpning
+#    ovenpå for høje skytal gangede de to fejl sammen.
+# 3) PEAK-TIMEN sorteres nu på underskuddet, ikke på den nul-klampede
+#    intensitet. Alle nul-nætter rapporterede før 21:00's tal som "nattens
+#    værste time" — 3 af 5 træner-samples i hynde-æraen bar derfor ubrugelig
+#    fysik-kontekst. Ingen adfærdsændring, kun diagnostik + træner-data.
+#
+# =============================================================================
+# v5.1 (2026-08-12) — skalaen var mættet, så tærsklen havde ingen opløsning
+# =============================================================================
+# User: "1. ja [lidt fugtigt tæller som varsel-værdigt]. 2. giv mig den fulde
+# korrektion men jeg vil jo kun varsles når der reelt falder dug eller regn."
+#
+# 4) ANKERET 3.0 → 6.0. Kørt på 32 nætters DMI-observationer (11-07 → 12-08)
+#    ramte scoren 100 på 20 af 32 nætter og landede ALDRIG mellem 32 og 70.
+#    Soak-fordelingen går 0 → 9,5 med median 2,3 blandt dug-nætterne, så
+#    ankeret lå under medianen = alt over "let dug" blev til 100. Med 6,0
+#    spænder tallet feltet, og niveau-ordene (Gennemvåde ≥75 = soak 4,5,
+#    Våde ≥55 = soak 3,3) beskriver igen noget sjældent.
+# 5) TÆRSKLEN 45 → 25 (følsomhed 55 → 75), fordi "lidt fugtigt" nu tæller som
+#    en varsel-værdig nat. Sammen med (4) flytter selve trigger-punktet sig
+#    knap: soak 1,35 → 1,50 time-ækvivalenter. Det er tallets BETYDNING der
+#    ændrer sig, ikke hvornår vi varsler. På regn-siden = 0,25 mm.
+#
+# ⚠️ FORVENTET VARSELS-RATE: ~2 ud af 3 nætter. Det er ikke en fejl i modellen
+#    — det er hvad facit siger: 4 af user's 5 hynde-svar var "lidt" eller "ja",
+#    og observationerne giver mindst noget dug på 23 af 32 nætter. Ønsker user
+#    færre varsler, er det DEFINITIONEN af varsel-værdig der skal strammes
+#    (tærskel op mod 55-60 = soak 3,3+), ikke fysikken. Skalaen i (4) er
+#    netop det der gør den justering mulig uden at ramme alt-eller-intet.
+#
+# Skala-versionen står nu i SIDSTE felt af `dug_nat_laas` — felt-tælling duede
+# som signatur ved v3→v4 (12 → 13 felter), men v5.1 ændrede ankeret uden at
+# ændre antallet. Bump versionen ved enhver fremtidig ændring af score-skalaen.
+#
+# =============================================================================
+# v6 (2026-08-16) — afkølingen blev GÆTTET ud fra skyer og vind, ikke MÅLT
+# =============================================================================
+# User: "det går dårligt for dug varsel. der er meget dug her til morgen. intet
+# varsel i går. omvendte problem natten før." To nætter i træk, hver sin vej:
+#   nat 14→15: score 30 → varsel sendt → facit "nej"
+#   nat 15→16: score 0  → intet varsel → facit "meget dug"
+#
+# Kørt på DMI-OBSERVATIONER (06180, 5 km fra huset) er de to nætter næsten
+# identiske i alt v5.1 kigger på: min-spænd 2,3 vs 2,2 °C, RH-max 87 vs 87,
+# middelvind 12,4 vs 14,6 km/h — og den "tørre" nat var endda den KLARESTE
+# (13 % vs 20 % skyer). v5.1 havde altså nul opløsning på netop det par: den
+# gav 31 til den tørre nat og 6 til den våde. Fejlen sad ikke i prognosen.
+#
+# Det der SKILLER dem er hvor langt luften faktisk faldt: 3,8 °C (tør) mod
+# 6,0 °C (våd), og timer ≥4 °C under aften-temperaturen: 0 mod 7. Nat 14→15
+# var varm advektion — dugpunktet STEG 12,0 → 15,4 gennem natten, dvs. ny
+# fugtig luft blev blæst ind og holdt overfladen oppe. Nat 15→16 var en
+# stillestående udstrålings-nat med fladt dugpunkt.
+#
+# `afkoeling = (8+ekstra)(1−0,7c)/(1+v/9)` er et POTENTIALE: hvor meget
+# overfladen KUNNE stråle sig ned givet frit sigt til himlen og en vis
+# udluftning. Den har ingen advektions-term og kan derfor ikke se forskel.
+# Nattens temperaturkurve KAN: den er et integreret facit på hvor meget
+# afkøling der rent faktisk blev realiseret — inkl. advektion, faktiske skyer,
+# faktisk vind og jordvarmestrøm. Og den er robust mod modellens største målte
+# input-fejl (met.no's skydække ligger +31 point over DMI om natten).
+#
+#   fald_i    = max(0, T_aften − T_i)          [T_aften = varmeste af 21/22]
+#   afkoeling = (1−W)·potentiale + W·fald_i    [W = dug_afkoeling_faldvaegt_pct]
+#
+# KALIBRERET på 19 nætters facit mod DMI-observationer (07-21 → 08-16):
+#   W = 0   (= v5.1)  15/19 rigtige, 1 falsk positiv, 3 missede
+#   W = 45            18/19 rigtige, 0 falske positive, 1 misset
+# Tærsklen 25 rører sig ikke: ved W=45 ligger sidste "nej"-nat på 23,4 og
+# første "ja"-nat på 25,7, så 25 falder ned i hullet. Den ene tilbageværende
+# fejl er 08-07 ("lidt" ved 24 km/h vind) — den billigste af dem alle.
+# W er en slider, ikke en konstant: 0 ruller adfærden tilbage til v5.1.
+#
+# =============================================================================
+# STABILITET — hvorfor tallet nu står stille (user-kravet)
+# =============================================================================
+# To lag, begge nødvendige:
+#
+# A) LÅS. Dommen fryses af to uafhængige grunde (OR):
+#    A1) TID (2026-08-05, user-spec item 10): klokken har passeret
+#        min(input_datetime.dug_laas_tid, dug_varsel_tid) — default 21:00.
+#        Eksplicit og justerbar; flytter brugeren varslet til fx 19:00, låser
+#        dommen også dér, så det tal der pushes er det tal der står natten ud.
+#    A2) DÆKNINGSTAB: vi tæller hvor mange af vinduets 12 timer met.no faktisk
+#        leverer (`daekning`). Er dækningen < 12 for den nat vi allerede har en
+#        gemt vurdering af, så er timer begyndt at falde ud af forecastet →
+#        vinduet KAN ikke genberegnes. Denne lås var før den eneste, og faldt i
+#        praksis ~21:00 — derfor rører defaults ikke adfærden.
+#    Låsen holder til 09:00, hvor `nat_key` skifter til næste nat.
+#    Den gemte dom ligger i input_text.dug_nat_laas (IKKE i this.attributes): en
+#    trigger-template-sensors attributter er ikke garanteret genskabt efter
+#    restart, og dette hus genstarter ofte. Begge låse kræver at der ER en gemt
+#    dom for NETOP denne nat — ellers ville en restart kl. 23 efterlade
+#    sensoren uden tal resten af natten.
+#
+# B) EMA-DÆMPNING mens vinduet er fuldt (dagen igennem, 09:00→21:00):
+#    ny = 0.25 × rå + 0.75 × forrige. Nulstilles ved nat-skifte (ingen
+#    blanding på tværs af nætter). Monte-Carlo over 60 simulerede døgns
+#    forecast-revisioner: total variation pr. dag v1 = 86, v2 rå = 175,
+#    v2 + EMA = 46. Altså halvt så uroligt som den gamle model, på trods af
+#    en 2× stejlere skala.
+#
+# `kilde`-attributten fortæller hvad du kigger på: raa / glat / laast / stale.
+#
+# Vindue: 21:00 → 09:00 næste dag (forecast-vinduet, fast). Sensoren opdateres
+# /30 + 10 min før hver af de to tids-slidere (+ HA-start + template reload +
+# slider-ændring), push på dug_varsel_tid. KUN push til Parent A — bevidst
+# INGEN lys-blink (natten, familien sover). Gates: Active; AirBnB styres
+# centralt via notif_dug_airbnb-togglen.
+# =============================================================================
+
+input_number:
+  dug_varsel_sensitivitet:
+    name: "Dug-varsel: følsomhed (0 = fra)"
+    icon: mdi:weather-fog
+    min: 0          # 0 = reelt fra (varsler aldrig)
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+    # Ingen `initial:` → persisterer restarts. Live-default (50) sat via API +
+    # snapshot; fresh-install loader på MIN (0 = feature fra = ingen spam).
+
+  # v3 (2026-08-02): hvor meget KOLDERE end græs-referencen bliver en hynde?
+  # 8.0 °C-referencen gælder en græsplæne i læ. En hynde ligger med luft under
+  # sig (ingen jordvarme), har lav varmekapacitet pr. areal og ε ≈ 0,95 → den
+  # køler mindst lige så meget. 0 = behandl hynden som græs.
+  # Hæv den hvis træner-facit siger hynderne var våde uden at der kom varsel.
+  dug_overflade_ekstra_afkoeling:
+    name: "Dug: ekstra overfladeafkøling (hynder vs. græs)"
+    icon: mdi:thermometer-minus
+    min: 0
+    max: 5
+    step: 0.5
+    unit_of_measurement: "°C"
+    mode: slider
+
+  # v4 (2026-08-07): met.no's nat-prognose er MÅLT for tør mod DMI 06180 —
+  # fugtighed −6,05 point, spænd (T−Td) +1,14° i middel. Korrektionen lægges
+  # på FUGTEN (ikke på dugpunktet direkte), fordi RH er selve inputtet til
+  # Magnus-formlen: +6 point løfter dugpunktet ~1,05-1,15° ved 15-20°, hvilket
+  # er præcis den målte spænd-bias. 0 = stol rå på met.no.
+  dug_metno_fugt_bias_pct:
+    name: "Dug: fugt-korrektion af met.no (point)"
+    icon: mdi:water-percent-alert
+    min: 0
+    max: 15
+    step: 1
+    unit_of_measurement: "point"
+    mode: slider
+
+  # v5 (2026-08-12): samme øvelse for SKYERNE, som er modellens mest følsomme
+  # input (cool ∝ 1 − k·c). Målt met.no minus DMI 06180 på nat-timer:
+  # +25 point i middel (n=19, 5 døgn) og +22 point i v4's 21-dages måling — men
+  # bias'en er ENSIDET og sidder præcis hvor det gør ondt: er himlen faktisk
+  # klar (DMI < 25 %), melder met.no **+43 point** for meget skydække; er den
+  # reelt overskyet, rammer den rigtigt (−7). Forklaringen er definitions-
+  # forskel: met.no tæller høje cirrus med, DMI's ceilometer ser dem ikke — og
+  # for udstråling ligger sandheden imellem. Derfor en KONSERVATIV default (10),
+  # ikke de målte 25. 0 = stol rå på met.no.
+  dug_metno_sky_bias_pct:
+    name: "Dug: sky-korrektion af met.no (point)"
+    icon: mdi:weather-cloudy-alert
+    min: 0
+    max: 40
+    step: 5
+    unit_of_measurement: "point"
+    mode: slider
+
+  # v6 (2026-08-16): hvor stor en del af afkølings-estimatet der hentes fra
+  # nattens FAKTISKE temperaturfald i stedet for skyer+vind-potentialet.
+  # Potentialet siger hvad overfladen KUNNE stråle sig ned; temperaturkurven
+  # siger hvad der blev realiseret — den ser advektion, som potentialet er
+  # blind for. 0 = ren v5.1-adfærd (rollback), 45 = kalibreret optimum på 19
+  # nætters facit. Skru NED hvis der kommer varsler på kolde frontpassager
+  # (temperaturfald uden klar himmel); OP hvis lune, klare nætter overvarsles.
+  dug_afkoeling_faldvaegt_pct:
+    name: "Dug: vægt på nattens faktiske temperaturfald"
+    icon: mdi:thermometer-chevron-down
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-08-16h: `dug_apollo_rgb_lysstyrke` er RETIRED — styrken ejes nu af
+  # input_number.apollo_rgb_varsel_lysstyrke (packages/global_tuning.yaml),
+  # fælles for dug, regn og batteri.
+  #
+  # Hvorfor den forsvandt: tidligere i dag blev den hævet 30 % → 80 %. Med
+  # γ ≈ 2,9 er det ikke en 2,7× ændring men en 17× ændring i udsendt lys, og
+  # køkken-Apolloens LED sidder ved siden af dens EGEN LTR390. Målt kl. 21:28:
+  # rå lux 487,3 mod et modelleret fradrag på 488,9 → `koekken_lux_reel`
+  # clampede til 0,0. Sensoren målte altså ikke køkkenet, den målte sig selv,
+  # og `open_plan_lux` (gennemsnit af spisestue + køkken) blev trukket fra
+  # 3,8 ned til 1,9 — hvilket entréens nye lux-kurve arvede direkte.
+  # Én slider mindre at glemme = fejlklasse #2 lukket.
+
+input_datetime:
+  # 2026-08-05 (item 10): de to tidspunkter der før var hardkodet i hhv.
+  # template-sensoren (~21:00 via dæknings-tabet) og push-automationen (21:30).
+  #
+  # LÅSEN er nu EKSPLICIT tid, ikke en bivirkning af at met.no's forecast-timer
+  # falder ud af vinduet. Den gamle lås var kun implicit ("i praksis ~21:00") og
+  # kunne derfor ikke justeres — flyttede brugeren varslet til 19:00, ville han
+  # få en dom der stadig bevægede sig i to timer bagefter.
+  #
+  # EFFEKTIV lås = min(lås, varsel): en lås SENERE end pushen ville sende et tal
+  # der derefter kunne skride, og pushens egen beskrivelse ("præcis den vurdering
+  # der står på Status-siden resten af natten") ville blive en løgn (#3).
+  dug_laas_tid:
+    name: "Dug: hvornår nattens vurdering låses"
+    icon: mdi:lock-clock
+    has_date: false
+    has_time: true
+
+  dug_varsel_tid:
+    name: "Dug: hvornår varslet sendes"
+    icon: mdi:bell-ring-outline
+    has_date: false
+    has_time: true
+
+  # 2026-08-06 (user-spec): "hvis hynderne bliver våde så giv Apollo stue og
+  # køkken 30% blå rgb lys fra kl. 19.00 og frem til kl. 22.00" — styrken er
+  # 2026-08-16h flyttet til den fælles apollo_rgb_varsel_lysstyrke. Vinduet ligger
+  # FØR dug_varsel_tid (21:30) med vilje — LED'en er den tidlige, passive
+  # påmindelse man ser mens man rydder af bordet, pushen er bagkanten.
+  dug_apollo_rgb_on:
+    name: "Dug: Apollo-LED tænd (blå)"
+    icon: mdi:led-on
+    has_date: false
+    has_time: true
+
+  dug_apollo_rgb_off:
+    name: "Dug: Apollo-LED sluk"
+    icon: mdi:led-off
+    has_date: false
+    has_time: true
+
+input_text:
+  # RUNTIME-lager for nattens vurdering (ikke en indstilling — udeladt af
+  # helper-snapshottet, som kun tager input_number/boolean/datetime/select).
+  # Format: "<nat-dato>|<score>|<daekning>|<peak>|<T>|<Td>|<skyer>|<vind>|<afkøl>|<underskud>|<soak>|<regn_mm>|<aarsag>|<fald>|<version>"
+  # SIDSTE felt er MODEL-VERSION. Et stempel fra en anden version bærer en score
+  # på en anden skala (v4 halverede både rampen og soak-ankeret, v5.1 fordoblede
+  # ankeret, v6 lagde temperaturfaldet ind i afkølingen) → det forkastes af
+  # parse-guarden nedenfor, og natten genberegnes én gang på den nye model.
+  # Nat-datoen er MORGENENS dato (natten 08-02 21:00 → 08-03 09:00 = "2026-08-03").
+  dug_nat_laas:
+    name: "Dug: nattens låste vurdering (runtime)"
+    icon: mdi:lock-clock
+    max: 255
+    mode: text
+
+template:
+  - trigger:
+      - platform: homeassistant
+        event: start
+      # Sidste friske beregning FØR låsen falder — det er DENNE værdi der
+      # fryser. Offsettet følger sliderne, så en flyttet lås ikke efterlader et
+      # op til 30 min gammelt tal som nattens dom (/30-tikket alene).
+      - platform: time
+        at:
+          - entity_id: input_datetime.dug_laas_tid
+            offset: "-00:10:00"
+          - entity_id: input_datetime.dug_varsel_tid
+            offset: "-00:10:00"
+      # Hold status-gauge frisk + genberegn straks når brugeren trækker i
+      # følsomheds-slideren (umiddelbar feedback på Status-siden) eller flytter
+      # lås-/varsels-tiden (så `kilde` skifter med det samme, ikke om ≤30 min).
+      - platform: time_pattern
+        minutes: "/30"
+      - platform: state
+        entity_id:
+          - input_number.dug_varsel_sensitivitet
+          - input_number.dug_overflade_ekstra_afkoeling
+          - input_number.dug_metno_fugt_bias_pct
+          - input_number.dug_metno_sky_bias_pct
+          - input_number.dug_afkoeling_faldvaegt_pct
+          - input_datetime.dug_laas_tid
+          - input_datetime.dug_varsel_tid
+      - platform: event
+        event_type: event_template_reloaded
+    action:
+      # continue_on_error (B48): fejler met.no beholder sensoren sin gamle state
+      # i st.f. at hele action-kæden dør; fc-guard nedenfor håndterer undefined.
+      - service: weather.get_forecasts
+        continue_on_error: true
+        data:
+          type: hourly
+        target:
+          entity_id: weather.forecast_home
+        response_variable: fc
+
+      # ---------------------------------------------------------------------
+      # RÅ beregning for nattens vindue. To gennemløb:
+      #   pass 1: pluk vinduets timer ud i parallelle lister (temp, dugpunkt,
+      #           skyer, vind, nedbør, klokkeslæt)
+      #   pass 2: glat skyer/vind over ±1 time, beregn afkøling → underskud →
+      #           intensitet pr. TØR time; summér til soak (v3) og læg nedbøren
+      #           sammen; score = max(dug-soak, regn)
+      # ---------------------------------------------------------------------
+      - variables:
+          agg: >-
+            {% set hrs = fc.get('weather.forecast_home', {}).get('forecast', []) if fc is defined else [] %}
+            {# Efter midnat (00-09) er "i nat" = i GÅR 21:00 → i dag 09:00 —
+               ellers hopper vinduet til NÆSTE nat ved første /30-tick efter 00. #}
+            {# timedelta, ikke 86400 s: DST-natten har 25/23 t (H1) #}
+            {% set shift = timedelta(days=1) if now() < today_at('09:00') else timedelta(0) %}
+            {% set t0 = as_timestamp(today_at('21:00') - shift) %}
+            {% set t1 = as_timestamp(today_at('09:00') + timedelta(days=1) - shift) %}
+            {% set a = 17.625 %}
+            {% set b = 243.04 %}
+            {# v3: hynden køler mere end græsset — se header-punkt 1. #}
+            {% set ekstra = states('input_number.dug_overflade_ekstra_afkoeling') | float(1.5) %}
+            {# v4: met.no-fugten er målt systematisk for lav om natten (−6,05
+               point mod DMI 06180 over 181 nat-samples) → læg korrektionen på
+               INPUTTET til Magnus, ikke på resultatet. Loftet 100 er fysisk:
+               overmættet luft findes ikke. #}
+            {% set bias = states('input_number.dug_metno_fugt_bias_pct') | float(6) %}
+            {# v5: samme korrektion på skyerne — se slider-kommentaren. Trækkes
+               fra RÅ-timen før udglatningen, så et enkelt bygefelt ikke smitter
+               af på nabotimerne gennem korrektionen. #}
+            {% set skybias = states('input_number.dug_metno_sky_bias_pct') | float(10) %}
+            {# v6: hvor meget af afkølingen der hentes fra nattens faktiske
+               temperaturfald frem for skyer+vind-potentialet. Se header. #}
+            {% set faldvaegt = (states('input_number.dug_afkoeling_faldvaegt_pct') | float(45)) / 100.0 %}
+            {% set w = namespace(tp=[], td=[], cl=[], wd=[], pr=[], hh=[]) %}
+            {% for h in hrs %}
+              {% set ts = as_timestamp(h.datetime) %}
+              {% if ts >= t0 and ts < t1 %}
+                {% set t = h.temperature | float(0) %}
+                {% set rh = [[(h.humidity | float(0)) + bias, 100] | min, 1] | max %}
+                {% set gamma = log(rh / 100) + (a * t / (b + t)) %}
+                {% set w.tp = w.tp + [t] %}
+                {% set w.td = w.td + [b * gamma / (a - gamma)] %}
+                {% set w.cl = w.cl + [[(h.cloud_coverage | float(100)) - skybias, 0] | max] %}
+                {% set w.wd = w.wd + [h.wind_speed | float(0)] %}
+                {% set w.pr = w.pr + [h.precipitation | float(0)] %}
+                {% set w.hh = w.hh + [(h.datetime | as_datetime | as_local).strftime('%H:%M')] %}
+              {% endif %}
+            {% endfor %}
+            {% set n = w.tp | length %}
+            {# v6-reference: den varmeste af vinduets to første timer (21/22).
+               Efter låsen dræner vinduet forfra, så tstart glider med — det er
+               uden betydning, fordi dommen da er frosset (kilde = laast). #}
+            {% set tstart = (w.tp[:2] | max) if n > 0 else 0.0 %}
+            {% set r = namespace(items=[], soak=0.0, regn=0.0, vaade=0) %}
+            {% for i in range(n) %}
+              {# Regnen lægges sammen over ALLE timer (også dem der regner —
+                 v3: regn er den værste våd-kilde for en hynde, ikke en
+                 undtagelse vi springer over). #}
+              {% set r.regn = r.regn + w.pr[i] %}
+              {# I en regntime giver strålings-modellen ingen mening (overskyet
+                 pr. definition, og overfladen er allerede våd) → ingen dug-bidrag. #}
+              {% if w.pr[i] < 0.1 %}
+                {% set lo = [i - 1, 0] | max %}
+                {% set hi = [i + 2, n] | min %}
+                {% set c = (w.cl[lo:hi] | sum) / (hi - lo) %}
+                {% set v = (w.wd[lo:hi] | sum) / (hi - lo) %}
+                {# v5: sky-koefficienten er 0.70 = dén der blev FITTET på de 770
+                   DMI-nat-samples (headerens punkt: 2.3×(1−0.70c)/(1+w/5.9)).
+                   v2 deployede 0.80 uden begrundelse — amplituden og
+                   vind-konstanten har hver sin dokumenterede opskalering, den
+                   her havde ingen. Fittet er desuden lavet mod DMI's EGNE
+                   skytal; at køre met.no's højere tal gennem en STÆRKERE
+                   dæmpning end fittet gangede de to fejl sammen. #}
+                {% set cool_pot = (8.0 + ekstra) * (1.0 - 0.70 * (c / 100.0)) / (1.0 + v / 9.0) %}
+                {# v6: potentialet er blindt for advektion — nat 08-14→15 var
+                   klar og stille (potentiale 4,4°) men luften faldt kun 3,8°
+                   fordi dugpunktet STEG 12,0 → 15,4: ny fugtig luft holdt
+                   overfladen oppe, og der kom ingen dug. Nattens faktiske
+                   temperaturfald er det integrerede facit på hvor meget
+                   afkøling der blev realiseret. #}
+                {% set fald = [tstart - w.tp[i], 0.0] | max %}
+                {% set cool = (1.0 - faldvaegt) * cool_pot + faldvaegt * fald %}
+                {% set spread = w.tp[i] - w.td[i] %}
+                {% set deficit = cool - spread %}
+                {# v4: dug kræver at overfladen NÅR dugpunktet — deficit > 0.
+                   v3's `(deficit + 3)/5` gav kredit helt ned til 3° OVER
+                   dugpunktet, hvor der pr. definition ikke kondenserer noget;
+                   kørt på observationer varslede den 21 ud af 23 nætter. #}
+                {% set inten = [[deficit / 3.0, 1.0] | min, 0.0] | max %}
+                {# SOAK = vandet der lægger sig, time for time. Intet fordamp-
+                   ningsfradrag: skum og betræk slipper det ikke igen (punkt 3). #}
+                {% set r.soak = r.soak + inten %}
+                {% set r.vaade = r.vaade + (1 if inten >= 0.5 else 0) %}
+                {% set r.items = r.items + [{'inten': inten, 'hh': w.hh[i],
+                                             't': w.tp[i], 'td': w.td[i],
+                                             'c': c, 'v': v, 'cool': cool,
+                                             'fald': fald, 'pot': cool_pot,
+                                             'dfc': deficit, 'spread': spread}] %}
+              {% endif %}
+            {% endfor %}
+            {# v5: sorteres på UNDERSKUDDET, ikke på intensiteten. `inten` er
+               klampet til 0 forneden, så på en tør nat er ALLE timer lige med
+               0 og en stabil sort returnerer den FØRSTE time = 21:00 — hvorfor
+               hver eneste nul-nat i træner-loggen bar 21:00's tal (spænd 9,7°
+               kl. 21 på en nat der havde 1,9° kl. 04). Diagnostikken beskrev
+               altså aftensmaden, ikke natten. `dfc` er umonoton-fri: for
+               positive værdier giver den samme rækkefølge som `inten`. #}
+            {% set srt = r.items | sort(attribute='dfc', reverse=true) | list %}
+            {% set m = srt | length %}
+            {# v5.1: ankeret 3.0 → 6.0. Kørt på 32 nætters DMI-observationer
+               ramte scoren 100 på 20 af 32 nætter og lå ALDRIG mellem 32 og 70
+               — skalaen var mættet, så "Gennemvåde" beskrev to tredjedele af
+               sommeren og tærskel-slideren havde ingen opløsning at arbejde i.
+               Den observerede soak-fordeling går 0 → 9,5 med median 2,3 blandt
+               dug-nætterne, så 6.0 spænder feltet: 100 = de virkelig våde
+               nætter, 25 ≈ 1,5 timer kondens = let men ægte dug.
+               Bemærk at trigger-punktet næsten ikke flytter sig ved samme
+               beslutning: gammel (anker 3, tærskel 45) = soak 1,35, ny
+               (anker 6, tærskel 25) = soak 1,50. Det er TALLETS betydning der
+               ændrer sig, ikke hvornår vi varsler.
+               1.0 mm regn gør stadig en hynde gennemvåd på under en time. #}
+            {% set dug_sc = 100 * ([r.soak / 6.0, 1.0] | min) %}
+            {% set regn_sc = 100 * ([r.regn / 1.0, 1.0] | min) %}
+            {% set sc = [dug_sc, regn_sc] | max %}
+            {{ {'score': sc | round(1),
+                'dug_score': dug_sc | round(1),
+                'regn_score': regn_sc | round(1),
+                'soak': r.soak | round(2),
+                'regn_mm': r.regn | round(1),
+                'vaade': r.vaade,
+                'ekstra': ekstra | round(1),
+                'aarsag': ('regn' if (regn_sc >= dug_sc and regn_sc > 0)
+                           else ('dug' if dug_sc > 0 else 'ingen')),
+                'daekning': n,
+                'toerre': m,
+                'peak_time': srt[0].hh if m > 0 else '',
+                't': (srt[0].t | round(1)) if m > 0 else 0,
+                'td': (srt[0].td | round(1)) if m > 0 else 0,
+                'spread': (srt[0].spread | round(1)) if m > 0 else 0,
+                'cloud': (srt[0].c | round(0) | int) if m > 0 else 100,
+                'wind': (srt[0].v | round(1)) if m > 0 else 0,
+                'cool': (srt[0].cool | round(1)) if m > 0 else 0,
+                'fald': (srt[0].fald | round(1)) if m > 0 else 0,
+                'pot': (srt[0].pot | round(1)) if m > 0 else 0,
+                'aften_t': tstart | round(1),
+                'faldvaegt': (faldvaegt * 100) | round(0) | int,
+                'deficit': (srt[0].dfc | round(1)) if m > 0 else 0} }}
+
+      # ---------------------------------------------------------------------
+      # STABILISERING: læs gemt vurdering, afgør kilde, byg den publicerede dom.
+      # ---------------------------------------------------------------------
+      - variables:
+          # Nattens nøgle = MORGENENS dato. Skifter kl 09:00, samme sted som
+          # vindues-shiftet ovenfor → ét fælles nat-begreb (fejlklasse #2).
+          nat_key: >-
+            {{ (now() if now() < today_at('09:00') else now() + timedelta(days=1)).strftime('%Y-%m-%d') }}
+          # TIDS-LÅS (2026-08-05). Ankeret er nattens AFTEN-dato, ikke today_at():
+          # efter midnat peger today_at('21:00') 19 timer FREM i tiden, så dommen
+          # ville låse op igen kl. 00:00 og skride resten af natten (fejlklasse #8).
+          # Aften-datoen er i går før kl 09 (samme skæring som nat_key), ellers i dag.
+          # Effektiv lås = den TIDLIGSTE af lås- og varsels-tiden, så det tal der
+          # bliver pushet er det tal der står natten ud.
+          tid_laast: >-
+            {% set lt = state_attr('input_datetime.dug_laas_tid','timestamp') | float(75600) %}
+            {% set vt = state_attr('input_datetime.dug_varsel_tid','timestamp') | float(77400) %}
+            {% set aften = today_at('00:00') - timedelta(days=1)
+                           if now() < today_at('09:00') else today_at('00:00') %}
+            {{ now() >= aften + timedelta(seconds=[lt, vt] | min) }}
+          prev: >-
+            {% set s = states('input_text.dug_nat_laas') %}
+            {% set p = s.split('|') if s is string else [] %}
+            {# Et stempel fra en ÆLDRE skala må aldrig genbruges: v3 → v4
+               halverede både rampen og ankeret, v5.1 fordoblede ankeret igen,
+               så det samme vejr giver et helt andet tal. Ville vi genbruge
+               det, blev aftenens dom publiceret i gammel skala mod ny tærskel
+               (målt ved v2→v3: gemt 78 mod nyberegnet 47).
+               Felt-TÆLLING duer ikke længere som skala-signatur — v5.1 ændrede
+               ankeret uden at ændre antallet af felter — så stemplet bærer nu
+               en eksplicit version i SIDSTE felt. Bump den ved ENHVER ændring
+               af score-skalaen. Ukendt/manglende version = "intet gemt" → natten
+               genberegnes én gang på den nye model og låser sig så igen. #}
+            {% if p | length >= 15 and (p[0] | length) == 10 and p[14] == 'v6' %}
+              {{ {'key': p[0], 'score': p[1] | float(0), 'daekning': p[2] | int(0),
+                  'peak_time': p[3], 't': p[4] | float(0), 'td': p[5] | float(0),
+                  'cloud': p[6] | float(100), 'wind': p[7] | float(0),
+                  'cool': p[8] | float(0), 'deficit': p[9] | float(0),
+                  'soak': p[10] | float(0), 'regn_mm': p[11] | float(0),
+                  'aarsag': p[12], 'fald': p[13] | float(0)} }}
+            {% else %}{{ {} }}{% endif %}
+      - variables:
+          # raa   = ny nat / intet gemt → brug rå score
+          # glat  = samme nat + fuldt vindue → EMA-dæmp mod den gemte
+          # laast = samme nat + (klokken er passeret lås-tiden ELLER timer er
+          #         faldet ud af forecastet) → FRYS
+          # stale = met.no leverede intet → behold sidste gode (this-fallback)
+          #
+          # De to lås-årsager er OR'et med vilje: dæknings-tabet er stadig en
+          # ægte lås (vinduet kan ikke genberegnes når timerne mangler), og med
+          # defaults (21:00/21:30) rammer tids-låsen samme øjeblik som før =
+          # uændret adfærd indtil brugeren trækker i den nye slider.
+          kilde: >-
+            {{ 'stale' if (prev and agg.daekning == 0)
+               else ('laast' if (prev and prev.key == nat_key
+                                 and (agg.daekning < 12 or tid_laast))
+               else ('glat' if (prev and prev.key == nat_key) else 'raa')) }}
+      - variables:
+          dug: >-
+            {# `aarsag` er GEMT i stemplet, ikke gen-gættet. Den gamle
+               udledning ("regn hvis der faldt ≥0,1 mm") kaldte en dugnat med
+               en enkelt byge for en regnnat. NB: denne kommentar SKAL stå her
+               udenfor — en Jinja-kommentar mellem to dict-nøgler INDE i et
+               {{ }}-udtryk er en TemplateSyntaxError der dræber hele
+               sensoren (fejlklasse #22, kostede 4 dug-morgener 08-02→08-06). #}
+            {% if kilde in ['stale', 'laast'] %}
+              {{ {'key': prev.key if kilde == 'stale' else nat_key,
+                  'score': prev.score, 'daekning': prev.daekning,
+                  'peak_time': prev.peak_time, 't': prev.t, 'td': prev.td,
+                  'spread': (prev.t - prev.td) | round(1),
+                  'cloud': prev.cloud | round(0) | int, 'wind': prev.wind,
+                  'cool': prev.cool, 'deficit': prev.deficit,
+                  'soak': prev.soak, 'regn_mm': prev.regn_mm,
+                  'aarsag': prev.aarsag | default('dug', true),
+                  'fald': prev.fald | default(0, true)} }}
+            {% else %}
+              {% set sc = agg.score if kilde == 'raa'
+                          else (0.25 * agg.score + 0.75 * prev.score) %}
+              {{ {'key': nat_key, 'score': sc | round(1), 'daekning': agg.daekning,
+                  'peak_time': agg.peak_time, 't': agg.t, 'td': agg.td,
+                  'spread': agg.spread, 'cloud': agg.cloud, 'wind': agg.wind,
+                  'cool': agg.cool, 'deficit': agg.deficit,
+                  'soak': agg.soak, 'regn_mm': agg.regn_mm,
+                  'aarsag': agg.aarsag, 'fald': agg.fald} }}
+            {% endif %}
+
+      # Skriv den publicerede dom tilbage — næste tick låser/dæmper mod DENNE.
+      # (Ved 'stale' beholdes den GAMLE nat-nøgle med vilje: kommer met.no
+      #  tilbage efter 21:00 må en forældet vurdering ikke være låst fast som
+      #  "aftenens dom" — nøgle-mismatch sender os i stedet i 'raa'.)
+      - service: input_text.set_value
+        continue_on_error: true
+        target:
+          entity_id: input_text.dug_nat_laas
+        data:
+          value: >-
+            {{ dug.key }}|{{ dug.score | round(1) }}|{{ dug.daekning }}|{{ dug.peak_time }}|{{ dug.t | round(1) }}|{{ dug.td | round(1) }}|{{ dug.cloud | round(0) | int }}|{{ dug.wind | round(1) }}|{{ dug.cool | round(1) }}|{{ dug.deficit | round(1) }}|{{ dug.soak | round(2) }}|{{ dug.regn_mm | round(1) }}|{{ dug.aarsag }}|{{ dug.fald | round(1) }}|v6
+
+      - variables:
+          score: "{{ dug.score | round(0) | int }}"
+          sens: "{{ states('input_number.dug_varsel_sensitivitet') | int(0) }}"
+          # Tærskel bundes ved 1 — sens=100 må ikke give tærskel 0 (= varsel
+          # selv ved score 0 / helt overskyet regnnat).
+          threshold: "{{ [100 - (states('input_number.dug_varsel_sensitivitet') | int(0)), 1] | max }}"
+          is_dug: >-
+            {{ (states('input_number.dug_varsel_sensitivitet') | int(0)) > 0
+               and (dug.score | round(0) | int)
+                   >= [100 - (states('input_number.dug_varsel_sensitivitet') | int(0)), 1] | max }}
+          # v3: niveauet beskriver HYNDERNE, ikke dugfaldets intensitet.
+          level: >-
+            {{ 'Gennemvåde' if (dug.score | round(0) | int) >= 75
+               else ('Våde' if (dug.score | round(0) | int) >= 55 else 'Fugtige') }}
+    sensor:
+      - name: "Dug-varsel i nat"
+        unique_id: dug_varsel_i_nat
+        icon: >-
+          {% if is_dug %}mdi:weather-fog{% else %}mdi:weather-night{% endif %}
+        state: "{{ level if is_dug else 'Ingen' }}"
+        attributes:
+          forklaring: >-
+            {% if is_dug %}
+              🛋️ Tag hynder og madrasser ind — de bliver {{ level | lower }} i nat.
+              {% if dug.aarsag == 'regn' %}
+                {{ dug.regn_mm }} mm regn ventes i vinduet 21–09 (1 mm = gennemvådt betræk).
+              {% else %}
+                {{ dug.soak | round(1) }} timers dugfald akkumuleret (værst ~{{ dug.peak_time }}):
+                luft {{ dug.t }}°, dugpunkt {{ dug.td }}° (spænd {{ dug.spread }}°),
+                {{ dug.cloud }}% skyer, vind {{ dug.wind }} km/h, luften er faldet
+                {{ dug.fald }}° siden kl. 21 → overfladen køler
+                ~{{ dug.cool }}° = {{ dug.deficit }}° under dugpunktet.
+                {% if dug.regn_mm >= 0.1 %}Dertil {{ dug.regn_mm }} mm regn.{% endif %}
+              {% endif %}
+            {% else %}
+              Hynderne kan blive ude. Våd-score {{ score }} < tærskel {{ threshold }}
+              (følsomhed {{ sens }}):
+              {{ dug.soak | round(1) }} timers dugfald + {{ dug.regn_mm }} mm regn.
+              Bedste dug-time ~{{ dug.peak_time if dug.peak_time else '—' }}:
+              spænd {{ dug.spread }}° mod ~{{ dug.cool }}° afkøling
+              ({{ dug.deficit }}° fra dugpunktet).
+            {% endif %}
+          # Attribut-navnet er BEVIDST uændret (dew_score/is_dug) — binary_sensoren
+          # nedenfor, træneren og Status-siden læser dem; se fejlklasse #2.
+          dew_score: "{{ score }}"
+          soak_timer: "{{ dug.soak }}"
+          regn_mm: "{{ dug.regn_mm }}"
+          aarsag: "{{ dug.aarsag }}"
+          threshold: "{{ threshold }}"
+          sensitivity: "{{ sens }}"
+          peak_time: "{{ dug.peak_time }}"
+          peak_temp_c: "{{ dug.t }}"
+          peak_dewpoint_c: "{{ dug.td }}"
+          peak_spread_c: "{{ dug.spread }}"
+          peak_cloud_pct: "{{ dug.cloud }}"
+          peak_wind_kmh: "{{ dug.wind }}"
+          afkoeling_c: "{{ dug.cool }}"
+          underskud_c: "{{ dug.deficit }}"
+          # v6: hvor langt luften er faldet under aften-temperaturen i peak-timen.
+          # Det er den term der ser advektion — se header-afsnittet om v6.
+          fald_c: "{{ dug.fald }}"
+          is_dug: "{{ is_dug }}"
+          gaelder_nat: "{{ dug.key }}"
+          kilde: "{{ kilde }}"
+
+      # Numerisk score (0–100) til speedometer-gauge på Status-siden — gauge-
+      # kortet kan ikke vise en attribut, så scoren eksponeres som egen sensor.
+      - name: "Dug-score i nat"
+        unique_id: dug_score_i_nat
+        unit_of_measurement: "%"
+        icon: mdi:speedometer
+        state: "{{ score }}"
+        attributes:
+          threshold: "{{ threshold }}"
+          sensitivity: "{{ sens }}"
+          is_dug: "{{ is_dug }}"
+          level: "{{ level if is_dug else 'Ingen' }}"
+          peak_time: "{{ dug.peak_time }}"
+          peak_temp_c: "{{ dug.t }}"
+          peak_dewpoint_c: "{{ dug.td }}"
+          peak_spread_c: "{{ dug.spread }}"
+          peak_cloud_pct: "{{ dug.cloud }}"
+          peak_wind_kmh: "{{ dug.wind }}"
+          # Mellemregninger i den nye energibalance-model:
+          #   afkoeling_c = hvor mange grader overfladen stråler sig ned under
+          #                 lufttemperaturen (skyer + vind bremser det)
+          #   underskud_c = afkoeling_c − spænd; positiv = dugpunktet nås
+          afkoeling_c: "{{ dug.cool }}"
+          underskud_c: "{{ dug.deficit }}"
+          # v6: afkølingen er en blanding af POTENTIALET (skyer+vind) og det
+          # temperaturfald prognosen faktisk lover. Er fald_c stort mens
+          # potentiale_c er lille, er det en overskyet/blæsende men reelt
+          # kølende nat — og omvendt (klar, stille, men varm advektion).
+          fald_c: "{{ dug.fald }}"
+          potentiale_c: "{{ agg.pot }}"
+          aften_temp_c: "{{ agg.aften_t }}"
+          faldvaegt_pct: "{{ agg.faldvaegt }}"
+          # v3-substansen bag scoren:
+          soak_timer: "{{ dug.soak }}"
+          regn_mm: "{{ dug.regn_mm }}"
+          aarsag: "{{ dug.aarsag }}"
+          overflade_ekstra_c: "{{ agg.ekstra }}"
+          # Stabilitets-diagnostik: hvad kigger du på lige nu?
+          kilde: "{{ kilde }}"
+          gaelder_nat: "{{ dug.key }}"
+          raa_score: "{{ agg.score | round(0) | int }}"
+          raa_dug_score: "{{ agg.dug_score | round(0) | int }}"
+          raa_regn_score: "{{ agg.regn_score | round(0) | int }}"
+          timer_i_vindue: "{{ agg.daekning }}"
+          toerre_timer: "{{ agg.toerre }}"
+          vaade_timer: "{{ agg.vaade }}"
+
+  # ===========================================================================
+  # "Sender notifikation i aften?" — live state-baseret (genberegnes når dug-
+  # sensoren, husets state eller mode ændrer sig). Spejler push-automationens
+  # gates (is_dug = score ≥ tærskel inkl. følsomhed, Active, AirBnB-opt-in).
+  # Pushen fyrer på input_datetime.dug_varsel_tid. Vis på Status-siden.
+  # ===========================================================================
+  # 2026-10-20: + regn-dubletten (binary_sensor.nattens_vejr_har_sagt_regn
+  # nedenfor) — samme anker som dug-pushens condition, så de ikke kan glide.
+  - binary_sensor:
+      - name: "Dug-varsel sender i aften"
+        unique_id: dug_varsel_sender_i_aften
+        icon: >-
+          {{ 'mdi:bell-ring' if (state_attr('sensor.dug_varsel_i_nat','is_dug') == true
+             and is_state('input_select.house_state','Active')
+             and (not is_state('input_select.house_mode','AirBnB')
+                  or is_state('input_boolean.notif_dug_airbnb','on'))
+             and not is_state('binary_sensor.nattens_vejr_har_sagt_regn','on')) else 'mdi:bell-off-outline' }}
+        state: >-
+          {{ state_attr('sensor.dug_varsel_i_nat','is_dug') == true
+             and is_state('input_select.house_state','Active')
+             and (not is_state('input_select.house_mode','AirBnB')
+                  or is_state('input_boolean.notif_dug_airbnb','on'))
+             and not is_state('binary_sensor.nattens_vejr_har_sagt_regn','on') }}
+        attributes:
+          forklaring: >-
+            {% set dug = state_attr('sensor.dug_varsel_i_nat','is_dug') == true %}
+            {% set score = state_attr('sensor.dug_varsel_i_nat','dew_score') | int(0) %}
+            {% set thr = state_attr('sensor.dug_varsel_i_nat','threshold') | int(100) %}
+            {% set active = is_state('input_select.house_state','Active') %}
+            {% set airbnb_blocked = is_state('input_select.house_mode','AirBnB')
+               and not is_state('input_boolean.notif_dug_airbnb','on') %}
+            {% set vt = states('input_datetime.dug_varsel_tid') | default('21:30:00', true) %}
+            {% if dug and active and not airbnb_blocked
+                  and is_state('binary_sensor.nattens_vejr_har_sagt_regn','on') %}
+              ❌ NEJ — "Nattens vejr" har allerede sagt regn og "tag hynder og madrasser ind" i aften.
+            {% elif dug and active and not airbnb_blocked %}
+              ✅ JA — "tag hynderne ind"-push kl {{ vt[:5] }} (våd-score {{ score }} ≥ tærskel {{ thr }}).
+            {% elif not dug %}
+              ❌ NEJ — våd-score {{ score }} < tærskel {{ thr }} (hæv følsomheden for at varsle ved mindre fugt).
+            {% elif not active %}
+              ❌ NEJ — hynderne bliver våde ({{ score }} ≥ {{ thr }}), men huset er ikke Active.
+            {% else %}
+              ❌ NEJ — AirBnB-mode (slå "💧 Dug — også i AirBnB" til på 🔔-fanen for at modtage den alligevel).
+            {% endif %}
+
+      # -----------------------------------------------------------------------
+      # Har "🌙 Nattens vejr" allerede sagt REGN i aften til mindst de samme
+      # telefoner som dug-pushen? (2026-10-20) Så er "tag hynderne ind" kl. 19
+      # en dublet: vejr-pushens regn-linje siger selv "tag hynder og madrasser
+      # ind". Målt 9/10, 13/10, 16/10: to pushes om det samme, begge swipet væk.
+      #  - pushen er kørt i dag efter kl. 12 (aften-tiderne er 16:30-17:30)
+      #  - vejr-sensoren har IKKE skiftet siden (så pushen viste regn). Efter en
+      #    restart er last_changed nulstillet → off → hellere én push for meget.
+      #  - vejr-routingen dækker dug-routingen (enabled, Parent A, Parent B, AirBnB).
+      #    Push_notify's tidsvindue og hjemkomst-kø er ikke spejlet: en kø'et
+      #    vejr-push når frem ved hjemkomst og siger det samme.
+      # Læst af dug_varsel_nat_push_parent_a + binary_sensor.dug_varsel_sender_i_aften.
+      # -----------------------------------------------------------------------
+      - name: "Nattens vejr har sagt regn"
+        unique_id: nattens_vejr_har_sagt_regn
+        icon: mdi:weather-pouring
+        state: >-
+          {% set sidst = state_attr('automation.vejr_varsel_aften_push_for_nattens_vejr_16_30_17_00_18_30', 'last_triggered') %}
+          {% set v = states.sensor.vejr_varsel_i_nat %}
+          {{ sidst is not none and sidst >= today_at('12:00')
+             and v is not none and v.attributes.get('is_rain') == true
+             and v.last_changed <= sidst
+             and is_state('input_boolean.notif_vejr_enabled', 'on')
+             and (is_state('input_boolean.notif_dug_parent_a', 'off') or is_state('input_boolean.notif_vejr_parent_a', 'on'))
+             and (is_state('input_boolean.notif_dug_parent_b', 'off') or is_state('input_boolean.notif_vejr_parent_b', 'on'))
+             and (not is_state('input_select.house_mode', 'AirBnB') or is_state('input_boolean.notif_vejr_airbnb', 'on')) }}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # APOLLO-LED BLÅ i stue + køkken når hynderne bliver våde (2026-08-06)
+  # ---------------------------------------------------------------------------
+  # User-spec: "hvis hynderne bliver våde så giv Apollo stue og køkken blå
+  # rgb lys fra kl. 19.00 og frem til kl. 22.00."
+  #
+  # 2026-08-16h FLYTTET. Automationerne `dug_apollo_rgb_on`/`_off` lå her indtil
+  # husets tre RGB-varsler (dug, regn, batteri) gik over til blink. De skrev til
+  # de samme LED'er og skelnede sig fra hinanden på hue + brightness — og da
+  # alle tre nu deler ÉN styrke-slider, holdt den ejerskabs-test op med at
+  # virke (fejlklasse #1/#2). Logikken bor nu ÉT sted:
+  #
+  #     packages/apollo_rgb_varsel.yaml
+  #       sensor.apollo_rgb_varsel            → hvem vinder (Batteri > Regn > Dug)
+  #       automation apollo_rgb_varsel_blink  → renderer vinderen som blink
+  #
+  # Dug-DELEN af gaten er uændret og læses stadig herfra: sensitivitet > 0,
+  # sensor.dug_varsel_i_nat.is_dug, og vinduet input_datetime.dug_apollo_rgb_on
+  # → dug_apollo_rgb_off (default 19:00-22:00), som stadig defineres i denne fil
+  # og stadig vises på indstillings-siden. Nyt oveni: godnat slukker varslet.
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # AFTEN-PUSH til Parent A's tlf — kun hvis dug varsles for natten.
+  # Tidspunktet styres af input_datetime.dug_varsel_tid (default 21:30).
+  # ---------------------------------------------------------------------------
+  - id: dug_varsel_nat_push_parent_a
+    alias: "Dug-varsel: aften-push til Parent A (kun dug-nætter)"
+    description: >
+      På input_datetime.dug_varsel_tid (default 21:30): hvis
+      sensor.dug_varsel_i_nat varsler at terrassens hynder og madrasser bliver
+      for våde i nat (følsomhed > 0 + score over tærsklen) sendes en sticky push
+      til Parent A's tlf (notify.mobile_app_phone_a) med besked om at tage dem ind
+      inden sengetid. Ingen push på tørre/blæsende/overskyede nætter. Bevidst
+      ingen lys-BLINK her (familien sover) — den passive blå Apollo-LED i
+      stue/køkken kører i sit eget aften-vindue, se dug_apollo_rgb_on ovenfor.
+      Gates: Active. AirBnB-undertrykkelse ligger centralt i push_notify
+      (notif_dug_airbnb-toggle, 2026-07-16). NB: scoren er på dette tidspunkt
+      LÅST — låsen falder på min(dug_laas_tid, dug_varsel_tid), så pushen sender
+      præcis den vurdering der står på Status-siden resten af natten.
+    mode: single
+    trigger:
+      - platform: time
+        at: input_datetime.dug_varsel_tid
+    condition:
+      # Slider = 0 → feature helt fra.
+      - condition: numeric_state
+        entity_id: input_number.dug_varsel_sensitivitet
+        above: 0
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      # AirBnB-gate fjernet 2026-07-16 — bor nu centralt i push_notify
+      # (input_boolean.notif_dug_airbnb, default off = uændret adfærd).
+      # Kun hvis sensoren faktisk varsler dug.
+      - condition: template
+        value_template: "{{ state_attr('sensor.dug_varsel_i_nat','is_dug') == true }}"
+      # 2026-10-20: regn-aftener gav to pushes om det samme — "🌙 Nattens vejr:
+      # Regn" kl. 16:30 og denne kl. 19 (9/10, 13/10, 16/10; begge swipet væk).
+      # Nattens vejr-push siger nu selv "tag hynder og madrasser ind", så har
+      # den sagt REGN i aften til mindst de samme telefoner, er denne en dublet.
+      # Kræver at vejr-sensoren ikke har skiftet siden pushen (så pushen viste
+      # regn) — efter en restart er det ukendt → push hellere én gang for meget.
+      # Logikken bor i binary_sensor.nattens_vejr_har_sagt_regn (ét anker, som
+      # Status-sidens "sender i aften" også læser — fejlklasse #2).
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.nattens_vejr_har_sagt_regn', 'on') }}"
+    action:
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: dug
+          title: "🛋️ Tag hynderne ind — {{ states('sensor.dug_varsel_i_nat') | lower }} i nat"
+          # 2026-10-20: egen kort tekst i stedet for `forklaring` (som Status-
+          # siden stadig viser med fysikken: spænd, afkøling, underskud). Titlen
+          # siger allerede hvad man skal gøre — brødteksten siger hvorfor.
+          message: >-
+            {% from 'tekst.jinja' import tal %}
+            {% set s = 'sensor.dug_varsel_i_nat' %}
+            {% set regn = state_attr(s, 'regn_mm') | float(0) %}
+            {% set peak = state_attr(s, 'peak_time') | default('', true) | string %}
+            {% if state_attr(s, 'aarsag') == 'regn' %}
+              {{- 'Ca. ' ~ tal(regn) ~ ' mm regn mellem kl. 21 og 09 — 1 mm er nok til at gennemvæde betrækket.' -}}
+            {% else %}
+              {{- 'Dug i ca. ' ~ tal(state_attr(s, 'soak_timer') | float(0)) ~ ' timer i nat'
+                  ~ (', værst omkring kl. ' ~ peak[:5] if peak | length >= 4 else '') ~ '.'
+                  ~ (' Dertil ' ~ tal(regn) ~ ' mm regn.' if regn >= 0.1 else '') -}}
+            {% endif %}
+          payload:
+            sticky: true
+            tag: dug_varsel_nat
+            notification_icon: mdi:weather-fog
+            actions:
+              - action: "DUG_SENS_NED"
+                title: "🔻 Mindre følsom"
+              - action: "DUG_SENS_FRA"
+                title: "🔕 Slå fra"
+      - service: logbook.log
+        data:
+          name: "Dug-varsel"
+          message: >
+            Aften-push til Parent A — hynder {{ states('sensor.dug_varsel_i_nat') | lower }}
+            (score {{ state_attr('sensor.dug_varsel_i_nat','dew_score') }} /
+            tærskel {{ state_attr('sensor.dug_varsel_i_nat','threshold') }},
+            årsag {{ state_attr('sensor.dug_varsel_i_nat','aarsag') }},
+            soak {{ state_attr('sensor.dug_varsel_i_nat','soak_timer') }} t /
+            regn {{ state_attr('sensor.dug_varsel_i_nat','regn_mm') }} mm).

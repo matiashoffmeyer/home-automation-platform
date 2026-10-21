@@ -1,0 +1,741 @@
+# =============================================================================
+# ROBOROCK — pr.-rum-scripts (hurtig / grundig) med opgave-kø
+# =============================================================================
+# User-spec 2026-08-13: "find alle de nye rum navne i roborock integrationen og
+# lav 2 scripts per rum: et til hurtig rengøring af det rum og et til super
+# grundig støvsugning og gulvvask af det rum. Skal bruge det til widgets og
+# måske fysiske knapper senere. Hvis flere scripts bliver kørt efter hinanden
+# skal de lægge sig i robottens kø af opgaver."
+#
+# 🗺️ SEGMENT-KORTET (hentet med `roborock.get_maps` 2026-08-13). Roborock-
+# app'ens navne er engelske defaults og siger derfor ikke hvilket dansk rum de
+# er. Mappingen er UDLEDT AF DATA, ikke gættet: for hvert interval hvor
+# `sensor.s8_maxv_ultra_current_room` stod på et navn, blev det talt op hvilke
+# rums occupancy-sensorer havde en RISING EDGE i intervallet (21 døgns
+# recorder) — robotten er selv den bevægelse sensorerne ser. Løft over
+# baseline: Bedroom→soveværelse +0,50 · Bedroom1→børneværelse +0,50 ·
+# Study→depot +0,45 · Bathroom→badeværelse +0,29. De to open-plan-segmenter
+# (16/23) kunne data ikke skelne — begge Apolloer ser hele arealet — og er
+# fastlagt af user 2026-08-13.
+#
+#   16 Living room  → Spisestue        25 Kitchen      → Køkken
+#   17 Bedroom1     → Børneværelse     21 Corridor     → Entré
+#   18 Bathroom     → Badeværelse      22 Study        → Depot
+#   19 Bedroom      → Soveværelse      23 Living room1 → Stue
+#   24 Kitchen1     → Teknikskab — må ALDRIG støvsuges (user 2026-10-10)
+#
+# 2026-10-10: user skilte teknikskabet ud af køkkenet i app'en (kortet
+# opdateret ~14:57) → det gamle køkken-segment 20 forsvandt, og et kald med 20
+# fik robotten til at køre ud og vende om efter ~12 s. Segment 24 står KUN i
+# `navne` (så current_room kan oversættes) — aldrig i `rum`/`slugs` eller et
+# script. Tjek altid `roborock.get_maps` før du stoler på numrene her.
+#
+# ⚠️ ID'erne HAR flyttet sig: kommentaren i roborock.yaml:312 tror stadig at 17
+# er "Living room1" (det er nu 23) — kortet er blevet re-segmenteret. Rør ikke
+# et segment-nummer andre steder i repoet uden at holde det op mod listen her.
+#
+# 🎯 ÉT DELT RESULTAT (fejlklasse #2): navnene står KUN i `rum`-attributten på
+# sensor.roborock_rum_kort. Både kø-teksten, logbogen og pushene læser DEN —
+# ingen af de 16 rum-scripts kender sit eget navn, kun sit segment-nummer.
+#
+# ⚠️ Selve kø-STRENGEN parses derimod bevidst inline i begge scripts i stedet
+# for via sensoren: en template-sensor gen-renderes asynkront efter at
+# input_text'en er skrevet, så `tilfoej` → `kick` (samme tick) ville læse en
+# kø UDEN den opgave der lige blev lagt i den, og to hurtige widget-tryk ville
+# overskrive hinanden. Sensorens tal/tekst er til VISNING, ikke til styring.
+#
+# 🔁 KØEN. Roborock har ingen server-side kø: sender man `app_segment_clean`
+# mens robotten kører, taber man enten den nye eller den igangværende opgave.
+# Køen bor derfor i HA (`input_text.roborock_rum_koe`, format `<seg>:<h|g|s>`
+# komma-separeret; `s` = SmartPlan, packages/roborock_smartplan.yaml) og
+# tømmes af `roborock_rum_koe_kick`, der KUN dispatcher når robotten
+# beviseligt er ledig (docked/idle + cleaning off + ingen fejl + batteri
+# ≥ 15 %).
+#
+#   • Trykker man flere rum i træk MED SAMME grundighed, sendes de som ÉN
+#     `app_segment_clean` med flere segmenter — det er robottens egen måde at
+#     køre flere rum på, og den planlægger så selv ruten i stedet for at docke
+#     mellem hvert rum. Skifter grundigheden i køen, brydes batchen dér.
+#   • Dispatch sker både på flanken (robotten docker) OG på en /2-min-backstop,
+#     fordi en HA-restart dræber enhver ventende flanke (💡 Permanente fakta) —
+#     står robotten allerede i dokken når HA kommer op, kommer der aldrig en ny
+#     `to: docked`, og køen ville hænge for evigt.
+#   • Automatisk udgang: har køen ligget urørt i `roborock_rum_koe_max_ventetid_
+#     minutter` (default 240), ryddes den + push. En kø må ikke kunne overleve
+#     til næste dag og starte en gulvvask kl. 03 fordi robotten var offline.
+#
+# 🧾 BOGFØRING: scripts her sætter BEVIDST ikke `roborock_session_active` —
+# samme grund som `roborock_start_let_stue` (roborock.yaml:314): et enkelt rum
+# må ikke stemple `roborock_last_completed` og dermed udskyde hel-hus-
+# rengøringen et helt aktiv-timer-interval. `roborock_segment_clean_at`
+# stemples derimod, så `roborock_fremmed_clean_stamp` springer kørslen over.
+#
+# 📱 Widgets: alle 16 scripts er selvstændige entities og kan lægges direkte i
+# companion-app'ens script-widget eller bindes til en fysisk knap senere.
+# =============================================================================
+
+input_text:
+  # Ventende opgaver, `<segment>:<h|g|s>` komma-separeret, fx "20:h,23:g".
+  # BEVIDST uden `initial:` — en initial-værdi ville nulstille en ventende kø
+  # ved hver HA-restart. En urørt input_text står på 'unknown' (som er TRUTHY,
+  # jf. 💡 Permanente fakta) → parsingen i sensoren tester eksplicit for det.
+  roborock_rum_koe:
+    name: "Roborock rum-kø (segment:mode)"
+    max: 255
+    icon: mdi:format-list-numbered
+
+  # Hvad der blev sendt afsted sidst — til dashboard/widget-visning.
+  roborock_rum_koe_nu:
+    name: "Roborock rum-kø: kører nu"
+    max: 255
+    icon: mdi:robot-vacuum
+
+input_datetime:
+  # SKREVET stempel (ikke last_changed, fejlklasse #5) — giv-op-uret skal
+  # overleve en HA-restart, ellers får en hængende kø fuld frist hver gang.
+  roborock_rum_koe_stemplet:
+    name: "Roborock rum-kø sidst ændret"
+    has_date: true
+    has_time: true
+
+input_number:
+  roborock_rum_koe_max_ventetid_minutter:
+    name: "🧹 Rum-kø: giv op og ryd efter"
+    min: 30
+    max: 720
+    step: 30
+    unit_of_measurement: "min"
+    icon: mdi:timer-off
+
+  # SAMLE-VINDUE. Uden det dispatcher det FØRSTE tryk med det samme (målt
+  # 2026-08-13: Entré startede < 1 s efter kaldet), og tryk nr. 2 kan pr.
+  # konstruktion aldrig nå at komme med i batchen — robotten ville køre ud,
+  # docke og køre ud igen. Vinduet holder kicket tilbage så alle tryk i en
+  # serie samles til én kommando. 0 = start med det samme.
+  roborock_rum_koe_samlevindue_sekunder:
+    name: "🧹 Rum-kø: saml tryk i"
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "s"
+    icon: mdi:timer-sync
+
+template:
+  - sensor:
+      # Segment → dansk rum. ENESTE sted mappingen findes; scripts og kø-
+      # teksten læser `rum`-attributten herfra. Egen sensor (ikke en attribut
+      # på kø-sensoren) så ingen skal self-reference sine egne attributter.
+      # Navnet slugify'er til `roborock_rum_kort` = unique_id (påkrævet).
+      - name: "Roborock rum kort"
+        unique_id: roborock_rum_kort
+        icon: mdi:map-marker-multiple
+        state: "8"
+        attributes:
+          rum: >-
+            {{ {'16': 'Spisestue', '17': 'Børneværelse', '18': 'Badeværelse',
+                '19': 'Soveværelse', '21': 'Entré', '22': 'Depot',
+                '23': 'Stue', '25': 'Køkken'} }}
+          # Samme mapping, nøglet på Roborocks engelske segment-NAVN i stedet
+          # for nummeret, fordi `sensor.s8_maxv_ultra_current_room` melder
+          # navnet. Bevidst her — så begge opslag ligger seks linjer fra
+          # hinanden og ikke kan divergere ubemærket (fejlklasse #2).
+          navne: >-
+            {{ {'Living room': 'Spisestue', 'Bedroom1': 'Børneværelse',
+                'Bathroom': 'Badeværelse', 'Bedroom': 'Soveværelse',
+                'Kitchen': 'Køkken', 'Kitchen1': 'Teknikskab', 'Corridor': 'Entré',
+                'Study': 'Depot', 'Living room1': 'Stue'} }}
+          # Tredje nøgling: husets slug → segment. Bruges af Styrbar-
+          # konfigurationen (packages/roborock_styrbar.yaml), der bygger
+          # entity-navne som input_boolean.roborock_styrbar_<tryk>_<slug>.
+          # RÆKKEFØLGEN er husets (samme som knapperne på Støvsug-siden), ikke
+          # segment-numrenes — den bestemmer kø-rækkefølgen ved et Styrbar-tryk.
+          # Et rum med flere segmenter må have en LISTE som værdi (Styrbar og
+          # Indstillinger forstår begge former).
+          slugs: >-
+            {{ {'stue': 23, 'spisestue': 16, 'koekken': 25, 'entre': 21,
+                'sovevaerelse': 19, 'boernevaerelse': 17,
+                'badevaerelse': 18, 'depot': 22} }}
+
+      # Kun til visning (dashboard/widget) og som billig gate-betingelse i
+      # automations — styringen læser input_text'en direkte, se hovedet.
+      - name: "Roborock rum koe"
+        unique_id: roborock_rum_koe
+        icon: mdi:playlist-play
+        unit_of_measurement: "opgaver"
+        state: >-
+          {% set q = states('input_text.roborock_rum_koe') %}
+          {{ 0 if q in ['unknown', 'unavailable', 'none', '', '-']
+             else q.split(',') | reject('eq', '') | list | count }}
+        attributes:
+          tekst: >-
+            {% set m = state_attr('sensor.roborock_rum_kort', 'rum') | default({}, true) %}
+            {% set q = states('input_text.roborock_rum_koe') %}
+            {% set jobs = [] if q in ['unknown', 'unavailable', 'none', '', '-']
+                          else q.split(',') | reject('eq', '') | list %}
+            {% if jobs | count == 0 %}
+              Ingen ventende opgaver
+            {% else %}
+              {% set ns = namespace(o=[]) %}
+              {% for j in jobs %}
+                {% set seg = j.split(':')[0] %}
+                {% set md = j.split(':')[1] %}
+                {% set ns.o = ns.o + [ m.get(seg, 'Segment ' ~ seg)
+                                       ~ {'g': ' (grundig)', 's': ' (SmartPlan)'}.get(md, ' (hurtig)') ] %}
+              {% endfor %}
+              {{ ns.o | unique | join(' → ') }}
+            {% endif %}
+          koerer: >-
+            {% set n = states('input_text.roborock_rum_koe_nu') %}
+            {{ '' if n in ['unknown', 'unavailable', 'none'] else n }}
+
+script:
+  # ---------------------------------------------------------------------------
+  # Fælles kø-motor
+  # ---------------------------------------------------------------------------
+  # De 16 rum-scripts indeholder ingen logik — de kalder KUN denne med deres
+  # segment-nummer. Al viden om profiler, batching og robot-tilstand bor her,
+  # så en ændring aldrig skal laves 16 gange (fejlklasse #2).
+  roborock_rum_koe_tilfoej:
+    alias: "Roborock rum-kø: tilføj opgave"
+    icon: mdi:playlist-plus
+    # queued: to widget-tryk med et halvt sekunds mellemrum må ikke tabes.
+    mode: queued
+    max: 16
+    fields:
+      segment:
+        description: "Roborock-segment-nummer (16-23)"
+        required: true
+        example: 20
+      grundighed:
+        description: "'h' = hurtig (kun støvsug) · 'g' = grundig (støvsug + gulvvask) · 's' = SmartPlan (robotten vælger selv pr. rum)"
+        required: true
+        example: "h"
+    variables:
+      # Rå læsning af køen — IKKE via template-sensoren (async gen-render, se
+      # hovedet). En urørt input_text står på 'unknown', som er truthy.
+      jobs: >-
+        {% set q = states('input_text.roborock_rum_koe') %}
+        {{ [] if q in ['unknown', 'unavailable', 'none', '', '-']
+           else q.split(',') | reject('eq', '') | list }}
+      job: "{{ segment | int(0) }}:{{ grundighed }}"
+      navn: >-
+        {% set m = state_attr('sensor.roborock_rum_kort', 'rum') | default({}, true) %}
+        {{ m.get(segment | int(0) | string, 'Segment ' ~ segment) }}
+      grundighed_navn: "{{ {'g': 'grundig', 's': 'SmartPlan'}.get(grundighed, 'hurtig') }}"
+    sequence:
+      - choose:
+          # Samme rum + samme grundighed ligger allerede og venter → et ekstra
+          # tryk skal ikke støvsuge rummet to gange. (Tryk med den ANDEN
+          # grundighed lægger sig som en selvstændig opgave.)
+          - conditions:
+              - condition: template
+                value_template: "{{ job in jobs }}"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Roborock rum-kø"
+                  message: >-
+                    {{ navn }} ({{ grundighed_navn }})
+                    ligger allerede i køen — ignoreret.
+        default:
+          - service: input_text.set_value
+            target: {entity_id: input_text.roborock_rum_koe}
+            data:
+              value: "{{ (jobs + [job]) | join(',') }}"
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.roborock_rum_koe_stemplet}
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - service: logbook.log
+            data:
+              name: "Roborock rum-kø"
+              message: >-
+                {{ navn }} ({{ grundighed_navn }})
+                lagt i kø (plads {{ jobs | count + 1 }}).
+      # Kør altid kicket. `script.turn_on` og IKKE `service:
+      # script.roborock_rum_koe_kick`: et direkte script-kald VENTER på at
+      # scriptet er færdigt, så dette script ville hænge i hele samle-vinduet —
+      # og fordi vi er `mode: queued`, ville tryk nr. 2 først blive lagt i køen
+      # EFTER at kicket havde sendt tryk nr. 1 afsted. Batching ville aldrig
+      # kunne ske. Fire-and-forget lader trykkene lande mens vinduet løber.
+      - service: script.turn_on
+        target: {entity_id: script.roborock_rum_koe_kick}
+
+  roborock_rum_koe_kick:
+    alias: "Roborock rum-kø: start næste opgave hvis robotten er ledig"
+    icon: mdi:play-speed
+    mode: single
+    max_exceeded: silent
+    sequence:
+      # --- tom kø: ryd visningen og stop med det samme -----------------------
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_text.roborock_rum_koe')
+                 in ['unknown', 'unavailable', 'none', '', '-'] }}
+        then:
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ states('input_text.roborock_rum_koe_nu')
+                     not in ['', 'unknown', 'unavailable'] }}
+            then:
+              - service: input_text.set_value
+                target: {entity_id: input_text.roborock_rum_koe_nu}
+                data: {value: ""}
+          - stop: "Køen er tom."
+
+      # --- saml en serie tryk til én kommando --------------------------------
+      # Alle variabler beregnes EFTER vinduet — havde de stået i scriptets
+      # `variables:`-blok, ville de være bundet før de sidste tryk landede.
+      - delay:
+          seconds: >-
+            {{ states('input_number.roborock_rum_koe_samlevindue_sekunder') | int(6) }}
+
+      - variables:
+          # Rå læsning — se hovedet: sensoren når ikke at gen-rendere mellem at
+          # `tilfoej` skriver køen og kalder dette script i samme tick.
+          jobs: >-
+            {% set q = states('input_text.roborock_rum_koe') %}
+            {{ [] if q in ['unknown', 'unavailable', 'none', '', '-']
+               else q.split(',') | reject('eq', '') | list }}
+          # Robotten skal beviseligt være ledig. `vacuum.s8_maxv_ultra`
+          # kollapser alle kørsels-varianter til `cleaning`, så docked/idle +
+          # cleaning-off er to uafhængige vidner. Batteri-gaten er der fordi en
+          # start under ~15 % blot sender robotten retur til dokken = opgaven
+          # ville blive spist af køen uden at rummet blev gjort rent.
+          ledig: >-
+            {{ is_state('binary_sensor.s8_maxv_ultra_cleaning', 'off')
+               and states('vacuum.s8_maxv_ultra') in ['docked', 'idle']
+               and states('sensor.s8_maxv_ultra_vacuum_error') in ['none', 'ok']
+               and states('sensor.s8_maxv_ultra_battery') | int(0) >= 15 }}
+          mode_naeste: "{{ jobs[0].split(':')[1] if jobs | count > 0 else '' }}"
+          # Tag den LEDENDE stribe opgaver med samme grundighed og send dem som
+          # én kommando. Stopper ved første afvigelse (namespace-flag — en ren
+          # mode-test ville samle en senere ø op igen).
+          batch: >-
+            {% set ns = namespace(out=[], stop=false) %}
+            {% for j in jobs %}
+              {% if not ns.stop %}
+                {% if j.split(':')[1] == mode_naeste and ns.out | count < 8 %}
+                  {% set ns.out = ns.out + [j] %}
+                {% else %}
+                  {% set ns.stop = true %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out }}
+          segmenter: >-
+            {{ batch | map('replace', ':h', '') | map('replace', ':g', '')
+                     | map('replace', ':s', '') | map('int') | list }}
+          rest: "{{ jobs[batch | count:] | join(',') }}"
+          navne: >-
+            {% set m = state_attr('sensor.roborock_rum_kort', 'rum') | default({}, true) %}
+            {% set ns = namespace(o=[]) %}
+            {% for s in segmenter %}
+              {% set ns.o = ns.o + [ m.get(s | string, 'Segment ' ~ s) ] %}
+            {% endfor %}
+            {{ ns.o | unique | join(', ') }}
+          grundig: "{{ mode_naeste == 'g' }}"
+          smartplan: "{{ mode_naeste == 's' }}"
+          # Grundig = to gennemløb. Hurtig og SmartPlan = ét (SmartPlan
+          # planlægger selv sine gennemløb).
+          gentag: "{{ 2 if mode_naeste == 'g' else 1 }}"
+
+      # Køen kan være blevet ryddet, og robotten kan være blevet sat i gang af
+      # noget andet, mens samle-vinduet løb — begge tjekkes derfor HER, efter
+      # ventetiden, ikke før den.
+      - condition: template
+        value_template: "{{ jobs | count > 0 and ledig }}"
+
+      # --- profil ------------------------------------------------------------
+      - choose:
+          # SmartPlan (packages/roborock_smartplan.yaml): ét atomisk skift af
+          # alle tre motor-koder + read-back. Landede den ikke, kører rummene
+          # som HURTIG i stedet — et fysisk tryk skal gøre rent — og pushen
+          # siger hvorfor, så eksperimentet ikke måler en tur der ikke var det.
+          - conditions:
+              - condition: template
+                value_template: "{{ smartplan }}"
+            sequence:
+              - service: script.roborock_smartplan_saet
+              - if:
+                  - condition: state
+                    entity_id: binary_sensor.roborock_smartplan_aktiv
+                    state: "off"
+                then:
+                  - service: select.select_option
+                    target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+                    data: {option: "off"}
+                  - service: vacuum.set_fan_speed
+                    target: {entity_id: vacuum.s8_maxv_ultra}
+                    data: {fan_speed: max_plus}
+                  - service: script.push_notify
+                    data:
+                      notif_id: roborock
+                      title: "🤖 SmartPlan landede ikke"
+                      message: >-
+                        Robotten ville ikke skifte til SmartPlan, så {{ navne }}
+                        køres som hurtig (kun støvsug) i stedet. Se logbogen
+                        "Roborock SmartPlan" for hvad robotten meldte.
+          - conditions:
+              - condition: template
+                value_template: "{{ grundig }}"
+            sequence:
+              # Rækkefølgen er ikke tilfældig, se roborock_start_max: mop-rute
+              # først, så mop-styrke, og sug SIDST (mop-skrivninger nulstiller
+              # sugestyrken til balanced). `max_plus`/`deep_plus` ville slå den
+              # anden funktion helt fra — de er ene-funktions-tilstande.
+              - service: select.select_option
+                target: {entity_id: select.s8_maxv_ultra_mop_mode}
+                data: {option: standard}
+              - service: select.select_option
+                target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+                data: {option: extreme}
+              - service: vacuum.set_fan_speed
+                target: {entity_id: vacuum.s8_maxv_ultra}
+                data: {fan_speed: max}
+              - delay: "00:00:03"
+        default:
+          # Hurtig = kun sug, men på fuld styrke (user-spec 2026-08-19).
+          # max_plus slår selv moppen fra; mop-skrivningen står først af samme
+          # rækkefølge-grund som ovenfor.
+          - service: select.select_option
+            target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+            data: {option: "off"}
+          - service: vacuum.set_fan_speed
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data: {fan_speed: max_plus}
+      - service: script.roborock_apply_forsigtig
+      # SmartPlan der beviseligt står på robotten NU (efter fallbacken) — det
+      # er DEN tekst og logbog skal sige, ikke hvad køen bad om.
+      - variables:
+          smartplan_ok: >-
+            {{ smartplan and is_state('binary_sensor.roborock_smartplan_aktiv', 'on') }}
+
+      # --- stempel FØR kommandoen (robottens egen start-tid lander et par
+      #     sekunder senere = indenfor genkendelses-vinduet i
+      #     roborock_fremmed_clean_stamp) -----------------------------------
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_segment_clean_at}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+      # --- send ---------------------------------------------------------------
+      - service: vacuum.send_command
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data:
+          command: app_segment_clean
+          params: >-
+            {{ [ {'segments': segmenter, 'repeat': gentag | int(1)} ] }}
+
+      # --- opdatér køen (opgaven er nu robottens, ikke køens) -----------------
+      - service: input_text.set_value
+        target: {entity_id: input_text.roborock_rum_koe}
+        data: {value: "{{ rest }}"}
+      - service: input_text.set_value
+        target: {entity_id: input_text.roborock_rum_koe_nu}
+        data:
+          value: >-
+            {{ 'SmartPlan' if smartplan_ok else ('Grundig' if grundig else 'Hurtig') }}: {{ navne }}
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_rum_koe_stemplet}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: logbook.log
+        data:
+          name: "Roborock rum-kø"
+          message: >-
+            Startet {{ 'SMARTPLAN (robotten vælger selv pr. rum)' if smartplan_ok
+                       else 'GRUNDIG (max sug + extreme mop, 2 gennemløb)' if grundig
+                       else 'HURTIG (max sug, mop off)' }}:
+            {{ navne }}. {{ rest.split(',') | reject('eq', '') | list | count }}
+            opgave(r) venter stadig.
+
+      # app_segment_clean bruger robottens gemte profil — re-sæt mop-
+      # indstillingerne mens kørslen allerede er i gang (samme belt+suspenders
+      # som roborock_start_max, der er kalibreret mod robottens faktiske
+      # adfærd). Kun relevant for gulvvask.
+      - if:
+          - condition: template
+            value_template: "{{ grundig }}"
+        then:
+          - delay: "00:00:05"
+          - service: select.select_option
+            target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+            data: {option: extreme}
+          - service: vacuum.set_fan_speed
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data: {fan_speed: max}
+          # Gulvvask uden moppen påsat er en tør tur — sig det, i stedet for at
+          # lade user tro rummet er vasket. Går gennem push_notify med
+          # notif_id `roborock`, så AirBnB-/nattetids-gates arves gratis.
+          - if:
+              - condition: state
+                entity_id: binary_sensor.s8_maxv_ultra_mop_attached
+                state: "off"
+            then:
+              - service: script.push_notify
+                data:
+                  notif_id: roborock
+                  title: "🧽 Moppen sidder ikke på"
+                  message: >-
+                    Grundig rengøring af {{ navne }} er startet, men moppekluden
+                    er ikke monteret — gulvet bliver støvsuget, ikke vasket.
+
+  roborock_rum_koe_ryd:
+    alias: "Roborock rum-kø: ryd alle ventende opgaver"
+    icon: mdi:playlist-remove
+    mode: single
+    sequence:
+      - service: input_text.set_value
+        target: {entity_id: input_text.roborock_rum_koe}
+        data: {value: ""}
+      - service: input_text.set_value
+        target: {entity_id: input_text.roborock_rum_koe_nu}
+        data: {value: ""}
+      - service: logbook.log
+        data:
+          name: "Roborock rum-kø"
+          message: "Køen ryddet."
+
+  # ---------------------------------------------------------------------------
+  # De 16 rum-scripts — widget-/knap-fladen
+  # ---------------------------------------------------------------------------
+  # Rene indgange: segment-nummer + grundighed, intet andet. Rækkefølgen er
+  # husets, ikke segment-numrenes.
+  roborock_hurtig_stue:
+    alias: "🧹 Hurtig rengøring: Stue"
+    icon: mdi:sofa-outline
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 23, grundighed: "h"}
+
+  roborock_grundig_stue:
+    alias: "💧 Grundig rengøring + gulvvask: Stue"
+    icon: mdi:sofa
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 23, grundighed: "g"}
+
+  roborock_hurtig_spisestue:
+    alias: "🧹 Hurtig rengøring: Spisestue"
+    icon: mdi:table-furniture
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 16, grundighed: "h"}
+
+  roborock_grundig_spisestue:
+    alias: "💧 Grundig rengøring + gulvvask: Spisestue"
+    icon: mdi:table-chair
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 16, grundighed: "g"}
+
+  roborock_hurtig_koekken:
+    alias: "🧹 Hurtig rengøring: Køkken"
+    icon: mdi:countertop-outline
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 25, grundighed: "h"}
+
+  roborock_grundig_koekken:
+    alias: "💧 Grundig rengøring + gulvvask: Køkken"
+    icon: mdi:countertop
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 25, grundighed: "g"}
+
+  roborock_hurtig_sovevaerelse:
+    alias: "🧹 Hurtig rengøring: Soveværelse"
+    icon: mdi:bed-outline
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 19, grundighed: "h"}
+
+  roborock_grundig_sovevaerelse:
+    alias: "💧 Grundig rengøring + gulvvask: Soveværelse"
+    icon: mdi:bed
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 19, grundighed: "g"}
+
+  roborock_hurtig_boernevaerelse:
+    alias: "🧹 Hurtig rengøring: Børneværelse"
+    icon: mdi:teddy-bear
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 17, grundighed: "h"}
+
+  roborock_grundig_boernevaerelse:
+    alias: "💧 Grundig rengøring + gulvvask: Børneværelse"
+    icon: mdi:toy-brick
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 17, grundighed: "g"}
+
+  roborock_hurtig_badevaerelse:
+    alias: "🧹 Hurtig rengøring: Badeværelse"
+    icon: mdi:shower
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 18, grundighed: "h"}
+
+  roborock_grundig_badevaerelse:
+    alias: "💧 Grundig rengøring + gulvvask: Badeværelse"
+    icon: mdi:shower-head
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 18, grundighed: "g"}
+
+  roborock_hurtig_entre:
+    alias: "🧹 Hurtig rengøring: Entré"
+    icon: mdi:door-open
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 21, grundighed: "h"}
+
+  roborock_grundig_entre:
+    alias: "💧 Grundig rengøring + gulvvask: Entré"
+    icon: mdi:door
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 21, grundighed: "g"}
+
+  roborock_hurtig_depot:
+    alias: "🧹 Hurtig rengøring: Depot"
+    icon: mdi:package-variant-closed
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 22, grundighed: "h"}
+
+  roborock_grundig_depot:
+    alias: "💧 Grundig rengøring + gulvvask: Depot"
+    icon: mdi:package-variant
+    mode: queued
+    max: 3
+    sequence:
+      - service: script.roborock_rum_koe_tilfoej
+        data: {segment: 22, grundighed: "g"}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Dispatch på flanken: robotten blev ledig
+  # ---------------------------------------------------------------------------
+  # `for: 15s` fordi robotten skifter til docked et øjeblik før dokken har
+  # accepteret den — en kommando i det vindue bliver tavst tabt.
+  - id: roborock_rum_koe_dispatch_ledig
+    alias: "Roborock rum-kø: robotten blev ledig → start næste"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: vacuum.s8_maxv_ultra
+        to: "docked"
+        for: "00:00:15"
+      - platform: state
+        entity_id: vacuum.s8_maxv_ultra
+        to: "idle"
+        for: "00:00:15"
+      - platform: state
+        entity_id: binary_sensor.s8_maxv_ultra_cleaning
+        to: "off"
+        for: "00:00:20"
+    # BEVIDST uden kø-betingelse (modsat backstoppen): er køen tom, rydder
+    # kicket "kører nu"-visningen og stopper straks. Havde flanken krævet en
+    # ikke-tom kø, ville den sidste opgave stå som "kører nu" for evigt, fordi
+    # intet andet kalder kicket når køen er tømt.
+    action:
+      - service: script.roborock_rum_koe_kick
+
+  # ---------------------------------------------------------------------------
+  # Backstop — den eneste vej der overlever en HA-restart
+  # ---------------------------------------------------------------------------
+  # Står robotten allerede i dokken når HA kommer op, sker der ALDRIG en ny
+  # `to: docked`-flanke, og køen ville hænge for evigt (💡 Permanente fakta:
+  # "En HA-restart dræber ethvert to:X for:N der venter på en flanke der
+  # allerede er sket"). Ticket er også re-armen for de tilfælde hvor robotten
+  # var optaget/lavt på batteri da flanken kom (fejlklasse #4).
+  - id: roborock_rum_koe_backstop
+    alias: "Roborock rum-kø: backstop-tick (start næste hvis ledig)"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/2"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: numeric_state
+        entity_id: sensor.roborock_rum_koe
+        above: 0
+    action:
+      - service: script.roborock_rum_koe_kick
+
+  # ---------------------------------------------------------------------------
+  # Automatisk udgang
+  # ---------------------------------------------------------------------------
+  # En kø der aldrig blev afviklet (robot offline, fejl, tom vandtank) må ikke
+  # overleve til næste døgn og pludselig starte en gulvvask midt om natten.
+  # Uret måles på det SKREVNE stempel, ikke last_changed (fejlklasse #5), og
+  # `as_timestamp()` på et input_datetimes state-streng læses som UTC → brug
+  # `timestamp`-attributten i stedet.
+  - id: roborock_rum_koe_giv_op
+    alias: "Roborock rum-kø: giv op og ryd efter timeout"
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: numeric_state
+        entity_id: sensor.roborock_rum_koe
+        above: 0
+      - condition: template
+        value_template: >-
+          {% set ts = state_attr('input_datetime.roborock_rum_koe_stemplet', 'timestamp') | float(0) %}
+          {% set maks = states('input_number.roborock_rum_koe_max_ventetid_minutter') | float(240) %}
+          {{ ts > 0 and (as_timestamp(now()) - ts) > (maks * 60) }}
+    action:
+      - variables:
+          tekst: "{{ state_attr('sensor.roborock_rum_koe', 'tekst') }}"
+          antal: "{{ states('sensor.roborock_rum_koe') | int(0) }}"
+      - service: script.roborock_rum_koe_ryd
+      - service: script.push_notify
+        data:
+          notif_id: roborock
+          title: "🧹 Rum-kø opgivet"
+          message: >-
+            {{ antal }} ventende rengøring(er) blev ryddet — robotten blev
+            aldrig ledig indenfor
+            {{ states('input_number.roborock_rum_koe_max_ventetid_minutter') | int(240) }}
+            min. Stod i kø: {{ tekst }}.

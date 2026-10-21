@@ -1,0 +1,201 @@
+# =============================================================================
+# Depot / Harry Potter Room
+# =============================================================================
+# Cozy warm light for the kids' den. Vallhorn PIR triggers on/off.
+# Very warm color temperature for a magical cave feel.
+# Respects house Active/Dormant state.
+#
+# HARDWARE NOTE (opdateret 2026-06-02 PM):
+#   binary_sensor.depot_valhorn_occupancy ER paret og virker (IEEE
+#   fd:00:ad:46:6a:93:29:a8, se entities/sensors/valhorn.yaml).
+#   Automationen styrer nu light.depot_all = HELE depotets lys:
+#     - light.depot_loft gruppen (IKEA WS + 2x Hue White loftslys)
+#     - light.depot_strip (ny ULLO RGB+CCT strip — overtog 2026-06-02 fra
+#       Innr-strippen, der blev flyttet til boernevaerelse som hygge-strip)
+#   Bruger valhorn = ALLE depot-lys taender FUNKTIONELT (100% dag / 70% aften,
+#   2700K varm hvid) — depotet bruges mest til at finde tøj. Harry Potter
+#   "magic cave" (2000K dim) er sjælden → manuel/scene, ikke valhorn-default.
+#   CT 2700K rammer IKEA + ULLO; Hue White er 2700K-native (faar brightness).
+# =============================================================================
+
+- id: depot_harry_potter_on
+  alias: "Harry Potter rum: Tænd hyggelig lys"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.depot_valhorn_occupancy
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-06-10: 30s grace efter FoH O-knap manuel sluk — PIR'en ser én
+    # selv på vej ud og ville ellers straks tænde igen. Timer startes i
+    # packages/depot_foh_switch.yaml (btn_O).
+    - condition: state
+      entity_id: timer.depot_sensor_grace
+      state: "idle"
+    # 2026-06-10 (opg 4): Manual mode = bruger har selv indstillet lyset —
+    # auto-tænd blokeret indtil drift-back → Auto.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_depot', 'Manual') }}"
+    # 2026-06-23 (user-spec): robot-spærre gælder nu KUN når huset er Dormant
+    # (binary_sensor.roborock_blokerer_lys). Er huset Active må robottens motion
+    # gerne tænde lys — KUN early-detect spærres (se early-detect-rummene).
+    # Dormant-wake er robot-filtreret centralt i house_state_to_active.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    # 2026-06-26 (user-spec): gå-i-seng-grace. Lige efter godnat-tryk (man ligger
+    # i sengen) ser depot-Myggsprayen bevægelse → depotet tændte 70-100% mens man
+    # var ved at sove. Bloker depot-auto-tænd i grace-vinduet efter godnat_force_at
+    # (slider, 0 = fra). Ægte depot-besøg efter grace lyser stadig.
+    - condition: template
+      value_template: >-
+        {% set s = states('input_datetime.godnat_force_at') %}
+        {% set g = states('input_number.godnat_walk_grace_seconds') | float(90) %}
+        {% if s in ['unknown','unavailable','none',''] or g <= 0 %}
+          true
+        {% else %}
+          {{ (now() - strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() >= g }}
+        {% endif %}
+  action:
+    - service: light.turn_on
+      target:
+        entity_id: light.depot_all
+      data:
+        # Light Aggressiveness factor (audit-finding 2026-05-07: missed file)
+        brightness_pct: >
+          {# Hverdagsbrug = finde tøj i depotet → funktionel lysstyrke.
+             2026-06-15 (user): styrke fra open_plan_lux i stedet for sol-elev —
+             Apollo (køkken/spisestue) er eneste troværdige lux, og depotet er
+             interiør uden egen måler. Mørkt → 70%, lyst → 100%. Harry Potter
+             "cave" (2000K dim) er sjælden → manuel/scene, ikke valhorn-default.
+             2026-08-12 (user-bug "vi sover"): efter godnat er 70-100 % i et rum
+             ved siden af soveværelset et vækkeur. Grace-vinduet (230 s) dækkede
+             kun selve gå-i-seng-turen; et nat-toilet kl. 03 lyste stadig fuldt.
+             Under godnat lyser depotet derfor på husets godnat-niveau — stadig
+             brugbart lys, aldrig et der vækker nogen. #}
+          {% if is_state('binary_sensor.godnat_any_active', 'on') %}
+            {{ states('input_number.godnat_brightness_pct') | float(25) | round(0) | int }}
+          {% else %}
+            {% set lux = states('sensor.open_plan_lux') | float(50) %}
+            {% if lux < 40 %}{% set base = 70 %}{% else %}{% set base = 100 %}{% endif %}
+            {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+            {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+          {% endif %}
+        color_temp_kelvin: 2700  # var 2000 (cave) → funktionel varm hvid; alle 3 pære-typer aligner på 2700K
+        transition: 2
+    # 2026-06-13 (user-spec): rigtig indgang (valhorn i depot) skruede op →
+    # ryd approach-pre-flaget så depot_approach_fast_clear ikke slukker igen.
+    # Condition på on undgår no-op write.
+    - if:
+        - condition: state
+          entity_id: input_boolean.depot_approach_lit
+          state: "on"
+      then:
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.depot_approach_lit
+    # 2026-06-28 (user-spec): detection 1 af besøgs-stadie-systemet. Denne
+    # automation har alle de rigtige gates (Active, ikke Manual, lås-grace,
+    # ikke-robot, godnat-grace), så når DEN tænder lyset er det per definition
+    # første ægte detection → Quick. Efterfølgende bursts eskaleres af
+    # depot_stage_escalate (packages/depot_visit_quality.yaml). Sæt kun fra
+    # Ingen → ellers ville et re-trip nulstille et højere stadie.
+    - if:
+        - condition: state
+          entity_id: input_select.depot_visit_stage
+          state: "Ingen"
+      then:
+        - service: input_select.select_option
+          target:
+            entity_id: input_select.depot_visit_stage
+          data:
+            option: "Quick"
+
+# =============================================================================
+# Depot approach early-detect hurtig-sluk (2026-06-13, user-spec)
+# =============================================================================
+# Entré-early-detect pre-tænder depot-strippen (40 %) som forvarsel. Går man
+# faktisk ind i depotet (valhorn) skruer depot_harry_potter_on op og clearer
+# flaget. Går man IKKE ind, bliver flaget stående → sluk strippen hurtigt
+# (input_number.early_detect_clear_seconds, default 30 s) i stedet for de
+# normale ~5 min. Conditions sikrer kun-pre-tilstand: flag on + depot-valhorn
+# i ro nu (så ingen der reelt er i depotet bliver slukket på).
+# =============================================================================
+- id: depot_approach_fast_clear
+  alias: "Harry Potter rum: approach-lys hurtig-sluk"
+  description: >
+    Pre-tændt depot-strip uden reel indgang (depot_approach_lit on, valhorn off)
+    → sluk efter early_detect_clear_seconds.
+  mode: restart
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.entre_valhorn_occupancy
+      to: "off"
+      for:
+        seconds: "{{ states('input_number.early_detect_clear_seconds') | int(30) }}"
+    - platform: state
+      entity_id: binary_sensor.depot_valhorn_occupancy
+      to: "off"
+      for:
+        seconds: "{{ states('input_number.early_detect_clear_seconds') | int(30) }}"
+  condition:
+    - condition: state
+      entity_id: input_boolean.depot_approach_lit
+      state: "on"
+    - condition: state
+      entity_id: light.depot_strip
+      state: "on"
+    # Depot-valhorn i ro nu = ingen er gået ind (havde de, var flaget cleared).
+    - condition: state
+      entity_id: binary_sensor.depot_valhorn_occupancy
+      state: "off"
+  action:
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.depot_strip
+      data:
+        transition: "{{ states('sensor.fade_passage_effective') | int(10) }}"
+
+# Approach-flag ryddes når depot-strippen slukker — uanset kilde (fast-clear,
+# normal off, manuelt, godnat). Forhindrer stale flag. Condition på on undgår
+# no-op writes.
+- id: depot_approach_lit_clear
+  alias: "Harry Potter rum: approach-flag clear (strip slukket)"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: light.depot_strip
+      to: "off"
+    # B50-fix 2026-07-14 (fejlklasse #9): strømkap/Innr-drop gør strippen
+    # 'unavailable' (IKKE 'off') → flaget ville hænge. 5 min 'for' skåner
+    # korte Zigbee-flaps (strippen er kendt flapper, jf. 2026-06-19).
+    - platform: state
+      entity_id: light.depot_strip
+      to:
+        - "unavailable"
+        - "unknown"
+      for:
+        minutes: 5
+  condition:
+    - condition: state
+      entity_id: input_boolean.depot_approach_lit
+      state: "on"
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.depot_approach_lit
+
+# =============================================================================
+# Depot SLUK er flyttet til packages/depot_visit_quality.yaml (2026-06-28)
+# =============================================================================
+# Den gamle enkelt-sluk (300 s × Turn-Off-faktor, clampet 600 s) er erstattet af
+# besøgs-stadie-skaleret sluk: Quick (1 detection) slukker hurtigt, Medium (2)
+# mellem, Long (3+) bruger fortsat den fulde ophold-ventetid + time_pattern-
+# fallback. Se depot_off_quick / _medium / _long i depot_visit_quality.yaml.
+# =============================================================================

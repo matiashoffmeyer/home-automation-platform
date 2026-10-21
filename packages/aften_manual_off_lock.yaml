@@ -1,0 +1,300 @@
+# =============================================================================
+# Aften-lås: slukker du selv lyset i et soverum om aftenen, bliver det slukket
+# =============================================================================
+# User-spec 2026-08-26: "slukning af lys manuelt i soveværelser efter kl 20 skal
+# gøre at det lys ikke tændes af auto-tænd resten af aftenen. 1830 for
+# børneværelset. slider bestemt. og det gælder alle knapper og app tryk både
+# fysiske og digitale (app)."
+#
+# HVORFOR EN LÅS OG IKKE BARE room_mode = Manual:
+# manual_override.yaml sætter allerede rummet i Manual når du slukker med en
+# finger — men room_drift_back sender rummet tilbage til Auto efter
+# global_drift_back_empty_minutes (20) minutters TOMT rum, og soveværelsets
+# Apollo **taber en person der ligger stille i 5-15 min ad gangen** (permanent
+# faktum). Et mørkt soverum med en sovende i ligner altså et tomt rum, mode'et
+# drifter til Auto, og næste radar-udslag tænder lyset igen. Låsen er derfor
+# tids-bunden i stedet for tomheds-bunden: den holder til morgen-clearet.
+#
+# HVAD TÆLLER SOM "MANUELT" (fejlklasse #3):
+#   1. context.user_id is not none  → app, UI, tile, stemme, script startet med
+#      et fingertryk. ALDRIG parent_id, som en tids-trigget automation også har.
+#   2. Et Styrbar-tryk bærer INTET user_id (zha_event) → vi accepterer i stedet
+#      et FRISKT stempel i input_datetime.styrbar_last_press_<rum>, som
+#      manual_override.yaml skriver ved enhver knap-/finger-betjening af rummet.
+# Begge veje dækkes, så "alle knapper og app tryk, fysiske og digitale" holder.
+#
+# Gates der tjekker sovevaerelse_manual_off_lock (fejlklasse #21 — hver eneste
+# vej ind skal være gated, ellers er låsen pynt):
+#   - presence_light_sovevaerelse_on       (presence_sovevaerelse.yaml)
+#   - presence_sove_early_detect_on        (presence_sovevaerelse.yaml)
+#   - sove_settle_cozy_fade                (presence_sovevaerelse.yaml)
+#   - presence_lux_sovevaerelse_on         (presence_lights.yaml)
+#   - sove_sengelys_ved_sengetid           (godmorgen_godnat.yaml, 2026-10-04)
+#   - sovelys_power_recovery               (light_power_recovery.yaml)
+# Børneværelsets lås har sin egen (længere) gate-liste — se
+# packages/boernevaerelse_manual_off_lock.yaml. Denne fil udvider KUN dens
+# arm-betingelse med aften-vinduet; alt andet dér er urørt.
+#
+# 2026-10-04 (user-spec, KRITISK — "igår aftes tændte lys mens jeg sov fordi
+# jeg ikke trykkede godnat"): SOVEVÆRELSETS lås armeres nu af ENHVER sluk i
+# aften-vinduet — også en automatiks (Dark Mode, presence-sluk, watchdog).
+# User: "hvis det er aften og mørkt i soveværelset og vi selv har slukket for
+# lyset eller en automation har, så skal lyset ikke auto-presence tænde
+# længere ... ellers skal mørket bare blive til godnat mode af sig selv."
+# Hændelsen 3/10: Dark Mode slukkede loftet 21:23 (film i sengen) → låsen
+# armede IKKE (ingen finger); HA-genstarten 22:46 nulstillede filmmørket, og
+# sove_sengelys_ved_sengetid — den femte tænd-vej, som aldrig var gated på
+# låsen (fejlklasse #21) — tændte loftet 23:14:13 på et still-target-blip.
+# Undtaget fra armeringen: gang-early-detect's hurtig-sluk (et pre-lys for én
+# der aldrig gik ind — rummet blev aldrig brugt) og vækkekæden (fejler åbent).
+# Filmmørke i soveværelset arver også låsen (ARM 2) — en film i sengen ER valgt
+# mørke, også når loftet allerede var slukket da den startede.
+# Mørket bliver selv til godnat: automations/godnat_auto_declare.yaml (`moerke`).
+# Børneværelsets lås er URØRT (stadig kun manuel sluk).
+#
+# VEJEN UD (AirBnB-regel 2: der SKAL være en automatisk udgang):
+#   - manuel TÆND i rummet (app eller Styrbar) rydder låsen med det samme
+#   - 05:00 morgen-backstop rydder begge låse uanset hvad
+#   - AirBnB entry/exit rydder (se automations/airbnb_mode.yaml)
+# =============================================================================
+
+input_boolean:
+  # Bevidst UDEN initial: — låsen skal overleve en HA-restart midt om natten
+  # (et initial: PÅTVINGER off ved hver boot, se CLAUDE.md).
+  sovevaerelse_manual_off_lock:
+    name: "Soveværelse manuel-sluk lås"
+    icon: mdi:lock-alert
+
+input_datetime:
+  sove_manual_off_lock_start:
+    name: "Soveværelse: aften-lås fra kl."
+    has_date: false
+    has_time: true
+
+  boern_manual_off_lock_start:
+    name: "Børneværelse: aften-lås fra kl."
+    has_date: false
+    has_time: true
+
+template:
+  - binary_sensor:
+      # Ét sted der svarer "er vi i aften-vinduet" pr. rum (fejlklasse #2), så
+      # arm-automationen og dashboardet ikke kan divergere. 05:00 er bagkanten
+      # og matcher morgen-clearet nedenfor.
+      # '00:00:00' er SENTINEL for "urørt helper" (permanent faktum) — ikke en
+      # gyldig værdi. Uden den gren ville en tom helper give
+      # `now() >= today_at('00:00:00')` = ALTID sandt = lås-vinduet åbent hele
+      # døgnet. Målt her ved første boot: begge sensorer stod 'on' kl. 22:47.
+      - name: "Sove aften laasevindue"
+        unique_id: sove_aften_laasevindue
+        icon: mdi:clock-alert-outline
+        state: >-
+          {% set c = states('input_datetime.sove_manual_off_lock_start') %}
+          {% if c in ['unknown', 'unavailable', 'none', '', '00:00:00'] %}
+            false
+          {% else %}
+            {{ now() >= today_at(c) or now().hour < 5 }}
+          {% endif %}
+
+      - name: "Boern aften laasevindue"
+        unique_id: boern_aften_laasevindue
+        icon: mdi:clock-alert-outline
+        state: >-
+          {% set c = states('input_datetime.boern_manual_off_lock_start') %}
+          {% if c in ['unknown', 'unavailable', 'none', '', '00:00:00'] %}
+            false
+          {% else %}
+            {{ now() >= today_at(c) or now().hour < 5 }}
+          {% endif %}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # ARM — soveværelset
+  # ---------------------------------------------------------------------------
+  - id: sove_manual_off_lock_arm
+    alias: "Sove lås: arm ved sluk i aften-vinduet (dig eller automatik)"
+    description: >
+      Slukkes soveværelsets lys efter aften-lås-tidspunktet — af app, knap ELLER
+      en automatik — eller starter filmmørke i soveværelset, blokeres alle
+      auto-tænd-veje resten af natten. Mørket bliver selv til godnat.
+    mode: single
+    trigger:
+      # 2 s debounce mod sluk-fade-transienter (samme som børne-låsen).
+      # from: "on" (2026-10-04): kun en ÆGTE sluk-flanke — ikke en pære der
+      # kommer tilbage fra unavailable efter en genstart.
+      - platform: state
+        entity_id:
+          # spisestue_pendel ER soveværelsets loft (alias-slug fra en tidligere
+          # placering). sovevaerelse_loft er orphan/dvale-pæren — permanent
+          # unavailable, men taget med som net hvis den vækkes igen.
+          - light.spisestue_pendel
+          - light.sovevaerelse_loft
+        from: "on"
+        to: "off"
+        for:
+          seconds: 2
+        id: sluk
+      # ARM 2 (2026-10-04): filmmørke i soveværelset = valgt mørke, også når
+      # loftet allerede var slukket da filmen startede (ingen sluk-flanke).
+      - platform: state
+        entity_id: binary_sensor.filmmoerke_sove
+        from: "off"
+        to: "on"
+        id: film
+      # ... og en film der startede FØR vinduet åbnede (Dark Mode slukkede
+      # loftet 19:45 → ingen flanke inde i vinduet).
+      - platform: time
+        at: input_datetime.sove_manual_off_lock_start
+        id: vindue_start
+    condition:
+      - condition: state
+        entity_id: binary_sensor.sove_aften_laasevindue
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ trigger.id != 'vindue_start' or is_state('binary_sensor.filmmoerke_sove', 'on') }}
+      # Gang-early-detect's hurtig-sluk er IKKE "rummet blev mørkt": pre-lyset
+      # tændte for én i entréen der aldrig gik ind. Den må ikke låse resten af
+      # aftenen (2026-10-04). Alle andre sluk tæller — finger som automatik.
+      - condition: template
+        value_template: >-
+          {% set lt = state_attr('automation.lysnet_sovevaerelse_gang_early_detect_hurtig_sluk', 'last_triggered') %}
+          {{ trigger.id != 'sluk' or lt is none
+             or (now() - lt).total_seconds() > 15 }}
+      # Fejlklasse #9: en pære der falder af nettet melder unavailable, ikke off
+      # — men to/off-triggeren fanger kun 'off', så vi bekræfter bare her.
+      - condition: template
+        value_template: >-
+          {{ states('light.spisestue_pendel') != 'on'
+             and states('light.sovevaerelse_loft') != 'on' }}
+      # Familie-koncept. AirBnB har sit eget natregime og gæsten kender ikke
+      # husets escape-veje; Home Vacation er familie hjemme og skal med.
+      - condition: template
+        value_template: >-
+          {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+      # Vækkekæden slukker selv lys undervejs og må aldrig kunne låse rummet
+      # (memory: gates i vække-kæden skal fejle åbent). Imminent går ON 45 min
+      # før alarmen, så en alarm før 05:45 falder inde i lås-vinduet.
+      - condition: state
+        entity_id: binary_sensor.wakeup_alarm_imminent
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.sovevaerelse_manual_off_lock
+        state: "off"
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.sovevaerelse_manual_off_lock
+      - service: logbook.log
+        data:
+          name: "Sove manuel-sluk lås"
+          message: >-
+            {% set c = trigger.to_state.context if trigger.to_state is defined and trigger.to_state else none %}
+            Armeret — {{ 'filmmørke i soveværelset' if trigger.id in ['film', 'vindue_start']
+                         else ('lyset blev slukket manuelt' if c is not none and c.user_id is not none
+                               else 'lyset blev slukket') }}
+            efter {{ states('input_datetime.sove_manual_off_lock_start') }}.
+            Auto-tænd blokeret til manuel tænd eller 05:00; mørket bliver selv til godnat.
+          entity_id: input_boolean.sovevaerelse_manual_off_lock
+
+  # ---------------------------------------------------------------------------
+  # CLEAR 1 — manuel TÆND rydder låsen (brugerens udvej)
+  # ---------------------------------------------------------------------------
+  - id: sove_manual_off_lock_clear_on
+    alias: "Sove lås: clear ved manuel tænd"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          # spisestue_pendel ER soveværelsets loft (alias-slug fra en tidligere
+          # placering). sovevaerelse_loft er orphan/dvale-pæren — permanent
+          # unavailable, men taget med som net hvis den vækkes igen.
+          - light.spisestue_pendel
+          - light.sovevaerelse_loft
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.sovevaerelse_manual_off_lock
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set c = trigger.to_state.context %}
+          {% set raw = states('input_datetime.styrbar_last_press_sovevaerelse') %}
+          {% set since = 99999 if raw in ['unknown','unavailable','none','']
+                         else (now() - strptime(raw, '%Y-%m-%d %H:%M:%S')
+                               .replace(tzinfo=now().tzinfo)).total_seconds() %}
+          {{ (c is not none and c.user_id is not none) or since < 20 }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.sovevaerelse_manual_off_lock
+      # 2026-10-04 (user-spec): "hvis vi manuelt tænder lyset ... så skal den gå
+      # direkte over på auto-presence lys for så er vi ikke gået i seng".
+      # Vent 2 s: et Styrbar-tryk / en app-justering sætter selv rummet i
+      # Manual (permanent faktum), og det skal ikke vinde over Auto her.
+      # Undtagelse: Somrig kort-op's aften-hygge er et bevidst hold til 04:00
+      # (sove_evening_hold, user-spec 2026-07-08) — det overskrives ikke.
+      - delay:
+          seconds: 2
+      - if:
+          - condition: state
+            entity_id: input_boolean.sove_evening_hold
+            state: "off"
+        then:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.room_mode_sovevaerelse
+            data:
+              option: Auto
+      - service: logbook.log
+        data:
+          name: "Sove manuel-sluk lås"
+          message: >-
+            Ryddet — lyset blev tændt manuelt igen.
+            {{ 'Aften-hygge holdes (Somrig).' if is_state('input_boolean.sove_evening_hold', 'on')
+               else 'Rummet tilbage på Auto (presence).' }}
+          entity_id: input_boolean.sovevaerelse_manual_off_lock
+
+  # ---------------------------------------------------------------------------
+  # CLEAR 2 — morgen-backstop. Begge rum, uanset alt andet.
+  # ---------------------------------------------------------------------------
+  # Bevidst med condition-template og ikke kun en time-trigger: en HA-restart
+  # hen over 05:00 dræber et ventende tidspunkt (permanent faktum), så /15-tick
+  # måler tiden selv og rydder også efter en genstart.
+  - id: aften_manual_off_lock_morgen_clear
+    alias: "Aften-lås: morgen-clear (05:00 backstop)"
+    mode: single
+    trigger:
+      - platform: time
+        at: "05:00:00"
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: template
+        value_template: "{{ 5 <= now().hour < 12 }}"
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.sovevaerelse_manual_off_lock', 'on')
+             or is_state('input_boolean.boernevaerelse_manual_off_lock', 'on') }}
+      # Gæste-holdet i børneværelset skal sove ud (fejlklasse #21: hver clear-vej
+      # skal respektere det) — men soveværelsets lås ryddes stadig.
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.sovevaerelse_manual_off_lock', 'on')
+             or is_state('input_boolean.boernevaerelse_gaest_sover', 'off') }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.sovevaerelse_manual_off_lock
+      - if:
+          - condition: state
+            entity_id: input_boolean.boernevaerelse_gaest_sover
+            state: "off"
+        then:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.boernevaerelse_manual_off_lock
+      - service: logbook.log
+        data:
+          name: "Aften-lås"
+          message: "Morgen-clear — soverummenes manuel-sluk-låse frigivet."

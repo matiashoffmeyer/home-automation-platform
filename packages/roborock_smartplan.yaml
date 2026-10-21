@@ -1,0 +1,289 @@
+# =============================================================================
+# ROBOROCK — SmartPlan (robottens egen AI-plan pr. rum), eksperiment
+# =============================================================================
+# User-spec 2026-10-04: "sørg for at styrbar køkken op sætter en rengøring
+# igang som bruger den nye SmartPlan feature i roborock. skal eksperimentere
+# med den."
+#
+# HVAD SMARTPLAN ER (python-roborock `v1_clean_modes.py`, HA's `mop_mode`-
+# label "SmartPlan"): én tilstand over ALLE tre motor-koder på én gang —
+#   fan_power 110 · water_box_mode 209 · mop_mode 306  (alle = `smart_mode`)
+# Robotten vælger så selv sug, vand og rute pr. rum. Appen (og HA's nyere
+# `cleaning_mode`-select) skifter med ÉT atomisk kald, `set_clean_motor_mode`
+# — vi gør det samme. Det passer med husets måling 08-16: sug + mop er ÉN
+# tilstand, så tre løse skrivninger kan ikke forventes at lande som en helhed.
+#
+# HVOR DEN BRUGES: kø-grundigheden `s` i packages/roborock_rum_scripts.yaml
+# (ved siden af `h`/`g`), som Styrbarens "Valgte rum — SmartPlan" lægger rum
+# i (packages/roborock_styrbar.yaml). Kø-motoren kalder
+# `script.roborock_smartplan_saet` og falder tilbage til HURTIG + push, hvis
+# SmartPlan ikke lander — et fysisk tryk skal gøre rent.
+#
+# ⚠️ AFLEVERINGEN (fejlklasse #1/#27): robotten HUSKER sin motor-tilstand.
+# Husets hurtige veje (start_quick, let_stue, rum-køens hurtig, måltids-
+# støvsugningen) skriver kun sug + mop-styrke, ALDRIG mop-ruten — så efter en
+# SmartPlan-tur ville `mop_mode` stå på smart_mode under dem, og ingen har målt
+# hvad robotten så gør. Derfor tager `roborock_smartplan_aflever` robotten UD
+# af SmartPlan igen, når HA's tur er slut — til den neutrale "kun støvsug"-
+# profil (balanced / vand off / standard = biblioteks-modusen VACUUM), ikke til
+# et snapshot. Den rører KUN en SmartPlan HA selv satte
+# (`input_boolean.roborock_smartplan_ha_sat`): vælger user SmartPlan i appen,
+# bliver den stående.
+# =============================================================================
+
+input_boolean:
+  # Runtime-flag: "HA satte robotten i SmartPlan og har ikke afleveret endnu".
+  # BEVIDST uden `initial:` (💡 `initial:` PÅTVINGER ved hver HA-start) — en
+  # restart midt i en SmartPlan-tur må ikke glemme at der skal ryddes op.
+  # Navnet matcher bevidst ingen helpers_export-allowlist (runtime, ikke config).
+  roborock_smartplan_ha_sat:
+    name: "Roborock: SmartPlan sat af HA (afventer aflevering)"
+    icon: mdi:robot-vacuum-alert
+
+template:
+  - binary_sensor:
+      # ÉT svar på "står robotten i SmartPlan?" (fejlklasse #2) — samme regel
+      # som bibliotekets `is_smart_mode_set`: én af de tre koder på smart_mode
+      # er nok. Læses af sæt-scriptet, kø-motorens fallback og afleveringen.
+      # Navnet slugify'er til `roborock_smartplan_aktiv` = unique_id.
+      - name: "Roborock SmartPlan aktiv"
+        unique_id: roborock_smartplan_aktiv
+        icon: mdi:robot-vacuum-variant
+        state: >-
+          {{ states('select.s8_maxv_ultra_mop_mode') == 'smart_mode'
+             or states('select.s8_maxv_ultra_mop_intensity') == 'smart_mode'
+             or state_attr('vacuum.s8_maxv_ultra', 'fan_speed') == 'smart_mode' }}
+        attributes:
+          # Til eksperimentet: hvad robotten FAKTISK melder, ikke hvad vi sendte.
+          sug: "{{ state_attr('vacuum.s8_maxv_ultra', 'fan_speed') }}"
+          mop_styrke: "{{ states('select.s8_maxv_ultra_mop_intensity') }}"
+          mop_rute: "{{ states('select.s8_maxv_ultra_mop_mode') }}"
+
+script:
+  # ---------------------------------------------------------------------------
+  # Sæt SmartPlan — skriver, venter, og BEVISER at det landede
+  # ---------------------------------------------------------------------------
+  # Kalderen læser `binary_sensor.roborock_smartplan_aktiv` bagefter (blokerende
+  # service-kald, så sensoren er gen-renderet når vi returnerer).
+  roborock_smartplan_saet:
+    alias: "Roborock: sæt SmartPlan (robotten planlægger selv pr. rum)"
+    icon: mdi:robot-vacuum-variant
+    mode: queued
+    max: 4
+    sequence:
+      # Kender integrationen overhovedet SmartPlan for denne robot? Options
+      # bygges af robottens feature-bits — står smart_mode ingen steder, er et
+      # forsøg kun støj i loggen (💡 et kald uden feature-bit fejler tavst).
+      - variables:
+          kendt: >-
+            {{ 'smart_mode' in (state_attr('select.s8_maxv_ultra_mop_mode', 'options') or [])
+               or 'smart_mode' in (state_attr('vacuum.s8_maxv_ultra', 'fan_speed_list') or []) }}
+      - if:
+          - condition: template
+            value_template: "{{ not kendt }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Roborock SmartPlan"
+              message: >-
+                SmartPlan ikke forsøgt — integrationen tilbyder den ikke for
+                robotten (mop-rute-options:
+                {{ state_attr('select.s8_maxv_ultra_mop_mode', 'options') }},
+                sug-options:
+                {{ state_attr('vacuum.s8_maxv_ultra', 'fan_speed_list') }}).
+          - stop: "SmartPlan ikke tilgængelig."
+      # Flaget FØR skrivningen: lander den kun halvt, skal afleveringen stadig
+      # rydde op efter os.
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.roborock_smartplan_ha_sat}
+      # Vej 1: appens atomiske kald. Literal params, ingen templatet dict.
+      - service: vacuum.send_command
+        continue_on_error: true
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data:
+          command: set_clean_motor_mode
+          params:
+            - fan_power: 110
+              water_box_mode: 209
+              mop_mode: 306
+      - delay: "00:00:03"
+      # Vej 2 (kun hvis vej 1 ikke landede): de tre entities hver for sig, i
+      # husets faste rækkefølge — mop-rute, mop-styrke, sug SIDST (💡 enhver
+      # mop-skrivning trækker sugestyrken ned). Hver skrivning kun hvis
+      # entity'en kender smart_mode; en ukendt fan-speed aborterer ellers HELE
+      # scriptet, før kalderen når sin fallback.
+      - if:
+          - condition: state
+            entity_id: binary_sensor.roborock_smartplan_aktiv
+            state: "off"
+        then:
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ 'smart_mode' in (state_attr('select.s8_maxv_ultra_mop_mode', 'options') or []) }}
+            then:
+              - service: select.select_option
+                continue_on_error: true
+                target: {entity_id: select.s8_maxv_ultra_mop_mode}
+                data: {option: smart_mode}
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ 'smart_mode' in (state_attr('select.s8_maxv_ultra_mop_intensity', 'options') or []) }}
+            then:
+              - service: select.select_option
+                continue_on_error: true
+                target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+                data: {option: smart_mode}
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ 'smart_mode' in (state_attr('vacuum.s8_maxv_ultra', 'fan_speed_list') or []) }}
+            then:
+              - service: vacuum.set_fan_speed
+                continue_on_error: true
+                target: {entity_id: vacuum.s8_maxv_ultra}
+                data: {fan_speed: smart_mode}
+          - delay: "00:00:03"
+      # Read-back i logbogen — det er hele pointen med et eksperiment.
+      - service: logbook.log
+        data:
+          name: "Roborock SmartPlan"
+          message: >-
+            {{ 'SmartPlan SAT' if is_state('binary_sensor.roborock_smartplan_aktiv', 'on')
+               else 'SmartPlan landede IKKE' }} — robotten melder sug
+            {{ state_attr('vacuum.s8_maxv_ultra', 'fan_speed') }}, mop-styrke
+            {{ states('select.s8_maxv_ultra_mop_intensity') }}, mop-rute
+            {{ states('select.s8_maxv_ultra_mop_mode') }}.
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Aflevering: ud af SmartPlan igen når HA's SmartPlan-tur er slut
+  # ---------------------------------------------------------------------------
+  - id: roborock_smartplan_aflever
+    alias: "Roborock: forlad SmartPlan igen efter HA's SmartPlan-tur"
+    description: >
+      Tager robotten ud af SmartPlan (til kun-støvsug, balanced) når en
+      SmartPlan som HA selv satte er kørt færdig — så husets hurtige veje, der
+      ikke skriver mop-ruten, ikke arver den. Rører aldrig en SmartPlan valgt i
+      appen. Se hovedet i packages/roborock_smartplan.yaml.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.s8_maxv_ultra_cleaning
+        from: "on"
+        to: "off"
+        for: {minutes: 10}
+      # 💡 En HA-restart dræber den ventende `for:` ovenfor → backstop der
+      # måler tiden selv i condition-templaten.
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roborock_smartplan_ha_sat
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.s8_maxv_ultra_cleaning
+        state: "off"
+      # Robotten skal beviseligt være færdig, ikke bare ikke-startet endnu:
+      # Roborock-statussen lander op til ~155 s EFTER robottens egen start
+      # (💡), så et tick lige efter dispatch ville se "docked + cleaning off"
+      # og skifte profil MIDT i turen. Derfor 10 min siden den seneste HA-
+      # segment-start OG 10 min uden rengøring (9 min i templaten = margen, så
+      # `for:`-flanken ikke afvises på millisekunder). `last_changed`
+      # nulstilles ved restart — det gør kun afleveringen senere, aldrig for
+      # tidlig.
+      - condition: template
+        value_template: >-
+          {% set c = states.binary_sensor.s8_maxv_ultra_cleaning %}
+          {% set seg = state_attr('input_datetime.roborock_segment_clean_at', 'timestamp') | float(0) %}
+          {{ states('vacuum.s8_maxv_ultra') in ['docked', 'idle']
+             and c is not none
+             and (now() - c.last_changed).total_seconds() >= 540
+             and (now().timestamp() - seg) >= 540 }}
+    action:
+      # Stod robotten slet ikke i SmartPlan (sæt-forsøget landede aldrig, og
+      # kø-motoren kørte HURTIG i stedet), er der kun flaget at rydde.
+      - variables:
+          var_smart: "{{ is_state('binary_sensor.roborock_smartplan_aktiv', 'on') }}"
+      - if:
+          - condition: template
+            value_template: "{{ var_smart }}"
+        then:
+          # Vej 1: samme atomiske kald som indgangen, med bibliotekets
+          # VACUUM-profil (balanced / vand off / standard-rute).
+          - service: vacuum.send_command
+            continue_on_error: true
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data:
+              command: set_clean_motor_mode
+              params:
+                - fan_power: 102
+                  water_box_mode: 200
+                  mop_mode: 300
+          - delay: "00:00:03"
+          # Vej 2: husets egne entity-skrivninger, i husets rækkefølge.
+          - if:
+              - condition: state
+                entity_id: binary_sensor.roborock_smartplan_aktiv
+                state: "on"
+            then:
+              - service: select.select_option
+                continue_on_error: true
+                target: {entity_id: select.s8_maxv_ultra_mop_mode}
+                data: {option: standard}
+              - service: select.select_option
+                continue_on_error: true
+                target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+                data: {option: "off"}
+              - service: vacuum.set_fan_speed
+                continue_on_error: true
+                target: {entity_id: vacuum.s8_maxv_ultra}
+                data: {fan_speed: balanced}
+              - delay: "00:00:03"
+      # Flaget ryddes uanset udfald — ingen retry-løkke mod robottens sky hvert
+      # kvarter. Kunne vi ikke komme ud, siger vi det i stedet.
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.roborock_smartplan_ha_sat}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ not var_smart }}"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Roborock SmartPlan"
+                  message: >-
+                    Intet at aflevere — robotten stod ikke i SmartPlan (flaget
+                    ryddet).
+          - conditions:
+              - condition: state
+                entity_id: binary_sensor.roborock_smartplan_aktiv
+                state: "off"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Roborock SmartPlan"
+                  message: >-
+                    SmartPlan-turen er slut — robotten sat tilbage til kun
+                    støvsug (sug {{ state_attr('vacuum.s8_maxv_ultra', 'fan_speed') }},
+                    mop-styrke {{ states('select.s8_maxv_ultra_mop_intensity') }},
+                    mop-rute {{ states('select.s8_maxv_ultra_mop_mode') }}).
+        default:
+          - service: logbook.log
+            data:
+              name: "Roborock SmartPlan"
+              message: >-
+                Kunne IKKE tage robotten ud af SmartPlan (sug
+                {{ state_attr('vacuum.s8_maxv_ultra', 'fan_speed') }}, mop-styrke
+                {{ states('select.s8_maxv_ultra_mop_intensity') }}, mop-rute
+                {{ states('select.s8_maxv_ultra_mop_mode') }}).
+          - service: script.push_notify
+            data:
+              notif_id: roborock
+              title: "🤖 Robotten står stadig i SmartPlan"
+              message: >-
+                Den kom ikke ud af SmartPlan efter turen. Husets hurtige
+                rengøringer kan arve den — vælg en anden tilstand i
+                Roborock-appen.

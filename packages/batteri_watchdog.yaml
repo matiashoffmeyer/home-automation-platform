@@ -1,0 +1,442 @@
+# =============================================================================
+# Batteri-enheds watchdog (2026-07-23, user-spec)
+# =============================================================================
+# User: "jeg skal notificeres når et device har været unavailable i længere
+# end 1 time efter available periode." Baggrund: to IKEA Matter-over-Thread
+# sleepy end-devices (timmerflotte 10:44, badevaerelse_inde 13:13) faldt tavst
+# af Thread 2026-07-23 og kom IKKE tilbage af sig selv — user opdagede det ved
+# tilfælde. (entré- OG depot-VALLHORN har egne dedikerede watchdogs i
+# packages/valhorn_watchdog.yaml — de dækker hængt-på-'on', ikke batteri.)
+#
+# DESIGN — dynamisk over ALLE batteri-enheder (device_class battery), så nye
+# devices dækkes uden roster-drift (fejlklasse #16):
+#  - LIVENESS-PROXY = batteri-sensoren selv. Den rapporterer VÆRDIER sjældent,
+#    MEN alle en enheds entities transitionerer til `unavailable` på SAMME
+#    sekund når enheden dropper (verificeret 07-23: battery+occupancy+illum
+#    alle → unavailable 13:13:26). Så batteri-sensorens last_changed = drop-tid.
+#  - `unavailable` only (IKKE `unknown` — unknown = restart/aldrig-rapporteret
+#    støj, fx STYRBAR-fjernbetjeningers batteri der er unknown til første report).
+#  - > tærskel-minutter (slider, default 60) siden drop → varsel. En reelt
+#    sleepy enhed der wakeuper indenfor tærsklen tripper aldrig (fejlklasse #14
+#    gælder ikke: unavailable er en diskret state, ikke analog).
+#  - Telefoner hardkodet ekskluderet (iphone/phone_a/parent_b/parent_a/_sim_ =
+#    forventet væk). User-exclude-liste (input_text) for ægte sleepy-devices;
+#    default TOM (timmerflotte er IKKE sleepy — den var stabil 14 dage, døde
+#    hårdt; ekskludér den ikke).
+#  - Dedupe-store (input_text) = KORTE tokens (eid uden sensor.-præfiks/_battery)
+#    for enheder vi allerede har varslet → /15-scan re-pusher ikke under
+#    vedvarende outage (fejlklasse #13). Recovery-push når en varslet enhed
+#    kommer tilbage. input_text er hårdt 255-tegn-begrænset → ved masse-udfald
+#    (mesh/koordinator; listen passer ikke selv forkortet) gemmes sentinel
+#    'MASS' + der sendes ÉT samlet varsel (2026-07-24-fix: fuld eid-join var
+#    ~830 tegn → set_value fejlede → push-storm hvert 15. min).
+#
+# Push via script.push_notify (nid: batteri_watchdog) → per-type toggle +
+# AirBnB-gate. AirBnB default OFF (silent-reglen; user kan tilvælge på 🔔-fanen).
+#
+# 2026-10-20 (user: "tydelige notifikationer"): danske navne (dansk-macroen i
+# custom_templates/tekst.jinja), og teksten siger hvad man gør. Målt 8-20/10:
+# 21/21 varslede enheder kom SELV igen (35 min-26 t; nat-udfaldene først kl.
+# 7-9, når dørene blev brugt) → beskeden siger det, og "✅ Enhed tilbage"-
+# kvitteringen (17 af 38 pushes) er erstattet af at varslet forsvinder tavst.
+# =============================================================================
+input_boolean:
+  notif_batteri_watchdog_enabled:
+    name: "🔋 Batteri-enhed nede — send"
+    icon: mdi:battery-alert-variant-outline
+  notif_batteri_watchdog_parent_a:
+    name: "🔋 Batteri-enhed nede — Parent A"
+    icon: mdi:cellphone
+  notif_batteri_watchdog_airbnb:
+    name: "🔋 Batteri-enhed nede — også i AirBnB"
+    icon: mdi:home-account
+
+input_number:
+  batteri_watchdog_min_minutter:
+    name: "🔋 Batteri-watchdog: min. minutter nede før varsel"
+    min: 15
+    max: 360
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:timer-alert-outline
+  # Hvor længe en varslet enhed skal rapportere igen, før "tilbage"-kvitteringen
+  # sendes. 0 = kvittér straks. Dæmper enheder der wakeup'er kort og dør igen.
+  batteri_watchdog_genopstaa_minutter:
+    name: "🔋 Batteri-watchdog: min. minutter oppe før 'tilbage'"
+    min: 0
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:battery-heart-variant
+
+input_text:
+  # Komma-separerede substrings — matcher entity_id (fx "timmerflotte").
+  # En battteri-enhed hvis eid indeholder en substring herfra ignoreres.
+  # DEFAULT TOM. Kun for ægte sleepy-devices der lovligt er unavailable >1t.
+  batteri_watchdog_undtag:
+    name: "🔋 Batteri-watchdog: undtag (substrings, komma)"
+    max: 255
+    icon: mdi:playlist-remove
+  # Runtime-store: eids vi allerede har varslet om (dedupe). Ikke config →
+  # ikke i init/snapshot. Overlever restart (.storage) → ingen re-push af
+  # allerede-varslet outage efter genstart.
+  batteri_watchdog_doede:
+    name: "Batteri-watchdog: allerede varslet (eids)"
+    max: 255
+    icon: mdi:bell-check
+  # B151 (2026-10-04): søster-store med ALDER pr. token i `_doede`:
+  # `token=<epoch-timer første gang>/<antal uger påmindet>,…`. Uden en alder
+  # tav huset for evigt om en død enhed (sonoff_swv: 55 døgn). Skrevet stempel,
+  # ikke last_changed — den nulstilles ved hver restart (permanent faktum).
+  # Runtime, ikke config → ikke i init/snapshot.
+  batteri_watchdog_doede_siden:
+    name: "Batteri-watchdog: død siden (runtime)"
+    max: 255
+    icon: mdi:calendar-clock
+
+template:
+  # TRIGGER-baseret (ikke state-baseret): en state-template der itererer
+  # states.sensor OG selv er en sensor skaber en selv-domæne-listener-løkke som
+  # HA nægter at rendere (entitet → None, tomme attrs). Trigger-baseret
+  # evaluerer kun på /5-tick + HA-start = intet domæne-listen, ingen løkke.
+  - trigger:
+      - platform: time_pattern
+        minutes: "/5"
+      - platform: homeassistant
+        event: start
+    sensor:
+      - name: "Døde batteri-enheder"
+        # NB: friendly-navnet "Døde…" slugifies til sensor.dode_… (ø→o), så
+        # ALLE referencer bruger sensor.dode_batteri_enheder (ikke doede).
+        unique_id: doede_batteri_enheder
+        icon: mdi:battery-alert-variant-outline
+        state: >
+          {% set thresh = states('input_number.batteri_watchdog_min_minutter') | int(60) %}
+          {% set ex = states('input_text.batteri_watchdog_undtag') %}
+          {% set excl = (ex.split(',') | map('trim') | reject('eq', '') | list)
+                        if ex not in ['unknown', 'unavailable', 'None', ''] else [] %}
+          {% set skip = ['iphone', 'phone_a', 'parent_b', 'parent_a', '_sim_'] + excl %}
+          {% set ns = namespace(n=0) %}
+          {% for e in states.sensor
+               | selectattr('attributes.device_class', 'defined')
+               | selectattr('attributes.device_class', 'eq', 'battery') %}
+            {% if e.state == 'unavailable'
+                  and (now() - e.last_changed).total_seconds() > thresh * 60
+                  and (skip | select('in', e.entity_id) | list | length) == 0 %}
+              {% set ns.n = ns.n + 1 %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.n }}
+        attributes:
+          # Ankeret: liste af batteri-sensor-eids der er unavailable > tærskel.
+          eids: >
+            {% set thresh = states('input_number.batteri_watchdog_min_minutter') | int(60) %}
+            {% set ex = states('input_text.batteri_watchdog_undtag') %}
+            {% set excl = (ex.split(',') | map('trim') | reject('eq', '') | list)
+                          if ex not in ['unknown', 'unavailable', 'None', ''] else [] %}
+            {% set skip = ['iphone', 'phone_a', 'parent_b', 'parent_a', '_sim_'] + excl %}
+            {% set ns = namespace(dead=[]) %}
+            {% for e in states.sensor
+                 | selectattr('attributes.device_class', 'defined')
+                 | selectattr('attributes.device_class', 'eq', 'battery') %}
+              {% if e.state == 'unavailable'
+                    and (now() - e.last_changed).total_seconds() > thresh * 60
+                    and (skip | select('in', e.entity_id) | list | length) == 0 %}
+                {% set ns.dead = ns.dead + [e.entity_id] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.dead }}
+          # Menneske-navne til dashboard-tile (device-navn frem for eid).
+          navne: >
+            {% set thresh = states('input_number.batteri_watchdog_min_minutter') | int(60) %}
+            {% set ex = states('input_text.batteri_watchdog_undtag') %}
+            {% set excl = (ex.split(',') | map('trim') | reject('eq', '') | list)
+                          if ex not in ['unknown', 'unavailable', 'None', ''] else [] %}
+            {% set skip = ['iphone', 'phone_a', 'parent_b', 'parent_a', '_sim_'] + excl %}
+            {% set ns = namespace(n=[]) %}
+            {% for e in states.sensor
+                 | selectattr('attributes.device_class', 'defined')
+                 | selectattr('attributes.device_class', 'eq', 'battery') %}
+              {% if e.state == 'unavailable'
+                    and (now() - e.last_changed).total_seconds() > thresh * 60
+                    and (skip | select('in', e.entity_id) | list | length) == 0 %}
+                {% set dn = device_attr(e.entity_id, 'name_by_user') or device_attr(e.entity_id, 'name') or e.entity_id %}
+                {% set ns.n = ns.n + [dn] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.n }}
+
+automation:
+  - id: batteri_watchdog_scan
+    alias: "Watchdog: batteri-enhed unavailable >tærskel (scan + varsel)"
+    description: >
+      /15-scan + reaktion på ændring i sensor.dode_batteri_enheder. Nye døde
+      → push; genoprettede (tidligere varslet, nu tilbage) → kvittering.
+      Dedupe-store i input_text så vedvarende outage ikke re-pusher.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/15"
+      - platform: state
+        entity_id: sensor.dode_batteri_enheder
+    variables:
+      dead_eids: "{{ state_attr('sensor.dode_batteri_enheder', 'eids') | default([], true) }}"
+      # 2026-07-24 (overflow-fix): input_text er hårdt begrænset til 255 tegn.
+      # Fuld eid-join for ALLE 23 batteri-sensorer er ~830 tegn → ved et mesh-/
+      # koordinator-udfald fejlede set_value (sidste action) → dedupe-storen
+      # opdateredes aldrig → fuld re-push HVERT 15. minut (push-storm). Fix:
+      # (a) korte tokens (sensor.-præfiks + _battery strippet) i storen,
+      # (b) passer selv de korte tokens ikke i 255 = ægte masse-udfald →
+      #     sentinel 'MASS' i storen + ÉT samlet varsel i stedet for pr.-enhed.
+      dead_short: >
+        {{ dead_eids | map('replace', 'sensor.', '') | map('replace', '_battery', '') | list }}
+      alerted_raw: "{{ states('input_text.batteri_watchdog_doede') }}"
+      alerted: >
+        {{ (alerted_raw.split(',') | map('trim') | reject('eq', '') | list)
+           if alerted_raw not in ['unknown', 'unavailable', 'None', ''] else [] }}
+      # 2026-10-20: entréens Myggspray har sin egen vagt (valhorn_watchdog,
+      # 15 min); har den varslet, er en batteri-push om samme udfald en dublet
+      # (5 af 5 entré-pushes 8-15/10). Tokenet kommer stadig i storen → ingen
+      # push senere i samme udfald, og den ugentlige påmindelse gælder fortsat.
+      new_dead: >
+        {% set entre_varslet = is_state('input_boolean.entre_valhorn_outage_alerted', 'on')
+                               and is_state('input_boolean.notif_valhorn_watchdog_enabled', 'on') %}
+        {% set ns = namespace(out=[]) %}
+        {% for eid in dead_eids %}
+          {% set s = eid | replace('sensor.', '') | replace('_battery', '') %}
+          {% if s not in alerted and not (entre_varslet and s == 'entre_valhorn') %}
+            {% set ns.out = ns.out + [eid] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.out }}
+      # 2026-08-13: "genoprettet" må IKKE udledes af at tærsklen ikke længere
+      # er opfyldt. last_changed nulstilles ved HA-restart (permanent faktum),
+      # så en enhed der har været død i to døgn faldt under 60-min-grænsen ved
+      # hver restart → falsk "✅ tilbage" + ny "⚠️ nede" 60 min senere. Målt
+      # 08-12: 6 pushes om sonoff_swv, som var unavailable uafbrudt fra 08-10
+      # 23:00. Recovery kræver nu at sensoren FAKTISK rapporterer igen, og at
+      # den har gjort det i genopstaa-vinduet (flap-dæmpning).
+      grace_s: "{{ (states('input_number.batteri_watchdog_genopstaa_minutter') | float(30)) * 60 }}"
+      # B151 (2026-10-04): samme skip-liste som sensoren (3. kopi — ret begge
+      # steder, #2). En enhed der undtages EFTER at være varslet (sonoff_swv:
+      # ligger bevidst i en skuffe) skal falde ud af storen, ellers hang den i
+      # holdover og fik ugentlige påmindelser om noget user har valgt fra.
+      skip: >
+        {% set ex = states('input_text.batteri_watchdog_undtag') %}
+        {% set excl = (ex.split(',') | map('trim') | reject('eq', '') | list)
+                      if ex not in ['unknown', 'unavailable', 'None', ''] else [] %}
+        {{ ['iphone', 'phone_a', 'parent_b', 'parent_a', '_sim_'] + excl }}
+      alerted_state: >
+        {% set ns = namespace(back=[], still=[]) %}
+        {% for e in states.sensor
+             | selectattr('attributes.device_class', 'defined')
+             | selectattr('attributes.device_class', 'eq', 'battery') %}
+          {% set s = e.entity_id | replace('sensor.', '') | replace('_battery', '') %}
+          {% if s in alerted and (skip | select('in', e.entity_id) | list | length) == 0 %}
+            {% if e.state != 'unavailable'
+                  and (now() - e.last_changed).total_seconds() >= (grace_s | float) %}
+              {% set ns.back = ns.back + [s] %}
+            {% else %}
+              {% set ns.still = ns.still + [s] %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.back | join(',') }}||{{ ns.still | join(',') }}
+      # Stadig døde (eller lige kommet tilbage indenfor grace) → bliv i storen,
+      # ingen push. Det er dét der bryder restart-loopet.
+      holdover: "{{ alerted_state.split('||')[1].split(',') | reject('eq', '') | list }}"
+      store_tokens: "{{ (dead_short + holdover) | unique | list }}"
+      mass: "{{ (store_tokens | join(',')) | length > 255 }}"
+      # --- B151: ugentlig påmindelse (dæmp, ikke ti) -----------------------
+      # Fejlklasse #13: dedupe på en flanke tav for evigt under en vedvarende
+      # outage. Nu: en enhed der STADIG er unavailable (målt på dens egen state
+      # nu, ikke på restart-følsomme last_changed) får én påmindelse pr. 7 døgn.
+      now_h: "{{ (now().timestamp() / 3600) | int }}"
+      dead_now: >
+        {% set ns = namespace(l=[]) %}
+        {% for e in states.sensor
+             | selectattr('attributes.device_class', 'defined')
+             | selectattr('attributes.device_class', 'eq', 'battery') %}
+          {% if e.state == 'unavailable' %}
+            {% set ns.l = ns.l + [e.entity_id | replace('sensor.', '') | replace('_battery', '')] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.l }}
+      stamps_now: >
+        {% set raw = states('input_text.batteri_watchdog_doede_siden') %}
+        {% set raw = raw if raw not in ['unknown', 'unavailable', 'None'] else '' %}
+        {% set ns = namespace(out=[]) %}
+        {% for tok in (store_tokens if not mass else []) %}
+          {% set f = namespace(v='') %}
+          {% for e in raw.split(',') if '=' in e and e.split('=')[0] == tok %}
+            {% set f.v = e.split('=')[1] %}
+          {% endfor %}
+          {% set ns.out = ns.out + [tok ~ '=' ~ (f.v if f.v != '' else now_h ~ '/0')] %}
+        {% endfor %}
+        {{ ns.out | join(',') }}
+      due: >
+        {% set ns = namespace(l=[]) %}
+        {% for e in stamps_now.split(',') if '=' in e %}
+          {% set tok = e.split('=')[0] %}
+          {% set v = (e.split('=')[1].split('/') + ['0'])[:2] %}
+          {% if tok in dead_now and (now_h - (v[0] | int(now_h))) >= 168 * ((v[1] | int(0)) + 1) %}
+            {% set ns.l = ns.l + [tok] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.l }}
+      # Kun dagtimer (09-21) og ikke under et ophold — så venter påmindelsen
+      # til første tick efter (antal-feltet tælles først når den sendes).
+      remind_ok: >-
+        {{ 9 <= now().hour < 21 and not is_state('input_select.house_mode', 'AirBnB') }}
+      # Påmindet → antal-feltet springer til nuværende uge (indhenter, så et
+      # langt ophold ikke giver en påmindelse pr. tick bagefter).
+      stamps_final: >
+        {% set ns = namespace(out=[]) %}
+        {% for e in stamps_now.split(',') if '=' in e %}
+          {% set tok = e.split('=')[0] %}
+          {% set since = (e.split('=')[1].split('/')[0]) | int(now_h) %}
+          {% if remind_ok and tok in due %}
+            {% set ns.out = ns.out + [tok ~ '=' ~ since ~ '/' ~ ((now_h - since) // 168)] %}
+          {% else %}
+            {% set ns.out = ns.out + [e] %}
+          {% endif %}
+        {% endfor %}
+        {% set out = ns.out | join(',') %}
+        {{ out if out | length <= 255 else '' }}
+    action:
+      # --- Masse-udfald (storen kan ikke rumme listen) → ét samlet varsel ---
+      - if:
+          - condition: template
+            value_template: "{{ mass and 'MASS' not in alerted }}"
+        then:
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: batteri_watchdog
+              title: "🔋⚠️ Mange enheder nede samtidig"
+              message: >-
+                {{ dead_eids | length }} batteri-enheder er unavailable på én
+                gang — det ligner et mesh-/koordinator-udfald (Zigbee/Thread),
+                ikke enkelt-enheders batterier. Tjek dongler/border router.
+              payload:
+                tag: batteri_watchdog
+      # --- Nye døde enheder → ét varsel der lister ALLE der er nede nu ---
+      # Tagget deles, så den nye push ERSTATTER den forrige på telefonen →
+      # tidligere varslede der STADIG er nede skal med, ellers forsvinder de.
+      - if:
+          - condition: template
+            value_template: "{{ (not mass) and new_dead | length > 0 }}"
+        then:
+          - variables:
+              linjer: >-
+                {% from 'tekst.jinja' import dansk %}
+                {% set ns = namespace(l=[]) %}
+                {% for e in states.sensor
+                     | selectattr('attributes.device_class', 'defined')
+                     | selectattr('attributes.device_class', 'eq', 'battery') %}
+                  {% set s = e.entity_id | replace('sensor.', '') | replace('_battery', '') %}
+                  {% set ny = e.entity_id in new_dead %}
+                  {% if ny or (s in alerted and e.state == 'unavailable'
+                               and (skip | select('in', e.entity_id) | list | length) == 0) %}
+                    {% set m = ((now() - e.last_changed).total_seconds() / 60) | round(0) | int %}
+                    {% set navn = dansk(device_attr(e.entity_id, 'name_by_user')
+                                        or device_attr(e.entity_id, 'name') or e.entity_id) | trim %}
+                    {% set tid = ((m ~ ' min') if m < 120 else ((m / 60) | round(0) | int) ~ ' t')
+                                 if ny else 'stadig' %}
+                    {% set ns.l = ns.l + [{'navn': navn, 'tid': tid}] %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.l }}
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: batteri_watchdog
+              title: >-
+                🔋 {{ linjer[0].navn ~ ' svarer ikke' if linjer | length == 1
+                      else (linjer | length) ~ ' enheder svarer ikke' }}
+              message: >-
+                {% if linjer | length == 1 %}
+                Ingen kontakt i {{ linjer[0].tid }}. Den plejer at komme selv
+                igen, tit først når den bruges næste gang. Er den stadig væk i
+                morgen, så tag batteriet ud og i igen.
+                {% else %}
+                {% for l in linjer %}• {{ l.navn }} ({{ l.tid }}){{ '\n' }}{% endfor %}{{ '\n' }}De
+                plejer at komme selv igen, tit først når de bruges
+                næste gang. Er en stadig væk i morgen, så tag batteriet ud og i igen.
+                {% endif %}
+              payload:
+                tag: batteri_watchdog
+      # --- Alle varslede er tilbage → tag varslet af telefonen, tavst ---
+      # Delvis genkomst lader varslet stå: en gen-post ville poppe en besked
+      # user har swipet væk op igen. clear_notification er ingen besked → uden
+      # om push_notify (samme mønster som plant_notifications.yaml).
+      - if:
+          - condition: template
+            value_template: "{{ alerted | length > 0 and store_tokens | length == 0 }}"
+        then:
+          - repeat:
+              for_each:
+                - mobile_app_phone_a
+                - mobile_app_phone_b
+              sequence:
+                - service: "notify.{{ repeat.item }}"
+                  continue_on_error: true
+                  data:
+                    message: clear_notification
+                    data:
+                      tag: batteri_watchdog
+                - service: "notify.{{ repeat.item }}"
+                  continue_on_error: true
+                  data:
+                    message: clear_notification
+                    data:
+                      tag: batteri_watchdog_paamindelse
+      # --- B151: alders-store FØR påmindelsen (at-most-once: fejler pushen,
+      #     mister vi højst én påmindelse — omvendt rækkefølge gav 07-24-stormen).
+      - if:
+          - condition: template
+            value_template: >-
+              {{ stamps_final != states('input_text.batteri_watchdog_doede_siden') }}
+        then:
+          - service: input_text.set_value
+            continue_on_error: true
+            target:
+              entity_id: input_text.batteri_watchdog_doede_siden
+            data:
+              value: "{{ stamps_final }}"
+      # --- B151: ugentlig påmindelse om enheder der STADIG er nede ---
+      - if:
+          - condition: template
+            value_template: "{{ remind_ok and due | length > 0 }}"
+        then:
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: batteri_watchdog
+              title: "🔋 Svarer stadig ikke efter en uge"
+              message: >-
+                {% from 'tekst.jinja' import dansk %}
+                {% set ns = namespace(lines=[]) %}
+                {% for e in states.sensor
+                     | selectattr('attributes.device_class', 'defined')
+                     | selectattr('attributes.device_class', 'eq', 'battery') %}
+                  {% set tok = e.entity_id | replace('sensor.', '') | replace('_battery', '') %}
+                  {% if tok in due %}
+                    {% set dn = dansk(device_attr(e.entity_id, 'name_by_user') or device_attr(e.entity_id, 'name') or e.entity_id) | trim %}
+                    {% set ns.lines = ns.lines + ['• ' ~ dn] %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.lines | join('\n') if ns.lines else due | join(', ') }}
+
+                Skift batteriet. Er den taget ud af drift med vilje, så skriv
+                {{ due | join(', ') }} i Undtag-feltet (Indstillinger →
+                Notifikationer); feltet matcher entity-navnet, ikke det pæne navn.
+              payload:
+                tag: batteri_watchdog_paamindelse
+      # --- Gem aktuel død-liste som ny dedupe-store (korte tokens; 'MASS' ved
+      #     masse-udfald så set_value ALDRIG kan fejle på 255-grænsen) ---
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.batteri_watchdog_doede
+        data:
+          value: "{{ 'MASS' if mass else store_tokens | join(',') }}"

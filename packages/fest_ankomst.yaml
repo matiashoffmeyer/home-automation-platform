@@ -1,0 +1,776 @@
+# =============================================================================
+# Fest: smooth party mode + gæste-ankomst-fanfare ved hoveddøren
+# =============================================================================
+# User-spec 2026-08-21 (fest afholdes 08-22): huset står i SMOOTH party mode
+# (dance_mode on, begge festlys-sliders i bund = binary_sensor.dance_smooth_mode
+# on = langsom farvedrift, ingen bursts). Oveni:
+#   • Terrassen er IKKE med i dansen — den står på FULD styrke hele aftenen.
+#   • Badeværelset og køkken-spottene kører HELT normalt (presence-styret).
+#   • Hver gang hoveddøren åbner: terrassen blinker + en hurtig regnbue-kaskade
+#     løber gennem open-plan og depot, hvorefter smooth-festen fortsætter.
+#
+# HVORFOR ET EGET LAG, IKKE ET NYT DANCE-EVENT (fejlklasse #2):
+# Kaskaden kunne have været et 15. event i dance_manual_event, men et event dér
+# kører i LOOP indtil nogen slår det fra og overruler dance_mode imens. En
+# ankomst er et ENGANGS-udbrud der skal give festen tilbage bagefter. Derfor
+# genbruger vi i stedet dance-lagets pause-mekanisme: input_boolean.
+# dance_strobe_active on = alle per-pære-loops parkerer i deres wait_template,
+# vi maler vores regnbue, og vi slipper flaget igen. Loopsne driver videre fra
+# den kulør pæren står på (smooth mode læser hs_color live), så regnbuen
+# smelter sammen med festen i stedet for at snappe tilbage.
+#
+# ⚠️ TERRASSEN HAR TRE NAT-LAG DER VIL SLUKKE DEN MIDT I FESTEN:
+#   22:30 flagermus_ekstra_dim   → 3 %   (terrace_bat_friendly.yaml)
+#   23:00 flagermus_curfew       → HÅRD SLUK
+#   23:30 terrasse_lys_nat_sluk  → sluk  (terrace_plug_control.yaml G)
+# Alle tre er allerede gatet på `binary_sensor.gaester_for_nylig == off`
+# (packages/gaesteaften.yaml, bygget efter incident 07-24 hvor curfew slukkede
+# lyset på gæsterne kl. 23:00). Vi tilføjer derfor IKKE en fjerde gate — vi
+# stempler det EKSISTERENDE gæste-vindue. Det er samme semantik (der ER gæster)
+# og holder reglen ét sted. Vinduet er 6 t fra stemplet, så en fest der varer
+# længere ville falde ud af det → /30-backstoppen nedenfor forlænger det så
+# længe festen kører.
+#
+# ⚠️ BADEVÆRELSET OG KØKKEN-SPOTTENE ER VERIFICERET FRI (2026-08-21):
+#   • Bad gates udelukkende på `room_mode_badevaerelse != Manual`, og festens
+#     dance_room_modes_claim rører kun de rum hvis dance_room_* er ON. Vi slår
+#     dance_room_bad OFF → badet claimes aldrig.
+#   • Køkken-spottene (switch.koekken_spots) er en SWITCH og indgår slet ikke i
+#     festens bulb-roster. presence_koekken_cooking_spots_on har siden 08-19 en
+#     eksplicit undtagelse der lader den tænde selv om room_mode_koekken er Manual
+#     når dance kører. Spottene er altså allerede med i designet.
+#
+# KILL-SWITCHES (fejlklasse #21 — hver vej ind er gatet):
+#   input_boolean.fest_ankomst_fanfare  → dør-fanfaren
+#   input_boolean.fest_terrasse_fuld    → terrasse-holdet + gæste-stemplet
+#
+# De er PRÆFERENCER, ikke en kopi af "festen kører" — og det var de ikke før
+# 2026-08-21f. Da blev de armet af script.fest_smooth_start og ryddet af
+# script.fest_smooth_stop, hvilket gav to tavse dødsmåder:
+#   1) Festen startes næsten altid ved at slå input_boolean.dance_mode til
+#      (dashboard-toggle, scene, Styrbar) — ikke via start-scriptet. Så var
+#      fanfaren aldrig armet, og dør-automationen fyrede ALDRIG. Målt: den
+#      havde ingen last_triggered overhovedet, mens flaget havde stået off
+#      siden 13:36:45.
+#   2) `initial: off` tvinger værdien ved HVER HA-start (input_boolean med
+#      `initial:` restorer ikke), så selv den rigtige vej ind blev afvæbnet af
+#      en restart midt i festen.
+# Nu: default ON, ryddes aldrig automatisk, og "kører festen?" besvares dér hvor
+# det hører hjemme — binary_sensor.festlys_aktiv, som ALLEREDE er en condition
+# på begge forbrugere. Ét spørgsmål, ét flag.
+# =============================================================================
+
+input_boolean:
+  # initial: on — fejler bevidst ÅBENT. Et misset show er en tom skuffelse;
+  # et uventet show er højst et grin. Samme afvejning som vække-kæden.
+  fest_ankomst_fanfare:
+    name: "Fest: gæste-fanfare ved hoveddør"
+    icon: mdi:door-open
+    initial: true
+
+  fest_terrasse_fuld:
+    name: "Fest: hold terrassen på fuld styrke"
+    icon: mdi:string-lights
+    initial: true
+
+input_number:
+  # Tempo for dør-fanfaren. ÉN kilde: både hus-kaskaden og entré-spinnet
+  # skaleres af den, så de to grene ikke kan komme i utakt indbyrdes.
+  # Skalering: ms mellem farveskift = 250 - tempo * 1.8
+  #   tempo  25 →  205 ms (roligere end den gamle faste 180)
+  #   tempo  50 →  160 ms
+  #   tempo  75 →  115 ms  ← default, ~1,6× hurtigere end før
+  #   tempo 100 →   70 ms
+  # LOFT, ikke en gratis skrue: HA leverer reelt ~5-10 light-kald/sek, og et
+  # design der beder om mere fejler TAVST (det kører bare langsommere, målt
+  # 2026-05-03: "40 ticks/sek" gav 7,5). Skruer du op og fanfaren ikke bliver
+  # hurtigere, er loftet nået — så er svaret færre pærer, ikke højere tempo.
+  fest_ankomst_tempo:
+    name: "Fest: tempo på dør-fanfaren"
+    icon: mdi:rainbow
+    min: 1
+    max: 100
+    step: 1
+    mode: slider
+
+template:
+  - binary_sensor:
+      # Festen kører = auto-shuffle ELLER et låst event. Samme udtryk som
+      # light.festlys' value_template — men fanfaren og terrasse-holdet skal
+      # kunne læse det som en entity i en `condition:`, og en template-lampe
+      # kan ikke bruges i en state-condition uden at gætte på dens state.
+      - name: "Festlys aktiv"
+        unique_id: festlys_aktiv
+        icon: mdi:party-popper
+        state: >-
+          {{ is_state('input_boolean.dance_mode', 'on')
+             or not is_state('input_select.dance_manual_event', 'off') }}
+
+      # Er huset fysisk klar til festen? De tre stue-lamper og depot-IKEA-pæren
+      # har stået unavailable siden 08-09 (12 døgn) — de er ZHA-pærer uden strøm
+      # (afbryder/lampekontakt slukket), og en unavailable pære er usynlig for
+      # HVER eneste lys-vej (permanent fakta). Terrassen kræver desuden at
+      # switch.terrasse_plug er tændt før pærelyskæden overhovedet melder sig.
+      # Attributten lister præcis hvad der mangler, så fest_klar_tjek kan
+      # sende den videre uden at gentage listen (fejlklasse #2).
+      - name: "Fest klar"
+        unique_id: fest_klar
+        icon: mdi:clipboard-check
+        state: >-
+          {% set roster = ['light.spisestue_loft', 'light.stue_laesehygge',
+                           'light.stue_sofa_lampe', 'light.stue_sofa_lampe_2',
+                           'light.stue_hjoernelampe', 'light.koekken_lyskaede',
+                           'light.depot_strip', 'light.terrasse_paerelyskaede'] %}
+          {{ roster | select('is_state', 'unavailable') | list | count == 0 }}
+        attributes:
+          mangler: >-
+            {% set roster = ['light.spisestue_loft', 'light.stue_laesehygge',
+                             'light.stue_sofa_lampe', 'light.stue_sofa_lampe_2',
+                             'light.stue_hjoernelampe', 'light.koekken_lyskaede',
+                             'light.depot_strip', 'light.terrasse_paerelyskaede'] %}
+            {{ roster | select('is_state', 'unavailable') | list }}
+
+script:
+
+  # ===========================================================================
+  # START — ét kald sætter hele festen op
+  # ===========================================================================
+  fest_smooth_start:
+    alias: "Fest: start smooth party mode"
+    icon: mdi:party-popper
+    mode: single
+    # 2026-09-16: rum-rosteret kan nu sendes med, så "Party Time" kan starte
+    # festen i netop de rum der har aktivitet — uden at hele resten af
+    # opsætningen (terrasse-strøm, sliders, gæste-stempel, dance_mode) bliver
+    # kopieret til et søster-script der så driver fra hinanden (fejlklasse #2).
+    # Udelades feltet, er adfærden præcis som før.
+    fields:
+      rum:
+        description: >
+          Liste af rum-nøgler der skal danse. Gyldige:
+          entre, stue, spisestue, koekken, depot.
+          Udelades den, bruges standard-rosteret (alle fem).
+        example: "['koekken', 'stue']"
+        required: false
+        selector:
+          object:
+    sequence:
+      # Et script-felt der ikke sendes med er UDEFINERET, og `| default(x)`
+      # er det eneste der redder det. `| default(x, true)` ville være forkert
+      # her: en TOM liste fra Party Time betyder "ingen rum havde aktivitet",
+      # og den beslutning hører hos kalderen, ikke her.
+      - variables:
+          rum_standard: ['entre', 'stue', 'spisestue', 'koekken', 'depot']
+          rum_valgt: "{{ rum | default(rum_standard) }}"
+
+      # 1) Strøm på terrassen FØRST — pærelyskæden hænger på switch.terrasse_plug
+      #    og melder sig først på Zigbee-nettet et stykke tid efter strøm
+      #    (målt 08-21: plug off 08:16 → light unavailable 08:28). Uden det her
+      #    er "terrassen på fuld" et kald mod en pære der ikke findes.
+      #
+      #    MEN kun når terrassen overhovedet kan ses. Elevations-gaten stod FØR
+      #    kun på `fest_terrasse_hold_fuld` (tilføjet 13/9, da et /10-tick blæste
+      #    kæden på 100 % i fuldt dagslys) — start-vejen havde ingen, og det er
+      #    fejlklasse #12: beskyttelsen tilføjet asymmetrisk på to veje med samme
+      #    fysik. Målt 17/9: "party time" kl. 12:30:44 i højsol tændte
+      #    pærelyskæden, selvom kun køkkenet dansede. -4° er spejlet fra
+      #    terrasse_dusk_auto_on (automations/terrace_plug_control.yaml) og fra
+      #    holdet nedenfor — ændrer du den ene, så ret alle tre (#2).
+      #
+      #    Starter festen i dagslys og varer den til det bliver mørkt, er
+      #    terrassen IKKE tabt: dusk-tænderen tænder plug + kæde ved -4°, og
+      #    holdet her i filen løfter den til fuld på næste /10-tick.
+      - if:
+          - condition: numeric_state
+            entity_id: sun.sun
+            attribute: elevation
+            below: input_number.terrasse_skumring_elevation
+        then:
+          - service: switch.turn_on
+            target:
+              entity_id: switch.terrasse_plug
+
+      # 2) Rum-roster: entré + open-plan + depot danser. Terrassen ude (den skal
+      #    stå STILLE på fuld, ikke drive i farver), badet og børneværelset ude
+      #    (skal køre normalt / må aldrig auto-tænde).
+      #    Entréen kom med 2026-08-21, da loftet blev skiftet fra en CCT-only
+      #    TRADFRI til en KAJPLATS CWS globe. Den er gæstens første indtryk og
+      #    bærer ankomst-fanfaren, så den er ALDRIG valgfri under fest.
+      #    2026-08-28: spisestuen fik egen toggle (open-plan splittet i tre)
+      #    — uden den ville spiseloftet falde ud af ankomst-festen.
+      #    Terrasse/bad/børn slukkes ALTID, uanset hvad kalderen beder om:
+      #    terrassen skal stå stille på fuld, badet køre normalt, og
+      #    børneværelset må aldrig auto-tænde.
+      - service: input_boolean.turn_on
+        target:
+          entity_id: >-
+            {{ rum_valgt | map('regex_replace', '^', 'input_boolean.dance_room_')
+               | list }}
+      - service: input_boolean.turn_off
+        target:
+          entity_id: >-
+            {{ (['entre', 'stue', 'spisestue', 'koekken', 'depot']
+                | reject('in', rum_valgt) | list
+                | map('regex_replace', '^', 'input_boolean.dance_room_') | list)
+               + ['input_boolean.dance_room_terrasse',
+                  'input_boolean.dance_room_bad',
+                  'input_boolean.dance_room_boern'] }}
+
+      # 3) Smooth mode = begge sliders i bund. binary_sensor.dance_smooth_mode
+      #    er defineret som præcis dette (ÉN kilde) og læses af både
+      #    dance_single_bulb (langsom drift) og dance_event_scheduler (ingen
+      #    bursts) — vi sætter derfor sliderne, ikke et separat flag.
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.dance_speed
+        data:
+          value: 1
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.dance_event_frequency
+        data:
+          value: 1
+
+      # 4) Stempl gæste-vinduet → flagermus-dim (22:30), flagermus-curfew
+      #    (23:00) og terrasse-nat-sluk (23:30) holder alle tre fingrene væk.
+      #    set_datetime, ikke set_value — set_value giver bart 400 på et
+      #    input_datetime (permanent fakta).
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.gaester_sidst_set
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+      # 5) Fanfaren og terrasse-holdet armes IKKE her. De er præferencer der
+      #    står ON som default (se toppen af filen) og gates af
+      #    binary_sensor.festlys_aktiv. Armede vi dem her, ville de kun virke
+      #    når festen startes via netop dette script — og det er ikke den vej
+      #    festen faktisk startes.
+
+      # 6) Festen kører. Sætter de dansende rum til Manual via
+      #    dance_room_modes_claim (kun stue+depot — badet røres ikke).
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.dance_mode
+
+      # 7) Terrassen på fuld — samme dagslys-gate som skridt 1. Vent på at pæren
+      #    er vågnet efter strøm; timeout er en grace, ikke en fejl —
+      #    terrasse_hold-backstoppen nedenfor fanger den alligevel hvert
+      #    10. minut hvis den er langsom.
+      - if:
+          - condition: numeric_state
+            entity_id: sun.sun
+            attribute: elevation
+            below: input_number.terrasse_skumring_elevation
+        then:
+          - wait_template: >-
+              {{ states('light.terrasse_paerelyskaede') not in ['unavailable', 'unknown'] }}
+            timeout: "00:02:00"
+            continue_on_timeout: true
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: light.terrasse_paerelyskaede
+            data:
+              brightness_pct: 100
+              transition: 2
+
+      - service: logbook.log
+        data:
+          name: "Fest"
+          message: >-
+            Smooth party mode startet — {{ rum_valgt | join(', ') }} danser,
+            {{ 'terrassen på fuld' if (state_attr('sun.sun', 'elevation') | float(0))
+                < (states('input_number.terrasse_skumring_elevation') | float(-4))
+               else 'terrassen rørt ikke (dagslys — dusk-tænderen tager den)' }},
+            fanfare armeret.
+            {{ 'ALLE pærer online.' if is_state('binary_sensor.fest_klar', 'on')
+               else 'MANGLER: ' ~ (state_attr('binary_sensor.fest_klar', 'mangler') | join(', ')) }}
+
+  # ===========================================================================
+  # STOP — slip alt igen
+  # ===========================================================================
+  # Bevidst kun SLIP, ingen tvungen sluttilstand: dance_mode → off kører
+  # dance_room_modes_release, som siden 08-16d sætter ALLE syv room_modes til
+  # Auto (user-spec "fuld auto mode når vi slukker festlys"). Terrassen får vi
+  # ikke fingre i — når fest_terrasse_fuld falder, overtager de normale
+  # nat-lag igen, og gæste-vinduet løber selv ud.
+  fest_smooth_stop:
+    alias: "Fest: stop smooth party mode"
+    icon: mdi:party-popper
+    mode: single
+    sequence:
+      # Fanfare- og terrasse-flagene ryddes IKKE — de er præferencer, ikke
+      # feststatus. binary_sensor.festlys_aktiv falder når dance_mode slukkes
+      # to trin nede, og det er dén der lukker begge forbrugere.
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.dance_manual_event
+        data:
+          option: "off"
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.dance_mode
+      - service: logbook.log
+        data:
+          name: "Fest"
+          message: "Smooth party mode stoppet — alle rum tilbage til Auto."
+
+  # ===========================================================================
+  # GÆSTE-ANKOMST — terrasse-blink + regnbue-kaskade gennem open-plan + depot
+  # ===========================================================================
+  fest_gaest_ankomst:
+    alias: "Fest: gæste-ankomst (regnbue-kaskade + terrasse-blink)"
+    icon: mdi:rainbow
+    # single + silent: en gæst mere der træder ind 3 sek efter må ikke starte
+    # kaskaden forfra midt i den. Fanfaren varer ~5 s; døren står typisk åben
+    # længere end det ved en ankomst.
+    mode: single
+    max_exceeded: silent
+    variables:
+      # Rumlig rækkefølge fra hoveddøren og indad, så kaskaden LØBER gennem
+      # huset i stedet for at blinke i tilfældig orden. Snittet mod det
+      # faktiske roster (sensor.dance_active_bulbs) betyder at rum-togglerne
+      # stadig styrer scopet — slår man depot fra, forsvinder det herfra af
+      # sig selv (fejlklasse #16: ingen anden kopi af rosteret).
+      #
+      # unavailable filtreres FRA: et light.turn_on mod en død ZHA-pære kaster
+      # og ville afbryde resten af kaskaden. Tre stue-lamper har stået
+      # unavailable i 12 døgn, så det er ikke et teoretisk hjørne.
+      #
+      # ENTRÉEN ER IKKE MED HER. Den har sin egen, hurtigere gren nedenfor, og
+      # to grene der skriver farver til samme pære ville slås om den. Den
+      # filtreres derfor eksplicit ud af roster-halen — den ligger i rosteret
+      # siden 2026-08-21, så uden filteret ville den snige sig med.
+      bulbs: >-
+        {% set roster = state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] %}
+        {% set spatial = ['light.spisestue_loft', 'light.stue_hjoernelampe',
+                          'light.stue_sofa_lampe', 'light.stue_sofa_lampe_2',
+                          'light.stue_laesehygge', 'light.koekken_lyskaede',
+                          'light.depot_strip'] %}
+        {% set ns = namespace(b=[]) %}
+        {% for e in spatial %}
+          {% if e in roster and states(e) not in ['unavailable', 'unknown'] %}
+            {% set ns.b = ns.b + [e] %}
+          {% endif %}
+        {% endfor %}
+        {% for e in roster %}
+          {% if e not in spatial and e != 'light.entre_loft'
+                and states(e) not in ['unavailable', 'unknown'] %}
+            {% set ns.b = ns.b + [e] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.b }}
+      terrasse_klar: >-
+        {{ states('light.terrasse_paerelyskaede') not in ['unavailable', 'unknown'] }}
+      # 2026-09-29 (user: "det er fint bare den slukker igen"): dance i KUN
+      # børneværelset tændte terrassen 17:47 ved en dør-åbning, og blinket
+      # efterlod den på fuld. Tilstanden FØR blinket afgør slutningen.
+      terrasse_foer: "{{ states('light.terrasse_paerelyskaede') }}"
+
+      # --- Tempo (ÉN kilde for begge grene, så de ikke kan komme i utakt) ---
+      tempo: "{{ states('input_number.fest_ankomst_tempo') | float(75) }}"
+      step_ms: "{{ (250 - tempo * 1.8) | round(0) | int }}"
+      # Entréen kører kortere skridt end huset: den er gæstens første indtryk,
+      # og den sidder på Thread/Matter — en anden radio end husets Zigbee-pærer
+      # — så dens kald slås ikke med kaskaden om samme sendetid.
+      #
+      # MÅLT 2026-08-21f på en live fanfare. Antagelsen HOLDER: entréen nåede
+      # alle 14 toner mens huset kørte sine bølger, så Thread deler ikke
+      # sendetid med Zigbee.
+      #
+      # Men målingen væltede en ANDEN antagelse: `delay` er ikke showets tempo.
+      # Selve service-kaldet koster mere end skridtet — Zigbee ~160 ms målt inde
+      # i sekvensen (isoleret: spisestue 140, køkken 179, depot 283), Thread
+      # ~200 ms (isoleret 137). Ved default-tempo er step_ms 115 ms, altså UNDER
+      # kald-prisen: skruer man tempo-slideren i top, bliver showet knap nok
+      # hurtigere, for radioen sætter gulvet. Derfor udledes varigheden nedenfor
+      # af kald-prisen PLUS skridtet — regnede vi kun på skridtet, ville et
+      # "5 sekunders show" i praksis køre næsten dobbelt så længe.
+      call_ms: 160
+      entre_call_ms: 200
+      entre_step_ms: "{{ [ (step_ms * 0.7) | round(0) | int, 100 ] | max }}"
+      # ALLE farveskift i fanfaren er transition: 0 = hårde snap. Indtil
+      # 2026-08-21f fadede huset over 1,6 × skridtet, altså LÆNGERE end skridtet
+      # selv — så to nabo-toner overlappede permanent, og showet læstes som et
+      # blødt regnbue-drift frem for et varsel. Et fadet farveskift kan ikke
+      # give glimt, uanset hvor hurtigt det kører.
+      #
+      # Dybden på glimtets mørke halvdel. Ikke lavere: under ~10 % ligner en
+      # Zigbee-pære slukket frem for dæmpet, og så bliver showet hakkende sort
+      # i stedet for pulserende.
+      dip_pct: 15
+      entre_klar: >-
+        {{ is_state('input_boolean.dance_room_entre', 'on')
+           and states('light.entre_loft') not in ['unavailable', 'unknown'] }}
+      # User-spec 2026-08-21f: "et vildt show med glimt og farver i 5 sek".
+      # VARIGHEDEN er kravet, så bølge-antallet udledes af den i stedet for at
+      # stå fast på 3. Et fast tal kan ikke holde 5 sekunder, når rosteret
+      # svinger: unavailable pærer filtreres fra, så huset er 4-8 pærer, og de
+      # samme 3 bølger tager dobbelt så lang tid ved 8 som ved 4.
+      maal_ms: 5000
+      boelger: >-
+        {% set pr_boelge = [ (bulbs | count) * ((step_ms | int) + (call_ms | int)), 1 ] | max %}
+        {{ [ [ ((maal_ms | int) / pr_boelge) | int, 2 ] | max, 8 ] | min }}
+      # Begge grene måler sig mod SAMME total, så de lander sammen og
+      # smooth-loopet overtager på ét tidspunkt. Målt før dette: entréen kørte
+      # 1,6 s længere end huset, så festen genoptog i to ryk.
+      total_ms: >-
+        {{ (boelger | int) * (bulbs | count) * ((step_ms | int) + (call_ms | int)) }}
+      entre_steps: >-
+        {{ [ ((total_ms | int) / ((entre_step_ms | int) + (entre_call_ms | int)))
+             | round(0) | int, 6 ] | max }}
+    sequence:
+      # Park festens per-pære-loops. De venter i wait_template med 15 s timeout
+      # og continue_on_timeout, så selv hvis dette script dør midtvejs, kommer
+      # festen af sig selv i gang igen — flaget kan ikke hænge festen død.
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.dance_strobe_active
+
+      # Terrasse-blink, hus-kaskade og entré-spin skal ske SAMTIDIG — det er ét
+      # varsel, ikke tre. Kald-budget: HA klarer ~5-10 light-kald/sek på Zigbee,
+      # og terrasse+hus lå ALLEREDE på ~10/sek i de 1,5 s de overlapper. Derfor
+      # kan tempo-slideren ikke bare skrue huset hurtigere uden at ramme loftet
+      # (og et design over loftet fejler TAVST — det kører bare langsommere).
+      # Entréen er den frie bane: Matter/Thread er en anden radio end Zigbee, så
+      # dens kald konkurrerer ikke med de andre to grene om sendetid. Det er
+      # dér "meget hurtigere" faktisk kan hentes.
+      - parallel:
+          # --- Terrassen: tre klare blink, så tilbage på fuld ---
+          # if/then frem for en bar `condition:` — en fejlende condition inde i
+          # en parallel-gren kan stoppe grenen på et sted hvor terrassen står
+          # slukket. Er pæren væk, springer vi bare blinket over.
+          - sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ terrasse_klar }}"
+                then:
+                  - repeat:
+                      count: 3
+                      sequence:
+                        - service: light.turn_on
+                          continue_on_error: true
+                          target:
+                            entity_id: light.terrasse_paerelyskaede
+                          data:
+                            brightness_pct: 100
+                            transition: 0
+                        - delay:
+                            milliseconds: 250
+                        - service: light.turn_on
+                          continue_on_error: true
+                          target:
+                            entity_id: light.terrasse_paerelyskaede
+                          data:
+                            brightness_pct: 1
+                            transition: 0
+                        - delay:
+                            milliseconds: 250
+                  # Slukket før → slukket igen; ellers altid tilbage på fuld —
+                  # også hvis et blink-kald fejlede.
+                  - if:
+                      - condition: template
+                        value_template: "{{ terrasse_foer == 'off' }}"
+                    then:
+                      - service: light.turn_off
+                        continue_on_error: true
+                        target:
+                          entity_id: light.terrasse_paerelyskaede
+                        data:
+                          transition: 1
+                    else:
+                      - service: light.turn_on
+                        continue_on_error: true
+                        target:
+                          entity_id: light.terrasse_paerelyskaede
+                        data:
+                          brightness_pct: 100
+                          transition: 1
+
+          # --- Open-plan + depot: regnbuen bygges, roterer, og bliver stående ---
+          - sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ bulbs | count > 0 }}"
+                then:
+                  # Bølge 1 — pærerne tændes én ad gangen, hver med sin egen
+                  # tone fordelt jævnt over hele farvecirklen = en regnbue der
+                  # ruller ind gennem huset.
+                  #
+                  # Den glimter fra første sekund (spin 0 i samme mønster som
+                  # bølgerne nedenfor). Det er ikke pynt: bølge-antallet udledes
+                  # nu af varigheden, og med et fuldt roster på 8 pærer bliver
+                  # det 2 bølger — hvoraf den sidste pr. design står fuldt lys.
+                  # Var bølge 1 fast på 100 %, ville huset da have NUL glimt,
+                  # præcis når alle pærer er i live. Showet må ikke blive
+                  # kedeligere af at flere pærer virker.
+                  - repeat:
+                      for_each: "{{ bulbs }}"
+                      sequence:
+                        - service: light.turn_on
+                          continue_on_error: true
+                          target:
+                            entity_id: "{{ repeat.item }}"
+                          data:
+                            hs_color: >-
+                              {{ [ (((repeat.index - 1) * 360.0 / (bulbs | count)) % 360) | round(1),
+                                   100 ] }}
+                            brightness_pct: >-
+                              {{ 100 if repeat.index % 2 == 0 else dip_pct }}
+                            transition: 0
+                        - delay:
+                            milliseconds: "{{ step_ms }}"
+
+                  # Resten af bølgerne — hele regnbuen drejes ét trin ad gangen,
+                  # så farverne vandrer videre gennem rummene. `spin` fanges FØR
+                  # den indre repeat, fordi repeat.index derinde refererer til
+                  # pæren.
+                  #
+                  # Drejningen er 360°/bølger, ikke faste 120°: da bølge-antallet
+                  # nu udledes af varigheden, ville 120° ved 4 bølger lægge bølge
+                  # 4 oven i bølge 1 (3 × 120 = 360 = samme regnbue) — showet
+                  # ville gentage sig selv præcis når det blev længere.
+                  #
+                  # GLIMTET: hver anden pære dykker til dip_pct, og hvilke der
+                  # dykker forskydes med `spin` — så det mørke felt VANDRER med
+                  # regnbuen i stedet for at stå og pulse på samme pærer. Det er
+                  # gratis: brightness rejser i SAMME light.turn_on som farven,
+                  # så kald-antallet er uændret (~8-9/sek, lige under HA's målte
+                  # loft). En separat brightness-skrivning ville fordoble kaldene
+                  # og gøre showet TAVST langsommere, ikke vildere.
+                  - repeat:
+                      count: "{{ (boelger | int) - 1 }}"
+                      sequence:
+                        - variables:
+                            spin: "{{ repeat.index }}"
+                            # Sidste bølge glimter ikke — den lander hele huset
+                            # på fuld, så smooth-loopet overtager fra lys farve
+                            # og ikke fra en halvmørk pære.
+                            sidste: "{{ repeat.index == (boelger | int) - 1 }}"
+                        - repeat:
+                            for_each: "{{ bulbs }}"
+                            sequence:
+                              - service: light.turn_on
+                                continue_on_error: true
+                                target:
+                                  entity_id: "{{ repeat.item }}"
+                                data:
+                                  hs_color: >-
+                                    {{ [ (((repeat.index - 1) * 360.0 / (bulbs | count)
+                                           + spin * 360.0 / (boelger | int)) % 360) | round(1),
+                                         100 ] }}
+                                  brightness_pct: >-
+                                    {{ 100 if (sidste or (repeat.index + spin) % 2 == 0)
+                                       else dip_pct }}
+                                  transition: 0
+                              - delay:
+                                  milliseconds: "{{ step_ms }}"
+
+          # --- Entréen: ankomst-pærens eget, hurtige regnbue-spin ---
+          # Egen gren, ikke en plads i hus-kaskaden: dér ville den kun få 3
+          # farveskift (én pr. bølge) og være den langsomste pære i huset —
+          # stik modsat pointen. Her får den `entre_steps` skift på samme
+          # varighed, altså mange gange flere toner på gæstens første pære.
+          #
+          # Skridtet på farvecirklen er 137,5° (den gyldne vinkel), ikke en
+          # jævn N-deling: to nabo-toner bliver derved altid maksimalt
+          # forskellige, uanset hvor mange skift der nås. En jævn deling ville
+          # ved høje step-tal give næsten ens naboer = et pulserende ensfarvet
+          # lys frem for en regnbue.
+          - sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ entre_klar }}"
+                then:
+                  - repeat:
+                      count: "{{ entre_steps }}"
+                      sequence:
+                        - service: light.turn_on
+                          continue_on_error: true
+                          target:
+                            entity_id: light.entre_loft
+                          data:
+                            hs_color: >-
+                              {{ [ (((repeat.index - 1) * 137.5) % 360) | round(1),
+                                   100 ] }}
+                            # Hvert 3. skridt dykker — ikke hvert 2. Entréen
+                            # kører flere skridt end huset, og en 50/50-veksling
+                            # ville dér læses som et jævnt flimmer. To lyse mod
+                            # ét mørkt giver en tydelig PULS. Sidste skridt er
+                            # altid fuldt, så gæsten mødes af lys, ikke af et
+                            # dyk, når smooth-loopet overtager.
+                            brightness_pct: >-
+                              {{ 100 if (repeat.index == (entre_steps | int)
+                                         or repeat.index % 3 != 0) else dip_pct }}
+                            transition: 0
+                        - delay:
+                            milliseconds: "{{ entre_step_ms }}"
+
+      # Ingen sluk til sidst. Pærerne bliver stående i deres regnbue-tone, og
+      # smooth-loopet driver videre DERFRA (det læser hs_color live) — så
+      # festen glider tilbage i stedet for at snappe. Et blackout her ville
+      # give et sort hul midt i festen.
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.dance_strobe_active
+
+  # ===========================================================================
+  # KLAR-TJEK — kør denne før festen
+  # ===========================================================================
+  fest_klar_tjek:
+    alias: "Fest: tjek om huset er klart"
+    icon: mdi:clipboard-check
+    mode: single
+    sequence:
+      - variables:
+          mangler: "{{ state_attr('binary_sensor.fest_klar', 'mangler') or [] }}"
+          besked: >-
+            {% set m = state_attr('binary_sensor.fest_klar', 'mangler') or [] %}
+            {% if m | count == 0 %}
+              ✅ Alle 8 fest-pærer er online. Klar til fest.
+            {% else %}
+              ⚠️ {{ m | count }} pære(r) offline — de er usynlige for festen:
+              {{ m | map('replace', 'light.', '') | join(', ') }}
+              → tjek afbryder/lampekontakt (ZHA-pærer uden strøm melder sig aldrig).
+            {% endif %}
+            Terrasse-plug: {{ states('switch.terrasse_plug') }}.
+            Gæste-vindue (holder flagermus-curfew væk): {{ states('binary_sensor.gaester_for_nylig') }}.
+      - service: logbook.log
+        data:
+          name: "Fest klar-tjek"
+          message: "{{ besked }}"
+      # AirBnB = telefonen kan være i gæstens hånd → aldrig push (user-spec).
+      - if:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: input_select.house_mode
+                state: "AirBnB"
+          - condition: state
+            entity_id: input_boolean.notifikationer_master_enabled
+            state: "on"
+        then:
+          - service: notify.mobile_app_phone_a
+            data:
+              title: "🎉 Fest klar-tjek"
+              message: "{{ besked }}"
+
+automation:
+
+  # --- Hoveddør åbner under festen → fanfare ---
+  - id: fest_ankomst_ved_hoveddoer
+    alias: "Fest: gæste-fanfare når hoveddøren åbner"
+    description: >
+      Hoveddør off→on mens festen kører → terrasse-blink + regnbue-kaskade
+      gennem open-plan og depot, hvorefter smooth-festen fortsætter af sig selv.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      # from: "off" med vilje — en Matter-node der kommer tilbage genopstår med
+      # sin sidste kendte værdi, så unavailable→on er et ekko, ikke en dør der
+      # åbner (permanent fakta).
+      - platform: state
+        entity_id: binary_sensor.parasoll_hoveddoer
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.fest_ankomst_fanfare
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.festlys_aktiv
+        state: "on"
+    action:
+      - service: script.fest_gaest_ankomst
+
+  # --- Terrassen holdes på fuld hele festen ---
+  - id: fest_terrasse_hold_fuld
+    alias: "Fest: hold terrassen på fuld styrke"
+    description: >
+      Terrassen er ude af dance-rosteret (den skal stå stille på fuld), så
+      INTET andet skriver den under festen — og nat-lagene er kun holdt tilbage
+      af gæste-vinduet. Skriver kun når pæren faktisk er faldet af fuld, så der
+      ikke churner Zigbee-kald.
+
+      To triggers med vilje: state-triggeren retter et dyk med det samme
+      (terrasse_dusk_auto_on tænder kæden på flagermus_dusk_dim_pct = 13 % når
+      solen går under -4° — med kun et /10-tick ville terrassen stå 13 % i op
+      til ti minutter midt i festen), og time_pattern er backstoppen der også
+      dækker et dyk der sker under en HA-restart, hvor flanken går tabt
+      (fejlklasse #4). `for: 15 s` så vi ikke rammer midt i en transition.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/10"
+      - platform: state
+        entity_id: light.terrasse_paerelyskaede
+        for:
+          seconds: 15
+    condition:
+      - condition: state
+        entity_id: input_boolean.fest_terrasse_fuld
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.festlys_aktiv
+        state: "on"
+      # Rør aldrig terrassen mens fanfaren blinker med den.
+      - condition: state
+        entity_id: input_boolean.dance_strobe_active
+        state: "off"
+      # Holdet er MODVÆGT til terrasse_dusk_auto_on's 13 %, ikke en selvstændig
+      # tænd-vej — så det må kun gælde i det vindue dusk-tænderen selv arbejder
+      # i. Uden denne gate blæste et /10-tick kæden på 100 % i fuldt dagslys
+      # (13/9 kl. 18:10, sol 9,5°, solnedgang først 19:33). Grænsen er DELT med
+      # terrasse_dusk_auto_on via input_number.terrasse_skumring_elevation
+      # (fejlklasse #2 — ét anker siden 2026-10-10, default -4°).
+      - condition: numeric_state
+        entity_id: sun.sun
+        attribute: elevation
+        below: input_number.terrasse_skumring_elevation
+      - condition: template
+        value_template: >-
+          {{ states('light.terrasse_paerelyskaede') not in ['unavailable', 'unknown']
+             and (not is_state('light.terrasse_paerelyskaede', 'on')
+                  or (state_attr('light.terrasse_paerelyskaede', 'brightness') | int(0)) < 240) }}
+    action:
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.terrasse_paerelyskaede
+        data:
+          brightness_pct: 100
+          transition: 2
+
+  # --- Gæste-vinduet forlænges så længe festen kører ---
+  - id: fest_gaeste_vindue_hold
+    alias: "Fest: forlæng gæste-vinduet mens festen kører"
+    description: >
+      gaester_for_nylig er 6 t fra sidste stempel, og det er DEN der holder
+      flagermus-dim (22:30), flagermus-curfew (23:00) og terrasse-nat-sluk
+      (23:30) tilbage. En fest der starter 18:00 ville miste dækningen 00:00
+      midt i festen. /30-tick genstempler mens festen kører — samme mønster som
+      gaester_over_baseline_stamp's eget tick, bare med festen som vidne i
+      stedet for people-estimate.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/30"
+    condition:
+      - condition: state
+        entity_id: input_boolean.fest_terrasse_fuld
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.festlys_aktiv
+        state: "on"
+      # Flagermus-lagene er selv Normal-gatede; i AirBnB er de allerede tavse,
+      # så et stempel dér ville kun være støj.
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "Normal"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.gaester_sidst_set
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"

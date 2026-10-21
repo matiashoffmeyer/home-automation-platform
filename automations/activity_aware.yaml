@@ -1,0 +1,387 @@
+# =============================================================================
+# Activity-aware behavior — auto-managed guest_mode + bedroom-only winddown
+# =============================================================================
+# Tre flows:
+#
+# 1. AUTO-SET guest_mode ON: hvis sensor.activity_state er social_dining /
+#    social_party / cooking i 30+ min (slider guest_mode_auto_minutter;
+#    kill-switch guest_mode_auto_enabled, 2026-10-10), antager systemet at der er gaester
+#    eller arrangement → drift-back + absence-fades pauses.
+#    terrasse_with_indoor taeller KUN naar people-modellen har holdt flere end
+#    familien (input_number.people_ekstra_gulv >= 1) — se B183 nedenfor.
+#
+# 2. AUTO-CLEAR guest_mode OFF: hvis activity_state er idle / bedroom_only /
+#    godnat i 15+ min, antager vi at gaester er gaaet → normal automation
+#    genoptages. 5-min backstop overlever en genstart (permanent faktum #1).
+#
+# 3. BEDROOM-ONLY WINDDOWN: hvis kun sove/boern har presence efter 21:00
+#    i 10+ min, slow auto-fade stue/koekken/spisestue lys (5 min smooth
+#    transition) ned til off. Antager: I er gaaet i seng uden eksplicit
+#    godnat-tryk, lyset i stuen blev glemt.
+# =============================================================================
+
+- id: activity_guest_mode_auto_set
+  alias: "Activity: Auto-set guest_mode ved social aktivitet"
+  description: >
+    Saetter guest_mode ON naar activity_state er i en social tilstand i 30
+    minutter. Forhindrer drift-back og presence-fades fra at forstyrre
+    middag/arrangement. Inkluderer ogsa terrasse_with_indoor (folk skiftes
+    mellem terrasse og open-plan = sandsynligt arrangement).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: sensor.activity_state
+      not_from: ["unknown", "unavailable"]
+      to:
+        - social_dining
+        - social_party
+        - cooking
+        - terrasse_with_indoor
+      for:
+        minutes: "{{ states('input_number.guest_mode_auto_minutter') | int(30) }}"
+    # Re-arm (fejlklasse #4): gæsterne bevises foerst EFTER at terrasse-
+    # tilstanden har holdt 30 min → ingen ny activity-flanke at fyre paa.
+    - platform: numeric_state
+      entity_id: input_number.people_ekstra_gulv
+      above: 0
+  condition:
+    # Kill-switch (2026-10-10) — gater kun auto-SÆT; auto-clear kører altid.
+    - condition: state
+      entity_id: input_boolean.guest_mode_auto_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.guest_mode
+      state: "off"
+    # B183 (2026-10-03): 4 af 5 auto-tændinger 22/9-2/10 kom fra
+    # terrasse_with_indoor med KUN familien hjemme (people_ekstra_nu 0 ved
+    # tændingen, estimat 1-3) — én person ved terrassedøren ses af stue-
+    # Apolloen gennem glasset. 2/10 16:33 (user alene) hang flaget 17 t.
+    # Terrasse-vejen kræver derfor holdt bevis paa flere end familien
+    # (ekstra-gulvet løftes kun efter people_ekstra_hold_sekunder).
+    # Holdet gælder ALLE veje ind (#21): re-arm-vejen må ikke tænde på en
+    # activity-state der lige er sprunget op. −5 s = for:-vejens timing-slør.
+    - condition: template
+      value_template: >-
+        {% set a = states.sensor.activity_state %}
+        {% set s = states('sensor.activity_state') %}
+        {{ a is not none
+           and s in ['social_dining', 'social_party', 'cooking', 'terrasse_with_indoor']
+           and (now() - a.last_changed).total_seconds()
+               >= (states('input_number.guest_mode_auto_minutter') | int(30)) * 60 - 5
+           and (s != 'terrasse_with_indoor'
+                or states('input_number.people_ekstra_gulv') | int(0) >= 1) }}
+    # M3 fix sprint 2026-05-06 (Blok F.3): block hvis godnat-flow er i gang.
+    # Forhindrer race hvor godnat_voksen_start venter på stue at clear, og
+    # imens triggrer guest_mode_auto fordi activity_state stadig er social_dining.
+    # guest_mode pauser drift_back → bug.
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.guest_mode
+    - service: persistent_notification.create
+      data:
+        notification_id: guest_mode_auto
+        title: "Gaeste-mode aktiveret"
+        message: >
+          Activity {{ states('sensor.activity_state') }} har varet i
+          {{ states('input_number.guest_mode_auto_minutter') | int(30) }}+ min.
+          Drift-back, absence-fades og klima-notifikationer pauses.
+          Auto-clears naar aktivitet falder til idle/bedroom_only.
+
+- id: activity_guest_mode_auto_clear
+  alias: "Activity: Auto-clear guest_mode når aktivitet falder"
+  description: >
+    Slukker guest_mode naar activity_state er idle/bedroom_only/godnat i
+    15 min. Genoptager normal automation.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: sensor.activity_state
+      not_from: ["unknown", "unavailable"]
+      to: ["idle", "bedroom_only", "godnat"]
+      for:
+        minutes: 15
+    # B183 (2026-10-03): genstarten 2/10 20:33:41 dræbte den ventende for:
+    # (godnat fra 20:30:00), og godnat stod uændret til 06:25 → ingen ny
+    # flanke, guest_mode hang til 3/10 09:30. Backstop måler tiden i
+    # condition'en; last_changed nulstilles ved boot = 15 min efter boot,
+    # hvilket er den sikre retning.
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: input_boolean.guest_mode
+      state: "on"
+    - condition: template
+      value_template: >-
+        {% set a = states.sensor.activity_state %}
+        {{ a is not none
+           and a.state in ['idle', 'bedroom_only', 'godnat']
+           and (now() - a.last_changed).total_seconds() >= 895 }}
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.guest_mode
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: guest_mode_auto
+
+- id: activity_bedroom_only_winddown_start
+  alias: "Activity: Bedroom-only winddown — soft fade af stue/køkken"
+  description: >
+    Hvis kun sove/boern har presence efter 21:00 i 10+ min, og stue+koekken
+    har vaeret tomme: fade stue/koekken/spisestue lys langsomt ned (5 min
+    smooth transition). Antager I er gaaet i seng uden eksplicit godnat.
+
+    Ekskluderer terrasse_active — hvis I er paa terrassen er det IKKE
+    bedroom-only situation, det er "ude og hygge". Bedroom_only-state
+    indeholder allerede terrasse-tjek men dobbelt-check her som safety.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: sensor.activity_state
+      not_from: ["unknown", "unavailable"]
+      to: "bedroom_only"
+      for:
+        minutes: 10
+  condition:
+    - condition: time
+      after: "21:00:00"
+      before: "07:00:00"
+    # A5 fix sprint 2026-05-06: gate på godnat_any_active så bedroom-only
+    # winddown ikke overskriver godnat_voksen_start's 20% wind-down dim
+    # mid-fade (race ville give wrong levels).
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_sovevaerelse
+      state: "off"
+    # Skip hvis terrasse er aktiv — "bedroom_only" inkluderer allerede
+    # terrasse-tjek i activity_state men her som ekstra safety.
+    - condition: state
+      entity_id: binary_sensor.terrasse_active
+      state: "off"
+    # M1 fix (audit-runde 5): skip hvis winddown allerede er fyret denne nat.
+    # Bath-visit afbryder bedroom_only -> nightwalk -> bedroom_only igen,
+    # uden denne condition ville winddown fyre 2 gange og slukke lyset igen
+    # 10 min efter de er taendt under bath-visit.
+    # bedroom_only_winddown_clear automation slukker flag ved skift fra
+    # bedroom_only — saa flag bliver off naar Parent B gar pa toilet, og
+    # winddown kan fyre igen ved naste bedroom_only-session NAESTE morgen.
+    - condition: state
+      entity_id: input_boolean.bedroom_only_winddown
+      state: "off"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.bedroom_only_winddown
+    - service: light.turn_off
+      target:
+        # 2026-06-05: light.spisestue_pendel fjernet — pendlen er nu soveloft;
+        # bedroom-only winddown skal IKKE slukke soveværelset.
+        entity_id:
+          - light.spisestue_loft
+          - light.stue_sofa_lampe
+          - light.stue_sofa_lampe_2
+          - light.stue_hjoernelampe
+      data:
+        transition: 300  # 5 minutters smooth fade — meget unotabel
+    - service: persistent_notification.create
+      data:
+        notification_id: bedroom_winddown
+        title: "Bedroom-only detected — slow fade af stuelys"
+        message: >
+          Kun sove/boern har vaeret aktive i 10 min efter kl 21. Stue/koekken
+          fades langsomt off over 5 min. Hvis I kommer tilbage til stuen
+          afbrydes fade af presence-lights normalt.
+
+- id: activity_bedroom_only_winddown_clear
+  alias: "Activity: Clear bedroom-winddown kun ved DEFINITIV session-slut"
+  description: >
+    M1 fix: clear KUN ved godnat/idle/morgen — ikke ved nightwalk/bath_visit
+    der er midlertidige afbrydelser. Forhindrer winddown re-fire samme nat
+    naar Parent B gaar pa toilet og tilbage i seng.
+  mode: single
+  trigger:
+    # Definitiv slut: godnat-flag aktiveret (= manuel godnat-tryk eller auto)
+    - platform: state
+      entity_id: input_boolean.godnat_active
+      to: "on"
+    # Eller: morgen — naar nogen forlader sove + boern (idle/active/cooking etc)
+    - platform: time
+      at: "07:00:00"
+    # Eller: state-skift til specifikke "definitive" states (ikke nightwalk/bath_visit)
+    - platform: state
+      entity_id: sensor.activity_state
+      to:
+        - idle
+        - sofa_relax
+        - cooking
+        - dining
+        - social_dining
+        - active
+      from: "bedroom_only"
+      for:
+        minutes: 5  # 5 min sustained vaek = ikke bath-visit detour
+  condition:
+    - condition: state
+      entity_id: input_boolean.bedroom_only_winddown
+      state: "on"
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.bedroom_only_winddown
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: bedroom_winddown
+
+# =============================================================================
+# Terrasse-only winddown — slow dim af indendoers lys naar I er udenfor laenge
+# =============================================================================
+# Efter 10 min terrasse_only: dim ceiling-lights (spisestue_loft)
+# langsomt til min 30% over 10 min smooth transition. (pendel = soveloft fra
+# 2026-06-05 → ikke længere en open-plan ceiling her.)
+# Ikke off — vi antager I kommer ind igen og I skal kunne se. Accent-lamper
+# (sofa_lampe, depot_strip) roeres ikke.
+#
+# Filtrerer kun lights der er ON AND > 30% — under 30% forbliver de er,
+# off-lys forbliver off (presence_lights handler tend ved tilbagekomst).
+# =============================================================================
+
+- id: activity_terrasse_only_winddown
+  alias: "Activity: Terrasse-only winddown — slow dim af indendørs ceiling lys"
+  description: >
+    Efter 10 min terrasse_only fade ceiling-lights (stue/koekken/spisestue)
+    over 10 min smooth transition til min 30%. Ingen off — folk kommer ind
+    igen. Accent-lamper roeres ikke.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: sensor.activity_state
+      not_from: ["unknown", "unavailable"]
+      to: "terrasse_only"
+      for:
+        minutes: 10
+  condition:
+    # A5 fix sprint 2026-05-06: gate på godnat_any_active (samme pattern som bedroom-only)
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_terrasse
+      state: "off"
+  action:
+    - variables:
+        ceiling_lights:
+          - light.spisestue_loft
+        # 2026-06-28 (user-spec): dæmpnings-målet er nu en slider
+        # (global_winddown_target_pct, default 30). Kun targets der er ON og
+        # OVER målet — forhindrer at vi BRIGHTENER lys der allerede er under.
+        winddown_target: "{{ states('input_number.global_winddown_target_pct') | int(30) }}"
+        targets: >
+          {% set target = states('input_number.global_winddown_target_pct') | int(30) %}
+          {% set ns = namespace(t=[]) %}
+          {% for l in ceiling_lights %}
+            {% set b = state_attr(l, 'brightness') %}
+            {% if b is not none and (b / 2.55) > target %}
+              {% set ns.t = ns.t + [l] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.t }}
+    # Skip hvis ingen lights opfylder kriterier (alt allerede dimt eller off)
+    - condition: template
+      value_template: "{{ targets | length > 0 }}"
+    - service: light.turn_on
+      target:
+        entity_id: "{{ targets }}"
+      data:
+        brightness_pct: "{{ winddown_target }}"
+        transition: 600  # 10 min smooth — naesten unotabel
+    - service: persistent_notification.create
+      data:
+        notification_id: terrasse_winddown
+        title: "Terrasse-mode: indendørs lys dimmer langsomt"
+        message: >
+          I har været på terrassen i 10 min. Indendørs ceiling-lys dimmer
+          gradvist til {{ winddown_target }}% over de næste 10 min.
+          {{ targets | length }} lys påvirket: {{ targets | join(', ') }}.
+          Manuel Styrbar-tryk overruler når I kommer ind.
+
+- id: activity_terrasse_only_winddown_clear
+  alias: "Activity: Clear terrasse-winddown notification ved skift væk"
+  description: >
+    A65 fix audit-3 2026-05-06 PM: tilfojet conditions for at undgå over-firing
+    (var 128/day). Activity_state oscillerer mellem terrasse_only og andre
+    states ofte. Dismiss kun når terrasse_active er OFF (= reelt left, ikke
+    transient oscillation).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: sensor.activity_state
+      from: "terrasse_only"
+      # A65 fix: kun fire hvis user been i terrasse_only i 5+ min (= winddown
+      # actually fired og notification eksisterer) OG ikke transient bath-visit.
+      for:
+        seconds: 30
+  condition:
+    # A65 fix: kun fire hvis user reelt har forladt terrasse-area (ikke bare
+    # transitioned mellem state-classifications mens stadig på terrasse).
+    - condition: state
+      entity_id: binary_sensor.terrasse_active
+      state: "off"
+  action:
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: terrasse_winddown
+
+# =============================================================================
+# Hurtigere guest_mode for social_party — fest er aabenlys efter N min (slider)
+# =============================================================================
+
+- id: activity_guest_mode_party_fast
+  alias: "Activity: Auto-set guest_mode hurtigt ved social_party"
+  description: >
+    Social_party (4+ aktive zoner) er aabenlys arrangement — set guest_mode
+    efter input_number.guest_mode_party_minutter (default 10) i stedet for
+    den almindelige vej (guest_mode_auto_minutter, default 30).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: sensor.activity_state
+      not_from: ["unknown", "unavailable"]
+      to: "social_party"
+      for:
+        minutes: "{{ states('input_number.guest_mode_party_minutter') | int(10) }}"
+  condition:
+    - condition: state
+      entity_id: input_boolean.guest_mode_auto_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.guest_mode
+      state: "off"
+    # M3 fix sprint 2026-05-06 (Blok F.3): block hvis godnat-flow er i gang.
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.guest_mode
+    - service: persistent_notification.create
+      data:
+        notification_id: guest_mode_auto
+        title: "Gaeste-mode aktiveret (party)"
+        message: >
+          social_party detekteret i {{ states('input_number.guest_mode_party_minutter') | int(10) }} min — fest-mode aktiveret hurtigt.
+          Drift-back, presence-fades, klima- og batteri-notifikationer
+          pauses indtil aktivitet falder.

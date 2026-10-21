@@ -1,0 +1,458 @@
+# =============================================================================
+# badevaerelse_faser.yaml — fuld fase-kontrol for badeværelset (sprint 2026-06-24d)
+# =============================================================================
+# User-spec: "slider for badets forskellige fasers lysstyrke + styre hvilke spots
+# der tændes i de forskellige faser — fuld kontrol i en tab for sig."
+#
+# To-PIR stadie-systemet (Quick/Medium/Fuld, se badevaerelse_visit_quality.yaml)
+# styrer SLUK-timingen. Denne pakke giver pr.-fase kontrol over LYSSTYRKE og
+# HVILKE SPOTS der lyser:
+#
+#   • Brightness-sliders pr. fase (faste, rå %, vinder ALTID over adaptiv læring):
+#       Quick  → badevaerelse_probe_brightness   (eksisterende, i constants.yaml)
+#       Medium → badevaerelse_medium_brightness   (ny, her)
+#       Fuld   → badevaerelse_fuld_brightness     (ny, her; = ramp-endepunkt)
+#     (Natlys/godnat + Approach har deres egne sliders i constants.yaml.)
+#
+#   • Per-spot toggles pr. fase: badevaerelse_{quick,medium,fuld}_spot_{1..5}.
+#     Default ALLE on → identisk med nuværende adfærd (hele gruppen tænder).
+#     Slå en spot fra i en fase → spot-enforceren slukker den i den fase.
+#     Spot 1-3 = Matter/Thread (Kajplats), 4-5 = Zigbee. Du mapper selv layout.
+#
+# DESIGN: brightness-sliderne wires inline i de eksisterende brightness-authorities
+# (presence on-block + ramp + confirm_upgrade). Spot-valget
+# håndteres af ÉN central enforcer her (badevaerelse_fase_spot_enforcer) der
+# prune'r/tilføjer spots efter de aktive fase-toggles — i st.f. at omskrive de 5
+# turn_on-steder. Ved default (alle on) = no-op → ingen regression.
+#
+# Natlys (godnat+mørke) og Approach bruger BEVIDST hele spot-sættet (lavt pre-/
+# nat-lys — per-spot-finjustering giver ikke mening der). Enforceren rører dem ikke.
+# =============================================================================
+
+input_number:
+  # Medium-besøg (deep-PIR / dør-PIR vedvarende, åben dør) brightness. Fast rå %,
+  # IKKE ganget med global aggressiveness (samme bevidste valg som probe/approach).
+  # Default 60 = matcher tidligere fast entry.
+  badevaerelse_medium_brightness:
+    name: "Bad: Medium-besøg brightness"
+    icon: mdi:lightbulb-on-60
+    min: 2
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Fuld-besøg (wasp / bag lukket dør = brusebad) brightness = ramp-ENDEPUNKT.
+  # Et Fuld-besøg starter på Medium-niveau og klatrer LANGSOMT op mod denne værdi
+  # (kun mens der er bevægelse — strøm-spareren bevaret, user-valg). Fast rå %.
+  # Default 100 = matcher tidligere hardcodede ramp-top.
+  badevaerelse_fuld_brightness:
+    name: "Bad: Fuld-besøg brightness (ramp-top)"
+    icon: mdi:lightbulb-on
+    min: 2
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-07-08 (user-spec, AirBnB): ÉN slider der gør ALLE badets sluk-veje mindre
+  # aggressive for gæster. 0 = som Normal; 100 = maksimalt tilbageholdende (4×
+  # længere holds). Virker via sensor.badevaerelse_airbnb_off_factor (nedenfor) =
+  # 1.0 udenfor AirBnB → familie-adfærd 100 % uændret. Konsumeres af ALLE sluk-
+  # automations i presence_badevaerelse.yaml: generel sluk (ventetid ×f), quick-/
+  # medium-sluk + leave-off-quiet (springes over ved f>1 → generel overtager),
+  # leave-off-dør-åbnet (delay ×f), wasp-probe (sluk-frist ×f), max-on watchdog
+  # (grænse ×f). Approach-pre-lysets hurtig-sluk er BEVIDST undtaget (fyrer kun
+  # når ingen er derinde). Default 50 (≈2,5× længere) via init + API-set.
+  badevaerelse_airbnb_off_forsigtighed:
+    name: "Bad: AirBnB sluk-forsigtighed"
+    icon: mdi:home-account
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-07-05 (user-spec): badet forlader natlys om morgenen ved det TIDLIGSTE af
+  # senest-tid (nedenfor) ELLER open-plan lux over denne tærskel (tidlig sommersol
+  # rammer før 05). Rå lx (ikke factor-skaleret). 0 = lux-gaten fra → kun tid.
+  badevaerelse_dagmode_lux:
+    name: "Bad: dagmode lux-tærskel (open-plan)"
+    icon: mdi:brightness-6
+    min: 0
+    max: 200
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+input_datetime:
+  # Seneste tidspunkt badet forlader natlys om morgenen (uafhængigt af godnat-
+  # clear ~06:00). Default 05:00. Lux kan gøre det TIDLIGERE, aldrig senere.
+  badevaerelse_dagmode_senest:
+    name: "Bad: dagmode senest-tid"
+    icon: mdi:clock-time-five-outline
+    has_date: false
+    has_time: true
+
+input_boolean:
+  # Per-spot toggles pr. fase. Default-ON sættes af init_user_preferences (fresh
+  # install) + live + snapshot — input_boolean falder ellers tilbage til off.
+  badevaerelse_quick_spot_1:
+    name: "Bad Quick: spot 1 (Matter)"
+    icon: mdi:lightbulb
+  badevaerelse_quick_spot_2:
+    name: "Bad Quick: spot 2 (Matter)"
+    icon: mdi:lightbulb
+  badevaerelse_quick_spot_3:
+    name: "Bad Quick: spot 3 (Matter)"
+    icon: mdi:lightbulb
+  badevaerelse_quick_spot_4:
+    name: "Bad Quick: spot 4 (Zigbee)"
+    icon: mdi:lightbulb
+  badevaerelse_quick_spot_5:
+    name: "Bad Quick: spot 5 (Zigbee)"
+    icon: mdi:lightbulb
+  badevaerelse_medium_spot_1:
+    name: "Bad Medium: spot 1 (Matter)"
+    icon: mdi:lightbulb
+  badevaerelse_medium_spot_2:
+    name: "Bad Medium: spot 2 (Matter)"
+    icon: mdi:lightbulb
+  badevaerelse_medium_spot_3:
+    name: "Bad Medium: spot 3 (Matter)"
+    icon: mdi:lightbulb
+  badevaerelse_medium_spot_4:
+    name: "Bad Medium: spot 4 (Zigbee)"
+    icon: mdi:lightbulb
+  badevaerelse_medium_spot_5:
+    name: "Bad Medium: spot 5 (Zigbee)"
+    icon: mdi:lightbulb
+  badevaerelse_fuld_spot_1:
+    name: "Bad Fuld: spot 1 (Matter)"
+    icon: mdi:lightbulb
+  badevaerelse_fuld_spot_2:
+    name: "Bad Fuld: spot 2 (Matter)"
+    icon: mdi:lightbulb
+  badevaerelse_fuld_spot_3:
+    name: "Bad Fuld: spot 3 (Matter)"
+    icon: mdi:lightbulb
+  badevaerelse_fuld_spot_4:
+    name: "Bad Fuld: spot 4 (Zigbee)"
+    icon: mdi:lightbulb
+  badevaerelse_fuld_spot_5:
+    name: "Bad Fuld: spot 5 (Zigbee)"
+    icon: mdi:lightbulb
+
+template:
+  - sensor:
+      # 2026-07-08 (user-spec): AirBnB sluk-forsigtigheds-FAKTOR — single authority
+      # for skalering af badets sluk-timinger. 1.0 udenfor AirBnB (= Normal-adfærd
+      # præcis uændret); i AirBnB = 1 + 3×(slider/100): 0→1.0, 50→2.5, 100→4.0.
+      # Re-renderer ved mode-skift + slider-træk (state-refs). Konsumeres i
+      # CONDITIONS/delays (ikke trigger-for:, som binder ved load og ikke ser
+      # mode-skift — fejlklasse-viden fra koekken relight).
+      - name: "Badevaerelse airbnb off factor"
+        unique_id: badevaerelse_airbnb_off_factor
+        icon: mdi:account-clock
+        state: >-
+          {% if is_state('input_select.house_mode', 'AirBnB') %}
+            {{ (1 + 3 * (states('input_number.badevaerelse_airbnb_off_forsigtighed') | float(50)) / 100) | round(2) }}
+          {% else %}
+            1.0
+          {% endif %}
+
+  - binary_sensor:
+      # SINGLE AUTHORITY for bad-natlys (2026-07-05, user-spec). Erstatter den
+      # tidligere "godnat_active ALENE"-definition begge steder (presence-filens
+      # natlys-variabel + fase-sensoren) → ingen drift (fejlklasse #2).
+      #
+      # natlys (8% varm 2000K) gælder KUN mens godnat er on OG morgenen endnu IKKE
+      # er nået. Morgen = nået ved det TIDLIGSTE af:
+      #   • kl. >= senest-tid (input_datetime, default 05:00), ELLER
+      #   • open-plan lux >= dagmode-lux-tærsklen (tidlig sommersol før 05).
+      # Uafhængig af godnat-CLEAR (~06:00) — user: "fra kl. 05 går bad i normal
+      # mode ... afhængigt af lux i openplan eller kl. 05 (senest)".
+      #
+      # MORGEN-SCOPED (03-12): så aften-godnat (h>=5 men >12) + en stray nat-lux-
+      # spike ikke fejlagtigt slukker natlyset. now() → HA re-renderer/min
+      # (minut-granularitet OK for 05:00-krydsningen); lux-ændring re-renderer straks.
+      # 2026-07-08 (AirBnB-review, user-valg): natlys gælder OGSÅ i AirBnB om
+      # natten — gæster har intet godnat-flag, så nat-signalet er solens position
+      # (natlys_sol_under_graense, default -6°). Uden dette fik gæstens kl-03-
+      # toiletbesøg fuldt lys i øjnene. Morgen-exit (senest-tid/lux) er fælles.
+      - name: "Badeværelse natlys aktiv"
+        unique_id: badevaerelse_natlys_aktiv
+        icon: mdi:weather-night
+        state: >-
+          {% set airbnb_nat = is_state('input_select.house_mode','AirBnB')
+             and is_state('binary_sensor.natlys_sol_under_graense','on') %}
+          {% if not (is_state('input_boolean.godnat_active','on') or airbnb_nat) %}false
+          {% else %}
+            {% set h = now().hour %}
+            {% set senest = states('input_datetime.badevaerelse_dagmode_senest') %}
+            {% set after_senest = (now() >= today_at(senest)) and h < 12 %}
+            {% set thr = states('input_number.badevaerelse_dagmode_lux') | float(20) %}
+            {% set lux = states('sensor.open_plan_lux') | float(-1) %}
+            {% set lux_bright = (3 <= h < 12) and thr > 0 and lux >= 0 and lux >= thr %}
+            {{ not (after_senest or lux_bright) }}
+          {% endif %}
+
+  - sensor:
+      # Aktiv fase (status-visning + enforcer-kilde). Natlys/Approach vinder over
+      # stadiet; ellers = visit_stage. Lowercase-værdier matcher toggle-navnene.
+      - name: "Badeværelse aktiv fase"
+        unique_id: badevaerelse_aktiv_fase
+        icon: mdi:state-machine
+        state: >-
+          {# 2026-07-05: natlys-definitionen bor nu i binary_sensor.badevaerelse_
+             natlys_aktiv (single authority) — godnat OG morgen-endnu-ikke-nået
+             (05:00/lux). Begge natlys-forbrugere (her + presence-filen) læser den
+             → ingen drift (fejlklasse #2). #}
+          {% if is_state('binary_sensor.badevaerelse_natlys_aktiv','on') %}natlys
+          {% elif is_state('input_boolean.badevaerelse_approach_lit','on') %}approach
+          {% else %}{{ states('input_select.badevaerelse_visit_stage') | lower }}{% endif %}
+
+      # Brightness % for den aktive fase (status-visning på Indstillinger).
+      - name: "Badeværelse fase-brightness"
+        unique_id: badevaerelse_fase_brightness
+        icon: mdi:brightness-percent
+        unit_of_measurement: "%"
+        state: >-
+          {% set f = states('sensor.badevaerelse_aktiv_fase') %}
+          {% if f == 'natlys' %}{{ states('input_number.badevaerelse_godnat_brightness') | int(8) }}
+          {% elif f == 'approach' %}{{ states('input_number.badevaerelse_approach_brightness') | int(30) }}
+          {% elif f == 'quick' %}{{ states('input_number.badevaerelse_probe_brightness') | int(55) }}
+          {% elif f == 'medium' %}{{ states('input_number.badevaerelse_medium_brightness') | int(60) }}
+          {% elif f == 'fuld' %}{{ states('input_number.badevaerelse_fuld_brightness') | int(100) }}
+          {% else %}0{% endif %}
+
+      # Hvilke spots er valgt i den aktive fase (komma-joined entity_ids).
+      # Natlys/Approach/Ingen → hele sættet (per-spot gælder kun Quick/Medium/Fuld).
+      - name: "Badeværelse fase-spots"
+        unique_id: badevaerelse_fase_spots
+        icon: mdi:lightbulb-group
+        state: >-
+          {% set f = states('sensor.badevaerelse_aktiv_fase') %}
+          {# 2026-06-27 (user-spec unidirektionelt besøg): 'ingen' = besøgs-start
+             FØR stadiet er nået at eskalere til Quick (race: presence
+             læser fasen i samme tick som stage_quick sætter den). Behandl derfor
+             'ingen' som 'quick' i spot-opslaget → entry tænder KUN Quick-valgte
+             spots, ikke hele sættet-og-prune-bagefter. natlys/approach (egne
+             fase-værdier) beholder hele sættet. #}
+          {% set f_eff = 'quick' if f == 'ingen' else f %}
+          {% from 'rosters.jinja' import bad_spots %}{% set all = bad_spots
+                        %}
+          {% if f_eff in ['quick','medium','fuld'] %}
+            {% set ns = namespace(s=[]) %}
+            {% for n in range(1,6) %}
+              {% if is_state('input_boolean.badevaerelse_' ~ f_eff ~ '_spot_' ~ n, 'on') %}
+                {% set ns.s = ns.s + ['light.badevaerelse_spot_' ~ n] %}
+              {% endif %}
+            {% endfor %}
+            {# Empty-set-guard (samme som enforceren): fravælg ALLE → hele sættet.
+               Gør sensoren altid sikker at targete direkte (badet bliver aldrig
+               mørkt, og turn_on får aldrig en tom liste). #}
+            {{ (ns.s if ns.s | length > 0 else all) | join(',') }}
+          {% else %}{{ all | join(',') }}{% endif %}
+
+  - binary_sensor:
+      # Thread/Matter-sundhed for badet: er de 3 Matter-spots (1-3) tilgængelige?
+      # off = Thread-mesh/dongle-problem (spots unavailable) → vises på Bad-tab'en.
+      - name: "Badeværelse Matter-spots OK"
+        unique_id: badevaerelse_matter_spots_ok
+        device_class: connectivity
+        icon: mdi:z-wave  # (Thread-ikon findes ikke; connectivity-class giver on/off)
+        state: >-
+          {{ not (states('light.badevaerelse_spot_1') == 'unavailable'
+                  or states('light.badevaerelse_spot_2') == 'unavailable'
+                  or states('light.badevaerelse_spot_3') == 'unavailable') }}
+
+      # 2026-10-09: "badet er BLINDT" ≠ "én pære er død". matter_spots_ok går
+      # off ved ÉN unavailable KAJPLATS — 09/10 06:53 døde spot_2 alene, og
+      # nødlyset tændte 4+5 på 100 % med tomt bad, vetoede alle 7 sluk-veje og
+      # ville have holdt dem tændt til pæren kom igen. Nødlys + healerens
+      # Thread-gren + confirm-off læser derfor DENNE: mindst 2 af 3 væk.
+      - name: "Badeværelse Thread-lys nede"
+        unique_id: badevaerelse_thread_lys_nede
+        device_class: problem
+        icon: mdi:lightbulb-off-outline
+        state: >-
+          {% from 'rosters.jinja' import bad_kajplats %}{{ bad_kajplats | select('is_state', 'unavailable')
+             | list | count >= 2 }}
+
+      # Bad-STRØM-vidne (2026-07-01): Zigbee-bad-spots (4,5) sidder på SAMME
+      # bad-strøm (vægkontakt/HPFI) som Matter-spots (1-3), men på et SEPARAT
+      # radio (Zigbee, ikke Thread). Er de OGSÅ nede = badet er strømløst, IKKE
+      # et Thread-problem. Bruges af Thread-watchdogen til at skelne "Thread-
+      # dongle hænger" (kun Matter nede, Zigbee oppe → strøm er der) fra "gæst
+      # slukkede vægkontakten til badet" (både Matter OG Zigbee nede) — så
+      # watchdogen ikke laver en nytteløs OTBR-genstart + forkert "re-plug
+      # donglen"-push. on = mindst ét Zigbee-spot tilgængeligt (= strøm i badet).
+      - name: "Badeværelse bad-strøm OK"
+        unique_id: badevaerelse_bad_strom_ok
+        device_class: connectivity
+        icon: mdi:power-plug
+        state: >-
+          {{ states('light.badevaerelse_spot_4') != 'unavailable'
+             or states('light.badevaerelse_spot_5') != 'unavailable' }}
+
+automation:
+  # ===========================================================================
+  # Spot-enforcer: prune'r/tilføjer bad-spots efter den aktive fases toggles.
+  # Centraliserer per-spot-valget så de eksisterende brightness-automations
+  # bare targeter hele gruppen (light.badevaerelse_all) som før. Ved default
+  # (alle toggles on) = no-op. Rører kun Quick/Medium/Fuld (ikke natlys/approach/
+  # manuel). Slukker fravalgte spots; tænder tilvalgte (der er off) på gruppens
+  # nuværende brightness, så de matcher resten.
+  # ===========================================================================
+  - id: badevaerelse_fase_spot_enforcer
+    alias: "Lysnet: Badeværelse per-fase spot-valg (enforcer)"
+    description: >
+      Sprint 2026-06-24d: håndhæver per-fase spot-valget. Når badet er tændt i
+      en Quick/Medium/Fuld-fase slukkes de spots der er fravalgt i fasen, og
+      tilvalgte spots der er slukket tændes på gruppens aktuelle brightness.
+      Default = alle spots valgt = ingen ændring.
+    mode: restart
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_select.badevaerelse_visit_stage
+      - platform: state
+        entity_id: light.badevaerelse_all
+        to: "on"
+      - platform: state
+        entity_id:
+          - input_boolean.badevaerelse_quick_spot_1
+          - input_boolean.badevaerelse_quick_spot_2
+          - input_boolean.badevaerelse_quick_spot_3
+          - input_boolean.badevaerelse_quick_spot_4
+          - input_boolean.badevaerelse_quick_spot_5
+          - input_boolean.badevaerelse_medium_spot_1
+          - input_boolean.badevaerelse_medium_spot_2
+          - input_boolean.badevaerelse_medium_spot_3
+          - input_boolean.badevaerelse_medium_spot_4
+          - input_boolean.badevaerelse_medium_spot_5
+          - input_boolean.badevaerelse_fuld_spot_1
+          - input_boolean.badevaerelse_fuld_spot_2
+          - input_boolean.badevaerelse_fuld_spot_3
+          - input_boolean.badevaerelse_fuld_spot_4
+          - input_boolean.badevaerelse_fuld_spot_5
+    condition:
+      # Kun mens lyset faktisk er tændt og i en per-spot-fase.
+      - condition: state
+        entity_id: light.badevaerelse_all
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ states('sensor.badevaerelse_aktiv_fase') in ['quick','medium','fuld'] }}
+      # Manuel-mode rører vi ikke (brugeren har taget kontrol).
+      - condition: template
+        value_template: "{{ not is_state('input_select.room_mode_badevaerelse','Manual') }}"
+      # B49 2026-07-02: ingen enforce under Thread-flap — unavailable Matter-spots
+      # (1-3) giver skæv on/off-læsning → forkert prune/add. Vent til mesh er oppe.
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_matter_spots_ok
+        state: "on"
+      # 2026-10-11: mens en sluk-vej venter på fugt-målingen står kun spot 2
+      # tændt MED VILJE (script.badevaerelse_fugt_ventesluk) — enforceren må
+      # ikke tænde de andre igen. Genrejsning ejes af _fugt_ventesluk_genrejs.
+      - condition: state
+        entity_id: input_boolean.badevaerelse_fugt_venteslukket
+        state: "off"
+    action:
+      # Lad on-/ramp-automationen sætte gruppen først.
+      - delay:
+          milliseconds: 700
+      - variables:
+          # 2026-06-27 (user-spec unidirektionelt besøg): et besøg må ALDRIG blive
+          # mørkere undervejs. Derfor pruner vi KUN spots væk når brugeren AKTIVT
+          # redigerer en per-fase toggle (live-feedback på Indstillinger) — IKKE
+          # når fasen eskalerer (stage-skift) eller gruppen tænder. Ved eskalering
+          # tilføjes kun spots (to_on); fravalg i en højere fase slukker ikke en
+          # spot der allerede lyser fra en lavere fase. Konfigurér supersets
+          # additivt, så lyset kun vokser gennem besøget.
+          is_toggle_edit: >-
+            {{ trigger.entity_id is not none
+               and trigger.entity_id.startswith('input_boolean.badevaerelse_') }}
+          # Re-evaluér fasen EFTER delayen (stadiet kan have skiftet).
+          # VIGTIGT: Jinja UNDERSTØTTER IKKE Python-list-comprehensions ([x for x
+          # in ...]) — det giver TemplateSyntaxError + disabler hele automationen.
+          # Vi bygger derfor med namespace+{% for %} og holder ALT som CSV-strenge.
+          # En CSV-streng-pipeline undgår også "{% %} → streng"-fælden (en foldet
+          # {% %}-blok kan ikke blive en ægte liste). Vi splitter først til en
+          # native liste i selve entity_id-target'et (et rent {{ x.split(',') }}).
+          fase: "{{ states('sensor.badevaerelse_aktiv_fase') }}"
+          # Ønskede spots i fasen (CSV).
+          wanted: >-
+            {% set ns = namespace(s=[]) %}
+            {% for n in range(1, 6) %}
+              {% if is_state('input_boolean.badevaerelse_' ~ fase ~ '_spot_' ~ n, 'on') %}
+                {% set ns.s = ns.s + ['light.badevaerelse_spot_' ~ n] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.s | join(',') }}
+          # Fravalgte der lige nu er ON → skal slukkes (CSV; undgår no-op writes).
+          to_off: >-
+            {% set ns = namespace(s=[]) %}
+            {% for n in range(1, 6) %}
+              {% set ent = 'light.badevaerelse_spot_' ~ n %}
+              {% if ent not in wanted.split(',') and is_state(ent, 'on') %}
+                {% set ns.s = ns.s + [ent] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.s | join(',') }}
+          # Tilvalgte der er OFF → tændes (håndterer eskalering der tilføjer spots).
+          to_on: >-
+            {% set ns = namespace(s=[]) %}
+            {% for ent in wanted.split(',') %}
+              {% if ent and is_state(ent, 'off') %}
+                {% set ns.s = ns.s + [ent] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.s | join(',') }}
+          cur_bri: "{{ state_attr('light.badevaerelse_all','brightness') | int(153) }}"
+          # Farve til de spots vi (gen-)tænder: KOPIÉR fra en allerede-tændt
+          # bad-spot → alle bad-spots deler ÉN farve (user-spec 2026-07-04:
+          # "en farve i spot lys bad"). Uden farve her restaurerede en spot sin
+          # sidste Zigbee/Matter-hukommelse = godnat-natlysets 2000K (gul) mens
+          # resten lyste dagsfarve. Ingen donor (alle valgte var slukket) → fald
+          # tilbage på PRESENCE-ON-BLOKKENS dag-farve-formel (max(aften-CT, anti-
+          # gul-gulv), fejlklasse #2: samme regel begge steder). Enforceren kører
+          # ALDRIG i natlys (kun quick/medium/fuld) → aldrig 2000K herfra.
+          donor: >-
+            {{ expand('light.badevaerelse_spot_1','light.badevaerelse_spot_2',
+                      'light.badevaerelse_spot_3','light.badevaerelse_spot_4',
+                      'light.badevaerelse_spot_5')
+               | selectattr('state','eq','on')
+               | map(attribute='entity_id') | list | first | default('') }}
+          donor_ct: >-
+            {% set c = state_attr(donor, 'color_temp_kelvin') if donor else none %}
+            {{ c if c is not none
+               else [states('sensor.auto_color_temp_evening') | int(2700),
+                     states('input_number.badevaerelse_min_kelvin') | int(2700)] | max }}
+      # Guard: tænd ALDRIG et tomt sæt (= bruger har fravalgt alle spots i fasen)
+      # → så ville badet stå mørkt. Da springer vi prune over (lad gruppen lyse).
+      - condition: template
+        value_template: "{{ wanted | length > 0 }}"
+      # Prune (slukke) KUN ved aktiv toggle-redigering — aldrig ved eskalering,
+      # så besøget forbliver unidirektionelt i lysmængde.
+      - if:
+          - condition: template
+            value_template: "{{ is_toggle_edit and to_off | length > 0 }}"
+        then:
+          - service: light.turn_off
+            target:
+              entity_id: "{{ to_off.split(',') }}"
+            data:
+              transition: 1
+      - if:
+          - condition: template
+            value_template: "{{ to_on | length > 0 }}"
+        then:
+          - service: light.turn_on
+            target:
+              entity_id: "{{ to_on.split(',') }}"
+            data:
+              brightness: "{{ cur_bri }}"
+              color_temp_kelvin: "{{ donor_ct }}"
+              transition: 1

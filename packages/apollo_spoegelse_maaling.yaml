@@ -1,0 +1,198 @@
+# =============================================================================
+# Apollo-spøgelses-måling — MIDLERTIDIGT MÅLEINSTRUMENT (2026-10-02, B179)
+# =============================================================================
+# USER: "lav en ghost flap hunt og sæt evt målinger op til senere evaluering.
+# kalibrer hvad du kan." (+ "stue apollo er lige blevet rykket om bag en
+# radiator skjuler … det er sket i dag")
+#
+# Hvorfor: husets diskriminatorer (afstand, energi, moving_target) er
+# recorder-ekskluderede (B99), så "var det et spøgelse?" kan kun besvares med
+# on/off-flanken og flap-jagtens gate-tekst. Det er for lidt til at kalibrere
+# stuens NYE placering (bag radiatorskjuleren) og til at skille move-ekko fra
+# ægte still (B112).
+#
+# To lag:
+#  1. UDSLAG (ai_feedback/apollo_udslag_feedback.jsonl): hvert rå Apollo-
+#     udslag ≤ 120 s i alle fem rum → afstand/energi ved start og +2 s,
+#     om moving_target var i spil, flap-jagtens gate-tekst og konteksten der
+#     sætter facit bagefter (hus_bevist_tomt, house_state, robot/gardin,
+#     andre rums radar, sol, rum-/ESP-temperatur — radiator-hypotesen).
+#     Udslag > 120 s logges ikke: det er mennesker, og on/off ligger i recorderen.
+#     Volumen målt 29/9-2/10: ~430 udslag/døgn i alt, ~75 % ≤ 120 s → ~300
+#     shell-kald/døgn (fejlklasse #7: ét kald pr. udslag, ingen backstop).
+#  2. NAT-BASELINE (bestilles): skriv rum i input_text.apollo_kalib_bestilling
+#     (fx "stue,koekken,spisestue"). Første 10-min-tick hvor alle de rum har
+#     været tomme i 30 min — kl. 01-05 eller mens hus_bevist_tomt er on, og
+#     ingen robot/gardin kører — rydder bestillingen (engangs) og starter
+#     scripts/apollo_kalib_capture.py: engineering mode i 7 min (sikkerheds-
+#     automationen slukker selv efter 10), støjgulv pr. gate → margin til
+#     tærsklen i ai_feedback/apollo_kalib_feedback.jsonl. Chip-wear-regel 2:
+#     kun ved bestilling (bruger-intent), aldrig periodisk.
+#
+# Evaluering: python3 scripts/apollo_spoegelse_eval.py (recorder + begge JSONL).
+# FJERN lag 1 når B179 er evalueret (≥ 2 uger, mindst 3 tomt-hus-dage).
+# =============================================================================
+
+input_text:
+  # Komma-separerede Apollo-navne: stue, koekken, spisestue, boernevaerelse,
+  # sovevaerelse. Tom = intet bestilt. Ryddes af automationen ved start.
+  apollo_kalib_bestilling:
+    name: "Apollo: bestil tomt-rum-baseline"
+    icon: mdi:flask-outline
+    max: 100
+
+shell_command:
+  # --detach: scriptet starter sig selv i baggrunden og returnerer straks
+  # (shell_command dræbes efter 60 s; målingen tager ~8 min).
+  apollo_kalib_capture: "python3 /config/scripts/apollo_kalib_capture.py --detach {{ rum }}"
+
+automation:
+  - id: apollo_udslag_maaling
+    alias: "Måling: Apollo-udslag med afstand/energi (B179)"
+    description: >
+      Midlertidigt måleinstrument (B179). Logger hvert rå Apollo-udslag ≤ 120 s
+      til ai_feedback/apollo_udslag_feedback.jsonl. Tænder/slukker intet.
+    mode: parallel
+    max: 15
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: !include ../rosters/apollo_occupancy.yaml
+        from: "off"
+        to: "on"
+    # AirBnB: JSONL'en committes til git og ville gemme gæstens bevægelses-
+    # mønster (privatliv, AirBnB-regel #3).
+    condition:
+      - condition: template
+        value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+    action:
+      - variables:
+          t0: "{{ trigger.to_state.last_changed.timestamp() }}"
+          rum: "{{ trigger.entity_id.split('.')[1] | replace('_apollo_occupancy', '') }}"
+          s0: &sample >-
+            {% set p = 'sensor.' ~ rum ~ '_apollo_radar_' %}
+            {{ {'sd': states(p ~ 'still_distance') | float(-1),
+                'se': states(p ~ 'still_energy') | float(-1),
+                'md': states(p ~ 'moving_distance') | float(-1),
+                'me': states(p ~ 'move_energy') | float(-1),
+                'dd': states(p ~ 'detection_distance') | float(-1),
+                'mt': is_state('binary_sensor.' ~ rum ~ '_apollo_radar_moving_target', 'on'),
+                'st': is_state('binary_sensor.' ~ rum ~ '_apollo_radar_still_target', 'on')} }}
+          # Andre rums RÅ radar i startsekundet: bredde = menneske (en fantom
+          # rører ét rum, permanent faktum), og gå-ruter ses som nabo-udslag.
+          andre: >-
+            {% set ns = namespace(o=[]) %}
+            {% for r in ['koekken', 'spisestue', 'stue', 'boernevaerelse', 'sovevaerelse'] %}
+              {% if r != rum and is_state('binary_sensor.' ~ r ~ '_apollo_occupancy', 'on') %}
+                {% set ns.o = ns.o + [r] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.o }}
+      - delay:
+          seconds: 2
+      - variables:
+          s2: *sample
+      - wait_template: "{{ is_state(trigger.entity_id, 'off') }}"
+        timeout:
+          seconds: 120
+        continue_on_timeout: false
+      - variables:
+          # last_changed er flankens eget tidsstempel — præcist selv når
+          # udslaget sluttede før ventetiden startede.
+          dur: >-
+            {% set s = states[trigger.entity_id] %}
+            {{ ((s.last_changed.timestamp() - t0) | round(1)) if s else -1 }}
+          mt_under: >-
+            {% set m = states['binary_sensor.' ~ rum ~ '_apollo_radar_moving_target'] %}
+            {{ m is not none and (m.state == 'on' or m.last_changed.timestamp() >= t0 - 1) }}
+          gate_txt: >-
+            {% set slug = 'sove' if rum == 'sovevaerelse' else rum %}
+            {{ states('input_text.' ~ slug ~ '_apollo_last_flap') }}
+          payload_b64: >-
+            {{ {
+              'ts': t0 | timestamp_local,
+              'rum': rum,
+              'dur': dur,
+              's0': s0, 's2': s2,
+              'mt_under': mt_under,
+              'gate': gate_txt,
+              'andre': andre,
+              'hus': states('input_select.house_state'),
+              'tomt': is_state('binary_sensor.hus_bevist_tomt', 'on'),
+              'ppl': states('sensor.people_estimate'),
+              'sup': is_state('binary_sensor.apollo_flap_suppress', 'on'),
+              'godnat': is_state('input_boolean.godnat_active', 'on'),
+              'terrdoer': states('binary_sensor.parasoll_terrassedoer'),
+              'sol_elev': state_attr('sun.sun', 'elevation'),
+              'sol_az': state_attr('sun.sun', 'azimuth'),
+              'temp': states('sensor.' ~ rum ~ '_apollo_temperature') | float(-1) | round(1),
+              'esp': states('sensor.' ~ rum ~ '_apollo_esp_temperature') | float(-1) | round(1)
+            } | to_json | base64_encode }}
+      - service: shell_command.ai_feedback_append
+        continue_on_error: true
+        data: {log_slug: apollo_udslag, payload_b64: "{{ payload_b64 }}"}
+
+  - id: apollo_kalib_nat_baseline
+    alias: "Måling: Apollo tomt-rum-baseline (bestilt, engangs)"
+    description: >
+      Kører scripts/apollo_kalib_capture.py når de rum der står i
+      input_text.apollo_kalib_bestilling har været tomme i 30 min (kl. 01-05
+      eller hus_bevist_tomt). Rydder bestillingen først = engangs.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/10"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_text.apollo_kalib_bestilling') not in ['', 'unknown', 'unavailable'] }}
+      - condition: template
+        value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+      - condition: state
+        entity_id: binary_sensor.apollo_flap_suppress
+        state: "off"
+      - condition: or
+        conditions:
+          - condition: time
+            after: "01:00:00"
+            before: "05:00:00"
+          - condition: state
+            entity_id: binary_sensor.hus_bevist_tomt
+            state: "on"
+      # Alle bestilte rum: kendt navn, rå radar off i ≥ 30 min, engineering
+      # mode slukket (ingen anden kalibrering i gang). last_changed nulstilles
+      # ved restart → kravet er så bare 30 min efter boot (fejler mod at vente).
+      - condition: template
+        value_template: >-
+          {% set rr = states('input_text.apollo_kalib_bestilling').split(',')
+                      | map('trim') | select | list %}
+          {% set ns = namespace(ok=rr | length > 0) %}
+          {% for r in rr %}
+            {% set o = states['binary_sensor.' ~ r ~ '_apollo_occupancy'] %}
+            {% if r not in ['stue', 'koekken', 'spisestue', 'boernevaerelse', 'sovevaerelse']
+                  or o is none or o.state != 'off'
+                  or (now() - o.last_changed).total_seconds() < 1800
+                  or not is_state('switch.' ~ r ~ '_apollo_radar_engineering_mode', 'off') %}
+              {% set ns.ok = false %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.ok }}
+    action:
+      - variables:
+          rum: >-
+            {{ states('input_text.apollo_kalib_bestilling').split(',')
+               | map('trim') | select | join(',') }}
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.apollo_kalib_bestilling
+        data:
+          value: ""
+      - service: shell_command.apollo_kalib_capture
+        continue_on_error: true
+        data:
+          rum: "{{ rum }}"
+      - service: logbook.log
+        data:
+          name: "Apollo-kalibrering"
+          message: "tomt-rum-baseline startet: {{ rum }} (7 min engineering mode)"
+          entity_id: input_text.apollo_kalib_bestilling

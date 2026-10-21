@@ -1,0 +1,619 @@
+# =============================================================================
+# Sofa Zen — AUTOMATISK scene (2026-10-03, user-spec) — første auto-scene
+# =============================================================================
+# User: "aktiviteten sofa hygge skal nu automatisk udløse Sofa Zen (ikke i
+# AirBnB, men på normal auto). Rejser vi os og går i køkkenet eller andre rum end
+# stuen, skal de andre rum opføre sig som normal auto. Genoptages sofa hygge,
+# fades der langsomt tilbage til scenen. Kun open-plan. Kun aften, når det er
+# mørkt udenfor, og terrasselys som jeg har sat dem. Sliders til hvor aggressivt
+# den slår til og fra og hvor hurtigt den fader ind — og kontrol over hvornår på
+# døgnet den må trigge (default: ikke før 20.30). Det må ikke flakke med lys."
+#
+# DESIGN (kortversion — begrundelser i docs/sprint_log.md "Sprint 2026-10-03"):
+#   SIGNAL   binary_sensor.sofa_hygge_stabil (packages/sofa_hygge_aktivitet.yaml)
+#            = sofa_relax STABILISERET. Rå `sensor.activity_state == sofa_relax`
+#            er hakket: median 25 s, 69 % af hullerne ≤ 2 min — en trigger på den
+#            ville flimre hele aftenen. Sliderne tænd-/slip-forsinkelse bor dér.
+#   MOTOR    automation sofa_zen_motor (nederst). NIVEAU-styret: hver trigger
+#            læser huset og afstemmer ønsket mod `input_boolean.sofa_zen_auto_aktiv`
+#            (ejer-flaget), så en genstart/reload/blokering der sluger en flanke
+#            heler sig selv (fejlklasse #4/#15/#19).
+#   LOOK     snapshot `scene.snap_zen_openplan` (brugerens Overskriv, kun open-plan)
+#            + standardværdier for lys der ikke står i den (script.scene_auto_apply)
+#            → en ny pære virker uden at nogen skal huske at fange den.
+#   SCOPE    Open-plan (light.stue_all) + to user-spec-undtagelser (3/10 22:00):
+#            KØKKENKÆDEN er med, men kun mens køkkenet ikke er i brug (Zen LÅNER
+#            den via binary_sensor.sofa_zen_laaner_kaeden → kædens låne-lås), og
+#            TERRASSEN dæmpes til højst 20 % hvis den lyser kraftigere (tændes
+#            aldrig af Zen — flagermus-curfew/nat-sluk vinder). Depot/sove/bad/
+#            børn og gardiner røres ALDRIG.
+#   MANUEL   Et tryk i stuen (Styrbar/app → styrbar_last_press_stue) spærrer Zen i
+#            `sofa_zen_manuel_hold_min` (user-spec 3/10: "eget kortere hold") —
+#            IKKE husets 3-t lys-hold: replay 19/9-3/10 gav 1 tænd på 15 aftener,
+#            fordi der trykkes i stuen kl. 19-20 næsten hver aften. Overtager Zen
+#            et gammelt tryk, sætter den stuen på Auto og stempler
+#            `sofa_zen_overtog`, som frigiver stue_manuel_lys_hold (room_modes.yaml)
+#            — ellers ville drift-backens loft male Zen om (room_mode_apply) og
+#            sofa-sluk stå spærret efter Zen slap.
+#   GATES    ÉN sandhed: sensor.sofa_zen_stop (hårde stop → motoren slipper straks)
+#            + sensor.sofa_zen_status (alle gates → motoren må tænde). Samme tekst
+#            vises på Scener-siden, så "hvorfor tændte den ikke?" kan aflæses.
+#   AirBnB   Normal/Home Vacation kun. En gæst får ingen familie-scene (CLAUDE.md
+#            AirBnB-regel 5); ejer-flaget ryddes ved entry/exit (airbnb_mode.yaml).
+# =============================================================================
+
+input_boolean:
+  # Kill-switch (fejlklasse #21: ligger som betingelse på HVER vej ind via
+  # sensor.sofa_zen_stop — motor, backstop og genstart læser alle samme sensor).
+  sofa_zen_auto_enabled:
+    name: "Sofa Zen automatik"
+    icon: mdi:meditation
+
+  # EJER-FLAG (runtime, snapshottes ikke): motoren sætter det ved tænd og
+  # fjerner det ved slip. Sofa-zonens øvrige auto-lys (sofa-sluk, spot-spejlet)
+  # står stille mens det er on. Initial udeladt → restores efter genstart;
+  # motorens backstop afgør om en gammel `on` stadig er rigtig.
+  sofa_zen_auto_aktiv:
+    name: "Sofa Zen auto: aktiv (internal)"
+    icon: mdi:sofa
+
+input_number:
+  # FADE-IND: hvor langsomt open-plan glider ind i scenen — både første gang og
+  # når sofa-hyggen genoptages. En lang `transition` køres i pærens firmware
+  # (lineær), hvilket er fint op til få minutter; ingen HA-drevet rampe nødvendig.
+  sofa_zen_fade_ind_s:
+    name: "Sofa Zen: fade ind (sek)"
+    icon: mdi:transition
+    min: 2
+    max: 300
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # MØRKT UDENFOR: sol under denne højde. Egen slider (ikke husets natlys/aftenlys):
+  # en ændring her må ikke flytte andre auto-lys. Se packages/natlys_sol.yaml for
+  # de to øvrige sol-gates.
+  sofa_zen_sol_graense:
+    name: "Sofa Zen: mørkt udenfor når sol under (°)"
+    icon: mdi:weather-sunset-down
+    min: -18
+    max: 10
+    step: 1
+    unit_of_measurement: "°"
+    mode: slider
+
+  # MANUELT TRYK spærrer Zen i så mange minutter (user-spec 3/10: "eget kortere
+  # hold", uanset hvornår sofa-hyggen starter). 0 = et tryk spærrer aldrig.
+  sofa_zen_manuel_hold_min:
+    name: "Sofa Zen: manuelt tryk spærrer (min)"
+    icon: mdi:hand-back-right
+    min: 0
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+input_datetime:
+  # Runtime-stempel (ikke config, snapshottes ikke): hvornår Zen sidst overtog
+  # stuen. Frigiver binary_sensor.stue_manuel_lys_hold for tryk FØR stemplet.
+  sofa_zen_overtog:
+    name: "Sofa Zen: overtog stuen (internal)"
+    icon: mdi:sofa
+    has_date: true
+    has_time: true
+
+  # TIDSVINDUE for AUTOMATISK tænd (user: "kontrol over hvor den automatisk
+  # trigger på døgnet. default: ikke før kl. 20.30"). Gater kun INDTRÆDEN — en
+  # session der er i gang slippes ikke fordi klokken passerer `til`. Slut før
+  # start = vinduet vrider sig over midnat; slut == start = hele døgnet (HA's
+  # `time`-semantik, samme som køkken-lyskædens vindue).
+  sofa_zen_fra:
+    name: "Sofa Zen: tidligst kl."
+    icon: mdi:clock-start
+    has_date: false
+    has_time: true
+  sofa_zen_til:
+    name: "Sofa Zen: senest kl."
+    icon: mdi:clock-end
+    has_date: false
+    has_time: true
+
+template:
+  - sensor:
+      # HÅRDE STOP = ting der gør at motoren ikke længere må eje open-plan. Rammer
+      # de en AKTIV scene, slipper motoren straks; rammer de en inaktiv, tænder
+      # den ikke. Rækkefølgen er "mest grundlæggende først" — den første der
+      # rammer er årsagen brugeren ser.
+      # Tidsvindue og mørke er BEVIDST ikke med her: de gater kun indtrædenen.
+      # FEJL-RETNING: en manglende/ukendt nøgle-entity giver 'data mangler'
+      # (= tænder ikke), aldrig "intet stop" (#9: unavailable er hverken on eller off).
+      - name: "Sofa Zen stop"
+        unique_id: sofa_zen_stop
+        icon: mdi:hand-back-right
+        state: >-
+          {% set kritiske = ['input_select.house_mode', 'input_select.house_state',
+                             'input_select.room_mode_stue', 'input_select.active_scene',
+                             'binary_sensor.godnat_common_active'] %}
+          {% if kritiske | reject('has_value') | list | length > 0 %}data mangler
+          {% elif is_state('input_boolean.sofa_zen_auto_enabled', 'off') %}slået fra
+          {% elif states('input_select.house_mode') not in ['Normal', 'Home Vacation'] %}AirBnB
+          {% elif not is_state('input_select.house_state', 'Active') %}huset hviler
+          {% elif is_state('binary_sensor.godnat_common_active', 'on') %}godnat
+          {% elif is_state('input_boolean.cinema_active', 'on')
+                  or is_state('binary_sensor.dark_mode_stue', 'on')
+                  or is_state('binary_sensor.filmmoerke_stue', 'on') %}film
+          {% elif is_state('binary_sensor.sofa_zen_manuel_spaerre', 'on') %}manuel
+          {% elif not is_state('input_select.active_scene', 'none') %}anden scene
+          {% elif is_state('binary_sensor.mood_pause_stue', 'on')
+                  or is_state('input_boolean.dance_mode', 'on')
+                  or is_state('input_boolean.cirkus_active', 'on') %}fest
+          {% elif is_state('binary_sensor.sleepover_openplan_moerkt', 'on') %}sleepover
+          {% elif is_state('binary_sensor.presence_sensors_available', 'off') %}radar offline
+          {% else %}ingen{% endif %}
+
+      # STATUS = hvorfor tænder (eller tændte) den ikke? 'aktiv' / 'klar' / årsag.
+      # 'stue slukket' (2026-10-03e): Zen TÆNDER aldrig en stue hvor alle lys er
+      # slukket — sofa-tænd lyser normalt sofaen op før beviset er holdt, så et
+      # mørkt rum betyder at nogen selv har valgt mørke (TV, slukket med vilje).
+      # Motoren tænder KUN når status == 'klar' — så UI og adfærd kan ikke
+      # divergere (#2). Tidsrum og mørke ejes af sensorerne i
+      # packages/sofa_hygge_aktivitet.yaml (samme vindue som signalets bevis).
+      - name: "Sofa Zen status"
+        unique_id: sofa_zen_status
+        icon: mdi:meditation
+        state: >-
+          {% set stop = states('sensor.sofa_zen_stop') %}
+          {# B183.4: en film der LIGE er slut kører pre-dark-restoren — Zen må
+             ikke tænde oven i den (to scener i samme sekund = flimmer). now()
+             re-renderer kun hvert minut, så vinduet er 60-119 s. #}
+          {% set ns = namespace(sek=999999) %}
+          {% for e in ['input_boolean.cinema_active', 'binary_sensor.dark_mode_stue',
+                       'binary_sensor.filmmoerke_stue'] %}
+            {% set o = states[e] %}
+            {% if o is not none %}
+              {% set ns.sek = [ns.sek, (now() - o.last_changed).total_seconds()] | min %}
+            {% endif %}
+          {% endfor %}
+          {% set film_slut = ns.sek %}
+          {% if stop in ['unavailable', 'unknown'] %}data mangler
+          {% elif stop != 'ingen' %}{{ stop }}
+          {% elif is_state('input_boolean.sofa_zen_auto_aktiv', 'on') %}aktiv
+          {% elif not is_state('binary_sensor.sofa_zen_tidsrum', 'on') %}udenfor tidsrum
+          {% elif not is_state('binary_sensor.sofa_zen_moerkt', 'on') %}for lyst ude
+          {% elif film_slut < 60 %}film slut
+          {% elif not is_state('light.stue_room', 'on') %}stue slukket
+          {% elif not is_state('binary_sensor.activity_state_confident', 'on') %}radar usikker
+          {% else %}klar{% endif %}
+
+  - binary_sensor:
+      # MANUEL SPÆRRE (user-spec 3/10: eget kortere hold). Et tryk i et rum Zen
+      # MALER — stuen eller spisestue-loftet; Styrbar ELLER app, begge stempler
+      # styrbar_last_press_<rum> (manual_override.yaml, kun når nogen er hjemme)
+      # — spærrer Zen i slider-minutter. Køkkenet er ikke med: kæden lånes kun
+      # når køkkenet ikke står på Manual (sofa_zen_laaner_kaeden). De to stående
+      # hus-tilstande (alle rum manuel, open-plan fuldt lys-hold) spærrer så
+      # længe de står. Urørt stempel = midnat → ignorér. now() giver kun en
+      # DB-række ved grænsen (#24).
+      - name: "Sofa Zen manuel spaerre"
+        unique_id: sofa_zen_manuel_spaerre
+        icon: mdi:hand-back-right
+        state: >-
+          {% set x = states('input_number.sofa_zen_manuel_hold_min') | float(45) * 60 %}
+          {% set ns = namespace(frisk=false) %}
+          {% for rum in ['stue', 'spisestue'] %}
+            {% set e = 'input_datetime.styrbar_last_press_' ~ rum %}
+            {% set raw = states(e) %}
+            {% set lp = state_attr(e, 'timestamp') | float(0) %}
+            {% if raw not in ['unknown', 'unavailable', ''] and raw[11:] != '00:00:00'
+                  and lp > 0 and 0 <= as_timestamp(now()) - lp < x %}
+              {% set ns.frisk = true %}
+            {% endif %}
+          {% endfor %}
+          {{ is_state('input_boolean.all_rooms_manual', 'on')
+             or is_state('input_boolean.open_plan_fuldt_lys', 'on')
+             or ns.frisk }}
+
+      # HOLDER = om den automatiske Zen LIGE NU reelt ejer sofa-zonen. AFLEDT, ikke
+      # det rå flag: et flag der hænger (genstart, deaktiveret motor) ville ellers
+      # spærre sofa-sluk/-tænd og spot-spejlet hele natten. Hver term er en grund
+      # til at slippe zonen til normal auto: et friskt tryk, AirBnB, godnat,
+      # sofa-hyggen forsvundet. (Ikke room_mode_stue: Zen sætter selv Auto når
+      # den overtager, og flaget skal holde zonen FØR det skift lander — ellers
+      # synker spot-spejlet på room_mode-flanken midt i Zen-fadet.) En manglende/ukendt term gør holderen OFF (= normal auto vinder).
+      # Læses af presence_light_sofa_on/_off, presence_lux_sofa_on og spot-spejlet.
+      - name: "Sofa Zen holder sofa"
+        unique_id: sofa_zen_holder_sofa
+        icon: mdi:sofa
+        state: >-
+          {{ is_state('input_boolean.sofa_zen_auto_aktiv', 'on')
+             and not is_state('binary_sensor.sofa_zen_manuel_spaerre', 'on')
+             and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+             and is_state('binary_sensor.sofa_hygge_stabil', 'on')
+             and is_state('binary_sensor.godnat_common_active', 'off') }}
+
+      # KØKKENKÆDEN LÅNES (user-spec 3/10: "den skal være med, men presence i
+      # køkkenet skal pause zen mode's effekt i køkkenet"). Læses af kædens
+      # låne-lås (packages/koekken_lyskaede.yaml, `Koekken lyskaede laant`):
+      # mens den er on står kædens enforcer og auto-sluk stille; når den falder,
+      # maler enforceren kæden til husets mål (laant_slut) = normal køkken-auto.
+      # "Køkkenet i brug" = madlavnings-ankeret (spots ∪ cooking-rampe), IKKE rå
+      # køkken-occupancy: køkken-Apolloens 6 m-felt ser en der ligger i sofaen
+      # (2026-08-19g) og ville pause Zen i køkkenet hele aftenen. Køkken på
+      # Manual = brugeren ejer kæden. delay_on 10 s: spots-flap ved sluk.
+      - name: "Sofa Zen laaner kaeden"
+        unique_id: sofa_zen_laaner_kaeden
+        icon: mdi:string-lights
+        delay_on: 10
+        state: >-
+          {{ is_state('binary_sensor.sofa_zen_holder_sofa', 'on')
+             and not is_state('binary_sensor.koekken_madlavningslys', 'on')
+             and not is_state('input_select.room_mode_koekken', 'Manual') }}
+
+# =============================================================================
+# script.scene_auto_apply — anvend en scenes open-plan-look, med fade
+# =============================================================================
+# KUN lys fra den afledte scene `scene.snap_<scene>_openplan` (scripts/
+# scene_overwrite.py skriver den ved hver Overskriv) + standardværdier for de
+# open-plan-lys der IKKE står i den. Køkkenkæden har sin EGEN afledte scene
+# (`snap_<scene>_kaede`) og sit eget script, fordi den kun må males mens
+# køkkenet ikke er i brug — og skal kunne males igen alene, når køkkenet bliver
+# ledigt midt i en Zen-session. Terrassen dæmpes til højst 20 % (tændes aldrig).
+# Aldrig gardiner, aldrig depot.
+# Alt starter PARALLELT, så fadene begynder samtidig (en Matter-pære der svarer
+# langsomt må ikke forskyde de andre). `continue_on_error`: CHIP Error 0x32
+# (timeout) må ikke afbryde resten (#permanente fakta).
+# Standardværdierne er de samme som den gamle håndkodede Sofa Zen (15 % / 2200 K
+# på sofa-lysene, 5 % på køkkenkæden, spisestue-loftet slukket) — brugerens eget
+# look overstyrer dem pr. lampe, så snart de har trykket Overskriv.
+script:
+  scene_auto_apply:
+    alias: "Scene (auto): anvend open-plan-look med fade"
+    mode: restart   # en nyere anvendelse (genoptaget sofa-hygge) afløser en igangværende fade
+    fields:
+      scene:
+        description: "Scene-navn. Kun 'zen' har standardværdier."
+        example: zen
+      fade_s:
+        description: "Fade i sekunder"
+        example: 40
+    variables:
+      scene_navn: "{{ scene | default('zen') }}"
+      fade: "{{ [(fade_s | default(30) | int(30)), 1] | max }}"
+      scene_id: "scene.snap_{{ scene_navn }}_openplan"
+      snap_ok: "{{ states[scene_id] is not none and states(scene_id) != 'unavailable' }}"
+      i_snap: "{{ (state_attr(scene_id, 'entity_id') or []) if snap_ok else [] }}"
+      # Spotsene sidder bag en filtplade og er gule ved samme kelvin som læselampen
+      # → samme køligere-end-lampen-offset som spot-spejlet (packages/stue_spots.yaml).
+      spot_kelvin: >-
+        {{ [2200 + (states('input_number.stue_spots_auto_kelvin_offset') | int(0)), 6500] | min }}
+      spots_uden_snap: >-
+        {{ ['light.stue_spot_1', 'light.stue_spot_2']
+           | reject('in', i_snap) | reject('is_state', 'unavailable') | list }}
+    sequence:
+      - condition: template
+        value_template: "{{ scene_navn == 'zen' }}"
+      - parallel:
+          # 1) Brugerens gemte look (kun open-plan-lysene).
+          - if:
+              - condition: template
+                value_template: "{{ snap_ok }}"
+            then:
+              - service: scene.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: "{{ scene_id }}"
+                data:
+                  transition: "{{ fade }}"
+          # 2) Standardværdier for roster-lys uden for snapshottet.
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ 'light.stue_laesehygge' not in i_snap
+                     and not is_state('light.stue_laesehygge', 'unavailable') }}
+            then:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.stue_laesehygge
+                data:
+                  brightness_pct: 15
+                  color_temp_kelvin: 2200
+                  transition: "{{ fade }}"
+          - if:
+              - condition: template
+                value_template: "{{ spots_uden_snap | length > 0 }}"
+            then:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: "{{ spots_uden_snap }}"
+                data:
+                  brightness_pct: 15
+                  color_temp_kelvin: "{{ spot_kelvin }}"
+                  transition: "{{ fade }}"
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ 'light.spisestue_loft' not in i_snap
+                     and is_state('light.spisestue_loft', 'on') }}
+            then:
+              - service: light.turn_off
+                continue_on_error: true
+                target:
+                  entity_id: light.spisestue_loft
+                data:
+                  transition: "{{ fade }}"
+          # 3) Køkkenkæden — eget script (gate: køkkenet ikke i brug).
+          # script.turn_on (ikke blokerende): kæde-scriptet venter op til 20 s
+          # på ejerskabet, og terrassen nedenfor skal ikke vente med.
+          - service: script.turn_on
+            continue_on_error: true
+            target:
+              entity_id: script.sofa_zen_kaede_apply
+            data:
+              variables:
+                fade_s: "{{ fade }}"
+          # 4) Terrassen (user-spec 3/10: "terrassen er 20 % tændt på zen mode").
+          #    Dusk-auto-tænd sætter den allerede på 20 % (flagermus-dæmp), og
+          #    flagermus-laget tager den til 5 % / curfew senere. Zen TÆNDER den
+          #    aldrig (så ville en genoptaget sofa-hygge kl. 23:30 bryde curfew'en)
+          #    og dæmper kun ned — en lavere flagermus-styrke får lov at stå.
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ is_state('light.terrasse_paerelyskaede', 'on')
+                     and (state_attr('light.terrasse_paerelyskaede', 'brightness') | int(0)) > 52 }}
+            then:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.terrasse_paerelyskaede
+                data:
+                  brightness_pct: 20
+                  transition: "{{ fade }}"
+
+  # Køkkenkæden i Zen-looket. Gate = samme som sofa_zen_laaner_kaeden minus
+  # holderen (den kaldes FRA motoren, så Zen ejer allerede zonen): madlavnings-
+  # ankeret off og køkkenet ikke på Manual. Brugerens gemte kæde-look (afledt
+  # scene) ellers 5 % / 2200 K (den gamle håndkodede Zens kæde-niveau).
+  sofa_zen_kaede_apply:
+    alias: "Sofa Zen (auto): mal køkkenkæden i Zen-looket"
+    mode: restart
+    fields:
+      fade_s:
+        description: "Fade i sekunder"
+        example: 40
+    variables:
+      fade: "{{ [(fade_s | default(30) | int(30)), 1] | max }}"
+      kaede_snap: "scene.snap_zen_kaede"
+    sequence:
+      - condition: template
+        value_template: >-
+          {{ not is_state('binary_sensor.koekken_madlavningslys', 'on')
+             and not is_state('input_select.room_mode_koekken', 'Manual')
+             and states('light.koekken_lyskaede') not in ['unavailable', 'unknown'] }}
+      # 2026-10-04 (ejerskab): skriv først når Zen EJER kæden. Låne-sensoren har
+      # delay_on 10 s, så før ventede vi ikke: Zen malede kæden, enforcerens
+      # on_edge så intet lån og malede husets mål ovenpå, og 10 s senere kom Zen
+      # igen (synligt flimmer). Holder et højere krav kæden (din hånd, en alarm),
+      # skriver Zen slet ikke — rangen i ejerskab/koekken_lyskaede.yaml.
+      - wait_template: "{{ is_state('sensor.koekken_lyskaede_ejer', 'sofa_zen') }}"
+        timeout: "00:00:20"
+        continue_on_timeout: false
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states[kaede_snap] is not none and states(kaede_snap) != 'unavailable' }}
+        then:
+          - service: scene.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ kaede_snap }}"
+            data:
+              transition: "{{ fade }}"
+        else:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: light.koekken_lyskaede
+            data:
+              brightness_pct: 5
+              color_temp_kelvin: 2200
+              transition: "{{ fade }}"
+
+# =============================================================================
+# MOTOREN — niveau-styret afstemning (ønsket tilstand mod ejer-flaget)
+# =============================================================================
+# HVER trigger læser huset og afstemmer; ingen gren stoler på hvilken flanke der
+# vækkede den. Derfor kan en genstart, et template-reload eller en blokering der
+# sluger en flanke ikke efterlade motoren i en forkert tilstand (#4/#15/#19), og
+# `sensor.sofa_zen_status → klar` er selv en trigger: åbner et tidsvindue / slutter
+# godnat / går Manual tilbage til Auto MENS sofa-hyggen står på, tænder den straks.
+#
+# TÆND  (ejer-flag off, stabil sofa-hygge, status 'klar'):
+#   flag ON FØRST (sofa-sluk og spot-spejlet står nu stille), så OVERTAGELSE af
+#   et gammelt tryk (stue/spisestue → Auto + `sofa_zen_overtog`-stempel, se
+#   MANUEL i headeren), derefter script.scene_auto_apply med fade-ind-slideren.
+#   Samme vej ved genoptaget sofa-hygge = "fader langsomt tilbage til scenen".
+# KÆDE  (aktiv, køkkenet bliver ledigt → sofa_zen_laaner_kaeden off→on): mal kun
+#   kæden igen. Køkkenets egen auto havde den mens køkkenet var i brug.
+# SLIP  (ejer-flag on og [hårdt stop ELLER sofa-hyggen er slut]):
+#   flag OFF → holderen falder → sofa-sluk re-armer selv (presence_stue.yaml) og
+#   tager sofa-lysene efter den normale tom-tid. Ingen anden oprydning: køkken-/
+#   spisestue-rummene er under deres egen auto hele tiden (de guardes ikke). Slip
+#   pga. et HÅRDT stop (manuel, godnat, film, scene, fest, AirBnB …) rører INTET lys:
+#   den der overtog ejer det nu. Aflevering = "spørg huset igen", aldrig et
+#   gemt snapshot (#27).
+# MODE queued: en tænd må ikke æde en slip-trigger der kommer 5 s efter.
+# =============================================================================
+automation:
+  - id: sofa_zen_motor
+    alias: "Sofa Zen: automatisk scene ved stabil sofa-hygge (kun open-plan)"
+    mode: queued
+    max: 6
+    max_exceeded: silent
+    trigger:
+      # Eksplicit from: på HVER to: — template.reload sender entities gennem
+      # unavailable, og en `delay_on`-sensor laver en ægte off→on delay_on
+      # sekunder efter et reload (CLAUDE.md permanente fakta).
+      - platform: state
+        entity_id: binary_sensor.sofa_hygge_stabil
+        from: "off"
+        to: "on"
+        id: signal_on
+      - platform: state
+        entity_id: binary_sensor.sofa_hygge_stabil
+        from: "on"
+        to: "off"
+        id: signal_off
+      # En gate åbner/lukker: tidsvindue, mørke, godnat slut, Manual → Auto …
+      - platform: state
+        entity_id: sensor.sofa_zen_status
+        not_from: ["unavailable", "unknown"]
+        not_to: ["unavailable", "unknown"]
+        id: status
+      # Køkkenet er ledigt igen midt i en session → kæden tilbage i Zen-looket.
+      - platform: state
+        entity_id: binary_sensor.sofa_zen_laaner_kaeden
+        from: "off"
+        to: "on"
+        id: kaede
+      # Backstop: heler et forældet ejer-flag (genstart, deaktiveret automation).
+      - platform: time_pattern
+        minutes: "/5"
+        id: tick
+      # En genstart dræber ventende `for:`/delay — afstem efter signalet er genopbygget.
+      - platform: homeassistant
+        event: start
+        id: start
+    action:
+      - if:
+          - condition: template
+            value_template: "{{ trigger is defined and trigger.id == 'start' }}"
+        then:
+          # Signalet (delay_on) starter forfra ved boot. Giv det tid til at melde
+          # igen før en gammel `on` bliver til et slip → ingen tænd/sluk-støj.
+          - delay:
+              seconds: >-
+                {{ [states('input_number.sofa_zen_taend_efter_s') | int(90),
+                    states('input_number.sofa_zen_slip_efter_s') | int(120)] | max + 30 }}
+      - variables:
+          aktiv: "{{ is_state('input_boolean.sofa_zen_auto_aktiv', 'on') }}"
+          signal: "{{ is_state('binary_sensor.sofa_hygge_stabil', 'on') }}"
+          status: "{{ states('sensor.sofa_zen_status') }}"
+          stop: "{{ states('sensor.sofa_zen_stop') }}"
+          fade: "{{ states('input_number.sofa_zen_fade_ind_s') | int(40) }}"
+          # Hårde stop = en ANDEN ejer overtager open-plan. 'data mangler' er
+          # BEVIDST ikke med (et reload må ikke give et slip + oprydning).
+          haarde: >-
+            {{ ['AirBnB', 'huset hviler', 'godnat', 'film', 'manuel', 'anden scene',
+                'fest', 'sleepover', 'radar offline'] }}
+          # Forældet flag: on i > 8 t = en tilstand ingen længere kan stå inde for.
+          for_gammel: >-
+            {{ aktiv and (now() - states.input_boolean.sofa_zen_auto_aktiv.last_changed).total_seconds() > 28800 }}
+          aarsag: >-
+            {% if stop in haarde %}{{ stop }}
+            {% elif stop == 'slået fra' %}slået fra
+            {% elif for_gammel %}forældet
+            {% elif not signal %}sofa-hygge slut
+            {% else %}{% endif %}
+      - choose:
+          # ---------------------------- SLIP ----------------------------------
+          - conditions:
+              - condition: template
+                value_template: "{{ aktiv and aarsag != '' }}"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.sofa_zen_auto_aktiv
+              # INGEN oprydning af andre rum (audit 2026-10-03): spisestue-loftet slukkes af
+              # sin egen presence_light_spisestue_off, og køkkenkæden skal blive som
+              # ambient så længe nogen er i open-plan. Aflevering = holderen falder
+              # (binary_sensor.sofa_zen_holder_sofa), så sofa-sluk re-armer og tager
+              # sofa-lysene efter den normale tom-tid.
+              - service: logbook.log
+                data:
+                  name: "Sofa Zen"
+                  message: "slap open-plan ({{ aarsag }})"
+                  entity_id: input_boolean.sofa_zen_auto_aktiv
+              - service: shell_command.ai_feedback_append
+                continue_on_error: true
+                data:
+                  log_slug: sofa_zen
+                  payload_b64: >-
+                    {{ {'type': 'slip', 'ts': now().isoformat(), 'aarsag': aarsag,
+                        'aktivitet': states('sensor.activity_state'),
+                        'taend_s': states('input_number.sofa_zen_taend_efter_s'),
+                        'slip_s': states('input_number.sofa_zen_slip_efter_s'),
+                        'lux': states('sensor.open_plan_lux'),
+                        'sol': state_attr('sun.sun', 'elevation')} | to_json | base64_encode }}
+          # ---------------------------- TÆND ----------------------------------
+          - conditions:
+              - condition: template
+                value_template: "{{ not aktiv and signal and status == 'klar' }}"
+            sequence:
+              # Flag FØRST: sofa-sluk og spot-spejlet skal stå stille når lysene begynder at fade.
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.sofa_zen_auto_aktiv
+              # OVERTAGELSE: spærren er udløbet (status 'klar'), så et rum der
+              # stadig står på Manual/Off gør det pga. et GAMMELT
+              # tryk. Lad det stå, og drift-backens loft maler Zen om med
+              # room_mode_apply (600 s). Stemplet frigiver stuens 3-t lys-hold,
+              # så sofa-sluk tager lysene når Zen slipper.
+              - variables:
+                  ikke_auto: >-
+                    {{ ['input_select.room_mode_stue', 'input_select.room_mode_spisestue']
+                       | reject('is_state', 'Auto') | list }}
+              - if:
+                  - condition: template
+                    value_template: "{{ ikke_auto | length > 0 }}"
+                then:
+                  - service: input_select.select_option
+                    continue_on_error: true
+                    target:
+                      entity_id: "{{ ikke_auto }}"
+                    data:
+                      option: Auto
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.sofa_zen_overtog
+                data:
+                  datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+              - service: script.scene_auto_apply
+                continue_on_error: true
+                data:
+                  scene: zen
+                  fade_s: "{{ fade }}"
+              - service: logbook.log
+                data:
+                  name: "Sofa Zen"
+                  message: "tændte open-plan (fade {{ fade }} s)"
+                  entity_id: input_boolean.sofa_zen_auto_aktiv
+              - service: shell_command.ai_feedback_append
+                continue_on_error: true
+                data:
+                  log_slug: sofa_zen
+                  payload_b64: >-
+                    {{ {'type': 'taend', 'ts': now().isoformat(), 'fade_s': fade,
+                        'aktivitet': states('sensor.activity_state'),
+                        'taend_s': states('input_number.sofa_zen_taend_efter_s'),
+                        'slip_s': states('input_number.sofa_zen_slip_efter_s'),
+                        'lux': states('sensor.open_plan_lux'),
+                        'sol': state_attr('sun.sun', 'elevation')} | to_json | base64_encode }}
+          # ---------------------------- KÆDE ----------------------------------
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ trigger is defined and trigger.id == 'kaede'
+                     and aktiv and aarsag == '' }}
+            sequence:
+              - service: script.sofa_zen_kaede_apply
+                continue_on_error: true
+                data:
+                  fade_s: "{{ fade }}"
+              - service: logbook.log
+                data:
+                  name: "Sofa Zen"
+                  message: "køkkenet ledigt — kæden tilbage i Zen (fade {{ fade }} s)"
+                  entity_id: input_boolean.sofa_zen_auto_aktiv

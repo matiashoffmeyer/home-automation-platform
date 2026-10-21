@@ -1,0 +1,734 @@
+# =============================================================================
+# Entré Styrbar Super-Remote — IKEA Styrbar E2001/E2002
+# =============================================================================
+# IEEE: 8d:72:8b:88:07:4a:d1:aa (paret 2026-05-20, erstatter gammel RODRET).
+# Filnavn er legacy fra dengang devicen var en Somrig.
+#
+# Sprint 2026-05-25 redesign per user-feedback:
+#   "skruer ikke lyset op og ned i gangen.... det er meget dårligt
+#    intuitivt. kan heller ikke slukke for entre med styrbar"
+#
+# Quick = simpel entré-dimmer (intuitivt). Long = bevidste macros.
+#
+# 6 actions:
+#
+#   TOP quick  ("on")                 → dim UP entre_loft (ladder, cursor-based)
+#                                       (eller restore snapshot hvis grace=on
+#                                       eller AirBnB welcome hvis AirBnB-mode)
+#   TOP long   ("move_with_on_off")   → NØDLYS (2026-10-15; før: tænd alt lux-aware)
+#   3 × TOP quick / 3 × pil (≤ 3 s)    → NØDLYS (packages/noedlys.yaml, alle modes)
+#   BUND quick ("off")                → SLUK ALT lys, ingen gardiner, 5-min grace
+#                                       + armér Dormant-evaluering (siden 2026-06-16;
+#                                       AirBnB: simpel sluk alt)
+#   BUND long  ("move", args[0]=1)    → SLUK ALT + undo-snapshot + Roborock fuld
+#   L arrow    ("arrow_left_click")   → Mode cycle BACKWARD [auto, zen, all_bright, all_off]
+#   R arrow    ("arrow_right_click")  → Mode cycle FORWARD
+#
+# 2026-06-04 (per user): TOP/BUND lang = direkte tænd-alt / sluk-alt. Entré
+# skal kunne styre HELE husets lys med ét tryk (genskabt "alle lys"-macro).
+# 2026-10-15 (per user): TOP lang = NØDLYS i stedet. NED kort/lang er nødlysets
+# udgang (slukker nødlyset FØRST, så sluk-alt ikke tændes igen af fangeren).
+#
+# L/R MODE CYCLE (4 modes, wrap):
+#   - auto:       clear active_scene + alle room_modes → Auto (presence-lights tager over)
+#   - zen:        script.scene_zen + active_scene → "zen"
+#   - all_bright: light.alle_lys @ 100% 2700K + house=Active + active_scene → "full_bright"
+#   - all_off:    script.sluk_alt
+#
+# UNDO EXIT FLOW:
+#   1. BUND long fires: scene.create snapshotter alle lys+plugs+gardiner i
+#      scene.entre_somrig_undo_snapshot. input_boolean.entre_somrig_undo_grace
+#      tændes (auto-cleared efter 10 min).
+#   2. TOP quick MENS grace == on: scene.turn_on restorer original state.
+#   3. TOP quick efter grace == off: normal dim up.
+#
+# Long-press triggers (sprint 2026-05-25 fix): bruger START-events (move /
+# move_with_on_off) ikke release-events (stop / stop_with_on_off). Root
+# cause: IKEA Styrbar firmware fyrer SAMME release-command (stop_with_on_off)
+# uanset om man slap TOP eller BUND — så release-based triggers kunne ikke
+# skelne. START-events er unambiguous: move_with_on_off = TOP-only,
+# move = BUND-only. Verificeret via 24h zha_event log (cluster 8). Hver
+# command fyrer præcis én gang per long-press = naturligt debouncet.
+#
+# Styrbar events:
+#   command="on"                  = top quick     → dim UP entre / undo / AirBnB welcome
+#   command="off"                 = bund quick    → dim DOWN entre / AirBnB sluk
+#   command="move_with_on_off"    = top long start → nødlys
+#   command="move" (args[0]=1)    = bund long start → sluk_alt + Dormant (vi forlader)
+#   command="stop_with_on_off"    = top OR bund release → ignoreret (ambiguous)
+#   command="arrow_left_click"    = L quick       → Mode -1
+#   command="arrow_right_click"   = R quick       → Mode +1
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# TOP — quick tap: dim UP entré (eller undo / AirBnB welcome)
+# ---------------------------------------------------------------------------
+- id: entre_somrig_top_quick_dim_up
+  alias: "Entré Styrbar: TOP quick -> dim UP entré / undo / AirBnB welcome"
+  description: >
+    3 branches:
+    1. AirBnB mode → comfort welcome (lux-baseret 80/60/35%) i entré + stue +
+       køkken + spisestue. Bredere scope = gæster ser hele open-plan.
+    2. Normal + grace=on (BUND long trykket inden 10 min) → undo exit (restore scene).
+    3. Normal + grace=off → dim UP entre_loft via cursor-based ladder
+       (sprint 2026-05-25 fix). Cursor undgår stale Zigbee state reads
+       så rapid taps faktisk stepper sekventielt.
+    mode: queued max:5 så hvert tap behandles sekventielt (queued mode
+    venter på forrige actions før næste starter — cursor er altid up-to-date).
+  mode: queued
+  max: 5
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "8d:72:8b:88:07:4a:d1:aa"
+        command: "on"
+  action:
+    # NØDLYS (2026-10-15, user-spec): 3 hurtige OP-tryk = nødlys. Tælles FØRST
+    # og blokerende, så det 3. tryk ikke også dæmper op i kapløb med nødlyset.
+    # Under nødlys gør OP intet (udgangen er NED). Se packages/noedlys.yaml.
+    - service: script.noedlys_tael_tryk
+      data:
+        ts: "{{ as_timestamp(trigger.event.time_fired) }}"
+    - condition: state
+      entity_id: input_boolean.noedlys_aktiv
+      state: "off"
+    - choose:
+        # Branch AirBnB: comfort welcome (open-plan scope)
+        - conditions:
+            - condition: state
+              entity_id: input_select.house_mode
+              state: "AirBnB"
+          sequence:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.house_state
+              data:
+                option: "Active"
+            # OP = "jeg vil have lys": ophæv en evt. aktiv nedluknings-grace
+            # (fra et tidligere NED) så presence må relighte rum gæsten går ind i.
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.entre_shutdown_grace
+            - service: input_datetime.set_datetime
+              target:
+                entity_id: input_datetime.styrbar_last_press_entre
+              data:
+                datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+            - variables:
+                bri_pct: >
+                  {% set lux = states('sensor.open_plan_lux') | float(50) %}
+                  {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}80
+                  {% elif lux < (states('input_number.lux_trin_dunkelt') | float(20)) %}60
+                  {% else %}35{% endif %}
+            # 2026-06-30 (user undtagelse 4): OP = tænd ALT lys i open-plan
+            # (entré + stue + køkken + spisestue). light.stue_all = hele open-
+            # plan (spisestue_loft + koekken_lyskaede + sofa-
+            # lamper + hjørne + hygge-plug + læsehygge). Depot + børn røres
+            # ALDRIG (de gates separat af airbnb_block_depot_boern_lights).
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.stue_all
+              data:
+                brightness_pct: "{{ bri_pct }}"
+                color_temp_kelvin: 2700
+                transition: 2
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.entre_loft
+              data:
+                brightness_pct: "{{ bri_pct }}"
+                # 2026-08-27b: entréens egen CT-slider (fejlklasse #2 — samme
+                # rum må ikke have to sandheder om sin farve).
+                color_temp_kelvin: "{{ states('input_number.entre_kelvin') | int(3200) }}"
+                transition: 0
+            # Sync cursor så efterfølgende quick-tap stepper fra ny brightness
+            - service: input_number.set_value
+              target:
+                entity_id: input_number.entre_brightness_cursor
+              data:
+                value: "{{ bri_pct }}"
+            - service: persistent_notification.create
+              data:
+                notification_id: "somrig_airbnb_welcome"
+                title: "Tændt (AirBnB)"
+                message: "Entré, stue, køkken, spisestue tændt på lux-tilpasset niveau."
+        # Branch Normal + grace=on: undo exit (BUND long pressed in last 10 min)
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.entre_somrig_undo_grace
+              state: "on"
+          sequence:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.house_state
+              data:
+                option: "Active"
+            - service: scene.turn_on
+              target:
+                entity_id: scene.entre_somrig_undo_snapshot
+              data:
+                transition: 2
+            # 2026-07-18e: undo = TOP-tryk = menneske hjemme → stempl last_press
+            # (default dim-up-grenen gør det; undo-grenen manglede det).
+            - service: input_datetime.set_datetime
+              target:
+                entity_id: input_datetime.styrbar_last_press_entre
+              data:
+                datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+            - service: input_boolean.turn_off
+              target:
+                entity_id:
+                  - input_boolean.entre_somrig_undo_grace
+                  # 2026-06-16: undo rydder også nedluknings-grace → huset
+                  # tilbage til fuld auto med det samme.
+                  - input_boolean.entre_shutdown_grace
+            - service: persistent_notification.dismiss
+              data:
+                notification_id: "somrig_leave"
+            - service: persistent_notification.create
+              data:
+                notification_id: "somrig_undo"
+                title: "Undo exit"
+                message: "Lys + gardiner gendannet til foer-exit state"
+      # Default: dim UP entre_loft via cursor-based ladder
+      default:
+        - service: input_select.select_option
+          target:
+            entity_id: input_select.house_state
+          data:
+            option: "Active"
+        - variables:
+            # (B49: AirBnB-ladder fjernet — AirBnB fanges af welcome-branchen
+            # ovenfor og når aldrig denne default.)
+            ladder: "{{ [0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100] }}"
+            # Cursor age <2s = trust cursor (rapid-tap session).
+            # Cursor age >=2s = re-sync fra bulb (fresh session, app/scene
+            # kan have ændret brightness siden).
+            cursor_age: >-
+              {{ (now() - states.input_number.entre_brightness_cursor.last_changed).total_seconds() }}
+            current_pct: >-
+              {% if cursor_age < 2 %}
+                {{ states('input_number.entre_brightness_cursor') | int(0) }}
+              {% else %}
+                {% set s = states('light.entre_loft') %}
+                {% set b = state_attr('light.entre_loft', 'brightness') %}
+                {% if s == 'on' and b is not none %}
+                  {{ (b / 2.55) | round(0) | int }}
+                {% else %}
+                  0
+                {% endif %}
+              {% endif %}
+            # Off + UP = time-aware default (50% day, 10% night).
+            # On + UP = næste ladder-step > current.
+            next_pct: >-
+              {% if current_pct | int == 0 %}
+                {% set elev = state_attr('sun.sun', 'elevation') | float(0) %}
+                {{ 50 if elev > 0 else 10 }}
+              {% else %}
+                {% set ns = namespace(found=ladder | max) %}
+                {% for val in ladder %}
+                  {% if val > current_pct | int and ns.found_set is not defined %}
+                    {% set ns.found = val %}
+                    {% set ns.found_set = true %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.found }}
+              {% endif %}
+        - service: input_number.set_value
+          target:
+            entity_id: input_number.entre_brightness_cursor
+          data:
+            value: "{{ next_pct | int }}"
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: light.entre_loft
+          data:
+            brightness_pct: "{{ next_pct | int }}"
+            transition: 0.3
+        - service: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.styrbar_last_press_entre
+          data:
+            datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+        - service: input_select.select_option
+          target:
+            entity_id: input_select.room_mode_entre
+          data:
+            option: "Manual"
+
+# ---------------------------------------------------------------------------
+# TOP — long press: NØDLYS (alt lys fuldt hvidt, overstyrer alt)
+# ---------------------------------------------------------------------------
+# id'et er bevaret fra den gamle "tænd alt lux-tilpasset"-macro (2026-06-04),
+# så automation-entity'en ikke bliver en registry-orphan.
+- id: entre_somrig_top_long_welcome_4rum
+  alias: "Entré Styrbar: TOP long -> nødlys"
+  description: >
+    2026-10-15 (user-spec): "langt tryk op og 3 hurtige piletryk og 3 hurtige
+    op tryk skal alle starte nødlys på entre styrbar". Erstatter den tidligere
+    "tænd ALT indvendigt lys lux-tilpasset" (30-70 %, 12 % om natten). Ingen
+    mode-gate: virker også i AirBnB og under godnat. Selve nødlyset (maling,
+    overstyring, udgange) bor i packages/noedlys.yaml.
+
+    Trigger = "move_with_on_off" (start), ikke release — release-eventet er
+    ens for TOP og BUND (IKEA-quirk, sprint 2026-05-25).
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "8d:72:8b:88:07:4a:d1:aa"
+        command: "move_with_on_off"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.noedlys_aktiv
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.styrbar_last_press_entre
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+# ---------------------------------------------------------------------------
+# BUND — quick tap: sluk ALT lys (uden gardiner) + grace (AirBnB: sluk alt)
+# ---------------------------------------------------------------------------
+- id: entre_somrig_bund_quick_dim_down
+  alias: "Entré Styrbar: BUND quick -> sluk ALT lys (uden gardiner) + grace"
+  description: >
+    2026-06-16 (user-spec) — REDESIGN: kort NED dæmper IKKE længere entré ned
+    (den gamle "intuitive dimmer"). Nu = sluk ALT lys (også entré), INGEN
+    gardiner, + 5-min nedluknings-grace så bevægelse ikke tænder lys igen.
+    2 branches:
+    1. AirBnB → simpel sluk alt lys (light.alle_lys), uændret (ingen snapshot/grace).
+    2. Normal → script.entre_ned_sluk_alt (sluk alt + snapshot/undo + grace).
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "8d:72:8b:88:07:4a:d1:aa"
+        command: "off"
+  action:
+    # NØDLYS-UDGANG (2026-10-15): NED slukker nødlyset FØRST — ellers ville
+    # nødlysets sluk-fanger tænde alt igen 400 ms efter sluk-alt nedenfor.
+    - if:
+        - condition: state
+          entity_id: input_boolean.noedlys_aktiv
+          state: "on"
+      then:
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.noedlys_aktiv
+    - choose:
+        # Branch AirBnB (2026-06-30, user undtagelse 4): sluk ALT lys i
+        # lejligheden (light.alle_lys = inkl. terrasse) + nedluknings-grace, så
+        # bevægelse ikke tænder lys igen mens gæsten går mod døren/sengen.
+        # Grace-varigheden styres af slider input_number.entre_shutdown_grace_minutes
+        # (samme flag + clear-automation som Normal). Gardiner røres ikke.
+        - conditions:
+            - condition: state
+              entity_id: input_select.house_mode
+              state: "AirBnB"
+          sequence:
+            # 2026-09-02c: subtrahér et OPTAGET bad. godnat_fuld har haft denne
+            # undtagelse siden 07-16, men den lå inline dér — så denne gren tog
+            # bad-spottene med og sort-slukkede en gæst midt i badet (fejlklasse
+            # #2/#12). Ankeret er sensor.badevaerelse_sluk_alt_undtagelse.
+            # 2026-09-02d: kvittér for udsættelsen, så efterslæbet kan indhente
+            # spottene når gæsten er ude af badet igen.
+            - service: script.badevaerelse_sluk_alt_udskyd
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: >-
+                  {{ expand('light.alle_lys')
+                     | rejectattr('entity_id', 'in',
+                         state_attr('sensor.badevaerelse_sluk_alt_undtagelse', 'lys')
+                         | default([], true) | list)
+                     | map(attribute='entity_id') | list }}
+              data:
+                transition: 5
+            - service: input_number.set_value
+              target:
+                entity_id: input_number.entre_brightness_cursor
+              data:
+                value: 0
+            - service: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.entre_shutdown_grace
+            # B49: stempel manglede i AirBnB-grenen (Normal-grenen har det) —
+            # forbrugere af styrbar_last_press_entre skal se NED-tryk i begge modes.
+            - service: input_datetime.set_datetime
+              target:
+                entity_id: input_datetime.styrbar_last_press_entre
+              data:
+                datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+            - service: persistent_notification.create
+              data:
+                notification_id: "somrig_airbnb_off"
+                title: "Sluk alt (AirBnB)"
+                message: >
+                  Alle lys slukket. Bevægelse tænder ikke lys i
+                  {{ states('input_number.entre_shutdown_grace_minutes') | int(5) }} min.
+                  Gardiner uændret.
+      # Default (2026-06-16): sluk ALT lys (også entré), ingen gardiner, + grace.
+      default:
+        - service: script.entre_ned_sluk_alt
+        - service: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.styrbar_last_press_entre
+          data:
+            datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+        - service: persistent_notification.create
+          data:
+            notification_id: "somrig_leave"
+            title: "Alt slukket"
+            message: >
+              Alt lys slukket (gardiner uændret). Bevægelse tænder ikke lys i
+              5 min. Tryk TOP indenfor 10 min for at gendanne.
+
+# ---------------------------------------------------------------------------
+# Auto-clear af undo grace efter 10 min
+# ---------------------------------------------------------------------------
+- id: entre_somrig_undo_grace_clear
+  alias: "Entré Styrbar: Auto-ryd undo grace efter 10 min"
+  description: >
+    Naar grace har staaet on i 10 min uden TOP-press, slukker vi den.
+
+    3 triggers + template-condition. State-trigger fanger normal case.
+    Homeassistant:start re-evaluerer post-restart fordi state-trigger med
+    `for:` fyrer ikke når state allerede er "on" pre-reload (HA bug:
+    for:-timer restartes ikke automatisk efter automation reload). Time-
+    pattern hver 5 min er safety-net hvis state-trigger missed.
+  mode: restart
+  trigger:
+    - platform: state
+      entity_id: input_boolean.entre_somrig_undo_grace
+      to: "on"
+      for:
+        minutes: 10
+    - platform: homeassistant
+      event: start
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: input_boolean.entre_somrig_undo_grace
+      state: "on"
+    - condition: template
+      value_template: >
+        {{ (now() - states.input_boolean.entre_somrig_undo_grace.last_changed).total_seconds() > 600 }}
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.entre_somrig_undo_grace
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: "somrig_leave"
+
+# ---------------------------------------------------------------------------
+# Auto-clear af nedluknings-grace efter 5 min
+# ---------------------------------------------------------------------------
+- id: entre_shutdown_grace_clear
+  alias: "Entré Styrbar: Auto-ryd nedluknings-grace efter slider-min"
+  description: >
+    Nedluknings-grace (set af NED kort/lang i Normal OG AirBnB) holder ALLE
+    presence-relights blokeret så et NED-tryk reelt slukker alt trods bevægelse.
+    Varigheden styres nu af slider input_number.entre_shutdown_grace_minutes
+    (default 5 min; var hardcodet 5). Samme 3-trigger-mønster som
+    entre_somrig_undo_grace_clear: state-trigger (normal), homeassistant:start
+    (for:-timer overlever ikke reload), time_pattern /1 (safety-net + fanger
+    slider-ændringer hurtigt ned til 1-min granularitet).
+  mode: restart
+  trigger:
+    - platform: state
+      entity_id: input_boolean.entre_shutdown_grace
+      to: "on"
+      for:
+        minutes: "{{ states('input_number.entre_shutdown_grace_minutes') | int(5) }}"
+    - platform: homeassistant
+      event: start
+    - platform: time_pattern
+      minutes: "/1"
+  condition:
+    - condition: state
+      entity_id: input_boolean.entre_shutdown_grace
+      state: "on"
+    - condition: template
+      value_template: >
+        {{ (now() - states.input_boolean.entre_shutdown_grace.last_changed).total_seconds()
+           >= (states('input_number.entre_shutdown_grace_minutes') | float(5) * 60) }}
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.entre_shutdown_grace
+
+# ---------------------------------------------------------------------------
+# BUND — long press: sluk alt + undo-snapshot (IKKE Dormant)
+# ---------------------------------------------------------------------------
+- id: entre_somrig_bund_long_leave
+  alias: "Entré Styrbar: BUND long -> sluk alt (uden gardiner) + Roborock full"
+  description: >
+    2026-06-16 (user-spec): "det samme som NED kort PLUS grundig rengøring".
+    = script.entre_ned_sluk_alt (sluk alt lys, INGEN gardiner, snapshot/undo,
+    5-min grace) + script.roborock_start_full (støvsug + mop). Gardin-lukning
+    via sluk_alt er FJERNET (NED må ikke røre gardiner).
+    --- tidligere doc ---
+    "Sluk alt mens vi er hjemme" — snapshot + script.sluk_alt (med fades).
+    Grace-flag aktiveres så TOP quick indenfor 10 min restorerer alt.
+    2026-06-02 (per user): house_state → Dormant FJERNET. Entré Styrbar må KUN
+    erklære HJEMME, ikke "ingen hjemme" — knappen bruges ofte til at slukke alt
+    mens man ER hjemme, og må ikke putte huset i Dormant (det blokerede bl.a.
+    depot-valhorn). Faktisk afgang → Dormant håndteres af phone-GPS-away.
+    Sprint 2026-05-25: snapshot flyttet hertil fra BUND quick (som nu bare
+    dimmer entré). Godnat-routine flyttet til sove-Somrig per sprint 2026-05-22.
+
+    Sprint 2026-05-25 fix: trigger ændret fra "stop" (release) til "move"
+    (start). IKEA Styrbar firmware sender ALDRIG "stop" — release-event er
+    altid "stop_with_on_off" uanset top/bund (ambiguous). "move" med
+    args[0]=1 (move_mode DOWN) er unambiguous BUND-only. Verificeret via
+    zha_event log. Sluk-alt fyrer nu korrekt ved BUND long-press.
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "8d:72:8b:88:07:4a:d1:aa"
+        command: "move"
+  condition:
+    # 2026-06-30 (user undtagelse 4): i AirBnB er entré-Styrbar KUN op/ned.
+    # Lang-tryk (sluk alt + rengøring) er deaktiveret — gæste-sikkert.
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+  action:
+    # NØDLYS-UDGANG (2026-10-15): under nødlys = som NED kort (slå nødlyset
+    # fra FØRST, så sluk-fangeren ikke tænder igen, og sluk alt) — men UDEN
+    # robotstøvsugeren: den skal ikke køre rundt ved en ulykke.
+    - if:
+        - condition: state
+          entity_id: input_boolean.noedlys_aktiv
+          state: "on"
+      then:
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.noedlys_aktiv
+        - service: script.entre_ned_sluk_alt
+        - service: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.styrbar_last_press_entre
+          data:
+            datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+        - stop: "Nødlys slukket med NED langt"
+    # 2026-06-16: sluk alt lys (INGEN gardiner) + snapshot/undo + 5-min grace.
+    # Delt med NED kort (script.entre_ned_sluk_alt). Gardin-lukkende sluk_alt
+    # er fjernet — NED må ikke røre gardiner. house_state → Dormant blev fjernet
+    # 2026-06-02 (entré må kun erklære HJEMME).
+    - service: script.entre_ned_sluk_alt
+    # 2026-07-18e: BUND-long er en HJEMME-gestus (2026-06-02: entré-Styrbar må kun
+    # erklære hjemme) → stempl last_press ligesom BUND-quick, så wasp-disarm +
+    # physical-presence-tracker ser trykket (script.entre_ned_sluk_alt stempler ikke).
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.styrbar_last_press_entre
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    # PLUS grundig rengøring: full clean (støvsug + mop).
+    - service: script.roborock_start_full
+    - service: persistent_notification.create
+      data:
+        notification_id: "somrig_leave"
+        title: "Alt slukket + rengøring"
+        message: >
+          Alt lys slukket (gardiner uændret) + Roborock full clean startet.
+          Bevægelse tænder ikke lys i 5 min. Tryk TOP indenfor 10 min for undo.
+
+# ---------------------------------------------------------------------------
+# L/R — mode cycle [auto, zen, all_bright, all_off]
+# ---------------------------------------------------------------------------
+# L = previous mode (wrap), R = next mode (wrap). input_number.entre_mode_idx
+# tracker cursor 0-3. Hvert mode er en distinkt "stemning" — auto resetter
+# huset til presence-styret, zen er sofa-ambient, all_bright = whole-house @
+# 100%, all_off = sluk_alt.
+# ---------------------------------------------------------------------------
+- id: entre_styrbar_lr_mode_cycle
+  alias: "Entré Styrbar: L/R mode cycle [auto, zen, all_bright, all_off]"
+  description: >
+    L/R quick på entré Styrbar = cycle mellem 4 modes. Cursor wraps via
+    modulo 4. Hver mode-apply er one-shot — ikke persistent state machine.
+    User kan altid bryde ud via TOP/BUND eller dashboard-scene.
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "8d:72:8b:88:07:4a:d1:aa"
+    # Filter command via condition (kan ikke gøres i event_data fordi vi
+    # accepterer 2 commands; et OR-trigger per command er længere).
+  condition:
+    # ⚠️ QUIRK-FIX 2026-07-16 (bug-hunt, fejlklasse #6): den FYSISKE entré-
+    # Styrbar emit'er den GAMLE ZHA-quirk for pilene: `press` med retning i
+    # args[0] — IKKE `arrow_left_click`/`arrow_right_click`. Bevis i recorder:
+    # press [257, 13, 0] 2026-07-03 07:05 uden effekt; arrow_* er ALDRIG set
+    # fra denne remote. Vi accepterer nu BEGGE quirk-former (retnings-encoding
+    # spejlet fra universal-handleren i styrbar_rooms.yaml).
+    - condition: template
+      value_template: >
+        {{ trigger.event.data.command in
+           ['arrow_left_click', 'arrow_right_click', 'press'] }}
+  action:
+    # NØDLYS (2026-10-15, user-spec): 3 hurtige piletryk = nødlys, OGSÅ i
+    # AirBnB og om natten. Tælles FØRST og blokerende: det 3. tryk må ikke
+    # også køre en mode (fx all_off → sluk_alt) i kapløb med nødlyset.
+    # mode: restart er ufarlig her — tælleren er et queued script, og
+    # nødlysets start kører i sin egen automation (flag-flanken).
+    - service: script.noedlys_tael_tryk
+      data:
+        ts: "{{ as_timestamp(trigger.event.time_fired) }}"
+    - condition: state
+      entity_id: input_boolean.noedlys_aktiv
+      state: "off"
+    # 2026-06-30 (user undtagelse 4): i AirBnB er entré-Styrbar KUN op/ned.
+    # L/R mode-cycle er deaktiveret — gæste-sikkert (nødlys-tælleren ovenfor
+    # kører dog stadig).
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    - variables:
+        cmd: "{{ trigger.event.data.command }}"
+        # Retning fra command (ny quirk) ELLER args[0] (gammel quirk):
+        # 257/0/2/258 = venstre, ellers (256) = højre.
+        direction: >-
+          {% set a = trigger.event.data.args | default([]) %}
+          {% if cmd == 'arrow_left_click' %}left
+          {% elif cmd == 'arrow_right_click' %}right
+          {% elif (a[0] | default(-1)) in [257, 0, 2, 258] %}left
+          {% else %}right{% endif %}
+        step: "{{ -1 if direction == 'left' else 1 }}"
+        cur_idx: "{{ states('input_number.entre_mode_idx') | int(0) }}"
+        new_idx: "{{ (cur_idx + step) % 4 }}"
+        modes: ['auto', 'zen', 'all_bright', 'all_off']
+        new_mode: "{{ modes[new_idx] }}"
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.entre_mode_idx
+      data:
+        value: "{{ new_idx }}"
+    - service: logbook.log
+      data:
+        name: "Entré Styrbar L/R"
+        message: >
+          {{ cmd }} → mode {{ new_idx }}/{{ modes | length - 1 }} = {{ new_mode }}
+    # 2026-07-18e: L/R er også et menneske-tryk i entréen → stempl last_press
+    # (som TOP/BUND gør). Ellers ser wasp-disarm, physical-presence-tracker,
+    # motion-off/phantom-skip og entre_ned_dormant-annullér IKKE trykket
+    # (entre_ned_dormant-kommentaren lovede "L/R" annullerede — nu sandt).
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.styrbar_last_press_entre
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - choose:
+        # --- Mode 0: AUTO — clear scene + reset all room_modes to Auto ---
+        - conditions:
+            - condition: template
+              value_template: "{{ new_mode == 'auto' }}"
+          sequence:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.active_scene
+              data:
+                option: "none"
+            # Reset cinema/cirkus flags så drift_back virker
+            - service: input_boolean.turn_off
+              target:
+                entity_id:
+                  - input_boolean.cinema_active
+                  - input_boolean.cirkus_active
+            # Alle room_modes tilbage til Auto (presence-lights tager over)
+            - service: input_select.select_option
+              target:
+                entity_id: !include ../rosters/alle_rum_mode.yaml
+              data:
+                option: "Auto"
+            - service: persistent_notification.create
+              data:
+                notification_id: "entre_mode"
+                title: "Mode: Auto"
+                message: "Scene clearet + alle rum tilbage til presence-styret."
+        # --- Mode 1: ZEN — sofa ambient ---
+        - conditions:
+            - condition: template
+              value_template: "{{ new_mode == 'zen' }}"
+          sequence:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.active_scene
+              data:
+                option: "zen"
+            - service: script.scene_zen
+            - service: persistent_notification.create
+              data:
+                notification_id: "entre_mode"
+                title: "Mode: Zen"
+                message: "Sofa-ambient aktiveret."
+        # --- Mode 2: ALL BRIGHT — whole house @ 100% ---
+        - conditions:
+            - condition: template
+              value_template: "{{ new_mode == 'all_bright' }}"
+          sequence:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.house_state
+              data:
+                option: "Active"
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.active_scene
+              data:
+                option: "full_bright"
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.alle_lys
+              data:
+                brightness_pct: 100
+                color_temp_kelvin: 2700
+                transition: 3
+            # bri+ct+transition lander TRADFRI WS-pæren på 2 % (2026-08-18)
+            # — se packages/light_groups.yaml. Entréen er UDE af listen siden
+            # 2026-08-21: loftet er en KAJPLATS på Matter og har ikke quirken.
+            - service: script.tradfri_ws_bri_fix
+              data:
+                entity_id:
+                  - light.depot_loft_ikea
+                brightness_pct: 100
+            - service: persistent_notification.create
+              data:
+                notification_id: "entre_mode"
+                title: "Mode: All Bright"
+                message: "Alle lys @ 100% 2700K."
+        # --- Mode 3: ALL OFF — sluk alt med fades ---
+        - conditions:
+            - condition: template
+              value_template: "{{ new_mode == 'all_off' }}"
+          sequence:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.active_scene
+              data:
+                option: "none"
+            - service: script.sluk_alt
+            - service: persistent_notification.create
+              data:
+                notification_id: "entre_mode"
+                title: "Mode: All Off"
+                message: "Alt slukket via script.sluk_alt (med fades)."

@@ -1,0 +1,332 @@
+# =============================================================================
+# Smartere Dormant-registrering — skema-drevet (opg 8, user-spec 2026-06-10)
+# =============================================================================
+# Formål: huset skal hurtigere i Dormant på dage hvor alle er ude, så
+# Roborock-støvsugeren (automations/roborock.yaml) kan komme i gang.
+# De eksisterende Dormant-paths (3h ingen GPS+fysisk, GPS-fast >1km) i
+# packages/house_modes.yaml kører UÆNDRET videre — det her er to EKSTRA paths:
+#
+#   1. HVERDAGE kl 09:30: huset er Active → Dormant, MEDMINDRE der er
+#      registreret bevægelse eller knaptryk i vinduet 08:45–09:30.
+#   2. WEEKEND "stearinlys"-counter: et 60-minutters lys der brænder ned for
+#      hvert minut UDEN fysisk aktivitet. Mindste tegn på fysisk
+#      tilstedeværelse (automations tæller IKKE) genstarter lyset. Kører kun
+#      09:31–15:00, og kun hvis huset ikke allerede er Dormant.
+#
+# 2026-10-10: alle tal ovenfor er nu sliders/tider i packages/global_tuning.yaml
+# (defaults = tallene ovenfor), og hver regel har sin egen kill-switch:
+#   input_boolean.dormant_skema_hverdag_enabled / _weekend_enabled
+#   input_datetime.dormant_skema_hverdag_tid (09:30)
+#   input_number.dormant_skema_hverdag_vindue_minutter (45 → 08:45)
+#   input_datetime.dormant_skema_weekend_start / _slut (09:31 / 15:00)
+#   input_number.dormant_skema_weekend_minutter (60)
+# En tid på sentinel 00:00:00 (urørt helper) slår reglen fra i stedet for at
+# fyre ved midnat.
+#
+# Aktivitets-kilde: sensor.last_physical_activity (packages/house_modes.yaml)
+# — trigger-baseret timestamp på seneste occupancy/dør-TRANSITION eller
+# knaptryk. Automations rører den ikke → "automations ignoreres" er gratis.
+# Stearinlys-genstart = timestampen rykker frem → elapsed nulstilles.
+#
+# SIKKERHEDS-VETO i begge paths: en occupancy-sensor der ER on lige nu (og
+# ikke stuck, last_changed <24h) = nogen sidder stille hjemme (Apollo radar
+# holder on uden nye transitions) → ALDRIG Dormant hen over hovedet på dem.
+# Samme (a)-logik som binary_sensor.physical_presence_recent. Vi bruger
+# BEVIDST ikke hele physical_presence_recent (3h-vindue) — den ville lade
+# morgenrutine-aktivitet kl 07 blokere 09:30-reglen, stik imod spec.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1) HVERDAGE: Dormant kl 09:30 hvis ingen aktivitet 08:45-09:30
+# ---------------------------------------------------------------------------
+- id: house_dormant_weekday_0930
+  alias: "Hus: Dormant på hverdags-skema (default 09:30, ingen aktivitet i forvejen)"
+  description: >
+    Hverdage kl 09:30: Active → Dormant medmindre der var fysisk aktivitet
+    (sensor-transition/knaptryk) i vinduet 08:45-09:30, eller nogen sidder
+    stille hjemme (occupancy on, ikke-stuck).
+  mode: single
+  trigger:
+    - platform: time
+      at: input_datetime.dormant_skema_hverdag_tid
+  condition:
+    - condition: state
+      entity_id: input_boolean.dormant_skema_hverdag_enabled
+      state: "on"
+    - condition: template
+      value_template: "{{ states('input_datetime.dormant_skema_hverdag_tid') not in ['00:00:00', 'unknown', 'unavailable'] }}"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Kun hverdage (workday-sensor med ugedags-fallback, samme mønster som
+    # binary_sensor.kids_weekday)
+    - condition: template
+      value_template: >-
+        {% set ws = states('binary_sensor.workday_sensor') %}
+        {{ ws == 'on'
+           or (ws in ['unknown','unavailable','none'] and now().isoweekday() <= 5) }}
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    # VETO 1: fysisk aktivitet i vinduet [tid − N min, tid] (default 08:45-09:30)
+    - condition: template
+      value_template: >-
+        {% set t = states('sensor.last_physical_activity') %}
+        {% set fra = today_at(states('input_datetime.dormant_skema_hverdag_tid'))
+                     - timedelta(minutes=states('input_number.dormant_skema_hverdag_vindue_minutter') | int(45)) %}
+        {{ t in ['unknown','unavailable','none','']
+           or as_datetime(t) < fra }}
+    # VETO 2: nogen sidder stille hjemme (occupancy on, ikke stuck >24h)
+    - condition: template
+      value_template: >-
+        {% set occ = [
+          'binary_sensor.stue_apollo_occupancy_filtered',
+          'binary_sensor.spisestue_apollo_occupancy_filtered',
+          'binary_sensor.koekken_apollo_occupancy_filtered',
+          'binary_sensor.badevaerelse_inde_occupancy',
+          'binary_sensor.sovevaerelse_dvale_vidne',
+          'binary_sensor.boernevaerelse_apollo_occupancy',
+          'binary_sensor.depot_valhorn_occupancy',
+          'binary_sensor.entre_valhorn_occupancy'
+        ] %}
+        {% set ns = namespace(present=false) %}
+        {% for s in occ %}
+          {% if is_state(s, 'on') %}
+            {% set lc = states[s].last_changed %}
+            {% if lc is not none and (now() - lc).total_seconds() < 86400 %}
+              {% set ns.present = true %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ not ns.present }}
+    # VETO 3: åben altandør = nogen er på terrassen (samme som hoved-path)
+    - condition: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      state: "off"
+    # VETO 4 (2026-07-05, wasp-in-a-box): kræv at en yderdør er åbnet siden
+    # sidste ophold indenfor. En stille person hjemme (radar taber still-target)
+    # må ikke Dormant'es kl 09:30 uden et ægte udgangs-event. Se
+    # packages/wasp_in_a_box.yaml.
+    - condition: state
+      entity_id: binary_sensor.wasp_dormant_allowed
+      state: "on"
+  action:
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_state
+      data:
+        option: "Dormant"
+    # Samme oprydning som GPS-fast Dormant (house_modes.yaml): clear flags +
+    # sluk indvendige lys (terrasse styres separat).
+    - service: input_boolean.turn_off
+      target:
+        entity_id: !include ../rosters/godnat_flag.yaml
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.alle_indvendige
+      data:
+        transition: 10
+    - service: logbook.log
+      data:
+        name: "Dormant skema"
+        message: >-
+          Hverdag {{ states('input_datetime.dormant_skema_hverdag_tid')[:5] }}-regel:
+          ingen fysisk aktivitet de sidste
+          {{ states('input_number.dormant_skema_hverdag_vindue_minutter') | int(45) }} min
+          (sidste: {{ states('sensor.last_physical_activity') }}) → Dormant.
+
+# ---------------------------------------------------------------------------
+# 2) WEEKEND: 60-min "stearinlys" suspicion counter, 09:31-15:00
+# ---------------------------------------------------------------------------
+# Lyset tændes konceptuelt kl 09:31 og brænder 60 min. Hvert minut uden
+# fysisk aktivitet brænder det ned; enhver aktivitet genstarter det (via
+# last_physical_activity-timestampen). Udbrændt = Dormant.
+# Implementering: poll hvert 5. minut; elapsed = now - max(last_activity,
+# i dag 09:31) ≥ 60 min → Dormant. Tidligste weekend-Dormant er dermed 10:31.
+- id: house_dormant_weekend_candle
+  alias: "Hus: Dormant weekend-stearinlys (default 60 min uden aktivitet, 09:31-15:00)"
+  description: >
+    Weekend 09:31-15:00: hvis der er gået 60 min uden nogen som helst fysisk
+    aktivitet (målt fra senest af: sidste aktivitet / vinduesstart 09:31),
+    går huset Dormant. Enhver fysisk aktivitet genstarter lyset.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    # Kun i vinduet 09:31-15:00 (tidligste fire reelt 10:31 pga 60-min lys)
+    - condition: state
+      entity_id: input_boolean.dormant_skema_weekend_enabled
+      state: "on"
+    - condition: template
+      value_template: >-
+        {{ states('input_datetime.dormant_skema_weekend_start') not in ['00:00:00', 'unknown', 'unavailable']
+           and states('input_datetime.dormant_skema_weekend_slut') not in ['00:00:00', 'unknown', 'unavailable'] }}
+    - condition: time
+      after: input_datetime.dormant_skema_weekend_start
+      before: input_datetime.dormant_skema_weekend_slut
+    # Kun hvis ikke allerede Dormant ("af en eller anden grund") — og kun
+    # fra Active (Night/andet skal ikke hoppe til Dormant herfra).
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Kun weekend (ikke-workday — fridage tæller som weekend)
+    - condition: template
+      value_template: >-
+        {% set ws = states('binary_sensor.workday_sensor') %}
+        {{ ws == 'off'
+           or (ws in ['unknown','unavailable','none'] and now().isoweekday() > 5) }}
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    # STEARINLYSET: 60 min uden aktivitet, målt fra max(aktivitet, 09:31)
+    - condition: template
+      value_template: >-
+        {% set t = states('sensor.last_physical_activity') %}
+        {% set act = as_datetime(t) if t not in ['unknown','unavailable','none','']
+                     else today_at('00:00') %}
+        {% set start = [act, today_at(states('input_datetime.dormant_skema_weekend_start'))] | max %}
+        {{ (now() - start).total_seconds()
+           >= (states('input_number.dormant_skema_weekend_minutter') | int(60)) * 60 }}
+    # Samme occupancy-/altandørs-vetoer som 09:30-reglen
+    - condition: template
+      value_template: >-
+        {% set occ = [
+          'binary_sensor.stue_apollo_occupancy_filtered',
+          'binary_sensor.spisestue_apollo_occupancy_filtered',
+          'binary_sensor.koekken_apollo_occupancy_filtered',
+          'binary_sensor.badevaerelse_inde_occupancy',
+          'binary_sensor.sovevaerelse_dvale_vidne',
+          'binary_sensor.boernevaerelse_apollo_occupancy',
+          'binary_sensor.depot_valhorn_occupancy',
+          'binary_sensor.entre_valhorn_occupancy'
+        ] %}
+        {% set ns = namespace(present=false) %}
+        {% for s in occ %}
+          {% if is_state(s, 'on') %}
+            {% set lc = states[s].last_changed %}
+            {% if lc is not none and (now() - lc).total_seconds() < 86400 %}
+              {% set ns.present = true %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ not ns.present }}
+    - condition: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      state: "off"
+    # Wasp-in-a-box (2026-07-05): kræv et ægte udgangs-event før weekend-Dormant.
+    - condition: state
+      entity_id: binary_sensor.wasp_dormant_allowed
+      state: "on"
+  action:
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_state
+      data:
+        option: "Dormant"
+    - service: input_boolean.turn_off
+      target:
+        entity_id: !include ../rosters/godnat_flag.yaml
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.alle_indvendige
+      data:
+        transition: 10
+    - service: logbook.log
+      data:
+        name: "Dormant skema"
+        message: >-
+          Weekend-stearinlys udbrændt:
+          {{ states('input_number.dormant_skema_weekend_minutter') | int(60) }}+ min uden fysisk aktivitet
+          (sidste: {{ states('sensor.last_physical_activity') }}) → Dormant.
+
+# ---------------------------------------------------------------------------
+# 3) VAGT: Dormant men nogen sidder stille hjemme → bounce til Active
+# ---------------------------------------------------------------------------
+# 2026-06-12 incident: manuel Dormant (app-tap på house_state-select) mens
+# stue-occupancy var on. 'Hus: Skift til Active' kræver en occupancy-
+# TRANSITION (to: on) — radar der HOLDER on (nogen sidder stille og
+# arbejder) giver ingen transition, så huset blev hængende i Dormant og
+# Roborock startede. Auto-Dormant-paths veto'er selv occupancy, så hvis
+# huset er Dormant OG en ikke-stuck occupancy-sensor er on, er det enten
+# en manuel/fejlagtig Dormant eller en sensor der flippede on i settle-
+# vinduet → Active er korrekt i begge tilfælde.
+# 5 min 'for:' giver Somrig manuel-dvale-flowet (man trykker når man går)
+# tid til at radaren clearer efter man har forladt rummet.
+- id: house_dormant_occupied_bounce
+  alias: "Hus: Dormant men occupancy on → bounce til Active (vagt)"
+  description: >
+    Huset har været Dormant i 5 min mens en occupancy-sensor (ikke-stuck,
+    last_changed <24h) holder on → nogen er hjemme, sæt Active. Dækker
+    manuel Dormant hen over hovedet på folk der sidder stille.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_select.house_state
+      to: "Dormant"
+      for:
+        minutes: 5
+    # 2026-06-12: re-check når robotten docker — Dormant-triggeren ovenfor
+    # fyrer kun ved transition, så uden denne ville en human der kom hjem
+    # under en rengøring aldrig blive opdaget af vagten.
+    - platform: state
+      entity_id: vacuum.s8_maxv_ultra
+      to: "docked"
+      for:
+        minutes: 5
+  condition:
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Dormant"
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    # 2026-06-12: Roborock i bevægelse trigger radar-occupancy — vagten må
+    # ikke bounce huset til Active pga. robottens egen motion (ville få
+    # dormant_interrupt til at docke robotten = selvmodsigende).
+    - condition: template
+      value_template: >-
+        {{ states('vacuum.s8_maxv_ultra') not in ['cleaning', 'returning'] }}
+    - condition: template
+      value_template: >-
+        {% set occ = [
+          'binary_sensor.stue_apollo_occupancy_filtered',
+          'binary_sensor.spisestue_apollo_occupancy_filtered',
+          'binary_sensor.koekken_apollo_occupancy_filtered',
+          'binary_sensor.badevaerelse_inde_occupancy',
+          'binary_sensor.sovevaerelse_dvale_vidne',
+          'binary_sensor.boernevaerelse_apollo_occupancy',
+          'binary_sensor.depot_valhorn_occupancy',
+          'binary_sensor.entre_valhorn_occupancy'
+        ] %}
+        {% set ns = namespace(present=false) %}
+        {% for s in occ %}
+          {% if is_state(s, 'on') %}
+            {% set lc = states[s].last_changed %}
+            {% if lc is not none and (now() - lc).total_seconds() < 86400 %}
+              {% set ns.present = true %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.present }}
+  action:
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_state
+      data:
+        option: "Active"
+    - service: logbook.log
+      data:
+        name: "Dormant skema"
+        message: >-
+          Bounce-vagt: huset var Dormant i 5 min med occupancy on →
+          tilbage til Active (nogen er hjemme).

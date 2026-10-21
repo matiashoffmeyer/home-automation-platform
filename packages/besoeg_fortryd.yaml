@@ -1,0 +1,266 @@
+# =============================================================================
+# "FORTRYD" — et auto-sluk der modsiges af en frisk detektion var for tidligt
+# 2026-08-28 (user-rapport: "bad og depot slukkede under presence")
+# =============================================================================
+# MÅLT den morgen (recorder, lokal tid):
+#   Depot  07:03:03 tændt → 07:03:22 PIR off → 07:03:47 slukket (Quick, 25 s)
+#          07:06:15 tændt igen → slukket 07:07:13 → 07:08:07 tændt → 07:09:16.
+#   Bad    07:04:53 begge indre-PIR off → 07:06:43 leave-off slukkede (110 s ro,
+#          dør åben) → 07:06:58 PIR igen = 15 SEKUNDER efter. Så 07:08:29 og
+#          07:11:52. Samme menneske, samme besøg, tre slukninger.
+#
+# FÆLLES ÅRSAG: begge rums stadie-maskiner NULSTILLER ved hvert sluk, så det
+# efterfølgende gen-tænd graderes som et helt nyt, umistænkeligt besøg — og får
+# derfor det KORTESTE hold der findes. Systemet lærer aldrig af sin egen fejl:
+# jo oftere det slukker forkert, jo hurtigere slukker det næste gang. Regningen
+# sendes til mennesket, der må vifte med armene igen (samme mønster som
+# spisestue-debouncen 08-26f).
+#
+# PRÆMIS: at lyset bliver tændt igen kort efter et AUTO-sluk er direkte bevis
+# for at kroppen aldrig forlod rummet. Det er et bevis rummets egne PIR'er
+# strukturelt ikke kan levere (en PIR ser ikke en der står i bruseren eller
+# sidder stille i depotet) — derfor er fortryd-signalet ikke redundant.
+#
+# TO RUM, TO MEKANIKKER — fordi deres sluk-veje er styret af hver sit:
+#   Depot: sluk-tiden ejes af input_select.depot_visit_stage → fortryd hæver
+#          stadiet ét trin over det stadie besøget HAVDE da det blev afbrudt.
+#          (Quick 25 s → Medium 120 s → Long ~10 min.)
+#   Bad:   sluk-tiden ejes af en FAKTOR alle bad-sluk-veje allerede ganger med
+#          (sensor.badevaerelse_bruser_off_factor). Fortryd armerer derfor den
+#          EKSISTERENDE bruser-vagt. Den vagt blev bygget 08-13 til præcis denne
+#          fejl, men kan kun armere når `alle_hjemme_i_bad` er sandt — og 08-28
+#          var person nr. 2 i depotet, så beviset kunne strukturelt ikke leveres.
+#          Fortryd er den hurtig-vej udenom, der gælder for den der ALLEREDE er
+#          bevist (08-27-reglen).
+#
+# Begge veje er selv-begrænsende: de kan kun gøre huset MERE tålmodigt, aldrig
+# tænde noget, og de udløber med besøget.
+# =============================================================================
+
+input_number:
+  # Hvor kort tid efter et auto-sluk et gen-tænd tæller som "det var forkert".
+  # 150 s valgt ud fra målingen: depotets tre gen-tænd kom 148 s / 54 s efter
+  # slukket, badets 15 s / 136 s. Alle inden for 150 s. Over ~3 min er det mere
+  # sandsynligt at nogen faktisk gik og kom tilbage.
+  besoeg_fortryd_sekunder:
+    name: "Besøg: fortryd-vindue"
+    min: 0
+    max: 600
+    step: 10
+    unit_of_measurement: s
+    icon: mdi:undo-variant
+    mode: slider
+
+input_datetime:
+  # Stemplet SKREVET ved auto-sluk. Bevidst en skrevet værdi og ikke lysets
+  # last_changed, som nulstilles ved HA-restart (permanent faktum).
+  depot_auto_off_at:
+    name: "Depot: auto-sluk tidspunkt"
+    has_date: true
+    has_time: true
+  badevaerelse_auto_off_at:
+    name: "Bad: auto-sluk tidspunkt"
+    has_date: true
+    has_time: true
+
+input_text:
+  # Hvilket stadie besøget stod på i det øjeblik auto-slukket faldt.
+  depot_stadie_ved_auto_off:
+    name: "Depot: stadie ved auto-sluk"
+    max: 10
+
+template:
+  - binary_sensor:
+      # Er der et FRISKT fortryd-vindue åbent for hvert rum? Guarden fejler
+      # LUKKET: et urørt has_date-input_datetime står på DAGENS midnat, ikke
+      # 1970, så `now() >= stemplet` ville være sandt hele dagen (08-26h).
+      # Tidsdelen '00:00:00' = aldrig sat.
+      - name: "Depot fortryd vindue"
+        unique_id: depot_fortryd_vindue
+        icon: mdi:undo-variant
+        state: >-
+          {% set s = states('input_datetime.depot_auto_off_at') %}
+          {% set w = states('input_number.besoeg_fortryd_sekunder') | float(150) %}
+          {% set ts = state_attr('input_datetime.depot_auto_off_at', 'timestamp') %}
+          {% if s in ['unknown', 'unavailable', 'none', ''] or s[11:] == '00:00:00'
+                or ts is none or w <= 0 %}
+            false
+          {% else %}
+            {{ 0 <= (now().timestamp() - ts) < w }}
+          {% endif %}
+
+      - name: "Badevaerelse fortryd vindue"
+        unique_id: badevaerelse_fortryd_vindue
+        icon: mdi:undo-variant
+        state: >-
+          {% set s = states('input_datetime.badevaerelse_auto_off_at') %}
+          {% set w = states('input_number.besoeg_fortryd_sekunder') | float(150) %}
+          {% set ts = state_attr('input_datetime.badevaerelse_auto_off_at', 'timestamp') %}
+          {% if s in ['unknown', 'unavailable', 'none', ''] or s[11:] == '00:00:00'
+                or ts is none or w <= 0 %}
+            false
+          {% else %}
+            {{ 0 <= (now().timestamp() - ts) < w }}
+          {% endif %}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # DEPOT — stempl auto-slukket (og det stadie besøget nåede)
+  # ---------------------------------------------------------------------------
+  # Ingen `for:` her, med vilje: depot_stage_reset venter 2 s før den skriver
+  # "Ingen", så vi når at læse det ægte stadie først.
+  - id: depot_auto_off_stamp
+    alias: "Depot fortryd: stempl auto-sluk"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: light.depot_all
+        to: "off"
+    condition:
+      # Et menneskes finger (app/dashboard) bærer user_id — det er ikke en fejl
+      # vi skal fortryde, det er en beslutning (#3).
+      - condition: template
+        value_template: "{{ trigger.to_state.context.user_id is none }}"
+      # FoH O-knappen bærer heller ikke user_id (zha_event), men den starter
+      # depot_sensor_grace → brug den som fingeraftryk for et manuelt sluk.
+      - condition: state
+        entity_id: timer.depot_sensor_grace
+        state: idle
+      # Kun hvis der faktisk var et gradueret besøg at afbryde.
+      - condition: template
+        value_template: "{{ not is_state('input_select.depot_visit_stage', 'Ingen') }}"
+    action:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.depot_stadie_ved_auto_off
+        data:
+          value: "{{ states('input_select.depot_visit_stage') }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.depot_auto_off_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ---------------------------------------------------------------------------
+  # DEPOT — fortryd: gen-tænd i vinduet → start ét stadie HØJERE
+  # ---------------------------------------------------------------------------
+  - id: depot_fortryd_eskaler
+    alias: "Depot fortryd: gen-tænd i vinduet → hæv stadie"
+    description: >-
+      depot_harry_potter_on sætter Quick ved hvert nyt besøg. Faldt det forrige
+      auto-sluk for under fortryd-vinduet siden, var kroppen aldrig ude → giv
+      besøget ét trin mere tålmodighed end det havde da det blev afbrudt.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_select.depot_visit_stage
+        from: "Ingen"
+        to: "Quick"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.depot_fortryd_vindue
+        state: "on"
+      # Samme nat-spærre som depot_stage_escalate: om natten er et par
+      # PIR-bursts på vej forbi ikke en grund til at holde depotet tændt længe.
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "off"
+    action:
+      - variables:
+          forrige: "{{ states('input_text.depot_stadie_ved_auto_off') }}"
+          naeste: >-
+            {% set f = states('input_text.depot_stadie_ved_auto_off') %}
+            {{ 'Long' if f in ['Medium', 'Long'] else 'Medium' }}
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.depot_visit_stage
+        data:
+          option: "{{ naeste }}"
+      - service: logbook.log
+        data:
+          name: "Depot fortryd"
+          message: >-
+            Lyset kom tilbage inden for fortryd-vinduet → forrige auto-sluk
+            (stadie {{ forrige }}) var for tidligt. Starter på {{ naeste }}.
+          entity_id: input_select.depot_visit_stage
+
+  # ---------------------------------------------------------------------------
+  # BAD — stempl auto-slukket
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_auto_off_stamp
+    alias: "Bad fortryd: stempl auto-sluk"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: light.badevaerelse_all
+        to: "off"
+    condition:
+      - condition: template
+        value_template: "{{ trigger.to_state.context.user_id is none }}"
+      - condition: template
+        value_template: "{{ not is_state('input_select.badevaerelse_visit_stage', 'Ingen') }}"
+      # Godnat/nat-toilet-slukket er en bevidst husholdning, ikke en fejlvurdering.
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "off"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.badevaerelse_auto_off_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ---------------------------------------------------------------------------
+  # BAD — fortryd: gen-tænd i vinduet → armér bruser-vagten
+  # ---------------------------------------------------------------------------
+  # Badet har ingen stadie-skaleret sluk-tid at hæve; det har en FAKTOR som alle
+  # sluk-vejene allerede ganger med. Vi armerer derfor den eksisterende vagt
+  # frem for at bygge en parallel faktor — så arver vi dens maks-varighed, dens
+  # afvæbning og alle fem forbrugere gratis (#2: ingen anden kopi af reglen).
+  - id: badevaerelse_fortryd_armer_bruser_vagt
+    alias: "Bad fortryd: gen-tænd i vinduet → armér bruser-vagt"
+    description: >-
+      Lyset tændte igen kort efter et auto-sluk = kroppen forlod aldrig badet.
+      Det er samme situation bruser-vagten blev bygget til 08-13 (PIR ser ikke
+      en der står i bruseren), men dens normale bevis (alle hjemmeværende var i
+      badet) kan ikke leveres når person nr. 2 er i et andet rum. Fortryd er
+      hurtig-vejen udenom for den der allerede ER bevist.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: light.badevaerelse_all
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_fortryd_vindue
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.badevaerelse_bruser_vagt_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.badevaerelse_bruser_vagt
+        state: "off"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.badevaerelse_bruser_vagt_stempel
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.badevaerelse_bruser_vagt
+      - service: logbook.log
+        data:
+          name: "Bad bruser-vagt"
+          message: >-
+            Armeret via FORTRYD — lyset kom tilbage kort efter et auto-sluk, så
+            slukket var for tidligt. Sluk-ventetider
+            ×{{ states('input_number.badevaerelse_bruser_off_faktor') }} til lyset
+            slukker eller
+            {{ states('input_number.badevaerelse_bruser_vagt_maks_minutter') | int(25) }} min.
+          entity_id: light.badevaerelse_all

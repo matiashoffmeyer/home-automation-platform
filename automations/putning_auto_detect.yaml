@@ -1,0 +1,706 @@
+# =============================================================================
+# Putning Auto-Detect — Sherlock pattern (sprint 2026-05-07 sen-PM)
+# =============================================================================
+# User-spec 2026-05-07:
+#   "Hvis børneværelset ser meget aktivitet og et badeværelse besøg
+#    (tandbørste) efterfælges af lang stille aktivitet i børneværelset,
+#    så er vi i gang med en putning og så må lyset for Gud skyld aldrig
+#    være skarpt derinde."
+#
+# Bekræftet putte-rytme (rigide tider):
+#   18:45-19:30  Bath: tandbørste + bad
+#   19:30-19:50  Sove: bedtime story (~20 min reading)
+#   19:50        Lyset slukke (parent manuel)
+#   20:30        Kids asleep at latest
+#
+# DETECTION SIGNALS (OR-logic — om nogen trigger fyrer):
+#   Trigger A (PRIMARY, post-flyt): Bath visit ≥3 min varighed i putte-
+#               vinduet → tandbørste detected → putning igang.
+#               Catches START af putning (~18:48).
+#               2026-06-12 ROLLESKIFT: START betyder TÆND FASE 1 (puttelys),
+#               IKKE sluk/natlys. Incident i aften: bad 18:46→18:49 satte
+#               godnat_boern_active=on → alt boern-lys slukket + 19:10-fase-1
+#               blokeret af flaget. Trigger A kalder nu
+#               script.puttelys_phase1_apply; putningens AFSLUTNING (godnat-
+#               flip → natlys) ejes af descent/Trigger B/C/trappe/bagkant.
+#   Trigger B (FALLBACK, pre-flyt + post-flyt confirmation): Boern still_target
+#               on for 10 min mellem 19:30-23:30 → kid lying still in bed →
+#               putning complete. Sikrer detection selv hvis bath Apollo er
+#               offline (B14 backlog: 3 Apollos unplugged pre-flyt).
+#               Catches END af putning. PT eneste levende detektor (bath
+#               Apollo unplugged pre-flyt).
+#
+# JUSTERING 2026-06-04 (lært fra observeret forløb):
+#   Tonight's putning var lang: loft-lys dæmpet/justeret 19:25-20:11, slukket
+#   20:47, og still_target var sustained on indtil 22:07 (= kids lå stille/sov
+#   ~20:50-22:07). Occupancy on hele aftenen. Det gamle 21:00 end-vindue
+#   afviste still-detektionen fordi den "kom for sent" → ingen auto-putning,
+#   godnat_boern_active forblev off. Fix: end-vindue 21:00 → 23:30 så lange/
+#   sene putninger fanges. Signalet (still_target) var korrekt; kun vinduet
+#   var for snævert.
+#
+# AUTO-ACTIONS:
+#   Trigger A (start): script.puttelys_phase1_apply (fase 1 tændt, flag sat).
+#   Trigger B/C (slut, delegated til godnat_boern_active_on_actions):
+#   1. Set godnat_boern_active = on (cascades til existing automation)
+#   2. Boern lys slukke (5s smooth, både loft + lampe)
+#   3. Boern gardin luk
+#   4. presence_light_boernevaerelse_on bliver gated (godnat_any_active=on)
+#
+# False-positive avoidance:
+#   - kids_home gate (skipper hvis ingen kids hjemme)
+#   - Strict tidsvinduer (rigide putte-tider; user bekræftede)
+#   - Bath duration ≥3 min (parent quick toilet < 3 min usually)
+#   - Boern still ≥10 min (ikke kort kig på telefon)
+#   - house_mode = Normal (skip AirBnB)
+#   - auto_putning_enabled (kill switch på dashboard)
+#   - godnat_boern_active = off (ingen redundant fyring)
+#
+# Recovery hvis false-positive:
+#   - Toggle "Boern i seng" tile på dashboard → off
+#   - ELLER vent på morgen wakeup auto-clear (06:05 hverdag, 07:30 weekend)
+#   - ELLER toggle auto_putning_enabled = off (kill switch)
+#   - ELLER 09:00 daglig godnat_subflag_safety_clear
+# =============================================================================
+
+- id: putning_auto_detect_via_bath_visit
+  alias: "Putning: Bath visit ≥3 min → tænd fase 1 (PRIMARY start-signal)"
+  description: >
+    Trigger A (2026-06-12 rolleskift): Bath occupancy on i 3 min i putte-
+    vinduet = tandbørste = putningen STARTER → tænd fase 1-puttelys
+    (script.puttelys_phase1_apply). Slider-tiden (puttelys_start) er bagkant
+    hvis intet bad-besøg detekteres. Afslutningen (godnat-flip → natlys)
+    ejes af descent / Trigger B / Trigger C / NED-trappen / natlys-bagkant.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      from: "off"
+      to: "on"
+      for:
+        minutes: 3
+    # 2026-07-17 bug hunt (fejlklasse #4): starter bad-besøget FØR vinduets
+    # forkant (fx 18:26 ved default 18:30), fyrer 3-min-flanken 18:29 →
+    # time-condition blokerer → re-fyrer ALDRIG mens occupancy forbliver on.
+    # Re-tjek ved vindue-start (condition nedenfor kræver ≥~3 min occupancy).
+    - platform: time
+      at: input_datetime.putning_vindue_start
+  condition:
+    - condition: state
+      entity_id: input_boolean.auto_putning_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    # Putte-vinduets forkant (tunable, default 18:30) → vindue-slut (default
+    # 22:00). 2026-08-07: bagkanten var natlys_start (20:30) = natlysets
+    # bagkant, ikke putningens — en sen putning kunne slet ikke STARTES,
+    # selvom Trigger B (still_target) allerede løb til 23:30.
+    - condition: time
+      after: input_datetime.putning_vindue_start
+      before: input_datetime.putning_vindue_slut
+    # Bad-occupancy skal reelt være on i ≥~3 min NU (holder for begge triggers:
+    # state-flanken har pr. definition 180s bag sig; vindue-start-triggeren
+    # kræver at flanken vi missede stadig står on). 170s = margin mod jitter.
+    - condition: template
+      value_template: >-
+        {% set s = states.binary_sensor.badevaerelse_inde_occupancy %}
+        {{ s is not none and s.state == 'on'
+           and (now() - s.last_changed).total_seconds() >= 170 }}
+    # Børnene er lagt (natlys kørt) → bad-besøg er parents aftenrutine,
+    # fase 1 må ikke vække rummet.
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    # Fase 1 allerede tændt i aften (slider/Styrbar OP/tidligere bad-besøg)
+    # → re-apply ikke oven i evt. manuelle justeringer.
+    - condition: state
+      entity_id: input_boolean.puttelys_phase1_fired
+      state: "off"
+    # Apollo-nedtrapning i gang → den ejer rummet, bland ikke fase 1 ind.
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    # 2026-10-06 (bug-hunt nat, 🏡 #1): Home Vacation = familien hjemme uden
+    # vækninger — putningen skal køre. Før `state: Normal` (udelukkede HV).
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    # Sprint 2026-05-10 fix: house_state Active gate (= ikke Dormant).
+    # Forhindrer false-positive trigger fra stuck Apollo sensors mens
+    # family er væk (incident 2026-05-08-10).
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    # 2026-06-19 (user-spec FULD LÅS): manuel sluk → ingen putte-tænd før Styrbar
+    # OP. Se packages/boernevaerelse_manual_off_lock.yaml.
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_manual_off_lock
+      state: "off"
+    # 2026-07-22: putningen sker i VOKSEN-værelset (packages/putning_sove.yaml)
+    # → børnenes tandbørste-bad må ikke arme fase 1 i det tomme børneværelse.
+    - condition: state
+      entity_id: input_boolean.putning_sove_active
+      state: "off"
+  action:
+    - service: logbook.log
+      data:
+        name: "Putning start-detected (bath)"
+        message: >-
+          Trigger A: Bath visit ≥3 min i putte-vinduet + kids hjemme →
+          fase 1 ARMERET (tænder når Apollo børn ser bevægelse; slider er bagkant).
+    # 2026-06-21 (user-spec): tænd IKKE et tomt rum — armér og tænd fase 1 først
+    # når Apollo børn ser bevægelse (script.puttelys_phase1_when_present, async).
+    - service: script.turn_on
+      target:
+        entity_id: script.puttelys_phase1_when_present
+    # Phone notification (low priority)
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: putning
+        title: "🛏️ Putning armeret (bath visit)"
+        message: >-
+          Fase 1 armeret kl {{ now().strftime('%H:%M') }} (bath visit ≥3 min) —
+          tænder når børnene kommer ind (Apollo ser bevægelse). Var det en voksens
+          bad, sker der ingenting.
+        payload:
+          tag: "putning_auto"
+          channel: "Putning"
+          importance: low
+
+# =============================================================================
+# Trigger B — FALLBACK / CONFIRMATION via boern still_target
+# =============================================================================
+# Pre-flyt (bath Apollo offline) eller post-flyt confirmation. Kid ligger
+# stille i seng = still_target=on. Hvis dette varer 10+ min mellem 19:30-23:30,
+# kid sover (eller er ved at). Putning er essentielt færdig.
+#
+# 10 min vindue undgår false-positives ved kort lige-down-pause (kid kigger
+# i bog 2 min). 19:30 start vindue = efter bath sequence (tandbørste 18:45-19:30).
+# 23:30 end vindue (udvidet fra 21:00 per 2026-06-04): rigtige putninger her i
+# huset settler ofte 20:45+ og kids ligger stille langt forbi 21:00. godnat_
+# boern_active=off-condition forhindrer re-fire, så et bredt vindue er sikkert.
+# =============================================================================
+
+- id: putning_auto_detect_via_boern_still
+  alias: "Putning: Auto-detect via børn still_target (FALLBACK, pre-flyt)"
+  description: >
+    Trigger B: Boern still_target=on for 10 min mellem 19:30-23:30.
+    Pre-flyt fallback når bath Apollo er offline (B14 backlog) — pt eneste
+    levende detektor. Catches end of putning (kid still i seng). Vindue
+    udvidet til 23:30 per 2026-06-04 (lange/sene putninger).
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_radar_still_target
+      to: "on"
+      for:
+        minutes: 10
+    # 2026-07-17 bug hunt (fejlklasse #4): latcher still_target FØR 19:30
+    # (tidlig putning, fx on 19:15 → flanke fyrer 19:25), blokerer time-
+    # conditionen og flanken re-fyrer ALDRIG mens still forbliver on →
+    # auto-putning misset hele aftenen. Re-tjek 19:40 (= vindue-start + 10 min).
+    - platform: time
+      at: "19:40:00"
+  condition:
+    - condition: state
+      entity_id: input_boolean.auto_putning_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    - condition: time
+      after: "19:30:00"
+      before: "23:30:00"
+    # still_target skal reelt have været on i ≥~10 min NU (holder for begge
+    # triggers; 590s = margin mod jitter på state-flanken).
+    - condition: template
+      value_template: >-
+        {% set s = states.binary_sensor.boernevaerelse_apollo_radar_still_target %}
+        {{ s is not none and s.state == 'on'
+           and (now() - s.last_changed).total_seconds() >= 590 }}
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    # 2026-06-06: descent (still_target 2 min + afstand) fyrer før denne (10 min)
+    # og sætter descent_active → suppress direkte-natlys her. Fallback bevares når
+    # descent ikke startede (afstand for tæt, auto_putning anden vej).
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    # 2026-10-06 (bug-hunt nat, 🏡 #1): Home Vacation = familien hjemme uden
+    # vækninger — putningen skal køre. Før `state: Normal` (udelukkede HV).
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    # Sprint 2026-05-10 fix: house_state Active gate (= ikke Dormant).
+    # Forhindrer false-positive trigger fra stuck Apollo sensors mens
+    # family er væk (incident 2026-05-08-10).
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    # Sanity: kid var aktiv i boern for ≤90 min siden (motion seen).
+    # Ellers er det måske bare en stuck Apollo radar.
+    # Bug-fix audit 2026-05-07: last_changed = state TRANSITION timestamp, not
+    # last-seen. Hvis state har været continuously 'on' i 2h, last_changed = 2h
+    # ago men kid har været aktiv hele tiden. Check current state først.
+    - condition: template
+      value_template: >-
+        {% set occ = states('binary_sensor.boernevaerelse_apollo_occupancy') %}
+        {% if occ == 'on' %}
+          true
+        {% else %}
+          {% set lc = states.binary_sensor.boernevaerelse_apollo_occupancy.last_changed %}
+          {{ lc is not none and (now() - lc).total_seconds() < 5400 }}
+        {% endif %}
+    # 2026-06-19 (user-spec FULD LÅS): manuel sluk → ingen putte-natlys-detektion
+    # før Styrbar OP. Se packages/boernevaerelse_manual_off_lock.yaml.
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_manual_off_lock
+      state: "off"
+  action:
+    - service: logbook.log
+      data:
+        name: "Putning auto-detected (still)"
+        message: >-
+          Trigger B: Boern still_target=on i 10 min mellem 19:30-23:30.
+          Sætter godnat_boern_active=on (cascades til slukke + gardin).
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.godnat_boern_active
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: putning
+        title: "🛏️ Putning detected (kid in bed)"
+        message: >-
+          Auto-startet putning kl {{ now().strftime('%H:%M') }} (kid stille
+          i seng 10+ min). Boern lys slukket + gardin lukket.
+        payload:
+          tag: "putning_auto"
+          channel: "Putning"
+          importance: low
+
+# =============================================================================
+# Trigger C — USER-SIGNAL via manuel natlys-dim (auto-manual hybrid)
+# =============================================================================
+# User-spec 2026-06-12: manuel lysjustering under putning er en DEL af auto
+# ("auto-manual hybrid mode") — brugeren hjælper auto med at vide hvor langt
+# putningen er. Når brugeren manuelt dæmper hygge-strippen til natlys-niveau
+# (<10% = under mirror-automationens hyggelys-grænse) i putte-vinduet, er det
+# et eksplicit "vi er ved natlys-stadiet, børnene er lagt"-signal → sæt
+# godnat_boern_active=on med det samme i stedet for at vente på still-
+# detektion (Trigger B tog 21 min den 2026-06-11: dim 22:18 → flag 22:39,
+# og i mellemtiden var rummet ugated).
+#
+# KUN ægte bruger-handlinger (context.user_id != none = app/dashboard).
+# Automations (fx puttelys_descent der selv fader strippen ned) har user_id
+# = none og rammer ikke denne — descent flipper selv flagget ved sin slutning.
+# =============================================================================
+- id: putning_auto_detect_via_natlys_dim
+  alias: "Putning: Auto-detect via manuel natlys-dim (USER-SIGNAL, hybrid)"
+  description: >
+    Bruger dæmper hygge-strippen til <10% i putte-vinduet via app = eksplicit
+    signal om at putningen er ved natlys-stadiet. Sætter godnat_boern_active=on
+    (cascades til slukke + gardin via godnat_boern_active_on_actions).
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: light.boernevaerelse_hygge_strip
+  condition:
+    # Ægte bruger-handling (app/dashboard) — automations har user_id=none.
+    - condition: template
+      value_template: "{{ trigger.to_state.context.user_id is not none }}"
+    # Strip on + dæmpet til natlys-niveau (<26 raw = <10%, samme grænse som
+    # boernevaerelse_hyggelys_mirror bruger til at skelne natlys fra hyggelys).
+    - condition: template
+      value_template: >-
+        {{ trigger.to_state.state == 'on'
+           and trigger.to_state.attributes.brightness is not none
+           and (trigger.to_state.attributes.brightness | int(255)) < 26 }}
+    # Samme gates som Trigger A/B
+    - condition: state
+      entity_id: input_boolean.auto_putning_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    # 2026-10-06 (bug-hunt nat, 🏡 #1): Home Vacation = familien hjemme uden
+    # vækninger — putningen skal køre. Før `state: Normal` (udelukkede HV).
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Putte-vinduet (2026-06-12: skiftet til single source of truth —
+    # binary_sensor.putning_vindue_aktivt = kids_home + efter 18:30 tunable +
+    # ikke vildt farve-leg). En dim midt på dagen er leg/test, ikke putning.
+    - condition: state
+      entity_id: binary_sensor.putning_vindue_aktivt
+      state: "on"
+  action:
+    - service: logbook.log
+      data:
+        name: "Putning auto-detected (natlys-dim)"
+        message: >-
+          Trigger C: Bruger dæmpede strippen til
+          {{ ((trigger.to_state.attributes.brightness | int(0)) / 2.55) | round(0) | int }}%
+          (natlys-niveau) i putte-vinduet → godnat_boern_active=on (hybrid-signal).
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.godnat_boern_active
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: putning
+        title: "🛏️ Putning detected (natlys-dim)"
+        message: >-
+          Du satte strippen på natlys kl {{ now().strftime('%H:%M') }} →
+          børne-nattemode aktiveret (gardin + lys-gates). Tap "Boern i seng"
+          på dashboard for at undo.
+        payload:
+          tag: "putning_auto"
+          channel: "Putning"
+          importance: low
+
+# =============================================================================
+# Trigger D — STYRBAR-OP + LÆGGE-PRESENCE (ankomst-aften, user-spec 2026-06-18)
+# =============================================================================
+# På dage hvor børn lige er ankommet sov de IKKE her i nat → binary_sensor.
+# kids_home (nyt "kræv stærkt signal") er off → Trigger A/B/C er gated fra. Men
+# der skal STADIG puttes. Manuel sti uafhængig af kids_home:
+#   Styrbar børn OP (top-paddle "on") efter 18:45  +  N min sammenhængende
+#   presence i LÆGGE-zonen (≥150 cm fra Apollo, still/moving = binary_sensor.
+#   boern_putte_zone_aktiv) → fase 1 + nedtrapning, FORKORTET med N min (vi har
+#   allerede puttet i N min mens vi ventede på presence-bekræftelsen).
+# Sætter også boern_sov_her_i_nat-latch → kids_home on resten af opholdet
+# (morgen-wakeup + gates virker), og næste morgen bekræfter 06:30-latchen.
+# N = input_number.puttelys_styrbar_presence_minutes (default 5, slider).
+# IKKE gated på kids_home (det er netop pointen).
+# 2026-08-07: IKKE længere one-shot. Vinduet er 18:45 → putning_vindue_slut
+# (22:00), og et OP-tryk må GENSTARTE en putning selvom godnat_boern_active
+# allerede står on — det er tv-pause-flowet: tv tændes (dark mode), tv slukkes
+# (lyset bliver slukket), Styrbar OP = "nu putter vi rigtigt". Gentagelses-
+# spærringen er i stedet presence-kravet (N min i lægge-zonen) +
+# puttelys_descent_active=off.
+# =============================================================================
+- id: puttelys_styrbar_start
+  alias: "Putning: Styrbar OP + lægge-presence → fase 1 + forkortet nedtrapning"
+  description: >
+    Trigger D (ankomst-aften): Styrbar børn OP efter 18:45 + N min presence i
+    lægge-zonen (≥150 cm) → fase 1 puttelys + forkortet nedtrapning (−N min) +
+    boern_sov_her_i_nat=on. Virker uafhængigt af kids_home (børn lige ankommet).
+  mode: restart
+  max_exceeded: silent
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "66:19:44:cc:2c:41:57:fe"
+        command: "on"
+  condition:
+    # 2026-08-07: bagkanten var natlys_start (20:30) = NATLYSETS bagkant, ikke
+    # putningens. Nu putning_vindue_slut (default 22:00) — user-spec: "jeg skal
+    # kunne putte lidt sent som i dag også".
+    - condition: time
+      after: "18:45:00"
+      before: input_datetime.putning_vindue_slut
+    - condition: state
+      entity_id: input_boolean.auto_putning_enabled
+      state: "on"
+    # 2026-10-06 (bug-hunt nat, 🏡 #1): Home Vacation = familien hjemme uden
+    # vækninger — putningen skal køre. Før `state: Normal` (udelukkede HV).
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    # 2026-08-13h: house_state Active var en HÅRD gate her. Den er GPS-drevet
+    # (Dormant = nogen_hjemme off i 3t / afgangs-dvale), så en barnepige-aften
+    # hvor begge forældre er ude kan ramme den — og et Dormant→Active-skift
+    # udløst af selve trykket er et race med denne condition. Trykket ER beviset:
+    # et zha_event fra børneværelsets Styrbar kræver en fysisk hånd i rummet, og
+    # presence-kravet nedenfor står stadig. Derfor: Active ELLER fysisk vidne.
+    - condition: template
+      value_template: >-
+        {{ is_state('input_select.house_state', 'Active')
+           or is_state('binary_sensor.physical_presence_recent', 'on') }}
+    # 2026-08-07: godnat_boern_active er IKKE længere en spærring. Efter en
+    # afsluttet nedtrapning står den on, og et OP-tryk kunne derfor ikke starte
+    # en NY putte-session — præcis det user beder om efter en tv-pause ("når tv
+    # så slukker … hvis jeg så trykker styrbar børne op, så starter vi en
+    # puttesession"). Flaget ryddes i action'en efter presence-bekræftelsen, så
+    # en genstart kræver stadig at nogen faktisk ligger i lægge-zonen i N min.
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+  action:
+    - variables:
+        n: "{{ states('input_number.puttelys_styrbar_presence_minutes') | float(5) }}"
+    # Vent på N min SAMMENHÆNGENDE presence i lægge-zonen (= vi ligger og putter).
+    # Timeout = 3× vinduet fra OP-tryk; ingen ro-presence = ingen putning (abort).
+    - wait_for_trigger:
+        - platform: state
+          entity_id: binary_sensor.boern_putte_zone_aktiv
+          from: "off"
+          to: "on"
+          for:
+            seconds: "{{ (n * 60) | int }}"
+        # 2026-07-17 bug hunt (fejlklasse #4-variant): er zonen ALLEREDE on når
+        # ventetiden starter (OP-tryk EFTER man har lagt sig, eller et OP-
+        # ladder-tryk mid-wait der mode:restart'er automationen), starter
+        # state-triggerens timer aldrig (kræver frisk off→on-flanke) →
+        # putningen døde silent på timeout. Template-triggeren re-renderes
+        # hvert minut (now()) og fanger den sti.
+        - platform: template
+          value_template: >-
+            {% set s = states.binary_sensor.boern_putte_zone_aktiv %}
+            {% set n_min = states('input_number.puttelys_styrbar_presence_minutes') | float(5) %}
+            {{ s is not none and s.state == 'on'
+               and (now() - s.last_changed).total_seconds() >= n_min * 60 }}
+        # 2026-08-13h FALLBACK: lægge-zonen kræver en AFSTAND ≥ min_cm, og
+        # Apollo'ens still/moving_distance står ofte 'unknown' midt i et ophold
+        # (samme grund til at zonen ikke bruger detection_distance). Uden
+        # afstandsdata er zonen pr. konstruktion off → hele putningen døde på
+        # timeout uden et eneste spor. Kan radaren MÅLE, gælder ≥150 cm uændret;
+        # kan den ikke, falder vi tilbage til ren occupancy i samme N min.
+        - platform: template
+          value_template: >-
+            {% set n_min = states('input_number.puttelys_styrbar_presence_minutes') | float(5) %}
+            {% set sd = states('sensor.boernevaerelse_apollo_radar_still_distance') %}
+            {% set md = states('sensor.boernevaerelse_apollo_radar_moving_distance') %}
+            {% set ingen_afstand = (sd in ['unknown', 'unavailable', 'none'] or (sd | float(0)) <= 0)
+                               and (md in ['unknown', 'unavailable', 'none'] or (md | float(0)) <= 0) %}
+            {% set o = states.binary_sensor.boernevaerelse_apollo_occupancy %}
+            {{ ingen_afstand and o is not none and o.state == 'on'
+               and (now() - o.last_changed).total_seconds() >= n_min * 60 }}
+      timeout:
+        seconds: "{{ (n * 60 * 3) | int }}"
+      # 2026-08-13h: var false = tavs død. Nu logges aborten, så en misset
+      # putning kan ses i logbogen i stedet for at skulle udledes af at
+      # script.puttelys_phase1_apply har et gammelt last_triggered.
+      continue_on_timeout: true
+    - if:
+        - condition: template
+          value_template: "{{ wait.trigger is none }}"
+      then:
+        - service: logbook.log
+          data:
+            name: "Putning (Styrbar OP)"
+            message: >-
+              AFBRUDT: intet {{ n | round(0) | int }} min sammenhængende ophold
+              i lægge-zonen (≥{{ states('input_number.puttelys_styrbar_zone_min_cm') | int(150) }} cm)
+              eller occupancy inden {{ (n * 3) | round(0) | int }} min — ingen putning startet.
+            entity_id: input_boolean.puttelys_phase1_fired
+        - stop: "Ingen lægge-presence efter Styrbar OP"
+    # Re-tjek gates (kan have ændret sig under ventetiden — fx anden putte-vej).
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    # 2026-08-07 GENSTART: stod godnat_boern_active on (afsluttet nedtrapning
+    # tidligere samme aften — fx afbrudt af tv), så ryddes den her, FØR fase 1
+    # tændes. Ellers ville nat-mode's gates slukke puttelyset igen med det
+    # samme. Sker først EFTER presence-bekræftelsen, så et tilfældigt OP-tryk
+    # ikke kan rive et sovende barn ud af nat-mode.
+    - if:
+        - condition: state
+          entity_id: input_boolean.godnat_boern_active
+          state: "on"
+      then:
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.godnat_boern_active
+        - service: logbook.log
+          data:
+            name: "Putning (Styrbar OP)"
+            message: >-
+              Genstart: børne-godnat var allerede sat (tidligere putning/tv-pause)
+              → ryddet, ny putte-session starter.
+            entity_id: input_boolean.godnat_boern_active
+    # 2026-06-19 (user-spec FULD LÅS): hvis brugeren slukkede lyset under presence-
+    # ventetiden (= "nej, vi putter ikke, vi ser TV"), så ARMERES låsen og denne
+    # putning skal IKKE tænde fase 1. Dette var præcis incident'en 2026-06-19
+    # 19:00: OP-tryk armede D, brugeren slukkede (snap_off 18:54), men D tændte
+    # alligevel 5 min senere pga. presence. Tjekkes EFTER ventetiden (ikke ved
+    # start), så et OP-tryk der netop frigiver låsen ikke selv-blokerer via race.
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_manual_off_lock
+      state: "off"
+    # Markér børn hjemme (ankomst → latch) så kids_home + morgen-wakeup virker.
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.boern_sov_her_i_nat
+    - service: logbook.log
+      data:
+        name: "Putning (Styrbar OP)"
+        message: >-
+          Styrbar OP + {{ n | round(0) | int }} min lægge-presence (≥150 cm) →
+          fase 1 + nedtrapning forkortet {{ n | round(0) | int }} min.
+          boern_sov_her_i_nat=on.
+    - service: script.puttelys_phase1_apply
+    - service: script.puttelys_descent_run
+      data:
+        duration_minutes: >-
+          {{ [ (states('input_number.global_puttelys_descent_minutes') | float(20)) - n, 5 ] | max }}
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: putning
+        title: "🛏️ Putning startet (Styrbar OP)"
+        message: >-
+          Fase 1 + nedtrapning
+          ({{ [ (states('input_number.global_puttelys_descent_minutes') | float(20)) - n, 5 ] | max | round(0) | int }} min)
+          startet kl {{ now().strftime('%H:%M') }}.
+        payload:
+          tag: "putning_auto"
+          channel: "Putning"
+          importance: low
+
+# =============================================================================
+# SEN HJEMKOMST (2026-10-06, user-spec): "hvis vi så kommer hjem og der er
+# børneværelse aktivitet så er det klart der er børn hjemme og skal ha
+# puttelys, så du kan bare bruge puttelys som normalt presence lys i det
+# tilfælde og så drifte over i putning hvis børneværelsesbevægelsen fortsætter
+# mere end 5 min."
+#
+# Natlys-bagkanten (godnat_night.yaml) springer over i et TOMT hus, så efter
+# natlys-tid uden putning er rummet "ingen putning endnu". Aktivitet derinde:
+#   1. puttelys-UDSEENDET som presence-lys (saet_flag=false → ingen fredning,
+#      tom-sluk tager det som ethvert presence-lys). 3 s efter flanken, så det
+#      lander efter presence-tændets eget kald (sidste skriver vinder, #2).
+#   2. stadig aktivitet efter N min (slider) → rigtig putning: fase 1-flaget +
+#      nedtrapning i fuld slider-tid, boern_sov_her_i_nat (som Styrbar-starten).
+# =============================================================================
+- id: putning_sen_hjemkomst
+  alias: "Putning: sen hjemkomst — puttelys som presence, putning efter N min aktivitet"
+  description: >-
+    Efter natlys-tid uden putning: aktivitet i børneværelset giver puttelys-
+    udseendet som presence-lys; fortsætter den N min (slider), starter putningen.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+      from: "off"
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: input_boolean.auto_putning_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Efter natlys-bagkanten og frem til nat-cutover (condition:time klarer midnat).
+    - condition: time
+      after: input_datetime.natlys_start
+      before: input_datetime.dark_mode_godnat_cutover
+    # "Ingen putning endnu": ingen natlys, ingen fase 1, ingen nedtrapning.
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.puttelys_phase1_fired
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_manual_off_lock
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.filmmoerke_boern
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_gaest_sover
+      state: "off"
+  action:
+    - delay: "00:00:03"
+    - service: script.puttelys_phase1_apply
+      data:
+        saet_flag: false
+    - service: logbook.log
+      data:
+        name: "Putning (sen hjemkomst)"
+        message: >-
+          {{ now().strftime('%H:%M') }} aktivitet i børneværelset efter natlys-tid
+          uden putning → puttelys som presence-lys; putning hvis aktiviteten
+          varer {{ states('input_number.puttelys_sen_hjemkomst_minutter') | int(5) }} min.
+    - delay:
+        minutes: "{{ states('input_number.puttelys_sen_hjemkomst_minutter') | int(5) }}"
+    # Stadig nogen derinde (lidt nåde for et radar-blink lige på mærket)?
+    - wait_template: "{{ is_state('binary_sensor.boernevaerelse_apollo_occupancy', 'on') }}"
+      timeout: "00:01:00"
+      continue_on_timeout: false
+    # Gatesne igen EFTER ventetiden: en manuel sluk, en anden putte-vej, natlys,
+    # kill-switch, filmmørke, gæste-hold eller en mode-skift kan være kommet
+    # imellem (bug-hunt nat 10-06: før kun 4 af 10 gates — #21).
+    - condition: state
+      entity_id: input_boolean.auto_putning_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: state
+      entity_id: binary_sensor.filmmoerke_boern
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_gaest_sover
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.puttelys_phase1_fired
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_manual_off_lock
+      state: "off"
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.boern_sov_her_i_nat
+    - service: script.puttelys_phase1_apply
+    - service: script.puttelys_descent_run
+      data:
+        duration_minutes: "{{ states('input_number.global_puttelys_descent_minutes') | float(20) }}"
+    - service: logbook.log
+      data:
+        name: "Putning (sen hjemkomst)"
+        message: >-
+          {{ now().strftime('%H:%M') }} aktivitet i
+          {{ states('input_number.puttelys_sen_hjemkomst_minutter') | int(5) }} min →
+          putning startet (fase 1 + nedtrapning
+          {{ states('input_number.global_puttelys_descent_minutes') | int(20) }} min).
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: putning
+        title: "🛏️ Putning startet (sen hjemkomst)"
+        message: >-
+          Aktivitet i børneværelset i
+          {{ states('input_number.puttelys_sen_hjemkomst_minutter') | int(5) }} min →
+          nedtrapning ({{ states('input_number.global_puttelys_descent_minutes') | int(20) }} min)
+          startet kl {{ now().strftime('%H:%M') }}.

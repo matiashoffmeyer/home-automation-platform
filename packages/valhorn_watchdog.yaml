@@ -1,0 +1,332 @@
+# =============================================================================
+# VALLHORN-watchdogs — entré + depot (2026-07-23, udvidet 2026-08-18)
+# =============================================================================
+# Hed entre_valhorn_watchdog.yaml indtil 2026-08-18. Depot-VALLHORN'en havde
+# INGEN hængt-watchdog (dashboards/status.yaml indrømmede det i en kommentar),
+# og reglen ville ellers blive kodet to steder (#2). De to devices er IKKE samme
+# hardware: entré er en Matter/Thread-Myggspray, som kan poll'es — et
+# `homeassistant.update_entity` tvinger den til `unavailable`, hvilket alle
+# forbrugere læser korrekt som "ikke til stede". Depot er en ZHA-VALLHORN og et
+# SLEEPY END DEVICE: den svarer ikke på et poll, så dér ER varslet hele
+# repareringen, og entityen kan først komme fri ved næste ægte bevægelse.
+#
+# binary_sensor.entre_valhorn_occupancy er ENESTE early-detect-trigger for bad,
+# depot OG sove (presence_badevaerelse / depot_harry_potter /
+# presence_sovevaerelse fyrer alle udelukkende på den). Går den unavailable dør
+# alle tre tavst — user opdagede det først på manglende pre-lys (2026-07-23:
+# enheden faldt af Thread-mesh'et kl 07:44 pga. tomt batteri, 9t tavst tab).
+# Denne watchdog gør tavst feature-tab til et højlydt varsel: unavailable i
+# 15 min → push, + kvittering når den er tilbage.
+#
+# Push via script.push_notify (nid: valhorn_watchdog) → per-type toggle +
+# AirBnB-gate. AirBnB-opt-in default OFF (silent-reglen; user kan tilvælge på
+# 🔔-fanen). Fejlklasse #9 (unavailable ≠ off, tavst) + #1 (single owner).
+#
+# 2026-10-20 (user: "tydelige notifikationer"): ÉN besked pr. entré-hændelse.
+# Målt 8-15/10: 8 "hængt"-pushes, og 7 af dem blev 9-16 min senere til et
+# udfald med sin egen "nede"-push (den 8. løste sig selv efter 8 min);
+# batteri-vagten sendte så en 3. om samme enhed efter 60 min, og "tilbage" en
+# 4. Nu: "hængt" pusher kun hvis pollet IKKE løste det inden 20 min, "tilbage"
+# tager varslet af telefonen tavst, og batteri_watchdog springer entréen over
+# mens entre_valhorn_outage_alerted er on. 11/11 udfald kom selv igen
+# (14 min-9 t).
+# =============================================================================
+input_boolean:
+  notif_valhorn_watchdog_enabled:
+    name: "📡 Bevægelsessensor nede/hængt — send"
+    icon: mdi:motion-sensor-off
+  notif_valhorn_watchdog_parent_a:
+    name: "📡 Bevægelsessensor nede/hængt — Parent A"
+    icon: mdi:cellphone
+  notif_valhorn_watchdog_airbnb:
+    name: "📡 Bevægelsessensor nede/hængt — også i AirBnB"
+    icon: mdi:home-account
+  # Runtime-flag: sat når outage-push er sendt → recovery-push fyrer KUN hvis
+  # vi faktisk varslede (undgår falsk "tilbage"-push ved restart-flap). Ikke
+  # config → ikke i init/snapshot.
+  entre_valhorn_outage_alerted:
+    name: "Entré-VALLHORN: outage varslet"
+    icon: mdi:bell-alert
+
+  # Runtime-flag for stuck-on-varslet (se afsnittet under input_boolean).
+  entre_valhorn_stuck_alerted:
+    name: "Entré-VALLHORN: stuck-on varslet"
+    icon: mdi:motion-sensor-off
+
+  depot_valhorn_stuck_alerted:
+    name: "Depot-VALLHORN: stuck-on varslet"
+    icon: mdi:motion-sensor-off
+
+# =============================================================================
+# STUCK-ON (2026-08-01, user-bug "ting hænger i bad og entré")
+# =============================================================================
+# Den anden — og tavse — udfaldsmåde: mister VALLHORN'en sin Thread-forælder
+# MENS den melder `on`, når dens `off` aldrig frem. HA bliver stående på `on` i
+# op mod 40 min før enheden endelig markeres unavailable, og i hele det vindue
+# ser 55 forbrugere (house_state, dormant, godnat-auto, roborock, people_estimate,
+# bad-presence …) en person der ikke findes. Målt over 21 dage: ægte ophold
+# topper ved 13,3 min, stuck-on-artefakter ligger på 30,8 og 39,1 min.
+#
+# Vi kan ikke maskere en fysisk Matter-entity ved kilden (kun template-sensorer
+# kan omskrives, jf. bad-unionen i packages/badevaerelse_wasp.yaml), så i stedet:
+# (1) `homeassistant.update_entity` tvinger Matter-integrationen til at spørge
+# noden — svarer den ikke, skifter den til `unavailable`, hvilket ALLE
+# `is_state(x,'on')`-forbrugere læser korrekt som "ikke til stede"; (2) push, så
+# et hængt entré-øje aldrig igen er noget man selv skal opdage.
+template:
+  - binary_sensor:
+      # NB slug: HA slugificerer navnet → `binary_sensor.entre_vallhorn_haengt`
+      # med DOBBELT L (produktnavnet), mens den fysiske sensor hedder
+      # `entre_valhorn_occupancy` med ét. Forbrugere skal bruge dobbelt-L-formen;
+      # unique_id'en er låst som den blev født (ændring ville forældre-løsrive
+      # registry-entryen og give et `_2`-duplikat).
+      - name: "Entre VALLHORN haengt"
+        unique_id: entre_valhorn_haengt
+        device_class: problem
+        icon: mdi:motion-sensor-off
+        state: >
+          {% set m = states('input_number.occupancy_stuck_on_minutes') | float(0) %}
+          {% set maks = (m if m > 0 else 18) * 60 %}
+          {% set s = states.binary_sensor.entre_valhorn_occupancy %}
+          {{ s is not none and s.state == 'on'
+             and (now() - s.last_changed).total_seconds() >= maks }}
+
+      # Depot-VALLHORN'ens occupancy har 21 forbrugere (house_modes,
+      # people_estimate, dormant, roborock, wasp …) og stod indtil 2026-08-18
+      # helt uden hængt-detektion. Samme regel som entré, men uden poll-forsøget
+      # (ZHA sleepy end device svarer ikke). Slug: DOBBELT L, som entréens.
+      - name: "Depot VALLHORN haengt"
+        unique_id: depot_valhorn_haengt
+        device_class: problem
+        icon: mdi:motion-sensor-off
+        state: >
+          {% set m = states('input_number.occupancy_stuck_on_minutes') | float(0) %}
+          {% set maks = (m if m > 0 else 18) * 60 %}
+          {% set s = states.binary_sensor.depot_valhorn_occupancy %}
+          {{ s is not none and s.state == 'on'
+             and (now() - s.last_changed).total_seconds() >= maks }}
+
+automation:
+  - id: valhorn_watchdog_unavailable
+    alias: "Watchdog: Entré-VALLHORN unavailable (early-detect single point of failure)"
+    description: >
+      Entré-VALLHORN er eneste early-detect-trigger for bad/depot/sove. Går den
+      unavailable i 15 min → push + stemplér outage-flag.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.entre_valhorn_occupancy
+        to: "unavailable"
+        for:
+          minutes: 15
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.entre_valhorn_outage_alerted
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: valhorn_watchdog
+          title: "📡 Entré-sensoren svarer ikke"
+          message: >-
+            Bevægelsessensoren i entréen har ikke svaret i 15 min. Indtil den
+            er tilbage, tænder lyset ikke i forvejen i bad, depot og
+            soveværelse. Den plejer at komme selv igen; gør den ikke inden i
+            morgen, så tag batterierne (2× AAA) ud og i igen.
+          payload:
+            tag: valhorn_watchdog
+
+  - id: valhorn_watchdog_recovered
+    alias: "Watchdog: Entré-VALLHORN tilbage online"
+    description: >
+      Entré-VALLHORN kom tilbage fra unavailable OG vi havde varslet → kvittér
+      + ryd outage-flag. Flag-guard undgår falsk push ved restart-flap.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.entre_valhorn_occupancy
+        from: "unavailable"
+    condition:
+      - condition: state
+        entity_id: input_boolean.entre_valhorn_outage_alerted
+        state: "on"
+      - condition: template
+        value_template: "{{ trigger.to_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.entre_valhorn_outage_alerted
+      # 2026-10-20: kvitteringen er erstattet af at varslet forsvinder tavst.
+      # clear_notification er ingen besked → uden om push_notify (samme
+      # mønster som plant_notifications.yaml).
+      - repeat:
+          for_each:
+            - mobile_app_phone_a
+            - mobile_app_phone_b
+          sequence:
+            - service: "notify.{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                message: clear_notification
+                data:
+                  tag: valhorn_watchdog
+
+  - id: valhorn_watchdog_stuck_on
+    alias: "Watchdog: Entré-VALLHORN hængt på 'on' (Thread-forælder tabt)"
+    description: >
+      Occupancy har stået `on` længere end nogen ægte tilstedeværelse (slider
+      occupancy_stuck_on_minutes) → sensoren har tabt sin off-besked. Tving et
+      Matter-poll: svarer noden ikke, falder den til `unavailable`, som alle
+      forbrugere læser korrekt. Push så det tavse tab bliver synligt.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.entre_vallhorn_haengt
+        from: "off"
+        to: "on"
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.entre_valhorn_stuck_alerted
+      - service: logbook.log
+        data:
+          name: "Entré-VALLHORN"
+          message: >-
+            Hængt på 'on' i
+            {{ ((now() - states.binary_sensor.entre_valhorn_occupancy.last_changed).total_seconds() / 60) | round(0) | int }}
+            min — tvinger Matter-poll.
+          entity_id: binary_sensor.entre_valhorn_occupancy
+      - service: homeassistant.update_entity
+        continue_on_error: true
+        target:
+          entity_id: binary_sensor.entre_valhorn_occupancy
+      # 2026-10-20: push KUN hvis pollet ikke løste det. Går sensoren
+      # unavailable (7/8 målt, 9-16 min efter), pusher _unavailable selv efter
+      # 15 min; slipper den til off (1/8), er der intet at sige.
+      - wait_for_trigger:
+          - platform: state
+            entity_id: binary_sensor.entre_vallhorn_haengt
+            from: "on"
+        timeout: "00:20:00"
+        continue_on_timeout: true
+      - condition: template
+        value_template: >-
+          {{ wait.trigger is none
+             and is_state('binary_sensor.entre_vallhorn_haengt', 'on') }}
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: valhorn_watchdog
+          title: "📡 Entré-sensoren hænger"
+          message: >-
+            Den har meldt bevægelse uafbrudt i
+            {{ ((now() - states.binary_sensor.entre_valhorn_occupancy.last_changed).total_seconds() / 60) | round(0) | int }}
+            min, så huset tror der står nogen i entréen. Det blokerer Dormant,
+            auto-godnat og robotten. Tag batterierne (2× AAA) ud og i igen.
+          payload:
+            tag: valhorn_watchdog
+
+  - id: valhorn_watchdog_depot_stuck_on
+    alias: "Watchdog: Depot-VALLHORN hængt på 'on' (Zigbee off-rapport tabt)"
+    description: >
+      Depot-occupancy har stået `on` længere end nogen ægte tilstedeværelse
+      (slider occupancy_stuck_on_minutes) → dens unoccupied-rapport er tabt.
+      Ingen poll her: ZHA-VALLHORN'en er et sleepy end device og svarer ikke,
+      så den kommer først fri ved næste ægte bevægelse. Push, fordi 21
+      forbrugere i mellemtiden ser et menneske der ikke findes.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.depot_vallhorn_haengt
+        from: "off"
+        to: "on"
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.depot_valhorn_stuck_alerted
+      - service: logbook.log
+        data:
+          name: "Depot-VALLHORN"
+          message: >-
+            Hængt på 'on' i
+            {{ ((now() - states.binary_sensor.depot_valhorn_occupancy.last_changed).total_seconds() / 60) | round(0) | int }}
+            min — ZHA-off-rapporten er tabt.
+          entity_id: binary_sensor.depot_valhorn_occupancy
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: valhorn_watchdog
+          title: "📡 Depot-sensoren hænger"
+          message: >-
+            Den har meldt bevægelse uafbrudt i over
+            {{ states('input_number.occupancy_stuck_on_minutes') | int(18) }} min,
+            så huset tror der står nogen i depotet. Det blokerer Dormant,
+            auto-godnat og robotten. Gå forbi depotet, så slipper den; ellers tag
+            batterierne (2× AAA) ud og i igen.
+          payload:
+            tag: valhorn_watchdog_depot
+
+  - id: valhorn_watchdog_depot_stuck_clear
+    alias: "Watchdog: Depot-VALLHORN ikke længere hængt"
+    description: >
+      Depot-sensoren melder igen noget andet end et hængt `on` → ryd flaget, så
+      næste hæng varsles igen. Ingen push (kvittering ville være støj) — varslet
+      tages tavst af telefonen (2026-10-20).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.depot_vallhorn_haengt
+        from: "on"
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.depot_valhorn_stuck_alerted
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.depot_valhorn_stuck_alerted
+      - repeat:
+          for_each:
+            - mobile_app_phone_a
+            - mobile_app_phone_b
+          sequence:
+            - service: "notify.{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                message: clear_notification
+                data:
+                  tag: valhorn_watchdog_depot
+
+  - id: valhorn_watchdog_stuck_clear
+    alias: "Watchdog: Entré-VALLHORN ikke længere hængt"
+    description: >
+      Sensoren melder igen noget andet end et hængt `on` → ryd flaget, så næste
+      hæng varsles igen. Ingen push (kvittering ville være støj) — et evt.
+      hængt-varsel tages tavst af telefonen (2026-10-20). Går den unavailable,
+      kommer _unavailable's egen besked 15 min senere på samme tag.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.entre_vallhorn_haengt
+        from: "on"
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.entre_valhorn_stuck_alerted
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.entre_valhorn_stuck_alerted
+      - repeat:
+          for_each:
+            - mobile_app_phone_a
+            - mobile_app_phone_b
+          sequence:
+            - service: "notify.{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                message: clear_notification
+                data:
+                  tag: valhorn_watchdog

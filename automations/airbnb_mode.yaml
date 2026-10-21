@@ -1,0 +1,1351 @@
+# =============================================================================
+# AirBnB mode — "kopiér Normal + 4 undtagelser" (REDESIGN 2026-06-30)
+# =============================================================================
+# User-spec 2026-06-30: Den gamle minimal-lockdown (alt manuelt via Styrbar)
+# var aldrig testet og for spartansk. Nu er vores presence-automations gode nok
+# til at AirBnB skal OPFØRE SIG SOM NORMAL MODE — gæster får intelligent,
+# bevægelses-/dagslys-styret lys — MED 4 undtagelser:
+#
+#   1. DEPOT + BØRNEVÆRELSE-lys må ALDRIG tænde (ikke engang via app/kontakt).
+#      → airbnb_block_depot_boern_lights (nedenfor) slukker dem øjeblikkeligt
+#        hvis NOGET tænder dem. + boern-presence forbliver disabled (lockdown).
+#   2. STRØM-GENSTART (vægkontakt off→on) tænder lys på passende lux-niveau;
+#      BAD hopper direkte til fuld (100%). → airbnb_power_recovery_all i
+#      automations/light_power_recovery.yaml. Depot/børn undtaget (regel 1).
+#   3. INGEN auto-lys om morgenen + INGEN auto-gardin-OP nogensinde. Auto-gardin
+#      NED er fint. → vækninger forbliver disabled/self-gated; alle gardin-OP-
+#      automations gated mod AirBnB (morning_curtains, winter_solar_gain_open,
+#      house_airbnb_to_active curtain-open fjernet, house_manual_active gated,
+#      house_state_to_active er allerede AirBnB-gated, summer_defense Normal-only).
+#   4. ENTRÉ-STYRBAR forenkles: OP = tænd open-plan (entré+stue+køkken+spisestue),
+#      NED = sluk ALT lys i lejligheden + grace-periode (slider
+#      input_number.entre_shutdown_grace_minutes). TOP-lang/BUND-lang/L-R =
+#      deaktiveret i AirBnB. → branches + AirBnB-gates i automations/entre_somrig.yaml.
+#
+# STADIG DISABLED i AirBnB (familie-rutiner — irrelevante/uønskede for gæster):
+#   - Wakeups (morgen-lys, undtagelse 3)
+#   - Familie-godnat-clears med lys/gardin-sideeffekter (godnat_deaktiver_om_
+#     morgenen åbner gardiner; kalde/børn-flows; auto-declare = Normal-designet
+#     2t-kontinuerlig som alligevel aldrig kan fyre med muted sove-still)
+#   - Børneværelse-presence + harry-potter-depot + klima-børn (undtagelse 1)
+#   - Activity-state winddown/guest-mode (familie-mønster)
+#   - Person-tracking arrive/leave (frosset — familien er væk)
+#   - Security front-door spam, styrbar battery-notifikationer
+#
+# KØRER NU i AirBnB (= som Normal):
+#   - Godnat/godmorgen via sove-Somrig (klik OP/NED + lang OP/NED) + nattur-dim
+#     + stuck-subflag-safety — gæster KAN bruge knapperne (sprint 2026-07-12);
+#     packages/airbnb_natmode.yaml auto-sætter/rydder natmode hvis de ikke gør
+#   - Presence-lys + lux-drivere for stue/køkken/spisestue/sove/bad/entré
+#   - Arrival-velkomst, entre-motion, room-mode drift-back
+#   - Terrasse dæmp/gendan/velkomst-komfort
+#   - House_state auto-transitions (presence-driven Active/Dormant)
+#   - Backup, device_health, bulb_firmware, mood-flag safety, alle safety-alerts
+#
+# AirBnB-SPECIFIKKE automations (uændret rolle):
+#   - airbnb_no_presence_60min_off — 60 min tomt: sluk alt + Dormant (gæste-safety)
+#   - airbnb_dormant_to_active_entre — Dormant + entré: comfort welcome (open-plan)
+#   - airbnb_outdoor_zen_on/off — terrasse zen-lys (terrace-controller er Normal-only)
+#   - airbnb_block_depot_boern_lights — undtagelse 1 enforcer (NY)
+# =============================================================================
+
+# =============================================================================
+# LOCKDOWN: triggers ved skift til AirBnB mode
+# =============================================================================
+- id: airbnb_mode_lockdown
+  alias: "AirBnB: Lockdown ved skift til AirBnB mode"
+  description: >
+    Disabler ALLE familie-automations + presence_lights (undtagen bath) +
+    drift-back. Frigør person-booleans. Sender notification.
+    F1 fix sprint 2026-05-06: kan purge 14-dages family-presence history så en
+    AirBnB-gæst MED UI-ADGANG ikke kan se familiens bevægelses-mønster — men
+    purgen er siden 2026-08-16 gated på input_boolean.airbnb_privacy_purge_
+    enabled, der er default OFF (den er irreversibel og gjorde mode-testning
+    umulig; se kommentaren ved selve kaldet).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_select.house_mode
+      to: "AirBnB"
+  action:
+    # F1 fix: Privacy purge — slet family presence-history før gæster ankommer.
+    # Service tager keep_days=0 + entity-list = øjeblikkelig slet af specifik
+    # historik. occupancy/presence/last_press/styrbar = familie-pattern data.
+    # A3 fix sprint 2026-05-06: udvidet med 15 nye entity-classes som agents
+    # auditet identificerede som privacy-leaks (scenes, terrasse, kalde,
+    # styrbar-state, room-mode preferences).
+    # 2026-08-16d (user-spec "jeg skal kunne slå airbnb til uden data purge —
+    # ellers kan jeg ikke teste det; privatliv ift data er lige meget i det her
+    # setup"): purgen er nu gated på en kill-switch der er **default OFF**.
+    # Den er IRREVERSIBEL (keep_days: 0 over ~90 globs) og gjorde hvert
+    # prøve-skift til AirBnB til et permanent tab af 14 dages historik — dvs.
+    # præcis de data enhver senere diagnose og kalibrering hviler på.
+    # Trusselsbilledet den blev bygget mod (F1 2026-05-06) er en gæst med
+    # adgang til HA's UI, der kan læse familiens bevægelses-mønster i history.
+    # Har gæsten ikke UI-adgang, er purgen ren datatab → slå den til igen
+    # (Indstillinger → 🏡 AirBnB) hvis du nogensinde deler dashboardet.
+    - if:
+        - condition: state
+          entity_id: input_boolean.airbnb_privacy_purge_enabled
+          state: "on"
+      then:
+        - service: recorder.purge_entities
+          data:
+            entity_globs:
+              # Presence-detection (original)
+              - binary_sensor.*_apollo_occupancy
+              - binary_sensor.*_apollo_radar_*
+              - binary_sensor.*_valhorn_occupancy
+              - binary_sensor.parasoll_*
+              # Person-state (original)
+              - input_boolean.parent_a_home
+              - input_boolean.parent_b_home
+              # 2026-08-14b: iOS-geofencen er et rent familie-mønster (hvornår
+              # Parent B er hjemme) — skal purges som de andre person-flag (#16).
+              - input_boolean.parent_b_hjemme_ios
+              - input_boolean.godnat_*
+              - input_boolean.guest_mode
+              - input_datetime.styrbar_last_press_*
+              # 2026-10-07 (B198): hvornår et rum forlod Auto = samme mønster.
+              - input_datetime.room_mode_*_ikke_auto_siden
+              - sensor.activity_state
+              - sensor.people_estimate
+              - device_tracker.*
+              # H1 fix audit 2026-05-07: Parent B + Parent A phone-derived sensors
+              # leakede tidligere (battery, location, activity, ssid, next_alarm).
+              # next_alarm afslorede direkte vækketidspunkt = familie pattern.
+              - sensor.phone_b_*
+              - sensor.phone_a_*
+              # H1 fix: person.* aggregator-entities holder også location-historik.
+              - person.*
+              # A3 additions: scenes (mood patterns)
+              - binary_sensor.scene_*_active
+              - input_select.active_scene
+              # A3 additions: terrasse (outdoor activity timing)
+              - binary_sensor.terrasse_active
+              - binary_sensor.terrasse_lights_on
+              - binary_sensor.likely_on_terrasse
+              # A3 additions: open-plan timing (when family was in living area)
+              - binary_sensor.open_plan_empty_for_20m
+              - binary_sensor.godnat_any_active
+              # A3 additions: mood/safety flags (intimate)
+              # 2026-07-28: dark_mode tilføjet (fejlklasse #16 — skabt 07-27, efter
+              # denne roster; film-aftener er samme slags "intimt" mønster som cinema).
+              - input_boolean.dark_mode
+              - input_boolean.predark_active
+              # 2026-08-07: "så børnene tv på deres værelse i aftes?" — låsen armeres
+              # af tv'et i børneværelset (packages/boernevaerelse_manual_off_lock.yaml
+              # ARM 2), så dens historik er familie-mønster på niveau med filmaftenen.
+              - input_boolean.boernevaerelse_manual_off_lock
+              # dark_mode_rooms/_exempt/_curtains_prev (07-28): HVILKE rum familien
+              # mørklagde = hvor de så film, og hvem der blev fritaget undervejs.
+              - input_text.dark_mode_*
+              # 2026-08-02 (fejlklasse #16): op-tryk-stemplet er et præcist
+              # tidsstempel for hvornår familien satte sig til at se film.
+              - input_datetime.dark_mode_op_tryk_at
+              # 2026-07-28 (item 4): Parent B's næste alarm = hvornår familien står op
+              # på hverdage. Genvejen på hendes iPhone genskriver den næste nat.
+              - input_datetime.parent_b_next_alarm
+              # 2026-07-30: samme oplysning rå fra genvejen (stempel + ALLE
+              # aktiverede alarm-klokkeslæt) — afslører også weekend-rytmen.
+              - input_text.parent_b_alarm_genvej
+              - input_boolean.cinema_active
+              - input_boolean.cirkus_active
+              # 2026-10-03 (fejlklasse #16): sofa-sessionerne og Zen-historikken afslører præcis
+              # hvornår familien sad i sofaen og hvor længe — samme mønster som presence.
+              - binary_sensor.sofa_hygge_*
+              - binary_sensor.sofa_zen_*
+              - sensor.sofa_zen_*
+              - input_boolean.sofa_zen_auto_aktiv
+              - input_boolean.kalde_active
+              - input_boolean.bedroom_only_winddown
+              - input_boolean.winter_solar_active
+              # A3 additions: per-room manual mode preferences
+              - input_select.room_mode_*
+              # A3 additions: Styrbar interaction state
+              - input_boolean.styrbar_*_holding_*
+              - input_boolean.styrbar_lr_grace_*
+              - input_number.styrbar_*_idx_*
+              # Hunt 2026-07-18: presence-entities skabt EFTER purge-listen (05-07)
+              # driftede ud af rosteret (fejlklasse #16). Matter-PIR-badet + derived
+              # akkumulerings-sensorer afslører samme familie-mønstre som de rå.
+              - binary_sensor.badevaerelse_inde_*
+              - binary_sensor.kids_home
+              - binary_sensor.faelles_areal_aktiv
+              - input_boolean.boern_sov_her_i_nat
+              # 2026-07-30 (fejlklasse #16): ankomst-flaget afslører præcis hvilke
+              # dage/klokkeslæt børnene kom — samme familie-mønster som latch'en.
+              - input_boolean.boern_aktivitet_detekteret
+              - input_datetime.boern_ankomst_suppress_until
+              - input_datetime.boern_ankomst_stille_until
+              # 2026-10-07: datoen for familiens manuelle "børn hjemme".
+              - input_text.kids_home_manual_dato
+              # 2026-07-28 (fejlklasse #16): putning-flaget er skabt 07-22, efter
+              # rosteret — det afslører præcis hvornår børnene puttes.
+              - input_boolean.putning_sove_active
+              # 2026-08-06 (fejlklasse #16): lås-detektorens stempler er præcise
+              # tidspunkter for hvornår familien trådte ind i hvert enkelt rum.
+              - input_datetime.*_apollo_occ_since
+              # 2026-08-06: morgen-udskydelsens stempel er et præcist tidsstempel
+              # for hvornår familien var i gang med morgenrutinen (og flaget for
+              # hvor længe de blev hjemme bagefter).
+              - input_boolean.roborock_morgen_venter
+              - input_datetime.roborock_morgen_vent_start
+              # 2026-07-29 (fejlklasse #16): sove-snoozen afslører præcis hvilke
+              # morgener familien sov videre og hvor længe; bad-gaten er afledt af
+              # badets occupancy = hvornår vi badede.
+              - input_datetime.sove_snooze_until
+              - binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+              - binary_sensor.sove_gardin_bad_klar
+              # 2026-07-30: flankerne på dagens bad-billet er præcis "hvornår var
+              # familiens første bad færdigt" hver eneste dag.
+              - input_boolean.sove_gardin_bad_foerste_besoeg_ovre
+              # 2026-07-30: alarm-vækningens fuldførelses-stempel + det afledte
+              # morgen-vindue afslører præcis hvornår familien stod op hver dag.
+              - input_datetime.wakeup_alarm_ramp_faerdig_at
+              # 2026-08-05 (fejlklasse #16): selve alarm-tidspunktet er endnu mere
+              # afslørende end rampens fuldførelse — stemplet skrives HVER morgen.
+              - input_datetime.wakeup_alarm_gaaet_af_at
+              - binary_sensor.sove_alarm_morgen_lys
+              # 2026-07-31 (fejlklasse #16): morgen-afgangssekvensen er samme
+              # privat-mønster — "hvornår forlod hvem soveværelset, og hvornår var
+              # vi begge oppe".
+              - input_datetime.sove_morgen_afgang_at
+              - input_datetime.sove_alarm_morgen_2p_at
+              # B209: morgen-varslets vente-anker = samme afgangs-tidspunkt.
+              - input_datetime.varsel_morgen_venter_fra
+              # 2026-10-07 (fejlklasse #16): entré-velkomstens stempler er
+              # "hvornår kom den første voksne ud / blev open plan tændt" hver morgen.
+              - input_datetime.openplan_entre_velkomst_at
+              - input_datetime.openplan_morgenlys_foerste_at
+              - input_boolean.sove_morgen_anden_krop
+              - binary_sensor.sove_alarm_morgen_vindue
+              - binary_sensor.sove_alarm_morgen_to_oppe
+              - binary_sensor.sove_morgen_moerklagt
+              # 2026-08-30e: dør-mørkholdet er afledt af soveværelsets dør, som
+              # er samme private mønster ("hvornår lukkede vi døren for at sove
+              # videre"). Selve dørsensoren er allerede dækket af
+              # binary_sensor.parasoll_* ovenfor.
+              - binary_sensor.sove_doer_moerkhold
+              - sensor.people_zones_now
+              # 2026-09-17 (fejlklasse #16): øjebliks-beviset bag people_estimate.
+              # Uden for AirBnB indgår parent_a_home/parent_b_home/kids_home i dens
+              # værdi, så dens historik er præcis "hvem af familien var hjemme
+              # hvornår" — samme klasse som sensor.people_estimate (linje 110).
+              # 2026-09-30 (people v4): people_evidence_now er afløst af
+              # familie-trioen + ekstra-tallet; entry'en bliver stående, så en
+              # purge også rydder den gamle entitys 14-døgns-historik.
+              - sensor.people_evidence_now
+              - sensor.people_familie
+              - sensor.people_voksne
+              - sensor.people_boern
+              # 2026-10-01 (people v5): gulvene ER antal-hjemme-historikken, og
+              # dør-stemplet/børne-flaget er "hvornår gik vi / var børnene her".
+              - input_number.people_gulv
+              - input_number.people_ekstra_gulv
+              - input_datetime.people_doer_haendelse
+              - input_boolean.people_boern_set_efter_doer
+              - sensor.people_ekstra_nu
+              - sensor.sove_presence_60min
+              - sensor.koekken_apollo_bevaegelse_5min
+              - sensor.koekken_bevaegelse_5min_sekunder
+              - sensor.faelles_aktivitet_30min
+              # 2026-08-01 (fejlklasse #16): akkumuleret bad-tid er lige så privat
+              # som fælles-arealet — den viser hvor længe nogen var i badet og hvornår.
+              - sensor.badevaerelse_aktivitet_30min
+              # 2026-08-13 (fejlklasse #16): bruser-vagtens stempel + signatur er
+              # præcist "hvornår var begge hjemmeværende i badet samtidig" —
+              # samme klasse af familie-mønster som sove_alarm_morgen_2p_at.
+              - input_datetime.badevaerelse_bruser_vagt_stempel
+              - input_boolean.badevaerelse_bruser_vagt
+              - binary_sensor.badevaerelse_alle_hjemme_i_bad
+              # 2026-09-01 (fejlklasse #16): brusebad-sessionen er et endnu
+              # skarpere familie-mønster — den siger præcis hvornår hver enkelt
+              # gik i bad og hvor længe. Samme klasse som ovenstående.
+              - input_datetime.badevaerelse_brusebad_stempel
+              - input_datetime.badevaerelse_sidste_indre_pir
+              - input_boolean.badevaerelse_brusebad_session
+              - binary_sensor.badevaerelse_brusebad_signatur
+              - binary_sensor.badevaerelse_brusebad_hold
+              # 2026-07-28 (fejlklasse #16): cykel-lade-historik afslører familiens
+              # hjemme-mønster (hvornår batterier sættes til = hvornår vi kom hjem).
+              - switch.entre_cykel_lader_plug
+              - sensor.entre_cykel_lader_effekt
+              - sensor.cykel_lader_effekt_ren
+              - binary_sensor.cykel_lader_nu
+              # 2026-07-29: probe-fund-stemplet er præcis "hvornår blev der sat et
+              # batteri til" = samme hjemkomst-mønster som pluggen selv.
+              - input_datetime.cykel_lader_probe_fund_at
+              # 2026-07-29: hjemmearbejdsdags-markøren + ophold-målingen afslører
+              # præcis hvilke dage familien var hjemme og arbejdede.
+              - input_boolean.maaltid_hjemmearbejde_dag
+              - sensor.hjemmearbejde_ophold_min_i_vindue
+            keep_days: 0
+      else:
+        - service: logbook.log
+          data:
+            name: "AirBnB lockdown"
+            message: >-
+              Privacy-purge SPRUNGET OVER (kill-switchen er off) — familiens
+              history er bevaret. Slå input_boolean.airbnb_privacy_purge_enabled
+              til hvis gæsten får adgang til HA-dashboardet.
+            entity_id: input_select.house_mode
+    # Frigør person-booleans
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          - input_boolean.parent_a_home
+          - input_boolean.parent_b_home
+          - input_boolean.parent_b_hjemme_ios
+    # Force-clear godnat flags
+    # A30 fix sprint 2026-05-06 PM: tilfojet input_boolean.guest_mode (var
+    # missing - kunne stuck'e drift_back forever hvis guest_mode=on pre-AirBnB).
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          - input_boolean.godnat_active
+          - input_boolean.godnat_voksne_active
+          - input_boolean.godnat_boern_active
+          - input_boolean.godnat_pending
+          - input_boolean.kalde_active
+          - input_boolean.bedroom_only_winddown
+          - input_boolean.guest_mode
+          # 2026-09-02: vækningens hold freder børneværelsets lys mod auto-sluk.
+          # Sættes aldrig i AirBnB (wakeup_kids er mode-gatet), men et hold sat
+          # FØR entry ville ellers holde gæstens lys tændt indtil backstoppen.
+          - input_boolean.wakeup_kids_hold_active
+          # 2026-09-29: morgen-nedtoningens flag hører til holdet (samme symmetri).
+          - input_boolean.boern_morgen_bevaeget
+          - input_boolean.boern_morgen_nedtoning_aktiv
+          # 2026-07-30: gæstens børn må ikke arve familiens ankomst-flag (og
+          # omvendt). Detektoren er selv mode-gatet, men et flag sat FØR entry
+          # ville ellers hænge ved som kids_home on gennem hele opholdet.
+          - input_boolean.boern_aktivitet_detekteret
+          # 2026-09-28 (AirBnB-audit): latch'en er hysteretisk (06:30 rydder
+          # den kun ved < 15 min ophold) og dens "Passer det?"-push er
+          # Normal-gatet. Sat under opholdet (gæst i børneværelset) ville den
+          # overleve exit som kids_home on UDEN at user blev spurgt (spec
+          # 2026-09-25). Ryddes derfor ved entry OG exit.
+          - input_boolean.boern_sov_her_i_nat
+          # 2026-07-28: putning-flaget holder sove-gardinet NEDE via
+          # sensor.gardiner_manual_hold og blokerer alt auto-tænd i sove →
+          # en gæst ville sidde i et mørkt soveværelse indtil 06:00-backstoppen.
+          # (Clear er bivirkningsfri: putning-clear rører aldrig lys/gardin.)
+          - input_boolean.putning_sove_active
+          # 2026-07-29: sove-gardinets bad-gate-pending-flag. Gæsten må ikke
+          # arve en halv-udført oprulning (gardinet ville rulle op af sig selv
+          # når badet blev tomt), og familien må ikke arve gæstens.
+          - input_boolean.sove_gardin_op_afventer
+          # 2026-07-30: dagens bad-billet. Arvet ON ville lade gardinet rulle
+          # helt op mens gæsten stod i badet på hans første dag; clear = gaten
+          # armeres igen (den sikre retning).
+          - input_boolean.sove_gardin_bad_foerste_besoeg_ovre
+          # 2026-07-29: hjemmearbejdsdags-markøren. Detektoren er AirBnB-gatet,
+          # men et arvet flag ville spærre måltids-støvsugningen under opholdet.
+          - input_boolean.maaltid_hjemmearbejde_dag
+          # 2026-08-05: armeret måltids-støvsugning. Måltids-faserne er
+          # AirBnB-gatede, så flaget kan ikke SÆTTES under opholdet — men et
+          # flag armeret minutter før entry ville sende robotten afsted i
+          # gæstens stue så snart køkkenet faldt til ro.
+          - input_boolean.maaltid_stovsug_venter
+          # 2026-08-06: morgen-udskudt manuel støvsugning. Arm-vejen er
+          # AirBnB-gatet, men et flag sat minutter før entry ville lade en
+          # PAUSET robot rulle i gang midt i gæstens ophold, første gang huset
+          # gik Dormant. Robotten forbliver pauset (gæsten kan selv fortsætte
+          # den i app'en) — vi rører den ikke, vi holder blot op med at vente.
+          - input_boolean.roborock_morgen_venter
+          # 2026-07-28 (AirBnB-review af Dark Mode): ryd mørklægningen ved entry.
+          # Ellers arver gæsten familiens film-blackout: dark_mode_lights_enforce
+          # er IKKE mode-gatet og ville slå gæstens presence-lys ihjel, og
+          # AirBnB-natmode rører aldrig cinema_active (= ingen oprydning).
+          # OFF-grenen tænder aldrig lys; gardiner genåbnes kun i dagslys.
+          - input_boolean.dark_mode
+          # Pre-Dark (projektor-dæmpning) — samme begrundelse: gæsten må ikke
+          # arve familiens dæmpe-tilstand, og dens restore-snapshot peger på
+          # familiens lysniveauer.
+          - input_boolean.predark_active
+          # 2026-08-07: børneværelsets manuel-sluk-lås. Begge dens ARM-veje er
+          # Normal-gatede, men en lås armeret MINUTTER før mode-skiftet ville
+          # arves ind i opholdet og spærre gæstens børneværelses-lys indtil
+          # rummet har stået tomt i 20 min (CLEAR 2) eller 05:45 (CLEAR 4) —
+          # og gæsten kender ikke udgangs-trykket (Styrbar OP).
+          - input_boolean.boernevaerelse_manual_off_lock
+          # 2026-08-26h: soveværelsets aften-lås (packages/aften_manual_off_lock.yaml).
+          # Strammere end børnenes: INGEN tomheds-clear, kun manuel tænd eller
+          # 05:00. En lås armeret lige før mode-skiftet ville spærre gæstens
+          # soveværelses-lys hele natten uden en udgang han kender.
+          - input_boolean.sovevaerelse_manual_off_lock
+          # 2026-10-17: hyggelampe-fravalg (packages/stue_plug.yaml) — gæsten får
+          # den fulde sofa-zone, og et familie-fravalg må ikke arves ind/ud.
+          - input_boolean.stue_hyggelampe_fravalgt
+          # 2026-10-17: festlys-stempel fra børne-Styrbar (packages/festlys_boern_styrbar.yaml).
+          - input_boolean.festlys_boern_styrbar
+          # 2026-08-23: gæste-holdet HOLDER netop låsen mod CLEAR 2/3/4. Ryddes
+          # det ikke sammen med den, gen-armerer det låsen bag lejeren og
+          # spærrer børneværelset til 10:00 uden nogen udgang han kender.
+          - input_boolean.boernevaerelse_gaest_sover
+          # 2026-08-13g: Sleep Over-armeringen. Den er ikke mode-gatet (en gæst
+          # KAN sove i open-plan i begge modes), men et flag armeret til
+          # familiens overnattende gæst ville følge med ind i udlejningen og
+          # mørklægge lejerens stue om natten — uden at han kender toggle'en.
+          # Kill-switchen (sleepover_enabled) er en indstilling og ryddes IKKE.
+          - input_boolean.sleepover_i_nat
+          # 2026-07-28: cykel-lader runtime-flag. Ladningen er i sig selv gatet
+          # til Normal/Home Vacation, så gæsten lader aldrig — men et arvet
+          # `probe_aktiv` ville spærre familiens ladning efter exit, og et
+          # arvet `faerdig` udskyder første ladning til deadline-clearet.
+          # `cykel_lader_alarm_lock` ryddes BEVIDST IKKE: den er en hård
+          # sikkerheds-spærring efter røgalarm, og et mode-skift må aldrig
+          # være det der genoptager ladning af et lithium-batteri.
+          - input_boolean.cykel_lader_faerdig
+          - input_boolean.cykel_lader_probe_aktiv
+          - input_boolean.cykel_lader_probe_stop
+          # 2026-06-30 (undtagelse 3): ryd vinter-solar-flag ved entry. Ellers
+          # kunne winter_solar_gain_close (ikke AirBnB-gated) partial-åbne syd-
+          # gardinet (position 50) i AirBnB = auto-gardin-OP. Flaget kan ikke
+          # gen-sættes i AirBnB (winter_solar_gain_open er AirBnB-gated).
+          - input_boolean.winter_solar_active
+          # 2026-07-16 (gardin-audit, fejlklasse #15): ryd sommer-forsvar-Active-
+          # flags ved entry. summer_defense_active er gated house_mode in
+          # [Normal, Home Vacation] → dens flag-clear-gren kan ALDRIG køre i
+          # AirBnB; entrer huset AirBnB
+          # med flagene on, sad de fast hele opholdet (og reopen-logik ville
+          # tro gardinerne stadig var auto-lukkede efter hjemkomst).
+          - input_boolean.summer_active_closed_syd
+          - input_boolean.summer_active_closed_vest
+          # 2026-09-23 (mosbillede-beskyttelsen, AirBnB-regel #3): ejerskabs-
+          # flaget ligger i gardiner_manual_hold's 'held' → et arvet flag ville
+          # blokere gæstens auto-gardin-op-veje, og et arvet manuel-op-hold
+          # ville holde solbeskyttelsen tilbage indtil huset gik Dormant.
+          - input_boolean.mosbillede_gardin_ned
+          - input_boolean.mosbillede_manuel_op_hold
+          # 2026-07-28: Apollo flap-jagten auto-tændes ved Dormant. Kørte den da
+          # mode skiftede, ville gæstens egen bevægelse blive læst som spøgelser
+          # og permanent hæve radar-gatene (= mindre følsomme for familien
+          # bagefter). Auto-on-grenen er allerede Normal/Home Vacation-gatet.
+          - input_boolean.apollo_flap_hunt_enabled
+          # 2026-10-03 (Sofa Zen automatik): ejer-flaget er runtime. Motoren slipper det selv ved
+          # house_mode == AirBnB, men er motoren deaktiveret, ville en arvet `on` aldrig ryddes.
+          - input_boolean.sofa_zen_auto_aktiv
+    # 2026-09-02 (AirBnB-audit): scene-rammen selv blev ALDRIG ryddet — kun
+    # dens to gamle booleans (cinema_active/cirkus_active). input_select.
+    # active_scene stod kun i privacy-purge-globben. Var familien i en scene da
+    # moden skiftede, arvede gæsten den: packages/foedselsdag_mood.yaml:38 har
+    # en time_pattern der bytter 10 lamper rød/hvid hvert 5. minut så længe
+    # active_scene == 'foedselsdag', og dance_mode/scene_spread hænger på samme
+    # anker. Sættes til 'none' ved BÅDE entry og exit (samme symmetri).
+    - service: input_select.select_option
+      continue_on_error: true
+      target:
+        entity_id: input_select.active_scene
+      data:
+        option: "none"
+    # 2026-09-28 (AirBnB-audit): festlyset og cirkus hænger IKKE på
+    # active_scene — begge booleans stod kun i privacy-purge-globben, aldrig i
+    # en force-clear. Et glemt festlys holdt stuens farve-loops kørende, lånte
+    # køkken-lyskæden (koekken_lyskaede_laant) og spærrede terrassens
+    # nat-sluk (terrace_plug_control: dance_mode == off) — uden udgang for
+    # gæsten. fest_smooth_stop er festens EGEN stop-vej (event → off FØR
+    # dance_mode → off, så orchestratoren giver rummene tilbage til Auto).
+    - if:
+        - condition: template
+          value_template: >-
+            {{ is_state('input_boolean.dance_mode', 'on')
+               or states('input_select.dance_manual_event') not in ['off', 'unknown', 'unavailable'] }}
+      then:
+        - service: script.fest_smooth_stop
+          continue_on_error: true
+    - service: input_boolean.turn_off
+      continue_on_error: true
+      target:
+        entity_id: input_boolean.cirkus_active
+    # 2026-09-12: børnestrippens aften-niveau-hold. ARM-vejen er mode-gatet, men
+    # et hold armeret minutter før entry ville fryse gæstens børneværelses-strip
+    # på familiens niveau indtil solopgang — og gæsten kender ikke udgangen.
+    # Flaget er et input_text (`off` | `hold:<epoch>`), ikke et boolean, så det
+    # kan ikke ligge i turn_off-listen ovenfor.
+    - service: input_text.set_value
+      continue_on_error: true
+      target:
+        entity_id: input_text.boern_aften_niveau_hold
+      data:
+        value: "off"
+    # 2026-07-29: ryd sove-snoozen ved entry. Selve snooze-TRYKKET er
+    # Normal/Home Vacation-gatet (en gæst kan ikke lave en), men en snooze der
+    # allerede kører når mode skifter, ville blokere gæstens auto-lys OG
+    # auto-gardin i soveværelset i op til `sove_snooze_timer` timer — uden at
+    # han har nogen måde at vide hvorfor. Timestamp'et nulstilles, ikke boolean'en
+    # (kill-switchen er familiens indstilling og skal overleve opholdet).
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.sove_snooze_until
+      data:
+        datetime: "1970-01-01 00:00:00"
+    # 2026-08-25: ryd "dagens vækning sprunget over"-stemplet. Samme argument som
+    # snoozen ovenfor — trykket er Normal/Home Vacation-gatet, men et stempel sat
+    # samme morgen ville følge med ind i opholdet og tie hele vække-kæden resten
+    # af dagen. Stemplet udløber ganske vist ved midnat, men "gæsten får ingen
+    # vækning i dag" er præcis den slags tilstand han ikke kan slippe ud af uden
+    # at kende huset. Ingen exit-clear (samme som søskendene ovenfor): en gæst
+    # kan ikke sætte stemplet, så familien har intet at arve.
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.wakeup_skip_dato
+      data:
+        datetime: "1970-01-01 00:00:00"
+    # 2026-07-30: ryd alarm-vækningens fuldførelses-stempel. Et arvet stempel
+    # ville lade `binary_sensor.sove_alarm_morgen_lys` stå on i op til
+    # `sove_alarm_morgen_vindue_minutter` ind i opholdet = hævet lux-gate +
+    # slukket dagslys-sluk i gæstens soveværelse, uden nogen synlig årsag.
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.wakeup_alarm_ramp_faerdig_at
+      data:
+        datetime: "1970-01-01 00:00:00"
+    # 2026-08-05: samme for alarm-stemplet. Arves det ind i opholdet, ville
+    # `sensor.wakeup_kids_maal` pege på familiens alarm + slider = en solopgang
+    # i gæstens børneværelse (kids_home er ganske vist off, men stemplet skal
+    # heller ikke ligge og lyve om gæstens morgen).
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.wakeup_alarm_gaaet_af_at
+      data:
+        datetime: "1970-01-01 00:00:00"
+    # 2026-07-31: samme begrundelse for morgen-afgangssekvensen. Et arvet
+    # 2p-stempel fra samme dag ville melde "to personer oppe bekræftet" ind i
+    # gæstens ophold = auto-lys bag et lukket gardin han ikke kan forklare.
+    - service: input_datetime.set_datetime
+      target:
+        entity_id:
+          - input_datetime.sove_alarm_morgen_2p_at
+          - input_datetime.sove_morgen_afgang_at
+          - input_datetime.varsel_morgen_venter_fra
+      data:
+        datetime: "1970-01-01 00:00:00"
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.sove_morgen_anden_krop
+    # 2026-08-13: bruser-vagten (armeret = "alle hjemmeværende er i badet") må
+    # ikke arves over mode-skiftet — den forlænger badets sluk-ventetider ×2.
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.badevaerelse_bruser_vagt
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.badevaerelse_bruser_vagt_stempel
+      data:
+        datetime: "1970-01-01 00:00:00"
+    # 2026-09-01: brusebad-sessionen holder ALLE badets sluk-veje tilbage. En
+    # arvet session ville låse gæstens badelys tændt i op til maks-minutter
+    # uden at han kan forklare hvorfor. Stemplet nulstilles med, ellers ville
+    # alderen regnes fra familiens bad.
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          - input_boolean.badevaerelse_brusebad_session
+          - input_boolean.badevaerelse_brusebad_lys_genrejst
+          - input_boolean.badevaerelse_fugt_venteslukket
+    - service: input_datetime.set_datetime
+      target:
+        entity_id:
+          - input_datetime.badevaerelse_brusebad_stempel
+          - input_datetime.badevaerelse_sidste_indre_pir
+      data:
+        datetime: "1970-01-01 00:00:00"
+    # 2026-07-29c: cykel-laderens slid-bogførings-stempel. Et arvet stempel
+    # ville få næste bogføring til at måle hen over hele opholdet og bogføre
+    # det som "slid" (packages/cykel_lader_slid.yaml). Nulstilles begge veje.
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.cykel_lader_energi_cursor_probe
+      data:
+        value: 0
+    # 2026-06-30 (undtagelse 1; rev. 2026-07-08 #12): sluk BØRNEVÆRELSE-lys ved
+    # AirBnB-entry (depot fjernet — depot skal fungere som Normal i AirBnB).
+    # Suppressoren (airbnb_block_depot_boern_lights) fanger kun NYE off→on-edges
+    # — lys der ALLEREDE er tændt når man skifter til AirBnB ville ellers blive
+    # stående til 60-min-off. Sluk dem eksplicit her.
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.boernevaerelse_all
+          - light.boernevaerelse_hyggelys
+          - light.boernevaerelse_lampe
+      data:
+        transition: 0
+    # Wakeups
+    # A28 fix: tilfojet wakeup_post_sluk_voksne (var missing fra Sprint 1 Blok F.5)
+    - service: automation.turn_off
+      target:
+        entity_id:
+          - automation.vaekning_voksne_alarm_driven_30_min_for_phone_alarm
+          - automation.vaekning_pigerne_kl_06_00_hverdage
+          - automation.vaekning_pigerne_kl_07_30_weekend_ferie
+          - automation.vaekning_sove_sluk_dim_15_min_efter_wakeup_smart_lux
+    # Godnat-flow familie-clears (lys/gardin-sideeffekter) — sove-Somrig
+    # knapflows + nattur-dim + stuck-subflag-safety er IKKE længere disabled
+    # (sprint 2026-07-12: gæster kan bruge godnat/godmorgen-knapperne;
+    # packages/airbnb_natmode.yaml auto-håndterer resten).
+    # A34 fix: tilfojet godnat_weekend_early_clear (var missing fra A19)
+    # A75 fix sprint 2026-05-07: styrbar_force_battery_poll var ghost (renamed
+    # til styrbar_battery_health_check + dismiss). Updated til de 2 nye aliases.
+    - service: automation.turn_off
+      target:
+        entity_id:
+          - automation.godnat_born_oppe_i_stuen_foraeldre_sover_stadig
+          - automation.godnat_gendan_stuelys_ved_godnat_slut_stue_allerede_beboet
+          - automation.godnat_kalde_lys_sluk
+          - automation.godnat_ryd_kalde_ved_godnat_slut
+          - automation.godnat_fuld_godnat_begge_cyklusser_aktive
+          - automation.godnat_deaktiver_om_morgenen
+          - automation.godnat_auto_declare_efter_2t_kun_sovevaerelse_presence
+          - automation.god_morgen_sovevaerelse_gardin_abner_kl_09_00_weekend
+          - automation.godnat_weekend_early_clear_voksne_active_nar_user_clearly_oppe
+          - automation.styrbar_daily_battery_health_check_notification_if_unknown_7d
+          - automation.styrbar_dismiss_battery_stale_notification_ved_valid_reading
+    # NB entity_id-slugs: godmorgen_forced (id) hedder stadig
+    # `godmorgen_sluk_somrig_klik_ned_sovevaerelse` (stale slug fra previous
+    # alias) — den + godmorgen_fast er nu bevidst UDE af lockdown (2026-07-12).
+    # 2026-06-30 REDESIGN (user-spec): AirBnB ≈ Normal mode. Presence-lys for
+    # stue/køkken/spisestue/sove + lux-drivere + arrival + entre-motion +
+    # drift-back + terrasse-komfort er IKKE længere disabled — gæster får samme
+    # intelligente bevægelses-/dagslys-styrede lys som familien. KUN
+    # børneværelse-presence forbliver disabled (undtagelse 1: børn + depot må
+    # aldrig tænde — depot har ingen presence-automation; app/switch-tænd
+    # fanges af airbnb_block_depot_boern_lights). Familie-RUTINER (vækning,
+    # godnat-knapflows, putning, kids-home) forbliver disabled/self-gated.
+    - service: automation.turn_off
+      target:
+        entity_id:
+          - automation.lysnet_bornevaerelse_taend
+          - automation.lysnet_bornevaerelse_gradvis_sluk
+          - automation.lysnet_bornevaerelse_taend_ved_lux_fald
+          - automation.lysnet_bornevaerelse_sluk_ved_lux_stigning
+    # Activity-state
+    - service: automation.turn_off
+      target:
+        entity_id:
+          - automation.activity_bedroom_only_winddown_soft_fade_af_stue_koekken
+          - automation.activity_clear_bedroom_winddown_ved_skift_vaek_fra_bedroom_only
+          - automation.activity_auto_set_guest_mode_ved_social_aktivitet
+          - automation.activity_auto_set_guest_mode_hurtigt_ved_social_party
+          - automation.activity_auto_clear_guest_mode_naar_aktivitet_falder
+          - automation.activity_terrasse_only_winddown_slow_dim_af_indendors_ceiling_lys
+          - automation.activity_clear_terrasse_winddown_notification_ved_skift_vaek
+    # Climate notifications guests don't need
+    # A75 fix sprint 2026-05-07: klima_udluftning_efter_bad slettet (humidity
+    # automations fjernet 2026-05-05 fordi Apollo MSR-2 har ingen humidity sensor).
+    - service: automation.turn_off
+      target:
+        entity_id:
+          - automation.klima_bornevaerelse_for_koldt
+    # H2 fix audit 2026-05-07: presence_*_arrive/leave automations + sove
+    # kalde orphan-protection + AirBnB lockdown defense-in-depth. Tidligere
+    # self-skipped via house_mode condition, men hvis user kort flipper til
+    # Normal mid-AirBnB ville de re-fire = parent_a_home/parent_b_home flip on.
+    - service: automation.turn_off
+      target:
+        entity_id:
+          - automation.tilstedevaerelse_parent_a_ankommer
+          - automation.tilstedevaerelse_parent_a_forlader
+          - automation.tilstedevaerelse_parent_b_ankommer
+          - automation.tilstedevaerelse_parent_b_forlader
+    # Misc
+    # 2026-07-08 (#12): harry_potter_rum_taend (depot auto-lys) er FJERNET herfra
+    # — depot skal fungere som i Normal mode i AirBnB (var fejlagtigt deaktiveret).
+    - service: automation.turn_off
+      target:
+        entity_id:
+          - automation.sikkerhed_hoveddor_abnet
+    # Notifications
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: airbnb_resume
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: airbnb
+        title: "AirBnB mode aktiveret"
+        message: >
+          AirBnB ≈ Normal nu: presence-lys kører for gæster overalt UNDTAGEN
+          depot + børneværelse (slukkes altid). Ingen morgen-lys/auto-gardin-op.
+          Strøm-genstart (vægkontakt) tænder lys på passende niveau (bad=fuld).
+          Entré-Styrbar: op=tænd open-plan, ned=sluk alt + grace.
+          Person-tracking frosset. Privacy-purge:
+          {{ 'KØRT' if is_state('input_boolean.airbnb_privacy_purge_enabled','on')
+             else 'sprunget over (historik bevaret)' }}.
+    - service: persistent_notification.create
+      data:
+        notification_id: airbnb_mode
+        title: "AirBnB mode active"
+        message: >
+          AirBnB ≈ Normal + undtagelser (depot/børn slukket, ingen morgen-lys/
+          gardin-op, strøm-recovery, entré op/ned). Skift house_mode til Normal
+          for fuld familie-funktion.
+
+# =============================================================================
+# RESUME: triggers ved skift FRA AirBnB
+# =============================================================================
+- id: airbnb_mode_resume
+  alias: "AirBnB: Genstart familie-automations ved skift fra AirBnB"
+  description: >
+    Re-enabler alle disablede automations. Person-tracking aktiveres igen.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_select.house_mode
+      from: "AirBnB"
+  action:
+    # Re-enable wakeup (A28 fix: tilfojet wakeup_post_sluk_voksne)
+    - service: automation.turn_on
+      target:
+        entity_id:
+          - automation.vaekning_voksne_alarm_driven_30_min_for_phone_alarm
+          - automation.vaekning_pigerne_kl_06_00_hverdage
+          - automation.vaekning_pigerne_kl_07_30_weekend_ferie
+          - automation.vaekning_sove_sluk_dim_15_min_efter_wakeup_smart_lux
+    # Re-enable godnat-flow (A33+A34 fix: tilfojet weekend_early_clear + battery_refresh)
+    # A75 fix sprint 2026-05-07: styrbar_force_battery_poll renamed til styrbar_battery_health_*.
+    - service: automation.turn_on
+      target:
+        entity_id:
+          - automation.godnat_born_oppe_i_stuen_foraeldre_sover_stadig
+          - automation.godnat_gendan_stuelys_ved_godnat_slut_stue_allerede_beboet
+          - automation.godnat_kalde_lys_sluk
+          - automation.godnat_ryd_kalde_ved_godnat_slut
+          - automation.godnat_fuld_godnat_begge_cyklusser_aktive
+          - automation.godnat_deaktiver_om_morgenen
+          - automation.godnat_auto_declare_efter_2t_kun_sovevaerelse_presence
+          - automation.god_morgen_sovevaerelse_gardin_abner_kl_09_00_weekend
+          - automation.godnat_weekend_early_clear_voksne_active_nar_user_clearly_oppe
+          - automation.styrbar_daily_battery_health_check_notification_if_unknown_7d
+          - automation.styrbar_dismiss_battery_stale_notification_ved_valid_reading
+    # Re-enable boern presence (de eneste presence-automations der disables i
+    # AirBnB nu — resten kører i AirBnB, jf. lockdown-kommentaren ovenfor).
+    - service: automation.turn_on
+      target:
+        entity_id:
+          - automation.lysnet_bornevaerelse_taend
+          - automation.lysnet_bornevaerelse_gradvis_sluk
+          - automation.lysnet_bornevaerelse_taend_ved_lux_fald
+          - automation.lysnet_bornevaerelse_sluk_ved_lux_stigning
+    # Re-enable activity-state
+    - service: automation.turn_on
+      target:
+        entity_id:
+          - automation.activity_bedroom_only_winddown_soft_fade_af_stue_koekken
+          - automation.activity_clear_bedroom_winddown_ved_skift_vaek_fra_bedroom_only
+          - automation.activity_auto_set_guest_mode_ved_social_aktivitet
+          - automation.activity_auto_set_guest_mode_hurtigt_ved_social_party
+          - automation.activity_auto_clear_guest_mode_naar_aktivitet_falder
+          - automation.activity_terrasse_only_winddown_slow_dim_af_indendors_ceiling_lys
+          - automation.activity_clear_terrasse_winddown_notification_ved_skift_vaek
+    # Re-enable climate notifications
+    # A75 fix sprint 2026-05-07: klima_udluftning_efter_bad slettet (humidity removed).
+    - service: automation.turn_on
+      target:
+        entity_id:
+          - automation.klima_bornevaerelse_for_koldt
+    # H2 fix audit 2026-05-07: re-enable presence + orphan-protection
+    - service: automation.turn_on
+      target:
+        entity_id:
+          - automation.tilstedevaerelse_parent_a_ankommer
+          - automation.tilstedevaerelse_parent_a_forlader
+          - automation.tilstedevaerelse_parent_b_ankommer
+          - automation.tilstedevaerelse_parent_b_forlader
+    # Re-enable misc (harry_potter/depot fjernet #12 — aldrig disabled længere).
+    - service: automation.turn_on
+      target:
+        entity_id:
+          - automation.sikkerhed_hoveddor_abnet
+    # 2026-07-28 (symmetri m. entry, fejlklasse #12): ryd Dark Mode ved exit —
+    # ellers arver familien en gæstes glemte mørklægning (enforce ville slå
+    # familiens presence-lys ihjel indtil næste 03:00-cutover).
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          # 2026-09-02 (AirBnB-audit): DISSE var den groveste asymmetri i hele
+          # filen. De ryddes ved entry, men IKKE ved exit — og AirBnB-natmoden
+          # (packages/airbnb_natmode.yaml:210) TÆNDER selv godnat_active +
+          # godnat_voksne_active under opholdet. Dens egne clears er
+          # hoveddør-åbning og en 12:00-backstop, så et mode-skifte tilbage til
+          # Normal om natten/morgenen afleverede familien en LEVENDE godnat:
+          # presence-lys undertrykt, drift_back aktiv, nattur-regime tændt.
+          - input_boolean.godnat_active
+          - input_boolean.godnat_voksne_active
+          - input_boolean.godnat_boern_active
+          - input_boolean.godnat_pending
+          # Samme symmetri (alle ryddet ved entry, glemt ved exit): gæstens
+          # sociale/winddown-tilstand må ikke følge med familien ind.
+          - input_boolean.guest_mode
+          - input_boolean.kalde_active
+          - input_boolean.bedroom_only_winddown
+          - input_boolean.dark_mode
+          - input_boolean.predark_active
+          # 2026-08-07: børneværelsets manuel-sluk-lås (se entry) — samme symmetri.
+          - input_boolean.boernevaerelse_manual_off_lock
+          # 2026-08-26h: soveværelsets aften-lås (se entry) — samme symmetri.
+          - input_boolean.sovevaerelse_manual_off_lock
+          # 2026-10-17: hyggelampe-fravalg (packages/stue_plug.yaml) — gæsten får
+          # den fulde sofa-zone, og et familie-fravalg må ikke arves ind/ud.
+          - input_boolean.stue_hyggelampe_fravalgt
+          # 2026-10-17: festlys-stempel fra børne-Styrbar (packages/festlys_boern_styrbar.yaml).
+          - input_boolean.festlys_boern_styrbar
+          - input_boolean.boernevaerelse_gaest_sover
+          # 2026-09-02: vækningens hold (se entry) — samme symmetri, ellers
+          # arver familien et hold der freder børneværelsets lys mod auto-sluk.
+          - input_boolean.wakeup_kids_hold_active
+          # 2026-09-29: morgen-nedtoningens flag hører til holdet (samme symmetri).
+          - input_boolean.boern_morgen_bevaeget
+          - input_boolean.boern_morgen_nedtoning_aktiv
+          # 2026-09-28: se entry-listen — en gæste-sat latch må ikke blive
+          # til familiens kids_home uden user-bekræftelse.
+          - input_boolean.boern_sov_her_i_nat
+          # Samme symmetri: gæstens/overleverede putning-flag må ikke holde
+          # familiens sove-gardin nede + auto-lys blokeret efter exit.
+          - input_boolean.putning_sove_active
+          # Samme symmetri for cykel-laderen (alarm_lock undtaget — se entry).
+          - input_boolean.cykel_lader_faerdig
+          - input_boolean.cykel_lader_probe_aktiv
+          - input_boolean.cykel_lader_probe_stop
+          # 2026-07-29: bad-gate-pending. En halv-udført oprulning fra
+          # opholdet må ikke rulle familiens sove-gardin op ud af det blå.
+          - input_boolean.sove_gardin_op_afventer
+          # 2026-07-30: gæstens brugte bad-billet må ikke efterlade familiens
+          # gate afvæbnet på hjemkomstdagen.
+          - input_boolean.sove_gardin_bad_foerste_besoeg_ovre
+          # Samme symmetri: en gæst der sad længe ved spisebordet må ikke
+          # efterlade familien med en falsk hjemmearbejdsdag efter exit.
+          - input_boolean.maaltid_hjemmearbejde_dag
+          # 2026-08-13: bruser-vagten, samme symmetri som ved entry.
+          - input_boolean.badevaerelse_bruser_vagt
+          # 2026-09-01: brusebad-sessionen, samme symmetri — familien må ikke
+          # arve et hold der låser badets sluk-veje efter gæstens sidste bad.
+          - input_boolean.badevaerelse_brusebad_session
+          - input_boolean.badevaerelse_brusebad_lys_genrejst
+          - input_boolean.badevaerelse_fugt_venteslukket
+          # 2026-08-13g: Sleep Over-armeringen, samme symmetri som ved entry —
+          # familien må ikke arve en mørklagt open-plan efter exit.
+          - input_boolean.sleepover_i_nat
+          # 2026-09-23: mosbillede-beskyttelsens to flag (se entry) — samme
+          # symmetri. Et arvet manuel-op-hold fra gæsten ville lade solen stå
+          # ind på billedet indtil familien næste gang forlod huset.
+          - input_boolean.mosbillede_gardin_ned
+          - input_boolean.mosbillede_manuel_op_hold
+    # 2026-09-02 (AirBnB-audit): scene-rammen, samme symmetri som ved entry.
+    - service: input_select.select_option
+      continue_on_error: true
+      target:
+        entity_id: input_select.active_scene
+      data:
+        option: "none"
+    # 2026-10-06 (bug-hunt nat, #12): festlys + cirkus — samme symmetri som
+    # entry (09-28-audit). dance_mode er bevidst IKKE AirBnB-gatet (en gæst må
+    # feste), så en fest startet under opholdet stod ellers videre efter exit:
+    # rummene claimet til Manual, farve-loops kørende, terrassens nat-sluk spærret.
+    - if:
+        - condition: template
+          value_template: >-
+            {{ is_state('input_boolean.dance_mode', 'on')
+               or states('input_select.dance_manual_event') not in ['off', 'unknown', 'unavailable'] }}
+      then:
+        - service: script.fest_smooth_stop
+          continue_on_error: true
+    - service: input_boolean.turn_off
+      continue_on_error: true
+      target:
+        entity_id: input_boolean.cirkus_active
+    # 2026-09-12: børnestrippens aften-niveau-hold (se entry) — samme symmetri.
+    # Uden den arver familien et hold gæsten satte, og putte-natlyset ville
+    # tavst blive sprunget over første aften efter exit.
+    - service: input_text.set_value
+      continue_on_error: true
+      target:
+        entity_id: input_text.boern_aften_niveau_hold
+      data:
+        value: "off"
+    # 2026-07-29c: slid-bogførings-stemplet, samme symmetri som ved entry.
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.cykel_lader_energi_cursor_probe
+      data:
+        value: 0
+    # 2026-07-15 (fejlklasse #15): re-evaluér presence-flags. De 4 presence-
+    # automations var slået HELT FRA under AirBnB-perioden — en automation der
+    # er off modtager INGEN triggers, så kom familien hjem (zone-transition)
+    # FØR mode-skiftet, er eventet tabt for altid → parent_a_home/parent_b_home
+    # stuck off (alarm-vækning, Roborock-gate, people_estimate fejler) indtil
+    # næste ud-og-hjem-tur. Genskab flagene fra live tracker + GPS-freshness
+    # (samme gates som presence_*_arrive).
+    - if:
+        - condition: template
+          value_template: >-
+            {{ is_state('device_tracker.phone_a', 'home')
+               and is_state('binary_sensor.parent_a_gps_fresh', 'on') }}
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.parent_a_home
+    - if:
+        - condition: template
+          value_template: >-
+            {{ is_state('device_tracker.phone_b', 'home')
+               and is_state('binary_sensor.parent_b_gps_fresh', 'on') }}
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.parent_b_home
+    # Notifications
+    # A29 fix sprint 2026-05-06 PM: dismiss stale AirBnB-related notifications.
+    # Tidligere kun airbnb_mode dismissed → airbnb_auto_off + airbnb_outdoor_zen
+    # forblev hængende i family UI efter return-home.
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: airbnb_mode
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: airbnb_auto_off
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: airbnb_outdoor_zen
+    - service: persistent_notification.create
+      data:
+        notification_id: airbnb_resume
+        title: "Familie-mode genoptaget"
+        message: >
+          Wakeup, godnat, presence-lys er aktiveret igen. Person-tracking
+          virker via location-detection.
+
+# =============================================================================
+# AIRBNB-SPECIFIC AUTOMATIONS (kun fyrer i AirBnB mode)
+# =============================================================================
+
+# 0. UNDTAGELSE 1 — depot + børneværelse-lys må ALDRIG tænde i AirBnB
+# ----------------------------------------------------------------------------
+# Hvis NOGET (app, fysisk vægkontakt/FoH-switch, strøm-recovery, en stray
+# automation) tænder et depot- eller børneværelse-lys mens vi er i AirBnB,
+# slukkes det øjeblikkeligt igen (transition 0). Reaktiv enforcer — HA kan ikke
+# pre-blokere et service-/Zigbee-kald, så det korte glimt er uundgåeligt, men
+# lyset bliver IKKE stående (samme mønster som bedroom_night_guard). Boern-
+# presence er allerede disabled i lockdown; depot har ingen presence-automation.
+# Apollo'ens onboard status-LED (light.boernevaerelse_apollo_rgb_light) er
+# bevidst IKKE med (det er en sensor-indikator, ikke rum-belysning).
+- id: airbnb_block_depot_boern_lights
+  alias: "AirBnB: Bloker børneværelse-lys (slukkes straks)"
+  description: >
+    Undtagelse 1 (user 2026-06-30; rev. 2026-07-08 #12): BØRNEVÆRELSE må aldrig
+    lyse for gæster. Enhver tænding (app/kontakt/recovery) slukkes igen med det
+    samme. DEPOT er FJERNET herfra (#12): depot auto-lys skal fungere som i Normal
+    mode i AirBnB. Triggere: gruppe-state→on + de to non-gruppe-lamper +
+    homeassistant:start (fanger lys der stod ON efter strømudfald/HA-reboot).
+  mode: queued
+  max: 10
+  trigger:
+    # Gruppe = on så snart ÉT medlem tænder → fanger boern loft+strip uanset om
+    # app rammer leaf eller gruppe.
+    - platform: state
+      entity_id:
+        - light.boernevaerelse_all
+        - light.boernevaerelse_hyggelys
+        - light.boernevaerelse_lampe
+      to: "on"
+      id: edge
+    # Reboot/strømudfald-resilience: lys kan stå ON efter HA-boot uden ny edge.
+    - platform: homeassistant
+      event: start
+      id: start
+    # 2026-09-02 (user-spec: "alt lys skal ALTID holdes slukket derinde under
+    # AirBnB. ALTID!"): et rent kant-drevet forbud har tre huller, og alle tre
+    # er tavse. (a) `homeassistant: start` fyrede UDEN settle-delay — ved boot
+    # kommer pærerne tilbage som `unavailable`, og HA springer selv unavailable
+    # entities over i service-kald (helpers/service.py), så sluk-kaldet ramte
+    # ingenting mens kanten `→ on` allerede var passeret uden lytter. (b) En
+    # pære der er unavailable præcis når kanten sker, får aldrig sit sluk.
+    # (c) light.boernevaerelse_lampe stod unavailable da dette blev skrevet —
+    # altså ikke et teoretisk hul. Backstoppen er det cause-agnostiske net:
+    # den måler tilstanden i stedet for at stole på en kant.
+    - platform: time_pattern
+      minutes: "/5"
+      id: backstop
+  condition:
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "AirBnB"
+  action:
+    # Settle: ved HA-start er radioerne ikke oppe endnu, og et turn_off mod en
+    # unavailable pære er en no-op. Vent til entities er tilbage. Gælder KUN
+    # start-grenen — kant-grenen skal blive ved med at slukke øjeblikkeligt.
+    - if:
+        - condition: trigger
+          id: start
+      then:
+        - delay:
+            seconds: 30
+    # Backstoppen er en no-op når alt allerede er slukket: ingen radiotid, og
+    # logbogen fyldes ikke hvert 5. minut hele opholdet.
+    - condition: template
+      value_template: >-
+        {% from 'rosters.jinja' import boern_alle_lys %}{{ boern_alle_lys
+           | select('is_state', 'on') | list | length > 0 }}
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.boernevaerelse_all
+          - light.boernevaerelse_hyggelys
+          - light.boernevaerelse_lampe
+      data:
+        transition: 0
+    - service: logbook.log
+      data:
+        name: "AirBnB børn-blok"
+        message: >
+          Slukkede børneværelse-lys (må ikke lyse i AirBnB; trigger={{
+          trigger.id | default('?') }}/{{ trigger.entity_id | default('-') }}).
+
+# 1. AUTO-OFF efter 60 min uden presence noget sted i lejligheden
+- id: airbnb_no_presence_60min_off
+  alias: "AirBnB: Sluk alt + Dormant efter 60 min uden presence"
+  description: >
+    Hvis ALLE rum (sove, boern, stue, spisestue, bad, entre, depot, terrasse)
+    har været tomme i 60 min, sluk alle indoor lys og sæt house_state Dormant.
+    Trigger winter/summer defense via house_state-aendring (eksisterende
+    automations watcher house_state). Outdoor lights styres separat af
+    airbnb_outdoor_zen_off.
+  mode: single
+  trigger:
+    - platform: template
+      value_template: >
+        {{ is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'off')
+           and is_state('binary_sensor.boernevaerelse_apollo_occupancy', 'off')
+           and is_state('binary_sensor.stue_apollo_occupancy_filtered', 'off')
+           and is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'off')
+           and is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'off')
+           and is_state('binary_sensor.badevaerelse_inde_occupancy', 'off')
+           and is_state('binary_sensor.entre_valhorn_occupancy', 'off')
+           and is_state('binary_sensor.depot_valhorn_occupancy', 'off') }}
+      for:
+        minutes: 60
+  condition:
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "AirBnB"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    # 2026-06-12 (user-spec): åben terrassedør = 100% nogen hjemme — gæster
+    # på terrassen ses ikke af indoor-sensorer, men døren afslører dem.
+    - condition: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      state: "off"
+    # 2026-09-11 (B128): badets veto MANGLEDE her, mens søster-vejen
+    # `house_airbnb_to_dormant` har haft det siden 09-02b. Badet er husets
+    # kendte blinde kanal — `badevaerelse_inde_occupancy` kan ikke se en person
+    # bag brusedøren — og handlingen nedenfor slukker lys. Uden disse to var
+    # denne vej den ENESTE Dormant-path der kunne slukke lyset på en gæst i
+    # bruseren (#12: beskyttelse tilføjet asymmetrisk på søster-automations).
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_afventer_klimabevis
+      state: "off"
+  action:
+    # 2026-09-11 (B128): sluk-sweep'en går nu gennem det SAMME script som
+    # `house_airbnb_to_dormant` (#2 — to kopier af husets sluk-regel divergerer,
+    # og det var præcis B124's pointe). Scriptet freder de rum hvis
+    # occupancy-kanal er blind; et rå `light.alle_indvendige` gjorde det ikke,
+    # så denne vej kunne slukke lyset i et rum hvor gæsten havde slukket
+    # vægkontakten og Apolloen derfor var død.
+    - service: script.airbnb_dormant_lys_sweep
+      data:
+        transition: 5
+    # Set house_state Dormant — eksisterende automations (winter_defense_close,
+    # summer_defense_close, etc.) trigger paa house_state Dormant + temp/lux
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_state
+      data:
+        option: "Dormant"
+    - service: persistent_notification.create
+      data:
+        notification_id: airbnb_auto_off
+        title: "AirBnB auto-off"
+        message: >
+          60 min uden presence — alt indoor lys slukket, hus i Dormant.
+          Winter/summer defense vil trigger gardin-handlinger hvis behov.
+
+# 2. AUTO-ON entré: Dormant + entré presence = comfort welcome
+- id: airbnb_dormant_to_active_entre
+  alias: "AirBnB: Dormant -> Active ved entré presence (comfort welcome)"
+  description: >
+    Hvis huset er Dormant og guest entrer entré, tænd lys "behageligt"
+    (lux-baseret 80/60/35%; under godnat/natmode i stedet dæmpet
+    airbnb_natmode_welcome_pct) i entré + stue + køkken + spisestue.
+    Auto-set house_state Active.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.entre_valhorn_occupancy
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "AirBnB"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Dormant"
+    # 2026-06-12: Roborock i entréen må ikke trigge welcome (samme
+    # vacuum-gate som house_state_to_active / bounce-vagten).
+    - condition: template
+      value_template: >-
+        {{ states('vacuum.s8_maxv_ultra') not in ['cleaning', 'returning'] }}
+  action:
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_state
+      data:
+        option: "Active"
+    - variables:
+        # 2026-07-12: godnat-aware — nat-toilettur fra Dormant må ikke give
+        # 80%-blast; dæmpet welcome via slider mens natmode er aktivt.
+        bri_pct: >
+          {% if is_state('binary_sensor.godnat_any_active', 'on') %}
+            {{ states('input_number.airbnb_natmode_welcome_pct') | int(12) }}
+          {% else %}
+            {% set lux = states('sensor.open_plan_lux') | float(50) %}
+            {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}80
+            {% elif lux < (states('input_number.lux_trin_dunkelt') | float(20)) %}60
+            {% else %}35{% endif %}
+          {% endif %}
+    # F4 fix 2026-05-22: split entre_loft fra andre rum pga TRADFRI WS
+    # bulb-quirk (bri+ct+transition giver false brightness-report efter fade).
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        brightness_pct: "{{ bri_pct }}"
+        color_temp_kelvin: 2700
+        transition: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        brightness_pct: "{{ bri_pct }}"
+        color_temp_kelvin: 2700
+        transition: 0
+
+# 3. OUTDOOR ZEN ON: terrasse zen-lys når mørkt udenfor
+- id: airbnb_outdoor_zen_on
+  alias: "AirBnB: Outdoor zen on ved mørkt udenfor"
+  description: >
+    Tænd terrasse-pærelyskæden på zen-indstilling (5%) når sun.elevation < -3.
+    Skip hvis allerede tændt. 2026-06-30: nu KUN udendørs (pærelyskæde) — den
+    tidligere medtagne light.koekken_lyskaede er et INDENDØRS køkken-accent
+    (omdøbt fra terrasse_lyskaede 2026-06-15) og tændte et tomt køkken hver
+    aften. Med presence-lys aktivt i AirBnB håndteres køkkenet af bevægelse.
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sun.sun
+      attribute: elevation
+      below: -3
+    # Hunt 2026-07-18 (fejlklasse #4): mode sat til AirBnB EFTER mørkefald →
+    # elevation-flanken er allerede passeret og re-fyrer først næste aften →
+    # ingen zen-lys første gæste-aften. Mode-entry re-armerer.
+    - platform: state
+      entity_id: input_select.house_mode
+      to: "AirBnB"
+  condition:
+    # 2026-09-27 (user-spec: "hvis en gæst sover i open plan skal hjemkomst og
+    # andre automations heller ikke tænde lys i openplan, terrasse og entré").
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "AirBnB"
+    # Mørke-krav gælder begge triggers (no-op for elevation-flanken).
+    - condition: template
+      value_template: "{{ state_attr('sun.sun', 'elevation') | float(0) < -3 }}"
+    # Skip hvis allerede tændt (idempotent — undgaa overskrive guest manual setting)
+    - condition: state
+      entity_id: light.terrasse_paerelyskaede
+      state: "off"
+  action:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.terrasse_paerelyskaede
+      data:
+        brightness_pct: 5
+        transition: 5
+
+# 4. OUTDOOR ZEN OFF: efter 2t kun-bedroom presence
+- id: airbnb_outdoor_zen_off
+  alias: "AirBnB: Outdoor zen off efter 2t kun-bedroom presence"
+  description: >
+    Sluk terrasse-pærelyskæden når kun bedroom (sove/boern) har presence i 2
+    sammenhængende timer + alle andre rum er tomme. Indikerer at guests er gået
+    i seng — outdoor lys ikke længere nødvendigt. 2026-06-30: kun pærelyskæde
+    (indendørs køkken-accent fjernet — styres af presence).
+  mode: single
+  trigger:
+    - platform: template
+      value_template: >
+        {% set bedrooms_occupied = (
+          is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'on')
+          or is_state('binary_sensor.boernevaerelse_apollo_occupancy', 'on')
+        ) %}
+        {% set rest_empty = (
+          is_state('binary_sensor.stue_apollo_occupancy_filtered', 'off')
+          and is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'off')
+          and is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'off')
+          and is_state('binary_sensor.badevaerelse_inde_occupancy', 'off')
+          and is_state('binary_sensor.entre_valhorn_occupancy', 'off')
+          and is_state('binary_sensor.depot_valhorn_occupancy', 'off')
+        ) %}
+        {{ bedrooms_occupied and rest_empty }}
+      for:
+        hours: 2
+  condition:
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "AirBnB"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+  action:
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.terrasse_paerelyskaede
+      data:
+        transition: 30
+
+# 5. PAR-KOBLING (#11b, user-spec 2026-07-08) — KUN i AirBnB
+# ----------------------------------------------------------------------------
+# a) Sofa hyggelampe (plug, light.stue_plug) kører on/off SAMMEN med sofa
+#    læselampen (light.stue_laesehygge). Bliver læselampen tilgængelig/tændt
+#    (væg-strøm på: off/unavailable → on) → plug on. Slukkes væggen (on →
+#    off/unavailable) → plug off. Én-vejs (læselampe driver plug) → ingen loop.
+- id: airbnb_sofa_laeselampe_plug_mirror
+  alias: "AirBnB: Sofa hyggelampe (plug) følger sofa læselampe on/off"
+  description: >
+    #11b: i AirBnB kører sofa-hyggelampen (light.stue_plug) on/off sammen med
+    sofa-læselampen (light.stue_laesehygge). Væg-strøm tilgængelig → plug on;
+    væg-strøm slukket → plug off. Kun i AirBnB.
+  mode: queued
+  max: 10
+  trigger:
+    - platform: state
+      entity_id: light.stue_laesehygge
+      to: "on"
+      id: paa
+    - platform: state
+      entity_id: light.stue_laesehygge
+      from: "on"
+      to:
+        - "off"
+        - "unavailable"
+        - "unknown"
+      id: fra
+  condition:
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "AirBnB"
+  action:
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.id == 'paa' }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.stue_plug
+        - conditions: []
+          sequence:
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: light.stue_plug
+
+# b) Køkken-spots/lyskæde: INTET AirBnB-spejl længere (user-spec 2026-09-03:
+#    "core features som openplan lys skal være de samme i airbnb mode og
+#    normal mode"). Spejlet tændte spots i samme sekund lyskæden tændte, så
+#    en gæst fik hele arbejdslyset ved et gennemgangs-blik, madlavnings-
+#    sessionens rækkefølge (kæden ramper først, spots til sidst) fandtes slet
+#    ikke, og alle lyskædens sluk-veje måtte bære en AirBnB-undtagelse fordi
+#    "spots on" ikke betød madlavning. Køkkenet kører nu husets almindelige
+#    logik i begge modes: presence tænder kæden, central-zone-akkumulering
+#    starter sessionen. Gæstens escape-vej er uændret (kontakt/app → Manual).
+
+# 6. INGEN AUTOMATISK STØVSUGNING i AirBnB (user-spec 2026-07-08)
+# ----------------------------------------------------------------------------
+# Ingen auto-clean for gæster: måltids-støvsug, daglig Dormant-clean og entré-
+# clean er ALLEREDE not-AirBnB-gated (roborock_dormant_start, maaltid-faserne,
+# entre_somrig_bund_long_leave). Denne guard er BELTE+SELER mod en fremtidig
+# u-gatet auto-clean: starter en clean i AirBnB og den kom fra en automation/
+# script-kæde (context.parent_id sat) UDEN et frisk MANUELT stempel (Styrbar) →
+# stop + dock. Manuel Styrbar (stemplet), app/dashboard (bruger-context) og
+# eksterne/robot-app-starts (tom poll-context, parent_id=none) røres ALDRIG →
+# "støvsuger Styrbar virker som den gør", kun aktivt startet er tilladt.
+- id: airbnb_block_auto_clean
+  alias: "AirBnB: Bloker automatisk støvsuger-clean (kun manuel tilladt)"
+  description: >
+    Stopper en støvsuger-clean der starter i AirBnB HVIS den kom fra en automation
+    (context.parent_id sat) OG ikke er manuelt stemplet (Styrbar) indenfor 25 s.
+    Manuel/app/ekstern start røres aldrig.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: vacuum.s8_maxv_ultra
+      to: "cleaning"
+  condition:
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "AirBnB"
+    # Kom fra en automation/script-kæde (ikke bruger-tap eller ekstern/robot-app
+    # poll, som har tom parent_id). Er poll-context afkoblet → parent_id=none →
+    # guarden er no-op (de inline not-AirBnB-gates er den egentlige beskyttelse).
+    - condition: template
+      value_template: "{{ trigger.to_state.context.parent_id is not none }}"
+    # IKKE manuelt stemplet (Styrbar) for nylig — ELLER del af en session der
+    # blev startet manuelt.
+    #
+    # 2026-09-09c (B116): de 25 s måler kun afstanden fra NU til stemplet, så en
+    # rengøring der genoptager efter mop-vask 19 min inde ikke længere ligner en
+    # manuel start. Robotten sender `→ cleaning` flere gange pr. kørsel, og hver
+    # gang bliver 25 s-testen mere forkert. Andet led spørger i stedet om
+    # SESSIONEN var menneske-startet (samme 60 s-test som roborock.yaml's to
+    # interrupt-guards, jf. #2) — det holder hele kørslen igennem.
+    - condition: template
+      value_template: >-
+        {% set stamp = state_attr('input_datetime.roborock_manual_start_at', 'timestamp') | float(0) %}
+        {% set sess = states.input_boolean.roborock_session_active %}
+        {% set sess_manuel = sess is not none and sess.state == 'on'
+                             and ((as_timestamp(sess.last_changed) - stamp) | abs) < 60 %}
+        {{ stamp <= 0
+           or ((now().timestamp() - stamp) > 25 and not sess_manuel) }}
+  action:
+    - service: script.roborock_stop_dock
+    - service: logbook.log
+      data:
+        name: "AirBnB robot-blok"
+        message: >-
+          Automatisk støvsuger-clean stoppet i AirBnB (kun manuel Styrbar/app-start
+          tilladt for gæster).
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: airbnb
+        title: "🤖🚫 AirBnB: auto-clean stoppet"
+        message: >-
+          En automatisk støvsugning startede i AirBnB og blev stoppet + docket.
+          Kun manuel start (Styrbar/app) er tilladt mens I har gæster.

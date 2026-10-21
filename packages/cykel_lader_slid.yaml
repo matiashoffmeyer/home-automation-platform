@@ -1,0 +1,293 @@
+# =============================================================================
+# Cykel-lader — SLID-REGNSKAB + dagligt overblik (user-spec 2026-07-29)
+# =============================================================================
+# User: "jeg er bekymret for cykelbatteri probe slitage. jeg vil ha
+# notifikationer på tlf dagligt (Parent A tlf) om hvor ofte der blev probet de
+# sidste 24 timer og om der blev fundet et batteri som så slitageopladede 1% op
+# (99=>100) og også overblik i ha siden over det på Statistik siden, så jeg kan
+# se hvor meget der lades og slides."
+#
+# HVAD "SLID" ER HER: strøm der er sendt ind i et batteri som ALLEREDE var
+# fuldt. Der er to måder det sker på, og de tælles BEGGE:
+#   1) TOP-OFF EFTER FUND — proben tænder, laderen slår til, men holder op igen
+#      inden for `cykel_lader_probe_stop_minutter` → færdig-detektoren dømmer
+#      det som top-off (se packages/cykel_lader.yaml). Det er præcis "99 → 100
+#      igen"-tilfældet user spørger til.
+#   2) TOP-OFF INDEN I SELVE PROBEN — laderen slår til og fra igen INDEN
+#      probens `probe_minutter` er gået, så effekten er faldet før vi måler →
+#      proben registrerer "intet nyt batteri", men der ER gået strøm ind.
+#      Uden måling ville netop dette slid være usynligt.
+# Begge bogføres af `script.cykel_lader_slid_bogfoer` som Wh.
+#
+# HVORFOR EN INTEGRATIONS-SENSOR OG IKKE PLUGGENS EGEN kWh-TÆLLER (målt
+# 2026-07-29 på 20 timers history): `sensor.entre_cykel_lader_energi`
+# rapporterer kun ~hvert 15. minut i tomgang (og ~hvert 3.-4. minut under
+# ladning). En 2-minutters probe når derfor ALDRIG at dukke op i den tæller når
+# vi læser den umiddelbart efter — deltaet ville blive 0. Effekt-sensoren
+# rapporterer derimod på ændring inden for sekunder (178 W → 4 W ved sluk), så
+# en Riemann-sum på EFFEKTEN fanger korte pulser. Pluggens egen tæller bruges
+# fortsat til "hvor meget er der ladet i alt" (hardware-sandhed, og over et
+# døgn er rapport-kadencen ligegyldig).
+# Bogføringen venter derfor `SLID_SETTLE` (90 s) efter at pluggen er slukket,
+# så integrationen har nået at få det sidste effekt-report med.
+#
+# 24-TIMERS-TÆLLERE: counters (ikke input_number) — de ligger uden for
+# helpers_export.py's domæner, så nattens tællinger ikke støjer i
+# config_snapshots/helper_values.yaml. `_24h` nulstilles af rapporten;
+# `_total` er monotone og spejles i template-sensorer med state_class, som er
+# det long-term statistics (= Statistik-sidens grafer) kan tegne på.
+# =============================================================================
+
+counter:
+  # Nulstilles af den daglige rapport → "siden sidste rapport" = det døgn.
+  cykel_lader_probe_24h:
+    name: "🔋 Cykel-lader: probes siden rapport"
+    icon: mdi:magnify-scan
+    step: 1
+  cykel_lader_fund_24h:
+    name: "🔋 Cykel-lader: probe-fund siden rapport"
+    icon: mdi:battery-plus-variant
+    step: 1
+  cykel_lader_topoff_24h:
+    name: "🔋 Cykel-lader: top-off på fuldt batteri siden rapport"
+    icon: mdi:battery-alert-variant
+    step: 1
+  cykel_lader_slid_wh_24h:
+    name: "🔋 Cykel-lader: slid-opladning siden rapport (Wh)"
+    icon: mdi:flash-alert
+    step: 1
+  # Monotone totaler → grafer.
+  cykel_lader_probe_total:
+    name: "🔋 Cykel-lader: probes i alt"
+    icon: mdi:magnify-scan
+    step: 1
+  cykel_lader_topoff_total:
+    name: "🔋 Cykel-lader: top-offs i alt"
+    icon: mdi:battery-alert-variant
+    step: 1
+  cykel_lader_slid_wh_total:
+    name: "🔋 Cykel-lader: slid-opladning i alt (Wh)"
+    icon: mdi:flash-alert
+    step: 1
+
+input_number:
+  # Runtime-cursors (navnet indeholder "cursor" → ude af helper-snapshottet).
+  # Integrations-tællerens stand da proben tændte pluggen. 0 = intet stempel.
+  cykel_lader_energi_cursor_probe:
+    name: "🔋 Cykel-lader: kWh-stempel ved probe-start (cursor)"
+    min: 0
+    max: 100000
+    step: 0.0001
+    unit_of_measurement: "kWh"
+    icon: mdi:counter
+    mode: box
+  # Pluggens kWh-tæller da rapporten sidst kørte → "ladet siden rapport".
+  cykel_lader_energi_cursor_rapport:
+    name: "🔋 Cykel-lader: kWh-stempel ved sidste rapport (cursor)"
+    min: 0
+    max: 100000
+    step: 0.0001
+    unit_of_measurement: "kWh"
+    icon: mdi:counter
+    mode: box
+
+input_datetime:
+  # Lige efter deadline (07:00) → rapporten dækker det ladevindue der netop
+  # sluttede = "de sidste 24 timer".
+  cykel_lader_rapport_tid:
+    name: "🔋 Cykel-lader: dagligt slid-overblik kl."
+    icon: mdi:chart-box-outline
+    has_date: false
+    has_time: true
+
+sensor:
+  # Riemann-sum på EFFEKTEN — fanger korte lade-pulser som pluggens egen
+  # kWh-tæller ikke rapporterer i tide (se header). Kun brugt til slid-deltaer.
+  - platform: integration
+    source: sensor.entre_cykel_lader_effekt
+    name: "Cykel lader effekt energi"
+    unique_id: cykel_lader_effekt_energi
+    method: left
+    unit_prefix: k
+    unit_time: h
+    round: 4
+
+template:
+  - sensor:
+      # --- Spejle af de monotone counters, med state_class → long-term stats
+      #     (counters har ingen state_class og kan derfor ikke tegnes som graf).
+      - name: "Cykel lader probes total"
+        unique_id: cykel_lader_probes_total
+        icon: mdi:magnify-scan
+        state: "{{ states('counter.cykel_lader_probe_total') | int(0) }}"
+        state_class: total_increasing
+
+      - name: "Cykel lader topoff total"
+        unique_id: cykel_lader_topoff_total
+        icon: mdi:battery-alert-variant
+        state: "{{ states('counter.cykel_lader_topoff_total') | int(0) }}"
+        state_class: total_increasing
+
+      - name: "Cykel lader slid energi total"
+        unique_id: cykel_lader_slid_energi_total
+        icon: mdi:flash-alert
+        unit_of_measurement: "kWh"
+        device_class: energy
+        state_class: total_increasing
+        state: >-
+          {{ (states('counter.cykel_lader_slid_wh_total') | float(0) / 1000)
+             | round(3) }}
+
+      # --- Døgn-tal til tiles + den daglige push -----------------------------
+      - name: "Cykel lader slid siden rapport"
+        unique_id: cykel_lader_slid_siden_rapport
+        icon: mdi:flash-alert
+        unit_of_measurement: "kWh"
+        device_class: energy
+        state: >-
+          {{ (states('counter.cykel_lader_slid_wh_24h') | float(0) / 1000)
+             | round(3) }}
+
+      - name: "Cykel lader ladet siden rapport"
+        unique_id: cykel_lader_ladet_siden_rapport
+        icon: mdi:ev-station
+        unit_of_measurement: "kWh"
+        device_class: energy
+        # Stempel 0 (før første rapport) eller meter-reset → 0, aldrig negativ.
+        state: >-
+          {% set c = states('input_number.cykel_lader_energi_cursor_rapport') | float(0) %}
+          {% set e = states('sensor.entre_cykel_lader_energi') | float(0) %}
+          {{ 0 if c <= 0 or e < c else (e - c) | round(3) }}
+        attributes:
+          slid_andel_pct: >-
+            {% set c = states('input_number.cykel_lader_energi_cursor_rapport') | float(0) %}
+            {% set e = states('sensor.entre_cykel_lader_energi') | float(0) %}
+            {% set ladet = 0 if c <= 0 or e < c else (e - c) %}
+            {% set slid = states('counter.cykel_lader_slid_wh_24h') | float(0) / 1000 %}
+            {{ 0 if ladet <= 0 else (100 * slid / ladet) | round(1) }}
+
+script:
+  # ===========================================================================
+  # ENESTE bogholder for slid-Wh (fejlklasse #1: to kaldere, ét sted der
+  # skriver). Måler fra probens stempel til nu på integrations-tælleren og
+  # rydder stemplet, så samme episode aldrig kan bogføres to gange.
+  # Kaldes fire-and-forget (`script.turn_on`) — den venter på settle-tiden og
+  # må ikke holde probe-/færdig-automationen i live så længe.
+  # ===========================================================================
+  cykel_lader_slid_bogfoer:
+    alias: "Cykel-lader: bogfør slid-opladning"
+    icon: mdi:flash-alert
+    mode: queued
+    max: 5
+    sequence:
+      # Vent til integrations-sensoren har fået det sidste effekt-report med
+      # (pluggen er slukket af kalderen; effekten rapporterer inden for ~8 s).
+      - delay:
+          seconds: 90
+      - variables:
+          wh: >-
+            {% set c = states('input_number.cykel_lader_energi_cursor_probe') | float(0) %}
+            {% set e = states('sensor.cykel_lader_effekt_energi') | float(0) %}
+            {{ 0 if c <= 0 or e < c else ((e - c) * 1000) | round(0) | int }}
+      # Ryd stemplet UANSET udfald — ellers ville næste episode måle mod et
+      # gammelt nulpunkt og bogføre alt imellem som slid.
+      - service: input_number.set_value
+        target: {entity_id: input_number.cykel_lader_energi_cursor_probe}
+        data:
+          value: 0
+      - condition: template
+        value_template: "{{ wh | int(0) > 0 }}"
+      - service: counter.set_value
+        target: {entity_id: counter.cykel_lader_slid_wh_24h}
+        data:
+          value: "{{ (states('counter.cykel_lader_slid_wh_24h') | int(0)) + (wh | int(0)) }}"
+      - service: counter.set_value
+        target: {entity_id: counter.cykel_lader_slid_wh_total}
+        data:
+          value: "{{ (states('counter.cykel_lader_slid_wh_total') | int(0)) + (wh | int(0)) }}"
+      - service: logbook.log
+        data:
+          name: "Cykel-lader"
+          message: >-
+            Slid-opladning bogført: {{ wh }} Wh gik ind i et batteri der
+            allerede var fuldt.
+
+automation:
+  # ===========================================================================
+  # DAGLIG RAPPORT (user-spec): hvor meget blev der probet, blev der fundet et
+  # batteri, og hvor meget strøm gik ind i noget der allerede var fuldt.
+  # Kører efter deadline, så tallene dækker det ladevindue der lige sluttede.
+  # ===========================================================================
+  - id: cykel_lader_slid_rapport
+    alias: "Cykel-lader: dagligt slid-overblik"
+    description: >
+      Push med døgnets probe-antal, fund, top-offs og kWh (ladet vs. slid) —
+      men KUN på døgn hvor der faktisk blev slidt (user-valg 2026-07-29c: "kun
+      når der ER slid", så beskeden er et signal og ikke en daglig rutine).
+      Tællerne nulstilles uanset, så tallene altid dækker det seneste døgn;
+      probe-antallet på stille døgn lever videre i de monotone totaler og
+      graferne på Statistik-siden. Gatet på selve lader-automatikken: er den
+      slået fra, er der intet at rapportere.
+    mode: single
+    trigger:
+      - platform: time
+        at: input_datetime.cykel_lader_rapport_tid
+    condition:
+      - condition: state
+        entity_id: input_boolean.cykel_lader_enabled
+        state: "on"
+    action:
+      - variables:
+          probes: "{{ states('counter.cykel_lader_probe_24h') | int(0) }}"
+          fund: "{{ states('counter.cykel_lader_fund_24h') | int(0) }}"
+          topoff: "{{ states('counter.cykel_lader_topoff_24h') | int(0) }}"
+          slid_wh: "{{ states('counter.cykel_lader_slid_wh_24h') | int(0) }}"
+          ladet: "{{ states('sensor.cykel_lader_ladet_siden_rapport') | float(0) | round(2) }}"
+      - if:
+          # "Der ER slid" = enten en dømt top-off, eller målte Wh ind i et
+          # batteri der allerede var fuldt. Begge veje tæller (se header).
+          - condition: template
+            value_template: "{{ topoff | int(0) > 0 or slid_wh | int(0) > 0 }}"
+        then:
+          - service: script.push_notify
+            data:
+              notif_id: cykel_lader
+              title: >-
+                🔋 Cykel-lader: {{ slid_wh }} Wh slid det seneste døgn
+              message: >-
+                {% if topoff > 0 %}⚠️ {{ topoff }} gang{{ 'e' if topoff != 1 else '' }}
+                ladede systemet et batteri der allerede var fuldt (99→100).
+                {% else %}⚠️ Laderen slog kort til på et fuldt batteri under en probe.
+                {% endif %}
+                🔍 {{ probes }} probe{{ 's' if probes != 1 else '' }} i alt,
+                {{ fund }} fandt last.
+                🔌 Ladet: {{ ladet }} kWh — heraf {{ slid_wh }} Wh slid.
+                {% if is_state('input_boolean.cykel_lader_probe_stop', 'on') %}
+                🔒 Probe-låsen slog til, så der blev ikke probet mere i nat.{% endif %}
+                {% if is_state('input_boolean.cykel_lader_alarm_lock', 'on') %}
+                🚨 Røgalarm-spærringen er stadig aktiv — laderen er låst.{% endif %}
+              payload:
+                # Egen tag: må ikke erstatte "batterier fulde"-beskeden fra i nat.
+                tag: cykel_lader_slid
+                channel: "Cykel-lader"
+        else:
+          # Ingen push på et rent døgn — men efterlad et spor, så "jeg fik ingen
+          # besked" kan skelnes fra "rapporten kørte ikke".
+          - service: logbook.log
+            data:
+              name: "Cykel-lader"
+              message: >-
+                Slid-overblik: intet slid det seneste døgn ({{ probes }} probes,
+                {{ fund }} fund, {{ ladet }} kWh ladet) — ingen push sendt.
+      # Nulstil døgnet FØRST efter pushen er dannet.
+      - service: counter.reset
+        target:
+          entity_id:
+            - counter.cykel_lader_probe_24h
+            - counter.cykel_lader_fund_24h
+            - counter.cykel_lader_topoff_24h
+            - counter.cykel_lader_slid_wh_24h
+      - service: input_number.set_value
+        target: {entity_id: input_number.cykel_lader_energi_cursor_rapport}
+        data:
+          value: "{{ states('sensor.entre_cykel_lader_energi') | float(0) }}"

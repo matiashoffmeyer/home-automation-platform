@@ -1,0 +1,662 @@
+# =============================================================================
+# Notifikationer — central push-dispatch + per-type telefon/tid-styring
+# =============================================================================
+# Sprint 2026-07-12 (user-spec): "lav en tab hvor jeg kan toggle alle
+# notifikationer til tlf, styre hvilke telefoner der får dem, og hvornår."
+#
+# ARKITEKTUR: ALLE push til telefon går nu gennem script.push_notify.
+# Kald: script.push_notify(notif_id, title, message [, payload]). Scriptet:
+#   1) master-kontakt (notifikationer_master_enabled) OFF  -> intet.
+#   2) per-type enable (notif_<id>_enabled) OFF             -> intet.
+#   2b) AirBnB-mode + notif_<id>_airbnb OFF                 -> intet.
+#      (per 2026-07-16, user-spec: "tilvælg notifikationer under AirBnB" —
+#       toggle ON = typen sendes OGSÅ mens huset er i AirBnB-mode. Defaults
+#       bevarer historisk adfærd: dug+vejr OFF (var hårdt gated i deres
+#       automations), alt andet ON (pushede allerede i AirBnB).)
+#      UNDTAGELSE `kritisk: true` (2026-09-09e, B118): varsler om at HUSET SELV
+#      er gået i stykker springer 2b over. En støj-beslutning om gæste-privatliv
+#      må ikke kunne slukke for husets evne til at melde sin egen blindhed
+#      (fejlklasse #21) — netop i AirBnB er der ingen beboer til at opdage det.
+#   3) tidsvindue notif_<id>_start -> _slut: uden for       -> intet.
+#      start == slut  =>  ALTID (24/7). Fresh-install 00:00/00:00 = altid.
+#   4) router til valgte telefoner (notif_<id>_parent_a / _parent_b).
+#   5) hjemkomst-kø (2026-07-18, packages/notif_hjemme.yaml): er
+#      notif_<id>_hjemme ON og modtagerens GPS ikke hjemme, køes den
+#      telefons kopi (scripts/notif_queue.py) og leveres ved ankomst.
+# payload = valgfri mobile-app data (tag/timeout/actions) — sendes UÆNDRET.
+#
+# ⛔️ RULLET TILBAGE 2026-07-30 (samme dag): auto-`sticky` på spørgsmåls-pushes.
+# Forsøget var at redde svaret når man trykker på selve beskeden (Android åbner
+# bare appen og sluger notifikationen). Løsningen satte `sticky: true` på enhver
+# push MED `actions` — på antagelsen om at companion-appen selv rydder den når
+# en SVAR-KNAP trykkes. Den antagelse er FALSK: `sticky` sætter
+# `setAutoCancel(false)`, og appens action-modtager rydder netop via autoCancel,
+# så notifikationen blev liggende uændret efter et svar. Facit fra samme dags
+# history: mad-stemme-automationen fyrede 16 gange på 84 sekunder (18:16:19 →
+# 18:17:43) — hvert tryk registrerede en stemme, men brugeren så intet ske og
+# trykkede videre. Nettoresultatet var værre end problemet: "jeg kan slet ikke
+# svare på options i notifikationer nu". Vil nogen prøve igen: en ACK med samme
+# `tag` er IKKE nok bevis for at rydningen virker — verificér på en fysisk
+# telefon (fejlklasse #6) før sticky sættes husdækkende, og husk at iOS ikke har
+# nogen sticky-pendant overhovedet (dér er langt tryk vejen til knapperne).
+#
+# 2 rigtige telefoner (verificeret live 2026-07-12):
+#   Parent A  = notify.mobile_app_phone_a
+#   Parent B = notify.mobile_app_phone_b
+#
+# Jinja-sikkerhed (jf. CLAUDE.md fejlklasser): targets holdes som CSV-streng
+# og splittes først i entity-target (>-foldede vars bliver strenge, ikke lister).
+# Snapshot: helpers_export.py fanger notif_*-booleans + notif_*-datetimes.
+# =============================================================================
+
+input_boolean:
+  notifikationer_master_enabled:
+    name: "🔔 Notifikationer master (alle push til tlf)"
+    icon: mdi:cellphone-message
+  notif_batteri_enabled:
+    name: "🔋 Lavt/kritisk batteri — send"
+    icon: mdi:battery-alert
+  notif_batteri_parent_a:
+    name: "🔋 Lavt/kritisk batteri — Parent A"
+    icon: mdi:cellphone
+  notif_batteri_parent_b:
+    name: "🔋 Lavt/kritisk batteri — Parent B"
+    icon: mdi:cellphone
+  notif_remote_offline_enabled:
+    name: "📟 Remote svarer ikke — send"
+    icon: mdi:remote
+  notif_remote_offline_parent_a:
+    name: "📟 Remote svarer ikke — Parent A"
+    icon: mdi:cellphone
+  notif_remote_offline_parent_b:
+    name: "📟 Remote svarer ikke — Parent B"
+    icon: mdi:cellphone
+  notif_lys_watchdog_enabled:
+    name: "💡 Lys-watchdog (fastlåst lys) — send"
+    icon: mdi:lightbulb-alert
+  notif_lys_watchdog_parent_a:
+    name: "💡 Lys-watchdog (fastlåst lys) — Parent A"
+    icon: mdi:cellphone
+  notif_lys_watchdog_parent_b:
+    name: "💡 Lys-watchdog (fastlåst lys) — Parent B"
+    icon: mdi:cellphone
+  notif_bad_lys_enabled:
+    name: "🐝 Bad-lys hænger — send"
+    icon: mdi:shower
+  notif_bad_lys_parent_a:
+    name: "🐝 Bad-lys hænger — Parent A"
+    icon: mdi:cellphone
+  notif_bad_lys_parent_b:
+    name: "🐝 Bad-lys hænger — Parent B"
+    icon: mdi:cellphone
+  notif_planter_enabled:
+    name: "🌱 Plante-vanding — send"
+    icon: mdi:flower
+  notif_planter_parent_a:
+    name: "🌱 Plante-vanding — Parent A"
+    icon: mdi:cellphone
+  notif_planter_parent_b:
+    name: "🌱 Plante-vanding — Parent B"
+    icon: mdi:cellphone
+  notif_putning_enabled:
+    name: "🛏️ Putning detekteret — send"
+    icon: mdi:bed
+  notif_putning_parent_a:
+    name: "🛏️ Putning detekteret — Parent A"
+    icon: mdi:cellphone
+  notif_putning_parent_b:
+    name: "🛏️ Putning detekteret — Parent B"
+    icon: mdi:cellphone
+  notif_vejr_enabled:
+    name: "🌦️ Vejr-varsel (dag+nat) — send"
+    icon: mdi:weather-partly-rainy
+  notif_vejr_parent_a:
+    name: "🌦️ Vejr-varsel (dag+nat) — Parent A"
+    icon: mdi:cellphone
+  notif_vejr_parent_b:
+    name: "🌦️ Vejr-varsel (dag+nat) — Parent B"
+    icon: mdi:cellphone
+  notif_regn_rapport_enabled:
+    name: "🌧️ Regn-facit (morgen) — send"
+    icon: mdi:weather-pouring
+  notif_regn_rapport_parent_a:
+    name: "🌧️ Regn-facit (morgen) — Parent A"
+    icon: mdi:cellphone
+  notif_regn_rapport_parent_b:
+    name: "🌧️ Regn-facit (morgen) — Parent B"
+    icon: mdi:cellphone
+  notif_fugt_enabled:
+    name: "💧 Høj luftfugtighed (TIMMERFLOTTE) — send"
+    icon: mdi:water-percent
+  notif_fugt_parent_a:
+    name: "💧 Høj luftfugtighed — Parent A"
+    icon: mdi:cellphone
+  notif_fugt_parent_b:
+    name: "💧 Høj luftfugtighed — Parent B"
+    icon: mdi:cellphone
+  notif_dug_enabled:
+    name: "💧 Dug-varsel i nat — send"
+    icon: mdi:weather-fog
+  notif_dug_parent_a:
+    name: "💧 Dug-varsel i nat — Parent A"
+    icon: mdi:cellphone
+  notif_dug_parent_b:
+    name: "💧 Dug-varsel i nat — Parent B"
+    icon: mdi:cellphone
+  notif_nordlys_enabled:
+    name: "🌌 Nordlys / NLC — send"
+    icon: mdi:weather-night
+  notif_nordlys_parent_a:
+    name: "🌌 Nordlys / NLC — Parent A"
+    icon: mdi:cellphone
+  notif_nordlys_parent_b:
+    name: "🌌 Nordlys / NLC — Parent B"
+    icon: mdi:cellphone
+  notif_vandlaek_enabled:
+    name: "🚨 Vandlæk (bad) — send"
+    icon: mdi:water-alert
+  notif_vandlaek_parent_a:
+    name: "🚨 Vandlæk (bad) — Parent A"
+    icon: mdi:cellphone
+  notif_vandlaek_parent_b:
+    name: "🚨 Vandlæk (bad) — Parent B"
+    icon: mdi:cellphone
+  notif_airbnb_enabled:
+    name: "✅ AirBnB check-in — send"
+    icon: mdi:home-account
+  notif_airbnb_parent_a:
+    name: "✅ AirBnB check-in — Parent A"
+    icon: mdi:cellphone
+  notif_airbnb_parent_b:
+    name: "✅ AirBnB check-in — Parent B"
+    icon: mdi:cellphone
+  notif_apollo_enabled:
+    name: "👻 Apollo spøgelses-flap — send"
+    icon: mdi:ghost
+  notif_apollo_parent_a:
+    name: "👻 Apollo spøgelses-flap — Parent A"
+    icon: mdi:cellphone
+  notif_apollo_parent_b:
+    name: "👻 Apollo spøgelses-flap — Parent B"
+    icon: mdi:cellphone
+  # 2026-09-09f: `notif_blind_*` er FJERNET igen (levede ét døgn). Blinde
+  # Apolloer skyldes normalt at en gæst har slukket en vægkontakt — normal
+  # brug, ikke en fejl, og dermed intet at varsle om. Målingen lever videre
+  # som ren diagnostik i packages/presence_blind_varsel.yaml.
+  notif_elpris_enabled:
+    name: "⚡ Høj elpris — send"
+    icon: mdi:flash
+  notif_elpris_parent_a:
+    name: "⚡ Høj elpris — Parent A"
+    icon: mdi:cellphone
+  notif_elpris_parent_b:
+    name: "⚡ Høj elpris — Parent B"
+    icon: mdi:cellphone
+  notif_lys_forbrug_enabled:
+    name: "📊 Lys-forbrug (KPI) — send"
+    icon: mdi:chart-bar
+  notif_lys_forbrug_parent_a:
+    name: "📊 Lys-forbrug (KPI) — Parent A"
+    icon: mdi:cellphone
+  notif_lys_forbrug_parent_b:
+    name: "📊 Lys-forbrug (KPI) — Parent B"
+    icon: mdi:cellphone
+  notif_maaltid_enabled:
+    name: "🍽️ Måltid → støvsuger — send"
+    icon: mdi:silverware-fork-knife
+  notif_maaltid_parent_a:
+    name: "🍽️ Måltid → støvsuger — Parent A"
+    icon: mdi:cellphone
+  notif_maaltid_parent_b:
+    name: "🍽️ Måltid → støvsuger — Parent B"
+    icon: mdi:cellphone
+  notif_thread_enabled:
+    name: "🧵 Thread / badet strømløst — send"
+    icon: mdi:z-wave
+  notif_thread_parent_a:
+    name: "🧵 Thread / badet strømløst — Parent A"
+    icon: mdi:cellphone
+  notif_thread_parent_b:
+    name: "🧵 Thread / badet strømløst — Parent B"
+    icon: mdi:cellphone
+  notif_sove_radar_enabled:
+    name: "🛠️ Sove-radar genstartet — send"
+    icon: mdi:radar
+  notif_sove_radar_parent_a:
+    name: "🛠️ Sove-radar genstartet — Parent A"
+    icon: mdi:cellphone
+  notif_sove_radar_parent_b:
+    name: "🛠️ Sove-radar genstartet — Parent B"
+    icon: mdi:cellphone
+  # Mad-planlægning (2026-07-29). NB: selve ret-spørgsmålet sendes IKKE gennem
+  # script.push_notify — hver telefon skal have sine EGNE svar-knapper (person
+  # er kodet ind i action-id'et), og dispatchen sender samme payload til alle.
+  # scripts/mad_planner.py::gate_ok SPEJLER derfor gate-logikken for
+  # notif_id=mad_spoergsmaal — ret BEGGE steder (fejlklasse #2).
+  notif_mad_spoergsmaal_enabled:
+    name: "🍽️ Ret-spørgsmål (dagens ret) — send"
+    icon: mdi:comment-question-outline
+  notif_mad_spoergsmaal_parent_a:
+    name: "🍽️ Ret-spørgsmål — Parent A"
+    icon: mdi:cellphone
+  notif_mad_spoergsmaal_parent_b:
+    name: "🍽️ Ret-spørgsmål — Parent B"
+    icon: mdi:cellphone
+  notif_mad_indkoeb_enabled:
+    name: "🛒 Indkøbsliste (nemlig) — send"
+    icon: mdi:cart-outline
+  notif_mad_indkoeb_parent_a:
+    name: "🛒 Indkøbsliste — Parent A"
+    icon: mdi:cellphone
+  notif_mad_indkoeb_parent_b:
+    name: "🛒 Indkøbsliste — Parent B"
+    icon: mdi:cellphone
+  # Morgen-spørgsmålet på indkøbsdage (2026-08-26, user-spec: "kun action
+  # notifikation til Parent A tlf."). Parent B-kontakten findes for symmetriens
+  # skyld men står OFF: spørgsmålet ejer indkøbs-kadencen, og to personer der
+  # svarer hver sin vej ville flytte ankeret to gange.
+  notif_mad_indkoeb_morgen_enabled:
+    name: "🧊 Indkøbsdag-morgenspørgsmål — send"
+    icon: mdi:fridge-outline
+  notif_mad_indkoeb_morgen_parent_a:
+    name: "🧊 Indkøbsdag-morgen — Parent A"
+    icon: mdi:cellphone
+  notif_mad_indkoeb_morgen_parent_b:
+    name: "🧊 Indkøbsdag-morgen — Parent B"
+    icon: mdi:cellphone
+
+  # --- AirBnB-opt-in pr. type (2026-07-16) — ON = send også i AirBnB-mode ---
+  # (sikkerhed/backup bor i system_varsler.yaml, anomali_* i anomali_vagt.yaml)
+  notif_batteri_airbnb:
+    name: "🔋 Lavt/kritisk batteri — også i AirBnB"
+    icon: mdi:home-account
+  notif_remote_offline_airbnb:
+    name: "📟 Remote svarer ikke — også i AirBnB"
+    icon: mdi:home-account
+  notif_lys_watchdog_airbnb:
+    name: "💡 Lys-watchdog (fastlåst lys) — også i AirBnB"
+    icon: mdi:home-account
+  notif_bad_lys_airbnb:
+    name: "🐝 Bad-lys hænger — også i AirBnB"
+    icon: mdi:home-account
+  notif_planter_airbnb:
+    name: "🌱 Plante-vanding — også i AirBnB"
+    icon: mdi:home-account
+  # notif_putning_airbnb fjernet (B215): putning-pushen kan ikke fyre i AirBnB
+  # (mode-gate/kids_home) — en manglende toggle læses som off = samme adfærd.
+  notif_vejr_airbnb:
+    name: "🌦️ Vejr-varsel (dag+nat) — også i AirBnB"
+    icon: mdi:home-account
+  notif_regn_rapport_airbnb:
+    name: "🌧️ Regn-facit (morgen) — også i AirBnB"
+    icon: mdi:home-account
+  notif_dug_airbnb:
+    name: "💧 Dug-varsel i nat — også i AirBnB"
+    icon: mdi:home-account
+  notif_fugt_airbnb:
+    name: "💧 Høj luftfugtighed — også i AirBnB"
+    icon: mdi:home-account
+  notif_nordlys_airbnb:
+    name: "🌌 Nordlys / NLC — også i AirBnB"
+    icon: mdi:home-account
+  notif_vandlaek_airbnb:
+    name: "🚨 Vandlæk (bad) — også i AirBnB"
+    icon: mdi:home-account
+  notif_airbnb_airbnb:
+    name: "✅ AirBnB check-in — også i AirBnB"
+    icon: mdi:home-account
+  notif_apollo_airbnb:
+    name: "👻 Apollo spøgelses-flap — også i AirBnB"
+    icon: mdi:home-account
+  notif_elpris_airbnb:
+    name: "⚡ Høj elpris — også i AirBnB"
+    icon: mdi:home-account
+  notif_lys_forbrug_airbnb:
+    name: "📊 Lys-forbrug (KPI) — også i AirBnB"
+    icon: mdi:home-account
+  # notif_maaltid_airbnb fjernet (B215): maaltid-pushen kan ikke fyre i AirBnB
+  # (mode-gate/kids_home) — en manglende toggle læses som off = samme adfærd.
+  notif_thread_airbnb:
+    name: "🧵 Thread / badet strømløst — også i AirBnB"
+    icon: mdi:home-account
+  notif_sove_radar_airbnb:
+    name: "🛠️ Sove-radar genstartet — også i AirBnB"
+    icon: mdi:home-account
+  # Mad: default OFF i AirBnB (gæsternes ophold skal ikke fylde vores madplan).
+  notif_mad_spoergsmaal_airbnb:
+    name: "🍽️ Ret-spørgsmål — også i AirBnB"
+    icon: mdi:home-account
+  notif_mad_indkoeb_airbnb:
+    name: "🛒 Indkøbsliste — også i AirBnB"
+    icon: mdi:home-account
+  notif_mad_indkoeb_morgen_airbnb:
+    name: "🧊 Indkøbsdag-morgen — også i AirBnB"
+    icon: mdi:home-account
+
+input_datetime:
+  notif_batteri_start:
+    name: "🔋 Lavt/kritisk batteri — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_batteri_slut:
+    name: "🔋 Lavt/kritisk batteri — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_remote_offline_start:
+    name: "📟 Remote svarer ikke — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_remote_offline_slut:
+    name: "📟 Remote svarer ikke — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_lys_watchdog_start:
+    name: "💡 Lys-watchdog (fastlåst lys) — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_lys_watchdog_slut:
+    name: "💡 Lys-watchdog (fastlåst lys) — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_bad_lys_start:
+    name: "🐝 Bad-lys hænger — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_bad_lys_slut:
+    name: "🐝 Bad-lys hænger — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_planter_start:
+    name: "🌱 Plante-vanding — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_planter_slut:
+    name: "🌱 Plante-vanding — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_putning_start:
+    name: "🛏️ Putning detekteret — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_putning_slut:
+    name: "🛏️ Putning detekteret — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_vejr_start:
+    name: "🌦️ Vejr-varsel (dag+nat) — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_vejr_slut:
+    name: "🌦️ Vejr-varsel (dag+nat) — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  # 00:00/00:00 = intet vindue (gate_ok: s == e ⇒ True). Automationens egen
+  # `regn_rapport_tid` er eneste tids-autoritet — som mad-planlægningens nids.
+  notif_regn_rapport_start:
+    name: "🌧️ Regn-facit (morgen) — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_regn_rapport_slut:
+    name: "🌧️ Regn-facit (morgen) — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  # Fresh = 00:00/00:00 = ALTID. Bevidst: et varsel der falder uden for et
+  # vindue bliver DROPPET (ikke udskudt), og fugt-episoderne er lange og
+  # natlige — 2 af 4 målte episoder startede efter kl. 20. Vil user ikke
+  # vækkes, sætter han vinduet selv på Indstillinger.
+  notif_fugt_start:
+    name: "💧 Høj luftfugtighed — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_fugt_slut:
+    name: "💧 Høj luftfugtighed — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_dug_start:
+    name: "💧 Dug-varsel i nat — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_dug_slut:
+    name: "💧 Dug-varsel i nat — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_nordlys_start:
+    name: "🌌 Nordlys / NLC — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_nordlys_slut:
+    name: "🌌 Nordlys / NLC — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_vandlaek_start:
+    name: "🚨 Vandlæk (bad) — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_vandlaek_slut:
+    name: "🚨 Vandlæk (bad) — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_airbnb_start:
+    name: "✅ AirBnB check-in — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_airbnb_slut:
+    name: "✅ AirBnB check-in — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_apollo_start:
+    name: "👻 Apollo spøgelses-flap — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_apollo_slut:
+    name: "👻 Apollo spøgelses-flap — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_elpris_start:
+    name: "⚡ Høj elpris — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_elpris_slut:
+    name: "⚡ Høj elpris — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_lys_forbrug_start:
+    name: "📊 Lys-forbrug (KPI) — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_lys_forbrug_slut:
+    name: "📊 Lys-forbrug (KPI) — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_maaltid_start:
+    name: "🍽️ Måltid → støvsuger — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_maaltid_slut:
+    name: "🍽️ Måltid → støvsuger — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_thread_start:
+    name: "🧵 Thread / badet strømløst — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_thread_slut:
+    name: "🧵 Thread / badet strømløst — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_sove_radar_start:
+    name: "🛠️ Sove-radar genstartet — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_mad_spoergsmaal_start:
+    name: "🍽️ Ret-spørgsmål — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_mad_spoergsmaal_slut:
+    name: "🍽️ Ret-spørgsmål — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_mad_indkoeb_start:
+    name: "🛒 Indkøbsliste — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_mad_indkoeb_slut:
+    name: "🛒 Indkøbsliste — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_mad_indkoeb_morgen_start:
+    name: "🧊 Indkøbsdag-morgen — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_mad_indkoeb_morgen_slut:
+    name: "🧊 Indkøbsdag-morgen — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_sove_radar_slut:
+    name: "🛠️ Sove-radar genstartet — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+
+script:
+  push_notify:
+    alias: "🔔 Push Notify (central dispatch)"
+    icon: mdi:cellphone-message
+    mode: parallel
+    max: 25
+    fields:
+      notif_id:
+        description: "Type-nøgle (fx batteri, vejr, vandlaek)"
+        required: true
+      title:
+        description: "Titel"
+        required: true
+      message:
+        description: "Besked"
+        required: true
+      payload:
+        description: "Valgfri mobile-app data (tag/timeout/actions)"
+        required: false
+      kritisk:
+        description: >-
+          Sæt true når varslet melder at HUSET SELV er i stykker. Springer KUN
+          AirBnB-gaten over (2b) — master, per-type enable og tidsvindue gælder
+          stadig. Fejlklasse #21: en støj-beslutning om gæste-privatliv må ikke
+          kunne slukke for husets evne til at sige at det er blevet blindt.
+        required: false
+    variables:
+      ndata: "{{ payload if payload is defined and payload else {} }}"
+      # Valgfrit script-felt = UDEFINERET hvis ikke sendt med, og | bool(false)
+      # redder det IKKE (Jinja-gotcha) → eksplicit is defined-test.
+      er_kritisk: "{{ kritisk if kritisk is defined else false }}"
+      # gate_ok -> "True"/"False" streng; bool-castes i condition.
+      # SPEJLET i scripts/plant_notify.py::deliverable_now (notif_id=planter) —
+      # ret BEGGE hvis du ændrer gate-betingelserne (fejlklasse #2, B66-fix).
+      # NB `kritisk` er bevidst IKKE spejlet: planter kalder aldrig med det, så
+      # spejlets adfærd er uændret.
+      gate_ok: >
+        {% set nid = notif_id %}
+        {% if not is_state('input_boolean.notifikationer_master_enabled', 'on') %}False
+        {% elif not is_state('input_boolean.notif_' ~ nid ~ '_enabled', 'on') %}False
+        {% elif is_state('input_select.house_mode', 'AirBnB')
+              and not er_kritisk
+              and not is_state('input_boolean.notif_' ~ nid ~ '_airbnb', 'on') %}False
+        {% else %}
+          {% set sh = state_attr('input_datetime.notif_' ~ nid ~ '_start', 'hour') %}
+          {% set sm = state_attr('input_datetime.notif_' ~ nid ~ '_start', 'minute') %}
+          {% set eh = state_attr('input_datetime.notif_' ~ nid ~ '_slut', 'hour') %}
+          {% set em = state_attr('input_datetime.notif_' ~ nid ~ '_slut', 'minute') %}
+          {% if sh is none or eh is none %}True
+          {% else %}
+            {% set nowm = now().hour * 60 + now().minute %}
+            {% set s = sh * 60 + sm %}
+            {% set e = eh * 60 + em %}
+            {% if s == e %}True
+            {% elif s < e %}{{ s <= nowm < e }}
+            {% else %}{{ nowm >= s or nowm < e }}{% endif %}
+          {% endif %}
+        {% endif %}
+      # hjemkomst-kø-gate (notif_hjemme.yaml): defensiv mod manglende toggle
+      # (missing entity -> 'unknown' -> ingen defer = historisk adfærd).
+      wait_home: "{{ states('input_boolean.notif_' ~ notif_id ~ '_hjemme') == 'on' }}"
+      # targets = CSV af notify-service-suffikser (tom = ingen telefon valgt).
+      targets: >
+        {% set nid = notif_id %}
+        {% set ns = namespace(t=[]) %}
+        {% if is_state('input_boolean.notif_' ~ nid ~ '_parent_a', 'on') %}{% set ns.t = ns.t + ['mobile_app_phone_a'] %}{% endif %}
+        {% if is_state('input_boolean.notif_' ~ nid ~ '_parent_b', 'on') %}{% set ns.t = ns.t + ['mobile_app_phone_b'] %}{% endif %}
+        {{ ns.t | join(',') }}
+    sequence:
+      - condition: template
+        value_template: "{{ (gate_ok | trim | bool) and (targets | trim | length) > 0 }}"
+      - repeat:
+          for_each: "{{ (targets | trim).split(',') }}"
+          sequence:
+            - choose:
+                # Hjemkomst-kø: pr. MODTAGER — personens GPS væk => kø i stedet
+                # for send. unknown/unavailable regnes som hjemme (brudt GPS må
+                # ikke sluge varsler). Zone-navne (arbejde mv.) = væk.
+                - conditions:
+                    - condition: template
+                      value_template: >
+                        {{ wait_home and states(
+                             {'mobile_app_phone_a': 'person.parent_a',
+                              'mobile_app_phone_b': 'person.parent_b'
+                             }.get(repeat.item, '')
+                           ) not in ['home', 'unknown', 'unavailable'] }}
+                  sequence:
+                    - service: shell_command.notif_koe_append
+                      data:
+                        payload_b64: >-
+                          {{ {'nid': notif_id, 'target': repeat.item,
+                              'title': title, 'message': message,
+                              'payload': ndata} | to_json | base64_encode }}
+              default:
+                - service: "notify.{{ repeat.item }}"
+                  data:
+                    title: "{{ title }}"
+                    message: "{{ message }}"
+                    data: "{{ ndata }}"

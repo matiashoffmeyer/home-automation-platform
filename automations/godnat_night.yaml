@@ -1,0 +1,908 @@
+# =============================================================================
+# Godnat Nattelys (Night Light during Godnat)
+# =============================================================================
+# Scenarier for nighttime / bedtime flows i børneværelse + voksen-flow.
+#
+# NB (2026-06-28): Den fysiske RODRET-knap (IEEE 56:25:d3:d2:0b:bd:62:42, i
+#   børneværelset) blev OMKODET til SIMPEL STYRING af voksen-soveværelset
+#   (light.spisestue_pendel) — se automations/sove_rodret_button.yaml. De
+#   gamle kalde-tænd (kort-op) og putning-via-knap (kort-ned) flows er FJERNET
+#   herfra. Tilbage i denne fil: kalde-LYS-sluk/-clear/-orphan automations (nu
+#   reelt dormant da input_boolean.kalde_active aldrig sættes længere), selve
+#   putning-flowet (aktiveres af auto-detect + dashboard + script.godnat),
+#   nedtrapning/natlys, og adult night walk.
+#
+# SCENARIO — PUTNING AF BØRN (godnat_boern_active):
+#   Aktiveres af auto-detect (bad-besøg), dashboard-toggle ("Boern i seng"),
+#   eller script.godnat → SLUKKER børneværelset (loft + lampe, smooth fade) +
+#   lukker boern gardin. Stue+køkken forbliver normal for voksne.
+#   USER-RULE 2026-05-07: så længe godnat_boern_active=on må boern lys MAX
+#   være svag rød, intet andet. "De må ikke vågne!" Putning slukker derfor.
+#
+# SCENARIO — ADULT NIGHT WALK:
+#   An adult goes from soveværelse to entré during godnat → dim warm light in
+#   sofa stue + køkken (8% @ 2000K). For bathroom trips or getting water.
+#   Light stays until nobody has been in stue+køkken for 5 minutes.
+#   USER-RULE 2026-05-08: ENTRÉ TÆNDER IKKE OVERHOVEDET under nightwalk.
+#
+# SLUKNING:
+#   De fælles-rum-baserede sluk bruger samme regel: stue+spisestue Apollo
+#   "off" i sammenhængende 5 min. Mode restart = bevægelse nulstiller timeren,
+#   fade over 30 s. Putning auto-clearet morgenen efter via wakeup-flows +
+#   godnat_subflag_safety_clear.
+# =============================================================================
+
+# ==========================================================================
+# KALDE-LYS SLUK/CLEAR (dormant — kalde_active sættes ikke længere af knap)
+# ==========================================================================
+# Disse blev styret af den nu-fjernede kalde-tænd. De er bevaret som no-op
+# safety-net (kalde_active forbliver off → de fyrer reelt aldrig), men kan
+# genoplives hvis kalde-funktionen senere flyttes til en anden knap.
+
+# --- Kalde light off: no presence in stue+køkken for 5 min ---
+# A55 fix audit-3 2026-05-06 PM: tilfojet time_pattern fallback (A27-pattern).
+# Tidligere kun state-trigger 'to: off for 5min' → require TRANSITION. Hvis
+# kid trykked kalde mens sensors already off, trigger fyrer ALDRIG → kalde
+# lights stuck 12h. time_pattern fanger uafhængigt af state-history.
+- id: godnat_kalde_off
+  alias: "Godnat: Kalde-lys sluk"
+  description: >
+    Turn off kalde night light when BOTH common-area sensors have been
+    clear for an uninterrupted 5 minutes. Mode restart silently resets
+    timer on motion. A55: time_pattern fallback for orphan-light protection.
+  mode: restart
+  trigger:
+    # Phase 4 sprint 2026-05-07 sen-PM: templated `for:` med Turn-Off Aggressiveness.
+    - platform: state
+      entity_id: binary_sensor.stue_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ (states('sensor.rum_tom_sluk_sekunder') | float(300)) | int }}"
+    - platform: state
+      entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ (states('sensor.rum_tom_sluk_sekunder') | float(300)) | int }}"
+    # A55 fix: time_pattern fallback. Fanger tilfælde hvor lys blev tændt
+    # UDEN at sensors transitioned (eg. kid pressed kalde mens sensors were
+    # already off). State-trigger kræver transition; time_pattern er state-
+    # history-uafhængig.
+    - platform: time_pattern
+      minutes: "/5"
+      id: fallback_check
+  condition:
+    - condition: state
+      entity_id: input_boolean.kalde_active
+      state: "on"
+    # C2 fix audit 2026-05-07: tidligere `state: "off"` på begge Apollos
+    # → hvis EN unavailable, kalde-lys stuck on indefinitely. Template:
+    # ingen Apollo "on" = open-plan empty (off OR unavailable behandles ens).
+    - condition: template
+      value_template: >-
+        {{ states('binary_sensor.stue_apollo_occupancy_filtered') != 'on'
+           and states('binary_sensor.spisestue_apollo_occupancy_filtered') != 'on' }}
+    # A55 fix: only fade if kalde-lights are actually ON (= ingen no-op fyringer
+    # fra time_pattern hver 5 min)
+    - condition: template
+      value_template: >
+        {{ is_state('light.spisestue_loft', 'on')
+           or is_state('light.spisestue_pendel', 'on') }}
+    # A55 fix: time_pattern fallback skal også kræve sensors været off i 5+ min
+    # siden last_changed (ikke bare on→off transition). Beskytter mod firing
+    # 1 min efter sensor blip. C2 fix: hvis sensor unavailable, brug last_changed
+    # alligevel (vi ved at den ikke har transitioned til "on" i 5+ min, så safe).
+    # 2026-10-11: ventetid = input_number.global_nightwalk_off_minutes (uskaleret).
+    - condition: template
+      value_template: >
+        {% set t1 = as_timestamp(states.binary_sensor.stue_apollo_occupancy_filtered.last_changed) | default(0) %}
+        {% set t2 = as_timestamp(states.binary_sensor.spisestue_apollo_occupancy_filtered.last_changed) | default(0) %}
+        {% set since = as_timestamp(now()) - [t1, t2] | max %}
+        {% set f = states('sensor.global_absence_wait_factor') | float(1.0) %}
+        {{ since >= (300 * f) }}
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.kalde_active
+    # Only turn off stue+køkken. Do NOT touch soveværelse
+    # (parents may have their own reading light on)
+    - service: light.turn_off
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        transition: "{{ states('sensor.fade_living_effective') | int(30) }}"
+    # H1 fix sprint 2026-05-07: dismiss kalde persistent_notification.
+    # Når stue+koekken slukker = familien har håndteret kalde, ryd UI alert.
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: "kalde_kid_alert"
+
+# --- Kalde auto-clear when godnat ends ---
+- id: godnat_kalde_clear
+  alias: "Godnat: Ryd kalde ved godnat-slut"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_boolean.godnat_active
+      to: "off"
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.kalde_active
+    # H1 fix: dismiss kalde alert når godnat ender
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: "kalde_kid_alert"
+
+# --- Single source of truth: actions ved godnat_boern_active flip on ---
+# User-rule 2026-05-07: så længe godnat_boern_active=on må boern lys MAX
+# være kalde-rød. Putning slukker derfor — uanset om flagget blev sat af:
+#   - Auto-detect via bath visit (putning_auto_detect_via_bath_visit)
+#   - Manuel dashboard toggle ("Boern i seng" tile)
+#   - Script.godnat (fuld godnat routine)
+# (Knap-kort-ned-pathen er fjernet 2026-06-28 — RODRET styrer nu sove-lys.)
+# Single automation → ingen duplication, ingen drift mellem entry-points.
+- id: godnat_boern_active_on_actions
+  alias: "Putning: Auto-actions ved godnat_børn flip ON"
+  description: >
+    Triggers på enhver godnat_boern_active off→on transition. Slukker boern
+    lys (loft + lampe) + lukker boern gardin. Mode: single med max_exceeded
+    silent for at undgå spam i logs hvis flag flippes hurtigt.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: input_boolean.godnat_boern_active
+      from: "off"
+      to: "on"
+  action:
+    # Sluk boern lys (smooth 5s fade)
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.boernevaerelse_loft
+          - light.boernevaerelse_lampe
+      data:
+        transition: 5
+    # 2026-06-06: ryd descent-flag — rummet er nu i nat-mode uanset kilde, så en
+    # evt. kørende/strandet Apollo-nedtrapning skal ikke længere suppress'e
+    # presence-lights. No-op hvis descent ikke kørte.
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.puttelys_descent_active
+    # 2026-06-18 (user-spec): EN PUTNING AKTIVERER KIDS_HOME. Man putter kun et
+    # barn der ER hjemme → sæt latchen her (single source of truth for ALLE
+    # putte-kilder: kalde-knap, app/manuel, Styrbar-OP, descent, Fase 2). Gælder
+    # også ankomst-aftener hvor auto-kids_home endnu var off. Sikkerhed: hele-
+    # huset-godnat flipper kun godnat_boern_active hvis kids_home (så et tomt rum
+    # kan ikke bootstrappe latchen herfra), og 06:30-morgen-latchen rydder igen
+    # hvis natten viste sig tom (falsk putte-tryk).
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.boern_sov_her_i_nat
+    # Logbook for debugging
+    - service: logbook.log
+      data:
+        name: "godnat_børn actions"
+        message: >-
+          Børn lys slukket + gardin lukket + kids_home aktiveret (latch) —
+          fra hvilken som helst putte-kilde.
+
+# ==========================================================================
+# SCENARIO 2b — FASE 1: Puttelys (slider-tid, default 19:10)
+# ==========================================================================
+# User-spec 2026-06-06: børnenes puttelys skal tænde automatisk på en slider-
+# justerbar tid (input_datetime.puttelys_start, default 19:10) HVER aften,
+# UANSET lux — men KUN hvis der faktisk var børn i rummet den dag. Det sidste
+# er præcis binary_sensor.kids_home (kræver overnight-søvn ≥4h + kumulativ
+# aktivitet, jf. packages/activity_state.yaml::kids_home).
+#
+# Fase 1 = "alt tændt men dæmpet":
+#   - loft:        månefarvet kølig hvid (~6535K = max cool) @ 30%
+#   - hygge-strip: lyserød (rgb 255,150,200) @ 40%
+#   - hyggelys:    børnehygge plug-lampe ON (non-dimmable teddy)
+#   - apollo-RGB:  røres ikke (forbliver slukket)
+#
+# Strippen sættes via rgb (xy-mode) så fase-2-overgangen kan fade blødt i
+# samme color-mode. Plug-lampen tændes både eksplicit her OG af
+# boernevaerelse_hyggelys_mirror_strip (strip on + godnat off + ≥10%).
+#
+# Gates: kids_home=on, house_mode=Normal, house_state=Active (tænd ikke et
+# tomt rum hvis familien er ude — kids_home kan stå on via S5 overnight selv
+# om de er ude i aften), godnat_boern_active=off (putning ikke i gang/børn
+# sover ikke → respekterer "boern-lys må aldrig tænde når børn sover").
+# INGEN lux-gate (user-spec: "lige meget hvad lux er").
+#
+# 2026-06-12: slider-tiden er nu BAGKANT ("senest da") — bad-besøg ≥3 min i
+# putte-vinduet tænder fase 1 tidligere (putning_auto_detect Trigger A →
+# script.puttelys_phase1_apply). phase1_fired + descent-gates sikrer at
+# bagkanten ikke re-applier oven i en allerede-igangsat putning.
+# ==========================================================================
+- id: puttelys_phase1_scene
+  alias: "Puttelys: Fase 1 bagkant (slider-tid, default 19:10)"
+  description: >
+    På puttelys_start (default 19:10): hvis børn var hjemme i dag (kids_home),
+    huset er aktivt, putning ikke allerede kørt og fase 1 ikke allerede tændt
+    (bad-besøg) → anvend fase 1 via script.puttelys_phase1_apply. Uanset lux.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: time
+      at: input_datetime.puttelys_start
+    # 2026-09-27 (fejlklasse #4, re-arm): tidspunktet er en ENKELT flanke. Blev
+    # kids_home først sand EFTER 19:10 (sent "✅ Ja", Nej-pause ophævet ved
+    # hjemkomst), fyrede intet mere den aften. Nu også på kids_home-flanken,
+    # men kun efter puttelys_start (før dét er tids-triggeren ejeren).
+    - platform: state
+      entity_id: binary_sensor.kids_home
+      from: "off"
+      to: "on"
+      id: kids_sent
+    # 2026-10-07 (user-bug "rødt lys i børneværelset"): en HA-genstart hen over
+    # puttelys_start sluger tids-flanken — og dræber et armeret
+    # puttelys_phase1_when_present midt i ventetiden (scripts overlever ikke en
+    # genstart). 10-07 startede HA 19:10:08 (deploy): bagkanten fyrede aldrig,
+    # og børne-tændet havde aftenen alene. Samme gren, ekstra id (permanent
+    # faktum). Kun inden for arm-vinduet [puttelys_start, + arm-timeout).
+    - platform: homeassistant
+      event: start
+      id: genstart
+  action:
+    # Efter boot er kids_home (template) endnu ikke rendret — 10-07 kom den 19 s
+    # efter start. Gatesne står derfor i action'en, så de evalueres EFTER
+    # settle (samme mønster som sove_gardin_aftenluk). For de to andre
+    # triggers er det det samme øjeblik som før.
+    - if:
+        - condition: trigger
+          id: genstart
+      then:
+        - delay:
+            seconds: 60
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    - condition: template
+      value_template: >-
+        {% set start = today_at(states('input_datetime.puttelys_start')) %}
+        {% set arm = states('input_number.puttelys_arm_timeout_minutes') | int(15) %}
+        {% if trigger.id == 'kids_sent' %}
+          {{ now() >= start and now().hour < 23 }}
+        {% elif trigger.id == 'genstart' %}
+          {{ start <= now() < start + timedelta(minutes=arm) }}
+        {% else %}
+          {{ true }}
+        {% endif %}
+    # 2026-10-06 (bug-hunt nat, 🏡 #1): Home Vacation = familien hjemme uden
+    # vækninger — putningen skal køre. Før `state: Normal` (udelukkede HV).
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    # Fase 1 allerede tændt i aften (bad-besøg/Styrbar OP) → re-apply ikke
+    # oven i evt. manuelle justeringer.
+    - condition: state
+      entity_id: input_boolean.puttelys_phase1_fired
+      state: "off"
+    # Apollo-nedtrapning i gang (kan starte før 19:10 når bad tændte fase 1
+    # tidligt) → bagkanten må ikke blaste lyset op igen.
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    # 2026-06-19 (user-spec FULD LÅS): manuel sluk → ingen tids-drevet fase-1-tænd
+    # før Styrbar OP. Se packages/boernevaerelse_manual_off_lock.yaml.
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_manual_off_lock
+      state: "off"
+    # 2026-06-21 (user-spec): tids-bagkanten tænder IKKE et tomt rum — armér og
+    # tænd fase 1 først når Apollo børn ser bevægelse (async wrapper).
+    # Efter en genstart armeres kun RESTEN af vinduet, så det slutter samme
+    # klokkeslæt som det ville have gjort uden genstarten.
+    - service: script.turn_on
+      target:
+        entity_id: script.puttelys_phase1_when_present
+      data:
+        variables:
+          timeout_minutter: >-
+            {% set arm = states('input_number.puttelys_arm_timeout_minutes') | int(15) %}
+            {% if trigger.id == 'genstart' %}
+              {% set gaaet = (now() - today_at(states('input_datetime.puttelys_start'))).total_seconds() / 60 %}
+              {{ [arm - gaaet, 1] | max | round(0, 'ceil') | int }}
+            {% else %}
+              {{ arm }}
+            {% endif %}
+
+# ==========================================================================
+# SCENARIO 2b.5 — NEDTRAPNING: Apollo-drevet putte-descent (fase 1 → fase 2)
+# ==========================================================================
+# User-spec 2026-06-06: Apollo skal afsløre HVORNÅR putningen faktisk begynder
+# (vi sidder/ligger i ÉT hjørne og læser — ikke bare går ind/ud) og fra det
+# punkt skal lyset langsomt trappe ned til natlys over en slider-justerbar tid
+# (global_puttelys_descent_minutes, default 20 min).
+#
+# DETEKTION ("2 min + læse-zone"): still_target ON kontinuerligt i 2 min OG
+# still_distance >= læse-afstand (boernevaerelse_putte_reading_min_cm, default
+# 120 cm). 2-min-sustain + afstand luger gå-igennem-falske-triggers fra reel
+# læse-stilstand i sengehjørnet (sengen ligger ~294 cm = uden for radar-zone 3).
+#
+# KOREOGRAFI ("Lang hygge, sen mørk") — breakpoints i % af descent-tiden w:
+#   0–100 % : loft fader geometrisk (HA-drevne trin) → ~2 %, slukkes HELT ved
+#             100 % (2026-10-05, user-spec "ud over hele putningen"; før 65 %).
+#   65–100 %: hygge-strip late-fader 40 % lyserød → 1 % blå-hvid natlys.
+#   85 %    : hyggelys plug-lampe (non-dimmable) slukkes (~min 17).
+#   100 %   : sæt godnat_boern_active=on → konvergerer med puttelys_natlys_strip
+#             (kanonisk natlys) + godnat_boern_active_on_actions (gardin luk).
+#
+# puttelys_descent_active=on under hele forløbet → suppress presence-relight,
+# lux-relight, auto-detect A/B og natlys-bagkant så de ikke
+# kæmper mod nedtrapningen. Cleares lige FØR godnat-flip (så natlys_strip's
+# descent-gate er åben på flip-tidspunktet), + 09:00-safety-clear som backstop.
+#
+# Loft/strip turn_on KUN hvis de allerede er ON (PRIME DIRECTIVE: boern-lys må
+# aldrig auto-tænde fra off når børn sover — vi dæmmer kun ned, aldrig op).
+# Timing bevares via else-delay hvis loft/strip var off.
+# mode: restart → forlader-og-vender-tilbage (still_target off→on→2min) genstarter
+# rent; kontinuerlig læse-stilstand giver ingen ny trigger.
+# ==========================================================================
+- id: puttelys_descent
+  alias: "Puttelys: Apollo-nedtrapning (fase 1 → natlys over slider-tid)"
+  description: >
+    Når Apollo ser sustained læse-stilstand (still_target 2 min + afstand) efter
+    puttelys_start, trappes børneværelset langsomt ned over en slider-tid: loft
+    fader ud først (~65 %), så hyggelys (~85 %), mens strippen late-fader til 1 %
+    blå-hvid natlys. Ender med godnat_boern_active=on (konvergerer til natlys).
+  mode: restart
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_radar_still_target
+      to: "on"
+      for:
+        minutes: 2
+  condition:
+    - condition: state
+      entity_id: input_boolean.auto_putning_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    # 2026-10-06 (bug-hunt nat, 🏡 #1): Home Vacation = familien hjemme uden
+    # vækninger — putningen skal køre. Før `state: Normal` (udelukkede HV).
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Putning ikke allerede afsluttet (børn sover ikke) + descent ikke i gang.
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    # Kun i aften-vinduet → bagkant. 2026-06-12: forkant udvidet fra
+    # puttelys_start (19:10) til putning_vindue_start (18:30) — bad-besøg kan
+    # nu tænde fase 1 før 19:10, og så skal nedtrapningen kunne starte når
+    # læse-stilstanden indtræffer (i dag: bad 18:46 → fase 1 18:49 → læsning
+    # ~18:55 ville ellers være blokeret til 19:10).
+    - condition: time
+      after: input_datetime.putning_vindue_start
+      before: input_datetime.natlys_start
+    # Mindst ét boern-lys tændt — descent uden lys ville bare vente w minutter
+    # og så flippe godnat_boern_active=on FØR fase 1 (recreér 2026-06-12-buggen
+    # ad bagvejen). Fade-ned kræver noget at fade.
+    - condition: template
+      value_template: >-
+        {{ is_state('light.boernevaerelse_loft', 'on')
+           or is_state('light.boernevaerelse_hygge_strip', 'on')
+           or is_state('light.boernevaerelse_hyggelys', 'on') }}
+    # Læse-zone: stilstand SKAL være i sengehjørnet/læse-afstanden, ikke en
+    # forbi-gående midt i rummet. still_distance fail-closed (float 0 → falsk).
+    - condition: template
+      value_template: >-
+        {{ states('sensor.boernevaerelse_apollo_radar_still_distance') | float(0)
+           >= states('input_number.boernevaerelse_putte_reading_min_cm') | float(120) }}
+  action:
+    # 2026-06-18: koreografien er flyttet til script.puttelys_descent_run (single
+    # source of truth, delt med Styrbar-OP-putningen). Fuld varighed her.
+    - service: script.puttelys_descent_run
+      data:
+        duration_minutes: "{{ states('input_number.global_puttelys_descent_minutes') | float(20) }}"
+
+# ==========================================================================
+# SCENARIO 2c — FASE 2: Natlys (1% blå-hvid strip) — slider-bagkant + tidlig auto
+# ==========================================================================
+# User-spec 2026-06-06: senere glider puttelyset over til natlys = KUN hygge-
+# strippen på 1% blå-hvid, alt andet boern-lys slukket. To indgange:
+#   1. HÅRD BAGKANT: natlys_start (default 20:30) → garanteret natlys senest da.
+#   2. TIDLIG AUTO:  putning auto-detekteres (godnat_boern_active off→on via
+#      still/bath, jf. putning_auto_detect.yaml) efter puttelys_start → natlys
+#      med det samme.
+#
+# Sætter godnat_boern_active=on → låser rummet i nat-mode (presence-lights
+# gated fra, så natlyset ikke overskrives af bevægelse). No-op hvis allerede on
+# (= tidlig-auto var kilden).
+#
+# LANGE FADES (user-spec "ikke pludseligt"): strippens 40% lyserød → 1% blå-hvid
+# bruger transition = global_puttelys_natlys_fade (default 180s). Loft+lampe
+# slukkes af godnat_boern_active_on_actions (5s fade); plug-lampe er
+# NON-DIMMABLE og popper off. Bevidst undtagelse fra "boern-lys MAX kalde-rød
+# under putning": dette er netop det lave 1%-natlys.
+# ==========================================================================
+- id: puttelys_natlys_strip
+  alias: "Puttelys: Fase 2 natlys (1% blå-hvid, slider-bagkant + tidlig auto)"
+  description: >
+    Natlys senest på natlys_start (default 20:30), eller tidligere når putning
+    auto-detekteres. Sætter godnat_boern_active=on, slukker øvrige boern-lys og
+    fader hygge-strippen langsomt til 1% blå-hvid natlys.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # Hård bagkant — garanteret natlys senest på slider-tiden
+    - platform: time
+      at: input_datetime.natlys_start
+    # Tidlig auto — putning auto-detekteret (still/bath sætter godnat_boern_active)
+    - platform: state
+      entity_id: input_boolean.godnat_boern_active
+      from: "off"
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    # 2026-10-06 (bug-hunt nat, 🏡 #1): Home Vacation = familien hjemme uden
+    # vækninger — putningen skal køre. Før `state: Normal` (udelukkede HV).
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    # 2026-06-06: mens Apollo-nedtrapningen kører (puttelys_descent_active=on)
+    # skal hverken 20:30-bagkanten eller en godnat-flip overtage — nedtrapningen
+    # ER den autoritative bløde vej og flipper selv godnat_boern_active ved slut
+    # (efter den har cleared descent-flag, så denne gate er åben på flip-tidspunktet).
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    # 2026-06-19 (user-spec FULD LÅS): efter en manuel sluk må den TIDS-drevne
+    # 20:30-bagkant ikke auto-natlyse (bruger ser TV) — men en godnat-FLIP
+    # (Trigger C natlys-dim / "Boern i seng"-toggle = bevidst sengetid) skal
+    # stadig kunne konvergere til natlys. Tids-grenen blokeres af låsen; state-
+    # grenen (godnat-flip) gælder altid. Se boernevaerelse_manual_off_lock.yaml.
+    - condition: template
+      value_template: >-
+        {{ trigger.platform == 'state'
+           or is_state('input_boolean.boernevaerelse_manual_off_lock', 'off') }}
+    # 2026-10-06 (user: "du kunne jo se at ingen var hjemme"): bagkanten satte
+    # godnat_boern_active 20:30 i et TOMT hus (Dormant 18:52-21:01), og
+    # hjemkomsten 21:09 kørte derfor i nat-tilstand. kids_home er skema, ikke
+    # tilstedeværelse. Kun tids-grenen gates; kommer I hjem efter bagkanten,
+    # tager putning_sen_hjemkomst (putning_auto_detect.yaml) over.
+    - condition: template
+      value_template: >-
+        {{ trigger.platform == 'state'
+           or not is_state('input_select.house_state', 'Dormant') }}
+    # 2026-08-07 (user-spec): "dark mode på børneværelset om aftenen skal slukke
+    # lys, selv puttelys". Uden denne gate ville en godnat-flip midt i en
+    # tv-session tænde natlyset, hvorefter dark_mode_lights_enforce slukkede det
+    # igen 2 s senere = et blink i et mørklagt rum. Gaten dækker BEGGE grene:
+    # også 20:30-bagkanten skal tie mens rummet bevidst er mørkt.
+    - condition: state
+      entity_id: binary_sensor.filmmoerke_boern
+      state: "off"
+    # Tidlig-auto-triggeren må kun gælde om aftenen, så en godnat-flip midt
+    # på dagen (manuel/kalde) ikke trigger natlys. 2026-06-12: udvidet fra
+    # puttelys_start (19:10) til putning_vindue_start (default 18:30) så
+    # putning-trappens bund-flip før 19:10 også konvergerer til natlys.
+    # Bagkant-triggeren (20:30) er altid efter vinduet, så sand der.
+    - condition: template
+      value_template: >-
+        {% set s = states('input_datetime.putning_vindue_start') %}
+        {% set s = '18:30:00' if s in ['unknown', 'unavailable', 'none', '00:00:00'] else s %}
+        {{ now().time() >= today_at(s).time() }}
+  action:
+    # Lås rummet i nat-mode (gate presence-lights). Triggerer godnat_boern_
+    # active_on_actions → loft+lampe off (5s) + gardin luk. No-op hvis allerede on.
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.godnat_boern_active
+    # Sluk øvrige (ikke-loft/lampe) boern-lys: plug-lampe + apollo-RGB.
+    # Strippen slukkes IKKE — den fader til natlys nedenfor.
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.boernevaerelse_hyggelys
+          - light.boernevaerelse_apollo_rgb_light
+    # Hygge-strip = eneste lys: langsomt fade til 1% blå-hvid natlys.
+    # Brightness + farve (kelvin) er tunable via sliders; fade-tid ligeså.
+    # ⚠️ 2026-07-30: sensor.luksus_blokeret_effekt (packages/luksus_besparelse.
+    # yaml) bruger godnat_boern_active + global_putte_natlys_brightness som
+    # counterfactual for "natlyset blev undertrykt af el-pris-blokken". Flytter
+    # du natlys-trinnet væk fra dette flag, så ret spejlet der (fejlklasse #2).
+    # 2026-08-20: via script.boern_natlys_set (RGB) — et color_temp-kald snapper
+    # strippen over i innr'ens hvide kanal midt i fadet. Ét sted at rette.
+    - service: script.boern_natlys_set
+      data:
+        transition: "{{ states('input_number.global_puttelys_natlys_fade') | int(180) }}"
+    - service: logbook.log
+      data:
+        name: "Natlys (fase 2)"
+        message: >-
+          {{ now().strftime('%H:%M') }} natlys: strip fader til 1% blå-hvid over
+          {{ states('input_number.global_puttelys_natlys_fade') | int(180) }}s,
+          godnat_boern_active=on, øvrige boern-lys slukket.
+
+# ==========================================================================
+# SCENARIO 3: Adult night walk (soveværelse → entré during godnat)
+# ==========================================================================
+
+# --- Adult walks to entré during godnat → dim warm in sofa stue + køkken ---
+- id: godnat_adult_nightwalk
+  alias: "Godnat: Voksen nattur (dim stue+køkken)"
+  description: "Dim warm light in stue+køkken when adult goes to entré at night"
+  mode: restart
+  trigger:
+    # Entré motion detected during godnat
+    # Audit-runde 13 fix (O7): rettet fra depot_valhorn til entre_valhorn.
+    # Original intent var entré (= voksen gaar til toilet), depot_valhorn var typo.
+    - platform: state
+      entity_id: binary_sensor.entre_valhorn_occupancy
+      to: "on"
+      id: entre
+    # 2026-08-26g (fejlklasse #4 — flanke-trigger uden re-arm): gå-i-seng-gracen
+    # nedenfor SLUGER entré-flanken. Målt 26/8: godnat 22:10:53, natture 22:12:31
+    # og 22:13:09 — begge inde i de 230 s grace, og der kom aldrig en tredje
+    # flanke, så natturen fyrede aldrig. Backstop hvert minut: er gracen udløbet,
+    # og skete natturen INDE i gracen, så tænd nu. Bevidst snævert (kun det
+    # vindue, kun hvis lyset stadig er slukket) — et /1-min tick der læser rå
+    # presence ville lade et radar-spøgelse tænde open-plan hele natten.
+    - platform: time_pattern
+      minutes: "/1"
+      id: rearm
+  condition:
+    # Re-arm-grenens EGNE krav (gælder ikke den normale entré-flanke).
+    - condition: or
+      conditions:
+        - condition: template
+          value_template: "{{ trigger.id | default('entre') != 'rearm' }}"
+        - condition: and
+          conditions:
+            # Ingen no-op-gentagelser: er lyset tændt, er natturen allerede sket.
+            - condition: state
+              entity_id: light.spisestue_loft
+              state: "off"
+            - condition: template
+              value_template: >-
+                {% set s = states('input_datetime.godnat_force_at') %}
+                {% set g = states('input_number.godnat_walk_grace_seconds') | float(90) %}
+                {% set t0 = (state_attr('input_datetime.godnat_force_at', 'timestamp') | float(0)) %}
+                {% set e = states.binary_sensor.entre_valhorn_occupancy %}
+                {% set et = e.last_changed.timestamp() if e is not none else 0 %}
+                {% set n = now().timestamp() %}
+                {{ t0 > 0 and g > 0
+                   and n >= t0 + g and n <= t0 + g + 300
+                   and et >= t0 and et <= t0 + g + 60 }}
+    # A1 fix sprint 2026-05-06: gate på et UNION-flag, ikke kun master. Tidligere
+    # blokerede gaten fordi user trykker somrig kort-ned → kun voksne_active=on,
+    # godnat_active=off → nightwalk silent → user i pitch-dark ved bath-trip.
+    # 2026-09-01b: unionen var godnat_ANY_active, som også er ON når kun BØRNENE
+    # er puttet — og en VOKSEN-nattur forudsætter at en VOKSEN er gået i seng.
+    # Målt 1/9: børne-godnat 19:42:21, entré-bevægelse 20:12:58 mens begge
+    # voksne var oppe → natturen malede køkken-lyskæden 2 % orange og
+    # spisestue-loftet dim-warm. Kæden kunne ikke rettes tilbage, fordi dens
+    # enforcer hang på præcis samme forkerte anker. godnat_common_active er
+    # samme union MINUS børne-putning, så A1-scenariet (kun voksne_active)
+    # består uændret. Samme rettelse som stuen fik 2026-06-06 og sove 2026-07-02.
+    - condition: state
+      entity_id: binary_sensor.godnat_common_active
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-08-13g (Sleep Over): natturen tænder spisestue-loftet — dvs. præcis
+    # over gæsten der sover i open-plan. Er sleepover armeret, navigerer den
+    # voksne i mørke (som entréen allerede gør, se USER-RULE nedenfor).
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    # Not already handled by kalde button
+    - condition: state
+      entity_id: input_boolean.kalde_active
+      state: "off"
+    # 2026-06-12 (user-spec): nightwalk skal tage lux/sol i betragtning — på
+    # lyse sommernætter er stuen navigerbar uden kunstlys, så tænd ikke.
+    # Primært: open_plan_lux under night-threshold (40 lx skaleret med global
+    # lux-sensitivity, samme bracket som presence_stue). Fallback når lux-
+    # kæden er død (stue-LTR390 defekt 2026-05-05, spisestue/sove Apollos
+    # offline): sun-elevation < -4° = reelt mørkt. Bad-flowet
+    # (presence_badevaerelse) er bevidst UÆNDRET.
+    - condition: template
+      value_template: >-
+        {% set raw = states('sensor.open_plan_lux') %}
+        {% if raw not in ['unknown', 'unavailable', 'none', ''] %}
+          {% set f = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {{ (raw | float(0)) < (40 * f) }}
+        {% else %}
+          {{ (state_attr('sun.sun', 'elevation') | float(0)) < -4 }}
+        {% endif %}
+    # 2026-09-13 (user-spec, AskUserQuestion): HÅRD sol-gate. Lux-testen ovenfor
+    # var natturens ENESTE "er det nat?"-diskriminator, og en mørk, overskyet
+    # morgen passerer den: 13/9 var solen gået op 06:38:55, og kl. 07:03 — 24 min
+    # efter — malede natturen køkkenet 2 % orange mens user var stået op for
+    # dagen. Sol-elevations-grenen ovenfor er kun FALLBACK når lux-kæden er død,
+    # så den bliver aldrig konsulteret på en normal morgen. Er solen over
+    # horisonten, er en entré-passage en morgen-opstigning, ikke en nattur →
+    # normalt presence-lys i fuld styrke overtager.
+    # Holder hele året: vintersolopgang 08:40 betyder at nattur stadig gælder
+    # kl. 07 i december, hvor den SKAL gælde.
+    - condition: state
+      entity_id: sun.sun
+      state: "below_horizon"
+    # 2026-06-12 (user-spec): nightwalk kræver EVIDENS for at nogen er i
+    # sengen — still target ELLER bevægelse i voksen-soveværelset. Uden det
+    # er entré-blip = voksen der stadig er oppe (sofa-aften), og natlys i
+    # køkken/spisestue er kun irriterende. NB: sove-Apollo er pt. bevidst
+    # offline → unavailable failer gaten → nightwalk reelt deaktiveret
+    # indtil Apollo re-parres. Accepteret af user 2026-06-12.
+    - condition: template
+      value_template: >-
+        {{ is_state('binary_sensor.sovevaerelse_apollo_radar_still_target', 'on')
+           or is_state('binary_sensor.sovevaerelse_apollo_radar_moving_target', 'on')
+           or is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'on') }}
+    # 2026-06-12 (user-spec): manuel Styrbar-aktivitet i stuen indenfor
+    # blok-vinduet (slider, default 30 min, 0 = off) blokerer nightwalk —
+    # brugeren styrer tydeligvis selv open-plan lyset. Dækker scenariet
+    # hvor partneren ligger i sengen (sove-gaten passerer) mens user
+    # sidder i sofaen og slukker via Styrbar.
+    # 2026-09-03d: open-plan blev splittet i tre room_modes, så en app-justering
+    # i spisestue/køkken stempler nu sit EGET last_press — før landede alle tre
+    # på _stue. Gaten læser derfor det NYESTE af de tre stempler, ellers ville
+    # splittet i tavshed gøre blokeringen smallere end user-spec'en fra 06-12.
+    - condition: template
+      value_template: >-
+        {% set mins = states('input_number.global_nightwalk_manual_block_minutes') | float(30) %}
+        {% set ns = namespace(newest = 0) %}
+        {# [11:] == '00:00:00' = URØRT stempel: et has_date-input_datetime der
+           aldrig er sat står på DAGENS midnat, ikke 1970. Uden guarden ville de
+           to nye (09-03d) stempler se friske ud fra 00:00 til 00:30 — midt i
+           det vindue nattur-lyset skal virke. #}
+        {% for r in ['stue', 'spisestue', 'koekken'] %}
+          {% set lp = states('input_datetime.styrbar_last_press_' ~ r) %}
+          {% if lp not in ['unknown', 'unavailable', 'none', '']
+                and lp[11:] != '00:00:00' %}
+            {% set ts = (state_attr('input_datetime.styrbar_last_press_' ~ r, 'timestamp') | float(0)) %}
+            {% if ts > ns.newest %}{% set ns.newest = ts %}{% endif %}
+          {% endif %}
+        {% endfor %}
+        {% if ns.newest == 0 or mins <= 0 %}
+          true
+        {% else %}
+          {{ (as_timestamp(now()) - ns.newest) > mins * 60 }}
+        {% endif %}
+    # 2026-06-25 (user-spec): gå-i-seng-grace. Lige efter godnat-tryk (kort/lang)
+    # går man fra sofa → seng forbi entré-Myggsprayen → denne nattur fyrede og
+    # "godnat slukkede ikke". Bloker nattur i grace-vinduet efter godnat_force_at
+    # (slider, 0 = fra). Senere natture (efter grace) urørt.
+    - condition: template
+      value_template: >-
+        {% set s = states('input_datetime.godnat_force_at') %}
+        {% set g = states('input_number.godnat_walk_grace_seconds') | float(90) %}
+        {% if s in ['unknown','unavailable','none',''] or g <= 0 %}
+          true
+        {% else %}
+          {{ (now() - strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() >= g }}
+        {% endif %}
+  action:
+    # Dim warm light ONLY in sofa stue + køkken (not spisestue, not entré)
+    # B216 (user-spec 2026-10-11): "spisestue-lyset om morgenen må ikke tænde
+    # hvis der har sovet børn der, og bevægelsen ikke er spisestue-Apolloen".
+    # Målt 10/10-11/10: natturen tændte loftet 05:45-06:21 på entré-flanker
+    # med børn i huset. Morgen = 04-12 (samme vindue som
+    # binary_sensor.open_plan_mork_morgen). Kæden får stadig sit natlys; går man
+    # videre ind i spisestuen, tænder Lysnet: Spisestue selv på sin Apollo.
+    # Søstre med samme gate: presence_light_stue_on, arrival_welcome_light
+    # (grep B216). Re-arm-grenen nedenfor tjekker loftet = off og kunne derfor
+    # gentage kæde-kaldet — men den lever kun 5 min efter et godnat-tryk, dvs.
+    # om aftenen, aldrig i morgen-vinduet.
+    - if:
+        - condition: template
+          value_template: >-
+            {{ not (now().hour >= 4 and now().hour < 12
+                    and is_state('input_boolean.boern_sov_her_i_nat', 'on')) }}
+      then:
+        - service: light.turn_on
+          target:
+            entity_id:
+              - light.spisestue_loft
+          data:
+            brightness_pct: "{{ states('input_number.global_nightwalk_brightness') | int(8) }}"
+            color_temp_kelvin: 2000  # Very warm
+            transition: 2
+    # 2026-08-26g (user-spec): køkken-lyskæden med som orange natlys. rgb_color
+    # og ikke color_temp_kelvin — kæden står i xy, og et kelvin-kald SNAPPER en
+    # farvet strip til hvid (permanent faktum). Samme Tanner-Helland-kurve som
+    # script.boern_natlys_set. Enforceren i packages/koekken_lyskaede.yaml er
+    # undtaget under godnat, ellers maler dens on_edge-gren natlyset cyan 2 s efter.
+    - variables:
+        natlys_rgb: >-
+          {%- set t = (states('input_number.global_nightwalk_lyskaede_kelvin') | float(1800)) / 100 -%}
+          {%- if t <= 66 -%}
+            {%- set r = 255 -%}
+            {%- set g = 99.4708025861 * log(t) - 161.1195681661 -%}
+            {%- set b = 0 if t <= 19 else 138.5177312231 * log(t - 10) - 305.0447927307 -%}
+          {%- else -%}
+            {%- set r = 329.698727446 * ((t - 60) ** -0.1332047592) -%}
+            {%- set g = 288.1221695283 * ((t - 60) ** -0.0755148492) -%}
+            {%- set b = 255 -%}
+          {%- endif -%}
+          {{ [ [[r | round(0) | int, 0] | max, 255] | min,
+               [[g | round(0) | int, 0] | max, 255] | min,
+               [[b | round(0) | int, 0] | max, 255] | min ] }}
+    # 2026-09-28 (AirBnB-audit): AirBnB-undtagelsen er fjernet. Den beskyttede
+    # mod airbnb_koekken_spots_lyskaede_mirror (kæde → fuldt spots-arbejdslys),
+    # men mirroren døde 2026-09-03 (c6fafb6, "køkkenlys kører ens i AirBnB og
+    # Normal") — tilbage stod kun at gæstens nattur fik spiseloftet, men ikke
+    # kædens 2 % orange som familien får.
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.koekken_lyskaede
+      data:
+        rgb_color: "{{ natlys_rgb }}"
+        brightness_pct: "{{ states('input_number.global_nightwalk_lyskaede_brightness') | int(2) }}"
+        transition: 2
+    # USER-RULE 2026-05-08: entré TÆNDER IKKE under nightwalk.
+    # Tidligere implementation: entré 8% @ 2000K via separat turn_on call.
+    # User vil have entré HELT MØRKT — voksen navigerer entré i mørke
+    # (kort distance, kendt layout). Kun stue+køkken får dim warm fordi
+    # de er længere væk + flere møbler at navigere rundt om.
+    # Entré-light er fjernet helt fra denne action. Hvis entré-light alligevel
+    # er ON ved trigger-tid (= en anden automation tændte den), så lader
+    # nightwalk-off automationen den slukke som normalt (defensive).
+
+# --- Adult night walk off: 5 min absence in stue+køkken ---
+# A27 fix sprint 2026-05-06 PM: tilfojet time_pattern fallback trigger.
+# Tidligere kun state-trigger 'to: off for 5min' = kræver transition.
+# Hvis sensors var ALLEREDE off pre-arrival (typisk under godnat), ingen
+# transition → trigger fires aldrig → lights stuck on i 12h indtil drift_back
+# ceiling. Fallback fires hvert 5 min så lights ALTID slukker når conditions met.
+- id: godnat_adult_nightwalk_off
+  alias: "Godnat: Nattur-lys sluk"
+  description: >
+    Fade out the night walk lights when open plan, entré and bath have
+    been clear for input_number.global_nightwalk_off_minutes (default 5). Mode restart silently
+    resets the timer on any motion. Also clears the entré light at the
+    same time. The fade uses a gentle 30-second transition — lights
+    never slam off. A27: time_pattern fallback for orphan-light protection.
+  mode: restart
+  trigger:
+    # 2026-10-11 (user: "kæden slukkede ikke af sig selv"): ventetiden er
+    # afkoblet fra Turn-Off Aggressiveness. Den skalerede 300 s med
+    # global_absence_wait_factor (4,47 = 22 min), så natturlyset brændte ~22 min
+    # efter at sidste radar i open plan/entré/bad var faldet — målt 10-09 og
+    # 10-10. Nattur-lys er et vejlys, ikke et rum-lys: egen slider.
+    # Målt over 13 nattur-episoder (30 d): stille-huller ≥ 5 min med badet som
+    # vidne = 5 (alle ægte "tilbage i seng"); UDEN badet = 9, hvor de ekstra 3
+    # var toiletbesøg (368/510/681 s) → badet står i vidne-sættet herunder.
+    - platform: state
+      entity_id: binary_sensor.stue_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ ((states('input_number.global_nightwalk_off_minutes') | float(5)) * 60) | int }}"
+    - platform: state
+      entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ ((states('input_number.global_nightwalk_off_minutes') | float(5)) * 60) | int }}"
+    # A27 fix: time_pattern fallback for tilfælde hvor lys blev tændt UDEN at
+    # sensors transitioned (eg. arrival under godnat tændte stue+koekken via A22).
+    # Hvert minut (2026-10-11, før /5): med en 5-min-vent ville /5 lægge op til
+    # 5 min oveni. Kun condition-evaluering — ingen kald før lyset faktisk er tændt.
+    - platform: time_pattern
+      minutes: "/1"
+      id: fallback_check
+  condition:
+    # A1 fix: same gate-pattern som adult_nightwalk_on
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.kalde_active
+      state: "off"
+    # C2 fix audit 2026-05-07: hvis Apollo unavailable, nightwalk-lys stuck
+    # on indefinitely (same antimønster som kalde_off + arrival_welcome).
+    # Template: ingen Apollo "on" = empty (off OR unavailable).
+    # 2026-09-13 (user: "nu står jeg igen i mørke i køkkenet"): vidne-sættet var
+    # smallere end handlingen. Actionen slukker entré + spisestue + køkken-kæden,
+    # men tomheden blev kun målt i stue + spisestue — og en voksen på nattur er
+    # pr. definition i entréen eller køkkenet, altså præcis de to rum ingen af
+    # de to vidner kan se. Derfor DØDE natturlyset midt i turen hver gang: målt
+    # 5/9 kl. 06:10+06:15 (samme klage) og 13/9 kl. 07:05+07:10, hvor entréen
+    # havde været aktiv 33 s / 4 min og 7 s / 2 min 54 s tidligere. Entréen er
+    # selve natturens TRIGGER, så den hører i tomheds-testen. `!= 'on'` bevarer
+    # C2-fail-open: unavailable må ikke kunne hænge lyset (#9).
+    - condition: template
+      value_template: >-
+        {{ states('binary_sensor.stue_apollo_occupancy_filtered') != 'on'
+           and states('binary_sensor.spisestue_apollo_occupancy_filtered') != 'on'
+           and states('binary_sensor.koekken_apollo_occupancy_filtered') != 'on'
+           and states('binary_sensor.entre_valhorn_occupancy') != 'on'
+           and states('binary_sensor.badevaerelse_inde_occupancy') != 'on' }}
+    # A27 fix: only fade if lights are actually ON (= ingen no-op fyringer fra
+    # time_pattern hver 5 min). Skip hvis alle 3 lights allerede off.
+    - condition: template
+      value_template: >
+        {{ is_state('light.spisestue_loft', 'on')
+           or is_state('light.entre_loft', 'on')
+           or (is_state('light.koekken_lyskaede', 'on')
+               and is_state('switch.koekken_spots', 'off')) }}
+    # A27 fix: time_pattern fallback skal også requires at sensors været off
+    # i 5+ min siden last_changed (ikke bare on→off transition). Beskytter mod
+    # firing 1 min efter sensor blip.
+    # Audit-fix 2026-05-07: scale med global_absence_wait_factor for consistency
+    # med templated state-trigger `for:` durations (also factor-scaled).
+    # 2026-09-13: samme udvidelse som vidne-sættet ovenfor. Kun kanaler der står
+    # i et ÆGTE 'off' bidrager med et "tomt siden"-stempel — en `unavailable`
+    # kanals last_changed er tidspunktet den døde, og ville her betyde "netop
+    # tomt" og dermed hænge natturlyset natten igennem (#9/C2). Er INGEN kanal i
+    # et rent 'off' (alle unavailable), falder vi tilbage til den gamle
+    # fail-open adfærd og rydder op. NB last_changed nulstilles ved HA-restart,
+    # så testen holder også lyset i ro de første 5 min efter boot.
+    - condition: template
+      value_template: >
+        {% set ns = namespace(newest = 0) %}
+        {% for eid in ['binary_sensor.stue_apollo_occupancy_filtered',
+                       'binary_sensor.spisestue_apollo_occupancy_filtered',
+                       'binary_sensor.koekken_apollo_occupancy_filtered',
+                       'binary_sensor.entre_valhorn_occupancy',
+                       'binary_sensor.badevaerelse_inde_occupancy'] %}
+          {% set e = states[eid] %}
+          {% if e is not none and e.state == 'off' %}
+            {% set t = e.last_changed.timestamp() %}
+            {% if t > ns.newest %}{% set ns.newest = t %}{% endif %}
+          {% endif %}
+        {% endfor %}
+        {% set wait = (states('input_number.global_nightwalk_off_minutes') | float(5)) * 60 %}
+        {{ ns.newest == 0
+           or (now().timestamp() - ns.newest) >= wait }}
+  action:
+    # Entré: slukker MOMENTANT, ikke som en fade. `light.entre_loft` er Matter,
+    # og HA videregiver aldrig `transition` til et Matter-`turn_off` (bart
+    # `OnOff.Off()`) — tallet herunder har aldrig haft effekt her. Det bliver
+    # stående fordi SAMME sensor bruges af ZHA-lysene længere nede i denne
+    # action, hvor den virker. Vil man have en ægte fade, skal HA selv drive
+    # rampen (`script.entre_fade_ud`) — bevidst IKKE koblet på her: en 45 s
+    # ramp ville lade entréen lyse længe efter resten af huset er mørkt.
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        transition: "{{ states('sensor.fade_passage_effective') | int(10) }}"
+    # Fade out stue+køkken night lights over 30 seconds
+    - service: light.turn_off
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        transition: "{{ states('sensor.fade_living_effective') | int(30) }}"
+    # 2026-08-26g: natturens køkken-lyskæde skal kunne DØ igen (jf. 08-26d, hvor
+    # kæden hang 3 t 41 min). Spots on = madlavning, ikke nattur → rør den ikke.
+    - condition: state
+      entity_id: switch.koekken_spots
+      state: "off"
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.koekken_lyskaede
+      data:
+        transition: "{{ states('sensor.fade_living_effective') | int(30) }}"

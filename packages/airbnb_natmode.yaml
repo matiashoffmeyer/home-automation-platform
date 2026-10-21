@@ -1,0 +1,401 @@
+# =============================================================================
+# AirBnB nat-mode — auto-godnat for gæster der ikke bruger knapperne
+# =============================================================================
+# User-spec 2026-07-12: "hvis en gæst ikke bruger godnat og godmorgen knapperne
+# skal der sættes natmode ved presence i soveværelset natten over eller ingen
+# bevægelse i resten af huset. brug akkumulerede presence i tidsintervaller som
+# tager højde for at still detection i soveværelset ikke er så god."
+#
+# HVORFOR AKKUMULERET (ikke kontinuerlig som Normal-auto-declare): sove-Apollos
+# still-gates g0-g3 er MUTED (100, pendel-spøgelses-kalibrering 2026-07-09b) →
+# en sovende gæst ses kun periodisk (g4/g5 still) → occupancy flapper. Krav om
+# 2 timers UBRUDT bedroom-presence (Normal-designet) ville aldrig opfyldes.
+# I stedet: history_stats-akkumulering over 60 min lookback.
+#
+# TO VEJE IND (nat-vindue start_hour→06):
+#   A) "i seng":     fælles-areal stille i quiet_min sammenhængende minutter
+#                    OG sove-occupancy akkumuleret >= sove_accum_min af de
+#                    sidste 60 min. (Stærkt signal: nogen ER i soveværelset.)
+#   B) "helt stille": fælles-areal stille i quiet_alene_min (0 = fra) — fanger
+#                    det tilfælde hvor still-detection SLET ikke ser gæsten.
+#   + hourly backstop-trigger (:07) mod blokeret-flanke (fejlklasse #4: quiet-
+#     for-timeren kan udløbe FØR nat-vinduet åbner → templaten forbliver true
+#     → ingen ny flanke).
+#
+# HVAD DEN GØR: sætter godnat_active + godnat_voksne_active (union
+# godnat_any_active driver bad-natlys 8%, entré 5%-nattlys, nattur-dim osv. —
+# alle godnat-consumers kører i AirBnB) + slukker glemte fælles-rum-lys.
+# RØRER ALDRIG: sove-loftet (light.spisestue_pendel — gæst kan læse i seng;
+# still-detection kan ikke skelne læsning fra søvn) + bad-spots (wasp kan holde
+# lys på en helt stille person bag lukket dør mens inde_occupancy er off).
+# INGEN gardiner (Somfy-motorstøj midt om natten), INGEN godnat_force_at-stempel
+# (entré-nattlys skal virke ved nat-toilet — force = "ro nu"-blok).
+#
+# FEJLER DEN DEN FORKERTE VEJ? Hvis gæsterne er UDE (ikke i seng) når den
+# fyrer: lyset er allerede slukket/60-min-reglen har sat Dormant → ingen synlig
+# effekt, og HOVEDDØR-CLEAREN nedenfor rydder godnat i samme sekund de låser
+# sig ind → presence-lys + welcome virker normalt. En sovende gæst åbner aldrig
+# hoveddøren → clearen kan ikke ramme ægte nat.
+#
+# CLEAR OM MORGENEN (= som Normal): godmorgen_auto_clear_on_activity +
+# godnat_auto_off_aktivitet er AirBnB-widened (flags-only, godmorgen_godnat.
+# yaml) + 12:00-backstop her (aktivitets-clearene er gated før 12:00 — en gæst
+# der sover til 13 må ikke have godnat-låst presence-lys resten af dagen).
+# godmorgen_auto_detect (lys + gardin-OP) forbliver Normal-only (undtagelse 3).
+# =============================================================================
+
+input_boolean:
+  airbnb_natmode_enabled:
+    name: "AirBnB nat-mode (auto-godnat for gæster) aktiveret"
+    icon: mdi:weather-night
+
+input_number:
+  # Nat-vinduets start-time (slut er fast 06:00 = hvor morgen-clearene tager over).
+  airbnb_natmode_start_hour:
+    name: "AirBnB nat-mode: tidligste time"
+    icon: mdi:clock-start
+    min: 18
+    max: 23
+    step: 1
+    unit_of_measurement: "t"
+    mode: slider
+
+  # Vej A: krævet akkumuleret sove-occupancy (minutter af de sidste 60).
+  airbnb_natmode_sove_accum_min:
+    name: "AirBnB nat-mode: akkumuleret sove-presence (min/60min)"
+    icon: mdi:bed-clock
+    min: 1
+    max: 45
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Vej A: hvor længe fælles-arealet skal være sammenhængende stille.
+  airbnb_natmode_quiet_min:
+    name: "AirBnB nat-mode: fælles-areal stille i (vej A)"
+    icon: mdi:volume-off
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Vej B: stille-alene-varighed uden krav om sove-presence (0 = vej B fra).
+  airbnb_natmode_quiet_alene_min:
+    name: "AirBnB nat-mode: helt stille i (vej B, 0=fra)"
+    icon: mdi:sleep
+    min: 0
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Natte-dim af Dormant→Active entré-welcome mens godnat er aktiv i AirBnB
+  # (ellers 80/60/35% lux-blast i hovedet på en nat-toilet-gæst).
+  airbnb_natmode_welcome_pct:
+    name: "AirBnB nat-mode: welcome-lys under godnat (%)"
+    icon: mdi:lightbulb-night
+    min: 5
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+sensor:
+  # Akkumuleret sove-occupancy (timer) over de sidste 60 min. Sliding window →
+  # kortvarige still-detection-dropouts (mutede g0-g3) koster ikke hele soaken.
+  - platform: history_stats
+    name: "Sove presence 60min"
+    unique_id: sove_presence_60min
+    entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      minutes: 60
+
+automation:
+  # ---------------------------------------------------------------------------
+  # AUTO-NATMODE: sæt godnat når gæsterne (målt akkumuleret) er gået til ro
+  # ---------------------------------------------------------------------------
+  - id: airbnb_natmode_auto_godnat
+    alias: "AirBnB nat-mode: auto-godnat ved ro i huset"
+    description: >
+      Sætter godnat-flags + slukker glemte fælles-lys når fælles-arealet har
+      været stille (vej A: quiet_min + akkumuleret sove-presence; vej B:
+      quiet_alene_min alene) i nat-vinduet. Rører aldrig sove-loftet og
+      bad-spots. Kun AirBnB.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      # Vej A — fælles stille + nok akkumuleret sove-presence, holdt i quiet_min.
+      - platform: template
+        id: i_seng
+        value_template: >-
+          {{ is_state('binary_sensor.faelles_areal_aktiv', 'off')
+             and (states('sensor.sove_presence_60min') | float(0)) * 60
+                 >= (states('input_number.airbnb_natmode_sove_accum_min') | float(10)) }}
+        for:
+          minutes: "{{ states('input_number.airbnb_natmode_quiet_min') | int(30) }}"
+      # Vej B — helt stille længe nok, uanset sove-detection (0 = fra).
+      - platform: template
+        id: helt_stille
+        value_template: >-
+          {{ (states('input_number.airbnb_natmode_quiet_alene_min') | int(0)) > 0
+             and is_state('binary_sensor.faelles_areal_aktiv', 'off') }}
+        for:
+          minutes: "{{ [states('input_number.airbnb_natmode_quiet_alene_min') | int(90), 1] | max }}"
+      # Backstop hver time (:07) — fanger for-timere der udløb FØR nat-vinduet
+      # åbnede (blokeret flanke, fejlklasse #4). Conditions gater alt.
+      - platform: time_pattern
+        id: backstop
+        minutes: "7"
+    condition:
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "AirBnB"
+      - condition: state
+        entity_id: input_boolean.airbnb_natmode_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "off"
+      # Nat-vindue: start_hour → 06 (cross-midnight).
+      - condition: template
+        value_template: >-
+          {% set start_h = states('input_number.airbnb_natmode_start_hour') | int(22) %}
+          {{ now().hour >= start_h or now().hour < 6 }}
+      - condition: state
+        entity_id: binary_sensor.presence_sensors_available
+        state: "on"
+      # "På terrassen" = ikke i seng. FØR kl. 01 blokerer hele terrasse_active-
+      # unionen (radar + terrasse-lys + ÅBEN DØR). FRA kl. 01 (→06) er en åben
+      # dør alene = natte-KØLING, ikke ophold — kun radar/lys blokerer.
+      # Gæste-forensik 07-12→15: gæsten sov med åben altandør hver nat →
+      # natmode fyrede ALDRIG → nat-toilet 01:12 fik fuldt sofa+køkken+bad-lys.
+      # Tids-backstop = user-valg 2026-07-15. Hardcodet 01 — slider på request.
+      - condition: template
+        value_template: >-
+          {% if 1 <= now().hour < 6 %}
+            {{ not (is_state('binary_sensor.likely_on_terrasse', 'on')
+                    or is_state('binary_sensor.terrasse_lights_on', 'on')) }}
+          {% else %}
+            {{ is_state('binary_sensor.terrasse_active', 'off') }}
+          {% endif %}
+      # Gæst der ser film helt stille: medie-afspilning afslører dem
+      # (unavailable != 'playing' → fail-open, blokerer ikke).
+      # ⚠️ 2026-07-28: entityen stod 'unavailable' i 3+ døgn — også en aften hvor
+      # der REELT blev set film (history-verificeret) — fordi Cast-discovery via
+      # mDNS er brudt af HA-hostens to default-routes. Genoprettet samme dag via
+      # known_hosts=192.0.2.97. Den er stadig kun et SUPPLEMENT: afspilning
+      # uden Cast (HDMI/indbyggede apps) giver ikke 'playing'. Ro-detektionen
+      # (faelles_areal_aktiv off i quiet_min) er fortsat det reelle værn.
+      - condition: template
+        value_template: >-
+          {{ states('media_player.projector') != 'playing' }}
+      # Backstop-triggeren har ingen for:-soak → kræv 30 min målt ro (history-
+      # stats) + at mindst én af vejene er "tændt" (accum opfyldt eller vej B slået til).
+      - condition: template
+        value_template: >-
+          {% if trigger.id != 'backstop' %}
+            true
+          {% else %}
+            {% set quiet30 = (states('sensor.faelles_aktivitet_30min') | float(1)) == 0 %}
+            {% set accum_ok = (states('sensor.sove_presence_60min') | float(0)) * 60
+               >= (states('input_number.airbnb_natmode_sove_accum_min') | float(10)) %}
+            {% set vej_b = (states('input_number.airbnb_natmode_quiet_alene_min') | int(0)) > 0 %}
+            {{ quiet30 and (accum_ok or vej_b) }}
+          {% endif %}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id:
+            - input_boolean.godnat_voksne_active
+            - input_boolean.godnat_active
+      # Sluk glemte lys — MEN aldrig sove-loftet (læsning i seng ≠ søvn for
+      # radaren) og aldrig bad-spots (wasp kan holde en stille person bag
+      # lukket dør mens inde_occupancy er off). Boern/depot er blokeret/egen-
+      # styret i forvejen; et ekstra off er harmløst.
+      - variables:
+          natmode_off_lights: >-
+            {% set skip = ['light.spisestue_pendel',
+                           'light.badevaerelse_spot_1', 'light.badevaerelse_spot_2',
+                           'light.badevaerelse_spot_3', 'light.badevaerelse_spot_4',
+                           'light.badevaerelse_spot_5'] %}
+            {{ expand('light.alle_indvendige')
+               | selectattr('state', 'eq', 'on')
+               | rejectattr('entity_id', 'in', skip)
+               | map(attribute='entity_id') | list }}
+      - if:
+          - condition: template
+            value_template: "{{ natmode_off_lights | count > 0 }}"
+        then:
+          - service: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: "{{ natmode_off_lights }}"
+            data:
+              transition: 10
+      - service: logbook.log
+        data:
+          name: "AirBnB nat-mode"
+          message: >-
+            Auto-godnat sat ({{ trigger.id | default('?') }}; sove-accum
+            {{ ((states('sensor.sove_presence_60min') | float(0)) * 60) | round(0) }}
+            min/60min). Slukkede: {{ natmode_off_lights | join(', ') if natmode_off_lights else 'intet' }}.
+
+  # ---------------------------------------------------------------------------
+  # HOVEDDØR-CLEAR: godnat viger for nogen der låser sig ind/ud
+  # ---------------------------------------------------------------------------
+  # En sovende gæst åbner aldrig hoveddøren → dette rammer kun ægte aktivitet:
+  # gæster der kommer hjem sent (auto-natmode fyrede mens de var ude) eller går
+  # tidligt. Flags-only — presence-lys/welcome overtager selv. Går de til ro
+  # igen, re-armerer auto-natmode via akkumulering.
+  - id: airbnb_natmode_clear_hoveddoer
+    alias: "AirBnB nat-mode: clear godnat ved hoveddør-åbning"
+    description: >
+      Hoveddøren åbnes mens godnat er aktiv i AirBnB → ryd godnat-flags så
+      hjemvendende gæster får normalt presence-lys (ikke godnat-gated mørke).
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_hoveddoer
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "AirBnB"
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: !include ../rosters/godnat_flag.yaml
+      - service: input_datetime.set_datetime
+        target:
+          entity_id:
+            - input_datetime.sove_winddown_at
+            - input_datetime.godnat_force_at
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: logbook.log
+        data:
+          name: "AirBnB nat-mode"
+          message: "Godnat ryddet — hoveddør åbnet (gæst kommer/går)."
+
+  # ---------------------------------------------------------------------------
+  # 12:00-BACKSTOP-CLEAR: gæster der sover længe må ikke få godnat-låst dag
+  # ---------------------------------------------------------------------------
+  # Aktivitets-clearene (godmorgen_godnat.yaml) er gated before 12:00. En gæst
+  # der først står op 13:00 ville ellers have godnat-gated (= dødt) presence-lys
+  # resten af dagen. Flags-only; lys kommer via presence + lux som normalt.
+  - id: airbnb_godnat_middag_backstop_clear
+    alias: "AirBnB nat-mode: godnat backstop-clear kl 12:00"
+    description: >
+      Godnat stadig aktiv kl 12 i AirBnB → ryd flags (aktivitets-clearene er
+      gated før 12). HA-start-trigger fanger restart i vinduet 12-18.
+    mode: single
+    trigger:
+      - platform: time
+        at: "12:00:00"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "AirBnB"
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "on"
+      # HA-start må kun clearet i 12-18 (ellers ville en aften-restart rydde en
+      # legitim nat-godnat).
+      - condition: template
+        value_template: >-
+          {{ trigger.platform != 'homeassistant' or (12 <= now().hour < 18) }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: !include ../rosters/godnat_flag.yaml
+      - service: input_datetime.set_datetime
+        target:
+          entity_id:
+            - input_datetime.sove_winddown_at
+            - input_datetime.godnat_force_at
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: logbook.log
+        data:
+          name: "AirBnB nat-mode"
+          message: "Godnat ryddet — 12:00-backstop (gæst sover længe / stale flag)."
+
+  # ---------------------------------------------------------------------------
+  # EFTERMIDDAGS-LUR: bevægelse i open-plan slipper godnat igen (2026-09-04)
+  # ---------------------------------------------------------------------------
+  # User-spec: "kan de tage en lur ved at trykke på godnat knappen i løbet af
+  # dagen?" — de KAN (i AirBnB falder både kort og langt tryk igennem til fuld
+  # godnat, uden morgen-snooze- og putte-grenene, som begge er familie-only).
+  # Men der var ingen vej UD igen: de tre aktivitets-clear i godmorgen_godnat
+  # er alle gated `before: 12:00`, og 12:00-backstoppen ovenfor er passeret.
+  # Tilbage stod KUN hoveddør-clearet — så en gæst der lurede kl. 14 og vågnede
+  # kl. 16 havde godnat-gated (= dødt) presence-lys resten af dagen, med mindre
+  # han tilfældigvis gik ud af hoveddøren. Præcis den fælde CLAUDE.md's
+  # AirBnB-regel 2 forbyder: en gæst skal kunne slippe ud af en tilstand uden
+  # at kende systemet.
+  #
+  # HVORFOR moving_target og ikke occupancy: samme begrundelse som Sleep Over-
+  # udgangen (packages/sleepover.yaml) — occupancy latcher og kan stå on fra
+  # før luren, mens et MOVING-target kræver en krop der faktisk bevæger sig.
+  # 3 s luger radarens sub-sekund-blink væk (jf. 2026-09-04b).
+  #
+  # HVORFOR kun 12:00 → natmode-start: mellem de to klokkeslæt kan godnat i
+  # praksis kun være sat af et bevidst tryk (backstoppen har lige ryddet, og
+  # auto-natmode fyrer først i nat-vinduet). Om NATTEN ville samme regel være
+  # skadelig — en gæst der henter et glas vand kl. 03 ville få hele huset ud af
+  # nat-regimet og presence-lys i dagsstyrke. Derfor er vinduet bundet til
+  # `airbnb_natmode_start_hour`, ikke til et hardcodet 22.
+  - id: airbnb_godnat_clear_dag_bevaegelse
+    alias: "AirBnB nat-mode: dag-bevægelse i open-plan slipper godnat (lur)"
+    description: >
+      Ægte bevægelse i spisestue/køkken mens godnat er aktivt i AirBnB midt på
+      dagen → ryd godnat-flags, så gæsten der har taget en lur får normalt
+      presence-lys igen uden at skulle ud af hoveddøren.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.spisestue_apollo_radar_moving_target
+          - binary_sensor.koekken_apollo_radar_moving_target
+        from: "off"
+        to: "on"
+        for:
+          seconds: 3
+    condition:
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "AirBnB"
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "on"
+      # Dag-vinduet: fra 12:00 og frem til nat-regimet selv starter.
+      - condition: template
+        value_template: >-
+          {% set start_h = states('input_number.airbnb_natmode_start_hour') | int(22) %}
+          {{ 12 <= now().hour < start_h }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: !include ../rosters/godnat_flag.yaml
+      - service: input_datetime.set_datetime
+        target:
+          entity_id:
+            - input_datetime.sove_winddown_at
+            - input_datetime.godnat_force_at
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: logbook.log
+        data:
+          name: "AirBnB nat-mode"
+          message: "Godnat ryddet — bevægelse i open-plan midt på dagen (gæst oppe efter lur)."

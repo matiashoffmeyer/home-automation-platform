@@ -1,0 +1,442 @@
+# =============================================================================
+# Soveværelse SNOOZE ("sov videre") — 2026-07-29 user-spec
+# =============================================================================
+# HISTORIK: filen var oprindeligt (2026-07-04) et FAST morgenvindue [start, slut]
+# hvor soveværelset blev holdt mørkt fordi en partner måske sov videre. Den model
+# er DØD (2026-07-29, user-spec) af to grunde:
+#   1. Den krævede at vide OM der lå en partner → begge-hjemme-tjek → afhængig af
+#      Parent B's GPS. User: "vi skal ikke bygge noget der er afhængigt af Parent B's
+#      GPS." (Og uden hjemme-krav spærrede vinduet i praksis kun for husets ejer:
+#      07-29 dræbte det hans egen alarm-vækning mens Parent B havde været væk 5 døgn.)
+#   2. Et fast vindue gætter. User: "hvis en alarm er sat vækkes vi, sådan er det."
+#
+# NY MODEL — SNOOZE PÅ KNAP (eksplicit intent, ingen gætteri, ingen GPS):
+#   • Alarmen vækker ALTID (ingen tids-/GPS-gate foran vækningen).
+#   • Vil man sove videre: tryk GODNAT-knappen (kort ned) på soveværelsets Somrig.
+#     → soveværelset mørklægges HELT (lys slukkes, gardin lukkes, room_mode=Off)
+#     → vækning + auto-tænd + auto-gardin-op er suppress'et i `sove_snooze_timer`
+#       timer (default 4).
+#   • Snoozen ophæves før tid af GODMORGEN-knappen (kort ELLER lang op) derinde.
+#
+# ÉN AUTORITET (uændret entity, ~12 konsumenter): binary_sensor.sovevaerelse_
+# morgen_beskyttelse_aktiv = kill-switch on OG nu < snooze-udløb. Alle konsumenter
+# (presence-on, gang-early-detect, alarm-vækning, gardin-åbnere, den reaktive
+# suppressor) læser DEN — reglen bor ét sted (fejlklasse #2). Entity-navnet er
+# BEVIDST ikke ændret: det ville kræve 12 samtidige edits uden funktionel gevinst.
+# Læs det som "soveværelset skal holdes mørkt nu", ikke som "morgenvindue".
+#
+# TO LAG (belt + suspenders, som bedroom_night_guard):
+#   1. PRÆVENTIVT: de kendte auto-tænd-kilder (presence-on, gang-early-detect,
+#      alarm-vækning) gates på sensoren → INGEN flash i normaltilfældet.
+#   2. REAKTIVT: catch-all suppressor snapper ethvert AUTO-tændt sove-lys slukket
+#      igen (drift-back, fremtidige bugs) — undtaget ægte manuel (app =
+#      context.user_id, eller nyligt knap-tryk <8s via bedroom_styrbar_intent_at,
+#      samme stempel som nat-låsen — dækker sove-Styrbar OG sove-Somrig).
+#
+# GARDIN: alle AUTO-oprulninger går gennem script.sove_gardin_op
+# (packages/sove_gardin_bad_gate.yaml) som selv afbryder mens snoozen kører →
+# gardin-delen er dækket ét sted. Manuelle knap-tryk vinder altid.
+#
+# HVORFOR IKKE dark_mode? User foreslog "brug evt dark mode". Dark mode er
+# hus-/rum-scopet med egen presence-logik, sticky sessions og 03:00-cutover —
+# at hænge en 4-timers sove-snooze på den ville koble to uafhængige tilstands-
+# maskiner sammen. Snoozen gør i stedet præcis det samme for ÉT rum: lys af,
+# gardin ned, room_mode=Off, auto-tænd suppress'et.
+# =============================================================================
+
+input_boolean:
+  sovevaerelse_morgen_beskyttelse_enabled:
+    name: "Sove: snooze-knap aktiveret"
+    icon: mdi:sleep
+
+input_number:
+  sove_snooze_timer:
+    name: "Sove: snooze-varighed (timer)"
+    icon: mdi:timer-sand
+    min: 0.5
+    max: 12
+    step: 0.5
+    unit_of_measurement: "t"
+    mode: slider
+
+  # KORT snooze — de tre soveværelses-knappers NED-tryk (se automationen
+  # sove_snooze_knap_ned nederst). Bevidst en anden slider end den ovenfor:
+  # godnat-knappen betyder "jeg står ikke op i dag" (timer), et ned-tryk på
+  # lys-/gardin-/dark-mode-knappen betyder "fem minutter mere" (minutter).
+  sove_snooze_knap_minutter:
+    name: "Sove: kort snooze ved knap-ned (minutter)"
+    icon: mdi:alarm-snooze
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+input_datetime:
+  sove_snooze_until:
+    name: "Sove: snooze til (runtime)"
+    icon: mdi:timer-lock
+    has_date: true
+    has_time: true
+
+template:
+  - binary_sensor:
+      # ÉN autoritet for "hold soveværelset mørkt nu". Templates med now() re-
+      # renderes hvert minut i HA → sensoren falder af inden for et minut efter
+      # udløb (minut-granularitet er rigeligt til en 4-timers snooze).
+      # NB: læs stemplet via attributten 'timestamp' — as_timestamp(states(...))
+      # på en input_datetime parser den naive streng som UTC (fejlklasse #B67).
+      - name: "Soveværelse morgen-beskyttelse aktiv"
+        unique_id: sovevaerelse_morgen_beskyttelse_aktiv
+        icon: mdi:sleep
+        state: >-
+          {% set en = is_state('input_boolean.sovevaerelse_morgen_beskyttelse_enabled','on') %}
+          {% set until = state_attr('input_datetime.sove_snooze_until','timestamp') | float(0) %}
+          {{ en and until > 0 and as_timestamp(now()) < until }}
+        attributes:
+          minutter_tilbage: >-
+            {% set until = state_attr('input_datetime.sove_snooze_until','timestamp') | float(0) %}
+            {% set rest = until - as_timestamp(now()) %}
+            {{ (rest / 60) | round(0) | int if rest > 0 else 0 }}
+
+script:
+  # ---------------------------------------------------------------------------
+  # SNOOZE START — kaldes af godnat-knappen i soveværelset i morgenvinduet.
+  # Mørklægger rummet HELT og sætter udløbs-stemplet.
+  # ---------------------------------------------------------------------------
+  sove_snooze_start:
+    alias: "Sove: start snooze (sov videre)"
+    icon: mdi:sleep
+    mode: single
+    sequence:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.sove_snooze_until
+        data:
+          datetime: >-
+            {{ (now() + timedelta(minutes=((states('input_number.sove_snooze_timer')
+                | float(4)) * 60) | round(0) | int)).strftime('%Y-%m-%d %H:%M:%S') }}
+      # Rummet skal være MØRKT — også hvis vækningen lige har lavet lys.
+      # Samme roster som suppressoren nedenfor håndhæver (ét roster, #16).
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: !include ../rosters/sove_lys.yaml
+        data:
+          transition: 2
+      # Gardinet ned + manuel-ned-stempel. Stemplet er en EKSTRA sikring oven på
+      # snoozen: gardin_manual_grace (default 120 min) holder gardinet nede selv
+      # hvis snoozen skulle blive ryddet utilsigtet. Grace er kortere end den
+      # typiske snooze (4 t), så når snoozen er slut, er gardinet frit igen —
+      # men morgen-backstoppen kræver stadig at rummet er TOMT før den ruller op,
+      # så en der stadig sover bliver ikke afsløret.
+      - service: cover.close_cover
+        continue_on_error: true
+        target:
+          entity_id: cover.gardin_sovevaerelse
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.gardin_manual_down_sove
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      # Presence må ikke re-tænde (drift_back sætter selv Auto igen når rummet
+      # har været tomt ~20 min, dvs. efter I er stået op).
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.room_mode_sovevaerelse
+        data:
+          option: "Off"
+      # 2026-08-25 (user-spec): trykket SPRINGER dagens vækning OVER — det er
+      # ikke bare en udskydelse. Snoozen ovenfor mørklægger rummet her og nu;
+      # stemplet her slår selve alarm-kæden fra resten af dagen, så alle tre
+      # kanaler (Parent A's telefon, Parent B's genvej, reserve-alarmen) tier.
+      # HVORFOR BEGGE DELE: snoozen alene efterlod vækningen i kø — den fyrede
+      # på sin egen udløbs-flanke fire timer senere (fejlklasse #19, se
+      # binary_sensor.wakeup_skip_i_dag). Stemplet alene ville derimod lade
+      # rampen tænde lyset hvis den allerede var i gang.
+      # Ryddes af godmorgen-knappen (sove_snooze_clear) eller ved midnat.
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.wakeup_skip_dato
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: logbook.log
+        data:
+          name: "Sove snooze"
+          message: >-
+            Godnat-knap i morgenvinduet → sov videre i
+            {{ states('input_number.sove_snooze_timer') | float(4) }} t
+            (til {{ states('input_datetime.sove_snooze_until')[11:16] }}).
+            Lys slukket, gardin ned, og DAGENS vækning er sprunget over
+            (alle tre alarm-kanaler) — ikke kun udskudt.
+          entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+
+  # ---------------------------------------------------------------------------
+  # KORT SNOOZE — kaldes af de tre soveværelses-knappers NED-tryk i vække-
+  # vinduet (2026-08-19 user-spec). Deler `sove_snooze_until` og dermed den ENE
+  # autoritet med den lange snooze (#2), men rører BEVIDST hverken gardin eller
+  # room_mode: et ned-tryk på lys-knappen skal ikke starte en gardinmotor —
+  # motorlarmen er selv en vækning. Lyset slukkes, og suppressoren nedenfor
+  # holder det slukket resten af vinduet = ingen blink.
+  # ---------------------------------------------------------------------------
+  sove_snooze_kort:
+    alias: "Sove: kort snooze (knap ned i vække-vinduet)"
+    icon: mdi:alarm-snooze
+    mode: single
+    fields:
+      kilde:
+        description: "Hvilken knap der udløste snoozen (kun til logbogen)"
+        example: "styrbar sove-lys"
+    sequence:
+      - variables:
+          minutter: >-
+            {{ states('input_number.sove_snooze_knap_minutter') | float(30) | round(0) | int }}
+          until_ny: "{{ (as_timestamp(now()) + minutter * 60) | int }}"
+          until_nu: >-
+            {{ state_attr('input_datetime.sove_snooze_until', 'timestamp') | float(0) }}
+      # Forkort ALDRIG en igangværende snooze: har godnat-knappen sat 4 timer,
+      # skal et ned-tryk på lyset ikke skrue den ned til 30 min.
+      - condition: template
+        value_template: "{{ until_ny > until_nu }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.sove_snooze_until
+        data:
+          timestamp: "{{ until_ny }}"
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: !include ../rosters/sove_lys.yaml
+        data:
+          transition: 2
+      - service: logbook.log
+        data:
+          name: "Sove snooze"
+          message: >-
+            Ned-tryk ({{ kilde | default('ukendt knap', true) }}) i vække-vinduet
+            → {{ minutter }} min snooze (til
+            {{ until_ny | timestamp_custom('%H:%M', true) }}). Vækningen dør,
+            lyset holdes slukket. Telefon-alarmen ringer stadig.
+          entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+
+  # ---------------------------------------------------------------------------
+  # SNOOZE CLEAR — kaldes af godmorgen-knapperne (kort + lang op) i soveværelset.
+  # Rører hverken lys eller gardin: de kaldende automations gør det selv.
+  # ---------------------------------------------------------------------------
+  sove_snooze_clear:
+    alias: "Sove: afbryd snooze"
+    icon: mdi:alarm-off
+    mode: single
+    sequence:
+      # 2026-08-25 (user-spec): godmorgen-knappen er FORTRYD for begge dele af
+      # godnat-trykket — både snoozen og "spring dagens vækning over".
+      # Ryddningen ligger FØR snooze-conditionen nedenfor med vilje: trykker man
+      # godmorgen efter at snoozen selv er udløbet, er beskyttelsen allerede
+      # off, og conditionen ville afbryde scriptet med skippet stadig sat
+      # (fejlklasse #21 — den u-gatede vej er den eneste der tæller).
+      - if:
+          - condition: state
+            entity_id: binary_sensor.wakeup_skip_i_dag
+            state: "on"
+        then:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.wakeup_skip_dato
+            data:
+              datetime: "1970-01-01 00:00:00"
+          - service: logbook.log
+            data:
+              name: "Vækning"
+              message: >-
+                Godmorgen-knap → dagens vækning er ikke længere sprunget over.
+              entity_id: binary_sensor.wakeup_skip_i_dag
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+        state: "on"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.sove_snooze_until
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: logbook.log
+        data:
+          name: "Sove snooze"
+          message: "Godmorgen-knap → snooze afbrudt, soveværelset er frigivet."
+          entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+
+automation:
+  # ---------------------------------------------------------------------------
+  # NED-TRYK I VÆKKE-VINDUET = SNOOZE (2026-08-19 user-spec)
+  # ---------------------------------------------------------------------------
+  # Baggrund: 08-19 05:56-06:00 blinkede sove-loftet. Rampens Phase 1 tændte,
+  # user trykkede NED på sove-Styrbaren (= lyset slukket), og Phase 2 + Phase 3
+  # tændte det bare igen 90 og 210 sek senere. Et ned-tryk midt i en vækning er
+  # ikke "dæmp lyset", det er "ikke endnu" — og den intention skal rampen
+  # respektere, ikke overskrive.
+  #
+  # Denne automation ligger SIDE OM SIDE med knappernes egen logik (Styrbar-
+  # dæmpning, gardin ned, dark mode off). Den overtager ingenting; den tilføjer
+  # kun snoozen. Derfor ét sted for reglen i stedet for tre kopier i tre filer
+  # (#2), og knappernes eksisterende automations er urørte.
+  #
+  # TIDS-FENCE 03:00-11:00: `godnat_active` er ON hele aftenen, så uden fencen
+  # ville et helt normalt "sluk lyset kl. 23" arme en snooze der spærrer
+  # presence-lyset i soveværelset resten af aftenen.
+  - id: sove_snooze_knap_ned
+    alias: "Sove: ned-tryk i vække-vinduet = snooze"
+    description: >
+      NED-tryk (klik eller hold) på sove-Styrbaren, sove-gardinets RODRET eller
+      Dark Mode-RODRET'en snoozer vækningen i input_number.
+      sove_snooze_knap_minutter — så rampen ikke tænder lyset igen bagefter.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      # Sove-Styrbar (lys): 'off' = kort ned, 'move' = hold ned
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+          command: "off"
+        variables: {kilde: "styrbar sove-lys (kort ned)"}
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+          command: "move"
+        variables: {kilde: "styrbar sove-lys (hold ned)"}
+      # Sove-gardinets RODRET
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "39:ed:51:54:13:58:b3:9d"
+          command: "off"
+        variables: {kilde: "gardin sove (kort ned)"}
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "39:ed:51:54:13:58:b3:9d"
+          command: "move"
+        variables: {kilde: "gardin sove (hold ned)"}
+      # Dark Mode-RODRET
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "7a:bf:91:6b:5f:7e:38:f0"
+          command: "off"
+        variables: {kilde: "dark mode (kort ned)"}
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "7a:bf:91:6b:5f:7e:38:f0"
+          command: "move"
+        variables: {kilde: "dark mode (hold ned)"}
+    condition:
+      - condition: state
+        entity_id: input_boolean.sovevaerelse_morgen_beskyttelse_enabled
+        state: "on"
+      # Kun familie-mode — en gæst skal aldrig kunne arme familiens snooze.
+      # 2026-08-20: rettet fra `state: "Normal"`, som også udelukkede
+      # Home Vacation — dér ER familien hjemme (bare uden hverdags-rutiner) og
+      # sover typisk længe, altså præcis når et ned-tryk betyder "fem minutter
+      # mere". Kun AirBnB skal spærres. Se AirBnB-regel 1 i CLAUDE.md.
+      - condition: template
+        value_template: >-
+          {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+      - condition: time
+        after: "03:00:00"
+        before: "11:00:00"
+      # En vækning er enten i gang (godnat står stadig på) eller nært
+      # forestående. Udenfor det er et ned-tryk bare et ned-tryk.
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.godnat_active', 'on')
+             or is_state('binary_sensor.wakeup_alarm_imminent', 'on') }}
+    action:
+      - service: script.sove_snooze_kort
+        data:
+          kilde: "{{ kilde }}"
+
+  # REAKTIV catch-all: snap ethvert auto-tændt sove-lys slukket igen mens
+  # snoozen kører. Spejler bedroom_night_guard's manuel-undtagelse
+  # (context.user_id + race-frit Styrbar-stempel) 1:1 — men gated på snoozen
+  # i st.f. godnat, så den dækker tiden EFTER vækningen.
+  - id: sovevaerelse_morgen_beskyttelse_suppressor
+    alias: "Sikkerhed: Soveværelse snooze — hold lys slukket"
+    description: >
+      Mens sove-snoozen kører snappes ethvert AUTO-tændt sove-lys slukket igen,
+      så man kan sove videre efter vækningen. Ægte manuelle handlinger (app =
+      context.user_id / nyligt knap-tryk <8s — sove-Styrbar ELLER sove-Somrig via
+      bedroom_styrbar_intent_at) undtaget. Catch-all bag de præventive gates på
+      presence/early-detect/vækning.
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id: !include ../rosters/sove_lys.yaml
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+        state: "on"
+      # 2026-07-08 (AirBnB-review): KUN familie-mode. Snoozen er familie-
+      # specifik — i AirBnB har gæstens FYSISKE vægkontakt-tænd tom context
+      # (user_id none = ligner auto) → suppressoren ville dræbe gæstens lys.
+      # (Snoozen kan i praksis ikke armeres i AirBnB, men gaten står som
+      # backstop hvis flaget skulle overleve et mode-skift.)
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # IKKE app/dashboard-manuel: de har context.user_id (Styrbar/automation =
+      # none). Race-frit (kendt på trigger-tidspunktet).
+      - condition: template
+        value_template: "{{ trigger.to_state.context.user_id is none }}"
+    action:
+      # Race-fri Styrbar-nød-tilladelse: vent 0,5 s så bedroom_styrbar_emergency_
+      # intent har nået at stemple, læs så stemplet (<8 s = ægte tryk → ABORT).
+      - delay:
+          milliseconds: 500
+      - condition: template
+        value_template: >-
+          {% set ia = states('input_datetime.bedroom_styrbar_intent_at') %}
+          {% set ia_e = (state_attr('input_datetime.bedroom_styrbar_intent_at', 'timestamp') | float(0)) if ia not in ['unknown','unavailable','',none] else 0 %}
+          {{ (as_timestamp(now()) - ia_e) >= 8 }}
+      # Re-tjek: stadig aktiv + lyset stadig tændt (kan være ændret i de 0,5 s).
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+        state: "on"
+      - condition: template
+        value_template: "{{ is_state(trigger.entity_id, 'on') }}"
+      - service: logbook.log
+        data:
+          name: "Sove snooze"
+          message: >-
+            {{ trigger.entity_id }} auto-tændte under snoozen → slukket igen.
+          entity_id: "{{ trigger.entity_id }}"
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: "{{ trigger.entity_id }}"
+        data:
+          transition: 1
+
+  # Synligt spor når snoozen løber ud af sig selv (ellers er der intet i
+  # logbogen der forklarer hvorfor rummet pludselig opfører sig normalt igen).
+  - id: sove_snooze_udloeb_log
+    alias: "Sove: snooze udløbet (log)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+        from: "on"
+        to: "off"
+    action:
+      - service: logbook.log
+        data:
+          name: "Sove snooze"
+          message: >-
+            Snooze slut → soveværelset følger normal automatik igen. Gardinet
+            ruller først op når rummet har været tomt længe nok (morgen-backstop)
+            og badet er fri.
+          entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv

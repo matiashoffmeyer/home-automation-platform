@@ -1,0 +1,1136 @@
+# =============================================================================
+# Måltids-detektion (user-spec 2026-07-04)
+# =============================================================================
+# User: "vi spiste et måltid. Sustained bevægelse i køkken, så spisestue, så
+# køkken igen (oprydning). Brug mønstret til en ny måltids-detektion. Efter
+# måltider, hvis børn er hjemme, kør en støvsugning med max power i rummet
+# 'Living room'. Sliders til fin-tuning + et specifikt spiselys i loftet med
+# hyggelig farve+styrke (afhængigt af lux i open plan)."
+#
+# MØNSTRET = en 3-fase state machine (input_select.maaltid_fase):
+#   Ingen → Madlavning → Spisning → (Oprydning = måltid registreret) → Ingen
+#     1) Madlavning : VEDVARENDE bevægelse i køkkenets centrale zone
+#        (binary_sensor.koekken_apollo_central_zone, 0-250 cm — samme kilde som
+#        cooking-detektionen) i >= maaltid_madlavning_minutter.
+#     2) Spisning   : VEDVARENDE tilstedeværelse ved spisebordet
+#        (binary_sensor.spisestue_apollo_occupancy_filtered — inkl. still-target,
+#        så en SIDDENDE spisende person tælles) i >= maaltid_spisning_minutter.
+#        → tænder SPISELYSET (spisestue-loft, varm hvid, lux-skaleret styrke).
+#     3) Oprydning  : VEDVARENDE bevægelse i køkkenet IGEN (man rydder af) i
+#        >= maaltid_oprydning_minutter → MÅLTID REGISTRERET → hvis børn hjemme:
+#        støvsug 'Living room' (segment 16) med max power. Resetter til Ingen.
+#        VETO (2026-08-26): registreringen kræver ogSÅ at spisestuen har
+#        > maaltid_registrer_min_spisestue_min ophold i sit vindue PÅ
+#        registrerings-tidspunktet — se nedenfor.
+#
+# SPISESTUE-VETOET (2026-08-26, user-spec: "25/08 omkring kl. 18:35: måltid
+# gættet uden spisestue aktivitet.... bug?"). Fase 3 havde INGEN spisestue-
+# betingelse: når fasen først var latchet til Spisning, kunne enhver senere
+# køkken-bevægelse registrere et måltid, uanset hvor længe bordet havde stået
+# tomt. 25/08 gik fasen til Spisning 17:42:59 (30-min-vinduet nåede tilbage til
+# 17:12:59 og talte 14,4 min ophold — hvoraf 11,2 lå FØR madlavnings-fasen
+# overhovedet begyndte 17:27:32), og registrerede så måltidet 18:40:58 på ren
+# køkken-bevægelse. I de 44 min inden da havde spisestuen NUL ægte udslag: de
+# tre der var (18:07:48, 18:13:28, 18:37:22) varede alle 5 s = præcis
+# radar_timeout = maskin-blip. Akkumulatoren stod på 0,0 min. Fejlklasse #20 i
+# begge ender: vinduet måler sit eget vindue, ikke fasen.
+#
+# "sustained" = AKKUMULERET on-tid i et bevægeligt vindue (IKKE kontinuerlig on).
+# Rod: køkken-radaren (koekken_apollo_central_zone) blinker med median ~4 s on +
+# hyppige 1-2 s off-flicker under aktivitet → et "kontinuerlig on i N min"-krav
+# (for:) nulstilles konstant og udløses stort set aldrig (målt: kun 1 uafbrudt
+# 4-min-segment på 30 t). Men AKKUMULERET er vinduet ~fuldt under ægte aktivitet
+# (15 min on-tid i et 15-min vindue ved madlavning; <1 min ved gennemgang) → ren
+# adskillelse. Derfor: history_stats-målere tæller on-minutter i det seneste
+# vindue; en numeric_state-trigger fyrer når on-minutterne >= fasens krav-slider.
+# Hver fase har TO sliders: KRAV (on-minutter der skal nås) + VINDUE (hvor langt
+# tilbage der måles). User styrer begge. Sæt vinduet større end kravet.
+#
+# TIMEOUT: hænger sekvensen i Madlavning/Spisning > maaltid_reset_minutter uden
+# at komme videre → reset til Ingen (fejlklasse #4: re-arm/backstop).
+#
+# SPISELYS-LIVSCYKLUS (user-valg AskUserQuestion): tænd v. Spisning (KUN når
+# spisestue-lux < input_number.spisestue_lux_threshold — spisestuens EGEN lux,
+# fælles tærskel m. presence_stue, 2026-07-27), sluk når
+# HELE open-plan-området er tomt (køkken+spisestue+stue Apollo off i N min).
+# Mens spiselyset er aktivt gates presence_light_spisestue_off (i presence_stue.
+# yaml) så den 20-min room-tomme-sluk ikke dræber hyggelyset før området er tomt.
+#
+# HJEMMEARBEJDSDAG (omskrevet 2026-07-29 efter træner-facit): flaget
+# maaltid_hjemmearbejde_dag sættes nu af en SELVSTÆNDIG måling af spisestue-
+# ophold (hjemmearbejde_dag_detekter nedenfor) — ikke længere som biprodukt af
+# en gennemført måltidssekvens. Rod: den gamle vej krævede en køkkenfase først,
+# så en dag hvor user sad ved bordet uden at lave mad blev ALDRIG markeret
+# (07-29: 150 min spisestue-ophold, flag off), mens en almindelig torsdag med
+# 29 min blev fejl-markeret (07-23, user svarede "forkert" i træneren).
+# Måltidssekvensen erklærer nu bare måltidet færdigt; støvsuge-spærringen
+# kommer fra flaget.
+#
+# STØVSUGNING (user-valg): STRAKS ved oprydning. KUN 'Living room' (segment 16 —
+# robotten har også en 'Living room1', bevidst udeladt). Max power = max_plus.
+# ⚠️ 2026-08-13: kortet er re-segmenteret — 'Living room1' er nu segment 23
+# (17 er 'Bedroom1' = børneværelset). Segment 16 er spisestuen, hvilket er
+# præcis det rigtige rum at støvsuge efter et måltid. Data-udledt segment→rum-
+# tabel: packages/roborock_rum_scripts.yaml.
+# Rører IKKE roborock-session-tracking (roborock.yaml) → den daglige Dormant-
+# clean påvirkes ikke. Gated: børn hjemme + robot docket/idle + (valgfri) el-pris
+# + IKKE på "rod på gulvet"-pause (input_boolean.roborock_auto_paused off —
+# Styrbar NED mens robotten står stille; samme pause som den daglige auto-clean,
+# se roborock.yaml, 2026-07-26).
+# =============================================================================
+
+input_boolean:
+  # Kill-switch for hele måltids-detektionen (default on).
+  maaltid_detektion_enabled:
+    name: "Måltids-detektion aktiv"
+    icon: mdi:silverware-fork-knife
+
+  # Runtime-flag: spiselyset er tændt af måltids-flowet (holdes til området tomt).
+  # Synkroniseres med light.spisestue_loft-state via maaltid_spiselys_flag_clear.
+  maaltid_spiselys_aktiv:
+    name: "Måltid: spiselys aktivt"
+    icon: mdi:ceiling-light
+
+  # Valgfri el-pris-gate for måltids-støvsugningen (default OFF = støvsug altid
+  # efter måltid, som user bad om). ON → spring støvsugning over når strømmen er
+  # over gns (genbruger binary_sensor.roborock_elpris_block fra roborock.yaml).
+  maaltid_stovsug_elpris_gate:
+    name: "Måltid: spring støvsug over ved høj elpris"
+    icon: mdi:cash-lock
+
+  # 2026-07-08 (#8, user-spec): "i dag er en hjemmearbejdsdag". Sættes ON når et
+  # dagtimer-måltids-mønster viser sig at være HJEMMEARBEJDE (fortsat spisestue-
+  # bevægelse efter "oprydning") i stedet for et rigtigt måltid. Blokerer AUTO-
+  # støvsugning i arbejdsdags-vinduet (06:30–17:00) resten af dagen (8d). Kun
+  # log/markør ellers ("gør ikke noget specielt endnu"). Nulstilles ved midnat.
+  maaltid_hjemmearbejde_dag:
+    name: "Måltid: hjemmearbejdsdag (bloker auto-støvsug 06:30–17:00)"
+    icon: mdi:laptop
+
+  # 2026-08-05 (user-spec item 9): "den forstyrrer mens vi går i køkkenet. Vent
+  # på at køkkenet har været konsistent tomt." Runtime-flag: måltidet ER
+  # registreret og alle støvsuge-gates passerede, men vi venter på et roligt
+  # køkken. maaltid_stovsug_naar_koekken_tomt afvikler eller opgiver.
+  maaltid_stovsug_venter:
+    name: "Måltid: venter på tomt køkken før støvsug"
+    icon: mdi:timer-sand
+
+input_select:
+  maaltid_fase:
+    name: "Måltid: fase"
+    icon: mdi:state-machine
+    options:
+      - Ingen
+      - Madlavning
+      - Spisning
+      - Oprydning
+
+input_datetime:
+  # Status-stempel: hvornår sidste måltid blev registreret (runtime, IKKE snapshot).
+  # Bruges også som cooldown så et travlt køkken ikke straks tæller som nyt måltid.
+  maaltid_sidst_registreret:
+    name: "Måltid: sidst registreret"
+    has_date: true
+    has_time: true
+
+  # 2026-08-05: hvornår ventetiden på et tomt køkken begyndte (runtime — bruges
+  # kun til max-cap'en, så en aften hvor køkkenet aldrig falder til ro ikke
+  # ender med en robot der starter ved sengetid).
+  maaltid_stovsug_vent_start:
+    name: "Måltid: ventetid på tomt køkken startet kl."
+    has_date: true
+    has_time: true
+
+input_number:
+  # ---- Fase-varigheder (sustained bevægelse pr. fase) ----------------------
+  maaltid_madlavning_minutter:
+    name: "Måltid: madlavnings-fase (min)"
+    icon: mdi:pot-steam
+    min: 0
+    max: 30
+    step: 0.5
+    mode: box
+    unit_of_measurement: "min"
+
+  maaltid_spisning_minutter:
+    name: "Måltid: spise-fase (min)"
+    icon: mdi:silverware-variant
+    min: 0
+    max: 60
+    step: 0.5
+    mode: box
+    unit_of_measurement: "min"
+
+  maaltid_oprydning_minutter:
+    name: "Måltid: oprydnings-fase (min)"
+    icon: mdi:broom
+    min: 0
+    max: 30
+    step: 0.5
+    mode: box
+    unit_of_measurement: "min"
+
+  # 2026-08-26 (user-spec: "25/08 omkring kl. 18:35: måltid gættet uden
+  # spisestue aktivitet.... bug?"). Fase 3 havde INGEN spisestue-betingelse —
+  # når fasen først var latchet til Spisning, kunne enhver senere køkken-
+  # bevægelse registrere et måltid, uanset at bordet havde stået tomt i timer.
+  # 25/08 stod spisestue-akkumulatoren på PRÆCIS 0,0 min ved registreringen
+  # (44 min uden ét eneste ægte udslag; de tre der var, varede 5 s = radar-
+  # timeout = maskin-blip). Træner-facit: brugeren svarede "forkert".
+  # Man rydder af MENS folk stadig er ved bordet — på de 14 bekræftet rigtige
+  # måltids-gæt lå spisning_min på 3,0-30,0 (median 27), på de 11 forkerte
+  # 0,0-30,0. Tærsklen kan derfor ikke skille dem alene, men NUL er
+  # kvalitativt anderledes: ingen har været ved bordet i en halv time.
+  maaltid_registrer_min_spisestue_min:
+    name: "Måltid: min. spisestue-ophold ved registrering (min)"
+    icon: mdi:seat-outline
+    min: 0
+    max: 30
+    step: 0.5
+    mode: box
+    unit_of_measurement: "min"
+
+  maaltid_reset_minutter:
+    name: "Måltid: timeout-reset (min)"
+    icon: mdi:timer-off-outline
+    min: 5
+    max: 180
+    step: 5
+    mode: box
+    unit_of_measurement: "min"
+
+  # ---- Vent på tomt køkken før støvsug (2026-08-05, user-spec item 9) -------
+  # Kalibreret mod 14 dages køkken-occupancy og de 17 faktiske måltids-
+  # registreringer i perioden: ved 5 min sammenhængende ro faldt ALLE 17 måltider
+  # på plads indenfor 83 min (median ~15). Ved 8 min havde to måltider haler på
+  # 229/231 min = robotten ville starte midt om aftenen. 5 er derfor midt i
+  # kløften mellem "ren gennemgang" (median off-run i aftentimerne er 0,5 min)
+  # og "familien er færdig i køkkenet".
+  maaltid_stovsug_koekken_tomt_minutter:
+    name: "Måltid: køkkenet skal være tomt (min) før støvsug"
+    icon: mdi:timer-sand
+    min: 0
+    max: 60
+    step: 1
+    mode: box
+    unit_of_measurement: "min"
+
+  # Loft på ventetiden: falder køkkenet aldrig til ro, opgiver vi hellere end at
+  # sende robotten ud ved sengetid. 90 dækker værste målte måltid (83 min).
+  maaltid_stovsug_vent_max_minutter:
+    name: "Måltid: opgiv støvsug efter (min) uden roligt køkken"
+    icon: mdi:timer-off-outline
+    min: 5
+    max: 300
+    step: 5
+    mode: box
+    unit_of_measurement: "min"
+
+  # ---- Fase-vinduer (hvor langt tilbage on-tiden akkumuleres) --------------
+  # Kravet ovenfor = on-minutter der skal nås INDENFOR dette vindue. Vinduet
+  # skal være >= kravet (fx krav 4 / vindue 15 = "4 min bevægelse i de sidste 15").
+  maaltid_madlavning_vindue_minutter:
+    name: "Måltid: madlavnings-vindue (min)"
+    icon: mdi:timer-cog-outline
+    min: 1
+    max: 60
+    step: 1
+    mode: box
+    unit_of_measurement: "min"
+
+  maaltid_spisning_vindue_minutter:
+    name: "Måltid: spise-vindue (min)"
+    icon: mdi:timer-cog-outline
+    min: 1
+    max: 90
+    step: 1
+    mode: box
+    unit_of_measurement: "min"
+
+  maaltid_oprydning_vindue_minutter:
+    name: "Måltid: oprydnings-vindue (min)"
+    icon: mdi:timer-cog-outline
+    min: 1
+    max: 60
+    step: 1
+    mode: box
+    unit_of_measurement: "min"
+
+  # ---- Spiselys (spisestue-loft, varm hvid) --------------------------------
+  maaltid_spiselys_kelvin:
+    name: "Måltid: spiselys kelvin"
+    icon: mdi:temperature-kelvin
+    min: 1798
+    max: 4000
+    step: 50
+    mode: box
+    unit_of_measurement: "K"
+
+  maaltid_spiselys_brightness:
+    name: "Måltid: spiselys styrke (ved mørke)"
+    icon: mdi:brightness-6
+    min: 0
+    max: 100
+    step: 1
+    mode: slider
+    unit_of_measurement: "%"
+
+  # 2026-07-27 (user-spec, konsolidering): den tidligere maaltid_spiselys_lux_
+  # reference er FJERNET og erstattet af den fælles input_number.spisestue_lux_
+  # threshold (packages/constants.yaml). Én direkte spisestue-lux-tærskel styrer
+  # nu BÅDE spisestue-loftets normale presence-tænd OG måltids-spiselyset — på
+  # spisestuens EGEN sensor, separat fra stue. Den tærskel bruges her som gate
+  # (spiselys tændes kun når spisestue-lux < tærskel) OG som skalerings-reference
+  # (mørkt → fuld styrke, ved tærsklen → 25% gulv).
+
+  maaltid_spiselys_tomt_minutter:
+    name: "Måltid: spiselys sluk når tomt (min)"
+    icon: mdi:timer-sand
+    min: 0
+    max: 60
+    step: 1
+    mode: box
+    unit_of_measurement: "min"
+
+  # ---- Hjemmearbejde-bekræftelse (#8, user-spec 2026-07-08) -----------------
+  # Efter "oprydning" i arbejdsdags-vinduet ventes dette vindue for at se OM der
+  # bliver ved med at være bevægelse i spisestuen (= nogen arbejder ved bordet =
+  # hjemmearbejde) i stedet for at erklære måltid færdig + støvsuge med det samme.
+  maaltid_hjemmearbejde_bekraeft_minutter:
+    name: "Måltid: hjemmearbejde-bekræftelses-vindue (min)"
+    icon: mdi:timer-cog
+    min: 5
+    max: 120
+    step: 5
+    mode: box
+    unit_of_measurement: "min"
+
+  # ---- Hjemmearbejdsdag-detektion (user-spec 2026-07-29) --------------------
+  # "hverdag og masser af aktivitet i spisestuen er hjemmearbejdsdag."
+  # Måler AKKUMULERET spisestue-ophold i et rullende vindue. Kalibreret mod 8
+  # dages historik (06:30–17:00, rullende 60-min vindue, max sammenhængende
+  # ophold pr. dag): hjemmearbejdsdag 07-29 = 60,0 min (mættet) mod 38,3 / 29,3 /
+  # 24,3 / 11,3 / 9,4 min på de øvrige hverdage → 45 min rammer midt i kløften.
+  # Weekender når også højt (54/60 min), men workday-sensoren holder dem ude.
+  hjemmearbejde_vindue_minutter:
+    name: "Hjemmearbejde: måle-vindue (min)"
+    icon: mdi:timer-outline
+    min: 30
+    max: 240
+    step: 5
+    mode: box
+    unit_of_measurement: "min"
+
+  hjemmearbejde_ophold_minutter:
+    name: "Hjemmearbejde: spisestue-ophold i vindue (min)"
+    icon: mdi:laptop
+    min: 15
+    max: 240
+    step: 5
+    mode: box
+    unit_of_measurement: "min"
+
+# =============================================================================
+# AKKUMULERINGS-MÅLERE: hvor mange minutter var kilden aktiv i det seneste
+# vindue? history_stats type:time giver TIMER → template-sensorerne omregner til
+# minutter (brugt af triggers + dashboard). Vinduet styres af slideren via en
+# templated start (now() - vindue). now() → history_stats re-render hvert minut.
+# =============================================================================
+sensor:
+  - platform: history_stats
+    name: "Maaltid madlavning aktiv vindue"
+    unique_id: maaltid_madlavning_aktiv_vindue
+    entity_id: binary_sensor.koekken_apollo_central_zone
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    start: >-
+      {{ now() - timedelta(minutes=states('input_number.maaltid_madlavning_vindue_minutter') | float(15)) }}
+
+  - platform: history_stats
+    name: "Maaltid spisning aktiv vindue"
+    unique_id: maaltid_spisning_aktiv_vindue
+    entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    start: >-
+      {{ now() - timedelta(minutes=states('input_number.maaltid_spisning_vindue_minutter') | float(20)) }}
+
+  - platform: history_stats
+    name: "Maaltid oprydning aktiv vindue"
+    unique_id: maaltid_oprydning_aktiv_vindue
+    entity_id: binary_sensor.koekken_apollo_central_zone
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    start: >-
+      {{ now() - timedelta(minutes=states('input_number.maaltid_oprydning_vindue_minutter') | float(12)) }}
+
+  # 2026-07-08 (#8, user 8b): akkumuleret SPISESTUE-ophold i bekræftelses-vinduet.
+  # Bruges af maaltid_hjemmearbejde_beslutning til at skelne "afsluttet måltid"
+  # (spisestue blev stille) fra "hjemmearbejde" (fortsat ophold ved bordet). Måler
+  # over hele vinduet — ikke et øjebliksbillede efter 30 min.
+  - platform: history_stats
+    name: "Maaltid spisestue bekraeft vindue"
+    unique_id: maaltid_spisestue_bekraeft_vindue
+    entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    start: >-
+      {{ now() - timedelta(minutes=states('input_number.maaltid_hjemmearbejde_bekraeft_minutter') | float(30)) }}
+
+  # 2026-07-29 (user-spec): akkumuleret spisestue-ophold i det RULLENDE
+  # hjemmearbejds-vindue. Selvstændig fra bekræftelses-vinduet ovenfor: den ene
+  # måler "sidder nogen stadig ved bordet efter et måltid", denne måler "har
+  # bordet været brugt som skrivebord i timevis".
+  - platform: history_stats
+    name: "Hjemmearbejde spisestue ophold vindue"
+    unique_id: hjemmearbejde_spisestue_ophold_vindue
+    entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    start: >-
+      {{ now() - timedelta(minutes=states('input_number.hjemmearbejde_vindue_minutter') | float(60)) }}
+
+template:
+  - sensor:
+      - name: "Maaltid madlavning min i vindue"
+        unique_id: maaltid_madlavning_min_i_vindue
+        unit_of_measurement: "min"
+        icon: mdi:pot-steam
+        state: >-
+          {{ (states('sensor.maaltid_madlavning_aktiv_vindue') | float(0) * 60) | round(1) }}
+      - name: "Maaltid spisning min i vindue"
+        unique_id: maaltid_spisning_min_i_vindue
+        unit_of_measurement: "min"
+        icon: mdi:silverware-variant
+        state: >-
+          {{ (states('sensor.maaltid_spisning_aktiv_vindue') | float(0) * 60) | round(1) }}
+      - name: "Maaltid oprydning min i vindue"
+        unique_id: maaltid_oprydning_min_i_vindue
+        unit_of_measurement: "min"
+        icon: mdi:broom
+        state: >-
+          {{ (states('sensor.maaltid_oprydning_aktiv_vindue') | float(0) * 60) | round(1) }}
+      - name: "Maaltid spisestue bekraeft min i vindue"
+        unique_id: maaltid_spisestue_bekraeft_min_i_vindue
+        unit_of_measurement: "min"
+        icon: mdi:seat-outline
+        state: >-
+          {{ (states('sensor.maaltid_spisestue_bekraeft_vindue') | float(0) * 60) | round(1) }}
+      - name: "Hjemmearbejde ophold min i vindue"
+        unique_id: hjemmearbejde_ophold_min_i_vindue
+        unit_of_measurement: "min"
+        icon: mdi:laptop
+        state: >-
+          {{ (states('sensor.hjemmearbejde_spisestue_ophold_vindue') | float(0) * 60) | round(1) }}
+
+script:
+  # Ren "støvsug Living room nu (max power)" — kan køres manuelt til test.
+  # Guards (børn/robot-idle/elpris) ligger i kalderen (maaltid_fase_3_oprydning).
+  maaltid_stovsug_living_room:
+    alias: "Måltid: støvsug Living room (max power)"
+    icon: mdi:robot-vacuum
+    sequence:
+      # 2026-09-04 (fejlklasse #21): AirBnB-gaten hører HER, i tragten. Begge
+      # kaldere (maaltid_fase_3_oprydning, maaltid_stovsug_naar_koekken_tomt)
+      # ender i dette script, men kun fase_3 havde en house_mode-condition —
+      # den vente-baserede vej havde ingen og var kun tilfældigt spærret af
+      # `kids_home == on`, som godt kan stå on under et gæste-ophold.
+      # Sikkerhedsnettet `airbnb_block_auto_clean` fanger den ikke: den kræver
+      # `parent_id is not none`, og robottens status kommer fra en sky-poll
+      # uden context (jf. dens egen kommentar) → den ville være en no-op.
+      # En robot der selv går i gang midt i gæsternes middag er præcis det
+      # AirBnB-reglen "kun manuel start for gæster" skal forhindre.
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - service: vacuum.set_fan_speed
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data: {fan_speed: max_plus}
+      # Altid-forsigtig (obstacle avoidance) før start, jf. roborock.yaml.
+      - service: script.roborock_apply_forsigtig
+      # 2026-07-28 (item 6): markér at DENNE rengøring er en delvis spot-clean.
+      # roborock_fremmed_clean_stamp ser en rengøring HA "ikke startede" og
+      # ville ellers stemple den som hel-hus-rengøring → udskyde husets
+      # auto-rengøring i flere dage for én støvsugning af spisepladsen.
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_segment_clean_at}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: vacuum.send_command
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data:
+          command: app_segment_clean
+          params:
+            - segments: [16]
+              repeat: 1
+      - service: logbook.log
+        data:
+          name: "Måltid"
+          message: "Living room støvsuges (max power) efter måltid."
+
+  # 2026-08-05 (user-spec item 9): "den forstyrrer mens vi går i køkkenet. Vent
+  # på at køkkenet har været konsistent tomt." Begge måltids-grene kalder denne
+  # i stedet for at støvsuge med det samme — ÉN skriver af vente-tilstanden
+  # (fejlklasse #1), så de to grene ikke kan divergere.
+  maaltid_stovsug_arm_vent:
+    alias: "Måltid: armér støvsug (vent på tomt køkken)"
+    icon: mdi:timer-sand
+    sequence:
+      # Sat via `timestamp:` og læst tilbage via attributten `timestamp` — den
+      # ENESTE kombination der er verificeret til at round-trippe uden 2-timers
+      # skew (CLAUDE.md 08-02c). En naiv `datetime:`-streng læses som UTC.
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.maaltid_stovsug_vent_start}
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.maaltid_stovsug_venter}
+      - service: logbook.log
+        data:
+          name: "Måltid"
+          message: >-
+            Støvsug armeret — venter på at køkkenet er tomt i
+            {{ states('input_number.maaltid_stovsug_koekken_tomt_minutter') | int(5) }} min
+            (opgiver efter {{ states('input_number.maaltid_stovsug_vent_max_minutter') | int(90) }} min).
+
+automation:
+  # ---------------------------------------------------------------------------
+  # FASE 1: Ingen → Madlavning (vedvarende køkken-bevægelse)
+  # ---------------------------------------------------------------------------
+  - id: maaltid_fase_1_madlavning
+    alias: "Måltid: fase 1 — madlavning (køkken)"
+    description: >
+      Akkumuleret køkken-bevægelse (on-minutter i madlavnings-vinduet) når
+      maaltid_madlavning_minutter → start måltids-sekvensen. Cooldown: mindst
+      20 min siden sidste registrerede måltid (undgår at et travlt køkken straks
+      tæller som nyt måltid).
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.maaltid_madlavning_min_i_vindue
+        above: input_number.maaltid_madlavning_minutter
+    condition:
+      - condition: state
+        entity_id: input_boolean.maaltid_detektion_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: state
+        entity_id: input_select.maaltid_fase
+        state: "Ingen"
+      # Cooldown: 20 min siden sidste måltid (as_timestamp håndterer TZ).
+      - condition: template
+        value_template: >-
+          {% set t = states('input_datetime.maaltid_sidst_registreret') %}
+          {{ t in ['unknown','unavailable','none','']
+             or (now().timestamp() - (state_attr('input_datetime.maaltid_sidst_registreret', 'timestamp') | float(0))) > 1200 }}
+    action:
+      - service: input_select.select_option
+        target: {entity_id: input_select.maaltid_fase}
+        data: {option: "Madlavning"}
+      - service: logbook.log
+        data:
+          name: "Måltid"
+          message: "Fase 1: madlavning registreret (køkken-bevægelse) → venter på spisebordet."
+
+  # ---------------------------------------------------------------------------
+  # FASE 2: Madlavning → Spisning (vedvarende spisebords-ophold) + spiselys
+  # ---------------------------------------------------------------------------
+  - id: maaltid_fase_2_spisning
+    alias: "Måltid: fase 2 — spisning (spisebord) + spiselys"
+    description: >
+      Akkumuleret spisebords-ophold (on-minutter i spise-vinduet, occupancy_
+      filtered inkl. still-target = siddende spisende) når maaltid_spisning_
+      minutter → spise-fase. Tænder spiselyset: spisestue-loft, varm hvid
+      (kelvin-slider), styrke skaleret efter open_plan_lux (mørkt → kraftigere).
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.maaltid_spisning_min_i_vindue
+        above: input_number.maaltid_spisning_minutter
+      # 2026-07-19 (#4 dead-edge re-arm): sad nogen ALLEREDE ved spisebordet da
+      # Madlavning startede (akkumulering ≥ tærskel, fx et barn der ventede/lavede
+      # lektier ved bordet mens der blev lavet mad), sker der INGEN frisk
+      # below→above-flanke på numeric_state → FASE 2 fyrede aldrig og sekvensen
+      # hang i Madlavning til timeout = tabt måltid (intet spiselys/støvsug).
+      # Re-tjek derfor ved fase-indgang; numeric_state-condition'en nedenfor
+      # sikrer at akkumuleringen FAKTISK er over tærskel (ellers no-op til den
+      # senere ægte flanke — normal-stien "lav mad først, sæt dig så" er urørt).
+      - platform: state
+        entity_id: input_select.maaltid_fase
+        to: "Madlavning"
+    condition:
+      - condition: state
+        entity_id: input_boolean.maaltid_detektion_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: state
+        entity_id: input_select.maaltid_fase
+        state: "Madlavning"
+      # Guard for re-arm-flanken (state→Madlavning garanterer IKKE selv at spise-
+      # akkumuleringen er over tærskel; numeric_state-flanken gør). Kræv derfor
+      # eksplicit at akkumuleringen er over tærsklen nu — så state-triggeren kun
+      # avancerer når spisebordet reelt allerede var optaget længe nok.
+      - condition: numeric_state
+        entity_id: sensor.maaltid_spisning_min_i_vindue
+        above: input_number.maaltid_spisning_minutter
+    action:
+      - service: input_select.select_option
+        target: {entity_id: input_select.maaltid_fase}
+        data: {option: "Spisning"}
+      # 2026-07-27 (user-spec, konsolidering): spisestuens EGEN lux (spisebords-
+      # Apolloen, fallback open_plan hvis den er ude) mod den fælles spisestue-
+      # lux-tærskel — SEPARAT fra stue. Samme kilde+tærskel som spisestue-loftets
+      # normale presence-tænd (presence_stue.yaml). Beregn én gang, genbrug til
+      # gate + styrke-skalering (fejlklasse #2: undgå divergerende kopier).
+      - variables:
+          # 2026-09-03b (user-bug "hvorfor er spiselys 17% tændt?"): kilden er
+          # skiftet fra sensor.spisestue_lux_reel til den RENE spisestue-kanal.
+          # Målt 06:42:38 (trace 66b7965): spisestue_lux_reel = 56,4 lx mens den
+          # immune entré-VALLHORN stod på 3,0 — lyskæden lyste hvid ind i
+          # Apolloen. Faktoren blev 0,34 i stedet for ~0,96 → spiselyset tændte
+          # på 17 % i bælgmørke. Se packages/room_lux_tuning.yaml.
+          spisestue_lux: >-
+            {% set raw = states('sensor.spisestue_dagslys_lx') %}
+            {{ (raw | float) if raw not in ['unknown','unavailable','none','']
+               else (states('sensor.open_plan_lux') | float(50)) }}
+          spisestue_lux_thr: "{{ states('input_number.spisestue_lux_threshold') | float(150) }}"
+      # 2026-07-08 (#7, user-spec): tænd KUN spiselyset når der er mørkt nok.
+      # Er spisestue-lux >= tærsklen springes lyset HELT over (før: skalerede bare
+      # til ~25% gulv → tændte spisestue-loftet i dagslys). Fasen skifter fortsat
+      # til Spisning (måltids-detektionen kører uændret) — kun lyset + flaget gates.
+      - if:
+          - condition: template
+            value_template: "{{ spisestue_lux < spisestue_lux_thr }}"
+        then:
+          - service: input_boolean.turn_on
+            target: {entity_id: input_boolean.maaltid_spiselys_aktiv}
+          - service: light.turn_on
+            target: {entity_id: light.spisestue_loft}
+            data:
+              color_temp_kelvin: "{{ states('input_number.maaltid_spiselys_kelvin') | int(2200) }}"
+              # Styrke afhængig af spisestue-lux: mørkt → fuld base, ved tærsklen → 25% gulv.
+              brightness_pct: >-
+                {% set base = states('input_number.maaltid_spiselys_brightness') | float(60) %}
+                {% set f = ((spisestue_lux_thr - spisestue_lux) / spisestue_lux_thr) if spisestue_lux_thr > 0 else 1.0 %}
+                {% set f = [[f, 1.0] | min, 0.25] | max %}
+                {{ [ (base * f) | round(0) | int, 1] | max }}
+              transition: 3
+          - service: logbook.log
+            data:
+              name: "Måltid"
+              message: "Fase 2: spisning registreret → spiselys tændt (varm hvid, lux-skaleret)."
+        else:
+          - service: logbook.log
+            data:
+              name: "Måltid"
+              message: >-
+                Fase 2: spisning registreret — spiselys sprunget over (lyst nok,
+                spisestue-lux {{ spisestue_lux | round(0) }} >=
+                {{ spisestue_lux_thr | round(0) }} lx).
+
+  # ---------------------------------------------------------------------------
+  # FASE 3: Spisning → Oprydning = MÅLTID REGISTRERET (køkken igen) + støvsug
+  # ---------------------------------------------------------------------------
+  - id: maaltid_fase_3_oprydning
+    alias: "Måltid: fase 3 — oprydning → måltid registreret + støvsug"
+    description: >
+      Akkumuleret køkken-bevægelse IGEN (oprydning, on-minutter i oprydnings-
+      vinduet) når maaltid_oprydning_minutter → måltid registreret. Straks: hvis
+      børn hjemme + robot docket/idle + (valgfri elpris-gate ok) → støvsug 'Living
+      room' (segment 16) med max power. Resetter fasen til Ingen. Rører IKKE
+      roborock-session (daglig Dormant-clean uændret).
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.maaltid_oprydning_min_i_vindue
+        above: input_number.maaltid_oprydning_minutter
+    condition:
+      - condition: state
+        entity_id: input_boolean.maaltid_detektion_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: state
+        entity_id: input_select.maaltid_fase
+        state: "Spisning"
+    action:
+      # 2026-08-26: har bordet stået tomt hele vejen frem til oprydningen, var
+      # det ikke et måltid. Bliv i Spisning — kommer folk tilbage til bordet og
+      # ryddes der af bagefter, fyrer triggeren igen; ellers rydder timeouten op.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ (states('sensor.maaltid_spisning_min_i_vindue') | float(0))
+                 <= (states('input_number.maaltid_registrer_min_spisestue_min') | float(2.5)) }}
+        then:
+          - service: logbook.log
+            data:
+              name: "Måltid"
+              message: >-
+                Fase 3 AFVIST: oprydning set i køkkenet
+                ({{ states('sensor.maaltid_oprydning_min_i_vindue') }} min), men
+                spisestuen har kun {{ states('sensor.maaltid_spisning_min_i_vindue') }} min
+                ophold i sit vindue (kræver >
+                {{ states('input_number.maaltid_registrer_min_spisestue_min') }}).
+                Ingen har været ved bordet — dette er ikke et måltid. Bliver i Spisning.
+              entity_id: input_select.maaltid_fase
+          - stop: "Ingen spisestue-evidens ved registrering"
+      - service: input_select.select_option
+        target: {entity_id: input_select.maaltid_fase}
+        data: {option: "Oprydning"}
+      - choose:
+          # ---- DAGTIMER + HVERDAG (06:30–17:00): vent på bekræftelse ----------
+          # 2026-07-08 (#8, user-spec): i arbejdsdags-vinduet kan "oprydning" i
+          # virkeligheden være at DEN ENE rydder op mens DEN ANDEN arbejder ved
+          # spisebordet. Erklær derfor IKKE måltid færdig endnu — bliv i Oprydning
+          # og lad maaltid_hjemmearbejde_beslutning afgøre efter bekræftelses-
+          # vinduet (fortsat spisestue-bevægelse = hjemmearbejde, ellers måltid).
+          - conditions:
+              - condition: time
+                after: "06:30:00"
+                before: "17:00:00"
+              - condition: state
+                entity_id: binary_sensor.workday_sensor
+                state: "on"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Måltid"
+                  message: >-
+                    Fase 3: oprydning set (arbejdsdags-vindue) → venter
+                    {{ states('input_number.maaltid_hjemmearbejde_bekraeft_minutter') | int(30) }}
+                    min: fortsat spisestue-bevægelse = hjemmearbejde, ellers måltid + støvsug.
+          # ---- ELLERS (aften/weekend/helligdag, 8c): direkte måltid + støvsug --
+          - conditions: []
+            sequence:
+              - service: input_datetime.set_datetime
+                target: {entity_id: input_datetime.maaltid_sidst_registreret}
+                data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
+              - variables:
+                  kids: "{{ is_state('binary_sensor.kids_home', 'on') }}"
+                  robot_klar: "{{ states('vacuum.s8_maxv_ultra') in ['docked','idle'] }}"
+                  pris_ok: >-
+                    {{ is_state('input_boolean.maaltid_stovsug_elpris_gate', 'off')
+                       or is_state('binary_sensor.roborock_elpris_block', 'off') }}
+                  # 2026-07-26 (user-spec): "rod på gulvet"-pause gælder også
+                  # måltids-støvsugningen (Styrbar NED). auto_paused on → skip.
+                  auto_ok: "{{ is_state('input_boolean.roborock_auto_paused', 'off') }}"
+                  # 2026-08-05 (user-spec item 9): kun hvis robotten slet ikke har
+                  # kørt i dag — uanset hvem der startede den.
+                  dagens_foerste: "{{ is_state('binary_sensor.roborock_startet_i_dag', 'off') }}"
+              - service: logbook.log
+                data:
+                  name: "Måltid"
+                  message: >-
+                    Fase 3: MÅLTID REGISTRERET (aften/weekend). Støvsug Living room: {{ 'venter på tomt køkken' if (kids and robot_klar and pris_ok and auto_ok and dagens_foerste)
+                    else ('nej — auto på pause (rod på gulvet)' if not auto_ok
+                          else ('nej — robotten har allerede kørt i dag' if not dagens_foerste
+                                else ('nej — børn ikke hjemme' if not kids
+                                      else ('nej — robot optaget (' ~ states('vacuum.s8_maxv_ultra') ~ ')' if not robot_klar
+                                            else 'nej — høj elpris (gate on)')))) }}.
+              - if:
+                  - condition: template
+                    value_template: "{{ kids and robot_klar and pris_ok and auto_ok and dagens_foerste }}"
+                then:
+                  - service: script.maaltid_stovsug_arm_vent
+              # Reset klar til næste måltid.
+              - service: input_select.select_option
+                target: {entity_id: input_select.maaltid_fase}
+                data: {option: "Ingen"}
+
+  # ---------------------------------------------------------------------------
+  # BEKRÆFTELSE (#8): efter bekræftelses-vinduet — måltid eller hjemmearbejde?
+  # ---------------------------------------------------------------------------
+  - id: maaltid_hjemmearbejde_beslutning
+    alias: "Måltid: registrér måltid efter arbejdsdags-vinduet"
+    description: >
+      2026-07-08 (#8): fasen har stået i Oprydning i bekræftelses-vinduet (kun
+      sat i arbejdsdags-vinduet 06:30–17:00 på hverdage) → registrér måltidet.
+      2026-07-29 (user-spec, træner-facit): den gamle "måltid vs hjemmearbejde"-
+      dom er FJERNET herfra — den krævede en køkkenfase først (missede rene
+      hjemmearbejdsdage) og fejl-markerede almindelige dage. Hjemmearbejdsdagen
+      afgøres nu alene af hjemmearbejde_dag_detekter; her gates støvsugningen
+      bare på flaget. Ventetiden er beholdt så robotten ikke starter mens nogen
+      måske stadig sidder ved bordet. Nulstiller fasen uanset udfald.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.maaltid_fase
+        to: "Oprydning"
+        for:
+          seconds: >-
+            {{ (states('input_number.maaltid_hjemmearbejde_bekraeft_minutter') | float(30) * 60) | round(0) | int }}
+    condition:
+      - condition: state
+        entity_id: input_select.maaltid_fase
+        state: "Oprydning"
+    action:
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.maaltid_sidst_registreret}
+        data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
+      - variables:
+          spisestue_min: "{{ states('sensor.maaltid_spisestue_bekraeft_min_i_vindue') | float(0) }}"
+          kids: "{{ is_state('binary_sensor.kids_home', 'on') }}"
+          robot_klar: "{{ states('vacuum.s8_maxv_ultra') in ['docked','idle'] }}"
+          pris_ok: >-
+            {{ is_state('input_boolean.maaltid_stovsug_elpris_gate', 'off')
+               or is_state('binary_sensor.roborock_elpris_block', 'off') }}
+          # 8d: ingen auto-støvsug i arbejdsdags-vinduet på hjemmearbejdsdage.
+          stovsug_ok: >-
+            {{ is_state('input_boolean.maaltid_hjemmearbejde_dag', 'off')
+               and is_state('input_select.house_state', 'Active') }}
+          # 2026-07-26 (user-spec): "rod på gulvet"-pause (Styrbar NED)
+          # gælder også måltids-støvsugningen. auto_paused on → skip.
+          auto_ok: "{{ is_state('input_boolean.roborock_auto_paused', 'off') }}"
+          # 2026-08-05 (user-spec item 9): kun dagens FØRSTE igangsætning.
+          dagens_foerste: "{{ is_state('binary_sensor.roborock_startet_i_dag', 'off') }}"
+      - service: logbook.log
+        data:
+          name: "Måltid"
+          message: >-
+            MÅLTID REGISTRERET (arbejdsdags-vindue, {{ spisestue_min | round(1) }} min spisestue-ophold i bekræftelses-vinduet).
+            Støvsug: {{ 'venter på tomt køkken' if (kids and robot_klar and pris_ok and stovsug_ok and auto_ok and dagens_foerste)
+            else ('nej — auto på pause (rod på gulvet)' if not auto_ok
+                  else ('nej — robotten har allerede kørt i dag' if not dagens_foerste
+                        else ('nej — hjemmearbejdsdag/ikke Active' if not stovsug_ok
+                              else ('nej — børn ikke hjemme' if not kids
+                                    else ('nej — robot optaget' if not robot_klar else 'nej — høj elpris'))))) }}.
+      - if:
+          - condition: template
+            value_template: "{{ kids and robot_klar and pris_ok and stovsug_ok and auto_ok and dagens_foerste }}"
+        then:
+          - service: script.maaltid_stovsug_arm_vent
+      - service: input_select.select_option
+        target: {entity_id: input_select.maaltid_fase}
+        data: {option: "Ingen"}
+
+  # ---------------------------------------------------------------------------
+  # HJEMMEARBEJDSDAG-DETEKTION (user-spec 2026-07-29)
+  # ---------------------------------------------------------------------------
+  - id: hjemmearbejde_dag_detekter
+    alias: "Hjemmearbejde: markér dagen (spisestue-ophold på hverdag)"
+    description: >
+      "hverdag og masser af aktivitet i spisestuen er hjemmearbejdsdag" (user).
+      Akkumuleret spisestue-ophold i det rullende vindue >= tærskel på en
+      hverdag i arbejdsdags-vinduet → markér dagen. Flaget spærrer måltids-
+      støvsugningen resten af dagen (nulstilles ved midnat) og lader
+      sensor.activity_state vise 'hjemmearbejde' mens bordet er i brug.
+      Backstop (fejlklasse #4): en HA-restart midt på dagen genstarter
+      history_stats-sensoren, så numeric_state-flanken kan gå tabt selv om
+      tærsklen reelt er overskredet — /15-tikket samler den op.
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.hjemmearbejde_ophold_min_i_vindue
+        above: input_number.hjemmearbejde_ophold_minutter
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: state
+        entity_id: input_boolean.maaltid_hjemmearbejde_dag
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.workday_sensor
+        state: "on"
+      - condition: time
+        after: "06:30:00"
+        before: "17:00:00"
+      # Gæstens ophold ved spisebordet er ikke familiens hjemmearbejdsdag.
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: template
+        value_template: >-
+          {{ (states('sensor.hjemmearbejde_ophold_min_i_vindue') | float(-1))
+             >= (states('input_number.hjemmearbejde_ophold_minutter') | float(45)) }}
+    action:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.maaltid_hjemmearbejde_dag}
+      - service: logbook.log
+        data:
+          name: "Hjemmearbejde"
+          message: >-
+            HJEMMEARBEJDSDAG markeret: {{ states('sensor.hjemmearbejde_ophold_min_i_vindue') }} min
+            spisestue-ophold i de seneste {{ states('input_number.hjemmearbejde_vindue_minutter') | int(60) }} min
+            (tærskel {{ states('input_number.hjemmearbejde_ophold_minutter') | int(45) }}). Auto-støvsug spærret resten af dagen.
+
+  # ---------------------------------------------------------------------------
+  # HJEMMEARBEJDSDAG RESET (midnat)
+  # ---------------------------------------------------------------------------
+  - id: maaltid_hjemmearbejde_dag_reset
+    alias: "Måltid: nulstil hjemmearbejdsdag (midnat)"
+    mode: single
+    trigger:
+      - platform: time
+        at: "00:00:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.maaltid_hjemmearbejde_dag
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.maaltid_hjemmearbejde_dag}
+
+  # ---------------------------------------------------------------------------
+  # VENT PÅ TOMT KØKKEN → støvsug (user-spec item 9, 2026-08-05)
+  # ---------------------------------------------------------------------------
+  - id: maaltid_stovsug_naar_koekken_tomt
+    alias: "Måltid: støvsug når køkkenet har været tomt"
+    description: >
+      "Den forstyrrer mens vi går i køkkenet. Vent på at køkkenet har været
+      konsistent tomt" (user 2026-08-05). Måltids-grenene armerer kun ventetiden;
+      selve starten sker her, når køkken-Apolloen har stået off sammenhængende i
+      maaltid_stovsug_koekken_tomt_minutter.
+
+      Måler roen på occupancy-sensorens last_changed i stedet for en `for:`-
+      trigger, af to grunde: (a) et templatet `for:` binder ved LOAD, så en
+      slider-ændring først ville virke efter reload; (b) en `for:`-timer
+      overlever ikke en HA-restart (fejlklasse #4/#15) — her genskabes
+      ventetilstanden af sig selv, fordi den bor i et input_boolean og
+      /2-tikket bare ser efter igen. last_changed ER gyldigt til "sustained"
+      her, fordi occupancy er BINÆR (fejlklasse #14 gælder analoge sensorer).
+
+      Alle gates gentages ved start (robotten kan være blevet startet manuelt
+      mens vi ventede, prisen kan være steget, nogen kan have sat auto på pause).
+      Opgiver efter maaltid_stovsug_vent_max_minutter og aldrig efter robottens
+      egen "forstyr ikke"-starttid — så en aften uden ro ikke ender med en robot
+      der kører ved sengetid.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/2"
+    condition:
+      - condition: state
+        entity_id: input_boolean.maaltid_stovsug_venter
+        state: "on"
+    action:
+      - variables:
+          vent_start: "{{ state_attr('input_datetime.maaltid_stovsug_vent_start', 'timestamp') | float(0) }}"
+          ventet_min: >-
+            {{ ((as_timestamp(now()) - (state_attr('input_datetime.maaltid_stovsug_vent_start', 'timestamp') | float(0))) / 60)
+               | round(1) }}
+          max_min: "{{ states('input_number.maaltid_stovsug_vent_max_minutter') | float(90) }}"
+          ro_krav: "{{ states('input_number.maaltid_stovsug_koekken_tomt_minutter') | float(5) }}"
+          ro_min: >-
+            {% if is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'off') %}
+              {{ ((as_timestamp(now()) - as_timestamp(states.binary_sensor.koekken_apollo_occupancy_filtered.last_changed)) / 60) | round(1) }}
+            {% else %}
+              0
+            {% endif %}
+          # Robottens egen "forstyr ikke"-start er cutoff'en — ét tal, sat ét
+          # sted (på robotten), i stedet for endnu en slider der kan divergere.
+          dnd_start: "{{ states('time.s8_maxv_ultra_do_not_disturb_begin') }}"
+          foer_dnd: >-
+            {% set d = states('time.s8_maxv_ultra_do_not_disturb_begin') %}
+            {{ true if d in ['unknown', 'unavailable', 'none', '']
+               else now() < today_at(d) }}
+          gates_ok: >-
+            {{ is_state('binary_sensor.kids_home', 'on')
+               and states('vacuum.s8_maxv_ultra') in ['docked', 'idle']
+               and is_state('input_boolean.roborock_auto_paused', 'off')
+               and is_state('binary_sensor.roborock_startet_i_dag', 'off')
+               and (is_state('input_boolean.maaltid_stovsug_elpris_gate', 'off')
+                    or is_state('binary_sensor.roborock_elpris_block', 'off')) }}
+      - choose:
+          # ---- OPGIV: for længe uden ro, eller robottens nattevindue nået -----
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ vent_start <= 0 or ventet_min > max_min or not foer_dnd }}
+            sequence:
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.maaltid_stovsug_venter}
+              - service: logbook.log
+                data:
+                  name: "Måltid"
+                  message: >-
+                    Støvsug opgivet efter {{ ventet_min }} min uden roligt køkken
+                    ({{ 'nattevindue (' ~ dnd_start ~ ') nået' if not foer_dnd
+                        else ('ugyldigt vente-stempel' if vent_start <= 0
+                              else 'maks ' ~ (max_min | round(0)) ~ ' min') }}).
+          # ---- KØKKENET HAR VÆRET TOMT LÆNGE NOK → støvsug -------------------
+          - conditions:
+              - condition: template
+                value_template: "{{ ro_min >= ro_krav and gates_ok }}"
+            sequence:
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.maaltid_stovsug_venter}
+              - service: script.maaltid_stovsug_living_room
+              - service: script.push_notify
+                data:
+                  notif_id: maaltid
+                  title: "🍽️🤖 Måltid → støvsuger"
+                  message: >-
+                    Køkkenet har været tomt i {{ ro_min }} min → Living room
+                    støvsuges nu (max power). Dagens første kørsel.
+          # ---- GATES FALDT VÆK MENS VI VENTEDE → drop stille ------------------
+          - conditions:
+              - condition: template
+                value_template: "{{ not gates_ok }}"
+            sequence:
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.maaltid_stovsug_venter}
+              - service: logbook.log
+                data:
+                  name: "Måltid"
+                  message: >-
+                    Støvsug annulleret efter {{ ventet_min }} min:
+                    {{ 'robotten er startet på anden vis i dag' if is_state('binary_sensor.roborock_startet_i_dag', 'on')
+                       else ('auto på pause (rod på gulvet)' if is_state('input_boolean.roborock_auto_paused', 'on')
+                             else ('børn ikke hjemme' if is_state('binary_sensor.kids_home', 'off')
+                                   else ('robot optaget (' ~ states('vacuum.s8_maxv_ultra') ~ ')'
+                                         if states('vacuum.s8_maxv_ultra') not in ['docked','idle']
+                                         else 'høj elpris'))) }}.
+
+  # Ryd vente-flaget ved midnat, så en armering aldrig kan overleve ind i en dag
+  # hvor "robotten har ikke kørt i dag" betyder noget andet (fejlklasse #21).
+  # AirBnB-entry ryddes IKKE her, men i airbnb_mode.yaml's fælles flag-clear-
+  # liste — ét roster frem for to der kan divergere (fejlklasse #2).
+  - id: maaltid_stovsug_vent_clear
+    alias: "Måltid: ryd armeret støvsug (midnat)"
+    mode: single
+    trigger:
+      - platform: time
+        at: "00:00:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.maaltid_stovsug_venter
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.maaltid_stovsug_venter}
+      - service: logbook.log
+        data:
+          name: "Måltid"
+          message: "Armeret støvsug ryddet ved midnat (køkkenet faldt aldrig til ro)."
+
+  # ---------------------------------------------------------------------------
+  # TIMEOUT: hængende sekvens → reset til Ingen
+  # ---------------------------------------------------------------------------
+  - id: maaltid_fase_reset_timeout
+    alias: "Måltid: reset ved timeout"
+    description: >
+      Sidder fasen fast i Madlavning eller Spisning i maaltid_reset_minutter uden
+      at komme videre → antag ikke-måltid → reset til Ingen.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.maaltid_fase
+        to: "Madlavning"
+        for:
+          seconds: "{{ (states('input_number.maaltid_reset_minutter') | float(45) * 60) | round(0) | int }}"
+      - platform: state
+        entity_id: input_select.maaltid_fase
+        to: "Spisning"
+        for:
+          seconds: "{{ (states('input_number.maaltid_reset_minutter') | float(45) * 60) | round(0) | int }}"
+      # 2026-07-19 (#4/#15 restart-stuck-state): en fase der venter på sit `for:`/
+      # bekræftelses-vindue mister sin timer ved HA-restart (jeg genstarter ved
+      # deploys, HAOS nat-opdaterer) — state-`for:`-triggere gen-armeres ikke
+      # pålideligt ved boot. Værst er Oprydning: den har INGEN `for:`-timeout her
+      # (kun maaltid_hjemmearbejde_beslutning rydder den) → tabt bekræftelses-timer
+      # = permanent stuck i Oprydning → ALT måltids-detektion blokeret (FASE 1
+      # kræver Ingen). Ryd derfor enhver transient fase ved HA-start. Afbryder en
+      # igangværende detektion — acceptabelt (værst ét mistet støvsug).
+      - platform: homeassistant
+        event: start
+        id: boot
+    condition:
+      - condition: template
+        value_template: "{{ states('input_select.maaltid_fase') in ['Madlavning','Spisning','Oprydning'] }}"
+    action:
+      - variables:
+          fase_foer: "{{ states('input_select.maaltid_fase') }}"
+      - service: input_select.select_option
+        target: {entity_id: input_select.maaltid_fase}
+        data: {option: "Ingen"}
+      - service: logbook.log
+        data:
+          name: "Måltid"
+          message: >-
+            {{ 'HA-start: transient fase (' ~ fase_foer ~ ') nulstillet til Ingen (tabt timer efter restart).'
+               if trigger.id == 'boot'
+               else 'Sekvens timeout → nulstillet til Ingen (intet fuldt måltids-mønster).' }}
+
+  # ---------------------------------------------------------------------------
+  # SPISELYS SLUK: hele open-plan-området tomt i N min → sluk spisestue-loft
+  # ---------------------------------------------------------------------------
+  - id: maaltid_spiselys_off_tomt
+    alias: "Måltid: sluk spiselys når området er tomt"
+    description: >
+      Spiselyset holdes (via flag-gate i presence_light_spisestue_off) til HELE
+      open-plan-området (køkken + spisestue + stue Apollo) har været tomt i
+      maaltid_spiselys_tomt_minutter → sluk spisestue-loftet.
+    mode: single
+    trigger:
+      - platform: template
+        value_template: >-
+          {{ is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'off')
+             and is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'off')
+             and is_state('binary_sensor.stue_apollo_occupancy_filtered', 'off') }}
+        for:
+          seconds: "{{ (states('input_number.maaltid_spiselys_tomt_minutter') | float(10) * 60) | round(0) | int }}"
+    condition:
+      - condition: state
+        entity_id: input_boolean.maaltid_spiselys_aktiv
+        state: "on"
+    action:
+      - service: light.turn_off
+        target: {entity_id: light.spisestue_loft}
+        data:
+          transition: "{{ states('sensor.fade_extended_effective') | int(60) }}"
+      - service: logbook.log
+        data:
+          name: "Måltid"
+          message: "Spiselys slukket — open-plan-området tomt."
+
+  # ---------------------------------------------------------------------------
+  # FLAG-SYNK: spisestue-loft slukket (uanset kilde) → ryd spiselys-flag
+  # ---------------------------------------------------------------------------
+  - id: maaltid_spiselys_flag_clear
+    alias: "Måltid: ryd spiselys-flag når loftet slukkes"
+    description: >
+      Holder maaltid_spiselys_aktiv i sync med den faktiske lys-state, så flaget
+      aldrig hænger (godnat/manuel/tom-sluk slukker loftet → flag ryddes →
+      presence_light_spisestue_off (gated på flaget) virker igen normalt).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: light.spisestue_loft
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.maaltid_spiselys_aktiv
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.maaltid_spiselys_aktiv}

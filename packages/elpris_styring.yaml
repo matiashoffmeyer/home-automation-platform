@@ -1,0 +1,245 @@
+# =============================================================================
+# El-pris-styret lys-dæmpning + baseline-vs-faktisk omkostning (2026-06-19)
+# =============================================================================
+# Lader den TIME-baserede spot-pris påvirke lysstyrken: når en time er dyrere
+# end de seneste 24 timers gennemsnit, dæmpes lyset. En slider styrer styrken:
+#   elpris_paavirkning = 0   → INGEN effekt (baseline = faktisk, default)
+#   elpris_paavirkning = 100 → fuld effekt: dagens dyreste time dæmper ned til
+#                              ~40% af det lyset ellers ville have haft.
+#
+# DESIGN-VALG (user-spec 2026-06-19):
+#   • Reference = rullende 30-dages-gennemsnit (dæmp når timen er over månedsnormen).
+#   • Kun lysstyrke (ikke on/off) → ren baseline-vs-faktisk graf.
+#   • ALLE 22 lamper (ingen undtagelser).
+#   • Gulv = 40% ved slider=100 + dagens dyreste time (aldrig helt slukket).
+#
+# UNIT-AGNOSTISK: alt regnes som RATIO mod 30-dages-gennemsnittet, så spot-prisens
+# enhed (kr/kWh, øre/kWh, EUR/MWh) er ligegyldig — kun kurvens FORM betyder noget.
+#
+# KOBLING: elpris_dim_factor ganges ind i sensor.global_brightness_factor
+# (packages/global_tuning.yaml) → alle 55 brightness-call-sites bliver pris-
+# bevidste med én edit. Ved slider=0 er faktoren 1.0 → eksisterende adfærd.
+#
+# PRIS-KILDE: HA-core Nord Pool-integrationen (tilføjes via UI: Indstillinger →
+# Enheder & tjenester → Tilføj → Nord Pool, vælg prisområde DK1/DK2). Indtil den
+# er tilføjet returnerer kilden 'unavailable' → dim-faktor 1.0 (intet sker) og
+# graf-prisen falder tilbage til den flade elpris_kr_kwh. SIKKERT at deploye nu.
+# =============================================================================
+
+input_number:
+  # Styrke af el-pris-effekten på lysstyrke. 0 = slået helt fra (default).
+  elpris_paavirkning:
+    name: "El-pris påvirkning på lys"
+    icon: mdi:cash-clock
+    min: 0
+    max: 100
+    step: 1
+    mode: slider
+
+template:
+  - sensor:
+      # --- Aktuel spot-pris (indirektion til Nord Pool core-entiteten) --------
+      # ÉN central reference: ret KUN entity_id'et herunder når Nord Pool er
+      # tilføjet via UI (læs det rigtige navn fra HA bagefter). Nonexistent/
+      # unavailable → 'unavailable' → alt falder sikkert tilbage til neutral.
+      - name: "Elpris spot aktuel"
+        unique_id: elpris_spot_aktuel
+        unit_of_measurement: "kr/kWh"
+        # 2026-07-13: state_class measurement → long-term statistics, så
+        # Statistik-sidens nye pris-historik-graf kan tegne spot mean/dag.
+        # Bygger FREMAD (ingen backfill). Ikke-numerisk (unavailable) ignoreres.
+        state_class: measurement
+        icon: mdi:transmission-tower
+        state: >-
+          {% set src = states('sensor.nord_pool_dk2_current_price') %}
+          {{ src if src not in ['unknown', 'unavailable', 'none', ''] else 'unavailable' }}
+
+      # --- Pris-dæmpnings-faktor (0.40 .. 1.0; 1.0 = ingen dæmpning) ----------
+      # k = slider/100. x = hvor langt timen er over 30d-gns (0 ved/under gns,
+      # 1 ved ≥2× gns). dæmpning = k·x·0.60 → gulv 0.40 ved k=1, x=1.
+      - name: "Elpris dim factor"
+        unique_id: elpris_dim_factor
+        icon: mdi:brightness-percent
+        state: >-
+          {% set k = (states('input_number.elpris_paavirkning') | float(0)) / 100 %}
+          {% set p = states('sensor.elpris_spot_aktuel') | float(-999) %}
+          {% set avg = states('sensor.elspot_30d_gns') | float(0) %}
+          {% if k <= 0 or p < -100 or avg <= 0 %}
+            1.0
+          {% else %}
+            {% set x = [[(p - avg) / avg, 0] | max, 1] | min %}
+            {{ (1.0 - k * x * 0.60) | round(3) }}
+          {% endif %}
+
+      # --- All-in time-pris: FLYTTET til packages/setup_cost.yaml (2026-06-21) -
+      # sensor.elpris_allin_aktuel bygges nu komponent-vis (spot + nettarif +
+      # elafgift + leverandør) × moms i setup_cost.yaml — den flade elpris_kr_kwh-
+      # slider er fjernet. lys_kost_rate_faktisk nedenfor bruger fortsat samme
+      # entity-navn (sensor.elpris_allin_aktuel), så intet andet skal ændres.
+
+  - sensor:
+      # --- Omkostnings-RATE (kr/h): faktisk vs. baseline ---------------------
+      # faktisk = nuværende (allerede pris-dæmpede) effekt × all-in time-pris.
+      # baseline = hvad det ville koste UDEN pris-dæmpning = faktisk / dim_factor
+      #   (effekten skalerer lineært med brightness i vores model; ved dim=1.0
+      #    er baseline = faktisk → linjerne ligger oven på hinanden ved slider=0).
+      # Pris-vægtningen sidder i begge → dæmpning i en DYR time sparer mere kr.
+      - name: "Lys kost rate faktisk"
+        unique_id: lys_kost_rate_faktisk
+        unit_of_measurement: "kr/h"
+        icon: mdi:cash-clock
+        state: >-
+          {{ ((states('sensor.lys_estimat_effekt') | float(0)) / 1000
+              * (states('sensor.elpris_allin_aktuel') | float(2.5))) | round(4) }}
+
+      - name: "Lys kost rate baseline"
+        unique_id: lys_kost_rate_baseline
+        unit_of_measurement: "kr/h"
+        icon: mdi:cash-clock
+        state: >-
+          {% set pf = states('sensor.elpris_dim_factor') | float(1.0) %}
+          {{ ((states('sensor.lys_kost_rate_faktisk') | float(0))
+              / (pf if pf > 0.05 else 1.0)) | round(4) }}
+
+      # --- Dagens besparelse (baseline − faktisk, kr) ------------------------
+      - name: "Lys besparelse i dag"
+        unique_id: lys_besparelse_idag
+        unit_of_measurement: "kr"
+        # 2026-06-25: state_class total (var ingen) → får long-term statistics så
+        # Forbrug-grafen kan plotte DENNE rene dags-besparelse (forskel mellem to
+        # monotone dags-utility-meters) i st.f. det knækkede lys_besparelse_dag-
+        # meter (utility_meter på en ikke-monoton kilde tolkede hvert fald som
+        # reset → ~37× oppustet). total (ikke total_increasing): må falde uden
+        # reset-antagelse. Nulstiller ved midnat (input = dags-meters) → graf-
+        # `state` ved dagsslut = dagens besparelse.
+        state_class: total
+        icon: mdi:piggy-bank
+        state: >-
+          {{ [ (states('sensor.lys_kost_baseline_i_dag') | float(0))
+               - (states('sensor.lys_kost_faktisk_i_dag') | float(0)), 0 ] | max | round(2) }}
+
+      # --- Akkumuleret besparelse (baseline_total − faktisk_total) -----------
+      # 2026-06-21 (task 2: læsbar graf): én monotont stigende total → graf'ens
+      # `change` pr. dag = kr sparet den dag = ÉN søjle/dag, ikke to linjer der
+      # ligger oven på hinanden. Står pris-feed/dæmpning af = 0/dag (linjen flad).
+      - name: "Lys besparelse total"
+        unique_id: lys_besparelse_total
+        unit_of_measurement: "kr"
+        # 2026-06-23: var total_increasing, men besparelsen (baseline - faktisk)
+        # KAN falde når faktisk forbrug stiger over baseline → recorder tolkede
+        # hvert fald som meter-reset → oppustede dags-besparelses-statistikken.
+        # total tillader op/ned uden reset-antagelse.
+        state_class: total
+        icon: mdi:piggy-bank
+        state: >-
+          {{ [ (states('sensor.lys_kost_baseline_total') | float(0))
+               - (states('sensor.lys_kost_faktisk_total') | float(0)), 0 ] | max | round(4) }}
+
+      # --- SAMLET BESPARELSE: lys + cykel-lader + luksus-blok + robot-lader --
+      # 2026-07-29e: "det skal tælle med i opgørelsen over hvor meget strøm vi
+      # sparer ved at lade på de rigtige tidspunkt …" (cykel-laderen).
+      # 2026-07-30: "en All Time Total Sparet på smart el forbrug (lader og
+      # dæmpning og luksus-block)" → tredje kilde tilføjet.
+      # De tre bidrag har HVER sin mekanisme, men samme form (kr, pris-vægtede
+      # mod den samme all-in pris), så de kan lægges sammen:
+      #   💡 lys         = dæmpet i de dyre timer (denne fil)
+      #   🔋 cykel-lader = ladet i vinduets billigste timer
+      #                    (packages/cykel_lader_besparelse.yaml)
+      #   ✨ luksus-blok = auto-tænd sprunget over mens strømmen er dyr
+      #                    (packages/luksus_besparelse.yaml)
+      #   🤖 robot-lader = ladningen udskudt til det billige vindue
+      #                    (packages/robot_lader_besparelse.yaml, 2026-08-22)
+      # (🔊 højttaleren var kilde nr. 5 i ét døgn, 10/10-2026 — droppet med
+      # pluggen, B212.)
+      # Tilføjer du en FEMTE kilde, så læg den ind BEGGE steder her (total +
+      # i dag) — det er de to sensorer Statistik-siden tegner "i alt" på.
+      # Cykel- og robot-delen kan være NEGATIVE (ladet dyrere end baseline, fx
+      # overrun forbi deadline, eller et off-peak-vindue der peger på timer der
+      # ikke længere er de billige); det skal kunne trække totalen ned. Lys og
+      # luksus er ≥ 0.
+      #
+      # ALL TIME: totalen er akkumuleret siden hver kildes Riemann-integration
+      # blev født (lys 21-06-2026, cykel-lader 29-07-2026, luksus 30-07-2026) og
+      # restore'es over restarts. Den nulstilles aldrig af sig selv.
+      - name: "El besparelse total"
+        unique_id: el_besparelse_total
+        unit_of_measurement: "kr"
+        state_class: total
+        icon: mdi:piggy-bank-outline
+        state: >-
+          {{ ((states('sensor.lys_besparelse_total') | float(0))
+              + (states('sensor.cykel_lader_besparelse_total') | float(0))
+              + (states('sensor.luksus_besparelse_total') | float(0))
+              + (states('sensor.robot_lade_besparelse_total') | float(0))) | round(4) }}
+        attributes:
+          lys: "{{ states('sensor.lys_besparelse_total') | float(0) | round(2) }}"
+          cykel_lader: "{{ states('sensor.cykel_lader_besparelse_total') | float(0) | round(2) }}"
+          luksus_blok: "{{ states('sensor.luksus_besparelse_total') | float(0) | round(2) }}"
+          robot_lader: "{{ states('sensor.robot_lade_besparelse_total') | float(0) | round(2) }}"
+
+      - name: "El besparelse i dag"
+        unique_id: el_besparelse_i_dag
+        unit_of_measurement: "kr"
+        state_class: total
+        icon: mdi:piggy-bank-outline
+        state: >-
+          {{ ((states('sensor.lys_besparelse_i_dag') | float(0))
+              + (states('sensor.cykel_lader_besparelse_i_dag') | float(0))
+              + (states('sensor.luksus_besparelse_i_dag') | float(0))
+              + (states('sensor.robot_lade_besparelse_i_dag') | float(0))) | round(2) }}
+        attributes:
+          lys: "{{ states('sensor.lys_besparelse_i_dag') | float(0) | round(2) }}"
+          cykel_lader: "{{ states('sensor.cykel_lader_besparelse_i_dag') | float(0) | round(2) }}"
+          luksus_blok: "{{ states('sensor.luksus_besparelse_i_dag') | float(0) | round(2) }}"
+          robot_lader: "{{ states('sensor.robot_lade_besparelse_i_dag') | float(0) | round(2) }}"
+
+sensor:
+  # --- Rullende 30-DAGES-gennemsnit af spot-prisen (reference for dæmpningen) -
+  # 2026-06-23 (user): udvidet fra 24h → 30 dage. Dæmpningen sammenligner nu den
+  # aktuelle time mod en MÅNEDS-baseline i stedet for kun sidste døgn → en
+  # vedvarende dyr periode (over månedsnormen) dæmper hele dagen, ikke kun
+  # intra-dags-toppe. NB: recorder gemmer 14 dage (purge_keep_days) → efter en
+  # HA-restart genopbygges bufferen fra ~14 dage og vokser mod 30 over tid.
+  # sampling_size hævet 200 → 5000 (30 dage × ~24 time-priser ≈ 720 + buffer).
+  - platform: statistics
+    name: "Elspot 30d gns"
+    unique_id: elspot_30d_gns
+    entity_id: sensor.elpris_spot_aktuel
+    state_characteristic: mean
+    max_age:
+      days: 30
+    sampling_size: 5000
+
+  # --- Riemann-integration af kost-rates (kr/h) → akkumuleret kr -------------
+  - platform: integration
+    name: "Lys kost faktisk total"
+    unique_id: lys_kost_faktisk_total
+    source: sensor.lys_kost_rate_faktisk
+    method: left
+    unit_time: h
+    round: 4
+
+  - platform: integration
+    name: "Lys kost baseline total"
+    unique_id: lys_kost_baseline_total
+    source: sensor.lys_kost_rate_baseline
+    method: left
+    unit_time: h
+    round: 4
+
+# --- Dagsforbrug i kr: utility_meter på de to totaler (rene dag-grænser) -----
+utility_meter:
+  lys_kost_faktisk_idag:
+    source: sensor.lys_kost_faktisk_total
+    cycle: daily
+    name: "Lys kost faktisk i dag"
+  lys_kost_baseline_idag:
+    source: sensor.lys_kost_baseline_total
+    cycle: daily
+    name: "Lys kost baseline i dag"
+  # 2026-06-25: lys_besparelse_dag_meter FJERNET. Den var et utility_meter oven
+  # på den IKKE-monotone sensor.lys_besparelse_total (max(baseline−faktisk,0) der
+  # falder når faktisk stiger) → utility_meter tolkede hvert fald som meter-reset
+  # og lagde den genvundne værdi til igen → ~37× oppustet dags-besparelse (1,18
+  # vs reelt 0,03 kr). Grafen peger nu i st.f. på sensor.lys_besparelse_i_dag
+  # (forskel mellem to RENE dags-meters, state_class total).

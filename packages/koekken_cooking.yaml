@@ -1,0 +1,874 @@
+# =============================================================================
+# Køkken madlavnings-lys — spots styres af Apolloens CENTRALE zone
+# =============================================================================
+# 2026-06-16: Køkken-spots (switch.koekken_spots) tænder ved AKKUMULERET
+# bevægelse foran køkken-Apollo (= madlavning → arbejdslys).
+#
+# 2026-06-17 (item 1 user-spec, omlagt):
+#   - LUX-GATED: tænder IKKE når der er lyst. Dedikeret slider
+#     input_number.koekken_spots_lux_threshold (absolut lux; koekken_lux_effektiv
+#     < tærskel → tilladt). Default 20 lx (rev.3 2026-07-24; #9 skiftede gaten
+#     fra open_plan til KØKKEN-Apolloen 07-08, og køkken-krogens dagslys-gulv er
+#     ~27 lx → 20 blokerer dagslys men tillader aften-madlavning). Erstatter den
+#     tidligere "tænder uanset lux"-adfærd (den fyrede spots i dagslys).
+#   - CENTRAL ZONE: akkumuleret bevægelse måles nu KUN i Apolloens centrale
+#     zone (radar zone 1-3 = 0-250 cm), ikke i periferien (op til 5,5 m).
+#     binary_sensor.koekken_apollo_central_zone samler de tre zoner.
+#   - SLUK (rev.2 2026-06-17, "wider zone only"): spots slukker når HELE
+#     køkken-feltet er tomt (binary_sensor.koekken_apollo_occupancy) + slider-
+#     forsinkelse — IKKE længere den tætte central-zone (den var for aggressiv:
+#     spots døde mens man lavede mad og trådte ud af de 250 cm). Se
+#     presence_koekken_spots_off i presence_koekken.yaml. Bemærk: ON bruger
+#     stadig central-zone-akkumulering (cooking-detection); kun OFF er udvidet.
+#     Spots er afkoblet fra almindelig køkken-presence (loft/lyskæde).
+#
+# Slider styrer aggressiviteten (hvor hurtigt spots tænder):
+#   input_number.koekken_cooking_aggressiveness (0-100, default 50)
+#     → sensor.koekken_cooking_threshold_min (minutter akkumuleret kræves)
+#       agg 0   → 12 min     (kræver lang vedvarende aktivitet før spots tænder)
+#       agg 50  → ~6.1 min   (default)
+#       agg 100 → 10 sek     (0.17 min — tænder næsten med det samme)
+#     2026-06-18: bunden sænket fra 1.5 min → 10 sek per user-spec, så slideren
+#     på max kan tænde spots næsten instant.
+#
+# Akkumuleret bevægelse = history_stats over central-zone-occupancy=on i de
+# sidste 15 min.
+# =============================================================================
+
+input_number:
+  koekken_cooking_aggressiveness:
+    name: "Køkken madlavnings-aggressivitet"
+    icon: mdi:stove
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-06-17 (item 1): dedikeret lux-tærskel for køkken-spots. Læses siden
+  # 2026-08-27 mod sensor.koekken_dagslys_lx (ÆGTE dagslys, vores eget lys
+  # trukket fra) — under denne værdi må spots tænde, over er de blokeret.
+  # 2026-08-29 (user-spec "køkkensessions skal ikke kun kunne ske om aftenen.
+  # hele dagen"): denne tærskel VAR grunden til at en madlavnings-session kun
+  # kunne starte om aftenen. Sessionen har ingen ur-gate overhovedet — men den
+  # kan kun fødes af presence_koekken_cooking_spots_on, og DEN stod bag et
+  # 45-lx-loft. Målt 27/8 (eneste hele solskinsdøgn med den nye dagslys-kanal):
+  # 539 af 837 samples lå over 45 lx = to tredjedele af dagen spærret, mens kun
+  # 112 lå over 250 og 7 over 400. Tærsklen er derfor hævet til 250 = et
+  # BLÆNDE-loft ("spottene ville alligevel ikke kunne ses") frem for en
+  # dagslys-spærre. Max hævet 300 → 600 så loftet kan skrues helt væk (køkkenets
+  # målte dagslys-max er 460 lx); 600 = gaten reelt fra.
+  # 2026-10-10 (user-bug "spots tænder trods meget lyst", valg a): 70 → 30.
+  # Målt i dag, sol 18-25°, ~10 % skyer: køkkenets dagslys kun 30-64 lx (indre
+  # sensor; spisestuen 107-152) → 21 auto-tændinger i dagtimerne. User slukkede
+  # selv 10:27 ved 39,4 lx, og hans manuelle kæde-sluk 7-9/10 lå ved 46-57 lx.
+  # Bonussen (koekken_session_lux_bonus_pct) virker nu (enheds-fejl rettet) og
+  # er aktiv i praksis hver gang nogen er i køkkenet → 30 × 1,25 = 37,5 < 39,4.
+  # Lyskæden tænder heller ikke for mørke over denne gate (koekken_lyskaede_lux_ok).
+  # Værdien bor i config_snapshots/ (fresh install).
+  koekken_spots_lux_threshold:
+    name: "Køkken-spots lux-tærskel"
+    icon: mdi:brightness-6
+    min: 0
+    max: 600
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-08-19f (user-spec "samme kontrol over alle rum"): køkken-spots var
+  # husets eneste presence-lys med en TÆND-grænse og ingen SLUK-grænse — blev
+  # de tændt en mørk morgen, kunne kun "køkkenet er tomt"-vejen slukke dem, uanset
+  # hvor lyst der blev. Default 0 = FRA (uændret adfærd) indtil user skruer op.
+  # Forbruges via sensor.koekken_spots_dagslys_sluk_effektiv (room_lux_tuning.yaml),
+  # som klamper mod tænd-tærsklen så tænd/sluk ikke kan invertere til en on/off-krig.
+  # Bevidst INGEN init_user_preferences-blok: den ønskede default ER min-værdien
+  # (0), så fresh install rammer den af sig selv. Ændrer du nogensinde defaulten
+  # til noget over 0, SKAL der tilføjes en init-blok (fejlklasse #5).
+  koekken_spots_dagslys_sluk_lux:
+    name: "Køkken-spots dagslys-sluk (0 = fra)"
+    icon: mdi:brightness-auto
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-06-17 (item 3): sekunder før spots slukker. Lav = mere aggressiv.
+  # NB målet er HELE Apollo-feltet, ikke central-zonen — rev.2 samme dag droppede
+  # zonen fordi spots døde midt i madlavningen når man trådte ud af de 250 cm.
+  #
+  # 2026-09-13d (user-spec "spots kan godt slukke hurtigere"): 75 → 30 s, målt.
+  #
+  # ⚠️ MÅLEVINDUET ER AFGØRENDE HER. Flapratet på occupancy_filtered kollapsede
+  # 20× da `naer_menneske` blev tilføjet 2026-09-04b (en person ved bordpladen
+  # blev før dømt ude af BEGGE varigheds-led og filtreret bort som spøgelse):
+  #   01/09: 2627 flaps/døgn · 03/09: 1427 · 04/09: 138 · 08/09: 6 · 13/09: 113
+  # Et 21-døgns vindue er derfor 90 % gammelt regime. Mål ALTID fra 06/09 frem.
+  #
+  # Nuværende regime (fra 06/09, 250 in-session-huller): p50 26 s, p75 84 s,
+  # p90 396 s. Modsat det gamle regime er de RESTERENDE huller ikke støj — de er
+  # ægte korte fravær. Derfor må tærsklen ikke længere "absorbere flapren"; den
+  # skal kun undgå at klippe under medianhullet. 30 s ligger lige over p50 = 26 s.
+  #
+  # Simuleret på 70 ægte spots-ON-perioder i nuværende regime:
+  #   75 s → median 241 s, 3,95 t tændt/døgn
+  #   45 s → median 139 s, 3,61 t/døgn   (spar 21 min/døgn)
+  #   30 s → median 112 s, 2,18 t/døgn   (spar 106 min/døgn)  ← valgt
+  #   20 s → median  83 s, 0,74 t/døgn   (spar 193 min/døgn, men under p50 = for
+  #          aggressivt: over halvdelen af normale pauser ville slukke lyset)
+  # Springet 45→30 er uproportionalt stort (+85 min/døgn for kun +2,6 sluk/døgn),
+  # fordi et UBRUDT hul er den knappe ressource: i lange sessioner optræder der
+  # aldrig et 45 s-hul, men godt et på 30 s.
+  # Halen kan ikke fjernes med et tal (jf. fejlklasse #25) — skal den væk, kræver
+  # det et AFGANGS-VIDNE (nabo-rummets Apollo), ikke en lavere tærskel.
+  #
+  # 2026-10-03 (user: "køkken apollo taber mig når jeg laver mad"): 30 → 60 s.
+  # "Ægte korte fravær" ovenfor holdt ikke: 23/9-3/10 fulgtes 216 af 388
+  # tomt-sluk (56 %) af gen-tænd inden 2 min, kronisk 5-14 pr. spot-time (ingen
+  # regression ved stue-kalibreringen 2/10). I 222 af 233 korte huller så
+  # kameraet heller ingen = user står stille, og begge kanaler er blinde.
+  # Afgangs-vidnet er MÅLT og skiller ikke: nabo-onset i [-5, +30] s fandtes ved
+  # 18 af 54 ægte afgange (> 10 min) og ved 133 af 434 huller < 60 s. Adaptiv
+  # forsinkelse (30 → 120 s efter en fejl) blev domineret af fast 60 s.
+  # Simuleret, 11 døgn:  30 s → 216 falske, 134 min mørke
+  #                      60 s → 109 falske,  90 min mørke, +14 min spot-tid/døgn
+  #                      90 s →  86 falske,  69 min mørke
+  # 60 ligger under de 75 s user fandt for langsomme 13/9. Selve tabet (still-
+  # energi under g2-g4's 22-23 ved komfuret) kræver støjgulv + live-capture (B182).
+  koekken_spots_off_seconds:
+    name: "Køkken-spots sluk-forsinkelse"
+    icon: mdi:timer-off
+    min: 0
+    max: 180
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-09-03b runde 3 (user-spec: "spots skal tænde ved 70% af rampen"): HVOR
+  # LANGT inde i lyskædens optrapning spottene lægges oven på. 100 = vent til
+  # kæden er helt i mål (den oprindelige adfærd), 0 = tænd med det samme.
+  # Måles i TID, ikke i lumen: rampens fremdrift kan ikke aflæses på pæren —
+  # brightness melder målet i samme sekund kaldet sendes (permanent faktum) — så
+  # ventetiden regnes ud af enforcerens egne fade-sensorer og ganges med denne.
+  # Den faste overhead (enforcerens reaktionstid) skaleres IKKE, kun selve fadet.
+  koekken_spots_ramp_pct:
+    name: "Køkken-spots: tænd ved % af lyskædens rampe"
+    icon: mdi:transfer-up
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-08-29d (user-spec: "køkkensessions skal startes ved 20% højere lux hvis
+  # der er mere end 5 min aktivitet i køkkenet — ok, hvis du er så meget i
+  # køkkenet, så tænder jeg allerede lyset for dig selv om det ikke er heeelt
+  # mørkt nok til det endnu"). Blænde-loftet (koekken_spots_lux_threshold) er en
+  # PÅSTAND om at spottene ikke ville kunne ses; står man og laver noget i
+  # køkkenet i flere minutter, er arbejdslys mere værd end den påstand.
+  # Måles på sensor.koekken_aktiv_15m (filtreret felt-occupancy, minutter af de
+  # sidste 15). BEVIDST ikke koekken_occupancy_recent: den er central-zone og
+  # kræver MOVING-target, så den lå på 0,24 min mens der faktisk blev lavet mad
+  # i 25 min (målt 29/8 16:06-16:31) = en tærskel på 5 kunne aldrig nås.
+  # Kalibreret samme dag på sensor.koekken_felt_aktiv_30m: tomt køkken 0,3-3,5 %,
+  # madlavning 22-94 % → 5 af 15 min skiller de to rent.
+  koekken_session_aktiv_minutter:
+    name: "Køkken: aktivitet der giver lux-bonus (min)"
+    icon: mdi:chef-hat
+    min: 1
+    max: 15
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Hvor meget blænde-loftet hæves når aktivitets-kravet ovenfor er opfyldt.
+  # 0 = feature FRA (gaten er præcis sliderens rå værdi, som før).
+  koekken_session_lux_bonus_pct:
+    name: "Køkken: lux-bonus ved vedvarende aktivitet (%)"
+    icon: mdi:brightness-percent
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-06-21 (user-spec "kitchen sessions"): når spots FØRST er tændt ved
+  # akkumulering kører en madlavnings-session hvor spots tænder HURTIGT igen ved
+  # bevægelse (ingen re-akkumulering — man går væk og kommer tilbage uden at
+  # vente). Sessionen SLUTTER når køkken-feltet har været tomt i SÅ mange minutter.
+  # Derefter kræver næste tænd fuld akkumulering igen. Consumer: presence_koekken.
+  # NB: trigger-`for:` binder ved load → fuld effekt efter HA-restart.
+  koekken_session_timeout_minutes:
+    name: "Køkken-session timeout (tomt før slut, min)"
+    icon: mdi:timer-sync-outline
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Runde 3b (2026-07-03, user-spec): under en session skal spots (+ lyskædens
+  # cooking-flip) IKKE gen-tænde instant ved gennemgang — central-zonen skal
+  # have været aktiv VEDVARENDE i så mange sekunder først. 0 = instant (som
+  # før). FØRSTE tænd via akkumulering er urørt. Default 10 via init + API-set.
+  # NB: trigger-`for:` binder ved load → slider-ændring kræver reload/restart.
+  koekken_session_relight_seconds:
+    name: "Køkken-session gen-tænd kræver (s)"
+    icon: mdi:timer-play-outline
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-08-19g: hvor længe en STILL-only detektion tæt på Apolloen (gate 0,
+  # < 75 cm) skal holde før den tros som et menneske. Kalibreret mod 14 døgns
+  # flap-log: 48 af 63 `g0 still`-hændelser varede PRÆCIS radarens timeout
+  # (number.koekken_apollo_radar_timeout = 5 s) = ét enkelt blip uden gentagelse,
+  # mens de 15 ægte varede 30-58 s. 8 s ligger over timeouten med margin og
+  # under den korteste ægte. 0 = filter fra.
+  koekken_naer_ghost_sekunder:
+    name: "Køkken: nær-spøgelse skal holde (s)"
+    icon: mdi:ghost-off-outline
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-09-04b (user: "det kan ikke være rigtigt at vi skal vente lang tid på
+  # køkkenlys"): VARIGHED kan ikke skille nær-spøgelse fra nær-menneske —
+  # GENTAGELSE kan. Slideren ovenfor kræver 11 s UBRUDT nær-detektion, men
+  # radarens egen timeout er 5 s, og et menneske i gate 0/1 (hvor LD2410'eren
+  # hverken har still-energi eller en åben move-gate) leveres som et TOG af
+  # timeout-korte blips — aldrig som ét langt udslag. Målt 14 døgn over 38.297
+  # nær-kandidat-flanker: 46 % varer PRÆCIS 5 s, p90 er 12,4 s. `naer_bekraeftet`
+  # er altså strukturelt uopnåelig for netop det menneske den blev bygget til at
+  # fange (den ramte 4 af 52 ankomster).
+  # Gentagelses-tætheden skiller derimod rent. Antal nær-flanker i 60 s, målt mod
+  # to kontroller (menneske = ±5 min af et ægte moving-target ≤ 250 cm;
+  # tomt = 02-05 om natten):
+  #   ≥3 flanker:  menneske 95,1 %  ·  nat 5,2 %
+  #   ≥4 flanker:  menneske 83,1 %  ·  nat 0,7 %   ← valgt
+  # ≥4 koster 12 point følsomhed og giver 7× færre falske tændinger — og den
+  # falske tænding er præcis 08-19g-klagen ("jeg ligger i sofaen og køkkenet er
+  # tomt"), så asymmetrien er bevidst. 0 = pulsvejen slået fra.
+  koekken_naer_pulser_min:
+    name: "Køkken: nær-pulser der beviser et menneske (60 s)"
+    icon: mdi:pulse
+    min: 0
+    max: 10
+    step: 1
+    unit_of_measurement: "flanker"
+    mode: slider
+
+  # Varigheds-krav for et still-ONLY udslag ANYWHERE i feltet — nær-filteret
+  # ovenfor dækker kun < 75 cm og lod resten passere. Kalibreret 2026-08-26 på
+  # 13,6 timers bevist tomt hus: alle 100 køkken-spøgelser varede ≤ 10,8 s
+  # (median 0,4 s, p90 4,4 s), mens et menneske kommer ind ad hurtig-vejen
+  # (moving-target) med nul forsinkelse. 15 s > radar-timeouten 5,0 s og har
+  # margin til det længste målte spøgelse. 0 = filter fra.
+  koekken_still_ghost_sekunder:
+    name: "Køkken: still-spøgelse skal holde (s)"
+    icon: mdi:ghost-off-outline
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-08-19g (user-spec): hvor længe et moving-target tæller som "nogen kom
+  # ind i køkkenet". Køkken-Apolloens STILL-rækkevidde er 6 m og når sofaen —
+  # user bekræftede live at et vedvarende still-mål i 3,1 m var ham i sofaen,
+  # ikke et menneske i køkkenet. Køkkenet er kun 2-3 m dybt, så afstand kan
+  # ikke skille de to ad; bevægelse kan. TÆND kræver derfor bevægelse, mens
+  # BLIV-TÆNDT stadig accepterer stilstand (man skal ikke mørklægges midt i
+  # madlavningen). 0 = krav fra.
+  koekken_taend_bevaegelse_sekunder:
+    name: "Køkken: tænd kræver bevægelse inden for (s)"
+    icon: mdi:run-fast
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-08-26d: hvor længe moving-target skal HOLDE før det tæller som et
+  # menneske. Målt over 5 døgn (1167 episoder): 53 % af alle — og 107 af nattens
+  # 134 — var puls ≤ 1 s, mens 1-3 s-båndet stort set var tomt (38 stk). Et krav
+  # på 2 s skiller derfor spøgelse fra menneske uden at koste ægte indgange.
+  # 2026-08-29 (user-incident "køkkenlyset hænger på fuldt on"): min hævet 0 → 2.
+  # Apolloen rapporterer ~1 gang/sek, så delay_on 0/1 s = ÉT radar-frame = ingen
+  # filtrering overhovedet. Sliderne blev sat til 1 s 28/8 kl. 21:00:05; fra den
+  # nat fyrede koekken_menneske_proof 24-38 gange i timen i et TOMT hus, hvert
+  # blip re-armede menneske_bevist's hold, hurtig-vejen stod åben i 10 timer, og
+  # occupancy_filtered = rå occupancy (duty 33 % mod 1 % natten før, længste
+  # off-stræk 51-78 s mod sluk-vejens 75 s) = strukturelt uslukkeligt køkken.
+  # Målt forskel: spøgelses-blip = 24-38 flanker/t men UNDER 4 sekunder i alt;
+  # et menneske = 14-142 sekunder/t. Varighed skiller dem, flanke-tal gør ikke.
+  # Derfor er "krav fra" ikke længere et lovligt valg — 2 s er gulvet.
+  koekken_taend_bevaegelse_min_sekunder:
+    name: "Køkken: bevægelse skal holde mindst (s)"
+    icon: mdi:timer-play-outline
+    min: 2
+    max: 10
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-08-27 (user-spec: "brug hvad vi ved til at holde igen når det er
+  # SANDSYNLIGT at det er ghost flaps — men det er det jo ikke på en hverdags
+  # morgen"). Hvor længe et bevist menneske må BLIVE bevist efter sidste
+  # bevægelse. I det vindue slipper rå occupancy direkte igennem filteret.
+  # Målt behov 27/8: user stod stille ved kaffemaskinen i 3 min 30 s (06:45:12
+  # → 06:48:42 uden ét moving-target) — 6 min giver luft uden at åbne natten.
+  # 0 = hurtig-vej fra.
+  koekken_menneske_bevist_minutter:
+    name: "Køkken: bevist menneske gælder i (min)"
+    icon: mdi:account-clock-outline
+    min: 0
+    max: 20
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-09-03c (user-incident "nu tændte køkken via ghost presence!"): hvor
+  # længe `menneske_proof` skal HOLDE før hurtig-vejen åbnes. Asymmetrien var
+  # hullet: 2 s bevis købte 6 minutters bypass af ghost-filteret = 180:1.
+  # Målt over 3 døgn (614 proof-episoder): 81 % varer ≤ 1 s efter kvalifikationen,
+  # og `bevist` stod on 1776 af 4287 min = 41 % af tiden — ghost-filteret var
+  # altså slået fra i 4 ud af 10 minutter. De blip der varer ≥ 3 s klumper sig
+  # præcis om måltiderne (08-31 17-18, 09-02 06 + 16-17, 09-03 06), mens de tomme
+  # timer (08-31 13-15, 09-01 09) har NUL. Varighed skiller igen, ikke flanke-tal.
+  # 0 = intet ekstra krav (gammel adfærd).
+  koekken_menneske_bevist_min_sekunder:
+    name: "Køkken: bevægelse skal holde før hurtig-vej (s)"
+    icon: mdi:account-clock
+    min: 0
+    max: 15
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-08-29: køkkenets sluk-veje spurgte ALLE om et UBRUDT hul — spots-sluk
+  # om 75 s tomt felt, anomali-vagten om 45 min. Køkken-Apolloen flapper
+  # 300-450 gange i timen døgnet rundt, så et ubrudt hul er den ene ting den
+  # ikke kan levere; hver gang filteret svigter, er der derfor NUL net tilbage.
+  # AKKUMULERET tomhed kan den levere: målt duty for occupancy_filtered er
+  # 0,1-1,1 % i et tomt hus mod 7-57 % når nogen er hjemme. Under denne grænse
+  # i 30 min = spots hænger, uanset HVILKEN sensor der løj.
+  koekken_spots_hang_pct:
+    name: "Køkken: spots hænger under (% aktivt felt/30 min)"
+    icon: mdi:lightbulb-alert-outline
+    min: 0
+    max: 25
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+input_boolean:
+  # 2026-06-21: aktiv køkken-madlavnings-session (se slider ovenfor). On =
+  # spots må tænde hurtigt ved bevægelse uden re-akkumulering.
+  koekken_session_active:
+    name: "Køkken-session aktiv"
+    icon: mdi:silverware-fork-knife
+
+  # 2026-09-03 (user-spec: "først ramper lyskæden op og når den rammer fuld, så
+  # tænder spots"). Rækkefølgen kunne ikke vendes så længe lyskædens cooking-
+  # mode blev DEFINERET af switch.koekken_spots: kæden kunne først vide at der
+  # laves mad efter spots var tændt. Dette flag er madlavnings-INTENTIONEN,
+  # sat af presence_koekken_cooking_spots_on FØR spots, og læst gennem
+  # binary_sensor.koekken_madlavningslys (spots ∪ dette flag, tidsbegrænset).
+  # Ryddes igen i samme action når spots er tændt — ankeret falder ikke, fordi
+  # spots overtager. Hænger flaget (HA-restart midt i rampen), udløber ankeret
+  # af sig selv efter fade-tiderne + 30 s. Bevidst uden `initial:`.
+  koekken_cooking_ramp:
+    name: "Køkken: lyskæde ramper op til madlavning"
+    icon: mdi:transfer-up
+
+template:
+  - binary_sensor:
+      # 2026-06-17 (item 1): Apolloens CENTRALE zone = radar zone 1+2+3
+      # (0-250 cm). Alt udenfor (op til ~5,5 m) = periferi → tæller ikke som
+      # "nogen står i køkkenet". Bruges som kilde til akkumuleret-bevægelse +
+      # aggressiv sluk.
+      # 2026-06-17 (item 3): inkluderer eksplicit STILL-target indenfor 250 cm, så
+      # en person der står stille i køkkenet holder zonen "occupied" (spots slukker
+      # ikke ved still target i zonen). Periferi-still (>250 cm) tæller IKKE.
+      - name: "Koekken Apollo central zone"
+        unique_id: koekken_apollo_central_zone
+        device_class: occupancy
+        icon: mdi:target
+        state: >
+          {% set zone_on = is_state('binary_sensor.koekken_apollo_radar_zone_1_occupancy', 'on')
+             or is_state('binary_sensor.koekken_apollo_radar_zone_2_occupancy', 'on')
+             or is_state('binary_sensor.koekken_apollo_radar_zone_3_occupancy', 'on') %}
+          {# 2026-09-03c (user-bug "nu tændte køkken via ghost presence"): den
+             MANGLENDE gate_dead-guard. LD2410'eren leverer ingen still-energi på
+             gate 0/1, og `still_distance` HVILER på 66-67 cm når radaren intet
+             ser (permanent faktum) — ikke 0, ikke unknown. 66 <= 250 er sandt,
+             så ethvert still_target-blip meldte "nogen står midt i køkkenet", og
+             central-zonen kunne stå on i 20+ s uden et menneske. Målt 3/9 08:32:
+             still_target=on, still_distance=66,0 (uændret på decimalen),
+             moving_target=off, moving_distance=unknown → session startet.
+             Guarden koster INTET ægte bevis: en person der står stille under
+             ~75 cm kan radaren fysisk ikke se via still-energi (døde knapper),
+             og bevæger hun sig, fanges hun af moving-grenen eller zone 1. #}
+          {% set sd = states('sensor.koekken_apollo_radar_still_distance') | float(9999) %}
+          {# 2026-09-04b: gate_dead-guarden (sd > 70) er korrekt så længe vi ikke
+             VED at der står nogen. Har nær-feltet leveret pulstoget, er det
+             bevist et menneske, og så er dets still-target ægte — ellers ville
+             spots-vejen være permanent blind for en person ved bordpladen. #}
+          {% set naer = is_state('binary_sensor.koekken_naer_menneske', 'on') %}
+          {% set still = is_state('binary_sensor.koekken_apollo_radar_still_target', 'on')
+             and sd <= 250 and (sd > 70 or naer) %}
+          {% set moving = is_state('binary_sensor.koekken_apollo_radar_moving_target', 'on')
+             and (states('sensor.koekken_apollo_radar_moving_distance') | float(9999)) <= 250 %}
+          {{ zone_on or still or moving }}
+
+      # =====================================================================
+      # NÆR-SPØGELSE (2026-08-19g) — user: "tændte køkken lige pga flap
+      # spøgelse. jeg ligger i sofaen og køkkenet er tomt"
+      # =====================================================================
+      # Signaturen er maskinel, ikke menneskelig: 21:02:45 gik occupancy on i
+      # PRÆCIS 5 s — radarens egen timeout — med still-target i gate 0 og
+      # ingen moving-target, og det tændte både lyskæde og spots. Samme
+      # fingeraftryk 11 gange samme aften, ~27 min mellem hver.
+      # NVRAM-vejen er udtømt: `number.koekken_apollo_g0_still_threshold` står
+      # ALLEREDE på 100 (max) og stopper det ikke — derfor filtreres i HA.
+      #
+      # Vi blokerer IKKE gate 0 generelt: 15 af 63 `g0 still`-hændelser varede
+      # 30-58 s og kan være et menneske der står helt stille tæt på sensoren.
+      # I stedet kræves det at detektionen OVERLEVER radarens timeout. Et
+      # menneske der står stille får sit lys `koekken_naer_ghost_sekunder`
+      # senere; et blip får det aldrig. Bevæger man sig overhovedet, er
+      # kandidaten falsk fra første øjeblik = nul forsinkelse.
+      - name: "Koekken Apollo naer kandidat"
+        unique_id: koekken_apollo_naer_kandidat
+        device_class: problem
+        icon: mdi:ghost
+        # float(9999) = fail-open: er still_distance unknown, filtrerer vi
+        # ikke (lyset opfører sig som før filteret fandtes).
+        state: >-
+          {{ (states('input_number.koekken_naer_ghost_sekunder') | float(0)) > 0
+             and is_state('binary_sensor.koekken_apollo_occupancy', 'on')
+             and is_state('binary_sensor.koekken_apollo_radar_moving_target', 'off')
+             and (states('sensor.koekken_apollo_radar_still_distance') | float(9999)) < 75 }}
+
+      # Kandidaten har holdt uafbrudt længere end radar-timeouten → det er et
+      # menneske, ikke et blip. delay_off = 0: falder straks, så filtered
+      # igen følger den rå sensor.
+      - name: "Koekken Apollo naer bekraeftet"
+        unique_id: koekken_apollo_naer_bekraeftet
+        device_class: occupancy
+        icon: mdi:account-clock
+        delay_on: >-
+          {{ states('input_number.koekken_naer_ghost_sekunder') | int(8) }}
+        state: "{{ is_state('binary_sensor.koekken_apollo_naer_kandidat', 'on') }}"
+
+      # =====================================================================
+      # NÆR-MENNESKE (2026-09-04b) — gentagelse, ikke varighed
+      # =====================================================================
+      # Den anden vej ud af nær-feltet. `naer_bekraeftet` ovenfor kræver ét
+      # langt ubrudt udslag; DENNE kræver mange korte inden for 60 s. De to er
+      # komplementære, ikke konkurrerende: et menneske der står helt stille tæt
+      # på sensoren giver det lange udslag, et menneske der laver kaffe giver
+      # blip-toget. Begge var før dømt som spøgelser.
+      # Kalibrering + kontroller: se input_number.koekken_naer_pulser_min.
+      #
+      # Sofa-immun pr. konstruktion: `naer_kandidat` kræver still_distance
+      # < 75 cm, og sofaen ligger ~6 m væk — der findes ingen sofa-adfærd der
+      # kan producere en nær-puls. Det er derfor forsvarligt at lade denne
+      # sensor tænde lys, hvor rå occupancy aldrig må.
+      #
+      # delay_off 30 s er debounce, ikke en adfærds-knap: tællingen falder af
+      # sig selv når vinduet glider videre (personen er væk inden for 60 s), og
+      # de 30 s forhindrer kun at sensoren flapper mens tallet vipper omkring
+      # tærsklen. Bevidst INGEN delay_on — beviset ER de 60 s der allerede er
+      # gået.
+      - name: "Koekken naer menneske"
+        unique_id: koekken_naer_menneske
+        device_class: occupancy
+        icon: mdi:account-alert-outline
+        delay_off: 30
+        state: >-
+          {% set m = states('input_number.koekken_naer_pulser_min') | float(0) %}
+          {{ m > 0 and (states('sensor.koekken_naer_pulser') | float(0)) >= m }}
+
+      # --- HURTIG-VEJ: bevægelse = menneske, ingen forsinkelse ---------------
+      # delay_off 20 s er hele pointen (samme fælde som stuen ramte 08-20d): et
+      # moving_target BLINKER, og et øjebliks-udtryk ville lade hurtig-vejen
+      # skifte med hvert blink, så `filtered` sendte flere flanker ud end den
+      # fik ind. Klæbrigheden holder vinduet åbent til varigheds-beviset
+      # nedenfor har overtaget. Klæbrigheden FØLGER slideren (+5 s): et fast
+      # tal ville åbne en sprække hvor hverken hurtig-vej eller varigheds-bevis
+      # holder, hvis slideren sættes højere end det — og i den sprække flapper
+      # `filtered`, præcis 08-20d-signaturen.
+      # ≤ 250 cm er køkkenets etablerede akse (feltet når sofaen 6 m væk); den
+      # genbruges her, så stue-bevægelse ikke kan validere køkken-occupancy.
+      # float(9999) = fail-CLOSED: moving_distance er 'unknown' når der intet
+      # mål er (målt 113/113 samples i tomt hus), og må ikke blive til 0 cm.
+      - name: "Koekken Apollo bevaegelse frisk"
+        unique_id: koekken_apollo_bevaegelse_frisk
+        device_class: motion
+        icon: mdi:motion-sensor
+        delay_off: >-
+          {{ [20, (states('input_number.koekken_still_ghost_sekunder') | int(15)) + 5] | max }}
+        state: >-
+          {{ is_state('binary_sensor.koekken_apollo_radar_moving_target', 'on')
+             and (states('sensor.koekken_apollo_radar_moving_distance') | float(9999)) <= 250 }}
+
+      # 2026-09-04b: RÅ spejl af tænd-aksen, HELT uden delays. To formål:
+      # (1) `binary_sensor.*_apollo_radar_moving_target` er recorder-ekskluderet,
+      #     så history_stats kan ikke akkumulere på den direkte — den skal
+      #     spejles i en egen template-sensor (samme mønster som børneværelset).
+      # (2) den er måle-punktet for hvor meget bevægelse der FAKTISK er, før
+      #     nogen delay har spist den.
+      - name: "Koekken bevaegelse raa"
+        unique_id: koekken_bevaegelse_raa
+        device_class: motion
+        icon: mdi:radar
+        state: >-
+          {{ is_state('binary_sensor.koekken_apollo_radar_moving_target', 'on')
+             and (states('sensor.koekken_apollo_radar_moving_distance') | float(9999)) <= 250 }}
+
+      # --- LANGSOM VEJ: udslaget overlevede radar-timeouten = menneske -------
+      # delay_off = 0 → falder straks når rå occupancy slipper, så filtered
+      # aldrig hænger længere end kilden.
+      - name: "Koekken Apollo still bekraeftet"
+        unique_id: koekken_apollo_still_bekraeftet
+        device_class: occupancy
+        icon: mdi:account-clock
+        delay_on: >-
+          {{ states('input_number.koekken_still_ghost_sekunder') | int(15) }}
+        state: "{{ is_state('binary_sensor.koekken_apollo_occupancy', 'on') }}"
+
+      # Rå occupancy MINUS ubekræftede nær-spøgelser. Lys-vejene (tænd OG sluk)
+      # læser denne; øvrige forbrugere (activity_state, people_estimate,
+      # ai_trainer m.fl.) læser stadig den rå — de tåler et 5 s blip, og et
+      # bredere skifte hører til sin egen gennemgang (#16).
+      # delay_on 1 s: occupancy-flanken og still_distance-opdateringen kommer
+      # ikke garanteret i samme event, så uden den kan et blip nå at slippe
+      # igennem på en STALE afstand fra sidste rigtige besøg. 1 s er
+      # radio-plumbing, ikke en adfærds-knap.
+      - name: "Koekken Apollo Occupancy Filtered"
+        unique_id: koekken_apollo_occupancy_filtered
+        device_class: occupancy
+        icon: mdi:account-check
+        availability: >-
+          {{ states('binary_sensor.koekken_apollo_occupancy') not in ['unknown', 'unavailable'] }}
+        delay_on: 1
+        # frossen ghost (packages/apollo_frossen_ghost.yaml): nær-filteret ovenfor kigger
+        # kun under 75 cm, så xray latchede rummet på et møbel 2,4 m væk.
+        # Findes sensoren ikke (xray rullet tilbage), er is_state False = ingen
+        # maskering.
+        # Varigheds-kravet (2026-08-26) er ET AND-led mere, ikke en erstatning:
+        # nær-filteret rammer < 75 cm hurtigere (8 s), varigheds-kravet rammer
+        # resten af feltet. Slider på 0 → hele leddet er sandt = filter fra.
+        # 2026-08-27: `koekken_menneske_bevist` er en hurtig-vej UDENOM begge
+        # varigheds-krav — står der beviseligt et menneske i rummet, er de her
+        # blips ham, ikke et spøgelse. Den frosne ghost er IKKE undtaget: en
+        # værdi der står identisk til decimalen er et møbel uanset hvem der
+        # ellers er i rummet.
+        state: >-
+          {# 2026-09-04b: `naer_menneske` er en tredje hurtig-vej, sidestillet med
+             `menneske_bevist`. Uden den er en person ved bordpladen dømt ude i
+             BEGGE led: hun ER en naer_kandidat (still < 75 cm), og hun kan
+             hverken nå naer_bekraeftet (11 s > radarens 5 s timeout) eller
+             still_bekraeftet (15 s ubrudt occupancy). Præcis det målte hul
+             06:44:04 → 06:48:43 hvor filteret lå dødt mens der blev lavet kaffe.
+             Bevidst UDEN om menneske_bevist's 20-min latch: en pulsbevist
+             person skal holde så længe hun pulser, ikke 20 min efter (08-27b's
+             uslukkelige køkken). #}
+          {{ is_state('binary_sensor.koekken_apollo_occupancy', 'on')
+             and not is_state('binary_sensor.koekken_apollo_frossen_ghost', 'on')
+             and (is_state('binary_sensor.koekken_menneske_bevist', 'on')
+                  or is_state('binary_sensor.koekken_naer_menneske', 'on')
+                  or ((is_state('binary_sensor.koekken_apollo_naer_kandidat', 'off')
+                       or is_state('binary_sensor.koekken_apollo_naer_bekraeftet', 'on'))
+                      and ((states('input_number.koekken_still_ghost_sekunder') | float(0)) <= 0
+                           or is_state('binary_sensor.koekken_apollo_bevaegelse_frisk', 'on')
+                           or is_state('binary_sensor.koekken_apollo_still_bekraeftet', 'on')))) }}
+
+      # =====================================================================
+      # TÆND-BEVIS (2026-08-19g, user-spec) — kun bevægelse må tænde
+      # =====================================================================
+      # Et still-target alene er IKKE bevis for et menneske i køkkenet: radaren
+      # ser 6 m og rammer sofaen, og en person i sofaen er pr. definition et
+      # still-target. Målt live 21:14: vedvarende still i 3,1 m tændte lyskæde
+      # + spots i et tomt køkken mens user lå i sofaen. Afstand kan ikke skille
+      # dem (køkkenet er 2-3 m dybt, sofaen lige udenfor) — bevægelse kan.
+      # delay_off = slider: bevægelse er øjeblikkelig og ville ellers være
+      # forsvundet igen når tænd-vejens 500 ms debounce evaluerer.
+      # Bruges KUN af tænd-vejene. Sluk-vejene rører den ikke — står man stille
+      # i køkkenet, skal lyset blive.
+      # 2026-08-26d: delay_on — et enkelt radar-frame er IKKE bevægelse. Uden det
+      # tændte et sub-sekund moving-blip lyskæden 04:13 i et tomt hus, og fordi
+      # lyskæden er open-plan-AMBIENT kunne den først slukke da open-plan endelig
+      # var tom 07:54 (3 t 41 min). Spøgelserne tændte den altså OG nulstillede
+      # den 20-minutters tomheds-timer der er dens eneste sluk-vej.
+      - name: "Koekken bevaegelse nylig"
+        unique_id: koekken_bevaegelse_nylig
+        device_class: motion
+        icon: mdi:motion-sensor
+        # 2026-09-04b: delay_on FJERNET — akkumuleringen ER kravet nu.
+        # `delay_on: 2` betød "moving-target uafbrudt inden for 250 cm i 2 hele
+        # sekunder", og det leverer radaren stort set aldrig. Målt 14 døgn:
+        # 6.146 kvalificerende bevægelses-episoder, hvoraf kun 481 (7,8 %) nåede
+        # at producere et 2-sekunders bevis — 92,2 % blev kasseret. Og de der
+        # slap igennem varede derefter median 0,1 s, p90 2,3 s: signalet er
+        # sub-sekund-blink, ikke et plateau. Kravet var altså ikke strengt, det
+        # var uopfyldeligt, og DET er hele ventetiden.
+        # Beskyttelsen mod 08-26d (ét sub-sekund-blip tændte lyskæden 04:13 i et
+        # tomt hus) er intakt: et enkelt blip akkumulerer ~0,3 s og kommer ikke i
+        # nærheden af 2 s. Vi kræver stadig 2 sekunders bevægelse — bare INDEN
+        # FOR 15 s i stedet for I TRÆK.
+        delay_off: >-
+          {{ states('input_number.koekken_taend_bevaegelse_sekunder') | int(20) }}
+        # TÆND-beviset var indtil nu ene og alene et moving-target.
+        # Det udelukker strukturelt hele nær-feltet: g0_move står på 100 (pinnet
+        # FRA) og g1_move på 50, så en person inden for ~1,5 m af Apolloen
+        # producerer INTET moving-target overhovedet — hun kan ikke bevise sig,
+        # uanset hvor længe hun venter. Gaten kan ikke løse det: den ghost-
+        # signatur der blev lukket ude 09-03 (g1_move 22 → 50, 2882 → 11 rå
+        # flap/døgn) er FYSISK IDENTISK med nær-mennesket, så at rulle gaten
+        # tilbage ville hente begge ind igen. Filtreringen hører i HA, ikke i
+        # gate-tærsklerne — og i HA har vi tidsdomænet radaren mangler.
+        # `naer_menneske` er den kanal. Sofa-immun (still < 75 cm), så den må
+        # tænde lys.
+        # 2026-09-04g (user: "køkkenlyset er stadig en my for lang tid om at
+        # tændes"). Målt 19 t på den NYE akkumulator-kanal, 145 bevægelses-
+        # bursts: burst-start → bevis fyrer p50 **7,2 s**, p90 15,3 s, og 62 af
+        # 145 bursts nåede aldrig et bevis.
+        # Årsagen er en TÆRSKEL-KLIFF, ikke en langsom sensor: et enkelt rå
+        # udslag varer p50 1,09 s (p90 3,18). Kræver man 2 s, skal man derfor
+        # næsten altid vente på DET NÆSTE udslag — og den ventetid ER hele
+        # forsinkelsen. Replay af de 145 bursts mod kravet:
+        #   krav 2,00 → 107 bursts, p50 5,20 s      krav 1,25 → 108, p50 5,11 s
+        #   krav 1,50 → 108 bursts, p50 5,11 s      krav 1,00 → 136, p50 1,10 s
+        # Alt mellem 1,25 og 2,0 er altså gratis-stramning: det koster 4 sekunder
+        # og køber INGEN ekstra afvisning. Først ved 1,0 falder kravet under
+        # median-udslaget, og så fyrer beviset på det FØRSTE udslag.
+        # 08-26d-beskyttelsen er intakt fordi den er BETINGET, ikke slækket:
+        # spøgelset dér var et SUB-sekund-blip kl. 04:13 i et tomt hus, og de
+        # 2 s gælder uændret præcis når det scenarie er muligt (godnat eller
+        # Dormant). Er huset vågent og beboet, koster et 1,0-s-krav stadig mere
+        # end det målte spøgelse kan levere. Jf. "filter skal være betinget":
+        # hold kun igen når et spøgelse er sandsynligt.
+        # NB slideren røres IKKE — den er delt med koekken_menneske_proof's
+        # delay_on (20-min menneske-latch), og DEN skal blive på 2 s.
+        state: >-
+          {% set akk = (states('sensor.koekken_bevaegelse_akkumuleret') | float(0)) * 3600 %}
+          {% set krav = states('input_number.koekken_taend_bevaegelse_min_sekunder') | float(2) %}
+          {% set streng = is_state('input_boolean.godnat_active', 'on')
+                          or is_state('input_select.house_state', 'Dormant') %}
+          {% set krav = krav if streng else [krav, 1.0] | min %}
+          {{ (states('input_number.koekken_taend_bevaegelse_sekunder') | float(20)) <= 0
+             or is_state('binary_sensor.koekken_naer_menneske', 'on')
+             or (krav <= 0 and is_state('binary_sensor.koekken_bevaegelse_raa', 'on'))
+             or (krav > 0 and akk >= krav) }}
+
+      # =====================================================================
+      # BEVIST MENNESKE (2026-08-27, user-spec) — hurtig-vej UDENOM filteret
+      # =====================================================================
+      # Spøgelses-filtrene nedenfor kræver at hvert enkelt udslag beviser sig
+      # selv forfra: enten et moving-target NU, eller rå occupancy holdt
+      # uafbrudt i koekken_still_ghost_sekunder. Begge krav fejler for et
+      # menneske der står STILLE tæt på sensoren — LD2410'eren har ingen
+      # still-energi på gate 0/1, så han leveres som 5-sekunders blips med
+      # still_distance på hvile-værdien 66-67 cm, hvilket samtidig gør ham til
+      # en `naer_kandidat`. Målt 27/8: occupancy_filtered lå DØD 06:44:04
+      # → 06:48:43 (4 min 39 s) mens der blev lavet kaffe, og spots slukkede
+      # på "køkken tomt i 95 s". Rå occupancy var i samme vindue on hvert
+      # 6-29 s — beviset var der, filteret ville bare ikke tro på det.
+      #
+      # Derfor: når huset ÉN gang har bevist et menneske, gælder beviset et
+      # stykke tid. Proof = moving-target inden for køkkenets 250 cm-akse,
+      # holdt lige så længe som tænd-vejen kræver (samme 2 s der skiller
+      # spøgelse fra menneske, 08-26d) — et sub-sekund natte-blip kan altså
+      # IKKE åbne hurtig-vejen. 250 cm-aksen holder sofa-bevægelse ude.
+      #
+      # Bevidst IKKE bygget på nabo-rummenes occupancy: køkken-Apolloens felt
+      # når selv stuen, så en varm stue gør et køkken-still-udslag MERE
+      # mistænkeligt, ikke mindre (08-26f). Et bevis fra rummets EGEN
+      # bevægelses-akse er både skarpere og løkke-frit.
+      # 2026-08-27b: BEVISET og HOLDET skal ligge i hver sin sensor. Ligger
+      # delay_on og delay_off på SAMME udtryk, bevogter de 2 s kun ÅBNINGEN:
+      # et 1-samples moving-target-blip renderer templaten True et øjeblik, og
+      # HA annullerer det ventende delay_off uden at kræve nogen varighed. Det
+      # blip der ikke må kunne åbne hurtig-vejen, kan altså holde den åben —
+      # for evigt. Målt 27/8 21:32: `bevist` stod on i 357 min på et 6-min
+      # hold, hvorefter occupancy_filtered = rå occupancy (447 flap på 66 min,
+      # længste ubrudte off-stræk 63,3 s mod sluk-vejens krav på 95 s) og
+      # køkkenet strukturelt ikke kunne slukke sig selv.
+      - name: "Koekken menneske proof"
+        unique_id: koekken_menneske_proof
+        device_class: occupancy
+        icon: mdi:motion-sensor
+        delay_on: >-
+          {{ states('input_number.koekken_taend_bevaegelse_min_sekunder') | int(2) }}
+        state: >-
+          {{ is_state('binary_sensor.koekken_apollo_radar_moving_target', 'on')
+             and (states('sensor.koekken_apollo_radar_moving_distance') | float(9999)) <= 250 }}
+
+      # 2026-09-03c: BEVIS-leddet for hurtig-vejen, skilt ud i sin egen sensor.
+      # Kravet må IKKE lægges som delay_on på `bevist` selv — delay_on + delay_off
+      # på samme udtryk bevogter kun åbningen, og et blip ville så annullere det
+      # ventende delay_off uden at opfylde delay_on (præcis den 08-27b-fælde der
+      # allerede kostede et uslukkeligt køkken). Derfor: BEVIS her (kun delay_on),
+      # HOLD i `bevist` (kun delay_off).
+      - name: "Koekken menneske proof vedvarende"
+        unique_id: koekken_menneske_proof_vedvarende
+        device_class: occupancy
+        icon: mdi:motion-sensor
+        delay_on: >-
+          {{ states('input_number.koekken_menneske_bevist_min_sekunder') | int(3) }}
+        state: >-
+          {{ is_state('binary_sensor.koekken_menneske_proof', 'on') }}
+
+      - name: "Koekken menneske bevist"
+        unique_id: koekken_menneske_bevist
+        device_class: occupancy
+        icon: mdi:account-check-outline
+        delay_off: >-
+          {{ ((states('input_number.koekken_menneske_bevist_minutter') | float(6)) * 60) | int }}
+        state: >-
+          {{ is_state('binary_sensor.koekken_menneske_proof_vedvarende', 'on') }}
+
+      # Samme maskering på central-zonen — spots-vejen hænger på DEN, ikke på
+      # occupancy, så en filtrering kun ét sted ville lade spots tænde videre.
+      - name: "Koekken Apollo central zone filtered"
+        unique_id: koekken_apollo_central_zone_filtered
+        device_class: occupancy
+        icon: mdi:target-account
+        availability: >-
+          {{ states('binary_sensor.koekken_apollo_central_zone') not in ['unknown', 'unavailable'] }}
+        delay_on: 1
+        # 2026-08-27: samme hurtig-vej som i occupancy_filtered (#2 — filtreres
+        # der kun ét sted, divergerer de to veje).
+        state: >-
+          {{ is_state('binary_sensor.koekken_apollo_central_zone', 'on')
+             and (is_state('binary_sensor.koekken_menneske_bevist', 'on')
+                  or is_state('binary_sensor.koekken_naer_menneske', 'on')
+                  or is_state('binary_sensor.koekken_apollo_naer_kandidat', 'off')
+                  or is_state('binary_sensor.koekken_apollo_naer_bekraeftet', 'on')) }}
+
+  - sensor:
+      # Minutter akkumuleret bevægelse der kræves før spots tænder.
+      # Inverse mapping: høj slider = lav tærskel = mere aggressiv.
+      - name: "Koekken cooking threshold min"
+        unique_id: koekken_cooking_threshold_min
+        unit_of_measurement: "min"
+        icon: mdi:timer-sand
+        state: >
+          {# Lineær: agg 0 = 720 s (12 min), agg 100 = 3 s. Output i MINUTTER
+             (sammenlignes mod koekken_occupancy_recent*60 i presence_koekken).
+             2026-06-18: bund sænket 90 s → 10 s per user-spec.
+             2026-09-28: bund 10 s → 3 s (user: "sæt de 10s ned til 3s") —
+             første tænding var median 26 s over 21-28/9. #}
+          {% set agg = states('input_number.koekken_cooking_aggressiveness') | float(50) %}
+          {% set secs = 720 - (agg / 100 * (720 - 3)) %}
+          {{ (secs / 60) | round(2) }}
+
+      # 2026-08-29d: det blænde-loft presence_koekken_cooking_spots_on faktisk
+      # sammenligner mod. = sliderens rå værdi, hævet med bonus-procenten når
+      # køkkenet har været aktivt længe nok (se sliderne ovenfor). ÉT anker (#2):
+      # både tænd-vejen og dagslys-sluk-klampen (room_lux_tuning) læser DENNE, så
+      # de ikke kan invertere til en tænd/sluk-krig når bonussen er aktiv.
+      - name: "Koekken spots lux gate effektiv"
+        unique_id: koekken_spots_lux_gate_effektiv
+        unit_of_measurement: "lx"
+        icon: mdi:brightness-6
+        state: >
+          {% set raa = states('input_number.koekken_spots_lux_threshold') | float(0) %}
+          {% set pct = states('input_number.koekken_session_lux_bonus_pct') | float(0) %}
+          {% set kraev = states('input_number.koekken_session_aktiv_minutter') | float(5) %}
+          {# 2026-10-10 (user-bug "spots tænder trods meget lyst"): koekken_aktiv_15m
+             er en history_stats type: time = TIMER, kravet er MINUTTER — bonussen
+             krævede reelt 1 times aktivitet af 15 min og fyrede aldrig. × 60. #}
+          {% set aktiv = (states('sensor.koekken_aktiv_15m') | float(0)) * 60 %}
+          {% if raa <= 0 or pct <= 0 or aktiv < kraev %}
+            {{ raa | round(1) }}
+          {% else %}
+            {{ (raa * (1 + pct / 100)) | round(1) }}
+          {% endif %}
+        attributes:
+          bonus_aktiv: >-
+            {{ (states('input_number.koekken_session_lux_bonus_pct') | float(0)) > 0
+               and (states('sensor.koekken_aktiv_15m') | float(0)) * 60
+                   >= (states('input_number.koekken_session_aktiv_minutter') | float(5)) }}
+          aktiv_min: "{{ ((states('sensor.koekken_aktiv_15m') | float(0)) * 60) | round(1) }}"
+          raa_gate: "{{ states('input_number.koekken_spots_lux_threshold') }}"
+          maaler_mod: sensor.koekken_dagslys_lx
+
+sensor:
+  # Akkumuleret CENTRAL-ZONE-occupancy (minutter on) i de sidste 15 min.
+  # 2026-06-17 (item 1): kilde ændret fra koekken_apollo_occupancy (hele feltet,
+  # inkl. periferi) → koekken_apollo_central_zone (0-250 cm).
+  - platform: history_stats
+    name: "Koekken occupancy recent"
+    unique_id: koekken_occupancy_recent
+    entity_id: binary_sensor.koekken_apollo_central_zone
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      minutes: 15
+
+  # Akkumuleret tomhed (2026-08-29) — se koekken_spots_hang_pct. Bevidst på
+  # occupancy_filtered og ikke på den rå: det er DEN lys-vejene handler på, så
+  # det er DEN et hæng skal måles på. `ratio` giver 0-100 %.
+  - platform: history_stats
+    name: "Koekken felt aktiv 30m"
+    unique_id: koekken_felt_aktiv_30m
+    entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+    state: "on"
+    type: ratio
+    end: "{{ now() }}"
+    duration:
+      minutes: 30
+
+  # 2026-08-29d: MINUTTER aktivt køkken-felt i de sidste 15 min — bærer
+  # lux-bonussen (koekken_spots_lux_gate_effektiv). Bevidst samme kilde som
+  # felt_aktiv_30m (occupancy_filtered = den lys-vejene handler på), men `time`
+  # i stedet for `ratio`, så user-spec'ens "mere end 5 min" kan læses direkte
+  # uden en procent-oversættelse der kan divergere fra vinduet (#2).
+  # 2026-09-04b: AKKUMULERET bevægelse på tænd-aksen i de sidste 15 s.
+  # Erstatter det umulige "2 sammenhængende sekunder" — se koekken_bevaegelse_nylig.
+  # 15 s er vinduet, ikke tærsklen; tærsklen er slideren
+  # koekken_taend_bevaegelse_min_sekunder, som nu læses som "sekunder INDEN FOR
+  # vinduet" i stedet for "sekunder i træk".
+  - platform: history_stats
+    name: "Koekken bevaegelse akkumuleret"
+    unique_id: koekken_bevaegelse_akkumuleret
+    entity_id: binary_sensor.koekken_bevaegelse_raa
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      seconds: 15
+
+  # 2026-09-04b: antal nær-kandidat-FLANKER i de sidste 60 s. Bevidst `count`
+  # og ikke `time`: varigheden er ubrugelig her (46 % af udslagene er præcis
+  # radarens 5 s timeout), mens gentagelses-tætheden er husets skarpeste
+  # nær-felts-diskriminator. Kilden er recorder-ført, så vinduet er ægte
+  # historik — ikke en akkumulator der kan latche (#20).
+  - platform: history_stats
+    name: "Koekken naer pulser"
+    unique_id: koekken_naer_pulser
+    entity_id: binary_sensor.koekken_apollo_naer_kandidat
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      seconds: 60
+
+  - platform: history_stats
+    name: "Koekken aktiv 15m"
+    unique_id: koekken_aktiv_15m
+    entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      minutes: 15

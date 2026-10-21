@@ -1,0 +1,1572 @@
+# =============================================================================
+# Global Tuning — sliders for system-wide UX tuning (Companion app diagnostik)
+# =============================================================================
+# Sprint 2026-05-07 (sen-PM): Original 4 sliders implementeret.
+# Sprint audit-5 2026-05-12: Widened extremes + 3 nye sliders + bedre doc.
+# Sprint 2026-06-05: Widened extremes igen (bredere ekstremer på alle 5
+#   factor-sliders) + 2 nye night-dim sliders (putte-natlys + nattur) +
+#   bredere bedtime-range (16-23). Baseline (slider=50 → factor 1.0) uændret.
+# Sprint 2026-06-06: Widened ALLE resterende direkte-værdi sliders (brightness,
+#   minutter, timer, kelvin, fade) + skubbede de 6 factor-sliders endnu mere
+#   ekstreme (light 0.02-6.0, sensor 12-0.05, turn-off 20-0.01, lux 0.02-15,
+#   kids-speed 5-0.15, fade 5-0.1). User-request: "mere ekstreme valgmuligheder,
+#   alle sliders, så jeg kan tune mere". UNDTAGET: evening_warmth (allerede ved fysisk
+#   2000K-max). Baseline (slider=50 → factor 1.0) STADIG uændret overalt.
+#
+# DESIGN:
+#   slider 0-100 → factor (per-slider math, se under hver sensor)
+#   factor 1.0 ved slider=50 → ingen ændring fra current state
+#   Math caps min/max så slider-extremes ikke giver UX-katastrofe
+#
+# HVORDAN DET VIRKER:
+#   1. Du flytter en slider i HA Companion app (Diagnostik dashboard)
+#   2. Computed factor sensor opdateres øjeblikkeligt
+#   3. Næste automation-trigger bruger den nye factor (ikke retroaktivt
+#      — eksisterende fade fortsætter med gamle værdi)
+#
+# HUSK: factor = 1.0 (slider=50) er current baseline behavior.
+# Flyt langsomt + observer effekten over 1 dag før du tuner videre.
+# =============================================================================
+
+# =============================================================================
+# PERSISTENCE NOTE (audit-fix 2026-05-07):
+# input_number `initial:` field FORCES reset on every HA restart (HA gotcha).
+# Removed `initial: 50` from alle sliders → HA bevarer last-set value via
+# state registry across restarts + updates. Fresh install = starts på `min: 0`
+# → automation `init_user_preferences_first_boot` sætter til 50 automatically.
+# =============================================================================
+input_number:
+  # Sprint 2026-05-20: %-sliders step 5 → 1 (finere granularitet) + factor
+  # extremes widened i piecewise formulas (se sensors-section nederst).
+  # User-feedback: sliders begrænsede for meget — vil have bredere span.
+
+  # INTERN markoer (B39-fix 2026-07-19): versioneret init-gate. Bump
+  # prefs_code_version i automations/init_user_preferences.yaml naar en NY
+  # slider tilfoejes → init koerer EEN gang til og seeder den nye slider.
+  # Kill-switches roeres IKKE ved re-run (kun genuine fresh install taender
+  # dem). INGEN initial: → persisterer paa tvaers af restarts. Roer ikke.
+  user_prefs_version:
+    name: "Init: user prefs version (intern markoer)"
+    icon: mdi:counter
+    min: 0
+    max: 1000
+    step: 1
+    mode: box
+
+  global_light_aggressiveness:
+    name: "Global Light Aggressiveness"
+    icon: mdi:lightbulb-on-outline
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # FØLSOMHEDS-SLIDERNE ER FJERNET FOR ALLE APOLLOER (2026-07-09b, user-spec:
+  # "fjern one-slider løsningen fra alle andre apolloer og giv mig det som sove
+  # har nu"). Den gamle faktor-model (én slider × alle gates) er erstattet af
+  # FULD per-gate kontrol for hver Apollo:
+  #   - sove  → packages/sove_apollo_per_gate.yaml (2026-07-09a)
+  #   - stue/spisestue/koekken/boernevaerelse → packages/apollo_per_gate.yaml
+  # Faktor-tuneren (automations/apollo_radar_global_tuning.yaml) + apply_now/
+  # tune_room (script_pkg/apollo_helpers.yaml) er slettet. De 4 factor-sensorer
+  # nedenfor er også fjernet. (De gamle input_number.{rum}_sensitivity +
+  # sensor.{rum}_radar_threshold_factor står 'unavailable' til næste restart.)
+
+  global_turn_off_aggressiveness:
+    name: "Global Turn-Off Aggressiveness"
+    icon: mdi:timer-off-outline
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  global_lux_sensitivity:
+    name: "Global LUX Sensitivity"
+    icon: mdi:brightness-6
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # ===========================================================================
+  # NEW Audit-5 2026-05-12 — 3 ekstra sliders
+  # ===========================================================================
+  # Wakeup brightness target (% til adults Phase 3).
+  # Hard-coded 80% i wakeup_alarm_driven_adults. Nu slider-tunable.
+  # 100% = "kommerciel kontorbelysning", 30% = "soft wake".
+  global_wakeup_brightness_pct:
+    name: "Wakeup: target brightness % (adults Phase 3)"
+    icon: mdi:weather-sunset-up
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-06-28 (user-spec, slider-hunt): terrasse-winddown dæmpnings-mål.
+  # Når man har været på terrassen i 10 min dæmpes fælles-loftslysene langsomt
+  # ned til denne % (over 10 min). Tidligere hardcoded 30. Slideren styrer BÅDE
+  # målet OG gaten (kun lys OVER målet dæmpes — undgår at BRIGHTNE allerede-dæmpet
+  # lys). Consumer: automations/activity_aware.yaml (terrasse-winddown).
+  global_winddown_target_pct:
+    name: "Winddown: terrasse-dæmpnings-mål %"
+    icon: mdi:brightness-4
+    min: 5
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Auto-godnat timer minutter (kun-sovevaerelse presence trigger godnat).
+  # Tidligere hardcoded 120 min (2h). Slider giver 30-240 min.
+  # Hvis du vil at auto-godnat fyrer hurtigere = lav værdi.
+  global_auto_godnat_minutes:
+    name: "Auto-godnat: minutter soveværelse-only før commit"
+    icon: mdi:weather-night
+    min: 5
+    max: 720
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Evening CT warmth offset (auto_color_temp_evening).
+  # WIRED audit-5 2026-05-12 — see packages/activity_state.yaml::auto_color_temp_evening
+  # 0   = ingen evening shift (CT forbliver 2850K hele aftenen)
+  # 50  = current baseline (4-bracket: 2850/2700/2500/2326K)
+  # 100 = max varm (night-bracket clamped til 2000K = ~325K varmere end baseline)
+  # Mid-day altid 2850K uanset slider (shift=0 ved elev>10 → ingen jolt).
+  global_evening_warmth:
+    name: "Evening: warmth offset (auto CT)"
+    icon: mdi:weather-sunset-down
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # ===========================================================================
+  # NEW sprint 2026-05-17 — wakeup tuning (adult lead time + kids speed/bright)
+  # ===========================================================================
+  # Adult alarm-driven wakeup: hvor mange minutter foer alarm starter rampen.
+  # 0 = wakeup fires AT alarm (ingen pre-ramp), 45 = lang sunrise.
+  # Default 15 (var 30 — user-spec 2026-05-17 "ikke 30 som default, men 15
+  # og lidt hurtigere fade in"). Skalerer Phase-tidings proportionalt:
+  # Phase 1 @ T-lead, Phase 2 @ T-lead/2, Phase 3 @ T-1 min.
+  global_wakeup_lead_minutes:
+    name: "Wakeup: lead time før alarm (adults)"
+    icon: mdi:alarm
+    min: 0
+    max: 180
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Kids wakeup speed (boern wakeup_kids weekday + weekend).
+  # 0 = meget langsom (~30 min total ramp), 50 = baseline (15 min), 100 = hurtig (~6 min).
+  # Skalerer Phase 1→2→3→curtain delays via piecewise formula.
+  global_kids_wakeup_speed:
+    name: "Kids wakeup: hastighed (børn)"
+    icon: mdi:speedometer
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Kids wakeup brightness target (Phase 3 max).
+  # 30 = meget dim, 60 = baseline weekday (var hardcoded), 100 = max bright.
+  # Phase 2 er altid ~50% af Phase 3, Phase 1 er konstant 5%.
+  global_kids_wakeup_brightness:
+    name: "Kids wakeup: target brightness (børn)"
+    icon: mdi:weather-sunset-up
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-08-05 (user-spec "slider til at bestemme hvor lang tid efter voksen-
+  # alarmen går af at børnevækning skal køre, default 15min"): børnevækningen var
+  # låst til 06:05 uanset hvornår de voksne blev vækket — flyttede man alarmen,
+  # rykkede børnene sig ikke med. Måles fra `input_datetime.wakeup_alarm_gaaet_
+  # af_at` (stemplet når `binary_sensor.wakeup_alarm_imminent` falder i selve
+  # alarm-minuttet) — IKKE fra voksen-rampen: rampen er gated på lux/godnat og
+  # kørte kun ÉN af 14 morgener, så et ramp-anker ville stort set altid falde
+  # igennem. Uden stempel bruges den forventede alarm, ellers fast 06:05.
+  # Se `sensor.wakeup_kids_maal` nedenfor + automations/wakeup_kids.yaml.
+  global_kids_wakeup_after_alarm_minutes:
+    name: "Kids wakeup: N min EFTER voksenalarmen"
+    icon: mdi:alarm-multiple
+    min: 0
+    max: 120
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # ===========================================================================
+  # NEW batch 2026-05-17 PM (sprint del 2) — wakeup post-sluk + privacy +
+  # bedtime + drift-back + re-entry + auto-godnat window
+  # ===========================================================================
+  # Hvor mange minutter efter godnat_voksne off (= wakeup completer) at
+  # wakeup_post_sluk fyrer og fader sove-lyset off/down. Default 10 (2026-08-18,
+  # var 15). Lavere = hurtigere off efter wakeup.
+  global_wakeup_post_sluk_minutes:
+    name: "Wakeup: post-sluk delay (min efter wakeup)"
+    icon: mdi:lightbulb-off-outline
+    min: 1
+    max: 360
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Privacy curtain window: efter wakeup Phase 3 staar sove-gardinet delvist
+  # nede (se global_wakeup_curtain_privacy_pct) foer det aabner helt.
+  # Denne slider styrer HVOR LAENGE. Default 60 min (var hardcoded).
+  global_wakeup_curtain_window_minutes:
+    name: "Wakeup: privacy curtain window (delvist→åbent)"
+    icon: mdi:blinds
+    min: 1
+    max: 720
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Privacy-positionen for sove-gardinet i samme vindue. 2026-07-28 (user-spec,
+  # maalt fysisk efter limit-kalibrering): 70 % daekket, var hardcoded 50 %.
+  # NB: slideren er i "% DAEKKET" (brugerens sprog) — cover-API'et vil have
+  # position = % AABEN, saa alle forbrugere skriver `100 - denne vaerdi`.
+  # Grep slider-navnet for at finde alle 3 call-sites (wakeup_adults +
+  # wakeup_alarm_driven main/restart-recovery).
+  global_wakeup_curtain_privacy_pct:
+    name: "Wakeup: privacy gardin-dækning (% dækket)"
+    icon: mdi:blinds-horizontal
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-08-05 (user-spec): "larmen fra sove gardinet vækker os". Motoren er selv
+  # en vækning — og den kørte FØR alarmen: Phase 3 ligger på T-1 min, så gardinet
+  # rykkede et minut før telefonen ringede (målt 08-03: lys 06:10, gardin 06:14,
+  # alarm 06:15). Rækkefølgen er nu eksplicit: lyset først, gardinet bagefter.
+  # Gardinet kører ved max(alarm + after_alarm, Phase 3 + light_before) — begge
+  # betingelser skal være opfyldt, så en lang lead-time ikke kan overhale alarmen.
+  global_wakeup_curtain_after_alarm_minutes:
+    name: "Wakeup: gardin først N min EFTER alarm"
+    icon: mdi:alarm-snooze
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  global_wakeup_light_before_curtain_minutes:
+    name: "Wakeup: lys tændt N min FØR gardin"
+    icon: mdi:lightbulb-on-outline
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Boern bedtime cutoff hour — bestemmer hvornaar boern-rummets presence-tænd
+  # skifter fra lux-styret hvidt til puttelys-udseendet (2026-10-07: før 5 %
+  # rødt natlys, fjernet — det fyrede kun når børnene var vågne).
+  # Adskilte sliders for weekday vs weekend.
+  # Range udvidet 2026-06-05: 17-22 → 16-23 (bredere ekstremer).
+  global_boern_bedtime_weekday:
+    name: "Børn: bedtime cutoff (hverdage)"
+    icon: mdi:bed-clock
+    min: 15
+    max: 23.75
+    step: 0.25
+    unit_of_measurement: "h"
+    mode: slider
+
+  global_boern_bedtime_weekend:
+    name: "Børn: bedtime cutoff (weekend/ferie)"
+    icon: mdi:bed-clock
+    min: 15
+    max: 23.75
+    step: 0.25
+    unit_of_measurement: "h"
+    mode: slider
+
+  # Drift-back empty timeout — hvor mange minutter et rum skal vaere tomt
+  # foer mode driftes tilbage fra Manual/Off til Auto.
+  # Default 20 (var hardcoded). NB: HA restart kraeves naar slider aendres
+  # da `for:` triggers binder vaerdi ved automation-init.
+  global_drift_back_empty_minutes:
+    name: "Drift-back: tom rum-tid før Auto"
+    icon: mdi:timer-sand
+    min: 1
+    max: 360
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Re-entry grace window — hvis boern-loft slukker og boern komme tilbage
+  # inden for denne tid, taendes 15% warm dim (ikke fuld brightness).
+  # Default 10 min (var hardcoded).
+  global_reentry_grace_minutes:
+    name: "Børn: re-entry grace window"
+    icon: mdi:walk
+    min: 1
+    max: 180
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Stuck-on-maske for Matter/Thread sleepy-sensorer (2026-08-01, bad-hæng).
+  # En SED (VALLHORN/MYGGSPRAY) der mister sin Thread-forælder MENS den melder
+  # `on` sender aldrig sin `off` — HA holder `on` i ~40 min før den endelig
+  # markeres unavailable. I den periode ser hele huset falsk tilstedeværelse.
+  # Kalibreret på 21 dages recorder-data: ÆGTE sammenhængende on-forløb topper
+  # ved 11,9 min (inde_1), 6,8 (inde_2), 13,3 (entré-VALLHORN); alle stuck-on-
+  # artefakter ligger ≥ 30,8 min. 18 min = midt i kløften, 1,35× værste ægte.
+  #
+  # BEVIDST INGEN "0 = fra"-værdi (fejlklasse #5): en fresh-min-sentinel duer kun
+  # når sentinel-værdien adskiller sig fra den ønskede default — og en maske der
+  # falder tilbage til "slået fra" ved fresh install ville genindføre præcis den
+  # hængning den findes for. Alle forbrugere læser `| float(0)` og bruger 18 hvis
+  # værdien er ≤ 0, så uinitialiseret == beskyttet. Vil man reelt slå masken fra,
+  # skrues den op på 240 (4 t = længere end nogen tænkelig hængning).
+  occupancy_stuck_on_minutes:
+    name: "Occupancy: stuck-on maske (Thread-sensor hængt)"
+    icon: mdi:motion-sensor-off
+    min: 5
+    max: 240
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Entré manuel wall-cycle grace — efter user flipper wall-switch
+  # (cutter strøm = entre_loft unavailable → on), respekteres "manuel
+  # tænd"-signal i N min. entre_motion_off skipper auto-slukke i vinduet.
+  # Default 15 min. Stamps via automation entre_loft_manual_on_detect →
+  # input_datetime.entre_loft_manual_on_at.
+  global_entre_manual_grace_minutes:
+    name: "Entré: manuel wall-cycle grace"
+    icon: mdi:hand-back-right
+    min: 1
+    max: 180
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Auto-godnat night window — godnat_auto_declare fyrer KUN inden for dette
+  # tidsvindue. Default 21:00 → 07:00 (var hardcoded). Hour-based sliders.
+  global_auto_godnat_start_hour:
+    name: "Auto-godnat: start time (kun aktiv efter)"
+    icon: mdi:weather-night
+    min: 14
+    max: 23
+    step: 1
+    unit_of_measurement: "h"
+    mode: slider
+
+  global_auto_godnat_end_hour:
+    name: "Auto-godnat: end time (kun aktiv før)"
+    icon: mdi:weather-sunset-up
+    min: 2
+    max: 14
+    step: 1
+    unit_of_measurement: "h"
+    mode: slider
+
+  # ===========================================================================
+  # NEW 2026-06-05 — night-dim brightness sliders (user-request: flere knapper)
+  # ===========================================================================
+  # Putte-natlys: hygge-strippens brightness i natlys-fasen (fase 2) under
+  # børneputning (automations/godnat_night.yaml::puttelys_natlys_strip). User-
+  # spec default 1% = diskret natlys; live 9% → 6% 2026-10-11 (user-spec).
+  # Også bunden af måne-knappen (script.putning_trappe_ned).
+  global_putte_natlys_brightness:
+    name: "Putning: natlys brightness (hygge-strip)"
+    icon: mdi:lightbulb-night
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Nattur-lys: voksen-nattur dim warm i stue+køkken under godnat
+  # (automations/godnat_night.yaml::godnat_adult_nightwalk). Default 8%.
+  # Range 1-40 — hæv hvis 8% er for svagt til sikker navigation om natten.
+  global_nightwalk_brightness:
+    name: "Nattur: dim warm brightness (stue+køkken)"
+    icon: mdi:weather-night
+    min: 1
+    max: 80
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Nattur-lyskæde (2026-08-26g, user-spec): køkken-lyskæden er med på natturen
+  # som et separat, meget svagere ORANGE natlys — spisestue-loftet lyser vejen,
+  # kæden markerer køkkenet. Sendes som rgb_color (kelvin oversat med samme
+  # Tanner-Helland-kurve som script.boern_natlys_set), fordi kæden står i xy og
+  # et color_temp-kald ville SNAPPE den til hvid midt i fadet.
+  global_nightwalk_lyskaede_brightness:
+    name: "Nattur: køkken-lyskæde brightness"
+    icon: mdi:string-lights
+    min: 1
+    max: 40
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 1800 K ≈ rgb(255,126,0). Lavere = mere rød/orange, højere = mere gullig.
+  global_nightwalk_lyskaede_kelvin:
+    name: "Nattur: køkken-lyskæde farve (kelvin)"
+    icon: mdi:palette
+    min: 1000
+    max: 3000
+    step: 100
+    unit_of_measurement: "K"
+    mode: slider
+
+  # Nattur manuel-blok: nightwalk skipper hvis stue-Styrbar er brugt indenfor
+  # de sidste N minutter (automations/godnat_night.yaml::godnat_adult_nightwalk).
+  # User-spec 2026-06-12: manuel kontrol over open-plan lyset = natlys uønsket.
+  # 0 = blok deaktiveret. Default 30 min.
+  global_nightwalk_manual_block_minutes:
+    name: "Nattur: manuel-blok efter Styrbar-tryk (stue)"
+    icon: mdi:hand-back-right-off
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Nattur-sluk (2026-10-11, user: kæden slukkede ikke af sig selv): minutter
+  # uden nogen i open plan, entré eller bad før natturlyset slukker
+  # (godnat_night.yaml::godnat_adult_nightwalk_off). Bevidst UDEN Turn-Off
+  # Aggressiveness-faktoren (den gav 22 min). Default 5.
+  global_nightwalk_off_minutes:
+    name: "Nattur: sluk efter tomt i"
+    icon: mdi:timer-off-outline
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Godnat gå-i-seng-grace: når du trykker godnat (kort ELLER lang ned på sove-
+  # Somrig) og går fra sofa → soveværelse passerer du entré-Myggsprayen. Den er
+  # approach-trigger for BÅDE nattur-dim (stue+køkken) OG bad-tænd → lyset poppede
+  # op igen mens du var på vej i seng = "godnat slukkede ikke / kort tryk virker
+  # ikke". I dette grace-vindue efter godnat_force_at blokeres KUN approach-
+  # relights (entré/valhorn på-vej-hen); ægte inde-i-rummet-triggere (bad-PIR/dør)
+  # + senere natture (efter grace) er urørt = nat-toilet virker stadig. Gælder
+  # begge tryk → eneste reelle forskel er fade-hastighed (user-spec 2026-06-25).
+  # 0 = deaktiveret. Default 90 sek.
+  godnat_walk_grace_seconds:
+    name: "Godnat: gå-i-seng-grace (bloker approach-relights)"
+    icon: mdi:bed-clock
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Soveværelse sengelys: når en voksen går i seng om aftenen (sove-Apollo ser
+  # bevægelse) tændes soveloftet MEGET svagt+varmt, så rummet ikke er bælgmørkt
+  # mens man lægger sig. Slukkes med godnat-knappen. Default 5% (under nat-lås-
+  # tærsklen 8% → bedroom_night_guard rører det ikke). User-spec 2026-06-25.
+  sove_sengelys_brightness:
+    name: "Soveværelse: sengelys ved sengetid"
+    icon: mdi:bed
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Kalde-lys brightness: kalde-blink (stue+køkken steady + sove-loft blink).
+  # global_kalde_brightness fjernet (B215): godnat_kalde_on findes ikke længere,
+  # og intet læste slideren. Genopliv kalde-knappen → hent den i git-historikken.
+
+  # Putte-natlys farve: kelvin for hygge-strippens natlys (fase 2).
+  # Lav = mere hvid (~5000K neutral), høj = mere blå (op til 20000K isnende).
+  # Default 12000K = tydelig blå-hvid. Erstatter tidligere hardcoded rgb.
+  global_putte_natlys_kelvin:
+    name: "Putning: natlys farve (kelvin, blå↔hvid)"
+    icon: mdi:palette
+    min: 2000
+    max: 20000
+    step: 500
+    unit_of_measurement: "K"
+    mode: slider
+
+  # Putte-loftets farve (fase 1, alle indgange via script.puttelys_phase1_apply).
+  # 2026-10-05 (user: "den var meget kold idag"): før hardcodet 6535 K. Innr
+  # RB 282 C kan 1800-6535 K; høj = koldere. Sat til 2700 K = presence-tændets
+  # farve i børneværelset, så det er ligegyldigt hvem der vinder tænd-racet.
+  global_putte_loft_kelvin:
+    name: "Putning: loft farve (kelvin)"
+    icon: mdi:ceiling-light
+    min: 1800
+    max: 6500
+    step: 100
+    unit_of_measurement: "K"
+    mode: slider
+
+  # Sen hjemkomst (2026-10-06, user-spec "drifte over i putning hvis
+  # børneværelsesbevægelsen fortsætter mere end 5 min"): så længe skal der
+  # være aktivitet i børneværelset efter natlys-tid før putningen starter.
+  # Bruges i automations/putning_auto_detect.yaml::putning_sen_hjemkomst.
+  puttelys_sen_hjemkomst_minutter:
+    name: "Putning: sen hjemkomst — aktivitet før putning (min)"
+    icon: mdi:home-clock
+    min: 1
+    max: 20
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Global fade-speed: skalerer de 4 centrale fade-out helpers (passage/ophold/
+  # living/extended) via sensor.fade_*_effective. 50=baseline. Højere=hurtigere
+  # (kortere fades), lavere=langsommere (mere filmisk). Funktionelle transition:0
+  # blink (kalde/vejr) og korte turn-ON transitions (2-5s) er IKKE påvirket.
+  global_fade_speed:
+    name: "Global Fade Speed (fade-out tider)"
+    icon: mdi:transition
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # --- FADE-IND (2026-08-08, user-spec: "fade-ins skal være langsommere når
+  # solen er i nat-vinkel for resten af lysene i open-plan samt badeværelset, så
+  # øjnene kan nå at vende sig til lyset").
+  # Erstatter de hårdkodede turn-ON transitions (2 s bad / 3 s stue+spisestue /
+  # 5 s lux-fald) med ÉN autoritet: sensor.fade_ind_effektiv. Gaten er husets
+  # eksisterende nat-vinkel (binary_sensor.natlys_sol_under_graense) — ingen ny
+  # tærskel. Bevidst UDEN for scope: soveværelse/børneværelse (egne natlys-
+  # regimer), køkken-lyskæden (har sine egne to-segments-fade-sliders) og alle
+  # fade-OUT tider (global_fade_speed ejer dem).
+  fade_ind_sekunder:
+    name: "Fade-ind (tænd) — dag"
+    icon: mdi:transition
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  fade_ind_nat_faktor:
+    name: "Fade-ind langsommere når mørkt ude (×)"
+    icon: mdi:weather-night
+    min: 1
+    max: 6
+    step: 0.1
+    unit_of_measurement: "×"
+    mode: slider
+
+  # Puttelys→natlys fade: hvor langsomt børneværelset glider fra puttelys
+  # (fase 1: loft hvid 30% + strip lyserød 40% + plug) til natlys (fase 2:
+  # 1% blå-hvid strip). User-spec 2026-06-06: "lange fades, ikke pludseligt".
+  # Default 180s = 3 min blødt fade på strippen. 0 = øjeblikkeligt. Bruges som
+  # transition i automations/godnat_night.yaml::puttelys_natlys_strip.
+  # NB: loft/lampe slukkes via godnat_boern_active_on_actions (5s) — kun
+  # strippen får dette lange fade. Plug-lampen er non-dimmable (popper off).
+  global_puttelys_natlys_fade:
+    name: "Puttelys→natlys fade (sek)"
+    icon: mdi:transition
+    min: 0
+    max: 1800
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Dynamisk puttelys-nedtrapning: hvor lang tid (min) der går fra Apollo
+  # detekterer settled-læsning (still_target ≥2 min i læse-afstand) til rummet
+  # er på 1% blå natlys. User-spec 2026-06-06: default 20 min (live 35 min
+  # 10-05). 2026-10-11 → 15 min (user-spec "median af rutinerne"): målt fra
+  # nedtrapnings-start til første finger-sluk, pige-aftener 02/9-11/10 (hul
+  # 17-26/9, recorder var 14 d): 6,4 8,3 10,2 13,0 14,1 15,6 16,1 22,0 24,1
+  # 24,6 min → median 14,85; user valgte 17 min. Med 35 nåede rampen aldrig auto-sluk. Pacing: loftet fader geometrisk over HELE tiden og slukker ved 100%
+  # (2026-10-05, før ved 65%), hygge-plug ved 85%, strip glider til natlys over
+  # de sidste 35%, rummet låses (godnat_boern_active on) ved 100%. Breakpoints
+  # skalerer med slideren.
+  # Bruges i automations/godnat_night.yaml::puttelys_descent. Range 5-60.
+  global_puttelys_descent_minutes:
+    name: "Puttelys: nedtrapning varighed (min)"
+    icon: mdi:bed-clock
+    min: 5
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-06-21 (user-spec): puttelys-fase-1 (bad-/tids-trigger) tænder IKKE et
+  # tomt rum — den armeres og tænder først når Apollo børn FØRSTE GANG ser
+  # bevægelse (børnene ankommer). Denne slider = hvor længe armeringen venter på
+  # bevægelse før den opgiver (og lyset ALDRIG tænder = intet spildt lys). Ser
+  # Apollo allerede bevægelse → tænder straks. Bruges i script.puttelys_phase1_
+  # when_present (kaldt af bad-Trigger A + tids-bagkanten). Default 15 min.
+  puttelys_arm_timeout_minutes:
+    name: "Puttelys: arm-timeout (vent på børn, min)"
+    icon: mdi:motion-sensor
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-06-18 (user-spec): Styrbar-OP-putning (ankomst-aftener hvor børn-detect
+  # er off). Styrbar børn OP efter 18:45 + N min presence ≥ zone-min cm i
+  # lægge-zonen → fade fase 1 + start nedtrapning. De N min tæller som allerede-
+  # puttet → nedtrapningen forkortes med N min (vi har jo puttet i N min).
+  # Bruges i automations/godnat_night.yaml::puttelys_styrbar_start. Range 1-15.
+  puttelys_styrbar_presence_minutes:
+    name: "Puttelys: Styrbar-OP presence-vindue (min)"
+    icon: mdi:bed-clock-outline
+    min: 1
+    max: 15
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Minimum still/move-afstand (cm) for at presence tæller som "ligger og putter"
+  # i lægge-zonen (ikke ved døren/sensoren). User-spec 2026-06-18: 150 cm = mindst.
+  # Sengen måles ~294 cm. Bruges i binary_sensor.boern_putte_zone_aktiv.
+  puttelys_styrbar_zone_min_cm:
+    name: "Puttelys: Styrbar-OP lægge-zone min (cm)"
+    icon: mdi:ruler
+    min: 50
+    max: 400
+    step: 10
+    unit_of_measurement: "cm"
+    mode: slider
+
+  # Læse-afstand: minimum still-target afstand (cm fra børneværelse-Apollo)
+  # for at en stille person tæller som "settled i læse-hjørnet" frem for at
+  # stå stille ved døren/sensoren. Apollo'en sidder nær døren; sengene/læse-
+  # pladsen måles ~294 cm væk. Default 120 = "inde i rummet, ikke ved døren".
+  # Hæv hvis falske starter når nogen står stille tæt på sensoren; sænk hvis
+  # ægte læsning sker tættere på. Bruges som condition i puttelys_descent +
+  # putning_auto_detect still-fallback. Range 0-500 (0 = afstands-gate fra).
+  boernevaerelse_putte_reading_min_cm:
+    name: "Puttelys: læse-afstand min (cm)"
+    icon: mdi:ruler
+    min: 0
+    max: 500
+    step: 10
+    unit_of_measurement: "cm"
+    mode: slider
+
+  # 2026-06-19 (user-spec): aggressivitet for sommer gardin-forsvar = den
+  # TIMMERFLOTTE-temperatur der udløser at gardinerne rulles ned (kun om dagen
+  # + kun når huset er Dormant; se automations/summer_defense.yaml). LAVERE =
+  # mere aggressivt (lukker ved lavere temp). Default 24 sættes af
+  # init_user_preferences. Knap på Indstillinger.
+  summer_defense_temp_threshold:
+    name: "Sommer-forsvar: temperatur-tærskel (TIMMERFLOTTE)"
+    icon: mdi:sun-thermometer
+    min: 20
+    max: 30
+    step: 0.5
+    unit_of_measurement: "°C"
+    mode: slider
+
+  # 2026-06-19 (user-spec): SEPARAT, HØJERE tærskel for når huset er ACTIVE
+  # (nogen hjemme). "Hvis TIMMERFLOTTE > 26°C skal gardinerne ned selv om huset
+  # er Active — det bliver simpelthen for varmt." Lukker kun den sol-ramte side
+  # (vest-gardiner når solen er i vest, syd-gardin når solen er i syd) og genåbner
+  # når det køler / solen flytter. Se summer_defense_active i summer_defense.yaml.
+  # Default 26 sættes af init_user_preferences. Knap på Indstillinger.
+  summer_defense_active_temp_threshold:
+    name: "Sommer-forsvar (Active): temp-tærskel (TIMMERFLOTTE)"
+    icon: mdi:sun-thermometer
+    min: 22
+    max: 32
+    step: 0.5
+    unit_of_measurement: "°C"
+    mode: slider
+
+  # 2026-07-28 (user-spec): sove-gardinet er SYD-vendt og kører med i sommer-
+  # forsvaret. User: "brug lux-sensoren, den er mere præcis — azimut kun som
+  # fallback." Tærsklen er kalibreret mod 3 døgns snapshot-historik
+  # (sensor.sove_lux, 09–17): median 101 lx, p75 173, p90 293, max 410 — de
+  # høje aflæsninger falder præcis 12–14 hvor solen står i syd. Apolloen sidder
+  # ikke i direkte sol, så absolutte tal er lave; 250 lx ≈ p85 = "solen rammer
+  # reelt ind". Bruges KUN når sensoren svarer; er den unavailable falder
+  # forsvaret tilbage på sol-azimut 130–245.
+  sove_sol_blast_lux:
+    name: "Sommer-forsvar: sove sol-blast (lux)"
+    icon: mdi:sun-wireless
+    min: 50
+    max: 1500
+    step: 10
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-07-01 (user-spec): sommer-forsvaret må IKKE lukke gardiner når det er
+  # tungt overskyet — så rammer solen ikke ind, og en luk gør bare rummet mørkt
+  # uden at blokere reel solvarme. Gardinerne lukkes KUN når skydække ≤ denne
+  # tærskel (weather.forecast_home cloud_coverage). HØJERE = tillad luk selv når
+  # mere skyet; 100 = aldrig blokeret af skyer; 0 = kun i skyfri sol. Gælder
+  # BÅDE Dormant-luk og Active-luk (Active genåbner også hvis det skyer til).
+  # Default 70 (matcher putte-glares "solen skinner"-tærskel). Fresh install =
+  # min (0) → init_user_preferences løfter til 70; live sat via API + snapshot.
+  summer_defense_max_cloud_cover:
+    name: "Sommer-forsvar: maks skydække for luk"
+    icon: mdi:weather-partly-cloudy
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-07-19 (user-spec): vinter-forsvarets temp-gates bruger UDENDØRS temp fra
+  # met.no (sensor.udetemp), IKKE indendørs TIMMERFLOTTE —
+  # "der bliver aldrig så koldt indenfor, væggene er moderne 56cm tykke". Denne
+  # slider = udendørs-temp under hvilken det regnes som fyrings-sæson: Dormant-luk
+  # (hold på varmen når ingen er hjemme) + solar-gain (åbn syd-gardin på kolde
+  # solrige dage). LAVERE = mere konservativt (kun forsvar ved koldere vejr).
+  # Default 12 sættes af init_user_preferences. Knap på Indstillinger.
+  winter_heating_season_temp:
+    name: "Vinter-forsvar: fyrings-sæson temp (UDENDØRS)"
+    icon: mdi:home-thermometer-outline
+    min: 0
+    max: 18
+    step: 0.5
+    unit_of_measurement: "°C"
+    mode: slider
+
+  # 2026-07-19 (user-spec): UDENDØRS kuldebølge-tærskel (met.no sensor.udetemp).
+  # Ved ekstrem frost under denne temp force-lukkes syd-gardinet selv på en
+  # solar-gain-dag (solen kan ikke opveje varmetabet gennem ruden). User-valg:
+  # "kun ekstrem frost <-6°C". Syd-gardinet er tyndt → sol prioriteres normalt;
+  # kun genuin frost overruler. Default -6 sættes af init_user_preferences.
+  winter_cold_snap_temp:
+    name: "Vinter-forsvar: kuldebølge-tærskel (UDENDØRS)"
+    icon: mdi:snowflake-thermometer
+    min: -20
+    max: 5
+    step: 0.5
+    unit_of_measurement: "°C"
+    mode: slider
+
+  # 2026-06-22 (user-spec): Sove Styrbar L/R = loop gennem soveloftets varme
+  # (light.spisestue_pendel, CCT-only, hardware 1798-6535K). L = varmere,
+  # R = køligere; hold = kontinuerlig loop med wrap. Disse 3 helpers afgrænser
+  # loopet. Default-startpunkt = sensor.auto_color_temp_evening (sol/tid-på-
+  # dagen-tilpasset varme-hvid). Se automations/styrbar_sove_warmth.yaml.
+  # Defaults sættes af init_user_preferences (fresh) + snapshot. Knapper på
+  # Indstillinger. Fresh-install = min (sentinel) → init bumper til default.
+  styrbar_sove_ct_warm_k:
+    name: "Sove Styrbar: varmeste ende (K)"
+    icon: mdi:thermometer-low
+    min: 1800
+    max: 4000
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+  styrbar_sove_ct_cool_k:
+    name: "Sove Styrbar: køligeste ende (K)"
+    icon: mdi:thermometer-high
+    min: 3000
+    max: 6500
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+  styrbar_sove_ct_step_k:
+    name: "Sove Styrbar: varme-skridt pr. klik/tick (K)"
+    icon: mdi:thermometer-lines
+    min: 25
+    max: 500
+    step: 25
+    unit_of_measurement: "K"
+    mode: slider
+
+  # 2026-08-16h (user-spec: "det skal være forbudt for rgb apollo lys at være
+  # full on"). ÉN styrke for ALLE Apollo-RGB-varsler. Før stod `204` hardcodet
+  # tre steder (regn, batteri) + en fjerde slider (dug 80 %) — samme regel fire
+  # steder, fejlklasse #2.
+  #
+  # Hvorfor det ikke bare er kosmetik: LED'en sidder ved siden af Apolloens egen
+  # LTR390, og bidraget er STÆRKT ikke-lineært (γ ≈ 2,9). Målt på køkkenet:
+  #   80 % (bri 204) → 489 lx selv-blænding   ← den gamle værdi
+  #   25 % (bri  64) →  17 lx
+  # Ved 80 % blev `koekken_lux_reel` clampet til 0,0 (fradrag 488,9 > rå 487,3),
+  # dvs. sensoren målte ikke rummet, den målte sig selv — og trak
+  # `open_plan_lux` (= gennemsnit af spisestue + køkken) halvt ned, hvilket
+  # entréens lux-kurve så arvede. Max er 60 og ikke 100 med vilje: over ~60 %
+  # begynder fradraget igen at nærme sig sensorens eget måleområde i et mørkt rum.
+  apollo_rgb_varsel_lysstyrke:
+    name: "Apollo RGB-varsel: lysstyrke"
+    icon: mdi:led-on
+    min: 5
+    max: 60
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-08-16h (user-spec: "longer breaks between the blinks, giving the lux
+  # sensor a chance to see the real lux"). Perioden er FAST ét minut (driverens
+  # time_pattern); det tunable er hvor mange blink der ligger i hvert minuts
+  # burst. Hvert blink er et `flash: short` = 2 sek, med 1 sek mellem dem.
+  #   1 blink → LED tændt 2 s af 60 = 3 % af tiden
+  #   2 blink → 4 s af 60 = 7 %   ← default
+  #   4 blink → 8 s af 60 = 13 %
+  # De øvrige 87-97 % er ægte mørke, hvor Apolloens LTR390 måler rummet og ikke
+  # sig selv. Skru op hvis varslet overses; ikke over 4 — så begynder
+  # lux-målingen at blive spist igen (og bursten løber ind i næste minut).
+  apollo_rgb_varsel_blink:
+    name: "Apollo RGB-varsel: blink pr. minut"
+    icon: mdi:flash-alert
+    min: 1
+    max: 4
+    step: 1
+    unit_of_measurement: "blink"
+    mode: slider
+
+  # Kill-switch-/slider-jagt 2026-10-10: faste tal i automationer uden slider.
+  # Defaults = den hidtidige adfærd (ingen adfærdsændring ved deploy).
+  # Dvale-skema (automations/dormant_schedule.yaml): hverdags-reglen kræver ro
+  # i N min FØR skema-tiden (var hårdt 08:45-09:30 = 45); weekend-stearinlyset
+  # brænder N min uden fysisk aktivitet (var hårdt 60).
+  dormant_skema_hverdag_vindue_minutter:
+    name: "Dvale-skema: hverdag, ro i forvejen"
+    icon: mdi:home-clock
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+  dormant_skema_weekend_minutter:
+    name: "Dvale-skema: weekend-stearinlys"
+    icon: mdi:candle
+    min: 15
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+  # Gæste-mode auto (automations/activity_aware.yaml): social aktivitet i N min
+  # → guest_mode ON (var hårdt 30). Party-vejen har sin egen slider herunder.
+  guest_mode_auto_minutter:
+    name: "Gæste-mode: auto efter social aktivitet i"
+    icon: mdi:account-group
+    min: 10
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+  # Party-vejen (activity_guest_mode_party_fast): social_party i N min →
+  # guest_mode ON (var hårdt 10). Målt 19/9-10/10: 176 episoder, p50 18 s,
+  # max 13 m 20 s — kun ÉN nåede 10 min (29/9). Hæves den over ~15, fyrer
+  # party-vejen reelt aldrig og den almindelige 30-min-vej tager over.
+  guest_mode_party_minutter:
+    name: "Gæste-mode: auto efter fest i"
+    icon: mdi:party-popper
+    min: 5
+    max: 60
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+  # Klima-varsler (automations/climate_control.yaml, TIMMERFLOTTE): var hårdt
+  # 18 / 27 °C. Målt 07-10/10: 22,7-23,9 °C (p5 22,8, p95 23,6).
+  klima_kold_graense:
+    name: "Klima: for koldt under"
+    icon: mdi:thermometer-low
+    min: 10
+    max: 22
+    step: 0.5
+    unit_of_measurement: "°C"
+    mode: box
+
+  klima_varm_graense:
+    name: "Klima: for varmt over"
+    icon: mdi:thermometer-high
+    min: 22
+    max: 35
+    step: 0.5
+    unit_of_measurement: "°C"
+    mode: box
+
+# =============================================================================
+# Tunable klokkeslæt (børne-putning) — slider-justerbare tider
+# =============================================================================
+# User-spec 2026-06-06: puttelys + natlys skal kunne justeres på dashboardet.
+# input_datetime (time-only) → renderes som tids-vælger. INGEN initial: (samme
+# persistence-gotcha som input_number) → HA restorer last value; fresh-install
+# defaults sættes af init_user_preferences (sentinel 00:00:00).
+#   - puttelys_start: fase 1 tænder (default 19:10)
+#   - natlys_start:   fase 2 hård bagkant, garanteret natlys senest (default 20:30)
+# =============================================================================
+input_datetime:
+  puttelys_start:
+    name: "Puttelys: starttid (fase 1)"
+    icon: mdi:weather-sunset-down
+    has_date: false
+    has_time: true
+
+  natlys_start:
+    name: "Natlys: senest-tid (fase 2 bagkant)"
+    icon: mdi:weather-night
+    has_date: false
+    has_time: true
+
+  # 2026-06-12 (user-spec): putning-VINDUET starter FØR puttelys fase 1 —
+  # "alt efter 18:30 når vi har børn skal betragtes som putningsorienteret
+  # lys". Bruges af binary_sensor.putning_vindue_aktivt (activity_state.yaml).
+  # Default 18:30 sættes af init_user_preferences.
+  putning_vindue_start:
+    name: "Putning: vindue-start (putningsorienteret lys)"
+    icon: mdi:human-male-child
+    has_date: false
+    has_time: true
+
+  # 2026-08-07 (user-spec: "jeg skal kunne putte lidt sent som i dag også"):
+  # Trigger A (bad-besøg) og D (Styrbar OP) sluttede FØR på natlys_start
+  # (20:30) — samme tal som natlysets bagkant. Det gjorde en sen putning
+  # umulig at STARTE, selvom Trigger B (still_target) allerede kørte til
+  # 23:30. Nu har vinduet sin egen bagkant. Default 22:00 (init_user_
+  # preferences); højere = senere putninger mulige.
+  putning_vindue_slut:
+    name: "Putning: vindue-slut (seneste auto-start)"
+    icon: mdi:human-male-child
+    has_date: false
+    has_time: true
+
+  # Dvale-skema (automations/dormant_schedule.yaml, 2026-10-10): var hårdt
+  # 09:30 (hverdag) og 09:31-15:00 (weekend-stearinlys). Defaults sættes af
+  # init_user_preferences (sentinel 00:00:00 = urørt → reglerne fyrer ikke).
+  dormant_skema_hverdag_tid:
+    name: "Dvale-skema: hverdag kl."
+    icon: mdi:home-clock
+    has_date: false
+    has_time: true
+
+  dormant_skema_weekend_start:
+    name: "Dvale-skema: weekend fra kl."
+    icon: mdi:candle
+    has_date: false
+    has_time: true
+
+  dormant_skema_weekend_slut:
+    name: "Dvale-skema: weekend til kl."
+    icon: mdi:candle
+    has_date: false
+    has_time: true
+
+# =============================================================================
+# Kill-switches — toggle off for at deaktivere features (ferie/preferences)
+# Default ON (= normal drift). User flipper OFF for at slå feature fra.
+# =============================================================================
+input_boolean:
+  airbnb_privacy_purge_enabled:
+    name: "AirBnB: slet familie-historik ved entry"
+    icon: mdi:database-remove
+    # 2026-08-16d (user-spec): **default OFF**. Lockdown-automationen kaldte før
+    # ubetinget recorder.purge_entities med keep_days: 0 over ~90 entity-globs
+    # (presence, person, telefoner, scener, alarm-stempler …). Det gjorde det
+    # umuligt at TESTE AirBnB-mode: hvert prøve-skift smed 14 dages historik
+    # permanent væk — netop de data enhver senere diagnose/kalibrering hviler på.
+    # User: "privatliv ift data er lige meget i det her setup."
+    # Slå den ON hvis en gæst nogensinde får HA-UI-adgang (det oprindelige
+    # trusselsbillede, F1 2026-05-06: gæsten kunne læse familiens bevægelses-
+    # mønster i history). Uden UI-adgang er purgen ren datatab.
+    # ⚠️ IRREVERSIBEL når den er ON — purgen kan ikke fortrydes.
+
+  wakeup_adults_enabled:
+    name: "Wakeup: voksne aktiveret"
+    icon: mdi:alarm
+    # Default on. Flip off ved ferie hvor man ikke vil have alarm-driven
+    # lys-ramp 30/15 min foer phone-alarm (kontorferie etc).
+
+  wakeup_kids_enabled:
+    name: "Wakeup: børn aktiveret"
+    icon: mdi:baby-face
+    # Default on. Flip off ved ferie / skiftedage hvor børn ikke skal vaekkes
+    # 06:05/07:30 (gates BAADE weekday + weekend variant).
+
+  arrival_welcome_enabled:
+    name: "Arrival: welcome-lys aktiveret"
+    icon: mdi:door-open
+    # Default on. Flip off hvis man ikke vil have stue+koekken tænder automatisk
+    # naar man kommer hjem (eg. arbejdsdag hvor man bare gaar igennem).
+
+  # Kill-switch-jagt 2026-10-10. Default on (= hidtidig adfærd).
+  dormant_skema_hverdag_enabled:
+    name: "Dvale-skema: hverdag aktiveret"
+    icon: mdi:home-clock
+    # Off = ingen fast hverdags-dvale; de øvrige dvale-veje kører videre.
+
+  dormant_skema_weekend_enabled:
+    name: "Dvale-skema: weekend-stearinlys aktiveret"
+    icon: mdi:candle
+
+  guest_mode_auto_enabled:
+    name: "Gæste-mode: auto-detektion aktiveret"
+    icon: mdi:account-group
+    # Gater KUN de to auto-SÆT-veje. Auto-clear kører altid videre, så et
+    # allerede sat flag stadig ryddes når aktiviteten falder.
+
+  terrace_presence_enabled:
+    name: "Terrasse: presence-rules aktiveret"
+    icon: mdi:flower-tulip
+    # Default on. Flip off i vinter naar altanen ikke bruges
+    # (= ingen dim_indoor / restore_indoor / welcome_light).
+
+  terrasse_dim_indoor_active:
+    name: "Terrasse: indendørs dim-episode aktiv"
+    icon: mdi:lightbulb-night
+    # RUNTIME-FLAG (ikke config — snapshottes ikke): sat af terrace_dim_indoor
+    # når den faktisk dæmpede noget; kræves + ryddes af terrace_restore_indoor.
+    # Uden flaget kunne restore fyre på hvert radar-flap med åben dør
+    # (gæste-uge 07-12→15: 727 restore-fires = lys-puls 5%↔60-90%).
+
+  winter_solar_enabled:
+    name: "Vinter: solar gain aktiveret"
+    icon: mdi:weather-sunny
+    # Default on. Flip off hvis du ikke vil have syd-gardin auto-aabner ved
+    # passende sun elevation (winter_solar_gain_open + _close).
+
+  winter_active_dark_close_enabled:
+    name: "Vinter: luk gardiner ved mørkt+koldt (Active)"
+    icon: mdi:window-shutter-alert
+    # Default on (2026-07-19, user-spec). Flip off hvis du IKKE vil have
+    # vinter-gardinerne lukke automatisk mens familien er hjemme (Active) når
+    # det er rigtig mørkt UDE (sol < natlys_sol_elevation, default -6°) OG koldt
+    # UDE (< winter_heating_season_temp) — beskyttelse mod gulv-kuldestrøm.
+    # Sol-vinkel-tærsklen GENBRUGES fra natlys (input_number.natlys_sol_elevation)
+    # — ingen egen slider. Se winter_active_dark_close i winter_defense.yaml.
+
+  summer_defense_enabled:
+    name: "Sommer: forsvar mod varme aktiveret"
+    icon: mdi:weather-sunny-alert
+    # Default on. Flip off hvis du ikke vil have gardiner auto-luk ved hede
+    # (summer_defense_close + _reopen + summer_defense_active).
+
+  # 2026-06-19: INTERNE tracking-flag for Active-sommer-forsvaret — markerer
+  # hvilken side automationen selv har lukket, så genåbningen KUN åbner det DEN
+  # lukkede (rører ikke godnat/manuel/Dormant-lukkede gardiner). Ikke bruger-
+  # vendt tuning; ryddes når huset forlader Active. Se summer_defense_active.
+  summer_active_closed_syd:
+    name: "Sommer Active: syd-gardin auto-lukket"
+    icon: mdi:window-shutter
+  summer_active_closed_vest:
+    name: "Sommer Active: vest-gardiner auto-lukket"
+    icon: mdi:window-shutter
+
+  morning_sanity_enabled:
+    name: "Morgen: sanity auto-sluk aktiveret"
+    icon: mdi:weather-sunset-up
+    # Default on. Flip off hvis morgen-vinduets auto-sluk (boern + sove ved
+    # lyst/tomt rum, 06-12) ikke skal koere — fx sygedag hvor man ligger
+    # laenge med lys taendt.
+
+  weather_warning_enabled:
+    name: "Vejr: varsler aktiveret (blink + push)"
+    icon: mdi:weather-pouring
+    # Default on. Flip off for at slippe for morgen/aften vejr-blink i
+    # farvelamper + push-notifikationer (fx ferie eller traet af dem).
+
+  legetoejsdag_varsel_enabled:
+    name: "Legetøjsdag: disko-varsel aktiveret"
+    icon: mdi:party-popper
+    # Default on. Foerste ikke-lukkedags-fredag i maaneden = legetoejsdag i
+    # boernehaven → 10 sek diskolys i stue/spisestue/koekken/bad lige efter
+    # morgen-vejrvarslerne. Flip off for at droppe varslet.
+
+  drift_back_enabled:
+    name: "Drift-back: Manual -> Auto aktiveret"
+    icon: mdi:backup-restore
+    # Default on. Flip off hvis manuelle lys-indstillinger IKKE skal drifte
+    # tilbage til Auto efter tom-rum timeout — manual mode holder til du
+    # selv aendrer det.
+
+  user_prefs_initialized:
+    name: "Init: user prefs initialiseret (intern markoer)"
+    icon: mdi:check-decagram
+    # INTERN — roer ikke. Sat ON af init_user_preferences efter foerste
+    # fresh-install init. Sikrer init ALDRIG koerer igen = kill-switches
+    # og sliders persisterer på tvaers af restarts (bug fixet 2026-06-11:
+    # restore giver frisk last_changed, saa "off + <60s = fresh" heuristikken
+    # gen-taendte alle kill-switches ved HVER restart).
+
+input_text:
+  legetoejsdag_sidst_fyret:
+    name: "Legetøjsdag: sidst fyret (YYYY-MM)"
+    icon: mdi:party-popper
+    max: 7
+    # INTERN markoer — saettes af legetoejsdag_disco_varsel naar maanedens
+    # disko er fyret, saa kun FOERSTE kvalificerende fredag rammer. Tom/gammel
+    # vaerdi = ikke fyret denne maaned endnu.
+
+template:
+  - sensor:
+      # =========================================================================
+      # PIECEWISE-LINEAR FORMULA STANDARD (audit-5 widening)
+      # =========================================================================
+      # Alle factor-sensors bruger piecewise formula så slider=50 ALTID → 1.0
+      # (baseline = current behavior). Widening ændrer KUN extremes (slider 0
+      # og slider 100), ikke baseline. Sikrer at user's eksisterende tuning
+      # forbliver den samme efter widening.
+      #
+      # FORMULA:
+      #   if s <= 50:  factor = 1.0 - (1.0 - LOW) * (50 - s)/50
+      #   else:        factor = 1.0 + (HIGH - 1.0) * (s - 50)/50
+      # =========================================================================
+
+      # =========================================================================
+      # Light Aggressiveness factor: 0.02x – 1.0x – 6.0x (WIDENED 2026-06-06)
+      # =========================================================================
+      # FORKLARING:
+      #   Multiplerer ALLE brightness_pct templates i presence-, arrival-,
+      #   wakeup-, og morgen-automations. Praktisk eksempel: stue auto-light
+      #   ved mørke er base 80%. Med slider=50 (factor 1.0) → 80%.
+      #
+      # EKSTREMER (widened 2026-06-06: 0.05-4.0 → 0.02-6.0):
+      #   slider=0   → 0.02x (ekstremt dim — 80% base → ~1.6% lys)
+      #   slider=25  → 0.51x (hyggeligt dæmpet)
+      #   slider=50  → 1.0x  (baseline)
+      #   slider=75  → 3.5x  (intenst — capped @100% i automations)
+      #   slider=100 → 6.0x  (max — alt 100% effektivt pga clamp)
+      # El-pris-kobling (2026-06-19): pris-dæmpnings-faktoren ganges ind, så
+      # alle brightness-call-sites bliver pris-bevidste med denne ene edit. Ved
+      # slider elpris_paavirkning=0 (default) er elpris_dim_factor=1.0 → ingen
+      # ændring af eksisterende adfærd. Se packages/elpris_styring.yaml.
+      - name: "Global brightness factor"
+        unique_id: global_brightness_factor
+        icon: mdi:lightbulb-on-outline
+        state: >
+          {% set s = states('input_number.global_light_aggressiveness') | float(50) %}
+          {% if s <= 50 %}
+            {% set base = 1.0 - 0.98 * (50 - s) / 50 %}
+          {% else %}
+            {% set base = 1.0 + 5.0 * (s - 50) / 50 %}
+          {% endif %}
+          {% set pf = states('sensor.elpris_dim_factor') | float(1.0) %}
+          {{ (base * pf) | round(2) }}
+        # 2026-09-28: skyder-ALENE-faktoren (uden el-pris). Live-omskaleringen
+        # nedenfor trigger på DENNE, så el-prisens timeskift ikke flytter lys
+        # der allerede er tændt — kun brugerens træk gør (ESP-/intent-reglen).
+        attributes:
+          base: >
+            {% set s = states('input_number.global_light_aggressiveness') | float(50) %}
+            {% if s <= 50 %}{{ (1.0 - 0.98 * (50 - s) / 50) | round(3) }}
+            {% else %}{{ (1.0 + 5.0 * (s - 50) / 50) | round(3) }}{% endif %}
+
+      # Sensor Sensitivity factor-sensorer (stue/spisestue/koekken/boernevaerelse)
+      # FJERNET 2026-07-09b → alle Apolloer bruger nu FULD per-gate kontrol
+      # (packages/apollo_per_gate.yaml + sove_apollo_per_gate.yaml), ikke faktor.
+
+      # =========================================================================
+      # GEOMETRISKE FAKTOR-KURVER (omlagt 2026-08-26, user-spec: "nogle af dem
+      # giver kun mening at bevæge sig mellem 40 og 60 fordi de har så voldsom
+      # effekt")
+      # =========================================================================
+      # Begge sliders var LINEÆRE I FAKTOREN med to segmenter der mødtes i 50 —
+      # og segmenternes hældninger var 14× forskellige. Målt på den gamle kurve:
+      #
+      #   LUX          50 → 51 = +28,0 %/point   |  50 → 49 =  −2,0 %/point
+      #   SLUK-VENT    50 → 49 = +38,0 %/point   |  50 → 51 =  −2,0 %/point
+      #
+      # Ét enkelt point på den "stejle" side ændrede altså tærsklen mere end
+      # ti point på den anden. Derfor var kun 40-60 brugbart, og selv dét kun
+      # på den ene halvdel: 50 → 60 gangede lux-tærsklen med 3,8.
+      #
+      # En slider der GANGER skal være geometrisk, ikke lineær: så koster hvert
+      # point den samme PROCENT hele vejen, og hele 0-100 bliver brugbar.
+      #
+      #   faktor = R ** ((s - 50) / 50)
+      #
+      # R er valgt så yderpunkterne stadig er meningsfulde frem for absurde.
+      # De gamle ekstremer (15× lux, 20× vent, 0,01× vent) var netop dét der
+      # klemte midten sammen: 15× på en 40 lx-base = 600 lx = "tænd i fuldt
+      # dagslys", og 0,01× = sluk efter 3 sekunder. Ingen af delene er en
+      # indstilling nogen vil bruge — de kostede bare opløsning i det område
+      # der bliver brugt.
+      #
+      # BEVARET ADFÆRD: sliderne blev flyttet i SAMME commit så den faktiske
+      # faktor er uændret på skiftedagen (lux 44 → 45,5 holder 0,88; sluk-
+      # aggressivitet 47 → 31,5 holder 2,14). 47 betød altså i virkeligheden
+      # "vent 2,14× så længe" — dét er nu synligt på skalaen.
+
+      # -------------------------------------------------------------------------
+      # Turn-Off Aggressiveness factor: 8.0x – 1.0x – 0.125x INVERSE (geometrisk)
+      # -------------------------------------------------------------------------
+      #   Multiplerer alle `for:` durations i presence-off automations
+      #   (5-min absence rule, fast-morning-off, entré motion-off).
+      #   Høj slider = utålmodig = kort ventetid → derfor (50 - s).
+      #
+      #   slider=0   → 8.0x    (TÅLMODIG      — 5 min → 40 min)
+      #   slider=50  → 1.0x    (baseline 5 min / 15 s)
+      #   slider=100 → 0.125x  (UTÅLMODIG     — 5 min → 37 s)
+      #   hvert point = 4,24 % hele vejen
+      - name: "Global absence wait factor"
+        unique_id: global_absence_wait_factor
+        icon: mdi:timer-sand
+        state: >
+          {% set s = states('input_number.global_turn_off_aggressiveness') | float(50) %}
+          {{ (8.0 ** ((50 - s) / 50)) | round(3) }}
+        attributes:
+          pct_pr_point: "{{ ((8.0 ** (1 / 50) - 1) * 100) | round(2) }}"
+          vent_ved_5_min: >-
+            {% set s = states('input_number.global_turn_off_aggressiveness') | float(50) %}
+            {{ (5 * 8.0 ** ((50 - s) / 50)) | round(1) }} min
+          vent_ved_15_sek: >-
+            {% set s = states('input_number.global_turn_off_aggressiveness') | float(50) %}
+            {{ (15 * 8.0 ** ((50 - s) / 50)) | round(0) | int }} s
+
+      # -------------------------------------------------------------------------
+      # LUX Sensitivity factor: 0.25x – 1.0x – 4.0x (geometrisk)
+      # -------------------------------------------------------------------------
+      #   Multiplerer alle lux-thresholds. Base typisk 40-47 lx. Lav slider =
+      #   streng (tænd kun i mørke). Høj slider = ivrig (tænd også i halvlys).
+      #
+      #   slider=0   → 0.25x  (STRENG  — 45 lx-gate bliver 11 lx = bælgmørkt)
+      #   slider=50  → 1.0x   (baseline)
+      #   slider=100 → 4.0x   (IVRIG   — 45 lx-gate bliver 180 lx = godt oplyst)
+      #   hvert point = 2,81 % hele vejen
+      - name: "Global lux threshold factor"
+        unique_id: global_lux_threshold_factor
+        icon: mdi:brightness-6
+        state: >
+          {% set s = states('input_number.global_lux_sensitivity') | float(50) %}
+          {{ (4.0 ** ((s - 50) / 50)) | round(3) }}
+        attributes:
+          pct_pr_point: "{{ ((4.0 ** (1 / 50) - 1) * 100) | round(2) }}"
+          gate_ved_45_lx: >-
+            {% set s = states('input_number.global_lux_sensitivity') | float(50) %}
+            {{ (45 * 4.0 ** ((s - 50) / 50)) | round(1) }} lx
+
+      # =========================================================================
+      # NEW Audit-5: Wakeup brightness target
+      # =========================================================================
+      # Direct exposure af slider som factor (1.0 = current 80%).
+      # wakeup_alarm_driven Phase 3 multiplerer 80 × factor for endeligt target.
+      - name: "Global wakeup brightness target"
+        unique_id: global_wakeup_brightness_target
+        icon: mdi:weather-sunset-up
+        unit_of_measurement: "%"
+        state: "{{ states('input_number.global_wakeup_brightness_pct') | int(80) }}"
+
+      # =========================================================================
+      # NEW Audit-5: Auto-godnat timer minutes (raw passthrough)
+      # =========================================================================
+      - name: "Global auto godnat minutes"
+        unique_id: global_auto_godnat_minutes_sensor
+        icon: mdi:weather-night
+        unit_of_measurement: "min"
+        state: "{{ states('input_number.global_auto_godnat_minutes') | int(120) }}"
+
+      # =========================================================================
+      # NEW Audit-5: Evening warmth factor (WIRED 2026-05-12)
+      # =========================================================================
+      # Consumed by sensor.auto_color_temp_evening (packages/activity_state.yaml).
+      # 0   = factor 0.0 → ingen evening shift (2850K hele aftenen)
+      # 50  = factor 1.0 → baseline 4-bracket gradient (uchanged behavior)
+      # 100 = factor 2.0 → max warm (night clamped til 2000K)
+      - name: "Global evening warmth factor"
+        unique_id: global_evening_warmth_factor
+        icon: mdi:weather-sunset-down
+        state: >
+          {% set s = states('input_number.global_evening_warmth') | float(50) %}
+          {{ (s / 50) | round(2) }}
+
+      # =========================================================================
+      # NEW sprint 2026-05-17: Wakeup lead minutes (raw passthrough)
+      # =========================================================================
+      # Consumed by automations/wakeup_alarm_driven.yaml.
+      # Brugt baade som trigger-threshold (sec_until_alarm <= lead_seconds)
+      # OG som Phase 2 delay basis (lead/2).
+      - name: "Global wakeup lead minutes"
+        unique_id: global_wakeup_lead_minutes_sensor
+        icon: mdi:alarm
+        unit_of_measurement: "min"
+        state: "{{ states('input_number.global_wakeup_lead_minutes') | int(15) }}"
+
+      # =========================================================================
+      # NEW sprint 2026-05-17: Kids wakeup duration factor
+      # =========================================================================
+      # Skalerer wakeup_kids Phase-delays. Higher slider = lower factor = faster ramp.
+      # Baseline (slider=50) = factor 1.0 = current 15-min total.
+      #
+      # FORMULA:
+      #   if s <= 50:  factor = 1.0 + 2.0*(50 - s)/50 → 1.0..3.0  (slower)
+      #   else:        factor = 1.0 - 0.75*(s-50)/50  → 1.0..0.25 (faster)
+      #
+      # EKSEMPLER (widened 2026-06-06: 3.0-0.25 → 5.0-0.15):
+      #   slider=0   → 5.0x  (~75 min total ramp)
+      #   slider=50  → 1.0x  (15 min — baseline)
+      #   slider=100 → 0.15x (~2.25 min total)
+      - name: "Global kids wakeup duration factor"
+        unique_id: global_kids_wakeup_duration_factor
+        icon: mdi:speedometer
+        state: >
+          {% set s = states('input_number.global_kids_wakeup_speed') | float(50) %}
+          {% if s <= 50 %}
+            {{ (1.0 + 4.0 * (50 - s) / 50) | round(2) }}
+          {% else %}
+            {{ (1.0 - 0.85 * (s - 50) / 50) | round(2) }}
+          {% endif %}
+
+      # =========================================================================
+      # NEW sprint 2026-05-17: Kids wakeup brightness target (raw passthrough)
+      # =========================================================================
+      # wakeup_kids Phase 3 maxer her. Phase 2 = 50% af denne. Phase 1 = 5% konstant.
+      - name: "Global kids wakeup brightness target"
+        unique_id: global_kids_wakeup_brightness_target
+        icon: mdi:weather-sunset-up
+        unit_of_measurement: "%"
+        state: "{{ states('input_number.global_kids_wakeup_brightness') | int(60) }}"
+
+      # =========================================================================
+      # NEW 2026-08-05: Børnevækningens MÅL-tidspunkt (epoch-sekunder)
+      # =========================================================================
+      # ÉT anker som BÅDE trigger og condition i wakeup_kids_weekday læser
+      # (fejlklasse #2 — samme regel to steder divergerer).
+      #
+      # Prioritet:
+      #   1. Alarmen ER gået af i dag  → stempel + slider-minutter (det ægte mål)
+      #   2. Alarmen forventes i dag   → forventet tid + slider (så målet kan ses
+      #      i forvejen; stemplet overhaler af sig selv når den ringer)
+      #   3. Ingen alarm               → fast 06:05 (den gamle adfærd, uændret)
+      #
+      # `now()` tvinger re-render hvert minut, så template-triggeren i
+      # wakeup_kids.yaml fyrer af sig selv når målet passeres.
+      # 04:00 er dagens gyldigheds-anker: alt før hører til i går (samme nulpunkt
+      # som resten af morgen-logikken) — og det dækker samtidig fælden med et
+      # URØRT input_datetime, der står på dagens midnat.
+      - name: "Wakeup kids maal"
+        unique_id: wakeup_kids_maal
+        icon: mdi:target
+        state: >
+          {% set off = states('input_number.global_kids_wakeup_after_alarm_minutes')
+               | float(15) %}
+          {% set nul = today_at('04:00').timestamp() %}
+          {% set loft = today_at('10:00').timestamp() %}
+          {% set ringede = state_attr('input_datetime.wakeup_alarm_gaaet_af_at',
+               'timestamp') | float(0) %}
+          {% set a = states('sensor.wakeup_alarm_next') %}
+          {% set a_ts = 0 if a in ['unknown', 'unavailable', 'none', '']
+               else as_timestamp(a, 0) %}
+          {% set _ = now() %}
+          {% if nul < ringede < loft %}
+            {{ (ringede + off * 60) | int }}
+          {% elif nul < a_ts < loft %}
+            {{ (a_ts + off * 60) | int }}
+          {% else %}
+            {{ today_at('06:05').timestamp() | int }}
+          {% endif %}
+        attributes:
+          kilde: >
+            {% set nul = today_at('04:00').timestamp() %}
+            {% set loft = today_at('10:00').timestamp() %}
+            {% set ringede = state_attr('input_datetime.wakeup_alarm_gaaet_af_at',
+                 'timestamp') | float(0) %}
+            {% set a = states('sensor.wakeup_alarm_next') %}
+            {% set a_ts = 0 if a in ['unknown', 'unavailable', 'none', '']
+                 else as_timestamp(a, 0) %}
+            {% set _ = now() %}
+            {% if nul < ringede < loft %}alarm gik af
+            {% elif nul < a_ts < loft %}alarm forventet
+            {% else %}fast 06:05{% endif %}
+          maal_lokal: >
+            {% set off = states('input_number.global_kids_wakeup_after_alarm_minutes')
+                 | float(15) %}
+            {% set nul = today_at('04:00').timestamp() %}
+            {% set loft = today_at('10:00').timestamp() %}
+            {% set ringede = state_attr('input_datetime.wakeup_alarm_gaaet_af_at',
+                 'timestamp') | float(0) %}
+            {% set a = states('sensor.wakeup_alarm_next') %}
+            {% set a_ts = 0 if a in ['unknown', 'unavailable', 'none', '']
+                 else as_timestamp(a, 0) %}
+            {% set _ = now() %}
+            {% if nul < ringede < loft %}{% set m = ringede + off * 60 %}
+            {% elif nul < a_ts < loft %}{% set m = a_ts + off * 60 %}
+            {% else %}{% set m = today_at('06:05').timestamp() %}{% endif %}
+            {{ m | timestamp_custom('%H:%M', true) }}
+
+      # =========================================================================
+      # NEW 2026-06-05: Global fade-speed factor + 4 effective fade-tider
+      # =========================================================================
+      # Factor multiplerer de 4 fade_*_seconds baseline-helpers (constants.yaml).
+      # INVERS slider: høj slider = lav factor = hurtigere (kortere) fades.
+      #   slider=0   → 5.0x  (5× længere — meget filmisk)
+      #   slider=50  → 1.0x  (baseline = nuværende fade-tider)
+      #   slider=100 → 0.1x  (10× hurtigere — snappy)
+      - name: "Global fade factor"
+        unique_id: global_fade_factor
+        icon: mdi:transition
+        state: >
+          {% set s = states('input_number.global_fade_speed') | float(50) %}
+          {% if s <= 50 %}
+            {{ (5.0 - 4.0 * s / 50) | round(2) }}
+          {% else %}
+            {{ (1.0 - 0.9 * (s - 50) / 50) | round(2) }}
+          {% endif %}
+
+      # Effektive fade-tider = baseline helper × fade-factor, clampet til
+      # [1, 6500] sek. Upper clamp fordi Zigbee transition er uint16 i 0.1s
+      # (max ~6553s) — slider 1800s × factor 5.0 ville ellers give 9000s og
+      # fejle silently på pærerne.
+      # Consumers (presence/godnat/entré/terrasse) læser disse i stedet for de
+      # rå input_number-helpers, så Global Fade Speed slår igennem ét sted.
+      - name: "Fade passage effective"
+        unique_id: fade_passage_effective
+        icon: mdi:transition
+        unit_of_measurement: "s"
+        state: >
+          {{ [1, [6500, ((states('input_number.fade_passage_seconds') | float(10))
+                  * (states('sensor.global_fade_factor') | float(1.0))) | round(0) | int] | min] | max }}
+
+      - name: "Fade ophold effective"
+        unique_id: fade_ophold_effective
+        icon: mdi:transition
+        unit_of_measurement: "s"
+        state: >
+          {{ [1, [6500, ((states('input_number.fade_ophold_seconds') | float(30))
+                  * (states('sensor.global_fade_factor') | float(1.0))) | round(0) | int] | min] | max }}
+
+      - name: "Fade living effective"
+        unique_id: fade_living_effective
+        icon: mdi:transition
+        unit_of_measurement: "s"
+        state: >
+          {{ [1, [6500, ((states('input_number.fade_living_seconds') | float(30))
+                  * (states('sensor.global_fade_factor') | float(1.0))) | round(0) | int] | min] | max }}
+
+      - name: "Fade extended effective"
+        unique_id: fade_extended_effective
+        icon: mdi:transition
+        unit_of_measurement: "s"
+        state: >
+          {{ [1, [6500, ((states('input_number.fade_extended_seconds') | float(60))
+                  * (states('sensor.global_fade_factor') | float(1.0))) | round(0) | int] | min] | max }}
+
+      # 2026-08-08: fade-IND (tænd). ÉN autoritet for open-plan + bad, så
+      # nat-vinklen kun står ét sted. Bevidst IKKE ganget med global_fade_factor:
+      # den slider ejer fade-UD (sluk-hastighed), og at koble tænd på den ville
+      # gøre en "sluk hurtigere"-justering til en "tænd hurtigere"-justering.
+      - name: "Fade ind effektiv"
+        unique_id: fade_ind_effektiv
+        icon: mdi:transition
+        unit_of_measurement: "s"
+        state: >
+          {% set f = states('input_number.fade_ind_nat_faktor') | float(2.0) %}
+          {% set m = f if is_state('binary_sensor.natlys_sol_under_graense', 'on') else 1.0 %}
+          {{ [1, [6500, ((states('input_number.fade_ind_sekunder') | float(3)) * m)
+                  | round(0) | int] | min] | max }}
+
+# =============================================================================
+# LIVE-OMSKALERING (2026-09-28, user: "Lights aggressiveness slideren virker
+# ikke instant. det burde den … også på tændte lys. den skal bare ikke tænde
+# slukkede lys")
+# =============================================================================
+# Faktoren ganges ind i 36 tænd-veje — men kun i det øjeblik de TÆNDER. Et lys
+# der allerede lyser hørte aldrig om trækket. Her skaleres hvert tændt, dæmpbart
+# auto-lys med forholdet ny/gammel skyder-faktor (`base`), så trækket ses med
+# det samme. Slukkede lys røres ALDRIG (kun `is_state on` er med i listen).
+#
+# Roster = rum-grupperne (en ny pære kommer med af sig selv, #16) minus lys med
+# EGNE rå sliders, som faktoren aldrig har skaleret: lyskæderne, spisestue-loftet
+# (spisestue_auto_brightness) og børne-strippen (natlys, RGBW). Onoff-lys har
+# ingen styrke. Manual-rum springes over (brugerens eget valg vinder), og hele
+# vejen står stille under godnat/fest/mood/film — natlys må aldrig løftes.
+#
+# Kendt grænse: et lys der stod CLAMPET på 100 % (base × faktor > 100) skaleres
+# fra 100, ikke fra sit uclampede mål — et træk NED kan derfor lande lidt under
+# hvad en frisk tænding ville give. Næste auto-tænding retter det.
+automation:
+  - id: global_light_aggressiveness_live
+    alias: "Lys-aggressivitet: skalér tændte auto-lys med det samme"
+    mode: queued
+    max: 10
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: sensor.global_brightness_factor
+        attribute: base
+    condition:
+      - condition: template
+        value_template: >-
+          {% set a = trigger.from_state.attributes.get('base') if trigger.from_state else none %}
+          {% set b = trigger.to_state.attributes.get('base') if trigger.to_state else none %}
+          {{ a is number and b is number and a > 0 and b > 0 and a != b }}
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.dance_mode
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.cinema_active
+        state: "off"
+      - condition: state
+        entity_id: input_select.active_scene
+        state: "none"
+    action:
+      - variables:
+          r: >-
+            {{ trigger.to_state.attributes.base | float(1) /
+               trigger.from_state.attributes.base | float(1) }}
+          maal: >-
+            {% set grupper = {
+                 'light.stue_all': 'input_select.room_mode_stue',
+                 'light.sovevaerelse_all': 'input_select.room_mode_sovevaerelse',
+                 'light.boernevaerelse_all': 'input_select.room_mode_boernevaerelse',
+                 'light.badevaerelse_all': 'input_select.room_mode_badevaerelse',
+                 'light.depot_all': 'input_select.room_mode_depot',
+                 'light.entre_all': 'input_select.room_mode_entre'} %}
+            {# Stue-spots ejes af spejlet (packages/stue_spots.yaml): fast
+               % × el-pris, og de følger læselampen når den ændres her. #}
+            {% set udelad = ['light.koekken_lyskaede', 'light.spisestue_loft',
+                             'light.sove_lyskaede', 'light.boernevaerelse_hygge_strip',
+                             'light.terrasse_paerelyskaede',
+                             'light.stue_spot_1', 'light.stue_spot_2'] %}
+            {% set pf = [states('sensor.elpris_dim_factor') | float(1.0), 1.0] | min %}
+            {% set loft = {'light.stue_laesehygge':
+                  (states('input_number.stue_laeselampe_auto_max_pct') | float(80) * pf * 2.55) | round(0) | int} %}
+            {% set ns = namespace(out=[]) %}
+            {% for g, mode in grupper.items() %}
+              {% if is_state(mode, 'Auto') %}
+                {% for l in state_attr(g, 'entity_id') or [] %}
+                  {% set b = state_attr(l, 'brightness') %}
+                  {% if l not in udelad and is_state(l, 'on') and b is number
+                        and not (g == 'light.stue_all'
+                                 and is_state('binary_sensor.filmmoerke_stue', 'on')) %}
+                    {% set n = [[(b * r) | round(0) | int, loft.get(l, 255)] | min, 3] | max %}
+                    {% if n != b %}
+                      {% set ns.out = ns.out + [{'e': l, 'b': n}] %}
+                    {% endif %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out }}
+      - condition: template
+        value_template: "{{ maal | count > 0 }}"
+      - repeat:
+          for_each: "{{ maal }}"
+          sequence:
+            - action: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: "{{ repeat.item.e }}"
+              data:
+                brightness: "{{ repeat.item.b }}"
+                transition: 1
+      - action: logbook.log
+        data:
+          name: "Lys-aggressivitet"
+          message: >-
+            skyder-faktor {{ trigger.from_state.attributes.base }} →
+            {{ trigger.to_state.attributes.base }} (×{{ r | round(2) }}):
+            {{ maal | map(attribute='e') | map('replace', 'light.', '') | join(', ') }}
+

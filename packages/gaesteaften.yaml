@@ -1,0 +1,152 @@
+# =============================================================================
+# Gæste-aften-detektion — people-estimate over familie-baseline (user-spec 2026-07-25)
+# =============================================================================
+# Incident 2026-07-24 aften: gæster på terrassen "næsten hele tiden" →
+# flagermus-curfew (23:00) hård-slukkede pærelyskæden mens alle sad derude
+# (user gen-tændte 13 sek senere). Nat-auto-slukket ville have gjort det samme
+# 23:30 (open-plan var "i ro" fordi alle var UDE — dance_mode blokerede det
+# tilfældigvis den aften). User: "flagermus mode slås fra automatisk hvis vi
+# har gæster som i går. kig på people count."
+#
+# 2026-09-30 (people v4, fejlklasse #2): baselinen er nu sensor.people_familie
+# — samme anker som estimatet selv. Den talte før sin egen kopi (parent_b_home +
+# "2 hvis kids_home"), mens estimatet talte anker + børn kun når børneværelset
+# var optaget, så de to kunne være uenige om hvem familien var. Siden v4 er
+# estimat > familie = præcis "ekstra-gulvet står på ≥ 1" = nogen UD OVER
+# familien har holdt sig i people_ekstra_hold_sekunder.
+# 2026-10-01 (people v5): estimatet holdes nu af et dør-låst gulv, så et
+# voksen-flag der falder uden dør gør estimat > familie UDEN nogen gæst. Vi
+# læser derfor ekstra-gulvet direkte — det v4-sammenligningen betød.
+#
+# DETEKTION (kalibreret mod 07-24-forløbet): sensor.people_estimate OVER
+# familie-baselinen (voksne-hjemme-flags + 2 hvis kids_home) sustained
+# gaester_over_baseline_minutter → stempl gaester_sidst_set. 07-24: estimate 5 >
+# baseline 4 kl. 19:47-20:06 (19 min) ✓; transienten kl. 14:24 (5 i 50 sek)
+# fanges IKKE ✓.
+#
+# 2026-07-28 (RE-KALIBRERET, fejlklasse #2/#12): people_zones_now blev strammet
+# op samme dag (ét sustain-krav på 300 s for ALLE zoner) fordi den gamle model
+# talte én person der gik rundt som 3-5. Replay af 07-24-aftenen gennem den nye
+# model: længste uafbrudte "over baseline" = **6 min**, ikke 19 → det tidligere
+# hardkodede 10-min-krav ville have misset gæsteaftenen helt. Derfor slider,
+# sat til 5 min. NB: detektionen hviler på INDENDØRS zoner, og 07-24 sad
+# gæsterne på terrassen — den ærlige margin er derfor tynd. Ser vi endnu en
+# misset gæsteaften, er næste skridt at give terrassen sin egen vægt her.
+#
+# VINDUE i stedet for live-tjek: om aftenen faldt estimatet til 3-4 igen
+# (zonerne ser dårligt terrassen når folk sidder ude) — et øjebliks-tjek ved
+# curfew-tid ville have fejlet. Derfor: "gæster for nylig" = stempel yngre end
+# gaester_suppression_timer (default 6 t; 07-24: 19:47 + 6t dækker hele natten
+# til 01:47).
+#
+# KONSUMENTER (alle terrasse-nat-lagene — fejlklasse #12, samme fysik: tom
+# open-plan ≠ ro når folk er på terrassen):
+#   - flagermus dusk-dæmp-branch (terrace_plug_control.yaml C) → dekorativ styrke
+#   - flagermus ekstra-dæmp + curfew (terrace_bat_friendly.yaml) → springes over
+#   - terrasse nat-auto-sluk (terrace_plug_control.yaml G) → springes over
+# Backstop mod nat-burn: G's /15-tick fyrer når vinduet udløber (fejlklasse #4
+# dækket), og super-watchdoggen (6 t) står bagved.
+#
+# Refresh-design (fejlklasse #13): flanke-triggeren (sustained 10 min) sætter
+# det FØRSTE stempel; /30-ticket FORLÆNGER kun et allerede aktivt vindue
+# (gaester_for_nylig on + over baseline NU) — så et 1-sek zone-spøgelse ved
+# tick-tid ikke kan starte et vindue alene.
+# =============================================================================
+
+input_datetime:
+  # Runtime-cursor (IKKE config — skal ikke i DATETIME_CONFIG/snapshot-restore).
+  gaester_sidst_set:
+    name: "Gæster: sidst set over familie-baseline"
+    icon: mdi:account-group
+    has_date: true
+    has_time: true
+
+input_number:
+  # Hvor længe efter sidste gæste-signal terrasse-nat-lagene holdes tilbage.
+  # Default 6.0 sættes af init_user_preferences.
+  gaester_suppression_timer:
+    name: "Gæste-aften: suppression-vindue (timer)"
+    min: 1
+    max: 12
+    step: 0.5
+    unit_of_measurement: "t"
+    icon: mdi:account-clock
+    mode: slider
+
+  # Hvor længe estimatet skal ligge over familie-baselinen før vinduet starter.
+  # Var hardkodet 10 min (kalibreret mod den GAMLE zone-model, der over-talte
+  # kraftigt pga. radar-trailing). Da people_zones_now blev strammet op
+  # 2026-07-28 (ét sustain-krav på 300 s for alle zoner), faldt 07-24-gæste-
+  # aftenens længste "over baseline"-forløb fra 19 til **6 min** → 10-min-kravet
+  # ville have MISSET aftenen og flagermus-curfew'en havde slukket lyset på
+  # gæsterne igen. 300 s zone-sustain er i forvejen transient-filteret; dette er
+  # kun bekræftelsen ovenpå → 5 min.
+  gaester_over_baseline_minutter:
+    name: "Gæste-aften: min. over baseline før vindue (min)"
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:timer-sand
+    mode: box
+
+template:
+  - binary_sensor:
+      # ASCII-navn med vilje: name-slug SKAL matche unique_id (repo-gotcha).
+      - name: "Gaester for nylig"
+        unique_id: gaester_for_nylig
+        icon: mdi:account-group
+        state: >-
+          {# B67-mønster: state_attr timestamp, IKKE as_timestamp(states(...)) #}
+          {% set ts = state_attr('input_datetime.gaester_sidst_set', 'timestamp') | float(0) %}
+          {% set win = states('input_number.gaester_suppression_timer') | float(6) %}
+          {{ ts > 0 and (as_timestamp(now()) - ts) < win * 3600 }}
+        attributes:
+          sidst_set: "{{ states('input_datetime.gaester_sidst_set') }}"
+
+automation:
+  - id: gaester_over_baseline_stamp
+    alias: "Gæster: stempl people-estimate over familie-baseline"
+    description: >
+      Sætter/forlænger gæste-stemplet: flanke = estimate > baseline sustained
+      gaester_over_baseline_minutter; /30-tick forlænger kun et allerede
+      aktivt vindue.
+    mode: single
+    trigger:
+      - platform: template
+        value_template: >-
+          {{ states('input_number.people_ekstra_gulv') | int(0) > 0 }}
+        for: >-
+          {{ (states('input_number.gaester_over_baseline_minutter') | float(5) * 60) | int }}
+        id: flank
+      - platform: time_pattern
+        minutes: "/30"
+        id: tick
+    condition:
+      # AirBnB: person-flags frosne → baselinen er meningsløs (og flagermus-
+      # lagene er i forvejen Normal-gatede).
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "Normal"
+      # Over baseline LIGE NU (flanken: redundant-sikkert; ticket: påkrævet).
+      - condition: template
+        value_template: >-
+          {{ states('input_number.people_ekstra_gulv') | int(0) > 0 }}
+      # Ticket må kun FORLÆNGE et aktivt vindue — aldrig starte et.
+      - condition: template
+        value_template: >-
+          {{ trigger.id == 'flank'
+             or is_state('binary_sensor.gaester_for_nylig', 'on') }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.gaester_sidst_set
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: logbook.log
+        data:
+          name: "Gæste-aften"
+          message: >-
+            People-estimate ({{ states('sensor.people_estimate') }}) har
+            {{ states('input_number.people_ekstra_gulv') | int(0) }} ud over familien — terrasse-nat-lag (flagermus/nat-sluk) holdes
+            tilbage i {{ states('input_number.gaester_suppression_timer') }} t.

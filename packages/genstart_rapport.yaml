@@ -1,0 +1,162 @@
+# =============================================================================
+# Genstart-rapport — ét varsel efter en PLANLAGT host-reboot
+# =============================================================================
+# Bygget 2026-09-17 til HAOS 17.1 → 18.2. Claude-sessionen kører inde i SSH-
+# add-on'et og dør med reboot'et, så ingen kan verificere at huset kom op igen.
+# Denne automation er den verifikation, og den pusher KUN hvis user skal gøre
+# noget.
+#
+# Den er bevidst SELV-DEAKTIVERENDE (sidste skridt = automation.turn_off på
+# `this.entity_id`). Grunden: device_health_check.yaml havde nøjagtig denne
+# trigger og blev fjernet 2026-05-12, fordi den fyrede 17x/døgn — én gang pr.
+# deploy-restart. User har to gange (2026-05-07, 2026-07-14/B52) sagt nej tak
+# til løbende "enhed offline"-pushes. Dette varsel er en UNDTAGELSE for en
+# planlagt reboot, ikke en genindførelse af den daglige health-check.
+#
+# GENBRUG: slå den til igen (UI eller automation.turn_on) LIGE FØR næste
+# planlagte host-reboot. Den fyrer én gang og slukker sig selv igen.
+# =============================================================================
+
+automation:
+  - id: genstart_rapport_efter_boot
+    alias: "Genstart-rapport efter planlagt reboot"
+    description: >-
+      Fyrer én gang efter HA-start, venter på at Zigbee/Thread/Apollo når at
+      konvergere, og pusher kun hvis noget mangler. Slukker derefter sig selv.
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      # Boot-tidspunktet skal fanges FØR delay'en — huset har ingen
+      # sensor.uptime for HA selv (permanent faktum).
+      - variables:
+          boot_tid: "{{ now().strftime('%H:%M') }}"
+      # SSH-add-on'et (23.0.8 → 24.1.4) kan IKKE opdateres fra en Claude-session,
+      # fordi sessionen kører INDE i add-on'et og dør med containeren. Her er der
+      # ingen session at dræbe, så lige efter en boot er det sikreste tidspunkt i
+      # hele døgnet. Supervisor gennemfører opdateringen uanset hvem der kaldte.
+      # NB: `hassio.addon_update` findes IKKE som service (tjekket i
+      # /api/services) — et ukendt service-kald ville abortere HELE action-
+      # body'en, så rapporten aldrig blev sendt (#22). Derfor update.install
+      # på add-on'ets egen update-entity. continue_on_error: en fejlet
+      # opdatering må ikke æde rapporten — det er præcis dét user skal vide.
+      - service: update.install
+        continue_on_error: true
+        target:
+          entity_id: update.advanced_ssh_web_terminal_update
+      # 8 min: Thread-mesh'et må gerne re-forme sig selv først. Et partition-
+      # split heler på 20-30 min, så 8 min er et kompromis — derfor siger
+      # teksten nedenfor eksplicit "vent før du gør noget" ved Thread-fejl.
+      - delay: "00:08:00"
+      - variables:
+          # Mains-Zigbee, spredt over mesh'et. Er ALLE tre nede, er det
+          # koordinatoren/donglen, ikke enkelt-pærer.
+          # En kanariefugl skal være en enhed der normalt er 100 % oppe, ellers
+          # melder rapporten "kom ikke op" om noget der aldrig var oppe:
+          # `light.stue_sofa_lampe` stod her og har været død i hele
+          # recorder-vinduet (14 døgn, 100 %) — den gjorde alt_ok uopnåelig.
+          # Målt unavailable-andel over 14 døgn: boernevaerelse_loft 0,0 %,
+          # terrasse_plug 0,0 %, spisestue_loft 5,6 %.
+          zigbee_kritiske:
+            - light.spisestue_loft
+            - light.boernevaerelse_loft
+            - switch.terrasse_plug
+          # Husets Thread-routere. Falder badets tre, kaskaderer halvdelen af
+          # Matter-nettet; entré-loftet er kingmaker (fysisk adskilt klynge).
+          thread_routere:
+            - light.badevaerelse_spot_1
+            - light.badevaerelse_spot_2
+            - light.badevaerelse_spot_3
+            - light.entre_loft
+          # Netdrevne Apolloer — normalt 100 % oppe, så et udfald her er ægte.
+          apolloer: !include ../rosters/apollo_occupancy.yaml
+      - variables:
+          zigbee_nede: >-
+            {% set ns = namespace(b=[]) %}
+            {% for e in zigbee_kritiske %}
+              {% if states(e) in ['unavailable', 'unknown'] %}
+                {% set ns.b = ns.b + [e.split('.')[1]] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.b }}
+          thread_nede: >-
+            {% set ns = namespace(b=[]) %}
+            {% for e in thread_routere %}
+              {% if states(e) in ['unavailable', 'unknown'] %}
+                {% set ns.b = ns.b + [e.split('.')[1]] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.b }}
+          apollo_nede: >-
+            {% set ns = namespace(b=[]) %}
+            {% for e in apolloer %}
+              {% if states(e) in ['unavailable', 'unknown'] %}
+                {% set ns.b = ns.b + [e.split('.')[1]] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.b }}
+          # Fejlklasse #22: en valideringsfejlet automation er unavailable UDEN
+          # `restored`. Er `restored: true` sat, er det en harmløs registry-
+          # orphan (huset har 61 af dem).
+          auto_fejlet: >-
+            {{ states.automation
+               | selectattr('state', 'eq', 'unavailable')
+               | rejectattr('attributes.restored', 'defined')
+               | list | count }}
+      - variables:
+          # `on` = opdateringen ligger der stadig, altså gik addon_update ikke
+          # igennem. Entityen er sandheden; service-kaldets returkode ser vi ikke.
+          ssh_mangler: "{{ is_state('update.advanced_ssh_web_terminal_update', 'on') }}"
+          alt_ok: >-
+            {{ zigbee_nede | count == 0 and thread_nede | count == 0
+               and apollo_nede | count == 0 and auto_fejlet | int == 0
+               and not ssh_mangler }}
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: thread
+          title: >-
+            {{ 'Huset er oppe igen efter genstart' if alt_ok
+               else 'Genstart: noget kom IKKE op' }}
+          message: >-
+            {% if alt_ok %}
+              Bootede {{ boot_tid }}. Zigbee, Thread-routerne, alle fem Apolloer
+              og alle automations er oppe, og SSH-add-on'et er opdateret. Hele
+              opdaterings-runden er dermed færdig — du skal ikke gøre noget.
+            {% else %}
+              Bootede {{ boot_tid }}. Tjekket 8 min efter:
+              {% if ssh_mangler %}
+                SSH-ADD-ON'et blev ikke opdateret automatisk (23.0.8 til 24.1.4)
+                — klik det manuelt i Indstillinger, Add-ons.
+              {% endif %}
+              {% if thread_nede | count > 0 %}
+                THREAD nede: {{ thread_nede | join(', ') }}.
+                VENT 20-30 min først — et partition-split heler sig selv, og en
+                RCP-reset midt i det gør det værre. Er de stadig væk bagefter:
+                entré-loftet sidder på en vægkontakt, så tjek den.
+              {% endif %}
+              {% if zigbee_nede | count > 0 %}
+                ZIGBEE nede: {{ zigbee_nede | join(', ') }}.
+                {% if zigbee_nede | count >= 3 %}
+                  Alle tre = det er koordinatoren/donglen, ikke pærerne.
+                {% endif %}
+              {% endif %}
+              {% if apollo_nede | count > 0 %}
+                APOLLO nede: {{ apollo_nede | join(', ') }}. De er netdrevne, så
+                tjek om en vægkontakt er slukket.
+              {% endif %}
+              {% if auto_fejlet | int > 0 %}
+                {{ auto_fejlet }} automation(s) er valideringsfejlet og helt
+                stumme.
+              {% endif %}
+            {% endif %}
+          payload:
+            tag: genstart_rapport
+      # Selv-deaktivering: slå til igen før næste planlagte reboot.
+      # `this.entity_id` frem for en gættet alias-slug.
+      - service: automation.turn_off
+        target:
+          entity_id: "{{ this.entity_id }}"
+        data:
+          stop_actions: false

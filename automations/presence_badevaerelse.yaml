@@ -1,0 +1,2428 @@
+# =============================================================================
+# Badeværelse Presence Lights — kort timeout (vs øvrige rum)
+# =============================================================================
+# INTENTIONAL kort-timeout for badeværelse:
+#   A bathroom light staying on for 5 minutes after every visit is not
+#   comfortable. DAG: besøgs-stadie-system (Quick/Medium/Fuld) styrer hold —
+#   Medium ~5 min, Fuld hold-til-dør (05-20-rewrite). GODNAT: dedikeret hurtig-
+#   sluk (badevaerelse_godnat_off_seconds, default 90 s, badevaerelse_godnat_
+#   nightwalk_off) så et nat-toilet ikke hænger — genindfører den gamle 90 s
+#   godnat-timeout som 05-20 tabte. Fade forbliver blød — no-aggressive-off.
+#
+# Godnat-aware: 8% very warm (2000K) i godnat for at beskytte mørketilpasset
+# syn under nat-toilet-besøg.
+#
+# Splittet ud fra presence_lights.yaml 2026-05-05 (Phase 2 refactor).
+#
+# Sprint 2026-06-07: VALLHORN (Matter Myggspray) tilføjet som bad early-detect/
+# approach-sensor + interim primær bad-presence (Apollo radar døde 2026-05-07).
+# STANDBY indtil Kajplats-spots er paret: light.badevaerelse_all er unavailable
+# → `light off`-condition fejler → no-op. Aktiveres automatisk når bad-lyset
+# kommer online. Se entities/sensors/valhorn.yaml for device-detaljer.
+# =============================================================================
+
+- id: presence_light_badevaerelse_on
+  alias: "Lysnet: Badeværelse tænd"
+  description: >
+    Mindre skarpt aften-lys — undgaa at blaende moerketilpasset syn.
+    Bruger sun-elevation som primaer-driver med lux-justering, og sun-
+    fallback hvis Apollo lux er unavailable.
+
+    Godnat = 8% very warm (toilet-trip, bevar morketilpasset syn).
+    Sun under horizon (aften/nat) = 45%, twilight = 55%, solskin = 70%
+    (alle x global brightness factor).
+
+    2026-06-13: approach-triggers (entre/valhorn early-detect) taender paa
+    egen FAST brightness (input_number.badevaerelse_approach_brightness,
+    default 30%, ikke factor-skaleret). Doer/inde-motion opgraderer derefter
+    til normalniveau via badevaerelse_approach_lit-flaget (cleares ved
+    upgrade + ved lys-sluk i badevaerelse_wasp.yaml).
+  mode: single
+  trigger:
+    # 2026-07-02 (B42, user-info): badevaerelse_valhorn er et UDGÅET device
+    # (unavailable siden 2026-06-21) — alle refs fjernet. Badets sensorer:
+    # entré-valhorn (early), inde-PIR 1+2 (union), parasoll (dør).
+    # 2026-06-10 (user-spec): ENTRÉ early-detect — bevægelse i entréen tænder
+    # bad-lyset tidligt, så man ankommer til et oplyst bad. Aktiv nu hvor
+    # spots 1+4+5 er parret (light.badevaerelse_all har online medlemmer).
+    # Kort bad-timeout + off-fallback rydder op hvis man bare passerede.
+    # 2026-08-01 SPØGELSES-GUARD (user-valg "ignorér første signal"): ALLE
+    # tænd-triggers kræver nu `from: "off"`. En Matter-sensor der kommer tilbage
+    # på Thread-mesh'et genopstår med sin SIDSTE kendte værdi — er den `on`,
+    # ser HA et `unavailable → on`-flip der ligner bevægelse, men som er et ekko
+    # af noget der skete før den faldt af. Målt: 5 sådanne genforbindelser på 14
+    # dage. `from: "off"` afviser dem uden en eneste ny condition, fordi et ÆGTE
+    # trip altid kommer fra `off`.
+    - platform: state
+      entity_id: binary_sensor.entre_valhorn_occupancy
+      from: "off"
+      to: "on"
+    # 2026-06-11: inde-Myggspray (node 263, INDE i badet) — fanger bevægelse
+    # direkte i rummet hvis approach-sensorerne ikke gjorde.
+    # 2026-08-01: triggeren er flyttet fra union-sensoren til den RÅ inde_1,
+    # fordi unionen ikke kan bære spøgelses-guarden: den rendrer `off` mens et
+    # medlem er unavailable, så en genforbindelse ser ud som et helt normalt
+    # off→on-flip. Rå-sensoren husker derimod at den var unavailable. Ægte
+    # bevægelse er uændret dækket — et hvert `on` på unionen stammer pr.
+    # definition fra inde_1 eller inde_2, som begge har egen trigger.
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_1_occupancy
+      from: "off"
+      to: "on"
+    # 2026-07-26 (user-bug "bad slukkede + tændte ikke da Parent B gik derud lige
+    # efter godnat"): eksplicit DYB inde_2-trigger. Går man dybt ind er union-
+    # triggeren (inde_1 ELLER inde_2) typisk ALLEREDE on via inde_1 (dør) →
+    # inde_2 giver ingen ny union-transition. En separat inde_2-trigger re-armer
+    # automationen så en ÆGTE dyb-tur (som bypasser godnat-grace, se nedenfor)
+    # faktisk tænder lyset. inde_2 = gulv/dybt inde mod toilet, "fanger KUN nogen
+    # der faktisk gik ind" (packages/badevaerelse_visit_quality.yaml).
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_2_occupancy
+      from: "off"
+      to: "on"
+    # 2026-06-12 (user-spec, wasp-sekvens): baddøren ÅBNES → tænd lyset.
+    # Dækker både entré ind i badet og udgang i mørke. Parasoll: on = åben.
+    - platform: state
+      entity_id: binary_sensor.parasoll_badevaerelse
+      from: "off"
+      to: "on"
+  condition:
+    # 2026-06-27 (user-spec): bevægelse INDE i badet (inde-PIR sensor 1/2, union
+    # binary_sensor.badevaerelse_inde_occupancy) er ABSOLUT VETO — den skal ALTID
+    # tænde lyset, lige meget hvad. Derfor OR'es hver gate nedenfor med inde-
+    # triggeren, så ingen condition (house_state, Manual, robot, light-off, godnat-
+    # grace, sensors_available) kan blokere et ægte inde-i-rummet-trig.
+    # 2026-07-26: den DYBE inde_2-trigger tælles med i vetoet (endnu stærkere
+    # inde-bevis end union'en — kun gulv/dybt-inde-bevægelse).
+    - condition: template
+      value_template: >-
+        {% from 'rosters.jinja' import bad_occupancy %}{{ trigger.entity_id in bad_occupancy
+           or is_state('binary_sensor.presence_sensors_available', 'on') }}
+    - condition: template
+      value_template: >-
+        {% from 'rosters.jinja' import bad_occupancy %}{{ trigger.entity_id in bad_occupancy
+           or is_state('input_select.house_state', 'Active') }}
+    # 2026-06-10 (opg 4): Manual mode = bruger har selv indstillet lyset —
+    # auto-tænd blokeret indtil drift-back → Auto. 2026-07-02 (user-valg,
+    # review): inde-veto bypasser IKKE længere Manual — manuel dæmpning må
+    # aldrig overskrives af bevægelse midt i et besøg.
+    # 2026-10-04 (user-spec: "ingen vil nogensinde ha MØRKE i badeværelset hvis
+    # der er presence/bad derinde ... jeg ville ha haft auto lys i den situation,
+    # trods nyligt manuelt tryk. det gælder kun bad"): Manual beskytter et lys
+    # du har SAT (dæmpning, festlys, rødt lys) — ikke mørke. Er ALT badlys
+    # slukket og en INDE-sensor ser nogen, tænder vi alligevel og sætter rummet
+    # på Auto i action'en. 4/10 08:07-08:15 sad user i mørke, fordi et app-"sluk
+    # alt" 07:57 havde sat badet i Manual. Døren tæller ikke (den åbnes også når
+    # man går ud). Festlys: dance-claimet bad er undtaget.
+    - condition: template
+      value_template: >-
+        {% from 'rosters.jinja' import bad_occupancy %}{{ not is_state('input_select.room_mode_badevaerelse', 'Manual')
+           or (trigger.entity_id in bad_occupancy
+               and is_state('light.badevaerelse_all', 'off')
+               and not (is_state('input_boolean.dance_mode', 'on')
+                        and is_state('input_boolean.dance_room_bad', 'on'))) }}
+    # 2026-06-23 (user-spec): EARLY-DETECT er det ENESTE robotten holder tilbage
+    # når huset er Active. I badet = approach-triggerne (entré/valhorn) der tænder
+    # lyset på vej derhen. De er FJERNET fra veto-listen → en robot-runde tænder
+    # ikke længere bad-lyset på afstand. MEN de FAKTISKE inde-i-rummet-triggere
+    # (inde-PIR + dør) vetoer stadig robotten, så et ægte bad-besøg under en
+    # støvsuge-runde får lys (kort hurtig-sluk/ophold-sluk rydder op hvis det var
+    # robotten selv i badet). NB: bad-on er Active-gated → i Dormant kører dette
+    # slet ikke (robotten kan ikke vække huset; house_state_to_active er robot-
+    # filtreret). Erstatter 2026-06-19-reglen hvor ALLE entry/approach vetoede.
+    - condition: template
+      value_template: >-
+        {% from 'rosters.jinja' import bad_occupancy %}{{ trigger.entity_id in bad_occupancy
+           or states('vacuum.s8_maxv_ultra') not in ['cleaning', 'returning']
+           or trigger.entity_id in [
+                'binary_sensor.parasoll_badevaerelse'] }}
+    # Sprint 2026-05-25: light=off gate. Uden den re-tændte bad lyset over
+    # user's manual dim ved hver re-trigger på occupancy (samme klasse bug
+    # som vi fixede på sove + andre rum). Re-entry i bad respekterer nu
+    # eksisterende dim.
+    # 2026-06-13 (user-spec approach-brightness): udvidet med upgrade-vej —
+    # lys ALLEREDE on er OK hvis det var approach-flowet selv der tændte det
+    # (flag badevaerelse_approach_lit=on) OG triggeren er en faktisk-inde-
+    # trigger (dør/inde-motion) → opgradér fra approach- til normalniveau.
+    # Manual dim respekteres stadig: flag sættes kun af approach-tænd og
+    # cleares når lyset slukker (badevaerelse_wasp.yaml).
+    # 2026-07-02 (user-valg, review): inde-PIR bypasser IKKE længere light-on-
+    # gaten (den overskrev manuel dim ved re-trip). Inde-PIR er i stedet med i
+    # upgrade-vejen: approach-tændt lys + fysisk inde → normalniveau.
+    - condition: template
+      value_template: >-
+        {{ is_state('light.badevaerelse_all', 'off')
+           or (is_state('input_boolean.badevaerelse_approach_lit', 'on')
+               and trigger.entity_id in ['binary_sensor.parasoll_badevaerelse',
+                                         'binary_sensor.badevaerelse_inde_occupancy',
+                                         'binary_sensor.badevaerelse_inde_1_occupancy',
+                                         'binary_sensor.badevaerelse_inde_2_occupancy']) }}
+    # 2026-06-25 (user-spec): gå-i-seng-grace. Lige efter godnat-tryk ligger man
+    # i sengen — entré/valhorn/inde-PIR/dør ser bevægelse (man falder til ro,
+    # spøgelses-trip) og badet tændte "med det samme" selvom man IKKE skulle på
+    # toilet. 2026-06-26 (user re-diag "vi lå i sengen"): bloker ALLE bad-triggers
+    # (også inde-PIR/dør) i grace-vinduet efter godnat_force_at — ikke kun approach.
+    # Ægte nat-toilet kommer typisk LANGT efter godnat (man rejser sig fra søvn),
+    # ikke indenfor de 90 s. slider 0 = fra.
+    # 2026-07-02 (user-valg, review): inde-PIR-undtagelsen fjernet igen —
+    # grace blokerer ALLE triggers (gendanner 2026-06-26 user re-diag
+    # "vi lå i sengen"; ghost-trip på inde-PIR lige efter godnat-tryk må
+    # ikke tænde badet).
+    # 2026-07-26 (user-bug "bad slukkede + tændte ikke da Parent B gik derud lige
+    # efter godnat"): grace var sat til 300 s → en ÆGTE dyb-tur lige efter godnat
+    # blev blokeret i 5 min. FIX: grace blokerer stadig approach/dør/SHALLOW
+    # inde_1-ghosts (= "vi lå i sengen"-beskyttelsen intakt), MEN den DYBE gulv-PIR
+    # inde_2 ("fanger KUN nogen der faktisk gik ind", jf.
+    # packages/badevaerelse_visit_quality.yaml) bypasser grace — dyb bevægelse
+    # mod toilet er per definition IKKE en seng-ghost. inde_1-triggeren (2026-08-01:
+    # tidligere union-triggeren) rammer stadig grace; kun inde_2 slipper igennem.
+    - condition: template
+      value_template: >-
+        {% set s = states('input_datetime.godnat_force_at') %}
+        {% set g = states('input_number.godnat_walk_grace_seconds') | float(90) %}
+        {% if trigger.entity_id == 'binary_sensor.badevaerelse_inde_2_occupancy'
+              or is_state('binary_sensor.badevaerelse_inde_2_occupancy', 'on') %}
+          true
+        {% elif s in ['unknown','unavailable','none',''] or g <= 0 %}
+          true
+        {% else %}
+          {{ (now() - strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() >= g }}
+        {% endif %}
+  action:
+    # 2026-10-04: kom vi igennem på "mørkt bad trods Manual" (se conditionen),
+    # så slip Manual FØRST — ophold-optrapning, fase-enforcer og sluk-vejene
+    # er alle gated på `!= Manual`, og ellers ville lyset brænde uden ejer.
+    - if:
+        - condition: state
+          entity_id: input_select.room_mode_badevaerelse
+          state: "Manual"
+      then:
+        - service: input_select.select_option
+          target:
+            entity_id: input_select.room_mode_badevaerelse
+          data:
+            option: "Auto"
+        - service: logbook.log
+          data:
+            name: "Badeværelse mode"
+            message: "Nogen i et mørkt bad trods Manual → Auto + lys (badet må aldrig være mørkt)"
+            entity_id: input_select.room_mode_badevaerelse
+    # 500ms delay + light=off re-check: kort debounce, og spring over hvis
+    # lyset allerede blev tændt manuelt i mellemtiden. transition: 3 = smooth fade.
+    - delay:
+        milliseconds: 500
+    # 2026-06-13: trigger-klassificering — approach (på vej mod bad) tænder
+    # på sin egen faste slider-brightness; inde/dør = normalniveau.
+    # 2026-06-13 (race-fix "inde vinder altid"): is_approach beregnes EFTER
+    # delayen og kræver at inde-sensor OG dør er off lige nu. Når man går
+    # direkte ind fyrer entré+dør+inde inden for samme ~½ sek; uden dette
+    # check kunne approach-instansen vinde race'en og efterlade lyset på
+    # 20% + approach_lit=on, så upgrade-vejen tabte. Nu: hvis man fysisk er
+    # inde (inde/dør on) → is_approach=false → fuld styrke uanset rækkefølge.
+    - variables:
+        # 2026-07-02 FIX (user-bug "tænder på medium/quick ved early-detect i
+        # gangen"): dør-checket var STATE (parasoll off = lukket) — men badedøren
+        # STÅR normalt åben om dagen → is_approach altid falsk → gang-passager
+        # tændte 55-60 % i st.f. approach-30 %. Intentionen (2026-06-13) var "dør
+        # fyrede LIGE NU = man går ind" → nu tæller kun en dør-HÆNDELSE < 10 s
+        # som inde-bevis (as_timestamp-default 0 → fail-open til approach).
+        # 2026-10-15 (user-spec, Thread-stedfortræder): er dør-PIR'en inde_1
+        # væk, ser badet ikke længere nogen gå ind — så tæller entré-
+        # bevægelsen som indgang (normalt niveau), ikke som approach.
+        is_approach: >-
+          {{ trigger.entity_id == 'binary_sensor.entre_valhorn_occupancy'
+             and states('binary_sensor.badevaerelse_inde_1_occupancy') not in ['unavailable', 'unknown']
+             and is_state('binary_sensor.badevaerelse_inde_occupancy', 'off')
+             and (now().timestamp()
+                  - as_timestamp(states.binary_sensor.parasoll_badevaerelse.last_changed, 0)) > 10 }}
+        # 2026-06-14 (user-spec): natlys (8% varm 2000K) gælder KUN i mørke —
+        # "natlys skal kun vare til solopgang". Efter solopgang er der dagslys
+        # nok → fald igennem til normalt sol-baseret niveau, selvom godnat-mode
+        # stadig er on. natlys = godnat ON OG solen under natlys-tærsklen
+        # (input_number.natlys_sol_elevation, default -6°). 2026-06-24 (user-spec):
+        # badet SKAL kunne tænde (sikkerhed) → tærsklen vælger KUN dæmpet natlys
+        # vs. normalt lys, blokerer ikke tænd. Se packages/natlys_sol.yaml.
+        # 2026-06-26 (user-spec): godnat = ALTID dæmpet natlys, uanset hvor lyst
+        # der er ude. Den gamle darkness-gate (natlys_sol_under_graense, slider
+        # -13°) tripper aldrig i CPH-midsommer (solen når kun ~-9°) → badet gav
+        # fuldt lys ved godnat-tryk i lyse sommeraftener. Nu styrer godnat alene.
+        # 2026-07-05 (user-spec): natlys slutter om morgenen ved det TIDLIGSTE af
+        # 05:00 (senest) ELLER open-plan lux — IKKE ved godnat-clear. Logikken bor
+        # nu i binary_sensor.badevaerelse_natlys_aktiv (single authority, delt med
+        # fase-sensoren). "fra kl. 05 går bad i normal mode."
+        natlys: >-
+          {{ is_state('binary_sensor.badevaerelse_natlys_aktiv', 'on') }}
+    - condition: template
+      value_template: >-
+        {{ is_state('light.badevaerelse_all', 'off')
+           or (is_state('input_boolean.badevaerelse_approach_lit', 'on')
+               and not is_approach) }}
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        # 2026-06-25: target KUN den aktive fases valgte spots (per-fase spot-
+        # valg), ikke hele gruppen. Fravalgte spots må ALDRIG kommanderes ON —
+        # ellers blinker de on→off→on når enforceren bagefter pruner dem.
+        # sensor.badevaerelse_fase_spots = valgte spots (= alle 5 i natlys/
+        # approach/ingen + empty-set-guard), så det er altid sikkert at targete.
+        entity_id: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+      data:
+        # Light Aggressiveness factor (audit-finding 2026-05-07: missed file)
+        # 2026-06-13 (user-spec): approach-triggers bruger egen FAST slider-
+        # brightness (rå %, bevidst IKKE ganget med aggressiveness — "fast
+        # værdi jeg vil kunne styre"). Godnat-8% vinder altid (nattesyn).
+        # Inde/dør-triggers (og upgrade fra approach) = sol-niveauer × factor.
+        brightness_pct: >
+          {% if natlys %}
+            {# 2026-06-21 (user-spec): godnat-brightness for ALLE stadier (lavt,
+               rå %, tunable). Stadierne styrer sluk-timingen, ikke styrken om
+               natten. Erstatter den hardcodede 8 %. #}
+            {{ [[states('input_number.badevaerelse_godnat_brightness') | int(8), 100] | min, 2] | max }}
+          {% elif is_approach %}
+            {{ [[states('input_number.badevaerelse_approach_brightness') | int(30), 100] | min, 2] | max }}
+          {% else %}
+            {# 2026-06-18 (user-spec): fast 60% ENTRY — bad-spots hopper ALDRIG
+               direkte til 100%. badevaerelse_spots_ramp trapper derfra langsomt
+               op mod 100% KUN mens inde-sensoren ser bevægelse (sparer strøm ved
+               korte toilet-besøg). Erstatter den tidligere lux-baserede 45/55/70.
+               2026-06-21 (to-PIR sok-filter): et ENDNU UBEKRÆFTET besøg (kun
+               dør-PIR/sensor 1, visit_serious=off) tænder kun på probe-
+               brightness. Bekræftes besøget (deep-PIR inde_2 ELLER dør-PIR
+               vedvarende → serious) løfter badevaerelse_visit_confirm_upgrade
+               til 60% + ramp. Gik man direkte i deep-zonen er serious allerede
+               on her (inde_2-arm er instant) → 60% med det samme. #}
+            {% if is_state('binary_sensor.badevaerelse_visit_serious', 'on') %}
+              {# 2026-06-24d (user-spec): fast Medium-slider som serious-ENTRY
+                 (= ramp-base for både Medium og Fuld). Erstatter hardcodet 60.
+                 Ramp'en klatrer derfra til stadiets endepunkt-slider. #}
+              {{ [[states('input_number.badevaerelse_medium_brightness') | int(60), 100] | min, 2] | max }}
+            {% else %}
+              {{ [[states('input_number.badevaerelse_probe_brightness') | int(55), 100] | min, 2] | max }}
+            {% endif %}
+          {% endif %}
+        # B1.1 fix audit-runde 19: brug central sensor for non-godnat CT.
+        # Godnat overrider med 2000K (varmere end constants 2326K — bevidst
+        # ekstra warm for nat-toilet-besøg, beskytter mørketilpasset syn).
+        # 2026-06-19 (user-spec): anti-gul gulv (badevaerelse_min_kelvin, default
+        # 2700) på non-natlys, så den globale Aften-varme-slider ikke gør badet
+        # gult. Natlys (godnat+mørke) = 2000K (nattesyn) — bevidst under gulvet.
+        color_temp_kelvin: >
+          {% if natlys %}2000
+          {% else %}{{ [states('sensor.auto_color_temp_evening') | int(2700),
+                        states('input_number.badevaerelse_min_kelvin') | int(2700)] | max }}
+          {% endif %}
+        transition: "{{ states('sensor.fade_ind_effektiv') | int(3) }}"
+    # 2026-06-13: flag-bogføring for approach→inde-opgradering.
+    # Approach-tænd (ikke godnat) → flag ON så dør/inde-motion må opgradere.
+    # Under godnat sættes flag IKKE: 8% er niveauet hele besøget, og en
+    # "opgradering" ville bare gen-skrive 8 (spildt Zigbee-write).
+    # Inde/dør-tænd eller upgrade → flag OFF (kun hvis on, undgå no-op write).
+    - if:
+        - condition: template
+          value_template: >-
+            {{ is_approach and not natlys }}
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.badevaerelse_approach_lit
+      else:
+        - if:
+            - condition: state
+              entity_id: input_boolean.badevaerelse_approach_lit
+              state: "on"
+          then:
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.badevaerelse_approach_lit
+            - service: logbook.log
+              data:
+                name: "Bad approach"
+                message: "Opgraderet til normalniveau ({{ trigger.entity_id }})"
+                entity_id: light.badevaerelse_all
+    # 2026-06-11 (user-spec): entré-early-detect tænder OGSÅ depot-strippen
+    # som pre-lys på input_number.depot_approach_brightness (default 40%,
+    # slider 2026-06-28) — depot ligger klos op ad badet. Går man faktisk
+    # ind i depotet, skruer depot_harry_potter_on (valhorn-trigger) HELT op
+    # på alle depot-lys og overskriver pre-niveauet. Går man ikke derind, slukker
+    # depot-off-fallback'en (2026-06-11) strippen igen indenfor ~5-15 min.
+    # Kun ved entré-triggeren — bad-sensorernes egne triggers rører ikke depot.
+    # Ikke i godnat (nat-toilet-tur skal ikke lyse depotet op).
+    # 2026-07-08 (#12, user-spec): depot-lys skal fungere som i NORMAL mode i
+    # AirBnB (user fik det fejlagtigt deaktiveret). AirBnB-gaten fjernet — kun
+    # godnat blokerer stadig (nat-toilet-tur skal ikke lyse depotet op).
+    - if:
+        - condition: template
+          value_template: >-
+            {{ trigger.entity_id == 'binary_sensor.entre_valhorn_occupancy'
+               and is_state('input_boolean.godnat_active', 'off') }}
+      then:
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: light.depot_strip
+          data:
+            # 2026-06-28 (user-spec): pre-niveau er nu en slider (rå %, ikke
+            # factor-skaleret). Default 40. Se packages/constants.yaml.
+            brightness_pct: "{{ states('input_number.depot_approach_brightness') | int(40) }}"
+            transition: 2
+        # 2026-06-13 (user-spec): markér strippen som approach-pre-lyst, så
+        # depot_approach_fast_clear kan slukke den hurtigt hvis man aldrig går
+        # ind i depotet. Cleares når depot skrues op (rigtig indgang) eller
+        # depot-strippen slukker. Se packages/depot_foh_switch.yaml.
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.depot_approach_lit
+
+- id: badevaerelse_spots_ramp
+  alias: "Lysnet: Badeværelse 60→100% langsom optrapning (kun ved ophold)"
+  description: >
+    User-spec 2026-06-18: bad-spots hopper ALDRIG direkte til 100%. Efter 60%-
+    entry (dør/inde) trappes de langsomt op mod 100% over badevaerelse_ramp_
+    minutes — KUN så længe inde-sensoren ser bevægelse. Stopper bevægelsen (kort
+    toilet-besøg / bag bruseglas) holder lyset på det niveau det nåede og følger
+    normale fade/sluk-regler → sparer strøm. mode:restart → ny inde-bevægelse
+    genoptager optrapningen fra current.
+  mode: restart
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      from: "off"
+      to: "on"
+    # 2026-06-21: start også klatringen i det øjeblik besøget bekræftes serious
+    # (confirm-upgrade har lige sat 60%) — ellers ville et besøg der gik direkte
+    # i deep-zonen uden flere union-transitions aldrig få ramp'en i gang.
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_visit_serious
+      from: "off"
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-06-21 (to-PIR sok-filter): klatr kun mod 100% for BEKRÆFTEDE besøg.
+    # Et ubekræftet probe-besøg bliver på probe-brightness (ingen ramp) indtil
+    # det evt. bekræftes — så en sok aldrig trapper sig op mod fuld styrke.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_visit_serious
+      state: "on"
+    # Rør ikke manuel / natlys (8%) / approach-pre-lys (30%) — kun normal 60%-entry.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # 2026-07-05 (user-spec): "normal mode fra kl. 05" → ramp igen når natlys er
+    # slut (05:00/lux), ikke først når godnat clearer. Gated på single-authority
+    # natlys-sensoren i st.f. godnat-flaget direkte.
+    - condition: template
+      value_template: >-
+        {{ is_state('binary_sensor.badevaerelse_natlys_aktiv','off') }}
+    - condition: state
+      entity_id: input_boolean.badevaerelse_approach_lit
+      state: "off"
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+  action:
+    # Lad on-automationens 60%-entry (500ms delay + 3s fade) sætte sig først.
+    - delay:
+        seconds: 4
+    - variables:
+        step_s: "{{ [((states('input_number.badevaerelse_ramp_minutes') | float(5)) * 60 / 8) | int, 3] | max }}"
+    - repeat:
+        while:
+          # Kun mens inde ser bevægelse + lyset stadig on + endnu ikke nået fasens
+          # endepunkt-slider. 2026-06-24d (user-spec): endepunktet er nu stadie-
+          # afhængigt — Medium → Medium-slider (= ingen klatring, bliver på base),
+          # Fuld → Fuld-slider (klatrer op). Target re-evalueres hver runde, så en
+          # Medium→Fuld-eskalering løfter loftet live. ~6 rå margin = afrundings-slip.
+          - condition: state
+            entity_id: binary_sensor.badevaerelse_inde_occupancy
+            state: "on"
+          - condition: state
+            entity_id: light.badevaerelse_all
+            state: "on"
+          - condition: template
+            value_template: >-
+              {% set target = states('input_number.badevaerelse_fuld_brightness') | int(100)
+                 if is_state('input_select.badevaerelse_visit_stage','Fuld')
+                 else states('input_number.badevaerelse_medium_brightness') | int(60) %}
+              {{ (state_attr('light.badevaerelse_all','brightness') | int(254)) < (target * 2.54 - 6) }}
+        sequence:
+          - variables:
+              target_pct: >-
+                {{ states('input_number.badevaerelse_fuld_brightness') | int(100)
+                   if is_state('input_select.badevaerelse_visit_stage','Fuld')
+                   else states('input_number.badevaerelse_medium_brightness') | int(60) }}
+              cur_pct: "{{ ((state_attr('light.badevaerelse_all','brightness') | int(153)) / 2.55) | round(0) | int }}"
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              # 2026-06-25: kun fasens valgte spots (fravalgte må ikke re-tændes
+              # af ramp'en → ingen flicker).
+              entity_id: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+            data:
+              brightness_pct: "{{ [cur_pct + 5, target_pct | int] | min }}"
+              transition: "{{ step_s }}"
+          - delay:
+              seconds: "{{ step_s }}"
+
+# =============================================================================
+# Stadie-eskalering: besøg bekræftet (→ Medium/Fuld) → løft probe til memory
+# 2026-06-21
+# =============================================================================
+# Et Quick-probe-besøg (kun dør-PIR, tændt på probe-brightness) eskalerede til
+# Medium/Fuld — deep-PIR (inde_2), dør-PIR vedvarende, eller wasp → visit_serious
+# on (packages/badevaerelse_visit_quality.yaml). Løft lyset fra probe-niveau til
+# Medium-slider-niveau (serious-base) — så et bekræftet besøg matcher normal
+# adfærd. Ramp'en
+# klatrer derfra mod 100% (badevaerelse_spots_ramp triggrer også på serious-on).
+# Rører ikke natlys / approach / manuel, og kun hvis lyset stadig hænger på
+# probe-niveau (< ~55%) → stommer aldrig et højere niveau / midt i ramp.
+# =============================================================================
+- id: badevaerelse_visit_confirm_upgrade
+  alias: "Lysnet: Badeværelse besøg bekræftet → løft probe til memory"
+  description: >
+    visit_serious flippede on (Quick → Medium/Fuld) → løft det tentative probe-
+    lys til det lærte memory-niveau. Ramp'en fortsætter mod 100%.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_visit_serious
+      from: "off"
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # Ikke natlys (8% varm vinder hele natten) og ikke approach-pre (eget flow).
+    # 2026-07-05: natlys-sensoren = single authority (godnat + morgen-05:00/lux) →
+    # confirm-upgrade må igen fra kl. 05, ikke først ved godnat-clear.
+    - condition: template
+      value_template: >-
+        {{ is_state('binary_sensor.badevaerelse_natlys_aktiv','off') }}
+    - condition: state
+      entity_id: input_boolean.badevaerelse_approach_lit
+      state: "off"
+    # Kun løft hvis lyset reelt hænger på probe-niveau (≈ probe-brightness).
+    # Allerede memory/ramp → no-op (undgå at stomme et højere niveau).
+    # 2026-06-23: relativ til probe-slideren (var hardkodet 140 = 55% rå). Da
+    # probe blev hævet til 55% ville den faste grænse blokere løftet → +8 rå margin.
+    - condition: template
+      value_template: >-
+        {% set probe_raw = (states('input_number.badevaerelse_probe_brightness') | float(55)) * 2.54 %}
+        {{ (state_attr('light.badevaerelse_all','brightness') | int(255)) <= (probe_raw + 8) }}
+  action:
+    # Løft til den faste Medium-slider (serious-base). Ramp'en klatrer derfra mod
+    # stadiets endepunkt (Fuld-slider hvis Fuld). CT = anti-gul-gulvet (min_kelvin).
+    - variables:
+        mem_pct: >-
+          {{ [[states('input_number.badevaerelse_medium_brightness') | int(60), 100] | min, 2] | max }}
+        mem_ct: "{{ states('input_number.badevaerelse_min_kelvin') | int(2700) }}"
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        # 2026-06-25: kun fasens valgte spots (fravalgte ikke re-tændt → ingen flicker).
+        entity_id: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+      data:
+        brightness_pct: "{{ mem_pct }}"
+        color_temp_kelvin: "{{ mem_ct }}"
+        transition: 2
+    - service: logbook.log
+      data:
+        name: "Bad besøg"
+        message: "Bekræftet besøg (→ Medium/Fuld) → løftet til Medium-slider (ramp fortsætter)"
+        entity_id: light.badevaerelse_all
+
+- id: presence_light_badevaerelse_off
+  alias: "Lysnet: Badeværelse gradvis sluk"
+  description: >
+    Sprint 2026-05-20: Reclassified fra passage → ophold-tier (private 5 min).
+    Bad er ikke walk-through — du kan være i bad eller på toilet i ophold.
+    Inde-PIR union (badevaerelse_inde_occupancy) dækker rummet, så
+    occupancy=off = du er reelt ude. Tidligere pattern (dim 10s + hold 30/90s + fade) erstattet med
+    private-tier pattern (5 min for: + fade_ophold).
+    2026-09-17 (user-spec): ventetiden er UNDTAGET den globale sluk-slider —
+    den kommer nu fra input_number.badevaerelse_off_minutter (u-skaleret) via
+    sensor.badevaerelse_tom_sluk_sekunder. Badets egne faktorer (AirBnB,
+    bruser-vagt) ganges stadig ovenpå i /5-fallbackens wait-beregning.
+  mode: restart
+  trigger:
+    # 2026-07-02 (B42): bad-valhorn-off-trigger fjernet (udgået device).
+    # 2026-06-11: NY inde-Myggspray (node 263, monteret INDE i badet) —
+    # primær "hold lyset"-sensor. Off-transition efter samme ventetid.
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ (states('sensor.badevaerelse_tom_sluk_sekunder') | float(300)) | int }}"
+    # 2026-06-10: time_pattern fallback (P2-mønstret fra boern). Entré-early-
+    # detect kan tænde bad-lyset UDEN at bad-sensorerne nogensinde går on →
+    # ingen off-transition → lyset ville hænge. Fallback fanger det.
+    - platform: time_pattern
+      minutes: "/5"
+      id: fallback_check
+  condition:
+    # 2026-09-01 (user-spec): brusebad-session i gang (TIMMERFLOTTE-klima:
+    # damp + varme) = der står nogen i bruseren hvor ingen PIR kan se dem.
+    # ÉT delt veto på tværs af alle badets sluk-veje (fejlklasse #21/#2) —
+    # se packages/badevaerelse_brusebad.yaml. Max-on watchdog er BEVIDST
+    # ikke vetoet og er stadig det ydre net.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    # 2026-09-03 (Thread-nødlys-veto, fejlklasse #21): mens bad-Zigbee-nødlyset
+    # ejer spot_4/5 (Matter-spots 1-3 unavailable pga. Thread-hang) må ingen
+    # sluk-vej fyre turn_off på gruppen/spots — det slukker vores eneste lys i
+    # badet. Målt 14:50:00 i dag: gradvis-sluk slukkede nødlyset 95 s efter
+    # tænding via /5-min fallback. Samme veto kopieres til alle 7 sluk-veje
+    # (samme #21-mønster som brusebad ovenfor). Max-on watchdog stadig ikke
+    # vetoet. Se packages/thread_otbr_watchdog.yaml for ejer-automationen.
+    # 2026-10-09: flaget udløber selv (badet tomt 3 min / Thread tilbage) og
+    # kræver ≥ 2 døde spots — ét dødt spot holdt det tændt hele natten.
+    - condition: state
+      entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+      state: "off"
+    # Fallback-gates (state-triggers passerer altid: lyset er enten on eller
+    # turn_off er no-op; betingelserne her beskytter mod for-tidlig fallback-sluk)
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    # WASP-IN-A-BOX (2026-06-12 user-spec): dør lukket + ny bevægelse inde
+    # → sluk UNDER INGEN OMSTÆNDIGHEDER før døren åbnes igen. Gælder både
+    # occupancy-off-triggers og /5-min fallback (conditions er fælles).
+    # Kræver dør=off (lukket) så stuck flag ved sensor-udfald ikke låser evigt.
+    # Se packages/badevaerelse_wasp.yaml.
+    #
+    # 2026-07-08 (#5, user-spec): UDVIDET veto. Wasp-arm kræver en frisk PIR-kant
+    # bag lukket dør; sætter man sig stille (toilet/kar) uden ny kant armerer wasp
+    # ALDRIG (det dokumenterede "rest-hul" i wasp-filen) → medium/general-off
+    # slukkede midt i besøget, og bevægelse tændte igen UDEN at døren åbnede. Nu
+    # holder lyset også ved (dør lukket + committet besøg = visit_serious). Kan
+    # ikke brænde et tomt bad: man ÅBNER altid døren for at gå ud (→ vetoet
+    # falder → sluk) FØR man lukker det tomme rum. Max-on watchdog (45 min) er
+    # backstop hvis dørsensoren skulle hænge.
+    - condition: template
+      value_template: >-
+        {{ not ((is_state('input_boolean.badevaerelse_wasp_active', 'on')
+                 or is_state('binary_sensor.badevaerelse_visit_serious', 'on'))
+                and is_state('binary_sensor.parasoll_badevaerelse', 'off')) }}
+    # 2026-06-10 user-regel (rev. 2026-06-11 #2): sluk ALDRIG i blinde.
+    # 2026-08-01 ÆRLIG RETTELSE (fejlklasse #3): denne condition har været altid-
+    # sand siden 06-21. badevaerelse_inde_occupancy er ikke længere den rå
+    # Myggspray, men en TEMPLATE-union UDEN availability → den rendrer altid
+    # on/off, aldrig unavailable. Beholdt bevidst: falder BEGGE inde-PIR'er ud,
+    # er "sluk alligevel" det rigtige udfald — et bad der brænder i blinde i
+    # timevis er værre end et lys der slukker for tidligt. Ægte blind-beskyttelse
+    # ville kræve en availability-template på unionen, ikke denne linje.
+    - condition: template
+      value_template: >-
+        {{ states('binary_sensor.badevaerelse_inde_occupancy')
+           not in ['unavailable', 'unknown'] }}
+    # HOLD: inde-bevægelse = nogen er i badet → sluk aldrig (user-spec
+    # 2026-06-11: "leder efter bevægelse derinde og holder lyset tændt").
+    # 2026-08-01: unionen maskerer nu selv et medlem der har hængt på `on` længere
+    # end input_number.occupancy_stuck_on_minutes (Thread-forælder tabt midt i en
+    # bevægelse) → et dødt PIR kan ikke længere holde bad-lyset tændt i timevis.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on') }}"
+    # MINIMUM-HOLD (user-spec 2026-06-11): efter aktivitet fra inde-sensoren
+    # skal lyset holde MINDST input_number.badevaerelse_min_on_minutes
+    # (slider på diagnostics, default 10 min) — uanset global Turn-Off-
+    # slider. Måles fra sensorens seneste on→off-transition. Unavailable
+    # sensor blokerer ikke her (dækkes af aldrig-sluk-i-blinde-reglen).
+    # 2026-06-21 (to-PIR stadier): 10-min minimum-hold gælder KUN FULD-besøg
+    # (wasp/brusebad bag lukket dør, hvor PIR ikke ser én der står stille).
+    # Quick → badevaerelse_probe_quick_off; Medium → badevaerelse_medium_off;
+    # Fuld-leave → badevaerelse_full_leave_off. Så stadie != Fuld → hold-kravet
+    # frafalder her (de dedikerede, hurtigere sluk-veje styrer).
+    - condition: template
+      value_template: >-
+        {% if not is_state('input_select.badevaerelse_visit_stage', 'Fuld') %}
+          true
+        {% else %}
+          {% set st = states('binary_sensor.badevaerelse_inde_occupancy') %}
+          {% if st == 'off' %}
+            {% set t = states.binary_sensor.badevaerelse_inde_occupancy.last_changed %}
+            {% set min_s = (states('input_number.badevaerelse_min_on_minutes') | float(10)) * 60 %}
+            {{ t is not none and (now() - t).total_seconds() >= min_s }}
+          {% else %}
+            true
+          {% endif %}
+        {% endif %}
+    - condition: template
+      value_template: >-
+        {# 2026-09-17 (user-spec "bad skal være undtaget den globale slider,
+           skal ikke ganges op"): basis kom før fra 300 s × global_absence_wait_
+           factor og blev 16,7 min ved husets slider-stilling 30. Nu badets EGEN
+           u-skalerede slider (input_number.badevaerelse_off_minutter). Badets
+           to egne faktorer nedenfor ganges stadig ovenpå — de beskytter mod at
+           slukke på et menneske ingen PIR kan se, og er ikke tålmodighed. #}
+        {% set basis = states('sensor.badevaerelse_tom_sluk_sekunder') | float(300) %}
+        {# 2026-07-08 (user-spec): AirBnB sluk-forsigtighed — ventetiden ganges
+           med badevaerelse_airbnb_off_factor (1.0 i Normal). State-triggeren
+           fyrer på Normal-tiden og blokeres her; /5-fallbacken re-tjekker til
+           den skalerede ventetid er nået. #}
+        {% set af = states('sensor.badevaerelse_airbnb_off_factor') | float(1.0) %}
+        {# 2026-08-13 (user-spec): bruser-vagt — var alle hjemmeværende i badet,
+           og gik den ene ud, står den anden usynlig i bruseren. Ventetiden
+           ganges med bruser_off_faktor mens vagten er armeret (1.0 ellers).
+           Se packages/badevaerelse_bruser_vagt.yaml. #}
+        {% set bf = states('sensor.badevaerelse_bruser_off_factor') | float(1.0) %}
+        {% set wait = basis * af * bf %}
+        {# 2026-08-29 (user-bug "bad med åben dør gør at lyset slukker på os",
+           user-spec "forlæng medium bad lys tænd med åben dør"): DENNE vej var
+           loftet over Medium-slideren. Wasp/visit_serious-vetoet ovenfor kræver
+           LUKKET dør, så et besøg med ÅBEN dør havde slet intet veto her og
+           døde efter 300 × faktorer (målt 583 s = 9,7 min) — UANSET hvor højt
+           badevaerelse_medium_off_minutes stod. Derfor hjalp det ikke at hæve
+           den fra 3 til 8: Medium-vejen nåede aldrig at fyre.
+           Fix: ved stadie Medium + åben dør ejer Medium-vejen timingen, så vi
+           venter det LÆNGSTE af de to vinduer. Bevidst `max` og ikke en
+           deferral: kan Medium-vejen ikke handle (Manual, AirBnB-faktor > 1),
+           slukker DENNE vej stadig — bare senere. Ingen ubundet hold.
+           Målt grundlag: PIR-huller hvor lyset var tændt hele vejen og døren
+           åben (10 døgn, n=273) ligger på p99 = 4,5 min, men et rigtigt
+           brusebad gav 14,5 min (22/08 08:01) — bruseren er strukturelt
+           usynlig for PIR'en, præcis som wasp-designet noterer. #}
+        {% if is_state('input_select.badevaerelse_visit_stage', 'Medium')
+              and is_state('binary_sensor.parasoll_badevaerelse', 'on') %}
+          {% set med = (states('input_number.badevaerelse_medium_off_minutes') | float(3)) * 60 %}
+          {% set wait = [wait, med] | max %}
+        {% endif %}
+        {% set ns = namespace(ok=true) %}
+        {% for s in ['binary_sensor.badevaerelse_inde_occupancy'] %}
+          {% set st = states(s) %}
+          {% if st == 'on' %}
+            {% set ns.ok = false %}
+          {% elif st == 'off' %}
+            {% set t = states[s].last_changed %}
+            {% if t is not none and (now() - t).total_seconds() < wait %}
+              {% set ns.ok = false %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.ok }}
+  action:
+    # 2026-10-01 (user-spec): "jeg vil ikke ha at du slukker lys i badet uden at
+    # der er blevet tjekket en frisk måling fra fugt måleren". Vent på en frisk
+    # måling og afgør på DEN (siger den bad, er brusebad_hold on). Samme blok på
+    # alle badets sluk-veje (#21) — grep fugt_frisk. Timeout = sensorens længste
+    # målte hul (586 s) + luft; max-on watchdog er stadig det ydre net.
+    # 2026-10-06 (bug-hunt nat, 📏): timeout 10 → 30 min og ALDRIG videre ved
+    # timeout. Målt 3 døgn: 834 huller, p99 464 s, men 5 over 600 s (max 1581 s)
+    # — 10-min-grænsen (586 s målt 1/10) slukkede i dem uden frisk måling.
+    # Død sensor = intet sluk her; max-on watchdog er det ydre net.
+    # 2026-10-11 (user-spec): venter vi KUN på fugt-målingen, slukker alt
+    # undtagen bruse-spotten (spot 2) med fade imens. Ikke-blokerende.
+    - service: script.turn_on
+      continue_on_error: true
+      target:
+        entity_id: script.badevaerelse_fugt_ventesluk
+    - wait_template: "{{ is_state('binary_sensor.badevaerelse_fugt_frisk', 'on') }}"
+      timeout: "00:30:00"
+      continue_on_timeout: false
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+           and is_state('light.badevaerelse_all', 'on')
+           and not is_state('input_select.room_mode_badevaerelse', 'Manual') }}
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        # Sprint 2026-05-10: target light.badevaerelse_all (group) i stedet for
+        # kun loft. Dækker loft + 5 spots (når paret) — ingen kode-ændring
+        # nødvendig efter spot-pairing.
+        entity_id: light.badevaerelse_all
+      data:
+        transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"
+
+# =============================================================================
+# Godnat nat-toilet hurtig-sluk (2026-07-27, user-bug)
+# =============================================================================
+# User: "godnat bad lys hang efter mit night walk → måtte slukke det på godnat-
+# knappen. det er en fejl." Rekonstruktion (history 07-27 02:13): under godnat
+# tændte badet på nat-toilet-turen (approach + inde), sensorerne clearede 02:15:37
+# og lyset hang til det factor-skalerede 300 s-ophold-vindue (~02:19). 05-20-
+# rewriten erstattede den gamle 90 s godnat-timeout (som headeren stadig lover)
+# med et fladt private-tier → nat-toilet holder lyset i minutter efter man er
+# tilbage i seng. Døren holdes ÅBEN om natten (user 2026-07-27) → wasp armerer
+# aldrig → besøget styres af gradvis-sluk/Medium = ~5 min.
+#
+# FIX: under godnat slukkes badet HURTIGT (badevaerelse_godnat_off_seconds,
+# default 90 = den gamle timeout) så snart inde-occupancy har været i ro i
+# vinduet — UANSET besøgs-stadie. Fyrer FØR gradvis-sluk/Medium (300 s) →
+# vinder som den hurtigste; de andre ser lyset allerede off = no-op. Kun mens
+# badets natlys-autoritet er aktiv (dag/morgen urørt — 2026-08-22, se
+# conditions). Respekterer Manual + wasp-hold ved LUKKET dør (nat-
+# brusebad) + aldrig-sluk-i-blinde (unavailable inde-sensor). /2-min backstop
+# fanger flanke-huller (fejlklasse #4). ACCEPTERET tradeoff: sidder man helt
+# stille > vinduet ved ÅBEN dør uden at deep-PIR inde_2 fanger mikro-bevægelse
+# → lyset kan dø på én; slideren tuner det (var 90 s i det gamle design).
+# =============================================================================
+- id: badevaerelse_godnat_nightwalk_off
+  alias: "Lysnet: Badeværelse godnat nat-toilet hurtig-sluk"
+  description: >
+    Mens badets natlys er aktivt: sluk hurtigt (badevaerelse_godnat_off_seconds)
+    når inde-occupancy har været i ro — uanset besøgs-stadie. Fikser hæng efter
+    nat-toilet. Veto: approach-pre-lys (ingen er nået frem endnu).
+  mode: restart
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ states('input_number.badevaerelse_godnat_off_seconds') | int(90) }}"
+    - platform: time_pattern
+      minutes: "/2"
+      id: backstop
+  condition:
+    # 2026-09-01 (user-spec): brusebad-session i gang (TIMMERFLOTTE-klima:
+    # damp + varme) = der står nogen i bruseren hvor ingen PIR kan se dem.
+    # ÉT delt veto på tværs af alle badets sluk-veje (fejlklasse #21/#2) —
+    # se packages/badevaerelse_brusebad.yaml. Max-on watchdog er BEVIDST
+    # ikke vetoet og er stadig det ydre net.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    # 2026-09-03 (Thread-nødlys-veto, fejlklasse #21): mens bad-Zigbee-nødlyset
+    # ejer spot_4/5 (Matter-spots 1-3 unavailable pga. Thread-hang) må ingen
+    # sluk-vej fyre turn_off på gruppen/spots — det slukker vores eneste lys i
+    # badet. Målt 14:50:00 i dag: gradvis-sluk slukkede nødlyset 95 s efter
+    # tænding via /5-min fallback. Samme veto kopieres til alle 7 sluk-veje
+    # (samme #21-mønster som brusebad ovenfor). Max-on watchdog stadig ikke
+    # vetoet. Se packages/thread_otbr_watchdog.yaml for ejer-automationen.
+    # 2026-10-09: flaget udløber selv (badet tomt 3 min / Thread tilbage) og
+    # kræver ≥ 2 døde spots — ét dødt spot holdt det tændt hele natten.
+    - condition: state
+      entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+      state: "off"
+    # 2026-08-22: læser badets nat-AUTORITET, ikke det rå godnat-flag. natlys_
+    # aktiv slipper ved dagmode_senest/lux (05:00 i går), mens godnat_active kan
+    # hænge til langt op ad formiddagen — 08-22 blev det først ryddet 07:26. I de
+    # 2,5 timer var badet i DAGmode-lysstyrke, men stadig styret af NAT-sluk'et
+    # (65 s), så morgenlyset døde under brugeren. Fejlklasse #2: samme spørgsmål
+    # ("er det nat i badet?") kodet to steder og divergeret.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_natlys_aktiv
+      state: "on"
+    # 2026-09-03 (AirBnB-review): denne vej VAR familie-adfærd — godnat_active er
+    # aldrig on for en gæst. 08-22-ankerskiftet til natlys_aktiv gav den tavst
+    # AirBnB-scope (sensoren dækker BEVIDST gæster: 8 % natlys kl. 03), og
+    # airbnb_natmode sætter oven i købet godnat_active direkte. Dermed arvede
+    # gæsten et 65 s hurtig-sluk der IKKE skaleres af off_factor — i alle tre
+    # besøgs-stadier, da vejen er stadie-agnostisk. Samme behandling som
+    # quick-/medium-sluk: i AirBnB (faktor > 1) springes den over, og den
+    # generelle (skalerede) sluk overtager. Triggeren er "ingen bevægelse i 65 s"
+    # = svagt fraværs-bevis; leave-off'ens dør-ÅBNINGS-gren er derimod stærk og
+    # skaleres i stedet for at blive sprunget over.
+    - condition: template
+      value_template: "{{ states('sensor.badevaerelse_airbnb_off_factor') | float(1.0) <= 1.0 }}"
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # Approach-pre-lys har sin egen hurtig-sluk (badevaerelse_approach_fast_clear)
+    # — samme veto som søster-automationen probe_quick_off (fejlklasse #12).
+    # UDEN den er "inde-occupancy i ro i 65 s" trivielt sandt FØR nogen er nået
+    # frem: entré-valhornen tænder badet på vej derhen, og /2-backstoppen slukker
+    # det så midt i gåturen (målt 08-22 07:01:38 tændt → 07:02:00 slukket, 22 s).
+    - condition: state
+      entity_id: input_boolean.badevaerelse_approach_lit
+      state: "off"
+    # Aldrig sluk i blinde: inde-sensor skal være tilgængelig (jf. gradvis-sluk).
+    - condition: template
+      value_template: >-
+        {{ states('binary_sensor.badevaerelse_inde_occupancy')
+           not in ['unavailable', 'unknown'] }}
+    # Wasp/committet besøg bag LUKKET dør (nat-brusebad) = hold — samme veto som
+    # gradvis-sluk. Dør ÅBEN (parasoll on) → vetoet falder → hurtig-sluk gælder.
+    - condition: template
+      value_template: >-
+        {{ not ((is_state('input_boolean.badevaerelse_wasp_active', 'on')
+                 or is_state('binary_sensor.badevaerelse_visit_serious', 'on'))
+                and is_state('binary_sensor.parasoll_badevaerelse', 'off')) }}
+    # Inde-occupancy i ro >= vinduet (dækker /2-backstop; state-trig passerer selv).
+    - condition: template
+      value_template: >-
+        {% set w = states('input_number.badevaerelse_godnat_off_seconds') | int(90) %}
+        {% set st = states('binary_sensor.badevaerelse_inde_occupancy') %}
+        {% if st != 'off' %}false
+        {% else %}
+          {% set t = states.binary_sensor.badevaerelse_inde_occupancy.last_changed %}
+          {{ t is not none and (now() - t).total_seconds() >= w }}
+        {% endif %}
+  action:
+    # 2026-10-01 (user-spec): "jeg vil ikke ha at du slukker lys i badet uden at
+    # der er blevet tjekket en frisk måling fra fugt måleren". Vent på en frisk
+    # måling og afgør på DEN (siger den bad, er brusebad_hold on). Samme blok på
+    # alle badets sluk-veje (#21) — grep fugt_frisk. Timeout = sensorens længste
+    # målte hul (586 s) + luft; max-on watchdog er stadig det ydre net.
+    # 2026-10-06 (bug-hunt nat, 📏): timeout 10 → 30 min og ALDRIG videre ved
+    # timeout. Målt 3 døgn: 834 huller, p99 464 s, men 5 over 600 s (max 1581 s)
+    # — 10-min-grænsen (586 s målt 1/10) slukkede i dem uden frisk måling.
+    # Død sensor = intet sluk her; max-on watchdog er det ydre net.
+    # 2026-10-11 (user-spec): venter vi KUN på fugt-målingen, slukker alt
+    # undtagen bruse-spotten (spot 2) med fade imens. Ikke-blokerende.
+    - service: script.turn_on
+      continue_on_error: true
+      target:
+        entity_id: script.badevaerelse_fugt_ventesluk
+    - wait_template: "{{ is_state('binary_sensor.badevaerelse_fugt_frisk', 'on') }}"
+      timeout: "00:30:00"
+      continue_on_timeout: false
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+           and is_state('light.badevaerelse_all', 'on')
+           and not is_state('input_select.room_mode_badevaerelse', 'Manual') }}
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all
+      data:
+        transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"
+    - service: logbook.log
+      data:
+        name: "Bad godnat nat-toilet"
+        message: "Hurtig-sluk under godnat (nat-toilet ude, ingen wasp-hold ved lukket dør)"
+        entity_id: light.badevaerelse_all
+
+# =============================================================================
+# Natlys-slut opgradering — "natlys skal kun vare til solopgang" (2026-06-14)
+# =============================================================================
+# BUG (2026-06-14 07:59): bruger gik ind i badet mens godnat stadig var on.
+# DENGANG tændte on-automationen badet på 8% natlys ALENE pga godnat-flaget —
+# selvom solen for længst var oppe (juni-solopgang ~04:25). Lyset hang på 8%.
+#
+# FIX (primær): natlys er nu gated på `godnat AND solen under horisonten`
+# (variabel `natlys` i on-automationen). Enhver presence-trigger EFTER
+# solopgang giver derfor normalt niveau — bug-scenariet kan ikke opstå mere.
+#
+# FIX (denne automation, edge-case): hvis man ER i badet på natlys NÅR solen
+# krydser horisonten (vinter: solopgang midt i et bad-besøg), re-evaluerer
+# intet det allerede-tændte lys. Trigger på solopgang (elev krydser 0) ELLER
+# godnat→off; hvis lyset stadig hænger på et dim/natlys-niveau og nogen er i
+# badet → løft til normalt. Respekterer Manual mode.
+# =============================================================================
+- id: badevaerelse_natlys_end_upgrade
+  alias: "Lysnet: Badeværelse natlys-slut opgradering"
+  description: >
+    Solopgang (eller godnat-slut) mens nogen er i badet og lyset stadig hænger
+    på natlys/dim-niveau → løft til normalt sol-baseret niveau. Fanger det
+    sjældne vinter-tilfælde hvor solen krydser horisonten midt i et besøg.
+  mode: single
+  trigger:
+    # 2026-06-24: krydsning af natlys-tærsklen (slider), ikke hardcoded 0 —
+    # natlys slutter nu ved input_number.natlys_sol_elevation.
+    - platform: numeric_state
+      entity_id: sun.sun
+      attribute: elevation
+      above: input_number.natlys_sol_elevation
+    - platform: state
+      entity_id: input_boolean.godnat_active
+      to: "off"
+    # 2026-07-05: natlys slutter om morgenen (05:00/lux) MENS godnat stadig kører
+    # (partneren sover videre) → løft et igangværende bad-besøg fra 8% til normalt.
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_natlys_aktiv
+      from: "on"
+      to: "off"
+  condition:
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    # Kun hvis nogen FAKTISK er i badet lige nu — ellers lad off-timeren rydde.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      state: "on"
+    # Respektér bruger-manuel: rør ikke et lys bruger selv har indstillet.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # 2026-07-05: opgradér når natlys er slut — enten godnat-clear ELLER morgen
+    # (05:00/lux) mens godnat stadig kører. Single-authority natlys-sensoren.
+    - condition: template
+      value_template: >-
+        {{ is_state('binary_sensor.badevaerelse_natlys_aktiv', 'off') }}
+    # Kun løft hvis lyset reelt hænger dim (natlys 8% ≈ 20/254). I Auto-mode
+    # kan kun natlys/approach være så lavt; approach (≥30%) ligger over 60.
+    - condition: template
+      value_template: >-
+        {{ (state_attr('light.badevaerelse_all', 'brightness') | int(255)) < 60 }}
+  action:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all
+      data:
+        # Samme normal-niveau som on-automationens non-natlys/non-approach gren.
+        # 2026-06-15 (user): open_plan_lux-styrke (Apollo = eneste troværdige lux).
+        brightness_pct: >
+          {% set lux = states('sensor.open_plan_lux') | float(50) %}
+          {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}{% set base = 45 %}
+          {% elif lux < 40 %}{% set base = 55 %}
+          {% else %}{% set base = 70 %}{% endif %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+        # 2026-06-19: anti-gul gulv (badevaerelse_min_kelvin) også her.
+        color_temp_kelvin: >-
+          {{ [states('sensor.auto_color_temp_evening') | int(2700),
+              states('input_number.badevaerelse_min_kelvin') | int(2700)] | max }}
+        # Blød rampe fra 8% — undgå at blænde lige-vågne øjne.
+        transition: "{{ states('sensor.fade_ind_effektiv') | int(3) }}"
+    - service: logbook.log
+      data:
+        name: "Bad natlys-slut"
+        message: "Natlys løftet til normalniveau (solopgang/godnat-slut, nogen i badet)"
+        entity_id: light.badevaerelse_all
+
+# =============================================================================
+# Approach early-detect hurtig-sluk (2026-06-13, user-spec)
+# =============================================================================
+# Early-detect/approach (entré-valhorn) tænder badet på vej derhen på
+# pre-niveau (badevaerelse_approach_lit=on). Går man FAKTISK ind, opgraderes
+# lyset (dør-åbning / inde-motion) → flag cleares → normal ophold-sluk gælder.
+# Går man IKKE ind (bare passerede entré), bliver flaget stående → dette
+# automation slukker pre-lyset hurtigt (input_number.early_detect_clear_seconds,
+# default 30 s) i stedet for de normale 5 min. Sikkerheden ligger i conditions:
+# kun når flaget stadig er on OG der ingen reel indgang er (inde off + dør
+# lukket) — så vi aldrig slukker for nogen der er inde (de har enten åbnet
+# døren eller udløst inde-motion, hvilket clearer flaget).
+# =============================================================================
+- id: badevaerelse_approach_fast_clear
+  alias: "Lysnet: Badeværelse approach-lys hurtig-sluk"
+  description: >
+    Approach tændte badet men ingen gik ind (approach_lit stadig on, inde off,
+    dør lukket) → sluk pre-lyset efter early_detect_clear_seconds.
+  mode: restart
+  trigger:
+    # 2026-07-02 (B42): bad-valhorn-trigger + condition fjernet (udgået device;
+    # unavailable ≠ off → conditionen var stille-false og DRÆBTE fast-clear
+    # siden 2026-06-21 — fejlklasse #9).
+    - platform: state
+      entity_id: binary_sensor.entre_valhorn_occupancy
+      to: "off"
+      for:
+        seconds: "{{ states('input_number.early_detect_clear_seconds') | int(30) }}"
+  condition:
+    # 2026-09-01 (user-spec): brusebad-session i gang (TIMMERFLOTTE-klima:
+    # damp + varme) = der står nogen i bruseren hvor ingen PIR kan se dem.
+    # ÉT delt veto på tværs af alle badets sluk-veje (fejlklasse #21/#2) —
+    # se packages/badevaerelse_brusebad.yaml. Max-on watchdog er BEVIDST
+    # ikke vetoet og er stadig det ydre net.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    # 2026-09-03 (Thread-nødlys-veto, fejlklasse #21): mens bad-Zigbee-nødlyset
+    # ejer spot_4/5 (Matter-spots 1-3 unavailable pga. Thread-hang) må ingen
+    # sluk-vej fyre turn_off på gruppen/spots — det slukker vores eneste lys i
+    # badet. Målt 14:50:00 i dag: gradvis-sluk slukkede nødlyset 95 s efter
+    # tænding via /5-min fallback. Samme veto kopieres til alle 7 sluk-veje
+    # (samme #21-mønster som brusebad ovenfor). Max-on watchdog stadig ikke
+    # vetoet. Se packages/thread_otbr_watchdog.yaml for ejer-automationen.
+    # 2026-10-09: flaget udløber selv (badet tomt 3 min / Thread tilbage) og
+    # kræver ≥ 2 døde spots — ét dødt spot holdt det tændt hele natten.
+    - condition: state
+      entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+      state: "off"
+    # Kun ægte approach-pre-tilstand (aldrig opgraderet til reel indgang).
+    - condition: state
+      entity_id: input_boolean.badevaerelse_approach_lit
+      state: "on"
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    # Ingen reel indgang: inde-sensor off. 2026-07-02 (B42 fix 2): parasoll==off
+    # (dør lukket)-condition DROPPET — badedøren står normalt ÅBEN om dagen, så
+    # kravet blokerede fast-clear ved enhver gang-passage. En reel indgang
+    # clearer approach_lit-flaget (dør-HÆNDELSE/inde-motion) → flag-conditionen
+    # ovenfor er den rigtige vagt.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      state: "off"
+    # Approach-sensoren i ro NU (kan have re-fyret i mellemtiden).
+    - condition: state
+      entity_id: binary_sensor.entre_valhorn_occupancy
+      state: "off"
+  action:
+    # Kort fade (passage-tier) — "gå væk hurtigt". approach_lit cleares
+    # automatisk af badevaerelse_approach_lit_clear når lyset slukker.
+    # 2026-10-01 (user-spec): "jeg vil ikke ha at du slukker lys i badet uden at
+    # der er blevet tjekket en frisk måling fra fugt måleren". Vent på en frisk
+    # måling og afgør på DEN (siger den bad, er brusebad_hold on). Samme blok på
+    # alle badets sluk-veje (#21) — grep fugt_frisk. Timeout = sensorens længste
+    # målte hul (586 s) + luft; max-on watchdog er stadig det ydre net.
+    # 2026-10-06 (bug-hunt nat, 📏): timeout 10 → 30 min og ALDRIG videre ved
+    # timeout. Målt 3 døgn: 834 huller, p99 464 s, men 5 over 600 s (max 1581 s)
+    # — 10-min-grænsen (586 s målt 1/10) slukkede i dem uden frisk måling.
+    # Død sensor = intet sluk her; max-on watchdog er det ydre net.
+    # 2026-10-11 (user-spec): venter vi KUN på fugt-målingen, slukker alt
+    # undtagen bruse-spotten (spot 2) med fade imens. Ikke-blokerende.
+    - service: script.turn_on
+      continue_on_error: true
+      target:
+        entity_id: script.badevaerelse_fugt_ventesluk
+    - wait_template: "{{ is_state('binary_sensor.badevaerelse_fugt_frisk', 'on') }}"
+      timeout: "00:30:00"
+      continue_on_timeout: false
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+           and is_state('light.badevaerelse_all', 'on')
+           and not is_state('input_select.room_mode_badevaerelse', 'Manual') }}
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all
+      data:
+        transition: "{{ states('sensor.fade_passage_effective') | int(10) }}"
+
+# =============================================================================
+# To-PIR sok-filter: probe quick-off (ubekræftet besøg = sok) — 2026-06-21
+# =============================================================================
+# user-spec ("nedkæmp burn ved hurtige/falske besøg"): dør-PIR (inde_1) udløste
+# lyset, men besøget blev ALDRIG bekræftet rigtigt — deep-PIR (inde_2) fyrede
+# aldrig OG dør-PIR var ikke vedvarende nok til sustain → visit_serious=off
+# (packages/badevaerelse_visit_quality.yaml). Når dør-PIR'en så er faldet helt i
+# ro i badevaerelse_probe_grace_seconds (clear-delay + buffer) og intet andet
+# holder besøget i live → sluk hurtigt (passage-fade) i stedet for de normale
+# 5/10 min. = en sok kastet ind koster kun probe-brightness i ~clear-delay+grace
+# sek, ikke 60% i 10+ min.
+#
+# SIKKER mod ægte besøg: et committet besøg sætter ENTEN visit_serious (deep/
+# sustain) ELLER wasp (bevægelse bag lukket dør) — begge veto'er her. Den
+# accepterede rest-hul (lige i bruseren bag glas uden ÉN bevægelse efter dør-luk)
+# er den samme som wasp-designet allerede noterer, og wasp dækker den normalt.
+# =============================================================================
+- id: badevaerelse_probe_quick_off
+  alias: "Lysnet: Badeværelse probe quick-off (ubekræftet = sok)"
+  description: >
+    Ubekræftet besøg (kun dør-PIR, ingen deep/sustain → visit_serious off) og
+    dør-PIR i ro i grace → sluk hurtigt (sok-filter). Veto: serious, wasp,
+    approach-pre, manuel, godnat. Daytime-feature.
+  mode: restart
+  trigger:
+    # Dør-PIR faldet i ro i grace (PIR clear-delay + buffer).
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_1_occupancy
+      to: "off"
+      for:
+        seconds: "{{ states('input_number.badevaerelse_probe_grace_seconds') | int(20) }}"
+    # Backstop: lyset tændt af en dør-åbning UDEN at nogen PIR fangede noget
+    # (sok kastet gennem åben dør, ingen PIR-edge) → ingen off-transition at
+    # vente på. Grace efter lyset blev tændt fanger den.
+    - platform: state
+      entity_id: light.badevaerelse_all
+      to: "on"
+      for:
+        seconds: "{{ states('input_number.badevaerelse_probe_grace_seconds') | int(20) }}"
+  condition:
+    # 2026-09-01 (user-spec): brusebad-session i gang (TIMMERFLOTTE-klima:
+    # damp + varme) = der står nogen i bruseren hvor ingen PIR kan se dem.
+    # ÉT delt veto på tværs af alle badets sluk-veje (fejlklasse #21/#2) —
+    # se packages/badevaerelse_brusebad.yaml. Max-on watchdog er BEVIDST
+    # ikke vetoet og er stadig det ydre net.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    # 2026-09-03 (Thread-nødlys-veto, fejlklasse #21): mens bad-Zigbee-nødlyset
+    # ejer spot_4/5 (Matter-spots 1-3 unavailable pga. Thread-hang) må ingen
+    # sluk-vej fyre turn_off på gruppen/spots — det slukker vores eneste lys i
+    # badet. Målt 14:50:00 i dag: gradvis-sluk slukkede nødlyset 95 s efter
+    # tænding via /5-min fallback. Samme veto kopieres til alle 7 sluk-veje
+    # (samme #21-mønster som brusebad ovenfor). Max-on watchdog stadig ikke
+    # vetoet. Se packages/thread_otbr_watchdog.yaml for ejer-automationen.
+    # 2026-10-09: flaget udløber selv (badet tomt 3 min / Thread tilbage) og
+    # kræver ≥ 2 døde spots — ét dødt spot holdt det tændt hele natten.
+    - condition: state
+      entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+      state: "off"
+    # Kun ubekræftede besøg — et rigtigt besøg har visit_serious=on.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_visit_serious
+      state: "off"
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    # Begge indre-PIR'er i ro NU.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_inde_1_occupancy
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_inde_2_occupancy
+      state: "off"
+    # Wasp armeret = bekræftet bevægelse bag lukket dør → rør ALDRIG (eget veto).
+    - condition: state
+      entity_id: input_boolean.badevaerelse_wasp_active
+      state: "off"
+    # Approach-pre-lys har sin egen hurtig-sluk (badevaerelse_approach_fast_clear).
+    - condition: state
+      entity_id: input_boolean.badevaerelse_approach_lit
+      state: "off"
+    # 2026-06-21 (user-spec): gælder OGSÅ under godnat (smart system om natten med
+    # lav brightness). En ubekræftet nat-trigger slukkes hurtigt ligesom om dagen.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # 2026-07-08 (user-spec, AirBnB sluk-forsigtighed): sok-filteret er familie-
+    # adfærd — i AirBnB (faktor > 1) springes hurtig-slukket over, og den generelle
+    # (skalerede) sluk overtager. Gæster kaster ikke sokker; en langsomt-bevægende
+    # gæst ved vasken må ikke få slukket lyset efter 20 s.
+    - condition: template
+      value_template: "{{ states('sensor.badevaerelse_airbnb_off_factor') | float(1.0) <= 1.0 }}"
+    # 2026-08-13 (user-spec): samme undtagelse mens bruser-vagten er armeret — er
+    # begge hjemmeværende lige gået ind i badet, er et 90 s dør-PIR-hul ikke en
+    # sok, det er en der er trådt ind i bruseren. Medium/general-sluk (skaleret)
+    # overtager; max-on watchdog er backstop.
+    - condition: template
+      value_template: "{{ states('sensor.badevaerelse_bruser_off_factor') | float(1.0) <= 1.0 }}"
+  action:
+    # 2026-10-01 (user-spec): "jeg vil ikke ha at du slukker lys i badet uden at
+    # der er blevet tjekket en frisk måling fra fugt måleren". Vent på en frisk
+    # måling og afgør på DEN (siger den bad, er brusebad_hold on). Samme blok på
+    # alle badets sluk-veje (#21) — grep fugt_frisk. Timeout = sensorens længste
+    # målte hul (586 s) + luft; max-on watchdog er stadig det ydre net.
+    # 2026-10-06 (bug-hunt nat, 📏): timeout 10 → 30 min og ALDRIG videre ved
+    # timeout. Målt 3 døgn: 834 huller, p99 464 s, men 5 over 600 s (max 1581 s)
+    # — 10-min-grænsen (586 s målt 1/10) slukkede i dem uden frisk måling.
+    # Død sensor = intet sluk her; max-on watchdog er det ydre net.
+    # 2026-10-11 (user-spec): venter vi KUN på fugt-målingen, slukker alt
+    # undtagen bruse-spotten (spot 2) med fade imens. Ikke-blokerende.
+    - service: script.turn_on
+      continue_on_error: true
+      target:
+        entity_id: script.badevaerelse_fugt_ventesluk
+    - wait_template: "{{ is_state('binary_sensor.badevaerelse_fugt_frisk', 'on') }}"
+      timeout: "00:30:00"
+      continue_on_timeout: false
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+           and is_state('light.badevaerelse_all', 'on')
+           and not is_state('input_select.room_mode_badevaerelse', 'Manual') }}
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all
+      data:
+        transition: "{{ states('sensor.fade_passage_effective') | int(10) }}"
+    - service: logbook.log
+      data:
+        name: "Bad besøg"
+        message: >-
+          Ubekræftet besøg (kun dør-PIR, ingen deep/sustain) → quick-off
+          (sok-filter, grace {{ states('input_number.badevaerelse_probe_grace_seconds') }}s)
+        entity_id: light.badevaerelse_all
+
+# =============================================================================
+# Medium-besøg sluk: kortere hold (2026-06-21)
+# =============================================================================
+# Stadie Medium = ÉT commitment-signal (deep-PIR én gang ELLER dør-PIR vedvarende)
+# men IKKE wasp = et reelt men kort besøg med åben dør (tisse-tur / hentede noget /
+# tandbørstning). Slukkes efter badevaerelse_medium_off_minutes uden bevægelse —
+# kortere end Fuld-besøgets min-hold, så vi ikke holder lyset tændt længe efter et
+# hurtigt besøg. (PIR ser ikke stilstand → måles fra sidste bevægelse; bevæger man
+# sig igen resetter mode:restart timeren.) Eskalerer besøget til Fuld (wasp) overtager
+# Fuld-hold + leave-off i stedet.
+# =============================================================================
+- id: badevaerelse_medium_off
+  alias: "Lysnet: Badeværelse Medium-besøg sluk (kortere hold)"
+  description: >
+    Stadie Medium + ingen indre-bevægelse i badevaerelse_medium_off_minutes →
+    sluk (ophold-fade). Veto: wasp (= Fuld-hold), godnat, manuel.
+  mode: restart
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      from: "on"
+      to: "off"
+      for:
+        seconds: >-
+          {{ ((states('input_number.badevaerelse_medium_off_minutes') | float(3)) * 60) | int }}
+  condition:
+    # 2026-09-01 (user-spec): brusebad-session i gang (TIMMERFLOTTE-klima:
+    # damp + varme) = der står nogen i bruseren hvor ingen PIR kan se dem.
+    # ÉT delt veto på tværs af alle badets sluk-veje (fejlklasse #21/#2) —
+    # se packages/badevaerelse_brusebad.yaml. Max-on watchdog er BEVIDST
+    # ikke vetoet og er stadig det ydre net.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    # 2026-09-03 (Thread-nødlys-veto, fejlklasse #21): mens bad-Zigbee-nødlyset
+    # ejer spot_4/5 (Matter-spots 1-3 unavailable pga. Thread-hang) må ingen
+    # sluk-vej fyre turn_off på gruppen/spots — det slukker vores eneste lys i
+    # badet. Målt 14:50:00 i dag: gradvis-sluk slukkede nødlyset 95 s efter
+    # tænding via /5-min fallback. Samme veto kopieres til alle 7 sluk-veje
+    # (samme #21-mønster som brusebad ovenfor). Max-on watchdog stadig ikke
+    # vetoet. Se packages/thread_otbr_watchdog.yaml for ejer-automationen.
+    # 2026-10-09: flaget udløber selv (badet tomt 3 min / Thread tilbage) og
+    # kræver ≥ 2 døde spots — ét dødt spot holdt det tændt hele natten.
+    - condition: state
+      entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+      state: "off"
+    - condition: state
+      entity_id: input_select.badevaerelse_visit_stage
+      state: "Medium"
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      state: "off"
+    # Wasp armeret → besøget er reelt Fuld (eskalering kan halte et øjeblik) →
+    # lad Fuld-hold/leave-off styre. 2026-06-21: gælder OGSÅ under godnat.
+    - condition: state
+      entity_id: input_boolean.badevaerelse_wasp_active
+      state: "off"
+    # 2026-07-08 (#5, user-spec): medium-off slukker KUN ved ÅBEN dør (parasoll
+    # on). Er døren lukket sidder man bag en lukket boks (toilet/kar) — PIR ser
+    # ikke stilstand, så et 3-min timeout ville mørklægge midt i besøget. Ved
+    # lukket dør holder general-off's udvidede wasp-veto lyset til døren åbnes.
+    - condition: state
+      entity_id: binary_sensor.parasoll_badevaerelse
+      state: "on"
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # 2026-07-08 (user-spec, AirBnB sluk-forsigtighed): i AirBnB (faktor > 1)
+    # springes det hurtige 3-min-sluk over — den generelle (skalerede) sluk
+    # overtager, så en gæst der ligger stille i kar med åben dør ikke mørklægges
+    # efter 3 min.
+    - condition: template
+      value_template: "{{ states('sensor.badevaerelse_airbnb_off_factor') | float(1.0) <= 1.0 }}"
+  action:
+    # 2026-08-13 (user-spec): bruser-vagten forlænger ventetiden ×faktor. Den kan
+    # ikke lægges i trigger-for: (binder ved load), så den hentes her: sov resten
+    # af tiden og kræv derefter at inde-occupancy har været i ro HELE den
+    # skalerede periode. Bevægelse undervejs nulstiller last_changed → ingen sluk
+    # (og mode:restart genstarter forløbet). Faktor 1.0 → delay 0 = uændret.
+    - delay:
+        seconds: >-
+          {% set bf = states('sensor.badevaerelse_bruser_off_factor') | float(1.0) %}
+          {% set base = (states('input_number.badevaerelse_medium_off_minutes') | float(3)) * 60 %}
+          {{ [(base * (bf - 1.0)), 0] | max | int }}
+    - condition: template
+      value_template: >-
+        {% set bf = states('sensor.badevaerelse_bruser_off_factor') | float(1.0) %}
+        {% set base = (states('input_number.badevaerelse_medium_off_minutes') | float(3)) * 60 %}
+        {% set st = states.binary_sensor.badevaerelse_inde_occupancy %}
+        {{ st is not none and st.state == 'off'
+           and (now() - st.last_changed).total_seconds() >= (base * bf) - 5 }}
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    # 2026-10-01 (user-spec): "jeg vil ikke ha at du slukker lys i badet uden at
+    # der er blevet tjekket en frisk måling fra fugt måleren". Vent på en frisk
+    # måling og afgør på DEN (siger den bad, er brusebad_hold on). Samme blok på
+    # alle badets sluk-veje (#21) — grep fugt_frisk. Timeout = sensorens længste
+    # målte hul (586 s) + luft; max-on watchdog er stadig det ydre net.
+    # 2026-10-06 (bug-hunt nat, 📏): timeout 10 → 30 min og ALDRIG videre ved
+    # timeout. Målt 3 døgn: 834 huller, p99 464 s, men 5 over 600 s (max 1581 s)
+    # — 10-min-grænsen (586 s målt 1/10) slukkede i dem uden frisk måling.
+    # Død sensor = intet sluk her; max-on watchdog er det ydre net.
+    # 2026-10-11 (user-spec): venter vi KUN på fugt-målingen, slukker alt
+    # undtagen bruse-spotten (spot 2) med fade imens. Ikke-blokerende.
+    - service: script.turn_on
+      continue_on_error: true
+      target:
+        entity_id: script.badevaerelse_fugt_ventesluk
+    - wait_template: "{{ is_state('binary_sensor.badevaerelse_fugt_frisk', 'on') }}"
+      timeout: "00:30:00"
+      continue_on_timeout: false
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+           and is_state('light.badevaerelse_all', 'on')
+           and not is_state('input_select.room_mode_badevaerelse', 'Manual') }}
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all
+      data:
+        transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"
+    - service: logbook.log
+      data:
+        name: "Bad besøg"
+        message: >-
+          Medium-besøg → sluk efter {{ states('input_number.badevaerelse_medium_off_minutes') }}
+          min uden bevægelse (dør åben)
+          {%- if (states('sensor.badevaerelse_bruser_off_factor') | float(1.0)) > 1.0 %}
+          ×{{ states('sensor.badevaerelse_bruser_off_factor') }} (bruser-vagt){% endif %}
+        entity_id: light.badevaerelse_all
+
+# =============================================================================
+# Fuld-besøg leave-off: dør åbnes = man gik → sluk hurtigt (2026-06-21)
+# =============================================================================
+# Stadie Fuld = wasp/committet bag lukket dør. PIR ser ikke én der står stille, så
+# lyset holdes mens døren er LUKKET (wasp-veto + min-hold). Men når døren ÅBNES er
+# man på vej UD — så skal vi ikke holde lyset tændt 10 min mere (det var den store
+# burn: 2-min tissetur → 8 min efterlys). Dør-åbning + ingen genoptaget bevægelse i
+# badevaerelse_leave_off_seconds → sluk. Robust mod "åbnede for at hente noget og
+# blev": genoptager man bevægelse inden grace udløber → ingen sluk.
+#
+# NB: dør-åbning gen-tænder IKKE lyset (on-automationens light=off-gate fejler når
+# lyset allerede er tændt), så leave-off kan trygt slukke bagefter.
+# =============================================================================
+- id: badevaerelse_full_leave_off
+  alias: "Lysnet: Badeværelse leave-off (Fuld + dør åben + ro)"
+  description: >
+    Fuld-besøg (du lukkede døren = committet) hvor døren NU er åben og der ikke
+    er bevægelse i leave_off_seconds = man er gået → sluk. To triggers fanger
+    begge forløb: (a) du åbner døren og går direkte ud; (b) du åbner døren, vasker
+    hænder, og bliver så stille. Gælder KUN Fuld — Medium (åben dør hele tiden)
+    styres af medium_off. mode:restart + recheck = genoptaget bevægelse aflyser.
+  mode: restart
+  trigger:
+    # (a) Døren åbnes mens man er i et Fuld-besøg = INTENT om at gå ud. At åbne
+    # døren er selve "jeg forlader"-signalet (en der sidder stille åbner den ikke).
+    - platform: state
+      entity_id: binary_sensor.parasoll_badevaerelse
+      to: "on"
+      id: door_open
+    # (b) Bevægelsen stopper (begge indre-PIR clearer) — kun gyldig hvis døren er
+    # åben (recheck nedenfor), så vi ikke slukker for en der sidder stille bag
+    # lukket dør (det beskytter min-hold/wasp-veto).
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      from: "on"
+      to: "off"
+      id: quiet
+  condition:
+    # 2026-09-01 (user-spec): brusebad-session i gang (TIMMERFLOTTE-klima:
+    # damp + varme) = der står nogen i bruseren hvor ingen PIR kan se dem.
+    # ÉT delt veto på tværs af alle badets sluk-veje (fejlklasse #21/#2) —
+    # se packages/badevaerelse_brusebad.yaml. Max-on watchdog er BEVIDST
+    # ikke vetoet og er stadig det ydre net.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    # 2026-09-03 (Thread-nødlys-veto, fejlklasse #21): mens bad-Zigbee-nødlyset
+    # ejer spot_4/5 (Matter-spots 1-3 unavailable pga. Thread-hang) må ingen
+    # sluk-vej fyre turn_off på gruppen/spots — det slukker vores eneste lys i
+    # badet. Målt 14:50:00 i dag: gradvis-sluk slukkede nødlyset 95 s efter
+    # tænding via /5-min fallback. Samme veto kopieres til alle 7 sluk-veje
+    # (samme #21-mønster som brusebad ovenfor). Max-on watchdog stadig ikke
+    # vetoet. Se packages/thread_otbr_watchdog.yaml for ejer-automationen.
+    # 2026-10-09: flaget udløber selv (badet tomt 3 min / Thread tilbage) og
+    # kræver ≥ 2 døde spots — ét dødt spot holdt det tændt hele natten.
+    - condition: state
+      entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+      state: "off"
+    - condition: state
+      entity_id: input_select.badevaerelse_visit_stage
+      state: "Fuld"
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    # Dør ÅBEN på trigger-tidspunktet (door_open: lige åbnet; quiet: kræver åben).
+    - condition: state
+      entity_id: binary_sensor.parasoll_badevaerelse
+      state: "on"
+    # 2026-06-21 (user-spec): gælder OGSÅ under godnat — et nat-toiletbesøg bag
+    # lukket dør holdes (wasp) og slukkes når du åbner døren = du gik.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # 2026-07-08 (user-spec, AirBnB sluk-forsigtighed): quiet-grenen (stilhed
+    # mens døren har stået åben = fx gæst i karbad med åben dør, sustained-Fuld)
+    # springes over i AirBnB (faktor > 1) — den generelle (skalerede) sluk
+    # overtager. Dør-åbnings-grenen (stærkt "jeg går"-signal) består, men med
+    # skaleret delay nedenfor.
+    - condition: template
+      value_template: >-
+        {{ trigger.id == 'door_open'
+           or (states('sensor.badevaerelse_airbnb_off_factor') | float(1.0)) <= 1.0 }}
+  action:
+    # 2026-07-08: delay × AirBnB-faktor (1.0 i Normal) — gæster får længere
+    # fortrydelses-vindue efter dør-åbning før lyset slukker.
+    # 2026-08-13: × bruser-vagtens faktor (1.0 når vagten sover). Dette er DEN
+    # vej der slukkede på user 08-13 kl. 06:32:04 og 06:52:58 mens han stod i
+    # bruseren — begge grene skal skaleres: dør-åbnet ER netop den anden person
+    # der går ud, og ro-grenen er bruseren der ikke ses af PIR.
+    - delay:
+        seconds: >-
+          {{ ((states('input_number.badevaerelse_leave_off_seconds') | int(25))
+              * (states('sensor.badevaerelse_airbnb_off_factor') | float(1.0))
+              * (states('sensor.badevaerelse_bruser_off_factor') | float(1.0))) | int }}
+    # Gik man faktisk? Stadig Fuld + lys tændt + ingen bevægelse genoptaget.
+    # (condition i action-sekvensen STOPPER stille hvis man kom tilbage / bevægede sig.)
+    - condition: state
+      entity_id: input_select.badevaerelse_visit_stage
+      state: "Fuld"
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_inde_1_occupancy
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_inde_2_occupancy
+      state: "off"
+    # door_open-stien: man åbnede døren (= gik) → sluk uanset om den nu er åben
+    # eller lukket bag dem. quiet-stien: kræv at døren STADIG er åben (ellers kunne
+    # det være en der lukkede + satte sig stille). Beskytter sit-still-bag-lukket-dør.
+    - condition: template
+      value_template: >-
+        {{ trigger.id == 'door_open'
+           or is_state('binary_sensor.parasoll_badevaerelse', 'on') }}
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # 2026-09-01: re-tjek EFTER delay'en — en brusebad-session kan nå at arme
+    # mens vi venter (klima-signaturen bruger 60 s delay_on), og så er dette
+    # sluk præcis det der ramte user 08-13 og 09-01.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    # 2026-10-01 (user-spec): "jeg vil ikke ha at du slukker lys i badet uden at
+    # der er blevet tjekket en frisk måling fra fugt måleren". Vent på en frisk
+    # måling og afgør på DEN (siger den bad, er brusebad_hold on). Samme blok på
+    # alle badets sluk-veje (#21) — grep fugt_frisk. Timeout = sensorens længste
+    # målte hul (586 s) + luft; max-on watchdog er stadig det ydre net.
+    # 2026-10-06 (bug-hunt nat, 📏): timeout 10 → 30 min og ALDRIG videre ved
+    # timeout. Målt 3 døgn: 834 huller, p99 464 s, men 5 over 600 s (max 1581 s)
+    # — 10-min-grænsen (586 s målt 1/10) slukkede i dem uden frisk måling.
+    # Død sensor = intet sluk her; max-on watchdog er det ydre net.
+    # 2026-10-11 (user-spec): venter vi KUN på fugt-målingen, slukker alt
+    # undtagen bruse-spotten (spot 2) med fade imens. Ikke-blokerende.
+    - service: script.turn_on
+      continue_on_error: true
+      target:
+        entity_id: script.badevaerelse_fugt_ventesluk
+    - wait_template: "{{ is_state('binary_sensor.badevaerelse_fugt_frisk', 'on') }}"
+      timeout: "00:30:00"
+      continue_on_timeout: false
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+           and is_state('light.badevaerelse_all', 'on')
+           and not is_state('input_select.room_mode_badevaerelse', 'Manual') }}
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all
+      data:
+        transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"
+    # Ryd evt. stadig-armeret wasp (døren er åben → låsen er meningsløs). Wasp-disarm
+    # gør det normalt selv på dør-edge; condition undgår no-op write.
+    - if:
+        - condition: state
+          entity_id: input_boolean.badevaerelse_wasp_active
+          state: "on"
+      then:
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.badevaerelse_wasp_active
+    - service: logbook.log
+      data:
+        name: "Bad besøg"
+        message: >-
+          Leave-off — dør åbnet + ingen bevægelse i
+          {{ states('input_number.badevaerelse_leave_off_seconds') }}s → man gik
+        entity_id: light.badevaerelse_all
+
+# =============================================================================
+# Spot-resync efter reconnect (2026-06-12)
+# =============================================================================
+# Badet har 3x KAJPLATS (Matter/Thread) + 2x Innr (Zigbee) i samme gruppe.
+# KAJPLATS-spottene flapper periodisk unavailable på Thread-nettet (13 events
+# sidste døgn) — en spot der er offline når gruppe-tænd/sluk fyrer, misser
+# kommandoen og kommer tilbage i forkert tilstand ("hænger tændt" mens resten
+# er slukket, eller omvendt). Denne automation retter den enkelte spot til de
+# øvrige spots' FÆLLES tilstand ved reconnect. Mixed tilstand blandt de andre
+# → no-op (kan ikke afgøre intent). Ren state-sync: opfinder aldrig selv en
+# tilstand, kopierer kun naboerne — derfor ingen mode/occupancy-gates.
+# =============================================================================
+
+- id: badevaerelse_spots_resync_efter_reconnect
+  alias: "Lysnet: Badeværelse spots resync efter reconnect"
+  description: >
+    KAJPLATS (Matter) + Innr (Zigbee) skal være 100% i sync. Spot der
+    reconnecter i anden tilstand end de øvrige 4 rettes til flertallet
+    (kun når alle øvrige tilgængelige spots er enige).
+  mode: queued
+  max: 10
+  trigger:
+    - platform: state
+      entity_id: !include ../rosters/bad_spots.yaml
+      from: "unavailable"
+      to:
+        - "on"
+        - "off"
+      # 5s stabilitet — KAJPLATS flap-bursts (unavailable→on→unavailable
+      # indenfor sekunder) skal ikke udløse kommandoer mod en ustabil node.
+      for:
+        seconds: 5
+  variables:
+    # 2026-06-25: per-fase spot-valg. "relevant" = de spots der er VALGT i den
+    # aktive fase (= alle 5 uden for en per-spot-fase). En spot der er FRAVALGT
+    # i fasen skal være OFF — uanset hvad naboerne gør — ellers re-tænder
+    # reconnect-syncen den (= flicker).
+    relevant: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+    spot_deselected: "{{ trigger.entity_id not in relevant }}"
+    other_states: >-
+      {{ expand(relevant)
+         | rejectattr('entity_id', 'eq', trigger.entity_id)
+         | rejectattr('state', 'in', ['unavailable', 'unknown'])
+         | map(attribute='state') | list }}
+  condition:
+    # Enten: spotten er fravalgt i fasen (skal slukkes), ELLER mindst én anden
+    # VALGT spot er online + alle enige + uenig med den reconnectede.
+    - condition: template
+      value_template: >-
+        {{ spot_deselected
+           or (other_states | length > 0
+               and (other_states | unique | list | length) == 1
+               and other_states[0] != states(trigger.entity_id)) }}
+  action:
+    - choose:
+        # Fravalgt i den aktive fase → skal være slukket.
+        - conditions:
+            - condition: template
+              value_template: "{{ spot_deselected }}"
+          sequence:
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: "{{ trigger.entity_id }}"
+              data:
+                transition: 1
+        - conditions:
+            - condition: template
+              value_template: "{{ other_states[0] == 'off' }}"
+          sequence:
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: "{{ trigger.entity_id }}"
+              data:
+                transition: 1
+      default:
+        # De andre er ON → kopiér brightness/CT fra første tændte nabo, så
+        # spotten ikke bare tænder på firmware-default (100% kold).
+        - variables:
+            donor: >-
+              {{ expand(relevant)
+                 | rejectattr('entity_id', 'eq', trigger.entity_id)
+                 | selectattr('state', 'eq', 'on')
+                 | map(attribute='entity_id') | list | first }}
+            donor_bri: "{{ state_attr(donor, 'brightness') }}"
+            donor_ct: "{{ state_attr(donor, 'color_temp_kelvin') }}"
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: "{{ trigger.entity_id }}"
+          data:
+            transition: 1
+            brightness: "{{ donor_bri | int(178) }}"
+        - if:
+            - condition: template
+              value_template: "{{ donor_ct is not none }}"
+          then:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: "{{ trigger.entity_id }}"
+              data:
+                color_temp_kelvin: "{{ donor_ct | int }}"
+
+# =============================================================================
+# Spot-sync HEALER — blandet on/off UDEN reconnect (2026-06-14)
+# =============================================================================
+# BUG (2026-06-14): efter core-restart hang kun light.badevaerelse_spot_4 på
+# "on" mens 1,2,3,5 var "off". light.badevaerelse_all læser "on" hvis BARE ÉN
+# spot er on → on-automationens `light.badevaerelse_all == 'off'`-gate fejlede
+# → Parent B gik ind i mørkt bad og lyset tændte ikke.
+#
+# `badevaerelse_spots_resync_efter_reconnect` (ovenfor) heler kun spots der
+# kommer FRA "unavailable" — den fanger IKKE en blandet-tilstand hvor alle 5
+# er available (restart-cachen / et delvist mislykket gruppe-kald). Denne
+# healer dækker præcis det hul.
+#
+# Retning = flertal:
+#   - flertal OFF (fx 1 on / 4 off, bug-casen) → sluk resten → gruppen bliver
+#     ærligt "off" → presence kan tænde igen.
+#   - flertal ON (fx 4 on / 1 off, delvist mislykket tænd) → tænd resten med
+#     donor-brightness/CT.
+#
+# 8s-DEBOUNCE er nøglen: under en bevidst gruppe-sluk-fade står alle 5 stadig
+# på state "on" indtil de rammer 0 og flipper "off" ~samtidig → ikke blandet
+# i 8s → ingen heal. Og hvis en KAJPLATS-node sakker bagud under en sluk og
+# efterlader blandet >8s, peger flertallet stadig mod sluk → heal slukker
+# laggard'en = samme intent som fade'n. Ingen kamp med off-transitionen.
+# =============================================================================
+- id: badevaerelse_spots_sync_healer
+  alias: "Lysnet: Badeværelse spots sync-healer (blandet on/off)"
+  description: >
+    Heler blandet on/off-tilstand på de 5 bad-spots NÅR alle er available
+    (restart-desync eller delvist gruppe-kald) — så light.badevaerelse_all
+    aldrig fejlagtigt læser "on" og blokerer presence-tænd. Synker til
+    flertallet efter 8s stabilitet (debounce mod sluk-fade-transienter).
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: !include ../rosters/bad_spots.yaml
+      to:
+        - "on"
+        - "off"
+      for:
+        seconds: 8
+  variables:
+    # 2026-06-25: kun de spots der ER VALGT i den aktive fase tæller som "skal
+    # være ens". Med per-fase spot-valg er det LEGITIMT at fravalgte spots er
+    # off mens valgte er on — det er IKKE en desync. Healede vi mod hele gruppen
+    # ville flertal-ON re-tænde de fravalgte spots (= on→off→on flicker).
+    # sensor.badevaerelse_fase_spots = alle 5 uden for en per-spot-fase.
+    all_spots: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+    avail_states: >-
+      {{ expand(all_spots)
+         | rejectattr('state', 'in', ['unavailable', 'unknown'])
+         | map(attribute='state') | list }}
+    n_on: "{{ avail_states | select('eq', 'on') | list | length }}"
+    n_off: "{{ avail_states | select('eq', 'off') | list | length }}"
+  condition:
+    # Blandet: mindst én on OG mindst én off blandt de tilgængelige spots.
+    - condition: template
+      value_template: "{{ n_on | int > 0 and n_off | int > 0 }}"
+    # Rør ikke hvis bruger har manuel kontrol over rummet.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+  action:
+    - choose:
+        # Flertal ON → tænd resten med donor-brightness/CT.
+        - conditions:
+            - condition: template
+              value_template: "{{ n_on | int > n_off | int }}"
+          sequence:
+            - variables:
+                donor: >-
+                  {{ expand(all_spots)
+                     | selectattr('state', 'eq', 'on')
+                     | map(attribute='entity_id') | list | first }}
+                off_spots: >-
+                  {{ expand(all_spots)
+                     | selectattr('state', 'eq', 'off')
+                     | map(attribute='entity_id') | list }}
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: "{{ off_spots }}"
+              data:
+                transition: 1
+                brightness: "{{ state_attr(donor, 'brightness') | int(178) }}"
+            - if:
+                - condition: template
+                  value_template: "{{ state_attr(donor, 'color_temp_kelvin') is not none }}"
+              then:
+                - service: light.turn_on
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ off_spots }}"
+                  data:
+                    color_temp_kelvin: "{{ state_attr(donor, 'color_temp_kelvin') | int }}"
+            - service: logbook.log
+              data:
+                name: "Bad spot-healer"
+                message: "Blandet ({{ n_on }} on / {{ n_off }} off) → synket til ON"
+                entity_id: light.badevaerelse_all
+        # 2026-09-26 (user: "badeværelset slukker aggresivt på mig" + "lyset skal
+        # jo ikke slukke mine manuelle tænd bare fordi thread er nede, tvært
+        # imod"). 22:12-22:14 var Thread ved at dø: spot 1-3 (KAJPLATS, Thread-
+        # routerne) svarede ikke men stod stadig "off", 4+5 tændte → 2 on /
+        # 3 off → flertal OFF → healeren slukkede user's Styrbar-tænd 5 gange
+        # på 8 s hver. Et FRISK tænd (on-spot tændt inden for 120 s, ikke blot
+        # restauret ved boot) er intent: hel mod ON (prøv laggards igen), aldrig
+        # OFF. Samme retning når Thread-helbredet er nede: de "off" spots er
+        # stumme, ikke slukkede — så rør ikke de spots der faktisk lyser.
+        - conditions:
+            - condition: template
+              value_template: >-
+                {% set boot = states.light | map(attribute='last_changed') | min %}
+                {% set frisk = expand(all_spots) | selectattr('state', 'eq', 'on')
+                   | selectattr('last_changed', 'gt', now() - timedelta(seconds=120))
+                   | selectattr('last_changed', 'gt', boot + timedelta(seconds=60))
+                   | list | count > 0 %}
+                {# 2026-10-09: thread_lys_nede (≥ 2 af 3 væk), ikke matter_spots_ok —
+                   ÉN død pære (spot_2 06:53) fik grenen til at re-tænde 1+3 i et
+                   tomt bad 8 s efter gradvis-sluk. En død pære tælles alligevel
+                   ikke med i avail_states. #}
+                {{ frisk
+                   or is_state('binary_sensor.thread_net_i_live', 'off')
+                   or is_state('binary_sensor.badevaerelse_thread_lys_nede', 'on') }}
+          sequence:
+            - variables:
+                donor2: >-
+                  {{ expand(all_spots)
+                     | selectattr('state', 'eq', 'on')
+                     | map(attribute='entity_id') | list | first }}
+                off_spots2: >-
+                  {{ expand(all_spots)
+                     | selectattr('state', 'eq', 'off')
+                     | map(attribute='entity_id') | list }}
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: "{{ off_spots2 }}"
+              data:
+                transition: 1
+                brightness: "{{ state_attr(donor2, 'brightness') | int(178) }}"
+            - service: logbook.log
+              data:
+                name: "Bad spot-healer"
+                message: >-
+                  Blandet ({{ n_on }} on / {{ n_off }} off) efter et FRISK tænd eller
+                  med Thread nede → prøver de slukkede igen, slukker IKKE de tændte.
+                entity_id: light.badevaerelse_all
+      default:
+        # Flertal OFF (inkl. lige) → sluk resten → gruppen bliver ærligt off
+        # og presence kan tænde igen. Dette er bug-casen (1 on / 4 off).
+        - variables:
+            on_spots: >-
+              {{ expand(all_spots)
+                 | selectattr('state', 'eq', 'on')
+                 | map(attribute='entity_id') | list }}
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id: "{{ on_spots }}"
+          data:
+            transition: 1
+        - service: logbook.log
+          data:
+            name: "Bad spot-healer"
+            message: "Blandet ({{ n_on }} on / {{ n_off }} off) → synket til OFF"
+            entity_id: light.badevaerelse_all
+
+# =============================================================================
+# Spot confirm-off — Matter optimistic-state laggard (2026-06-30)
+# =============================================================================
+# INCIDENT 2026-06-29 ~23:22 local: bad-lyset gik "off" i HA (leave-off fyrede)
+# men ÉN KAJPLATS-spot (Matter/Thread) hang fysisk tændt natten over — bruger
+# måtte slukke manuelt.
+#
+# Hvorfor de to eksisterende healere IKKE fanger det:
+#   • resync_efter_reconnect: kræver en unavailable→on/off-edge. Spotten gik
+#     ALDRIG unavailable (den var available hele tiden), så den fyrer ikke.
+#   • sync_healer: kræver at HA SER blandet on/off. Men Matter er optimistisk —
+#     HA sendte turn_off, markerede spotten "off" med det samme, og Thread-
+#     pakken gik tabt → pæren fik aldrig kommandoen. HA ser 5/5 OFF (ikke
+#     blandet) = no-op. Den fysiske virkelighed (1 tændt) er USYNLIG for HA.
+#
+# Ingen state-baseret healer kan rette dette — HA's state-model er forkert.
+# Eneste kur: RE-SEND turn_off til de fysiske spots. Når gruppen er gået off
+# (og fade'n er overstået) re-sendes turn_off — no-op på korrekt-slukkede
+# spots, tvinger laggard'en off. mode:restart + recheck (gruppen stadig off) →
+# et nyt bad-besøg der re-tænder indenfor vinduet aflyser re-sendet.
+#
+# BEVIDST ikke gated på inde-occupancy: ghost-flap (døde valhorn-batteri +
+# nærfelt-spøgelser) må ikke kunne skippe re-sendet — samme flap defeater
+# leave-off + watchdog. Gruppen-stadig-off er det eneste sande "skal forblive
+# slukket"-signal. Delay = fade + 5s så den normale sluk-fade får lov at
+# fuldføre uforstyrret; først DEREFTER rettes en evt. laggard.
+# =============================================================================
+- id: badevaerelse_spots_confirm_off
+  alias: "Lysnet: Badeværelse spots confirm-off (Matter missed-command)"
+  description: >
+    Re-sender turn_off til de 5 bad-spots efter gruppen er gået off + fade
+    fuldført — fanger en KAJPLATS-spot der missede gruppe-turn_off uden at gå
+    unavailable (Matter optimistic-state). Idempotent på mains-pærer.
+  mode: restart
+  trigger:
+    # 2026-08-29 (REGRESSION-fix, samme dag): `from: "on"` er OBLIGATORISK her.
+    # Uden den er `unavailable → off` en gyldig flanke, og gruppen går præcis den
+    # vej ved HVER HA-restart (målt 07:59:16 i dag, 22 s efter et deploy). Det var
+    # harmløst så længe automationen ventede fade+5 s før den rørte noget — men
+    # TRIN 0 nedenfor (tilføjet i morges) sender et turn_off med det samme, så en
+    # restart blev til et øjeblikkeligt sluk-skud mod spot_4/5. Havde presence
+    # tændt lyset i det sekund, ville to af fem pærer være gået sort igen.
+    - platform: state
+      entity_id: light.badevaerelse_all
+      from: "on"
+      to: "off"
+  condition:
+    # 2026-09-03: dette er en MATTER-optimistic-state-healer — den giver kun
+    # mening når Matter-spots faktisk er tilgængelige. Under et Thread-hang er
+    # spot_1-3 unavailable (HA springer dem selv over i turn_off, permanent
+    # faktum) og TRIN 0's ZHA-turn_off ville slukke vores nødlys. Se
+    # bad_zigbee_nodlys_taend i packages/thread_otbr_watchdog.yaml.
+    # 2026-10-09: thread_lys_nede (≥ 2 af 3 væk) i stedet for matter_spots_ok —
+    # med ÉN død pære skal de to levende KAJPLATS stadig bekræftes slukket.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_thread_lys_nede
+      state: "off"
+  action:
+    # === TRIN 0: ENS SLUK-TEMPO (2026-08-29, user-bug "badeværelset slukker på
+    # en buggy måde med nogle pærer først og så andre") =======================
+    # Gruppen har TO radioer med hver sin sluk-fysik:
+    #   • spot_1/2/3 = IKEA KAJPLATS over MATTER. HA's matter-light-platform
+    #     sender et bart `OnOff.Off()` og VIDEREGIVER ALDRIG `transition` —
+    #     de går sort med det samme (kun pærens egen ~0,5 s NVRAM-rampe).
+    #   • spot_4/5 = innr RS 242 C over ZHA. De HONORERER transition og fader
+    #     ud over hele fade_ophold/fade_passage (8-11 s, målt via attributten
+    #     `off_with_transition: true` + `off_brightness: 76`).
+    # Resultat: 3 pærer slukker på et sekund, 2 hænger og fader i 8-11 s. Det
+    # er ikke en timing-bug i logikken — det er to fabrikater i én gruppe, og
+    # INGEN af de 8 sluk-veje kan rette det, fordi de alle bare sætter
+    # `transition` på gruppen. Derfor rettes det ÉT sted, her, hvor gruppen
+    # netop ER gået off: re-send sluk til de to ZHA-pærer med transition 1 →
+    # alle fem er sorte inden for ~1 s af hinanden.
+    # NB: vi vælger at gøre de LANGSOMME hurtige (ikke omvendt): en Matter-
+    # softfade ville kræve en pre-dim på hver enkelt sluk-vej = 8 steder, og
+    # ville dermed være præcis den duplikering fejlklasse #2 advarer imod.
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.badevaerelse_spot_4
+          - light.badevaerelse_spot_5
+      data:
+        transition: 1
+    - delay:
+        seconds: "{{ (states('sensor.fade_ophold_effective') | int(11)) + 5 }}"
+    # Frisk besøg? Hvis gruppen er tændt igen indenfor vinduet → drop re-sendet.
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "off"
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/bad_spots.yaml
+      data:
+        transition: 2
+
+# =============================================================================
+# Restart-recovery (2026-08-29, user-bug "jeg måtte lige tænde bad lys med entre
+# knappen fordi det blev holdt mørkt")
+# =============================================================================
+# Alle fire tænd-triggers i presence_light_badevaerelse_on kræver `from: "off"`
+# (spøgelses-guarden fra 01-08 mod Matter-genforbindelses-ekkoer). Den guard er
+# rigtig — men den har en pris ingen havde skrevet ned: efter en HA-restart
+# kommer sensorerne tilbage som `unknown → on`, ALDRIG som `off → on`. Står du
+# allerede i badet når HA kommer op, findes der derfor ikke én trigger der kan
+# tænde lyset. Du skal bevæge dig nok til en helt ny flanke — eller trykke.
+#
+# Målt i dag: entré-VALLHORN 07:58:40, restart 07:58:54,
+# badevaerelse_inde_occupancy `unknown → on` 07:59:16 = nul triggers, og user
+# tændte selv med entré-Styrbar 07:59:22. Huset genstarter tit (hver deploy).
+#
+# Fejlklasse #23 siger man ikke må bevise sin præmis med den kanal der var nede
+# — en PIR der booter hængende `on` beviser ingenting. User har valgt prisen
+# bevidst: hellere dæmpet lys i et tomt bad et par minutter (de normale
+# sluk-veje rydder op) end at gå ind i et mørkt bad efter hver deploy.
+# Derfor: dæmpet approach-niveau, ikke fuldt lys. Under godnat = natlys-niveau.
+# =============================================================================
+- id: badevaerelse_restart_recovery
+  alias: "Lysnet: Badeværelse restart-recovery (nogen står derinde når HA kommer op)"
+  description: >
+    30 s efter HA-start: er inde-PIR'en on og lyset stadig off i et Auto-rum,
+    så tænd dæmpet. Dækker hullet at `from: "off"`-guarden gør enhver
+    restart-flanke (`unknown → on`) usynlig for de normale tænd-triggers.
+  mode: single
+  trigger:
+    - platform: homeassistant
+      event: start
+  action:
+    # Lad Matter/Zigbee komme tilbage og PIR-unionen sætte sig, før vi tror på
+    # den. Kortere end det, og vi læser bare `unknown`.
+    - delay:
+        seconds: 30
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      state: "on"
+    # Tændte noget andet lyset i mellemtiden (ægte PIR-flanke, knap, script) er
+    # der intet at gøre — og vi må ikke overskrive dets niveau.
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "off"
+    # Manual/Off = brugeren har bevidst taget rummet ud af automatik.
+    - condition: state
+      entity_id: input_select.room_mode_badevaerelse
+      state: "Auto"
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+      data:
+        # Samme to niveauer som approach-grenen i presence_light_badevaerelse_on
+        # — bevidst DEN gren og ikke entry-niveauet: vi ved at nogen er der, men
+        # ikke hvad de laver, så det svageste brugbare lys er det rigtige.
+        brightness_pct: >
+          {% if is_state('binary_sensor.badevaerelse_natlys_aktiv', 'on') %}
+            {{ [[states('input_number.badevaerelse_godnat_brightness') | int(8), 100] | min, 2] | max }}
+          {% else %}
+            {{ [[states('input_number.badevaerelse_approach_brightness') | int(30), 100] | min, 2] | max }}
+          {% endif %}
+        color_temp_kelvin: >
+          {% if is_state('binary_sensor.badevaerelse_natlys_aktiv', 'on') %}2000
+          {% else %}{{ [states('sensor.auto_color_temp_evening') | int(2700),
+                        states('input_number.badevaerelse_min_kelvin') | int(2700)] | max }}
+          {% endif %}
+        transition: "{{ states('sensor.fade_ind_effektiv') | int(3) }}"
+    # BEVIDST: badevaerelse_approach_lit sættes IKKE. Flaget ville give
+    # badevaerelse_approach_fast_clear lov til at slukke igen, og vi har jo
+    # allerede bevis for at nogen er INDE. Næste ægte PIR-flanke løfter
+    # niveauet ad den normale vej.
+    - service: logbook.log
+      data:
+        name: "Bad restart-recovery"
+        message: >
+          Tændte dæmpet efter HA-restart: inde-PIR var on, men restart-flanken
+          (unknown → on) er usynlig for tænd-triggernes from:-guard.
+
+# =============================================================================
+# Sluk → Auto mode (user-spec 2026-06-14)
+# =============================================================================
+# "slukket lys på bad skal altid gøre at bad kommer på auto mode."
+# Uanset HVEM der slukkede (manuel app/Styrbar ELLER auto presence/gradvis
+# sluk): når light.badevaerelse_all bliver off, frigives en evt. Manual-lås
+# straks → næste presence-bevægelse tænder normalt.
+#
+# Konsistent med room_drift_back's manual_hold_ok ((not any_on) → hold
+# frigivet) — denne gør bare frigivelsen ØJEBLIKKELIG i stedet for at vente
+# på drift-back-ticket. 2s-debounce undgår at reagere på sluk-fade-transienter
+# / healer-blink. Idempotent: rør ikke hvis allerede Auto.
+# =============================================================================
+- id: badevaerelse_sluk_giver_auto
+  alias: "Lysnet: Badeværelse sluk → Auto mode"
+  description: >
+    Når bad-lyset bliver helt off (manuelt eller auto) — eller sættes i Manual
+    mens det allerede er slukket — sættes room_mode_badevaerelse til Auto, så
+    en Manual-lås aldrig efterlader et mørkt bad.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: light.badevaerelse_all
+      to: "off"
+      for:
+        seconds: 2
+    # 2026-10-04 (user-spec: "ingen vil nogensinde ha MØRKE i badeværelset hvis
+    # der er presence ... aldrig mørke. det gælder kun bad"): Manual sat mens
+    # badet ALLEREDE var mørkt har ingen sluk-flanke at fange. 4/10 07:57:40
+    # satte et app-"sluk alt" badet i Manual (3 t hold) selvom det havde været
+    # slukket siden 07:36 → user sad i mørke d9:c0:72-4d:99:a7.
+    - platform: template
+      value_template: >-
+        {{ is_state('input_select.room_mode_badevaerelse', 'Manual')
+           and is_state('light.badevaerelse_all', 'off') }}
+      for:
+        seconds: 3
+      id: manual_moerk
+    # Template-triggeren fyrer ikke hvis tilstanden allerede var sand da den
+    # blev sat op (genstart midt i et "Manual + mørkt").
+    - platform: homeassistant
+      event: start
+      id: manual_moerk
+  condition:
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Auto') }}"
+    # Festlys: når dance har claimet badet, er Manual festens — rør den ikke.
+    - condition: template
+      value_template: >-
+        {{ trigger.id != 'manual_moerk'
+           or (is_state('input_select.room_mode_badevaerelse', 'Manual')
+               and is_state('light.badevaerelse_all', 'off')
+               and not (is_state('input_boolean.dance_mode', 'on')
+                        and is_state('input_boolean.dance_room_bad', 'on'))) }}
+  action:
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.room_mode_badevaerelse
+      data:
+        option: "Auto"
+    - service: logbook.log
+      data:
+        name: "Badeværelse mode"
+        message: >-
+          {{ 'Manual sat mens badet var mørkt → Auto (badet må aldrig være mørkt med nogen derinde)'
+             if trigger.id == 'manual_moerk'
+             else 'Lys slukket → room_mode Auto (Manual-lås frigivet)' }}
+        entity_id: input_select.room_mode_badevaerelse
+
+- id: presence_light_badevaerelse_watchdog
+  alias: "Lysnet: Badeværelse max-on watchdog"
+  description: >
+    Sikkerhedsnet 2026-06-15 (user-spec): Når bad-presence-sensorerne (VALLHORN/
+    Myggspray, Thread/Matter) falder af mens lyset er tændt, fejler gradvis-
+    sluk'ens 'sluk aldrig i blinde'-gate (binary_sensor.badevaerelse_inde_
+    occupancy unavailable) → lyset hænger til sensoren kommer tilbage.
+
+    Observeret 2026-06-15: hele Thread-flåden (VALLHORN+PARASOLL) gik unavailable
+    05:56–05:57 UTC mens bad-lyset var tændt → stuck-on i timevis.
+
+    Denne watchdog slukker bad-lyset hvis det har været tændt SAMMENHÆNGENDE i
+    input_number.badevaerelse_max_on_minutes (default 45 min) UANSET sensor-
+    state. Brightness-ændringer nulstiller ikke timeren (state forbliver 'on').
+    Springer over hvis inde-sensoren reelt ser nogen lige nu (= ægte langt
+    ophold; normal gradvis-sluk rydder bagefter).
+
+    2026-08-01 (fejlklasse #3 — påstanden "robust mod ENHVER sensor-dropout" var
+    forkert): en sensor der falder af mens den melder `on` sender aldrig sin
+    `off`, så hold-conditionen nedenfor holdt watchdoggen tilbage lige så længe.
+    Målt 08-01: inde_1 hang på `on` 16:11:50→16:51:41 og bad-lyset brændte 64,3
+    min (median: 1,4). Watchdoggen var altså IKKE sidste forsvarslinje — den var
+    afhængig af netop den sensor den skulle beskytte imod. Lukket ved kilden:
+    unionen maskerer nu et medlem hvis `on` er ældre end
+    input_number.occupancy_stuck_on_minutes (packages/badevaerelse_wasp.yaml),
+    så hold-conditionen kun kan holdes af et LEVENDE øje.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: light.badevaerelse_all
+      to: "on"
+      for:
+        seconds: "{{ ((states('input_number.badevaerelse_max_on_minutes') | float(45)) * 60) | int }}"
+    # 2026-07-08 (AirBnB sluk-forsigtighed): /10-re-check. I AirBnB blokerer
+    # alders-betingelsen nedenfor state-triggeren ved Normal-grænsen (45 min) —
+    # uden en re-check ville watchdoggen aldrig fyre igen (trigger-for: binder
+    # ved load). time_pattern fanger den skalerede grænse. I Normal er den et
+    # harmløst ekstra tjek (samme betingelser).
+    - platform: time_pattern
+      minutes: "/10"
+  condition:
+    # Race/restart-safe: stadig tændt.
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    # 2026-07-08 (user-spec, AirBnB sluk-forsigtighed): grænsen ganges med
+    # badevaerelse_airbnb_off_factor (1.0 i Normal → uændret 45 min; slider 50 →
+    # ~112 min) — en gæsts lange bad bag lukket dør slukkes ikke midt i.
+    # Brightness-ændringer rører ikke last_changed (state forbliver 'on').
+    - condition: template
+      value_template: >-
+        {% set t = states.light.badevaerelse_all.last_changed %}
+        {% set max_s = (states('input_number.badevaerelse_max_on_minutes') | float(45)) * 60
+           * (states('sensor.badevaerelse_airbnb_off_factor') | float(1.0)) %}
+        {{ t is not none and (now() - t).total_seconds() >= max_s }}
+    # HOLD hvis inde-sensoren ER online OG ser nogen lige nu (reelt ophold).
+    # Er den unavailable/off → watchdog'en slukker (= hele pointen).
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on') }}"
+  action:
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.badevaerelse_all
+      data:
+        transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"
+    # 2026-06-18: ryd også wasp-flaget — ellers ville en evt. stadig-armeret
+    # wasp veto'e næste tænd og lyset hænge igen. Condition undgår no-op write.
+    - if:
+        - condition: state
+          entity_id: input_boolean.badevaerelse_wasp_active
+          state: "on"
+      then:
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.badevaerelse_wasp_active
+    - service: logbook.log
+      data:
+        name: "Badeværelse watchdog"
+        message: >-
+          Max-on watchdog slukkede bad-lyset (tændt >
+          {{ states('input_number.badevaerelse_max_on_minutes') }} min;
+          inde-sensor = {{ states('binary_sensor.badevaerelse_inde_occupancy') }}).
+        entity_id: light.badevaerelse_all
+
+# =============================================================================
+# Wasp re-konfirmations-probe (B42 fix 3a, 2026-07-02, user-valgt "begge dele")
+# =============================================================================
+# Problem: exit med LUKKET dør bag sig → wasp-hold (Fuld) brænder lyset på
+# 100 % i et tomt bad indtil max_on-watchdogen (fx 09:29-burnet 2026-07-02:
+# dør lukket 09:33, sidste motion 09:39, watchdog-kill 09:59 = 20 min tomt).
+# Wasp kan ikke skelne "sidder stille i karbad" fra "gik ud og lukkede døren"
+# — PIR ser ikke stilstand. Proben spørger: lukket dør + Fuld + ingen inde-
+# motion i probe_minutes → dæmp til probe-niveau ("er her nogen?"); motion →
+# straks Fuld igen; stadig intet efter probe_off_minutes → sluk + ryd wasp.
+# Stille karbad koster altså kun "vift med armen" hvert probe_minutes.
+#
+# KUN-NEDAD: proben dæmper aldrig OP — godnat-natlys (8 %) og manuelt dæmpet
+# lys forbliver urørt (condition på aktuel brightness > probe-niveau + ikke
+# Manual). Åben-dør-Fuld håndteres allerede af badevaerelse_full_leave_off
+# (~25 s) → proben kræver parasoll=off (lukket). Targeter kun fasens valgte
+# spots (sensor.badevaerelse_fase_spots) så fravalgte spots ikke re-tændes —
+# samme mønster som spots_ramp.
+# =============================================================================
+- id: badevaerelse_wasp_probe_dim
+  alias: "Lysnet: Badeværelse wasp-probe (dæmp→sluk ved stilhed bag lukket dør)"
+  description: >
+    Lukket dør + Fuld + ingen inde-motion i badevaerelse_wasp_probe_minutes →
+    dæmp til badevaerelse_wasp_probe_brightness. Motion under proben → straks
+    Fuld igen. Stadig intet efter badevaerelse_wasp_probe_off_minutes → sluk
+    lyset + ryd wasp-flaget.
+  mode: restart
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_inde_occupancy
+      from: "on"
+      to: "off"
+      for:
+        seconds: >-
+          {{ ((states('input_number.badevaerelse_wasp_probe_minutes') | float(10))
+              * 60) | int }}
+  condition:
+    # 2026-09-01 (user-spec): brusebad-session i gang (TIMMERFLOTTE-klima:
+    # damp + varme) = der står nogen i bruseren hvor ingen PIR kan se dem.
+    # ÉT delt veto på tværs af alle badets sluk-veje (fejlklasse #21/#2) —
+    # se packages/badevaerelse_brusebad.yaml. Max-on watchdog er BEVIDST
+    # ikke vetoet og er stadig det ydre net.
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    # 2026-09-03 (Thread-nødlys-veto, fejlklasse #21): mens bad-Zigbee-nødlyset
+    # ejer spot_4/5 (Matter-spots 1-3 unavailable pga. Thread-hang) må ingen
+    # sluk-vej fyre turn_off på gruppen/spots — det slukker vores eneste lys i
+    # badet. Målt 14:50:00 i dag: gradvis-sluk slukkede nødlyset 95 s efter
+    # tænding via /5-min fallback. Samme veto kopieres til alle 7 sluk-veje
+    # (samme #21-mønster som brusebad ovenfor). Max-on watchdog stadig ikke
+    # vetoet. Se packages/thread_otbr_watchdog.yaml for ejer-automationen.
+    # 2026-10-09: flaget udløber selv (badet tomt 3 min / Thread tilbage) og
+    # kræver ≥ 2 døde spots — ét dødt spot holdt det tændt hele natten.
+    - condition: state
+      entity_id: input_boolean.bad_zigbee_nodlys_aktiv
+      state: "off"
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    - condition: state
+      entity_id: input_select.badevaerelse_visit_stage
+      state: "Fuld"
+    # Kun lukket dør — åben-dør-Fuld ejes af full_leave_off.
+    - condition: state
+      entity_id: binary_sensor.parasoll_badevaerelse
+      state: "off"
+    # Rør aldrig manuel dæmpning.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # KUN-NEDAD: aktuel brightness skal ligge OVER probe-niveauet (blokerer
+    # natlys 8 % og allerede-dæmpet lys — proben løfter aldrig).
+    - condition: template
+      value_template: >-
+        {{ (state_attr('light.badevaerelse_all', 'brightness') | int(0))
+           > (((states('input_number.badevaerelse_wasp_probe_brightness') | float(40))
+               * 2.55) | int) }}
+  action:
+    - variables:
+        probe_pct: "{{ states('input_number.badevaerelse_wasp_probe_brightness') | int(40) }}"
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+      data:
+        brightness_pct: "{{ probe_pct }}"
+        # Blød dæmpning — signalet SKAL kunne ses fra karbadet, men ikke chokere.
+        transition: 10
+    - service: logbook.log
+      data:
+        name: "Bad wasp-probe"
+        message: >-
+          Dæmpet til {{ probe_pct }} % — ingen bevægelse i
+          {{ states('input_number.badevaerelse_wasp_probe_minutes') }} min bag
+          lukket dør. Bevægelse løfter til Fuld igen.
+        entity_id: light.badevaerelse_all
+    - wait_for_trigger:
+        - platform: state
+          entity_id: binary_sensor.badevaerelse_inde_occupancy
+          from: "off"
+          to: "on"
+        - platform: state
+          entity_id: binary_sensor.parasoll_badevaerelse
+          to: "on"
+        - platform: state
+          entity_id: light.badevaerelse_all
+          to: "off"
+      timeout:
+        # 2026-07-08 (user-spec, AirBnB sluk-forsigtighed): frist × faktor (1.0 i
+        # Normal) — gæster får længere tid til at "vifte" efter probe-dæmpningen
+        # før lyset slukker bag lukket dør. Selve dæmpningen (blidt signal) er
+        # uændret, så et tomt lukket bad stadig ryddes op.
+        seconds: >-
+          {{ (((states('input_number.badevaerelse_wasp_probe_off_minutes') | float(3))
+              * 60) * (states('sensor.badevaerelse_airbnb_off_factor') | float(1.0))) | int }}
+    - choose:
+        # Motion under proben → straks Fuld igen (fasens spots, Fuld-slider).
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ wait.trigger is not none
+                   and wait.trigger.entity_id == 'binary_sensor.badevaerelse_inde_occupancy' }}
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+              data:
+                brightness_pct: "{{ states('input_number.badevaerelse_fuld_brightness') | int(100) }}"
+                transition: 2
+            - service: logbook.log
+              data:
+                name: "Bad wasp-probe"
+                message: "Bevægelse under proben — løftet til Fuld igen"
+                entity_id: light.badevaerelse_all
+        # Timeout (ingen reaktion) → tomt bad: sluk + ryd wasp.
+        - conditions:
+            - condition: template
+              value_template: "{{ wait.trigger is none }}"
+          sequence:
+            # 2026-09-01: proben kan have kørt HELE vejen mens brusebadet stod
+            # på — stilhed bag lukket dør ER signaturen for en der står i
+            # bruseren. Sessionen vetoer sluk'et; dæmpningen selv er harmløs.
+            - condition: state
+              entity_id: binary_sensor.badevaerelse_brusebad_hold
+              state: "off"
+            # 2026-10-01 (user-spec): "jeg vil ikke ha at du slukker lys i badet uden at
+            # der er blevet tjekket en frisk måling fra fugt måleren". Vent på en frisk
+            # måling og afgør på DEN (siger den bad, er brusebad_hold on). Samme blok på
+            # alle badets sluk-veje (#21) — grep fugt_frisk. Timeout = sensorens længste
+            # målte hul (586 s) + luft; max-on watchdog er stadig det ydre net.
+            # 2026-10-06 (bug-hunt nat, 📏): timeout 10 → 30 min og ALDRIG videre ved
+            # timeout. Målt 3 døgn: 834 huller, p99 464 s, men 5 over 600 s (max 1581 s)
+            # — 10-min-grænsen (586 s målt 1/10) slukkede i dem uden frisk måling.
+            # Død sensor = intet sluk her; max-on watchdog er det ydre net.
+            # 2026-10-11 (user-spec): venter vi KUN på fugt-målingen, slukker alt
+            # undtagen bruse-spotten (spot 2) med fade imens. Ikke-blokerende.
+            - service: script.turn_on
+              continue_on_error: true
+              target:
+                entity_id: script.badevaerelse_fugt_ventesluk
+            - wait_template: "{{ is_state('binary_sensor.badevaerelse_fugt_frisk', 'on') }}"
+              timeout: "00:30:00"
+              continue_on_timeout: false
+            - condition: state
+              entity_id: binary_sensor.badevaerelse_brusebad_hold
+              state: "off"
+            - condition: template
+              value_template: >-
+                {{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+                   and is_state('light.badevaerelse_all', 'on')
+                   and not is_state('input_select.room_mode_badevaerelse', 'Manual') }}
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: light.badevaerelse_all
+              data:
+                transition: "{{ states('sensor.fade_passage_effective') | int(10) }}"
+            - if:
+                - condition: state
+                  entity_id: input_boolean.badevaerelse_wasp_active
+                  state: "on"
+              then:
+                - service: input_boolean.turn_off
+                  target:
+                    entity_id: input_boolean.badevaerelse_wasp_active
+            - service: logbook.log
+              data:
+                name: "Bad wasp-probe"
+                message: >-
+                  Ingen reaktion på proben i
+                  {{ states('input_number.badevaerelse_wasp_probe_off_minutes') }}
+                  min — badet er tomt, lys slukket + wasp ryddet.
+                entity_id: light.badevaerelse_all
+      # Dør åbnet / lys slukket i mellemtiden → full_leave_off / anden sluk-
+      # logik ejer flowet — proben gør bevidst intet.
+
+# =============================================================================
+# Wasp-probe RE-ARM: genskab den flanke en HA-restart slugte (2026-08-13d)
+# =============================================================================
+# Badets fire sluk-veje (quick, medium-off, leave-off, wasp-probe) hænger ALLE på
+# flanke-triggers — `inde_occupancy to:"off" for:N` eller dør-åbning. Genstarter HA
+# mens lyset er tændt og badet ALLEREDE er stille bag en lukket dør, kommer der
+# aldrig en ny flanke: sensorerne restaureres i den off-tilstand de stod i, og
+# ingen af de fire fyrer igen (fejlklasse #4/#15).
+#
+# Målt 08-13: badet blev tomt 08:33:19, HA genstartede 08:36:36 med lys tændt +
+# stadie Fuld + dør lukket. Alle fire veje var stumme resten af episoden. Lyset
+# brændte 49,5 min i et tomt bad og blev til sidst slukket af en TILFÆLDIGHED —
+# user åbnede døren 09:15:47, hvilket gav leave-off sin flanke tilbage. Max-on
+# watchdog'en var 7 sekunder fra at nå det først, og kun fordi restarten OGSÅ
+# nulstillede dens ur (den måler på light.last_changed, #5) = et helt nyt
+# 40-min-budget oveni de 6 minutter der allerede var brændt.
+#
+# Denne backstop kopierer ikke reglen — den TRIGGER proben (fejlklasse #2), så
+# dæmp-signalet ("er her nogen?") stadig gives før lyset slukkes. Én der ligger
+# stille i karbadet får altså sit vift-vindue, også efter en restart.
+#
+# INVARIANT: tick-intervallet (5 min) skal være > probens egen timeout
+# (badevaerelse_wasp_probe_off_minutes, default 4 min). Ellers kunne en re-trigger
+# nulstille proben før den nåede at slukke = sult. Brightness-gaten nedenfor er
+# andet lag: den blokerer så snart proben har dæmpet.
+# =============================================================================
+- id: badevaerelse_wasp_probe_rearm
+  alias: "Lysnet: Badeværelse wasp-probe re-arm (flanke tabt over restart)"
+  description: >
+    Lys tændt + Fuld + lukket dør + stilhed langt ud over probe-vinduet =
+    probens flanke er gået tabt (typisk en HA-restart). Trigger proben så den
+    normale dæmp→sluk-sekvens kører alligevel.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: light.badevaerelse_all
+      state: "on"
+    - condition: state
+      entity_id: input_select.badevaerelse_visit_stage
+      state: "Fuld"
+    # Kun lukket dør — åben-dør-Fuld ejes af full_leave_off.
+    - condition: state
+      entity_id: binary_sensor.parasoll_badevaerelse
+      state: "off"
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # Stilhed i HELE probe-vinduet + probens egen frist + 1 min margin. Var
+    # flanken i live, havde proben for længst slukket lyset → når vi står her,
+    # er den død. Binær sensor → last_changed er et gyldigt "off i N"-mål (#14);
+    # efter en restart tæller den fra restarten, så proben får sin fulde frist.
+    - condition: template
+      value_template: >-
+        {% set st = states.binary_sensor.badevaerelse_inde_occupancy %}
+        {% set n = ((states('input_number.badevaerelse_wasp_probe_minutes') | float(10))
+                  + (states('input_number.badevaerelse_wasp_probe_off_minutes') | float(4))
+                  + 1) * 60 %}
+        {{ st is not none and st.state == 'off'
+           and (now() - st.last_changed).total_seconds() >= n }}
+    # Proben er ikke allerede i gang: har den dæmpet, ligger brightness på
+    # probe-niveau og dens egen KUN-NEDAD-gate ville alligevel blokere.
+    - condition: template
+      value_template: >-
+        {{ (state_attr('light.badevaerelse_all', 'brightness') | int(0))
+           > (((states('input_number.badevaerelse_wasp_probe_brightness') | float(40))
+               * 2.55) | int) }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Bad wasp-probe"
+        message: >-
+          Re-arm — badet har været stille i
+          {{ ((now() - states.binary_sensor.badevaerelse_inde_occupancy.last_changed).total_seconds()
+              / 60) | round(0) | int }} min bag lukket dør uden at proben kørte
+          (tabt flanke, typisk HA-restart). Kører proben nu.
+        entity_id: light.badevaerelse_all
+    - service: automation.trigger
+      target:
+        entity_id: automation.lysnet_badevaerelse_wasp_probe_daemp_sluk_ved_stilhed_bag_lukket_dor
+      data:
+        skip_condition: false

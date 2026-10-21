@@ -1,0 +1,150 @@
+# =============================================================================
+# Mood-flag safety net (E2)
+# =============================================================================
+# Hvis cinema_active eller cirkus_active sidder fast pga HA crash mid-cycle,
+# UI-toggle der ikke completede, eller scene-cycle der ikke ryddede flagene,
+# blokeres alle presence_lights permanent. Familien staar i moerke uanset
+# motion fordi conditions tjekker `cinema_active == off`.
+#
+# Safety: hvis flag har vaeret on i >4h OG stue er tom >30 min, antager vi
+# fejl-state og force-clearer. Real cinema-session bliver sjaeldent >4h, og
+# selv hvis det skete: flag clear giver bare presence_lights normal kontrol
+# tilbage — ingen lys-behavior aendring hvis film stadig spiller.
+# =============================================================================
+
+- id: mood_flag_safety_cinema
+  alias: "Mood: Auto-clear cinema_active hvis stuck >4h og stue tom"
+  description: >
+    Cinema_active on i 4h+ + stue tom 30+ min = sandsynligvis stuck flag
+    fra crash/abort. Force-clear saa presence_lights virker igen.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_boolean.cinema_active
+      to: "on"
+      for:
+        hours: 4
+      id: stuck
+    # #4/#15 2026-07-21: state-for:4h-edgen overlever ikke HA-restart
+    # (deploy/HAOS-nat) → sad flaget stuck ON da vi rebootede, fyrer nettet
+    # ALDRIG (ingen frisk flanke). /30-backstop re-tjekker igangvaerende
+    # stuck-flag; last_changed nulstilles ved boot → self-heal ≤4h efter reboot.
+    - platform: time_pattern
+      minutes: "/30"
+      id: backstop
+  # P1 pattern fix audit 2026-05-07: hvis Apollo unavailable, gamle
+  # `state: "off" for: 30min` failed → cinema/cirkus stuck-flag protection
+  # broken. Template: ingen Apollo "on" + last_changed >30min.
+  condition:
+    # Backstop maa kun rydde et reelt stuck flag (on ≥4h); state-triggeren
+    # garanterer selv 4h. Kraev ogsaa on, saa notif/lys-restore ikke fyrer
+    # hvert /30 naar flaget allerede er off.
+    - condition: template
+      value_template: >-
+        {{ is_state('input_boolean.cinema_active', 'on')
+           and (trigger.id == 'stuck'
+                or (as_timestamp(now())
+                    - (as_timestamp(states.input_boolean.cinema_active.last_changed) | default(0))) >= 14400) }}
+    - condition: template
+      value_template: >-
+        {{ states('binary_sensor.stue_apollo_occupancy_filtered') != 'on'
+           and states('binary_sensor.spisestue_apollo_occupancy_filtered') != 'on' }}
+    - condition: template
+      value_template: >-
+        {% set t1 = as_timestamp(states.binary_sensor.stue_apollo_occupancy_filtered.last_changed) | default(0) %}
+        {% set t2 = as_timestamp(states.binary_sensor.spisestue_apollo_occupancy_filtered.last_changed) | default(0) %}
+        {% set since = as_timestamp(now()) - [t1, t2] | max %}
+        {{ since >= 1800 }}
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.cinema_active
+    # Sprint E.16 fix audit 2026-05-07: efter clear, restore stue+koekken
+    # til normal brightness IF anyone is around. Tidligere stayed at cinema
+    # mood-level fordi presence_light_stue_on requires Apollo on (3 unplugged
+    # → silent skip). Mirror godnat_clear_stue_restore pattern.
+    - if:
+        - condition: state
+          entity_id: input_select.house_state
+          state: "Active"
+        # Day-aware threshold (sprint 2026-05-07): halve under sun_bracket=day.
+        # 2026-08-19: flyttet til sensor.open_plan_haendelse_lux_gate (klampet
+        # til dagslys-sluk, #2).
+        - condition: template
+          value_template: >-
+            {% set lux = states('sensor.open_plan_lux') | float(50) %}
+            {{ lux < (states('sensor.open_plan_haendelse_lux_gate') | float(18)) }}
+      then:
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id:
+              - light.spisestue_loft
+          data:
+            # Light Aggressiveness factor (Phase 2 sprint 2026-05-07)
+            brightness_pct: >
+              {% set lux = states('sensor.open_plan_lux') | float(50) %}
+              {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}{% set base = 60 %}
+              {% elif lux < (states('input_number.lux_trin_dunkelt') | float(20)) %}{% set base = 40 %}
+              {% else %}{% set base = 25 %}{% endif %}
+              {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+              {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+            color_temp_kelvin: 2700
+            transition: 10
+    - service: persistent_notification.create
+      data:
+        notification_id: mood_flag_safety
+        title: "Cinema mode auto-cleared"
+        message: >
+          Cinema_active stod on i 4+ timer med tom stue. Antaget stuck-state
+          fra crash eller manglende cycle-clear. Flag slukket — presence
+          lights virker normalt igen.
+
+- id: mood_flag_safety_cirkus
+  alias: "Mood: Auto-clear cirkus_active hvis stuck >4h og stue tom"
+  description: >
+    Samme safety som cinema men for cirkus_active.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_boolean.cirkus_active
+      to: "on"
+      for:
+        hours: 4
+      id: stuck
+    # #4/#15 2026-07-21: se cinema-noten — /30-backstop mod stuck flag der
+    # overlevede en HA-restart (state-for:4h-edgen re-armeres ikke ved boot).
+    - platform: time_pattern
+      minutes: "/30"
+      id: backstop
+  # P1 pattern fix audit 2026-05-07: hvis Apollo unavailable, gamle
+  # `state: "off" for: 30min` failed → cinema/cirkus stuck-flag protection
+  # broken. Template: ingen Apollo "on" + last_changed >30min.
+  condition:
+    - condition: template
+      value_template: >-
+        {{ is_state('input_boolean.cirkus_active', 'on')
+           and (trigger.id == 'stuck'
+                or (as_timestamp(now())
+                    - (as_timestamp(states.input_boolean.cirkus_active.last_changed) | default(0))) >= 14400) }}
+    - condition: template
+      value_template: >-
+        {{ states('binary_sensor.stue_apollo_occupancy_filtered') != 'on'
+           and states('binary_sensor.spisestue_apollo_occupancy_filtered') != 'on' }}
+    - condition: template
+      value_template: >-
+        {% set t1 = as_timestamp(states.binary_sensor.stue_apollo_occupancy_filtered.last_changed) | default(0) %}
+        {% set t2 = as_timestamp(states.binary_sensor.spisestue_apollo_occupancy_filtered.last_changed) | default(0) %}
+        {% set since = as_timestamp(now()) - [t1, t2] | max %}
+        {{ since >= 1800 }}
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.cirkus_active
+    - service: persistent_notification.create
+      data:
+        notification_id: mood_flag_safety
+        title: "Cirkus mode auto-cleared"
+        message: >
+          Cirkus_active stod on i 4+ timer med tom stue. Antaget stuck-state.
+          Flag slukket — presence lights virker normalt igen.

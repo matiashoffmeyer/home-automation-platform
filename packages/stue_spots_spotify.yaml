@@ -1,0 +1,218 @@
+# =============================================================================
+# Stue-spots: Spotify-stemning (2026-10-17)
+# =============================================================================
+# User 17/10: "er der data på hvilken type spotify sang der spiller? så
+# melankolske sange kunne give lilla stue spots fx?" → "du laver og aktiverer
+# spotify lys på stue spot 1 og 2. de skal ikke ha samme farve, de skal være i
+# samme farve genre, de to spots. bløde skift."
+#
+# KÆDEN:
+# 1. Spotify-broen (add-on local_spotify_bro, B237) kender sangens Spotify-ID
+#    og beder selv HA om update_entity på sensor.spotify_bro ved hver ændring
+#    (add-on-option ha_entity) → rest-sensoren herunder er push, pollen reserve.
+#    Kun Spotify via broen har et ID — radio, AirPlay og Music Assistant ikke.
+# 2. Nyt ID → rest_command.reccobeats_audio_features. Spotifys egne audio-
+#    features er lukket for nye apps (nov. 2024); ReccoBeats er gratis, uden
+#    nøgle, samme skala. Målt 17/10: Bon Iver "Flume" valence 0,09 / energy
+#    0,14; 1 af 5 test-ID'er manglede → state 'ukendt' = ingen stemningsfarve.
+#    Ikke i AirBnB: en gæsts sange sendes ikke til en tredjepart.
+# 3. sensor.stue_spotify_stemning: valence × energy → farve på Russells
+#    cirkel (vinklen om (0,5; 0,5)): glad = guld, glad+energisk = orange,
+#    energisk = rød, anspændt = magenta, trist = lilla, melankolsk (trist +
+#    rolig) = violet, rolig = blå, afslappet = turkis. Afstanden fra midten =
+#    mætning (50-100 %). Ankrene står i ÉN liste i templaten.
+# 4. binary_sensor.stue_spots_spotify_aktiv (attributter hs_1/hs_2: spot 1
+#    `spredning`/2 under, spot 2 over — samme farvefamilie, ikke samme farve).
+#    delay_off = pause/stop/sangskift må ikke blinke tilbage til ild-orange.
+# 5. Lysstyrken ånder mellem top og bund hvert ild-tick (spot 2 en halv takt
+#    efter spot 1) i stedet for ildens tilfældige flakken — regnes i ild-
+#    løkken, samme takt.
+#
+# EJERSKAB (fejlklasse #2/#27): INGEN egen skriver. Ild-løkken
+# (packages/stue_spots_ild.yaml) ejer spotsenes farve mens den kører og læser
+# hs_1/hs_2 herfra i stedet for ild-orange. Afviger spottens farve fra målet,
+# bærer dens næste tick farve + lysstyrke i ét kald (2 Matter-kommandoer mod
+# ellers 1) → ≈ +2 kommandoer pr. sang for begge spots (≈ +35/t med musik),
+# og ildens Thread-pause gælder også farven. Med ild-kontakten FRA kører
+# løkken alligevel mens denne sensor er on (user 17/10: "ja" til farver uden
+# ild) — så kun stemningsfarve + bølge, ≈ 2 kommandoer pr. spot-interval som
+# ilden. Manual, film, Dark Mode, AirBnB … = ingen stemningsfarve.
+# =============================================================================
+
+input_boolean:
+  # Kill switch. Ingen `initial:` — sat on via API ved deploy.
+  stue_spots_spotify:
+    name: "Stue-spots: Spotify-stemning"
+    icon: mdi:spotify
+
+input_number:
+  # Hvor langt spot 1 og 2 ligger fra hinanden på farvecirklen (°). 0 = samme
+  # farve; 24 = fx violet 260 / lilla 284.
+  stue_spots_spotify_spredning:
+    name: "Stue-spots: Spotify farve-spredning"
+    icon: mdi:palette-swatch-variant
+    min: 0
+    max: 90
+    step: 2
+    unit_of_measurement: "°"
+    mode: slider
+
+  # Farve-overgangen når en ny sang skifter farven (lofteret af ildens
+  # interval). Lysstyrken følger med i samme overgang.
+  stue_spots_spotify_overgang:
+    name: "Stue-spots: Spotify farve-overgang"
+    icon: mdi:transition
+    min: 2
+    max: 120
+    step: 1
+    unit_of_measurement: "s"
+    mode: box
+
+  # Hvor dybt stemningslyset ånder: ±point om 50 % af spottens Auto-styrke
+  # (35 = 15-85 %). Takten er ildens (stue_spots_ild_sekunder pr. halve bølge,
+  # packages/stue_spots_ild.yaml) — hurtigere tillader Thread-budgettet ikke.
+  stue_spots_spotify_boelge_dybde:
+    name: "Stue-spots: Spotify bølge-dybde"
+    icon: mdi:sine-wave
+    min: 0
+    max: 48
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+# sensor.spotify_bro (rest-sensoren broen selv opdaterer) bor i
+# packages/spotify_bro.yaml sammen med resten af broens HA-side.
+
+rest_command:
+  reccobeats_audio_features:
+    url: "https://api.reccobeats.com/v1/audio-features?ids={{ id }}"
+    method: get
+    timeout: 10
+
+template:
+  - trigger:
+      - platform: event
+        event_type: stue_spotify_stemning
+    sensor:
+      # State = farvetonen (°) eller 'ukendt' (ReccoBeats kender ikke sangen).
+      - name: "Stue Spotify stemning"
+        unique_id: stue_spotify_stemning
+        icon: mdi:emoticon-outline
+        state: >-
+          {% set v = trigger.event.data.valence | default('') %}
+          {% set e = trigger.event.data.energy | default('') %}
+          {% if not (v | is_number and e | is_number) %}ukendt
+          {% else %}
+            {% set x = v | float - 0.5 %}
+            {% set y = e | float - 0.5 %}
+            {% set t = atan2(y, x) * 180 / pi %}
+            {% set t = t + 360 if t < -135 else t %}
+            {# vinkel → farvetone; monotont faldende hele vejen rundt #}
+            {% set a = [-135, -90, -45, 0, 45, 90, 135, 180, 225] %}
+            {% set h = [270, 225, 160, 45, 30, 5, -25, -70, -90] %}
+            {% set ns = namespace(hue=h[0]) %}
+            {% for i in range(8) %}
+              {% if a[i] <= t <= a[i + 1] %}
+                {% set ns.hue = h[i] + (h[i + 1] - h[i]) * (t - a[i]) / 45 %}
+              {% endif %}
+            {% endfor %}
+            {{ ((ns.hue % 360) | round(0)) | int }}
+          {% endif %}
+        attributes:
+          sat: >-
+            {% set v = trigger.event.data.valence | default(0.5) | float(0.5) %}
+            {% set e = trigger.event.data.energy | default(0.5) | float(0.5) %}
+            {% set r = (((v - 0.5) ** 2 + (e - 0.5) ** 2) ** 0.5) / 0.5 %}
+            {{ (50 + 50 * [r, 1] | min) | round(0) | int }}
+          stemning: >-
+            {% set v = trigger.event.data.valence | default('') %}
+            {% set e = trigger.event.data.energy | default('') %}
+            {% if not (v | is_number and e | is_number) %}ukendt
+            {% else %}
+              {% set t = atan2(e | float - 0.5, v | float - 0.5) * 180 / pi %}
+              {% set navne = ['trist', 'melankolsk', 'rolig', 'afslappet', 'glad',
+                              'glad og energisk', 'energisk', 'anspændt', 'trist'] %}
+              {{ navne[((t + 180 + 22.5) / 45) | int] }}
+            {% endif %}
+          valence: "{{ trigger.event.data.valence | default('') | float(none) }}"
+          energy: "{{ trigger.event.data.energy | default('') | float(none) }}"
+          uri: "{{ trigger.event.data.uri | default('') }}"
+          sang: "{{ trigger.event.data.sang | default('') }}"
+
+  - binary_sensor:
+      # Musik fra broen på højttaleren, og stemningen er for DEN sang.
+      # delay_off: pause < 2 min og sangskiftets opslag (~1 s med uri ≠ ny uri)
+      # holder farven; en ukendt sang beholder forrige sangs farve i de 2 min.
+      - name: "Stue-spots Spotify aktiv"
+        unique_id: stue_spots_spotify_aktiv
+        icon: mdi:spotify
+        # Kill switch fra = straks.
+        delay_off: "{{ 0 if is_state('input_boolean.stue_spots_spotify', 'off') else 120 }}"
+        state: >-
+          {{ is_state('input_boolean.stue_spots_spotify', 'on')
+             and is_state('sensor.spotify_bro', 'playing')
+             and is_state_attr('sensor.spotify_bro', 'hoejttaler', 'spiller')
+             and states('sensor.stue_spotify_stemning') | is_number
+             and state_attr('sensor.stue_spotify_stemning', 'uri')
+                 == state_attr('sensor.spotify_bro', 'uri') }}
+        attributes:
+          # Ild-løkkens mål pr. spot: [farvetone, mætning].
+          hs_1: >-
+            {% set h = states('sensor.stue_spotify_stemning') %}
+            {% set d = states('input_number.stue_spots_spotify_spredning') | float(24) / 2 %}
+            {% if h | is_number %}
+              {{ [((h | float - d) % 360) | round(1), state_attr('sensor.stue_spotify_stemning', 'sat') | float(91)] }}
+            {% else %}{{ this.attributes.get('hs_1', [17, 91]) }}{% endif %}
+          hs_2: >-
+            {% set h = states('sensor.stue_spotify_stemning') %}
+            {% set d = states('input_number.stue_spots_spotify_spredning') | float(24) / 2 %}
+            {% if h | is_number %}
+              {{ [((h | float + d) % 360) | round(1), state_attr('sensor.stue_spotify_stemning', 'sat') | float(91)] }}
+            {% else %}{{ this.attributes.get('hs_2', [17, 91]) }}{% endif %}
+
+automation:
+  - id: stue_spots_spotify_opslag
+    alias: "Stue-spots: slå Spotify-sangens stemning op"
+    mode: queued
+    max: 3
+    trigger:
+      - platform: state
+        entity_id: sensor.spotify_bro
+        attribute: uri
+      # Kill switch slået til midt i en sang.
+      - platform: state
+        entity_id: input_boolean.stue_spots_spotify
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.stue_spots_spotify
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ states('input_select.house_mode') in ['Normal', 'Home Vacation']
+             and (state_attr('sensor.spotify_bro', 'uri') or '') is match('spotify:track:')
+             and state_attr('sensor.spotify_bro', 'uri')
+                 != state_attr('sensor.stue_spotify_stemning', 'uri') }}
+    action:
+      - variables:
+          uri: "{{ state_attr('sensor.spotify_bro', 'uri') }}"
+          sang: >-
+            {{ state_attr('sensor.spotify_bro', 'kunstner') | default('', true) }} - {{ state_attr('sensor.spotify_bro', 'titel') | default('', true) }}
+      - service: rest_command.reccobeats_audio_features
+        continue_on_error: true
+        data:
+          id: "{{ uri.split(':')[-1] }}"
+        response_variable: svar
+      - variables:
+          f: >-
+            {% set c = svar.content if svar is defined and svar.status | default(0) == 200
+                       and svar.content is mapping else {} %}
+            {% set l = c.get('content', []) %}
+            {{ l[0] if l | count > 0 and l[0].valence is defined and l[0].energy is defined else {} }}
+      - event: stue_spotify_stemning
+        event_data:
+          uri: "{{ uri }}"
+          sang: "{{ sang }}"
+          valence: "{{ f.valence if f.valence is defined else 'ukendt' }}"
+          energy: "{{ f.energy if f.energy is defined else 'ukendt' }}"

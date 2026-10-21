@@ -1,0 +1,336 @@
+# =============================================================================
+# Cykel-lader — forbrug i kr + besparelse ved at lade i de billige timer
+# (user-spec 2026-07-29e)
+# =============================================================================
+# User: "nu er cykel batteri opladning kommet med. der skal raporteres på hvor
+# meget strøm de bruger og det skal tælle med i opgørelsen over hvor meget strøm
+# vi sparer ved at lade på de rigtige tidspunkt, og oversættes i kr grafen med
+# en anden bar farve og en total farve. integrer det fuldt ud i statistik siden"
+#
+# MODELLEN (samme form som lysets pris-dæmpning i packages/elpris_styring.yaml,
+# så de to besparelser kan lægges sammen til ét tal):
+#   faktisk  = ladeeffekt × all-in prisen i DEN time vi faktisk ladede
+#   baseline = ladeeffekt × gennemsnitsprisen i SPIDSLAST-timerne (17-21)
+#   besparelse = baseline − faktisk, integreret over tid
+#
+# HVORFOR SPIDSLAST-TIMERNE SOM BASELINE (user-valg 2026-07-29e: "ja brug 17-21
+# baseline i stedet, det er mere realistisk"): alternativet til den billig-time-
+# planlagte ladning er en dum lader uden ur — den kører fra det øjeblik batteriet
+# sættes til, og batteriet kommer hjem sammen med cyklen sidst på eftermiddagen.
+# Så en dum lader ville reelt køre hen over 17-21, som ovenikøbet er
+# nettarifs-spidslasten (dyreste spot OG dyreste tarif på samme tid).
+#
+# Vinduets gennemsnit var første udgave af den her baseline (og lever videre som
+# fallback længere nede), men det svarer til at batteriet blev sat til på et
+# tilfældigt tidspunkt mellem 16 og 07 — inkl. midt om natten, hvilket ingen gør.
+# Målt på 2026-07-29's priser: spidslast 2,530 kr/kWh all-in mod planens 5 timer
+# 1,462 = ~42 % sparet; vindue-gennemsnittet gav kun 1,931 = ~24 %.
+#
+# VINDUET ER TUNBART (`input_datetime.cykel_lader_baseline_start`/`_slut`, 17:00
+# → 21:00) og må gerne krydse midnat — time-testet er wrap-aware. Kun timer der
+# ligger inde i selve ladevinduet tælles med, så baselinen ikke kan hente priser
+# fra en aften vi slet ikke lader i.
+#
+# BASELINE-PRISEN SKAL STEMPLES (ellers er den væk om natten): Energi Data
+# Service viser `raw_today` (dagens 24 timer) + `raw_tomorrow`. Kl. 20 kan vi se
+# hele aftenen. Kl. 02 er gårsdagens 17-21 rullet ud af `raw_today` → spidslast-
+# timerne er slet ikke synlige mere, netop mens den planlagte ladning kører.
+# Derfor: `sensor.cykel_lader_spidslast_gns_pris` regner live og melder selv om
+# den er `komplet` (alle spidslast-timer synlige); en automation stempler den i
+# `input_number.cykel_lader_baseline_cursor` hver gang den ER komplet (fra
+# ~13:00 til midnat), og `sensor.cykel_lader_baseline_pris` bruger stemplet når
+# live er ufuldstændig. Stemplet skrives kun ved reel ændring (1×/døgn).
+#
+# VINDUES-MATEMATIKKEN GENBRUGES: begge templates læser `sensor.
+# cykel_lader_vindue` (packages/cykel_lader.yaml) i stedet for at regne
+# midnats-krydsningen ud selv (fejlklasse #2 — to kopier af samme regel
+# divergerer). Ret vinduet ÉT sted.
+#
+# HVAD DER TÆLLES SOM FORBRUG: kun effekt målt mens pluggen er TÆNDT
+# (`sensor.cykel_lader_effekt_aktiv`). Pluggens eget standby (~0,7 W døgnet
+# rundt ≈ 6 kWh/år) er bevidst udeladt — det er ikke cykel-ladning, og det ville
+# lægge støj i besparelsen fordi standby løber i alle timer, også de dyre.
+#
+# BESPARELSEN CLAMPES IKKE ved 0 (modsat lysets): en negativ dag betyder at der
+# blev ladet DYRERE end spidslast-timerne, og det er reel information — det
+# sker kun ved overrun forbi deadline eller hvis prisdata manglede, og så vil
+# man gerne kunne se det i grafen.
+#
+# AIRBNB: ladningen er allerede gatet til Normal/Home Vacation i
+# packages/cykel_lader.yaml → pluggen er slukket, effekten 0, og alle tal
+# herunder står stille af sig selv. Ingen ekstra gate, intet at rydde ved
+# mode-skift (tallene er kroner, ikke tilstedeværelses-mønstre).
+# =============================================================================
+
+input_datetime:
+  # "Hvornår ville en dum lader have kørt?" Default = nettarifs-spidslasten
+  # 17-21, som også er dagens dyreste spot-timer. Krydser gerne midnat.
+  cykel_lader_baseline_start:
+    name: "🔋 Cykel-lader: baseline (dum lader) fra"
+    has_date: false
+    has_time: true
+    icon: mdi:clock-alert-outline
+  cykel_lader_baseline_slut:
+    name: "🔋 Cykel-lader: baseline (dum lader) til"
+    has_date: false
+    has_time: true
+    icon: mdi:clock-alert-outline
+
+input_number:
+  # Stemplet spidslast-gennemsnit (all-in kr/kWh). Runtime-cursor: navnet
+  # indeholder "cursor" → holdes ude af helper-snapshottet (helpers_export.py).
+  # 0 = aldrig stemplet → baseline-sensoren falder tilbage (se dens template).
+  cykel_lader_baseline_cursor:
+    name: "🔋 Cykel-lader: baseline-pris, stemplet (cursor)"
+    min: 0
+    max: 100
+    step: 0.001
+    unit_of_measurement: "kr/kWh"
+    icon: mdi:cash-clock
+    mode: box
+
+template:
+  - sensor:
+      # --- Ladeeffekt (W) — KUN når pluggen er tændt ------------------------
+      # Ét sted der definerer "det her er cykel-ladning" (begge kost-rates
+      # læser den). Effekt-sensoren viser ~0,7 W standby når pluggen er slukket
+      # og beholder desuden sin sidste værdi i ~8 s efter sluk → uden switch-
+      # gaten ville en færdig session smøre lidt effekt ud over det næste døgn.
+      - name: "Cykel lader effekt aktiv"
+        unique_id: cykel_lader_effekt_aktiv
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:ev-station
+        state: >-
+          {{ (states('sensor.entre_cykel_lader_effekt') | float(0))
+             if is_state('switch.entre_cykel_lader_plug', 'on') else 0 }}
+
+      # --- LED 1: rå-data for baseline-timerne, "gns|timer_set|baseline_timer"
+      # ÉN løkke over EDS' timepriser, ét sted. Pakket som streng frem for
+      # attributter, fordi en attribut der læser sin EGEN entity er en
+      # self-reference (render'er én cyklus forsinket og kan trippe HA's
+      # "Template loop detected") — samme énvejs-kæde som vindue → plan →
+      # billig_nu i packages/cykel_lader.yaml.
+      #
+      # En time tælles med når den ligger BÅDE i ladevinduet (så vi ikke henter
+      # priser fra en aften vi ikke lader i) OG i baseline-spandet 17-21.
+      # Time-testet er wrap-aware, så spandet gerne må krydse midnat.
+      - name: "Cykel lader baseline prisdata"
+        unique_id: cykel_lader_baseline_prisdata
+        icon: mdi:database-clock
+        state: >-
+          {% set v = states('sensor.cykel_lader_vindue') %}
+          {% if '|' not in v %}
+            0|0|0
+          {% else %}
+            {% set st = v.split('|')[0] | as_datetime %}
+            {% set dl = v.split('|')[1] | as_datetime %}
+            {% set bs = (state_attr('input_datetime.cykel_lader_baseline_start', 'timestamp')
+                         | float(61200) / 3600) | int %}
+            {% set be = (state_attr('input_datetime.cykel_lader_baseline_slut', 'timestamp')
+                         | float(75600) / 3600) | int %}
+            {% set spand = (be - bs) if be > bs else (24 - bs + be) %}
+            {% set raw = (state_attr('sensor.energi_data_service', 'raw_today') or [])
+                       + (state_attr('sensor.energi_data_service', 'raw_tomorrow') or []) %}
+            {% set ns = namespace(sum=0, n=0) %}
+            {% for r in raw %}
+              {% set h = r.hour | as_datetime %}
+              {% if h is not none and st <= h < dl
+                    and ((bs <= h.hour < be) if be > bs else (h.hour >= bs or h.hour < be)) %}
+                {% set ns.sum = ns.sum + (r.price | float(0)) %}
+                {% set ns.n = ns.n + 1 %}
+              {% endif %}
+            {% endfor %}
+            {# Samme all-in-formel som sensor.elpris_allin_aktuel: EDS-prisen er
+               ex moms og inkl. tariffer+afgift; kun leverandør-tillægget lægges
+               til, derefter moms. #}
+            {% set gns = 0 if ns.n == 0 else
+                         (((ns.sum / ns.n)
+                           + (states('input_number.cost_markup_kr_kwh') | float(0.10)))
+                          * 1.25) | round(3) %}
+            {{ gns ~ '|' ~ ns.n ~ '|' ~ spand }}
+          {% endif %}
+
+      # --- LED 2: spidslast-timernes gennemsnitspris (all-in kr/kWh), live ----
+      # `komplet` fortæller om ALLE baseline-timerne var synlige i prisfeedet
+      # (se header) — er den false, må tallet IKKE bruges som baseline. Der er
+      # kun 4 timer i spandet, så vi kræver dem alle (ikke en 90 %-andel).
+      - name: "Cykel lader spidslast gns pris"
+        unique_id: cykel_lader_spidslast_gns_pris
+        unit_of_measurement: "kr/kWh"
+        icon: mdi:cash-clock
+        state: >-
+          {% set d = states('sensor.cykel_lader_baseline_prisdata').split('|') %}
+          {{ d[0] | float(0) if d | count == 3 else 0 }}
+        attributes:
+          timer_set: >-
+            {% set d = states('sensor.cykel_lader_baseline_prisdata').split('|') %}
+            {{ d[1] | int(0) if d | count == 3 else 0 }}
+          baseline_timer: >-
+            {% set d = states('sensor.cykel_lader_baseline_prisdata').split('|') %}
+            {{ d[2] | int(0) if d | count == 3 else 0 }}
+          # ÉT udtryk (Jinja `and` kortslutter, så d[1]/d[2] kun læses når
+          # strengen har 3 felter): en `{% if %}`-gren der skriver "false" ville
+          # blive en STRENG — og en ikke-tom streng er truthy, så `| default(
+          # false, true)` hos forbrugerne ville læse den som TRUE.
+          komplet: >-
+            {% set d = states('sensor.cykel_lader_baseline_prisdata').split('|') %}
+            {{ d | count == 3
+               and (d[2] | int(0)) > 0
+               and (d[1] | int(0)) >= (d[2] | int(0))
+               and (d[0] | float(0)) > 0 }}
+
+      # --- Baseline-prisen der faktisk bruges i regnskabet -------------------
+      # Live når alle spidslast-timerne er synlige (eftermiddag/aften), ellers
+      # nattens stempel fra samme aften. Sidste udvej: prisen lige nu — så
+      # bliver besparelsen 0 i stedet for forkert.
+      - name: "Cykel lader baseline pris"
+        unique_id: cykel_lader_baseline_pris
+        unit_of_measurement: "kr/kWh"
+        icon: mdi:cash-remove
+        state: >-
+          {% set live = states('sensor.cykel_lader_spidslast_gns_pris') | float(0) %}
+          {% set komplet = state_attr('sensor.cykel_lader_spidslast_gns_pris', 'komplet')
+                           | default(false, true) %}
+          {% set stamp = states('input_number.cykel_lader_baseline_cursor') | float(0) %}
+          {% if komplet and live > 0 %}{{ live | round(3) }}
+          {% elif stamp > 0 %}{{ stamp | round(3) }}
+          {% elif live > 0 %}{{ live | round(3) }}
+          {% else %}{{ states('sensor.elpris_allin_aktuel') | float(0) | round(3) }}
+          {% endif %}
+        attributes:
+          kilde: >-
+            {% set komplet = state_attr('sensor.cykel_lader_spidslast_gns_pris', 'komplet')
+                             | default(false, true) %}
+            {% set stamp = states('input_number.cykel_lader_baseline_cursor') | float(0) %}
+            {{ 'live (alle spidslast-timer synlige)' if komplet
+               else ('stemplet spidslast-gns' if stamp > 0 else 'fallback: pris nu') }}
+
+      # --- Omkostnings-RATES (kr/h): faktisk vs. baseline ---------------------
+      - name: "Cykel lader kost rate faktisk"
+        unique_id: cykel_lader_kost_rate_faktisk
+        unit_of_measurement: "kr/h"
+        icon: mdi:cash-clock
+        state: >-
+          {{ ((states('sensor.cykel_lader_effekt_aktiv') | float(0)) / 1000
+              * (states('sensor.elpris_allin_aktuel') | float(0))) | round(5) }}
+
+      - name: "Cykel lader kost rate baseline"
+        unique_id: cykel_lader_kost_rate_baseline
+        unit_of_measurement: "kr/h"
+        icon: mdi:cash-remove
+        state: >-
+          {{ ((states('sensor.cykel_lader_effekt_aktiv') | float(0)) / 1000
+              * (states('sensor.cykel_lader_baseline_pris') | float(0))) | round(5) }}
+
+  - sensor:
+      # --- Besparelse (kr) — akkumuleret og pr. dag ---------------------------
+      # IKKE clampet ved 0 (se header): en negativ dag = der blev ladet dyrere
+      # end spidslast-timerne, og det skal kunne ses.
+      - name: "Cykel lader besparelse total"
+        unique_id: cykel_lader_besparelse_total
+        unit_of_measurement: "kr"
+        state_class: total
+        icon: mdi:piggy-bank
+        state: >-
+          {{ ((states('sensor.cykel_lader_kost_baseline_total') | float(0))
+              - (states('sensor.cykel_lader_kost_total') | float(0))) | round(4) }}
+
+      - name: "Cykel lader besparelse i dag"
+        unique_id: cykel_lader_besparelse_i_dag
+        unit_of_measurement: "kr"
+        state_class: total
+        icon: mdi:piggy-bank
+        state: >-
+          {{ ((states('sensor.cykel_lader_kost_baseline_i_dag') | float(0))
+              - (states('sensor.cykel_lader_kost_i_dag') | float(0))) | round(2) }}
+        attributes:
+          sparet_pct: >-
+            {% set b = states('sensor.cykel_lader_kost_baseline_i_dag') | float(0) %}
+            {% set f = states('sensor.cykel_lader_kost_i_dag') | float(0) %}
+            {{ 0 if b <= 0 else (100 * (b - f) / b) | round(1) }}
+
+sensor:
+  # --- Riemann-integration af kost-rates (kr/h) → akkumuleret kr -------------
+  - platform: integration
+    name: "Cykel lader kost total"
+    unique_id: cykel_lader_kost_total
+    source: sensor.cykel_lader_kost_rate_faktisk
+    method: left
+    unit_time: h
+    round: 4
+
+  - platform: integration
+    name: "Cykel lader kost baseline total"
+    unique_id: cykel_lader_kost_baseline_total
+    source: sensor.cykel_lader_kost_rate_baseline
+    method: left
+    unit_time: h
+    round: 4
+
+  # --- Energi (kWh) brugt på ladning, uden pluggens standby ------------------
+  # Pluggens egen kWh-tæller (sensor.entre_cykel_lader_energi) er hardware-
+  # sandheden for "alt der er gået gennem pluggen"; denne er den rene ladedel og
+  # kan sammenlignes 1:1 med kr-tallene ovenfor (samme kilde-effekt).
+  - platform: integration
+    name: "Cykel lader energi ladning"
+    unique_id: cykel_lader_energi_ladning
+    source: sensor.cykel_lader_effekt_aktiv
+    method: left
+    unit_prefix: k
+    unit_time: h
+    round: 4
+
+# --- Dagsforbrug i kr: utility_meter på de to totaler (rene dag-grænser) -----
+utility_meter:
+  cykel_lader_kost_idag:
+    source: sensor.cykel_lader_kost_total
+    cycle: daily
+    name: "Cykel lader kost i dag"
+  cykel_lader_kost_baseline_idag:
+    source: sensor.cykel_lader_kost_baseline_total
+    cycle: daily
+    name: "Cykel lader kost baseline i dag"
+  cykel_lader_energi_idag:
+    source: sensor.cykel_lader_energi_ladning
+    cycle: daily
+    name: "Cykel lader energi i dag"
+
+automation:
+  # ===========================================================================
+  # STEMPL spidslast-gennemsnittet mens aftenens timer er synlige (se header).
+  # Skriver kun ved reel ændring → typisk ét write i døgnet, ingen recorder-støj.
+  # /15 frem for en flanke: EDS-opdateringen er ikke en pålidelig flanke, og et
+  # manglende stempel ville ramme hele natten (fejlklasse #4).
+  # ===========================================================================
+  - id: cykel_lader_baseline_stempl
+    alias: "Cykel-lader: stempl spidslast-gennemsnittet"
+    description: >
+      Gemmer aftenens gennemsnitlige all-in pris i spidslast-timerne så længe de
+      kan ses i Energi Data Service. Om natten er de rullet ud af raw_today, og
+      så er stemplet den eneste rigtige baseline.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ state_attr('sensor.cykel_lader_spidslast_gns_pris', 'komplet')
+             | default(false, true) }}
+      - condition: template
+        value_template: >-
+          {{ (states('sensor.cykel_lader_spidslast_gns_pris') | float(0)) > 0 }}
+      # Kun ved reel ændring.
+      - condition: template
+        value_template: >-
+          {{ ((states('sensor.cykel_lader_spidslast_gns_pris') | float(0))
+              - (states('input_number.cykel_lader_baseline_cursor') | float(0)))
+             | abs > 0.0015 }}
+    action:
+      - service: input_number.set_value
+        target: {entity_id: input_number.cykel_lader_baseline_cursor}
+        data:
+          value: "{{ states('sensor.cykel_lader_spidslast_gns_pris') | float(0) | round(3) }}"

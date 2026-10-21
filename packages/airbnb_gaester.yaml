@@ -1,0 +1,260 @@
+# =============================================================================
+# AirBnB gæste-antal + over-belægnings-vagt (Sprint 2026-07-17)
+# =============================================================================
+# User-spec: "ved airbnb check in, spørg mig hvor mange gæster der er booket
+# til og send mig advarsler på notifikation hvis der konsekvent konstateres
+# flere mennesker end det."
+#
+# FLOW:
+#   1. house_mode → AirBnB: gæste-antal nulstilles og der pushes et spørgsmål
+#      med handlings-knapper (1/2/3 gæster — user 2026-07-17: "1, 2, eller 3
+#      personer besøger via airbnb"; andre antal via slider på AirBnB-siden —
+#      knap-svar OG slider kan begge rettes senere).
+#   2. binary_sensor.airbnb_over_belaegning_nu = LIGE NU ses flere aktive
+#      zoner (sensor.people_zones_now) end der er booket gæster.
+#   3. history_stats akkumulerer over-tilstanden i et rullende 3t-vindue —
+#      /15-min-vagten pusher når akkumuleringen når slider-grænsen (default
+#      45 min). Akkumulering (ikke flanke) = robust mod zone-flap
+#      (fejlklasse #13/#14); /15-scan = re-push efter cooldown hvis
+#      tilstanden består (fejlklasse #4).
+#   4. Cooldown-slider (default 6 t) via runtime-stempel.
+#
+# AIRBNB-SILENT-UNDTAGELSE (user-bekræftet 2026-07-17): nid `airbnb_gaester`
+# har notif_airbnb_gaester_airbnb = ON — disse push går IGENNEM i AirBnB-mode
+# (hele pointen er at varsle MENS gæster er der). Alle andre nids forbliver
+# silent i AirBnB.
+#
+# Gæste-antal = 0 betyder "ikke sat" → vagten er slukket (ingen falske varsler
+# før user har svaret). Nulstilles ved mode-exit.
+#
+# 2026-07-28 (zone-model strammet op): `people_zones_now` fik ét fælles
+# sustain-krav på 300 s for ALLE zoner, fordi radar-still-target-trailing lod
+# ÉN person tælle som 3-5 (målt: to zoner samtidigt i op til 292 s). Denne
+# vagts 45-min-akkumulering blev kalibreret mod den GAMLE, oppustede model →
+# den er nu mindre følsom end da tallet blev valgt. Bevidst ikke ændret: for en
+# over-belægnings-ALARM er under-tælling den sikre retning (falsk anklage mod en
+# gæst er værre end en misset), og akkumuleringen over 3 t giver stadig masser
+# af tid til at nå grænsen ved ægte over-belægning. Ser vi missede tilfælde, er
+# skruen `airbnb_over_akkum_minutter` (ned), ikke zone-sustain (op).
+# =============================================================================
+
+input_number:
+  airbnb_gaeste_antal:
+    name: "👥 AirBnB — bookede gæster"
+    min: 0
+    max: 8
+    step: 1
+    mode: box
+    icon: mdi:account-group
+    unit_of_measurement: "gæster"
+  airbnb_over_akkum_minutter:
+    name: "👥 Over-belægning — akkum. min. (3t-vindue)"
+    min: 5
+    max: 180
+    step: 5
+    mode: box
+    icon: mdi:timer-alert-outline
+    unit_of_measurement: "min"
+  airbnb_over_cooldown_timer:
+    name: "👥 Over-belægning — cooldown"
+    min: 1
+    max: 24
+    step: 1
+    mode: box
+    icon: mdi:bell-sleep
+    unit_of_measurement: "t"
+
+input_boolean:
+  notif_airbnb_gaester_enabled:
+    name: "👥 AirBnB gæster — send"
+    icon: mdi:account-alert
+  notif_airbnb_gaester_parent_a:
+    name: "👥 AirBnB gæster — Parent A"
+    icon: mdi:cellphone
+  notif_airbnb_gaester_parent_b:
+    name: "👥 AirBnB gæster — Parent B"
+    icon: mdi:cellphone
+  # SKAL være ON — nid'ets eksistensberettigelse er push UNDER AirBnB.
+  notif_airbnb_gaester_airbnb:
+    name: "👥 AirBnB gæster — også i AirBnB"
+    icon: mdi:home-account
+
+input_datetime:
+  notif_airbnb_gaester_start:
+    name: "👥 AirBnB gæster — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_airbnb_gaester_slut:
+    name: "👥 AirBnB gæster — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  # Runtime-stempel (BEVIDST uden for snapshot-whitelisten).
+  airbnb_over_sidste_push:
+    name: "👥 Over-belægning — sidste push"
+    has_date: true
+    has_time: true
+    icon: mdi:bell-check
+
+template:
+  - binary_sensor:
+      - name: "AirBnB over belaegning nu"
+        unique_id: airbnb_over_belaegning_nu
+        icon: mdi:account-multiple-plus
+        state: >-
+          {% set booked = states('input_number.airbnb_gaeste_antal') | int(0) %}
+          {% set zones = states('sensor.people_zones_now') | int(0) %}
+          {{ is_state('input_select.house_mode', 'AirBnB')
+             and booked > 0 and zones > booked }}
+        attributes:
+          booket: "{{ states('input_number.airbnb_gaeste_antal') | int(0) }}"
+          zoner_nu: "{{ states('sensor.people_zones_now') | int(0) }}"
+
+sensor:
+  # Akkumuleret over-belægnings-tid i rullende 3t-vindue (timer som float).
+  - platform: history_stats
+    name: "AirBnB over belaegning 3t"
+    unique_id: airbnb_over_belaegning_3t
+    entity_id: binary_sensor.airbnb_over_belaegning_nu
+    state: 'on'
+    type: time
+    end: '{{ now() }}'
+    duration:
+      hours: 3
+
+automation:
+  # --- Check-in: spørg om booket gæste-antal (push m. knapper) ---
+  - id: airbnb_gaester_checkin_sporg
+    alias: "AirBnB gæster: check-in spørgsmål"
+    description: >-
+      house_mode → AirBnB: nulstil gæste-antal og spørg via push med
+      handlings-knapper. Andre antal sættes via slider under Indstillinger → AirBnB.
+    trigger:
+      - platform: state
+        entity_id: input_select.house_mode
+        to: "AirBnB"
+    action:
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.airbnb_gaeste_antal
+        data:
+          value: 0
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: airbnb_gaester
+          title: "🏠 AirBnB check-in"
+          message: >-
+            Hvor mange gæster er der booket til? Svar med knap — eller sæt
+            et andet antal under Indstillinger → AirBnB. Over-belægnings-
+            vagten starter først når antallet er sat.
+          payload:
+            tag: airbnb_gaester_checkin
+            actions:
+              - action: "AIRBNB_GAESTER_1"
+                title: "1"
+              - action: "AIRBNB_GAESTER_2"
+                title: "2"
+              - action: "AIRBNB_GAESTER_3"
+                title: "3"
+
+  # --- Svar-handler: knap-tryk sætter gæste-antal ---
+  - id: airbnb_gaester_svar
+    alias: "AirBnB gæster: knap-svar modtaget"
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default(''))
+             .startswith('AIRBNB_GAESTER_') }}
+    action:
+      - variables:
+          antal: "{{ trigger.event.data.action.split('_')[-1] | int(-1) }}"
+      - condition: template
+        value_template: "{{ antal | int >= 0 }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.airbnb_gaeste_antal
+        data:
+          value: "{{ antal }}"
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: airbnb_gaester
+          title: "🏠 AirBnB check-in"
+          message: >-
+            Gæste-antal sat til {{ antal }}. Over-belægnings-vagten er
+            aktiv (varsel ved > {{ antal }} aktive zoner akkumuleret
+            {{ states('input_number.airbnb_over_akkum_minutter') | int(45) }}
+            min i 3t-vindue).
+          payload:
+            tag: airbnb_gaester_checkin
+
+  # --- Over-belægnings-vagt: /15-scan af akkumuleret 3t-vindue ---
+  # time_pattern-scan (ikke flanke) = re-pusher efter cooldown hvis tilstanden
+  # består (fejlklasse #4/#13). history_stats = "sustained" korrekt målt
+  # (fejlklasse #14 — last_changed duer ikke til analog akkumulering).
+  - id: airbnb_over_belaegning_vagt
+    alias: "AirBnB gæster: over-belægnings-vagt"
+    trigger:
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "AirBnB"
+      - condition: template
+        value_template: >-
+          {{ states('input_number.airbnb_gaeste_antal') | int(0) > 0 }}
+      - condition: template
+        value_template: >-
+          {% set akkum_min = states('sensor.airbnb_over_belaegning_3t')
+             | float(0) * 60 %}
+          {{ akkum_min >= states('input_number.airbnb_over_akkum_minutter')
+             | float(45) }}
+      - condition: template
+        value_template: >-
+          {% set last = as_timestamp(
+             states('input_datetime.airbnb_over_sidste_push'), 0) %}
+          {% set cd_s = states('input_number.airbnb_over_cooldown_timer')
+             | float(6) * 3600 %}
+          {{ (as_timestamp(now()) - last) > cd_s }}
+    action:
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: airbnb_gaester
+          title: "👥 Flere folk end booket?"
+          message: >-
+            {% set booked = states('input_number.airbnb_gaeste_antal') | int(0) %}
+            {% set zones = states('sensor.people_zones_now') | int(0) %}
+            {% set akkum = (states('sensor.airbnb_over_belaegning_3t')
+               | float(0) * 60) | round(0) | int %}
+            Der er booket {{ booked }} gæster, men huset har vist flere
+            aktive zoner i {{ akkum }} min over de sidste 3 timer
+            (lige nu: {{ zones }} zoner). Kan være besøg — eller flere
+            gæster end aftalt.
+          payload:
+            tag: airbnb_over_belaegning
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_over_sidste_push
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # --- Mode-exit: nulstil gæste-antal (vagt slukker via antal=0) ---
+  - id: airbnb_gaester_reset_ved_exit
+    alias: "AirBnB gæster: nulstil ved check-ud"
+    trigger:
+      - platform: state
+        entity_id: input_select.house_mode
+        from: "AirBnB"
+    action:
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.airbnb_gaeste_antal
+        data:
+          value: 0

@@ -1,0 +1,264 @@
+# =============================================================================
+# Legetøjsdag-varsel — diskolys første ikke-lukkedags-fredag i måneden
+# =============================================================================
+# User-spec 2026-06-12: "Den første ikke-helligdags fredag i måneden skal der
+# være diskolys i stuerne, køkken, bad lige umiddelbart efter vejvarslerne.
+# Det skal vare i 10 sek og afsluttes med normalt default lys eller sluk (auto
+# mode). Det varsler at Child A skal ha legetøj med i børnehaven."
+#
+# "Ikke-lukkedags-fredag" = fredag HVOR børnehaven har åbent:
+#   - binary_sensor.arbejdsdag = on (officielle helligdage)
+#   - PLUS eksplicit lukkedags-liste for dage arbejdsdag-sensoren IKKE kender:
+#     grundlovsdag (06-05, verificeret on i recorder 2026-06-05!), 1. maj,
+#     juleaftensdag, nytårsaftensdag. Eksempel: 2026-06-05 var grundlovsdag →
+#     legetøjsdag forskudt til 2026-06-12.
+#   - Måneds-markør (input_text.legetoejsdag_sidst_fyret, YYYY-MM) sikrer at
+#     KUN den første kvalificerende fredag fyrer — helligdags-første-fredag
+#     defererer automatisk til næste fredag fordi markøren forbliver gammel.
+#
+# Timing: trigger 06:30:05 (+ 07:00/07:30 backstop hvis HA var nede) — venter
+# på at morgen-vejrvarslet (vejr_morgen_regn_vind_blink, samme 06:30-slot) er
+# FÆRDIGT, så +10 sek, så 10 sek disko. På varsel-frie dage exiter vejrvarslet
+# straks → disko ~06:30:15.
+#
+# Mekanik: scene-snapshot → disko-chase → varm-finalize 2700K → snapshot-
+# restore = "normalt default lys eller sluk". Samme restore-mønster som
+# vejrvarslerne. continue_on_error overalt (unavailable lamper springes over —
+# ikke-teoretisk: 4 af de gamle 6 lamper stod unavailable 2026-08-05). Ingen
+# button-stamp → rummet flippes ikke til Manual af disko-farverne.
+#
+# 2026-07-02: + køkken-lyskæden — enforcer varsel-gated.
+# 2026-08-05 (user-spec "det skal være vildt disko i hele huset!"): rosteret
+# udvidet fra 6 open-plan-lamper til alle 21 farve-dygtige lyspunkter — dette
+# ophæver 2026-07-03's open-plan-indsnævring. Samtidig lagt om fra "alle lamper
+# hvert step" til en CHASE (én af 4 grupper pr. step), fordi den gamle model
+# skalerede belastningen med roster-størrelsen: 21 lamper à 1,25 s = ~17
+# cmd/sek mod HA/Zigbees ~5-10 loft. Chasen holder ~9 cmd/sek KONSTANT uanset
+# hvor mange lamper der tilføjes.
+# =============================================================================
+
+- id: legetoejsdag_disco_varsel
+  alias: "Legetøjsdag: disko-varsel første åbne-fredag i måneden (efter vejrvarsler)"
+  description: >
+    Første ikke-lukkedags-fredag i måneden kl ~06:30 (10 sek efter morgen-
+    vejrvarslerne): 10 sek diskolys i stue+spisestue+køkken+bad som varsel om
+    at Child A skal have legetøj med i børnehaven. Afsluttes med snapshot-restore
+    (normalt lys eller sluk). Måneds-markør = fyrer kun én gang pr. måned.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # Følger varsel_morgen_blink_start (fyrer "efter vejrvarslerne" uanset
+    # bruger-valgt tid). Backstops hvis HA var nede/genstartede — måneds-
+    # markøren forhindrer dobbelt-fyring; now_min-gaten holder dem inde i
+    # vinduet hvis brugeren flytter blink-start senere end backstop-tiderne.
+    - platform: time
+      at: input_datetime.varsel_morgen_blink_start
+    - platform: time
+      at: "07:00:05"
+    - platform: time
+      at: "07:30:05"
+  condition:
+    - condition: state
+      entity_id: input_boolean.legetoejsdag_varsel_enabled
+      state: "on"
+    # Aldrig FØR morgen-blink-vinduet starter (beskytter backstops mod at fyre
+    # disko før vejrvarslerne når brugeren har flyttet blink-start).
+    - condition: template
+      value_template: >-
+        {% set now_min = now().hour * 60 + now().minute %}
+        {% set sp = states('input_datetime.varsel_morgen_blink_start').split(':') %}
+        {{ now_min >= sp[0]|int * 60 + sp[1]|int }}
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    # Fredag
+    - condition: template
+      value_template: "{{ now().isoweekday() == 5 }}"
+    # Børnehaven har åbent: officiel arbejdsdag...
+    - condition: state
+      entity_id: binary_sensor.arbejdsdag
+      state: "on"
+    # ...og IKKE en lukkedag arbejdsdag-sensoren ikke kender (grundlovsdag
+    # m.fl. — sensoren var on 2026-06-05, verificeret i recorder).
+    - condition: template
+      value_template: >-
+        {{ now().strftime('%m-%d') not in ['05-01', '06-05', '12-24', '12-31'] }}
+    # Kun første kvalificerende fredag i måneden
+    - condition: template
+      value_template: >-
+        {{ states('input_text.legetoejsdag_sidst_fyret') != now().strftime('%Y-%m') }}
+  action:
+    - variables:
+        # 2026-08-05 (user-spec: "det skal være vildt disko i hele huset!") —
+        # rosteret er udvidet fra 6 open-plan-lamper til ALLE farve-dygtige
+        # lyspunkter i huset. Dette OPHÆVER bevidst 2026-07-03's indsnævring til
+        # open-plan; nyeste spec vinder.
+        #
+        # RÆKKEFØLGEN ER FUNKTIONEL, ikke kosmetisk: listen er interleaved så to
+        # naboer aldrig ligger i samme rum. Grupperne dannes med l[i::4], så hver
+        # gruppe automatisk spænder over hele huset og chasen VANDRER fra rum til
+        # rum. Sorterer du listen rumvis, blinker ét rum ad gangen i stedet.
+        #
+        # Apollo-RGB'erne er med (de er eneste farvekilde i sove/depot-hjørnet og
+        # gør varslet husdækkende). To kendte følger, begge accepterede:
+        #   • De lyser ind i deres egen LTR390 → `<rum>_lux_reel` er upålidelig i
+        #     de ~10 sek diskoen kører. Kompensations-modellen i
+        #     packages/apollo_led_lux_kompensation.yaml regner på LED'ens FAKTISKE
+        #     farve/styrke, så den følger med — men forvent støj i vinduet.
+        #   • Apolloen bærer regn-varslet (blå 06:30-10:00). Snapshot-restore
+        #     nedenfor sætter den tilbage; der findes ingen enforcer der ville
+        #     gøre det for os.
+        all_disco:
+          - light.stue_sofa_lampe
+          - light.spisestue_loft
+          - light.koekken_lyskaede
+          - light.badevaerelse_spot_1
+          - light.boernevaerelse_loft
+          - light.sovevaerelse_loft
+          # 2026-08-21: entréen med. Loftet var CCT-only (TRADFRI WS) og kunne
+          # ikke bære et farve-varsel; den nye KAJPLATS kan. Placeret midt i
+          # listen, ikke i bunden, fordi rækkefølgen med vilje er rum-
+          # INTERLEAVET — sidst ville entréen blinke alene til allersidst.
+          - light.entre_loft
+          - light.stue_sofa_lampe_2
+          - light.spisestue_apollo_rgb_light
+          - light.koekken_apollo_rgb_light
+          - light.badevaerelse_spot_2
+          - light.boernevaerelse_lampe
+          - light.sovevaerelse_apollo_rgb_light
+          - light.stue_hjoernelampe
+          - light.badevaerelse_spot_3
+          - light.boernevaerelse_hygge_strip
+          - light.depot_strip
+          - light.stue_laesehygge
+          - light.badevaerelse_spot_4
+          - light.boernevaerelse_apollo_rgb_light
+          - light.stue_apollo_rgb_light
+          - light.badevaerelse_spot_5
+    # Disko fyrer nu på SAMME sekund som morgen-blinket (begge på blink_start,
+    # ikke længere +5s offset) → giv blinket et forspring så det når at claime
+    # current=1 FØR vi tjekker wait_template (ellers race → wait passerer straks).
+    - delay:
+        seconds: 8
+    # Vent på at morgen-vejrvarslet er færdigt (kører i samme blink-start-slot).
+    # Varsel-frie dage: exiter straks. Max blink-forløb ~30s. Timeout = fail-safe.
+    # V1-fix 2026-06-12: brugte automationens yaml-id som entity_id → entity
+    # findes ikke → state_attr none → wait passerede ALTID straks (disko kunne
+    # overlappe vejr-blink). Registry-entity_id er afledt af det oprindelige
+    # alias og ændrer sig ikke ved alias-rename.
+    - wait_template: >-
+        {{ state_attr('automation.vejr_varsel_regn_bla_glimt_vind_hvid_blink_morgen_20min', 'current') | int(0) == 0 }}
+      timeout: "00:03:00"
+      continue_on_timeout: true
+    # User-spec: "der må gerne lige gå 10 sek efter vejrvarslerne"
+    - delay:
+        seconds: 10
+    # Markør FØR disko — selv hvis disko fejler halvvejs, prøver vi ikke igen
+    # (et halvt varsel er stadig et varsel; dobbelt-disko er værre).
+    - service: input_text.set_value
+      data:
+        entity_id: input_text.legetoejsdag_sidst_fyret
+        value: "{{ now().strftime('%Y-%m') }}"
+    # Snapshot så lamperne kan restores til deres on/off-tilstand efter disko.
+    # `pre_off` er en EKSPLICIT liste over hvad der var slukket: scene-restoren
+    # slukkede 2026-08-07 alle Zigbee-lamperne korrekt, men efterlod de tre
+    # Apollo-RGB'er (stue/spisestue/børn) tændt på bookend-hvid i 9 timer —
+    # ESPHome-lysene kommer ikke tilbage til off ad den vej. Beregnes HER, ikke i
+    # variables-blokken øverst, fordi der ligger ~23 s delays imellem.
+    - variables:
+        pre_off: >-
+          {{ all_disco | select('is_state', 'off') | list }}
+    - service: scene.create
+      continue_on_error: true
+      data:
+        scene_id: legetoejsdag_restore
+        snapshot_entities: "{{ all_disco }}"
+    # --- BOOKEND START: 5 sek varm hvid = "her kommer varsel" (user 2026-07-02,
+    # samme sprog som vejr-varslerne i rain_warning.yaml) ---
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ all_disco }}"
+      data:
+        color_temp_kelvin: 2700
+        brightness_pct: 70
+        transition: 0
+    - delay:
+        seconds: 5
+    # --- DISKO: chase over hele huset (2026-08-05) ---
+    # Den gamle model kommanderede ALLE lamper hvert step. Med 21 lamper ville
+    # det være 21 cmd/step = ~17 cmd/sek ved 1,25 s — langt over HA/Zigbees
+    # ~5-10/sek, og resultatet ville være en KØ: diskoen bliver langsommere jo
+    # flere lamper man tilføjer (præcis Styrbar-fælden fra 2026-05-03).
+    #
+    # I stedet skifter ÉN gruppe pr. step (roster[i % 4::4] ≈ 5-6 lamper), mens
+    # de øvrige står med deres forrige farve. Belastningen er dermed konstant
+    # uanset hvor mange lamper der tilføjes til rosteret, og øjet ser en farve-
+    # bølge løbe gennem huset i stedet for at hele huset skifter i takt.
+    - repeat:
+        count: "{{ states('input_number.alert_disko_steps') | int(16) }}"
+        sequence:
+          - variables:
+              # +47°/step er bevidst et primtal-agtigt skridt: 47 og 360 har kun
+              # 1 til fælles, så farverne gentager sig først efter 360 steps.
+              # Grupperne ligger 90° fra hinanden (4 grupper × 90 = 360) og
+              # danner derfor en regnbue der roterer gennem huset.
+              #
+              # 2026-08-07: `repeat.index0` FINDES IKKE i HA — repeat-variablen
+              # har kun first/index/last/count, og index er 1-baseret. Chase-
+              # omskrivningen 08-05 brugte index0 og sprang derfor på iteration
+              # 1 med "UndefinedError: 'dict object' has no attribute 'index0'",
+              # dvs. varslet har aldrig kunnet køre. Markøren sættes FØR diskoen
+              # (bevidst), så 06:30-kørslen nåede at brænde månedens forsøg af
+              # uden at tænde en eneste lampe.
+              hue: >-
+                {{ (states('input_number.alert_disko_hue') | int(0)
+                    + repeat.index * 47
+                    + ((repeat.index - 1) % 4) * 90) % 360 }}
+              grp: "{{ all_disco[(repeat.index - 1) % 4::4] }}"
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ grp }}"
+            data:
+              hs_color: ["{{ hue }}", 100]
+              brightness: 255
+              transition: 0
+          - delay:
+              milliseconds: "{{ states('input_number.alert_disko_step_ms') | int(600) }}"
+    # --- BOOKEND SLUT: 5 sek varm hvid = "varsel slut" (erstatter 0-sek
+    # finalize-blip; samme sidegevinst: Zigbee husker varm hvid) + restore ---
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ all_disco }}"
+      data:
+        color_temp_kelvin: 2700
+        brightness_pct: 70
+        transition: 0
+    - delay:
+        seconds: 5
+    - service: scene.turn_on
+      continue_on_error: true
+      target:
+        entity_id: scene.legetoejsdag_restore
+      data:
+        transition: 0
+    # Backstop: sluk eksplicit det der var slukket før diskoen (se pre_off).
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: "{{ pre_off }}"
+      data:
+        transition: 0
+    - service: logbook.log
+      data:
+        name: "Legetøjsdag"
+        message: >
+          Disko-varsel fyret ({{ now().strftime('%Y-%m-%d %H:%M') }}) —
+          Child A skal have legetøj med i børnehaven i dag!

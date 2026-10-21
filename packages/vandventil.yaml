@@ -1,0 +1,289 @@
+# =============================================================================
+# Vandventil (Sonoff SWV) — LÅST: kun script.vandventil_taend må tænde den
+# =============================================================================
+# User-spec 2026-08-10 (vandskade-risiko): "intet andet end knappen på siden
+# må tænde ventilen — heller ikke restarts eller noget", "voldsom
+# notifikation hver gang den starter", og "må aldrig køre mere end 10 sek ad
+# gangen (slider bestemt med 10)".
+#
+# DESIGN: input_boolean.vandventil_autoriseret er den ENESTE kilde til
+# "er dette en legitim tænding". Kun script.vandventil_taend sætter den ON
+# før den kalder switch.turn_on. `vandventil_taendt_handler` tjekker flaget
+# på HVER "on"-flanke uanset hvem der satte den (app-toggle, fysisk knap,
+# Zigbee2MQTT, en anden automation, en gendannet state ved HA-restart) —
+# er flaget ikke sat, slukkes ventilen STRAKS + voldsom alarm.
+# `vandventil_off_watchdog` er UAFHÆNGIG af scriptet (overlever at et script
+# afbrydes af et HA-restart midt i en delay — script-state overlever IKKE
+# restart, en separat automation-trigger gør) og garanterer hård afbrydelse
+# efter input_number.vandventil_max_sekunder, uanset hvad der tændte den.
+# `vandventil_boot_safety` nulstiller autoriseret-flaget ved hvert HA-boot
+# (input_booleans RESTORES sidste værdi på tværs af restart — uden dette
+# ville et restart midt i en legitim session efterlade flaget ON og et
+# efterfølgende ægte on-signal fejlagtigt fremstå "autoriseret").
+#
+# STRØMAFBRYDELSE / ROUTER DØR MIDT I DE N SEKUNDER (user-spørgsmål 2026-08-10):
+# ALT ovenstående er HA-side logik — dør NUC'en, Zigbee-coordinatoren eller
+# routeren, kan intet af det fyre. Ventilen selv er batteridrevet (Zigbee
+# end device, `sensor.sonoff_swv_battery`) og bliver IKKE slukket af en
+# strømafbrydelse — den fortsætter med at være "on" for evigt, fordi den
+# aldrig modtog en off-kommando. Løsning: devicet understøtter ZCL OnOff-
+# clusterets STANDARD `on_with_timed_off`-kommando (cluster 6, command 0x42,
+# verificeret via `zha/devices/clusters/commands` 2026-08-10 — se
+# CustomSonoffCluster-listen på devicet). Den sætter en TIMER PÅ SELVE
+# DEVICET: det tænder og slukker sig selv igen efter `on_time` (i 1/10 sek),
+# helt uden hjælp fra HA/coordinator/router bagefter kommandoen er afsendt.
+# `vandventil_taend` bruger DERFOR denne kommando i stedet for et almindeligt
+# switch.turn_on — hård afbrydelse overlever nu en fuld strømafbrydelse.
+# HA-siden (watchdog + autoriseret-flag + alarm) beholdes SOM ØVRE lag: den
+# fanger "hvem tændte den" (ZCL-timeren kan ikke skelne autoriseret fra ej)
+# og er et andet-lags backstop hvis en firmware-quirk ikke overholder timeren
+# helt præcist — men er IKKE længere den eneste garant mod "kører for evigt".
+# ieee er device-specifikt: c2:3b:ed:ed:ab:8a:91:62 — ændres ved re-parring.
+# =============================================================================
+
+input_boolean:
+  vandventil_autoriseret:
+    name: "🔒 Vandventil: autoriseret tænd (internt flag)"
+    icon: mdi:lock-check
+  # Notifikations-toggles (script.push_notify-framework, notif_id: vandventil).
+  # Default ON for alle — sikkerhedsvarsel, skal ALTID igennem.
+  notif_vandventil_enabled:
+    name: "🚨 Vandventil tændt — send"
+    icon: mdi:water-alert
+    initial: true
+  notif_vandventil_parent_a:
+    name: "🚨 Vandventil tændt — Parent A"
+    icon: mdi:cellphone
+    initial: true
+  notif_vandventil_parent_b:
+    name: "🚨 Vandventil tændt — Parent B"
+    icon: mdi:cellphone
+    initial: true
+  notif_vandventil_airbnb:
+    name: "🚨 Vandventil tændt — også i AirBnB"
+    icon: mdi:home-account
+    initial: true
+  notif_vandventil_hjemme:
+    name: "🚨 Vandventil tændt — vent til hjemkomst"
+    icon: mdi:home-clock
+    initial: false   # sikkerhedsvarsel: send STRAKS, kø den aldrig
+
+input_datetime:
+  # Begge 00:00:00 = altid aktiv (push_notify's gate_ok: s == e -> True).
+  notif_vandventil_start:
+    name: "🚨 Vandventil tændt — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_vandventil_slut:
+    name: "🚨 Vandventil tændt — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+
+input_number:
+  vandventil_liter_cursor:
+    name: "Vandventil: volumen ved sidste tænd (cursor)"
+    min: 0
+    max: 1000000
+    step: 0.0001
+    unit_of_measurement: "m³"
+    icon: mdi:counter
+    mode: box
+  # Hård grænse: sliderens EGET max er loftet (10) — kan ikke sættes højere i UI.
+  vandventil_max_sekunder:
+    name: "💧 Vandventil: maks kørselstid"
+    min: 1
+    max: 10
+    step: 1
+    unit_of_measurement: "s"
+    icon: mdi:timer-alert
+
+sensor:
+  - platform: integration
+    source: sensor.sonoff_swv_volume_flow_rate
+    name: "Vandventil volumen total"
+    unique_id: vandventil_volumen_total
+    method: left
+    unit_time: h
+    round: 4
+
+template:
+  - sensor:
+      - name: "Vandventil liter denne session"
+        unique_id: vandventil_liter_session
+        icon: mdi:water
+        unit_of_measurement: "L"
+        state: >-
+          {% set cursor = states('input_number.vandventil_liter_cursor') | float(0) %}
+          {% set total = states('sensor.vandventil_volumen_total') | float(0) %}
+          {{ ((total - cursor) * 1000) | round(1) if total >= cursor else 0 }}
+
+script:
+  # ENESTE sanktionerede vej til at tænde ventilen. Sætter autoriseret-flaget
+  # FØR selve tændingen, så `vandventil_taendt_handler` kan se det med det
+  # samme (ingen race — flaget er sat og committed før tænd-kommandoen sendes).
+  # Bruger den native ZCL `on_with_timed_off` i stedet for switch.turn_on, så
+  # SELVE DEVICET holder tidsloftet — overlever strømafbrydelse/router-død
+  # (se header). HA's `vandventil_off_watchdog` er stadig et andet-lags
+  # backstop, ikke den eneste garant (fejlklasse #1-ånd: to lag, men hvert
+  # lag ved hvorfor det findes og hvad det dækker som det andet ikke gør).
+  vandventil_taend:
+    alias: "💧 Vandventil: tænd (autoriseret)"
+    icon: mdi:valve-open
+    mode: single
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.vandventil_autoriseret}
+      - service: zha.issue_zigbee_cluster_command
+        data:
+          ieee: "c2:3b:ed:ed:ab:8a:91:62"
+          endpoint_id: 1
+          cluster_id: 6
+          cluster_type: "in"
+          command: 66   # on_with_timed_off
+          command_type: "server"
+          params:
+            on_off_control: []
+            on_time: "{{ (states('input_number.vandventil_max_sekunder') | int(10)) * 10 }}"
+            off_wait_time: 0
+
+automation:
+  - id: vandventil_session_start
+    alias: "Vandventil: nulstil sessions-tæller ved tænd"
+    trigger:
+      - platform: state
+        entity_id: switch.sonoff_swv
+        to: "on"
+    action:
+      - service: input_number.set_value
+        target: {entity_id: input_number.vandventil_liter_cursor}
+        data:
+          value: "{{ states('sensor.vandventil_volumen_total') | float(0) }}"
+
+  # ===========================================================================
+  # STRAKS-tjek ved hver "on"-flanke: autoriseret via script.vandventil_taend?
+  # Nej -> sluk med det samme + voldsom alarm. Ja -> voldsom alarm alligevel
+  # (bruger skal ALTID vide ventilen kører — "hver gang den starter").
+  # ===========================================================================
+  - id: vandventil_taendt_handler
+    alias: "Vandventil: håndter hver tænding"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: switch.sonoff_swv
+        to: "on"
+    action:
+      - variables:
+          autoriseret: "{{ is_state('input_boolean.vandventil_autoriseret', 'on') }}"
+          maks_sek: "{{ states('input_number.vandventil_max_sekunder') | int(10) }}"
+      - if: "{{ not autoriseret }}"
+        then:
+          # Slukkes STRAKS — vent ikke på watchdoggen.
+          - service: switch.turn_off
+            target: {entity_id: switch.sonoff_swv}
+          - service: persistent_notification.create
+            data:
+              notification_id: vandventil
+              title: "🚨🚨 VANDVENTIL TÆNDT UDEN TILLADELSE"
+              message: >-
+                Ventilen blev tændt af noget ANDET end appens knap kl.
+                {{ now().strftime('%H:%M:%S %d-%m-%Y') }} — slukket automatisk
+                med det samme. Tjek for fejl, en anden automation, eller
+                manipulation.
+          - service: script.push_notify
+            data:
+              notif_id: vandventil
+              title: "🚨🚨 VANDVENTIL TÆNDT UDEN TILLADELSE"
+              message: "Slukket automatisk med det samme. Tjek huset for vandskade."
+              payload:
+                tag: vandventil_alarm
+                channel: "Vandventil"
+            continue_on_error: true
+          - service: logbook.log
+            data:
+              name: "Vandventil ALARM"
+              message: "Tændt UDEN autorisation — slukket automatisk."
+        else:
+          - service: persistent_notification.create
+            data:
+              notification_id: vandventil
+              title: "🚨 VANDVENTIL TÆNDT"
+              message: >-
+                Ventilen er tændt via appen kl. {{ now().strftime('%H:%M:%S') }}.
+                Slukker automatisk senest om {{ maks_sek }} sekunder.
+          - service: script.push_notify
+            data:
+              notif_id: vandventil
+              title: "🚨 VANDVENTIL TÆNDT"
+              message: "Tændt via appen. Slukker automatisk om {{ maks_sek }} sek."
+              payload:
+                tag: vandventil_alarm
+                channel: "Vandventil"
+            continue_on_error: true
+
+  # ===========================================================================
+  # HÅRD, KILDE-UAFHÆNGIG afbrydelse. Kører altid, uanset om tændingen var
+  # autoriseret — så en fejl i handler-automationen ovenfor ikke kan lade
+  # ventilen køre for evigt. mode: restart -> en fornyet "on" nulstiller uret.
+  # ===========================================================================
+  - id: vandventil_off_watchdog
+    alias: "Vandventil: hård afbrydelse efter maks-tid"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: switch.sonoff_swv
+        to: "on"
+    action:
+      - delay: "{{ states('input_number.vandventil_max_sekunder') | int(10) }}"
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.vandventil_autoriseret}
+      - service: switch.turn_off
+        target: {entity_id: switch.sonoff_swv}
+      - service: logbook.log
+        data:
+          name: "Vandventil"
+          message: "Automatisk slukket efter maks-kørselstid."
+
+  # Rydder flaget ved ENHVER "off" (manuel, watchdog, alarm-sluk) — en stale
+  # ON-flag må aldrig kunne overleve til at godkende en senere, uautoriseret
+  # tænding (se header).
+  - id: vandventil_clear_flag_on_off
+    alias: "Vandventil: ryd autoriseret-flag ved sluk"
+    trigger:
+      - platform: state
+        entity_id: switch.sonoff_swv
+        to: "off"
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.vandventil_autoriseret}
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: vandventil
+
+  # input_boolean restores sin sidste værdi på tværs af HA-restart — uden
+  # dette ville et restart midt i en legitim session efterlade flaget ON.
+  - id: vandventil_boot_safety
+    alias: "Vandventil: nulstil autorisation + fail-safe ved HA-start"
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.vandventil_autoriseret}
+      - if:
+          - condition: state
+            entity_id: switch.sonoff_swv
+            state: "on"
+        then:
+          - service: switch.turn_off
+            target: {entity_id: switch.sonoff_swv}
+          - service: script.push_notify
+            data:
+              notif_id: vandventil
+              title: "🚨🚨 VANDVENTIL VAR TÆNDT VED OPSTART"
+              message: "HA genstartede og fandt ventilen tændt — slukket automatisk."
+              payload:
+                tag: vandventil_alarm
+                channel: "Vandventil"
+            continue_on_error: true

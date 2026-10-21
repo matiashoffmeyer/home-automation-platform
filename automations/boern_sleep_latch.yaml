@@ -1,0 +1,165 @@
+# =============================================================================
+# Børn "sov her i nat"-latch — STABILT kids_home-signal (2026-06-18, user-spec)
+# =============================================================================
+# Den gamle kids_home brugte svage motion-signaler der falsk-fyrede på 30-40 min
+# voksen-aktivitet om aftenen → natlys tændte 4 dage i træk uden børn. I har
+# altid børnene OVERNATTENDE, så "sov her i nat" er det pålidelige signal.
+#
+# Denne latch (input_boolean.boern_sov_her_i_nat) er stabil hele døgnet — intet
+# midnat-reset-hul som de rå overnight/today-sensorer har. Den læses af
+# binary_sensor.kids_home (packages/activity_state.yaml) som primært auto-signal.
+#
+# Sættes/ryddes 06:30 ud fra sidste nats Apollo-overnight (22:00→06:00). Ankomst-
+# aften sætter den også on via Styrbar-OP-putning / manuel (kids_home_manual).
+# Når et barn tages hjem → den nat bliver tom → næste 06:30 rydder latchen.
+# =============================================================================
+
+- id: boern_sleep_latch_morning
+  alias: "Børn: latch 'sov her i nat' (06:30 ud fra sidste nats søvn)"
+  description: >
+    Sætter input_boolean.boern_sov_her_i_nat hvis et barn faktisk sov i
+    børneværelset sidste nat (sensor.boern_occupancy_overnight ≥ ~3t). Rydder
+    den KUN ved definitivt tom nat (< 15 min); gråzone imellem = radar-
+    underrapportering → latch uændret. Det stabile "barn overnatter hos
+    os"-signal for kids_home.
+  mode: single
+  trigger:
+    - platform: time
+      at: "06:30:00"
+  action:
+    # 2026-07-17 bug hunt (fejlklasse #9): unavailable/unknown er hverken ≥3t
+    # eller <3t — numeric_state-conditionen er false på en DØD sensor, så
+    # default-grenen ville rydde latchen (= børn markeret "væk" pga. en
+    # Apollo-/recorder-hikke kl 06:30). Fail-safe: rør ikke latchen.
+    - if:
+        - condition: template
+          value_template: "{{ not is_number(states('sensor.boern_occupancy_overnight')) }}"
+      then:
+        - service: logbook.log
+          data:
+            name: "Børn latch"
+            message: "06:30: overnight-sensor død/unavailable → latch RØRES IKKE (fail-safe)."
+        - stop: "overnight-sensor unavailable — latch uændret"
+    - choose:
+        - conditions:
+            # ≥ ~3t Apollo-presence i børneværelset hen over natten = barn sov her.
+            - condition: numeric_state
+              entity_id: sensor.boern_occupancy_overnight
+              above: 2.9
+          sequence:
+            - if:
+                - condition: state
+                  entity_id: input_boolean.boern_sov_her_i_nat
+                  state: "off"
+              then:
+                - service: input_boolean.turn_on
+                  target:
+                    entity_id: input_boolean.boern_sov_her_i_nat
+                # 2026-09-25 (user-spec: "alle nye børnebesøg-perioder skal
+                # bekræftes af mig"): latch off → on ER starten på en ny
+                # periode. Var den allerede bekræftet — "✅ Ja" i går eller i
+                # dag (stille_until ≥ dagens midnat) eller manuel force-on —
+                # er der intet at spørge om. "❌ Nej" rydder latchen igen
+                # (boern_ankomst_svar) og holder kids_home slukket i pausen.
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {% set u = state_attr('input_datetime.boern_ankomst_stille_until', 'timestamp') | float(0) %}
+                        {{ u < today_at('00:00').timestamp()
+                           and is_state('input_boolean.kids_home_manual', 'off')
+                           and states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+                  then:
+                    - action: script.boern_ankomst_spoerg
+                      continue_on_error: true
+                      data:
+                        kilde: latch
+                        besked: >-
+                          Der var nogen i børneværelset i
+                          {{ (states('sensor.boern_occupancy_overnight') | float(0) | round(1) | string) | replace('.', ',') }} t
+                          i nat, så jeg regner med at et barn sov her (Børn hjemme i dag). Passer det?
+            - service: logbook.log
+              data:
+                name: "Børn latch"
+                message: >-
+                  06:30: barn sov her i nat
+                  ({{ states('sensor.boern_occupancy_overnight') | float(0) | round(1) }}t) → latch on.
+        # 2026-07-24 (putte-lys-incident): GRÅZONE 15 min–2.9t → latch RØRES
+        # IKKE. Natten 23→24/7 sov et barn derinde (putning 22:45, godnat-flag
+        # on hele natten) men LD2410-radaren holdt ikke still-presence på det
+        # sovende barn — kun korte blink, sum 0.86t → gammel default-gren
+        # ryddede latchen → kids_home off → aftenens Fase 1 blokeret. Radar-
+        # underrapportering må ikke tælle som "tom nat"; kun < ~15 min er
+        # "definitivt ingen kid her i nat" (jf. overnight-sensorens header i
+        # packages/activity_state.yaml). Hysterese: latch on (putning i går)
+        # forbliver on; latch off forbliver off.
+        - conditions:
+            - condition: numeric_state
+              entity_id: sensor.boern_occupancy_overnight
+              above: 0.25
+          sequence:
+            - service: logbook.log
+              data:
+                name: "Børn latch"
+                message: >-
+                  06:30: gråzone-nat
+                  ({{ states('sensor.boern_occupancy_overnight') | float(0) | round(1) }}t
+                  — radar-blink, ikke bevis for tomt rum) → latch uændret
+                  ({{ states('input_boolean.boern_sov_her_i_nat') }}).
+      default:
+        - if:
+            - condition: state
+              entity_id: input_boolean.boern_sov_her_i_nat
+              state: "on"
+          then:
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.boern_sov_her_i_nat
+            - service: logbook.log
+              data:
+                name: "Børn latch"
+                message: >-
+                  06:30: tom nat
+                  ({{ states('sensor.boern_occupancy_overnight') | float(0) | round(1) }}t) → latch off (ingen børn).
+        # 2026-10-07 (user-bug "der er ingen børn hjemme heller. jeg troede jeg
+        # nu bliver spurgt"): en manuel force-on fra mandag 5/10 12:51 holdt
+        # kids_home on gennem den tomme nat 6→7/10 (0,0 t) — latchen her blev
+        # ryddet, men force-on vinder i kids_home, og alle spørge-veje er
+        # gatet på at den er off. Samme bevis som rydder latchen (< 15 min =
+        # definitivt tom nat) rydder nu også force-on — og SPØRGER, med samme
+        # "De ER hjemme"-knap som eftermiddags-spærren (sætter den igen).
+        - if:
+            - condition: state
+              entity_id: input_boolean.kids_home_manual
+              state: "on"
+          then:
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.kids_home_manual
+            - service: logbook.log
+              data:
+                name: "Børn latch"
+                message: >-
+                  06:30: tom nat → manuel "børn hjemme" (sat
+                  {{ states('input_text.kids_home_manual_dato') }}) slået fra.
+            # Ingen push i AirBnB (telefonen kan være i gæstens hænder).
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+                - condition: state
+                  entity_id: input_boolean.notifikationer_master_enabled
+                  state: "on"
+              then:
+                - service: notify.mobile_app_phone_a
+                  continue_on_error: true
+                  data:
+                    title: "🧒 Børn hjemme?"
+                    message: >-
+                      Børneværelset var tomt i nat
+                      ({{ (states('sensor.boern_occupancy_overnight') | float(0) * 60) | round(0) | int }} min)
+                      → din manuelle "børn hjemme" er slået fra. Er de hjemme alligevel?
+                    data:
+                      tag: boern_ankomst
+                      actions:
+                        - action: "BOERN_ER_HJEMME"
+                          title: "De ER hjemme"

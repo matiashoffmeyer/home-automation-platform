@@ -1,0 +1,173 @@
+# =============================================================================
+# ENTRÉ: langsom fade-ud der kan afbrydes af bevægelse (2026-09-12, user-spec)
+# =============================================================================
+# User: "entrelys skal fade meget langsommere ud og blusse op hvis der kommer
+# bevægelse mens den fader"
+#
+# HVORFOR DET IKKE BARE ER ET STØRRE `transition:`-TAL
+# ----------------------------------------------------
+# `entre_motion_off` sendte i forvejen
+#   light.turn_off(light.entre_loft, transition: sensor.fade_passage_effective)
+# — men `light.entre_loft` er en **Matter**-pære (verificeret i
+# core.entity_registry: platform = matter), og HA videregiver ALDRIG
+# `transition` til et Matter-`turn_off`; integrationen sender et bart
+# `OnOff.Off()`. Fade-tiden har altså aldrig haft nogen effekt i entréen —
+# lyset er knipset ud med det samme, hver gang, siden pæren blev skiftet til
+# Matter/Thread. Det er derfor den ikke "fader for hurtigt", men slet ikke.
+# (ZHA-pærer honorerer transition, så det samme tal virker fint i badet og
+# soveværelset — se listen over de 7 andre forbrugere nedenfor.)
+#
+# Derfor driver HA selv rampen her, i trin, præcis som `godnat_fuld` gør:
+# ét `MoveToLevel` fra pærens firmware er desuden LINEÆRT, mens lysopfattelse
+# er logaritmisk, så et enkelt langt transition-kald hakker synligt i den
+# mørke ende. Trinnene her er **geometriske** (hvert trin ganger med samme
+# faktor), hvilket giver en jævn opfattet nedtoning.
+#
+# ... OG DET ER RAMPEN DER GØR "BLUS OP IGEN" MULIG
+# --------------------------------------------------
+# Et firmware-drevet fade er uafbrydeligt udefra: HA rører ikke pæren igen før
+# den er slukket, så der findes intet tidspunkt at "fange" den på. Fordi HA nu
+# selv tager et trin ad gangen, kan hvert trin først spørge om der er kommet
+# bevægelse — og i så fald skrue tilbage til det niveau lyset stod på da faden
+# begyndte. Mellem trinnene venter scriptet med en `wait_template` på
+# bevægelse, så flaren kommer STRAKS — uafhængigt af trin-intervallet.
+#
+# THREAD-BUDGET (15/10): entré-loftet er stuens ENESTE vej til OTBR'en. Med
+# trin hvert 1,5 s kostede én fade ~31 Matter-kommandoer (8-24 fades/dag =
+# 250-750 kommandoer gennem broen). Nu ~4,5 s pr. trin = 10 kommandoer, og
+# transition (1,2× intervallet) lader pæren glide mellem trinnene. Med pærens
+# rapporter (CurrentLevel pr. ~50 trin + 2× RemainingTime pr. trin, målt
+# 15/10) ≈ 45 udvekslinger pr. fade mod ≈ 125 før.
+#
+# EJERSKAB (fejlklasse #1/#2): scriptet ejer hele nedtoningen ALENE, og det er
+# med vilje at bevægelses-svaret ligger INDE i løkken i stedet for i en
+# søster-automation. Et separat "afbryd"-flow ville skulle kende det niveau
+# lyset stod på før faden, altså enten en helper mere eller en kopi af
+# lux-kurven fra entre_motion_on — og så var vi tilbage i #2. Her er start-
+# niveauet bare en variabel i det script der allerede kører.
+# NB `entre_motion_on` kan ikke selv tage flaren: den kræver
+# `light.entre_loft == 'off'`, og midt i en fade er lyset `on`.
+#
+# SCOPE (user-spec 2026-07-02): slideren herunder gælder entréens
+# **bevægelses-sluk** (`entre_motion_off`) OG **terrasse-dæmpen**
+# (`terrace_dim_indoor`, user-spec 2026-09-12b). Begge veje kalder scriptet med
+# `script.turn_on` — fire-and-forget — fordi begge deres automations er
+# `mode: restart` og et inline kald ville blive dræbt midt i rampen.
+#
+# De øvrige sluk-veje er BEVIDST urørt og slukker entréen momentant:
+# godnat (`automations/godnat_night.yaml`), nattur-retur
+# (`packages/nattur_retur.yaml`, hvor user-spec eksplicit siger "straks") og
+# Scene: Biograf. En 45 s ramp dér ville lade gangen lyse længe efter resten af
+# huset er mørkt.
+#
+# NB for nye kaldere: flaren læser `binary_sensor.entre_valhorn_occupancy`, så
+# en kalder der IKKE selv har bevist at valhornet er tomt, skal gate på den —
+# ellers blusser første trin op og scriptet stopper med lyset tændt. Det gælder
+# især Matter-hæng (sleepy end device, op mod 40 min uden sit `off`).
+# `input_number.fade_passage_seconds`
+# (→ sensor.fade_passage_effective, 10 s) har 7 andre forbrugere — depot,
+# terrasse, soveværelse, badeværelset (3 steder) og godnat — og er derfor
+# BEVIDST ikke skruet op; entréen er koblet af den i stedet.
+# =============================================================================
+
+script:
+  entre_fade_ud:
+    alias: "Entré: fade langsomt ud (afbrydes af bevægelse)"
+    icon: mdi:transition-masked
+    # restart: kaldes den igen mens en fade kører, starter faden forfra i
+    # stedet for at lægge to ramper oven i hinanden.
+    mode: restart
+    sequence:
+      - variables:
+          # Rå 0-255. Er pæren allerede slukket (eller unavailable, #9) bliver
+          # det 0, og guarden nedenfor stopper scriptet uden at røre noget.
+          start_bri: "{{ state_attr('light.entre_loft', 'brightness') | int(0) }}"
+          fade_s: "{{ states('input_number.entre_fade_ud_sekunder') | float(45) }}"
+          # ~4,5 s pr. trin (Thread-budget, se toppen); flaren venter IKKE på
+          # trinnet (wait_template nederst i løkken). 40-loftet: 180 s
+          # (sliderens max) = 40 trin.
+          trin: "{{ [[(fade_s / 4.5) | round(0) | int, 4] | max, 40] | min }}"
+          # Stemplet faden startede på. Bruges til at opdage at brugeren har
+          # rørt pæren i mellemtiden (se afbryds-grenen i løkken).
+          start_ts: "{{ now().timestamp() }}"
+      - condition: template
+        value_template: "{{ start_bri > 0 }}"
+      - repeat:
+          count: "{{ trin }}"
+          sequence:
+            # --- Afbryds-grene, i prioriteret rækkefølge -------------------
+            - choose:
+                # 1) BEVÆGELSE → blus op til udgangsniveauet og stop.
+                #    Der sendes bevidst KUN brightness: farve/ct er ikke rørt
+                #    af rampen, så pæren står allerede i den rigtige farve —
+                #    også hvis den er i `hs` efter et festlys-event. Et ct i
+                #    kaldet ville overskrive den farve med gang-hvid.
+                - conditions:
+                    # 2026-10-15: + stedfortræder-pulsen (VALLHORN'en væk).
+                    - condition: template
+                      value_template: >-
+                        {{ is_state('binary_sensor.entre_valhorn_occupancy', 'on')
+                           or is_state('binary_sensor.entre_stedfortraeder_bevaegelse', 'on') }}
+                  sequence:
+                    - service: light.turn_on
+                      target:
+                        entity_id: light.entre_loft
+                      data:
+                        brightness: "{{ start_bri }}"
+                        transition: 1
+                      continue_on_error: true
+                    - stop: "Bevægelse i entréen — lyset blusser op igen"
+                # 2) Lyset er slukket under os (manuelt, godnat, gruppe-sluk)
+                #    → lad være med at tænde det igen på næste trin.
+                - conditions:
+                    - condition: not
+                      conditions:
+                        - condition: state
+                          entity_id: light.entre_loft
+                          state: "on"
+                  sequence:
+                    - stop: "Entré-lyset er allerede slukket"
+                # 3) Brugeren har tændt/wall-cyclet pæren EFTER at faden
+                #    begyndte. entre_loft_manual_on_detect stempler
+                #    input_datetime.entre_loft_manual_on_at ved den slags.
+                #    Manuel betjening vinder over en automatisk nedtoning
+                #    (fejlklasse #3) — vi lader lyset stå som han satte det.
+                - conditions:
+                    - condition: template
+                      value_template: >-
+                        {% set ts = state_attr('input_datetime.entre_loft_manual_on_at', 'timestamp') %}
+                        {{ ts is not none and ts > start_ts }}
+                  sequence:
+                    - stop: "Manuel betjening under faden — lyset står som brugeren satte det"
+            # --- Ét geometrisk trin ned -----------------------------------
+            # start_bri * (1/start_bri)^(i/trin): rammer præcis 1 på sidste
+            # trin, og hvert trin ganger med samme faktor = jævn OPFATTET
+            # nedtoning (lysopfattelse er logaritmisk, ikke lineær).
+            # `**` findes i husets Jinja; `exp()` gør ikke.
+            - service: light.turn_on
+              target:
+                entity_id: light.entre_loft
+              data:
+                brightness: >-
+                  {% set p = repeat.index / trin %}
+                  {{ [ (start_bri * ((1.0 / start_bri) ** p)) | round(0) | int, 1 ] | max }}
+                # ~1,2× intervallet, så hvert trin er færdigt med at glide
+                # lige inden det næste sendes — ellers ses trinnene som hak.
+                transition: "{{ ((fade_s / trin) * 1.2) | round(1) }}"
+              continue_on_error: true
+            # Vent trin-intervallet — men vågn STRAKS ved bevægelse eller sluk;
+            # afbryds-grenene øverst i næste omgang tager sig af resten.
+            - wait_template: >-
+                {{ is_state('binary_sensor.entre_valhorn_occupancy', 'on')
+                   or is_state('binary_sensor.entre_stedfortraeder_bevaegelse', 'on')
+                   or not is_state('light.entre_loft', 'on') }}
+              timeout:
+                seconds: "{{ (fade_s / trin) | round(2) }}"
+              continue_on_timeout: true
+      # Rampen slutter på brightness 1; selve slukningen er et rent turn_off
+      # uden transition (Matter ville droppe den alligevel, og der er ikke
+      # noget tilbage at fade fra).
+      - service: light.turn_off
+        target:
+          entity_id: light.entre_loft
+        continue_on_error: true

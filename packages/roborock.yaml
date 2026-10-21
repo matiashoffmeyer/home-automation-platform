@@ -1,0 +1,1345 @@
+# =============================================================================
+# Roborock S8 MaxV Ultra — dormant-drevet rengøring (opg 7, user-spec 2026-06-10)
+# =============================================================================
+# Entities fra officiel Roborock-integration: vacuum.s8_maxv_ultra +
+# select.s8_maxv_ultra_mop_intensity/mop_mode + binary_sensor.s8_maxv_ultra_*.
+#
+# REGLER:
+#   - Trigger: house_state → Dormant, OG mindst input_number.roborock_auto_
+#     interval_aktiv_timer VÆGTEDE AKTIV-TIMER (105, user-spec 2026-09-01)
+#     siden sidste HEL-HUS-rengøring — uanset om den var auto, Styrbar- eller
+#     app-startet. Opsparingen tælles i packages/roborock_aktiv_timer.yaml:
+#     kun timer hvor huset er Active tæller, og timer med børn hjemme tæller
+#     dobbelt. Afløste døgn-slideren `roborock_auto_interval_dage` 2026-09-01
+#     (et tomt døgn gør ikke gulvet beskidt).
+#   - HVAD den så gør styres af input_select.roborock_auto_dormant_handling.
+#     På "Auto (børn og kadence)" gælder den hidtidige kadence: børn hjemme →
+#     altid FULL; ellers FULL hvis der er ≥ 3 dage siden sidste full, ellers
+#     QUICK. De tre andre options (Fuld/Grundig/Kun
+#     støvsugning) tvinger ét bestemt udfald.
+#   - Måltids-støvsugningen (maaltid_detektion.yaml) er en DELVIS spot-clean af
+#     Living room og tæller IKKE som en hel-hus-rengøring — den udskyder derfor
+#     ikke intervallet (genkendes via roborock_segment_clean_at).
+#   - Dormant slår fra mens robotten kører → ØJEBLIKKELIG pause + retur til
+#     dock (sessionen tæller IKKE som completed).
+#   - Manuel styring på den ledige Styrbar (ex-depot, IEEE 00:3c:84:ff:fe:
+#     10:f0:29 — "ready to be assigned" siden 2026-06-06): TOP-knap toggler
+#     quick-session, BUND-knap toggler full-session. Skift IEEE'en i
+#     roborock_manual_buttons hvis en anden fjernbetjening ønskes (alle
+#     RODRET'er + begge SOMRIG'er var optaget 2026-06-10).
+#
+# Session-tracking: input_boolean.roborock_session_active +
+# input_select.roborock_session_type. Completion stamper last_completed
+# (+ last_full_completed ved full) — kun når robotten SELV bliver færdig.
+# =============================================================================
+#
+# OFF-PEAK OPLADNING (native Roborock-feature, aktiveret 2026-07-01, user-spec)
+# -----------------------------------------------------------------------------
+# User: "robotten må ALDRIG oplade når prisen er over gennemsnit". Roborock-
+# integrationen har INGEN dynamisk pris-styring og INGEN "stop charge"-kommando
+# (opladning sker automatisk når robotten er docket), OG dokken sidder ikke på
+# en smart-plug (TRETAKT-pluggen driver switch.koekken_spots). MEN robotten har
+# en indbygget off-peak-charging: den oplader kun i et fast tidsvindue. De tre
+# entities var disabled_by: integration → gen-aktiveret i entity-registry:
+#   switch.s8_maxv_ultra_off_peak_charging  → slået ON
+#   time.s8_maxv_ultra_off_peak_start = 00:00
+#   time.s8_maxv_ultra_off_peak_end   = 06:00   (DK2 lavlast + typisk lav spot)
+# VIGTIGT: enable-tilstanden lever i .storage (gitignored) + robottens cloud —
+# IKKE i git. Ved fresh install / entity-registry-tab skal de tre entities
+# gen-aktiveres (Indstillinger → Enheder → Roborock → aktivér de skjulte
+# entities, ELLER WS config/entity_registry/update disabled_by:null + reload af
+# config-entry). Fast vindue = bevidst user-valg (AskUserQuestion 2026-07-01),
+# IKKE dynamisk mod 30d-gns. Vil du have ægte "under gennemsnit"-styring: gate i
+# stedet den daglige clean (roborock_dormant_start) på sensor.elpris_spot_aktuel
+# vs sensor.elspot_30d_gns (samme ratio som luksus_lys/elpris_dim).
+# Kontrol/synlighed: dashboards/status.yaml (Roborock off-peak-kort).
+# =============================================================================
+
+input_number:
+  # El-pris-gate for den daglige auto-clean (2026-07-01, user-spec). Samme ratio-
+  # mapping som luksus_lys: 0 = OFF (clean altid), 100 = skip når spot > 30d-gns.
+  # Manuel start (Styrbar/app/scripts) er ALDRIG gated. Fresh-install = 0 (min) =
+  # safe (robotten cleaner altid); live-default (100) sat via API + snapshot.
+  roborock_elpris_aggressivitet:
+    name: "Roborock: el-pris aggressivitet (skip clean når dyrt)"
+    icon: mdi:cash-lock
+    min: 0
+    max: 100
+    step: 1
+    mode: slider
+
+  # 2026-07-28 (item 6) indførte `roborock_auto_interval_dage` = minimum antal
+  # DØGN siden sidste hel-hus-rengøring. FJERNET 2026-09-01 (user-spec):
+  # kadencen måles nu i vægtede AKTIV-TIMER i stedet, fordi et døgn hvor huset
+  # stod tomt ikke gør gulvet beskidt, og et døgn med børn gør det dobbelt.
+  # Tærskel + opsparing bor i packages/roborock_aktiv_timer.yaml.
+
+  # 2026-08-06 (user-valg "kør robotten senere"): karantæne efter Dormant, så
+  # Apollo-trænerne får køretid FØR robotten starter.
+  # BAGGRUND: flap-jagten og gate-decay kører KUN i Dormant, og begge er
+  # spærret mens `binary_sensor.apollo_flap_suppress` er on (robottens egen
+  # bevægelse er legitim radar-uro, ikke spøgelser). Robotten kører netop når
+  # huset er tomt = præcis når Dormant indtræffer, så den åd vinduet: det ENESTE
+  # substantielle Dormant-vindue på 14 dage (07-31, 6,5 t) var 100 % dækket af en
+  # Roborock-session → nul træner-tid. Med 60 min karantæne får decay 2 skridt
+  # (30-min-intervallet) og jagten en ægte lytte-periode først.
+  # 0 = gammel adfærd (2 min settle).
+  roborock_dormant_delay_minutter:
+    name: "Roborock: karantæne efter Dormant (træner-vindue)"
+    icon: mdi:timer-sand
+    min: 0
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+input_boolean:
+  roborock_session_active:
+    name: "Roborock session aktiv (HA-startet)"
+    icon: mdi:robot-vacuum
+
+  # 2026-07-26 (user-spec): "rod på gulvet"-pause. Styrbar NED mens robotten
+  # STÅR STILLE = suspendér ALLE automatiske støvsugninger (robotten skal ikke
+  # køre hen over rod): den daglige Dormant-clean (roborock_dormant_start) OG
+  # måltids-støvsugningen (maaltid_detektion.yaml). Auto genoptages ved næste
+  # MANUELLE kørsel (Styrbar OP eller Roborock-app) ELLER ved endnu et NED-tryk
+  # (toggle). Runtime-state (som session_active) — IKKE i init_user_preferences/
+  # snapshot; overlever reboot via .storage.
+  roborock_auto_paused:
+    name: "Roborock: auto-clean på pause (rod på gulvet)"
+    icon: mdi:robot-vacuum-off
+
+  # 2026-07-27 (user-spec): "når robotstøvsugeren kører skal det være med max
+  # forsigtighed så den ikke kører ind i ting" — men KUN når huset er ude/Dormant
+  # (user-valg: hjemme = hurtig clean når der er ryddet op). Killswitch (default
+  # ON) for reaktiv kollisions-undgåelse (obstacle avoidance). Anvendes af
+  # script.roborock_apply_forsigtig — kaldt før hver clean-start (start_quick/
+  # full + måltids-støvsug + airbnb-checkout-restore). ON + ude/Dormant → rå
+  # kommando `set_collision_avoid_status status=1`; hjemme ELLER OFF → status=0.
+  # AirBnB check-ud tvinger status=1 uanset (egen kommando). Snapshot: fanges af
+  # helpers_export (_enabled-suffix).
+  roborock_forsigtig_enabled:
+    name: "🤖 Roborock: altid forsigtig (undvig ting på gulvet)"
+    icon: mdi:robot-vacuum-alert
+
+  # 2026-08-08 (user-spec): "på de dage hvor støvsugeren ikke har tænkt sig at
+  # gøre auto-dormant rent skal den trods alt gøre Living room rent med
+  # støvsugning. En Light Rengøring." Killswitch for netop den fallback.
+  # Er den OFF, opfører huset sig præcis som før: interval ikke nået = ingen
+  # kørsel. Snapshot: fanges af helpers_export (_enabled-suffix).
+  roborock_let_stue_enabled:
+    name: "🤖 Roborock: let stue-rengøring på mellemdage"
+    icon: mdi:sofa-outline
+
+input_select:
+  roborock_session_type:
+    name: "Roborock sessionstype"
+    icon: mdi:robot-vacuum-variant
+    options:
+      - none
+      - quick
+      - full
+
+input_datetime:
+  roborock_last_completed:
+    name: "Roborock sidste gennemførte rengøring"
+    has_date: true
+    has_time: true
+  roborock_last_full_completed:
+    name: "Roborock sidste gennemførte FULL clean"
+    has_date: true
+    has_time: true
+  # 2026-07-08 (#AirBnB-vacuum-blok, user-spec): stempel for MANUEL clean-start
+  # (Styrbar). AirBnB-auto-clean-guarden (airbnb_block_auto_clean i airbnb_mode.
+  # yaml) undtager cleans der er manuelt stemplet indenfor et kort vindue, så
+  # Styrbar-start virker uændret i AirBnB mens automatiske cleans stoppes.
+  roborock_manual_start_at:
+    name: "Roborock manuel clean-start kl."
+    has_date: true
+    has_time: true
+  # 2026-07-28 (item 6): stempel for VORES egne delvis-rengøringer (måltids-
+  # støvsugningen af Living room). Interval-gaten skal kun tælle HEL-HUS-
+  # rengøringer — en spot-clean af spisepladsen må ikke udskyde hele husets
+  # rengøring i 3 dage. Detektoren for app-startede rengøringer bruger
+  # stemplet til at genkende og ignorere sine egne segment-cleans.
+  roborock_segment_clean_at:
+    name: "Roborock segment-clean startet kl."
+    has_date: true
+    has_time: true
+  # 2026-08-08 (user-spec): stempel for den LETTE stue-rengøring på mellemdage.
+  # Ankeret for "max 1 pr. Dormant-session" (stempel < house_state.last_changed).
+  # BEVIDST et selvstændigt stempel og IKKE last_completed: en let stue-clean må
+  # aldrig nulstille husets opsparede aktiv-timer og dermed udskyde hel-hus-
+  # — så ville fallbacken spise præcis den kørsel den er en erstatning for.
+  # Runtime → ude af helper-snapshottet (helpers_export' DATETIME_CONFIG er
+  # opt-in), så en restore ikke genindsætter en dage gammel session-markering.
+  roborock_let_clean_at:
+    name: "Roborock let stue-rengøring startet kl."
+    has_date: true
+    has_time: true
+
+script:
+  # 2026-07-27 (user-spec): fælles "anvend forsigtig-mode"-helper. Sætter
+  # robottens reaktive kollisions-undgåelse (obstacle avoidance) status=1 KUN når
+  # killswitchen roborock_forsigtig_enabled er ON OG huset er ude/Dormant
+  # (Dormant-state ELLER ingen voksne+børn hjemme) — ellers status=0 (hurtig
+  # clean når hjemme). Kaldes FØR hver clean-start (start_quick/full + måltids-
+  # støvsug). Genbruger den beviste rå-kommando fra airbnb_checkout (literal
+  # params — ingen templatet dict, jf. fejlklasse #6). Service-kald → parent venter.
+  roborock_apply_forsigtig:
+    alias: "Roborock: anvend forsigtig-mode (collision avoid) efter killswitch"
+    icon: mdi:robot-vacuum-alert
+    sequence:
+      - if:
+          - condition: template
+            # Forsigtig KUN når huset er ude/Dormant (user-valg 2026-07-27):
+            # tomt hus → undvig ting på gulvet; hjemme → hurtig clean (status 0).
+            value_template: >-
+              {{ is_state('input_boolean.roborock_forsigtig_enabled', 'on')
+                 and (is_state('input_select.house_state', 'Dormant')
+                      or (is_state('input_boolean.parent_a_home', 'off')
+                          and is_state('input_boolean.parent_b_home', 'off')
+                          and is_state('binary_sensor.kids_home', 'off'))) }}
+        then:
+          - service: vacuum.send_command
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data:
+              command: set_collision_avoid_status
+              params: {"status": 1}
+        else:
+          - service: vacuum.send_command
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data:
+              command: set_collision_avoid_status
+              params: {"status": 0}
+      - delay: "00:00:02"
+
+  roborock_start_quick:
+    alias: "Roborock: start QUICK (kun støvsugning)"
+    icon: mdi:robot-vacuum
+    sequence:
+      - service: input_select.select_option
+        target: {entity_id: input_select.roborock_session_type}
+        data: {option: quick}
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.roborock_session_active}
+      # max_plus er ene-funktions-tilstanden "kun sug": den nulstiller selv
+      # mop_intensity til off. Mop skrives alligevel først, så rækkefølgen er
+      # den samme overalt (enhver mop-skrivning trækker sug ned til balanced).
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+        data: {option: "off"}
+      - service: vacuum.set_fan_speed
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data: {fan_speed: max_plus}
+      - service: script.roborock_apply_forsigtig
+      - service: vacuum.start
+        target: {entity_id: vacuum.s8_maxv_ultra}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: "QUICK session startet (kun støvsugning, max sug, mop off)."
+
+  roborock_start_full:
+    alias: "Roborock: start FULL clean (støvsug + mop)"
+    icon: mdi:robot-vacuum-variant
+    sequence:
+      - service: input_select.select_option
+        target: {entity_id: input_select.roborock_session_type}
+        data: {option: full}
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.roborock_session_active}
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+        data: {option: standard}
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_mode}
+        data: {option: standard}
+      - service: vacuum.set_fan_speed
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data: {fan_speed: balanced}
+      - service: script.roborock_apply_forsigtig
+      - service: vacuum.start
+        target: {entity_id: vacuum.s8_maxv_ultra}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: "FULL clean session startet (støvsug + mop)."
+
+  # ⚠️ 2026-08-16 (målt live på robotten): sug og mop er ÉN tilstand på S8 MaxV
+  # Ultra, ikke to uafhængige knapper — og de tre stærkeste indstillinger er
+  # hver især ENE-funktions:
+  #   • `fan_speed: max_plus` → robotten skifter til vac-only, mop_intensity
+  #     falder til `off`. (Målt: mop extreme + max_plus ⇒ mop_int=off.)
+  #   • `mop_mode: deep_plus` → mop-only, fan_speed falder til `off`. Det var
+  #     præcis symptomet 08-16 kl. 08:28: "den moppede, men sugede ikke".
+  #   • `mop_mode: deep` afvises og ruller tilbage til `standard`.
+  # Desuden nulstiller ENHVER mop-skrivning sugestyrken til `balanced`, så sug
+  # skal sættes SIDST. Den kraftigste kombination der beviseligt holder samtidig
+  # er derfor `max` + `extreme` + `standard` — verificeret live på en kørende
+  # robot, ikke gættet.
+  roborock_start_max:
+    alias: "Roborock: MAX clean (max sug + extreme mop samtidig)"
+    icon: mdi:robot-vacuum-variant
+    sequence:
+      - service: input_select.select_option
+        target: {entity_id: input_select.roborock_session_type}
+        data: {option: full}
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.roborock_session_active}
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_mode}
+        data: {option: standard}
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+        data: {option: extreme}
+      - service: vacuum.set_fan_speed
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data: {fan_speed: max}
+      - delay: "00:00:03"
+      - service: script.roborock_apply_forsigtig
+      - service: vacuum.start
+        target: {entity_id: vacuum.s8_maxv_ultra}
+      # app_start bruger robottens gemte profil — re-sæt 5s efter start så
+      # indstillingerne lander mens robotten allerede kører (belt+suspenders).
+      # Sug SIDST, ellers nulstiller mop-skrivningen det til balanced.
+      - delay: "00:00:05"
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+        data: {option: extreme}
+      - service: vacuum.set_fan_speed
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data: {fan_speed: max}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: "MAX clean session startet (max sug + extreme mop samtidig)."
+
+  # 2026-08-08 (user-spec): "på de dage hvor støvsugeren ikke har tænkt sig at
+  # gøre auto-dormant rent skal den trods alt gøre Living room rent med
+  # støvsugning. En Light Rengøring."
+  #
+  # "Let" = QUICK-profilen (mop OFF + balanced sug) på ÉT segment i stedet for
+  # hele huset. Segment 16 = "Living room" — samme segment som måltids-
+  # støvsugningen; "Living room1" er bevidst udenfor, jf. maaltid_detektion.
+  #
+  # ⚠️ 2026-08-13: kortet er blevet re-segmenteret, og "Living room1" er nu
+  # segment 23, ikke 17 (17 er "Bedroom1"). Vigtigere: segment 16 er ifølge
+  # user SPISESTUEN, ikke stuen — scriptets navn er altså misvisende, men
+  # adfærden matcher user-spec'en fra 08-08, der bad om "Living room" ved
+  # navn. Den fulde, data-udledte segment→rum-tabel står i
+  # packages/roborock_rum_scripts.yaml; læs DEN før du rører et segment-nummer.
+  #
+  # ⚠️ Sætter BEVIDST IKKE roborock_session_active/session_type. Gjorde den det,
+  # ville roborock_session_completed stemple `roborock_last_completed` når
+  # robotten docker → interval-gaten ville tro hele huset var rengjort, og
+  # hel-hus-rengøringen ville blive udskudt et helt aktiv-timer-interval
+  # HVER gang fallbacken kørte = den ville sulte netop den kørsel den erstatter.
+  # Til gengæld stemples `roborock_segment_clean_at`, så den app-clean-detektor
+  # der ellers ville stemple den udefra (roborock_fremmed_clean_stamp) springer
+  # den over — samme mekanik som måltids-støvsugningen.
+  roborock_start_let_stue:
+    alias: "Roborock: LET rengøring af stuen (segment, kun støvsug)"
+    icon: mdi:sofa-outline
+    sequence:
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+        data: {option: "off"}
+      - service: vacuum.set_fan_speed
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data: {fan_speed: max_plus}
+      - service: script.roborock_apply_forsigtig
+      # Begge stempler skrives FØR kommandoen: robottens egen `last_clean_begin`
+      # ligger da et par sekunder senere, hvilket er indenfor genkendelses-
+      # vinduet i roborock_fremmed_clean_stamp.
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_segment_clean_at}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_let_clean_at}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: vacuum.send_command
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data:
+          command: app_segment_clean
+          params:
+            - segments: [16]
+              repeat: 1
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: >-
+            LET rengøring: Living room støvsuges (mop off, balanced) —
+            mellemdag, hel-hus-rengøring er ikke forfalden endnu.
+
+  roborock_stop_dock:
+    alias: "Roborock: stop + retur til dock (tæller ikke som completed)"
+    icon: mdi:home-import-outline
+    sequence:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.roborock_session_active}
+      - service: input_select.select_option
+        target: {entity_id: input_select.roborock_session_type}
+        data: {option: none}
+      - service: vacuum.pause
+        target: {entity_id: vacuum.s8_maxv_ultra}
+      - delay: "00:00:03"
+      - service: vacuum.return_to_base
+        target: {entity_id: vacuum.s8_maxv_ultra}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: "Session afbrudt — pause + retur til dock (ikke completed)."
+
+  roborock_wrap_up:
+    alias: "Roborock: wrap up (kør færdig + tæl som completed)"
+    icon: mdi:flag-checkered
+    description: >
+      User-spec 2026-06-14 (Styrbar KORT NED): lad nuværende rengøring køre
+      HELT færdig — robotten docker selv når den er done. session_active ON
+      sikrer at roborock_session_completed stamper last_completed (også hvis
+      cleaningen blev startet fra app'en med session_active=off), så dagens
+      auto-clean springes over. Kører robotten ikke, er der intet at afslutte.
+    sequence:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: binary_sensor.s8_maxv_ultra_cleaning
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_on
+                target: {entity_id: input_boolean.roborock_session_active}
+              - service: logbook.log
+                data:
+                  name: "Roborock"
+                  message: >-
+                    Wrap up: lader nuværende rengøring køre færdig → docker
+                    selv + tæller som completed.
+        default:
+          - service: logbook.log
+            data:
+              name: "Roborock"
+              message: "Wrap up: robotten kører ikke — intet at afslutte."
+
+automation:
+  # ---------------------------------------------------------------------------
+  # 1) Dormant → start rengøring (max 1 completed/dag)
+  # ---------------------------------------------------------------------------
+  - id: roborock_dormant_start
+    alias: "Roborock: start ved Dormant (aktiv-timer-kadence, full/quick)"
+    description: >
+      House Dormant + mindst `roborock_auto_interval_aktiv_timer` VÆGTEDE
+      aktiv-timer (105) opsparet siden sidste hel-hus-rengøring → start.
+      Opsparingen tælles i packages/roborock_aktiv_timer.yaml (kun Active-timer,
+      børne-timer dobbelt) og afløste døgn-slideren 2026-09-01.
+      HVAD den gør vælges med `input_select.roborock_auto_dormant_handling`; på
+      "Auto (børn og kadence)" gælder den hidtidige regel: børn hjemme → altid
+      FULL, ellers FULL hvis ≥ 3 dage siden sidste full, QUICK de øvrige gange.
+      2026-07-01: PRIS-GATED — starter kun når strømmen ikke er
+      over gns (binary_sensor.roborock_elpris_block off), så hele forløbet
+      (clean → dok-selvrens → mop-tørring) lander i billige timer. Falder
+      prisen mens huset stadig er Dormant → block→off-triggeren re-forsøger.
+      2026-07-18: max 1 pr. Dormant-session + kræver hoveddør åbnet siden
+      sidste completed (user-spec). Manuel start (Styrbar/app) er urørt.
+      2026-08-06: `roborock_dormant_delay_minutter` (60) karantæner starten, så
+      Apollo-trænerne får køretid før robottens bevægelse suppresser dem.
+      2026-08-08 (user-spec): er intervallet IKKE nået, kører den i stedet en
+      LET rengøring af stuen (segment 16, kun støvsug) — max 1 pr. Dormant-
+      session. Interval-gaten er derfor flyttet fra `condition:` til en gren i
+      `action:`, så alle øvrige sikkerheds-conditions deles af begge udfald
+      (fejlklasse #2 — den lette gren må ikke få sit eget, divergerende sæt).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.house_state
+        to: "Dormant"
+        # Settle mod Dormant-bounce + træner-karantæne i ÉN ventetid (min 2 min
+        # så en slider på 0 beholder den gamle bounce-beskyttelse).
+        for: >-
+          {% set m = [2, states('input_number.roborock_dormant_delay_minutter')
+                          | int(60)] | max %}
+          {{ '%02d:%02d:00' | format(m // 60, m % 60) }}
+      # Pris faldt til/under gns mens huset stadig er Dormant → re-forsøg clean.
+      - platform: state
+        entity_id: binary_sensor.roborock_elpris_block
+        from: "on"
+        to: "off"
+        for:
+          minutes: 1
+      # 2026-08-08 (fejlklasse #4 — re-arm): user-spec siger den lette
+      # stue-rengøring skal køre "ALTID mindst 1 gang per dormant session når
+      # den altså må". De to flanker ovenfor fyrer ÉN gang hver; fejler bare én
+      # condition i det sekund (robotten står i emptying_the_bin, en radar er
+      # kortvarigt on, prisen er høj), er sessionen tabt. Backstoppen prøver
+      # igen hvert kvarter så længe huset er Dormant. Sikker at gentage:
+      # session-stemplerne + `session_active == off` + robot-klar-gaten gør en
+      # allerede kørt/kørende session til en no-op.
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      # Huset skal STADIG være Dormant (vigtigt for pris-re-triggeren, der kan
+      # fyre længe efter selve Dormant-skiftet).
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Dormant"
+      # Karantænen skal også gælde PRIS-triggeren — ellers ville et prisfald 5
+      # min inde i Dormant smutte udenom og æde træner-vinduet alligevel (samme
+      # regel to steder = fejlklasse #2). Den mistede pris-flanke er dækket:
+      # Dormant-triggeren ovenfor fyrer selv når karantænen udløber og tjekker
+      # prisen dér, så der er ingen tabt flanke uden re-arm (#4).
+      # NB: house_state.last_changed nulstilles ved HA-restart → karantænen
+      # starter forfra. Det FORLÆNGER kun ventetiden = fejler sikkert.
+      - condition: template
+        value_template: >-
+          {% set ds = states.input_select.house_state.last_changed %}
+          {% set m = states('input_number.roborock_dormant_delay_minutter')
+                     | int(60) %}
+          {{ ds is none or (now() - ds).total_seconds() >= m * 60 }}
+      # Strømmen må ikke være over gns (fail-safe: block=off ved død pris-feed).
+      - condition: state
+        entity_id: binary_sensor.roborock_elpris_block
+        state: "off"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # 2026-07-26 (user-spec): auto-clean på pause (rod på gulvet) → spring
+      # den automatiske start over. Ryddes ved næste manuelle kørsel (Styrbar
+      # OP/app → roborock_auto_resume_on_manual) eller endnu et NED-tryk.
+      # Manuel start (Styrbar/app) er urørt — kun DENNE auto-start gates.
+      - condition: state
+        entity_id: input_boolean.roborock_auto_paused
+        state: "off"
+      # 2026-08-08: HA må ikke selv have en session i gang/hængende. Uden denne
+      # ville /15-backstoppen kunne genstarte en kørsel der fejlede undervejs
+      # (session_active hænger på — jf. 08-06c) hvert kvarter resten af dagen.
+      # Robot-klar-gaten nedenfor dækker den kørende robot; denne dækker halen.
+      - condition: state
+        entity_id: input_boolean.roborock_session_active
+        state: "off"
+      # 2026-07-28 (user-spec item 6) + 2026-08-08 (let stue-rengøring):
+      # der skal være MINDST ÉT udfald tilbage i denne Dormant-session, ellers
+      # er hele automationen en no-op (vigtigt nu hvor /15-backstoppen fyrer
+      # 4×/time). Selve VALGET mellem de to udfald ligger i `action:` — her
+      # spørges kun "er der noget at lave?".
+      #
+      # (a) HEL-HUS: mindst `roborock_auto_interval_aktiv_timer` VÆGTEDE
+      #     aktiv-timer opsparet siden sidste hel-hus-rengøring (2026-09-01).
+      #     Opsparingen nulstilles af `roborock_last_completed`, som er det
+      #     fælles anker for ALLE hel-hus-rengøringer — auto, Styrbar OG
+      #     app-startede (roborock_fremmed_clean_stamp) — så en manuel kørsel
+      #     udskyder næste auto med et helt interval. Segment-/spot-cleans
+      #     stempler bevidst ikke og udskyder derfor ikke.
+      #     Sensoren er væk (template.reload) → `default(false, true)` gør
+      #     gaten falsk = robotten starter ikke. Fejler bevidst LUKKET: en
+      #     uventet robot-start er værre end en udskudt rengøring.
+      # (b) LET STUE: killswitch on OG der er ikke allerede støvsuget DELVIST i
+      #     denne Dormant-session. Testen dækker BEGGE stempler, fordi tre
+      #     uafhængige veje rammer det samme segment 16 ("Living room"):
+      #       - `roborock_let_clean_at`   = vores egen lette stue-rengøring
+      #       - `roborock_segment_clean_at` = måltids-støvsugningen OG enhver
+      #         segment-/zone-clean brugeren selv starter i Roborock-app'en
+      #         (stemples af roborock_delvis_clean_mark siden 2026-08-08)
+      #     Uden segment-stemplet ville en app-startet stue-clean blive fulgt op
+      #     af vores lette tur få minutter senere — en regression indført samme
+      #     dag som vi holdt op med at bogføre app-segment-cleans som hel-hus.
+      #     Stemplerne læses via `timestamp`-ATTRIBUTTEN (as_timestamp på state
+      #     giver 2 t skew), og et urørt stempel står på dagens midnat (08-02c)
+      #     → tidsdel-testen skiller "aldrig sat" fra en ægte kørsel kl. 00:00.
+      - condition: template
+        value_template: >-
+          {% set hus = state_attr('sensor.roborock_aktive_timer_siden_rengoring',
+                                  'maa_starte') | default(false, true) %}
+          {% set ds = states.input_select.house_state.last_changed %}
+          {% set ns = namespace(delvis=false) %}
+          {% for e in ['input_datetime.roborock_let_clean_at',
+                       'input_datetime.roborock_segment_clean_at'] %}
+            {% set raw = states(e) %}
+            {% if raw not in ['unknown','unavailable','none','']
+                  and raw[11:] != '00:00:00' and ds is not none
+                  and (state_attr(e, 'timestamp') | float(0)) >= as_timestamp(ds) %}
+              {% set ns.delvis = true %}
+            {% endif %}
+          {% endfor %}
+          {{ hus or (is_state('input_boolean.roborock_let_stue_enabled', 'on')
+                     and not ns.delvis) }}
+      # 2026-07-18 (user-spec): max 1 rengøring pr. Dormant-SESSION — seneste
+      # completed må ikke ligge inde i den igangværende Dormant-periode.
+      # Overnats-Dormant krydser midnat → dags-gaten ovenfor alene ville
+      # tillade rengøring nr. 2 næste morgen uden at nogen har været hjemme.
+      # NB: house_state.last_changed resettes ved HA-restart (sessionen ser
+      # "ny" ud) — dør-gaten nedenfor backstopper netop det tilfælde.
+      # 2026-08-08: læses via `timestamp`-ATTRIBUTTEN, ikke
+      # `as_timestamp(states(...))` — sidstnævnte fortolker den naive streng som
+      # UTC og gav 2 timers skew (målt: state "11:43:54" → as_timestamp 13:43:54,
+      # attribut 11:43:54). Skewet gjorde gaten for konservativ: en rengøring der
+      # sluttede op til 2 t FØR Dormant begyndte talte som "denne session" og
+      # spærrede — nu også for den lette stue-rengøring, som derfor kunne miste
+      # sessioner. Den urørte-midnat-fælde (08-02c) er dækket af tidsdel-testen.
+      - condition: template
+        value_template: >-
+          {% set raw = states('input_datetime.roborock_last_completed') %}
+          {% set ds = states.input_select.house_state.last_changed %}
+          {{ raw in ['unknown','unavailable','none','']
+             or raw[11:] == '00:00:00' or ds is none
+             or (state_attr('input_datetime.roborock_last_completed',
+                            'timestamp') | float(0)) < as_timestamp(ds) }}
+      # 2026-07-18 (user-spec): ny rengøring kræver at hoveddøren har været
+      # åbnet SIDEN sidste completed — ingen har været inde = intet nyt snavs.
+      # Stemplet vedligeholdes af hoveddoer_stamp_altid (security.yaml, altid
+      # tændt — modsat push-automationen der er i AirBnB-lockdown-listen).
+      - condition: template
+        value_template: >-
+          {% set t = states('input_datetime.roborock_last_completed') %}
+          {{ t in ['unknown','unavailable','none','']
+             or (state_attr('input_datetime.hoveddoer_last_open', 'timestamp') | float(0))
+                > (state_attr('input_datetime.roborock_last_completed', 'timestamp') | float(0)) }}
+      # Robot klar: docket/charging, ingen fejl, batteri ≥ 30%
+      - condition: template
+        value_template: >-
+          {{ states('vacuum.s8_maxv_ultra') in ['docked', 'idle']
+             and states('sensor.s8_maxv_ultra_vacuum_error') in ['none', 'ok']
+             and states('sensor.s8_maxv_ultra_battery') | int(0) >= 30 }}
+      # Dagtimer kun (robottens egen DND er 22-08; vi strammer til 08-21)
+      - condition: time
+        after: "08:00:00"
+        before: "21:00:00"
+      # 2026-06-12: ALDRIG start hen over hovedet på nogen — samme occupancy-
+      # veto som dormant_schedule. Dormant kan sættes manuelt (app-tap) eller
+      # fejlagtigt mens nogen sidder stille hjemme (radar holder on uden
+      # transition → 'Skift til Active' fyrer ikke). I dag: manuel Dormant
+      # 11:10 med stue-occupancy on → robot startede mens Parent B arbejdede
+      # hjemmefra. GPS-booleans med som ekstra bælte-og-seler.
+      # 2026-09-20: templaten stod inline her. Den skal nu også læses af
+      # godkendelses-handleren (roborock_dormant_godkend.yaml), og to kopier af
+      # et 25-linjers occupancy-template divergerer (fejlklasse #2) → flyttet
+      # ord for ord til binary_sensor.roborock_ingen_hjemme, som er det fælles
+      # anker. Er sensoren væk efter template.reload, er den ikke 'on' og
+      # gaten fejler LUKKET, præcis som inline-varianten gjorde (#9).
+      - condition: state
+        entity_id: binary_sensor.roborock_ingen_hjemme
+        state: "on"
+      # ---- Godkendelses-gaten (user-spec 2026-09-20) --------------------------
+      # Der spørges ikke igen så længe der står en ubesvaret forespørgsel — ellers
+      # ville /15-backstoppen sende en ny hvert kvarter. Forespørgslen lukkes af
+      # et svar, eller af roborock_godkend_ryd_ved_vaagen når huset vågner.
+      - condition: template
+        value_template: >-
+          {{ states('input_text.roborock_godkend_pending')
+             in ['off', 'unknown', 'unavailable', ''] }}
+      # Et nej gælder denne Dormant-session. Samme mønster som husets øvrige
+      # "max 1 pr. session"-gates: stemplet holdes op mod house_state's flanke.
+      # Ukendt/tomt stempel = aldrig afvist → gaten er åben.
+      - condition: template
+        value_template: >-
+          {% set a = states('input_text.roborock_godkend_afvist_at') %}
+          {% set ds = states.input_select.house_state.last_changed %}
+          {{ a in ['unknown', 'unavailable', '', '0', 'off'] or ds is none
+             or (a | float(0)) < as_timestamp(ds) }}
+    action:
+      - variables:
+          # Ét-udtryks-template → HA native-typer det til en ægte bool. (En
+          # `{% if %}`-blok ville give en STRENG, og "False" er truthy — jf.
+          # 07-29e.) Samme udtryk som i "er der noget at lave?"-conditionen
+          # ovenfor; VALGET mellem de to udfald hører hjemme her.
+          hus_ok: >-
+            {{ state_attr('sensor.roborock_aktive_timer_siden_rengoring',
+                          'maa_starte') | default(false, true) }}
+          kids: "{{ is_state('binary_sensor.kids_home', 'on') }}"
+          last_full: "{{ states('input_datetime.roborock_last_full_completed') }}"
+          days_since_full: >-
+            {% if last_full in ['unknown','unavailable','none',''] %}99
+            {% else %}{{ (now().date() - as_datetime(last_full).date()).days }}{% endif %}
+          do_full: "{{ kids or (days_since_full | int(99)) >= 3 }}"
+          # 2026-09-01 (user-spec): user kan tvinge ét bestemt udfald i stedet
+          # for kadencen. Ét-udtryks-template med .get() — en {% if %}-blok
+          # ville give en streng med indrykning og linjeskift i, og et
+          # service-navn tåler ikke whitespace. Ukendt/unavailable option
+          # falder tilbage på kadencen, så en tabt .storage ikke ændrer adfærd.
+          valg: "{{ states('input_select.roborock_auto_dormant_handling') }}"
+          start_script: >-
+            {{ {'Fuld rengøring': 'script.roborock_start_full',
+                'Grundig rengøring': 'script.roborock_start_max',
+                'Kun støvsugning': 'script.roborock_start_quick'}
+               .get(valg, 'script.roborock_start_full' if do_full
+                          else 'script.roborock_start_quick') }}
+          grund: >-
+            {{ valg if valg in ['Fuld rengøring', 'Grundig rengøring',
+                                'Kun støvsugning']
+               else ('kadence: børn hjemme' if kids
+                     else 'kadence: ' ~ days_since_full ~ ' dage siden sidste full') }}
+      # 2026-09-20 (user-spec): BEGGE udfald skal godkendes fra telefonen —
+      # "alle roborock dormant kørsler". Valget af hvad der skal køre ligger
+      # stadig her; det er kun UDFØRELSEN der flyttes bag et ja. Planen bæres
+      # med i forespørgslen, så et ja udfører det beskeden lovede og ikke en
+      # plan der er regnet forfra (fejlklasse #27).
+      - variables:
+          # MELLEMDAG: intervallet er ikke nået. Conditionen ovenfor har
+          # allerede slået fast at killswitchen er on OG at der ikke er kørt en
+          # let rengøring i denne Dormant-session — ellers var vi aldrig nået
+          # hertil. Derfor er "ikke hus_ok" per definition den lette stue-tur.
+          valgt_script: >-
+            {{ start_script if hus_ok else 'script.roborock_start_let_stue' }}
+          # Teksten afledes af det VALGTE SCRIPT, ikke af kadence-variablen
+          # `do_full`: tvinger user "Kun støvsugning" i
+          # input_select.roborock_auto_dormant_handling, kan do_full stadig være
+          # sand, og beskeden ville love en mop-tur der ikke kommer. Beskeden
+          # skal love det der kører (fejlklasse #2).
+          valgt_plan: >-
+            {{ {'script.roborock_start_full': 'Hele huset — støvsug + mop',
+                'script.roborock_start_max': 'Hele huset — grundig (kraftigst)',
+                'script.roborock_start_quick': 'Hele huset — kun støvsug',
+                'script.roborock_start_let_stue': 'Let tur i stuen — kun støvsug'}
+               .get(valgt_script, 'Hele huset') }}{{ ' · ' ~ grund if hus_ok else '' }}
+      - choose:
+          # Kill-switchen slået FRA → adfærd som før 2026-09-20: start direkte.
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.roborock_godkendelse_enabled
+                state: "off"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Roborock"
+                  message: >-
+                    Dormant-start (godkendelse slået fra) efter
+                    {{ states('sensor.roborock_aktive_timer_siden_rengoring') }}
+                    vægtede aktiv-timer → {{ valgt_script }} ({{ grund }}).
+              - service: "{{ valgt_script }}"
+        default:
+          - service: script.roborock_godkend_spoerg
+            data:
+              start_script: "{{ valgt_script }}"
+              plan: "{{ valgt_plan }}"
+
+  # ---------------------------------------------------------------------------
+  # 1c) Menneske-startet session → stempl manuel-start (ét sted, tre arvinger)
+  # ---------------------------------------------------------------------------
+  - id: roborock_manuel_session_stamp
+    alias: "Roborock: menneske-startet session → stempl manuel-start"
+    description: >
+      2026-09-09c (B116). Kun script.roborock_start_* (Styrbar) og
+      script.airbnb_checkout stemplede roborock_manual_start_at. Starter man
+      rengøringen i Roborock-app'en og tænder session_active i HA, står stemplet
+      timer eller dage gammelt — og så klassificerer ALLE tre interrupt-veje
+      (dormant, hjemkomst, airbnb_block_auto_clean) kørslen som auto-startet =
+      fritvildt. Målt 2026-09-05: en check-ud-rengøring blev docket 18,5 min inde
+      (18,0 m² af huset) fordi stemplet var 14 timer gammelt.
+
+      Diskriminatoren er husets kanoniske (fejlklasse #3): et menneske sætter
+      flaget med en context der bærer user_id, en automation gør ikke. Målt over
+      45 dage: 7 tændinger af session_active — 3 med user_id (menneske), 4 uden
+      (auto). Stemplet sættes til FLANKENS eget tidspunkt, ikke now(), så
+      guardenes 60 s-vindue måler det de tror de måler.
+
+      Fixet sidder her og ikke i de tre guards, fordi tre kopier af den samme
+      regel divergerer (fejlklasse #2) — guardene rører vi ikke.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.roborock_session_active
+        from: "off"
+        to: "on"
+    condition:
+      - condition: template
+        value_template: >-
+          {% set ts = (trigger.to_state | default(none)) if trigger is defined else none %}
+          {{ ts is not none and ts.context.user_id is not none }}
+    action:
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_manual_start_at}
+        data:
+          datetime: >-
+            {% set ts = (trigger.to_state | default(none)) if trigger is defined else none %}
+            {{ ((ts.last_changed | as_local) if ts is not none else now())
+               .strftime('%Y-%m-%d %H:%M:%S') }}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: >-
+            Sessionen blev tændt af et menneske (app/UI) — stemplet som manuel
+            start, så hverken Dormant-, hjemkomst- eller AirBnB-guarden docker
+            den midt i huset.
+
+  # ---------------------------------------------------------------------------
+  # 2) Dormant slår fra under kørsel → øjeblikkelig pause + dock
+  # ---------------------------------------------------------------------------
+  - id: roborock_dormant_interrupt
+    alias: "Roborock: Dormant af under kørsel → pause + dock"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.house_state
+        from: "Dormant"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roborock_session_active
+        state: "on"
+      # 2026-09-09c (B116): FLANKEN BÆRER IKKE INTENTIONEN (fejlklasse #4).
+      # Designintentionen er hjemkomst — "nogen kom ind, stop robotten" — men et
+      # house_mode-skift TVINGER også house_state → Active, og på trigger-niveau
+      # er de to flanker identiske. Konteksten afslører ejeren. Målt 2026-09-05:
+      #   house_mode  → AirBnB 08:30:35.72  id=01A0704305C872F613971E05615312F4
+      #   house_state → Active 08:30:35.78  parent=01A0704305C872F613971E05615312F4
+      # altså er state-skiftet BARN af mode-skiftet. ⚠️ De to context-ID'er er
+      # IKKE ens — de deler kun ULID'ens millisekund-præfiks (`01A0704305`), så
+      # en test på `context.id` ser ud til at virke hvis man sammenligner
+      # afkortede ID'er og er i virkeligheden en no-op. Sammenlign FULDE id'er,
+      # og test parent_id — det er den der bærer slægtskabet.
+      # Tabet ved at springe over er dækket: en ægte hjemkomst stoppes allerede
+      # af GPS-vejen 2b) MENS huset stadig er Dormant, altså før denne flanke.
+      - condition: template
+        value_template: >-
+          {% set ts = (trigger.to_state | default(none)) if trigger is defined else none %}
+          {% set mode_ctx = states.input_select.house_mode.context.id | default('') %}
+          {{ ts is none
+             or (ts.context.parent_id != mode_ctx and ts.context.id != mode_ctx) }}
+      # Springer over hvis sessionen blev manuelt startet (Styrbar OP) inden for
+      # 60 s — roborock_manual_start_at sættes FØR session_active tændes, så
+      # diff < 60 = manuel start; stor diff = auto-dormant-start.
+      - condition: template
+        value_template: >-
+          {{ (as_timestamp(states.input_boolean.roborock_session_active.last_changed)
+              - (state_attr('input_datetime.roborock_manual_start_at', 'timestamp') | float(0)))
+             > 60 }}
+    action:
+      # roborock_stop_dock rydder session-flag FØR pause/dock, så
+      # completion-automationen ikke fejl-stempler den afbrudte session.
+      - service: script.roborock_stop_dock
+
+  # ---------------------------------------------------------------------------
+  # 2b) Telefonen rammer hjemme-zonen → stop robotten MED DET SAMME
+  # ---------------------------------------------------------------------------
+  # User-spec 2026-08-05 (item 6): "når vi kommer hen til hjemmezonen udefra må
+  # du gerne sætte huset på active (hvis det var dormant) og stoppe støvsugeren
+  # og køre den hjem på plads hvis den var i gang via dormant automations."
+  #
+  # HVORFOR EN EGEN VEJ, når 2) ovenfor allerede gør det ved Dormant→Active:
+  # kæden dertil er tracker → presence_*_arrive (`for: minutes: 2` + gps_fresh)
+  # → <person>_home → house_state_to_active → 2). Debouncen er bevidst og
+  # bevares — men den koster ~2 minutter hvor robotten stadig kører rundt mens
+  # man låser sig ind. Denne gren springer KUN robot-stoppet foran; huset skifter
+  # til Active ad den normale, fuldt gatede vej (dvale-lås, robot-veto osv.).
+  #
+  # RÆKKEFØLGEN ER RACE-FRI, ikke tilfældig: roborock_stop_dock rydder
+  # `session_active` som ALLERFØRSTE trin, så når house_state senere forlader
+  # Dormant, er 2)'s condition allerede falsk → den no-op'er. Ingen dobbelt
+  # pause/return_to_base.
+  #
+  # "I gang via dormant automations" er operationaliseret som `house_state ==
+  # Dormant` + aktiv session + session_active.last_changed - manual_start_at > 60 s
+  # (= auto-startet, ikke Styrbar OP). Manuel start afbrydes IKKE ved hjemkomst.
+  - id: roborock_hjemkomst_interrupt
+    alias: "Roborock: hjemkomst (GPS) under kørsel → pause + dock"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: device_tracker.phone_a
+        to: "home"
+      - platform: state
+        entity_id: device_tracker.phone_b
+        to: "home"
+    condition:
+      # Kun ægte ankomst udefra — ikke et HA-restart hvor entiteten tilføjes
+      # (from_state is none) og heller ikke en attribut-opdatering der lander
+      # på samme state.
+      - condition: template
+        value_template: >-
+          {{ trigger.from_state is not none
+             and trigger.from_state.state != 'home' }}
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Dormant"
+      - condition: state
+        entity_id: input_boolean.roborock_session_active
+        state: "on"
+      # Springer over ved manuel start (samme logik som dormant_interrupt ovenfor).
+      - condition: template
+        value_template: >-
+          {{ (as_timestamp(states.input_boolean.roborock_session_active.last_changed)
+              - (state_attr('input_datetime.roborock_manual_start_at', 'timestamp') | float(0)))
+             > 60 }}
+      # Gæstens robot-kørsler er ikke vores at afbryde på familiens GPS.
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+    action:
+      - service: script.roborock_stop_dock
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: >-
+            Hjemkomst registreret på GPS ({{ trigger.entity_id }}) mens huset var
+            Dormant — robotten sendt på plads før nogen når ind ad døren.
+
+  # ---------------------------------------------------------------------------
+  # 3) Robotten færdig af sig selv → stamp completed
+  # ---------------------------------------------------------------------------
+  - id: roborock_session_completed
+    alias: "Roborock: session gennemført → stamp completed"
+    mode: single
+    trigger:
+      # Når robotten selv afslutter, går status cleaning → returning →
+      # charging/docked. Interrupt-flowet har ALLEREDE clearet session-flag,
+      # så condition session_active=on betyder "robotten blev selv færdig".
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_status
+        to: "returning"
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_status
+        to: "charging"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roborock_session_active
+        state: "on"
+      # Ikke pause/fejl — kun ægte afslutning
+      - condition: template
+        value_template: >-
+          {{ states('sensor.s8_maxv_ultra_vacuum_error') in ['none', 'ok'] }}
+    action:
+      - variables:
+          was_full: "{{ is_state('input_select.roborock_session_type', 'full') }}"
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_last_completed}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - if:
+          - condition: template
+            value_template: "{{ was_full }}"
+        then:
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.roborock_last_full_completed}
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.roborock_session_active}
+      - service: input_select.select_option
+        target: {entity_id: input_select.roborock_session_type}
+        data: {option: none}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: >-
+            Session gennemført ({{ 'FULL' if was_full else 'QUICK' }}) —
+            stamped completed for i dag.
+
+  # ---------------------------------------------------------------------------
+  # 3a2) DELVIS rengøring startet udefra → markér den som delvis
+  # ---------------------------------------------------------------------------
+  # 2026-08-08: `roborock_segment_clean_at` blev hidtil KUN skrevet af vores egne
+  # scripts, så en segment-/zone-clean startet i Roborock-app'en blev stemplet af
+  # roborock_fremmed_clean_stamp som en HEL-HUS-rengøring. Målt to gange:
+  # 08-05 17:10 (segment) → last_completed 17:16:27, og 08-07 11:33 (segment,
+  # 6,0 m² / 8,75 min) → last_completed 11:43:54 med logbook-linjen "næste
+  # auto-rengøring udskydes 3 dage". Effekten er at intervallet i praksis aldrig
+  # nås: `dage_siden_rengoring` stod på 1 mod et interval på 3.
+  #
+  # `sensor.s8_maxv_ultra_status` skelner varianterne (`segment_cleaning`,
+  # `zoned_cleaning`, …) mens `vacuum.s8_maxv_ultra` kollapser dem alle til
+  # `cleaning` — derfor status-sensoren. En HEL-HUS-kørsel melder `cleaning` og
+  # rammer altså IKKE denne automation → den tælles fortsat korrekt med.
+  - id: roborock_delvis_clean_mark
+    alias: "Roborock: delvis rengøring (segment/zone/spot) markeres som delvis"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_status
+        to:
+          - segment_cleaning
+          - zoned_cleaning
+          - spot_cleaning
+          - segment_mopping
+          - zoned_mopping
+          - segment_clean_mop_cleaning
+          - segment_clean_mop_mopping
+          - zoned_clean_mop_cleaning
+          - zoned_clean_mop_mopping
+    action:
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_segment_clean_at}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ---------------------------------------------------------------------------
+  # 3b) Rengøring HA ikke startede (Roborock-app / robottens egen tidsplan)
+  # ---------------------------------------------------------------------------
+  - id: roborock_fremmed_clean_stamp
+    alias: "Roborock: app-startet rengøring tæller også som rengøring"
+    description: >
+      2026-07-28 (user-spec item 6: "en manuel rengøring udskyder også næste
+      auto-clean"). Starter man en rengøring i Roborock-app'en, er
+      roborock_session_active off → roborock_session_completed stempler ikke,
+      og interval-gaten ville tro huset var urengjort. Denne stempler derfor
+      last_completed for rengøringer HA ikke selv startede.
+
+      Springer VORES EGNE delvis-rengøringer over: måltids-støvsugningen tager
+      kun Living room (segment 16) og må ikke udskyde hele husets rengøring i
+      flere dage. Den genkendes på roborock_segment_clean_at-stemplet.
+
+      Stempler kun last_completed — ikke last_full_completed: vi ved ikke om
+      app-kørslen moppede, så FULL/QUICK-kadencen beholder sit eget anker og
+      vælger i tvivlstilfælde det grundige.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_status
+        to: "charging"
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_status
+        to: "returning"
+    condition:
+      # HA startede den ikke (ellers ejer roborock_session_completed stemplet).
+      - condition: state
+        entity_id: input_boolean.roborock_session_active
+        state: "off"
+      - condition: template
+        value_template: >-
+          {{ states('sensor.s8_maxv_ultra_vacuum_error') in ['none', 'ok'] }}
+      # Robotten skal have en frisk, gyldig slut-tid (unavailable/unknown må
+      # ikke blive et stempel — fejlklasse #9).
+      - condition: template
+        value_template: >-
+          {% set e = states('sensor.s8_maxv_ultra_last_clean_end') %}
+          {{ e not in ['unknown', 'unavailable', 'none', '']
+             and (as_timestamp(now()) - as_timestamp(e, 0)) < 1800 }}
+      # Ikke en DELVIS rengøring: ligger robottens egen start-tid indenfor 5 min
+      # af segment-stemplet, var kørslen en segment-/zone-/spot-clean.
+      # Vinduet er SYMMETRISK (2026-08-08): stemplet skrives før kommandoen når
+      # VI starter (robottens start ligger da et par sekunder efter), men EFTER
+      # robottens egen start når kørslen kom fra app'en — Roborock-statussen
+      # hentes fra deres sky og lander 18-155 s for sent (målt n=30 over 21
+      # dage). Den gamle ensidede test `0 <= diff < 300` fangede derfor kun
+      # vores egne og lod app-startede segment-cleans udskyde hele husets
+      # rengøring et helt aktiv-timer-interval.
+      - condition: template
+        value_template: >-
+          {% set seg = state_attr('input_datetime.roborock_segment_clean_at', 'timestamp') %}
+          {% set b = states('sensor.s8_maxv_ultra_last_clean_begin') %}
+          {% if seg is none or (seg | float(0)) <= 0
+                or b in ['unknown', 'unavailable', 'none', ''] %}
+            true
+          {% else %}
+            {{ ((as_timestamp(b, 0) - (seg | float(0))) | abs) >= 300 }}
+          {% endif %}
+      # Kun ét stempel pr. rengøring: slut-tiden skal være nyere end stemplet.
+      - condition: template
+        value_template: >-
+          {% set t = state_attr('input_datetime.roborock_last_completed', 'timestamp') %}
+          {{ t is none or (t | float(0)) <= 0
+             or as_timestamp(states('sensor.s8_maxv_ultra_last_clean_end'), 0)
+                > (t | float(0)) }}
+    action:
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_last_completed}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: >-
+            Rengøring startet udenfor HA (app/tidsplan) registreret. Siden
+            2026-09-23 nulstiller kun en FULD (sug+mop) HA-session de opsparede
+            aktiv-timer; denne kørsel trækker
+            {{ states('input_number.roborock_stoevsug_reduktion_pct') | int(20) }} %
+            fra (roborock_aktiv_timer_delvis_reduktion).
+
+  # ---------------------------------------------------------------------------
+  # 4) Manuel styring — ledig Styrbar (ex-depot): TOP=quick, BUND=full toggle
+  # ---------------------------------------------------------------------------
+  - id: roborock_manual_buttons
+    alias: "Roborock: Styrbar styring (op/ned kort + lang)"
+    description: >
+      Ex-depot Styrbar (IEEE 99:a8:bb:14:4e:71:ce:67) — user-spec 2026-06-14,
+      NED omlagt 2026-07-25, NED-idle-pause tilføjet 2026-07-26, OP gjort
+      KONFIGURERBAR 2026-08-24:
+        KORT OP  (on)              = input_select.roborock_styrbar_kort_op
+        LANG OP  (move_with_on_off) = input_select.roborock_styrbar_lang_op
+        KORT NED (off)             = se NED nedenfor
+        LANG NED (move)            = se NED nedenfor
+      De to OP-handlinger (og hvilke rum de rammer) sættes på Støvsug →
+      Fjernbetjening; al logik bor i script.roborock_styrbar_udfoer
+      (packages/roborock_styrbar.yaml). Skriv ALDRIG en handling ind her igen —
+      så divergerer knappen fra det dashboardet påstår (fejlklasse #2).
+      NED (begge tryk) er kontekst-afhængigt (user-spec 2026-07-26):
+        · Robotten KØRER (cleaning/returning/paused) → STOP + retur til dock
+          (tæl IKKE) — uændret.
+        · Robotten STÅR STILLE → TOGGLE auto-clean-pause: 1. tryk sætter de
+          automatiske Dormant-cleans på pause ("rod på gulvet"), 2. tryk
+          ophæver igen. På-pause ryddes også automatisk ved næste manuelle
+          kørsel (denne Styrbars OP-knap eller Roborock-app'en) via
+          roborock_auto_resume_on_manual. Push ved både pause og genoptag (nid
+          roborock).
+      roborock_wrap_up (kør færdig → tæl som completed) er ikke bundet til en
+      knap, men findes stadig som script. Hold-release-kommandoer (stop /
+      stop_with_on_off) ignoreres. Skift device_ieee her hvis en anden
+      fjernbetjening skal bruges.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "99:a8:bb:14:4e:71:ce:67"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.event.data.command
+             in ['on', 'off', 'move_with_on_off', 'move'] }}
+    action:
+      - variables:
+          cmd: "{{ trigger.event.data.command }}"
+          running: "{{ is_state('input_boolean.roborock_session_active', 'on') }}"
+          cur_type: "{{ states('input_select.roborock_session_type') }}"
+          # Faktisk robot-aktivitet (ikke kun HA-startet session) — app-startede
+          # cleans har session_active=off men robotten kører reelt. Bruges af
+          # NED til at skelne "kører → stop+dock" fra "står stille → toggle pause".
+          robot_running: >-
+            {{ is_state('binary_sensor.s8_maxv_ultra_cleaning', 'on')
+               or states('vacuum.s8_maxv_ultra') in ['cleaning', 'returning', 'paused'] }}
+      # 2026-07-08: stempl MANUEL intent → AirBnB-auto-clean-guarden lader
+      # Styrbar-startede cleans køre (kun automatiske cleans stoppes i AirBnB).
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_manual_start_at}
+        data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
+      - choose:
+          # BEGGE OP-tryk → den handling brugeren har valgt på Støvsug-siden.
+          # Tragten kender rum-valget; her må der ikke stå en handling.
+          - conditions: "{{ cmd == 'on' }}"
+            sequence:
+              - service: script.roborock_styrbar_udfoer
+                data: {tryk: kort_op}
+          - conditions: "{{ cmd == 'move_with_on_off' }}"
+            sequence:
+              - service: script.roborock_styrbar_udfoer
+                data: {tryk: lang_op}
+          # BEGGE NED (kort off + lang move) — kontekst-afhængigt (2026-07-26):
+          #   robotten kører → STOP + retur til dock (tæl IKKE, uændret)
+          #   robotten står stille → TOGGLE auto-clean-pause ("rod på gulvet")
+          - conditions: "{{ cmd in ['off', 'move'] }}"
+            sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ robot_running }}"
+                then:
+                  - service: script.roborock_stop_dock
+                else:
+                  # Robotten står stille → toggle pause på de auto-cleans.
+                  - if:
+                      - condition: state
+                        entity_id: input_boolean.roborock_auto_paused
+                        state: "off"
+                    then:
+                      - service: input_boolean.turn_on
+                        target: {entity_id: input_boolean.roborock_auto_paused}
+                      - service: logbook.log
+                        data:
+                          name: "Roborock"
+                          message: >-
+                            Auto-clean SAT PÅ PAUSE (Styrbar NED, robotten stod
+                            stille) — venter på manuel kørsel (Styrbar OP/app)
+                            eller endnu et NED-tryk.
+                      - service: script.push_notify
+                        data:
+                          notif_id: roborock
+                          title: "⏸️ Auto-støvsugning på pause"
+                          message: >-
+                            De automatiske rengøringer er sat på pause (rod på
+                            gulvet). Auto starter igen når du kører robotten
+                            manuelt næste gang — eller tryk NED igen for at
+                            ophæve.
+                    else:
+                      - service: input_boolean.turn_off
+                        target: {entity_id: input_boolean.roborock_auto_paused}
+                      - service: logbook.log
+                        data:
+                          name: "Roborock"
+                          message: >-
+                            Auto-clean GENOPTAGET (Styrbar NED-toggle mens
+                            robotten stod stille).
+                      - service: script.push_notify
+                        data:
+                          notif_id: roborock
+                          title: "▶️ Auto-støvsugning genoptaget"
+                          message: >-
+                            Pausen er ophævet — de automatiske Dormant-cleans
+                            kører igen som normalt.
+
+  # ---------------------------------------------------------------------------
+  # 5) Manuel kørsel mens auto er på pause → genoptag auto (user-spec 2026-07-26)
+  # ---------------------------------------------------------------------------
+  - id: roborock_auto_resume_on_manual
+    alias: "Roborock: manuel kørsel ophæver auto-pause"
+    description: >
+      Når auto-clean er sat på pause (roborock_auto_paused on, sat via Styrbar
+      NED mens robotten stod stille) og brugeren SELV kører robotten næste gang
+      — Styrbar OP ELLER Roborock-app'en — så starter robotten en clean →
+      cleaning-sensoren går on → vi ophæver pausen, så de automatiske Dormant-
+      cleans kører igen bagefter. Den automatiske Dormant-start er selv gated på
+      pausen, så en clean-start MENS pausen er aktiv er PR. DEFINITION manuel.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.s8_maxv_ultra_cleaning
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roborock_auto_paused
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.roborock_auto_paused}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: >-
+            Auto-clean GENOPTAGET — manuel kørsel registreret (robotten begyndte
+            at rengøre mens auto var på pause).
+      - service: script.push_notify
+        data:
+          notif_id: roborock
+          title: "▶️ Auto-støvsugning genoptaget"
+          message: >-
+            Du kørte robotten manuelt — pausen er ophævet, og de automatiske
+            Dormant-cleans kører igen som normalt bagefter.
+
+# =============================================================================
+# Robot-lys-politik (2026-06-23, user-spec) — ÉN sandhed bag den nye regel
+# =============================================================================
+# Politik: når huset er ACTIVE må robottens egen motion (radar/PIR ser robotten)
+# gerne tænde bevægelses-lys — kun EARLY-DETECT spærres (bad-approach; se gaten
+# i presence_badevaerelse.yaml). Når huset er DORMANT må robotten IKKE tænde lys.
+#
+# Dette ene binary_sensor er sandheden:
+#   ON  = robot kører (cleaning/returning) OG huset er Dormant
+#       = bevægelses-lys skal holdes tilbage.
+#   OFF = ellers (inkl. ALT mens huset er Active).
+#
+# Brugt af alle presence/stadie on-gates via
+# `{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}` (fail-OPEN:
+# er sensoren unavailable tænder lyset alligevel). Dormant-husets centrale wake-
+# gate (house_state_to_active + last_physical_activity) er robot-filtreret SEPARAT,
+# så robotten heller ikke kan vække huset til Active i første omgang. Robotten
+# kører i praksis kun mens huset er Dormant (roborock_dormant_interrupt docker
+# den når huset bliver Active) — "returning"-hjemturen er det korte Active-vindue.
+# =============================================================================
+template:
+  - binary_sensor:
+      - name: "Roborock blokerer lys"
+        unique_id: roborock_blokerer_lys
+        icon: mdi:robot-vacuum-alert
+        state: >
+          {{ states('vacuum.s8_maxv_ultra') in ['cleaning', 'returning']
+             and is_state('input_select.house_state', 'Dormant') }}
+
+      # "For dyrt til at starte den daglige auto-clean lige nu." Gater KUN den
+      # automatiske Dormant-start (roborock_dormant_start); manuel start (Styrbar/
+      # app/scripts) er urørt. Samme ratio + fail-safe som luksus_lys_elpris_block:
+      # dør pris-feeden (unavailable) → false → robotten cleaner normalt (bliver
+      # aldrig "stuck dirty" pga. en død Nord Pool-feed). name-slug = unique_id.
+      - name: "Roborock elpris block"
+        unique_id: roborock_elpris_block
+        icon: mdi:cash-lock
+        state: >-
+          {% set k = states('input_number.roborock_elpris_aggressivitet') | float(0) %}
+          {% set p = states('sensor.elpris_spot_aktuel') | float(-999) %}
+          {% set avg = states('sensor.elspot_30d_gns') | float(0) %}
+          {% if k <= 0 or p < -100 or avg <= 0 %}
+            false
+          {% else %}
+            {% set x = [[(p - avg) / avg, 0] | max, 1] | min %}
+            {{ x > (1 - k / 100) }}
+          {% endif %}
+        attributes:
+          spot_kr_kwh: "{{ states('sensor.elpris_spot_aktuel') }}"
+          gns_30d_kr_kwh: "{{ states('sensor.elspot_30d_gns') }}"
+          ratio_over_gns: >-
+            {% set p = states('sensor.elpris_spot_aktuel') | float(-999) %}
+            {% set avg = states('sensor.elspot_30d_gns') | float(0) %}
+            {% if p < -100 or avg <= 0 %}n/a
+            {% else %}{{ ([[(p - avg) / avg, 0] | max, 1] | min) | round(2) }}{% endif %}
+          taerskel: >-
+            {% set k = states('input_number.roborock_elpris_aggressivitet') | float(0) %}
+            {{ (1 - k / 100) | round(2) if k > 0 else 'off' }}
+
+      # 2026-08-05 (user-spec item 9): "måltids-støvsugning skal kun foregå hvis
+      # støvsugeren slet ikke har været igangsat (på den ene eller anden måde),
+      # den dag." ÉT anker for "er robotten sat i gang i dag?" — uanset hvem der
+      # gjorde det (HA-auto, Styrbar, Roborock-app, robottens egen tidsplan,
+      # knappen på robotten). Robottens EGEN last_clean_begin er den ærlige
+      # primær-kilde (den kender ikke afsenderen); vores tre HA-stempler er
+      # fallback, så et sensor-udfald ikke gør gaten blind.
+      # ⚠️ FÆLDE: et URØRT input_datetime med has_date står på DAGENS midnat
+      # (CLAUDE.md permanent faktum) → uden tids-guarden ville en aldrig-sat
+      # helper melde "startet i dag" hver eneste dag og permanent dræbe
+      # måltids-støvsugningen. Derfor kræves et klokkeslæt != 00:00:00.
+      # Retning: ukendt/unavailable på ALLE fire kilder → false (= "ikke
+      # startet") så featuren fejler ÅBENT; en tavs feature er dyrere at
+      # opdage end en ekstra støvsugning.
+      - name: "Roborock startet i dag"
+        unique_id: roborock_startet_i_dag
+        icon: mdi:robot-vacuum-variant
+        state: >-
+          {% set ns = namespace(hit=false) %}
+          {% set b = states('sensor.s8_maxv_ultra_last_clean_begin') %}
+          {% if b not in ['unknown', 'unavailable', 'none', ''] %}
+            {% if (b | as_datetime | as_local).date() == now().date() %}
+              {% set ns.hit = true %}
+            {% endif %}
+          {% endif %}
+          {% for e in ['input_datetime.roborock_last_completed',
+                       'input_datetime.roborock_manual_start_at',
+                       'input_datetime.roborock_segment_clean_at'] %}
+            {% set v = states(e) %}
+            {% if v not in ['unknown', 'unavailable', 'none', '']
+                  and v[11:] != '00:00:00' and v[:10] == now().strftime('%Y-%m-%d') %}
+              {% set ns.hit = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.hit }}
+        attributes:
+          robot_last_begin: "{{ states('sensor.s8_maxv_ultra_last_clean_begin') }}"
+          ha_last_completed: "{{ states('input_datetime.roborock_last_completed') }}"
+          ha_manual_start: "{{ states('input_datetime.roborock_manual_start_at') }}"
+          ha_segment_clean: "{{ states('input_datetime.roborock_segment_clean_at') }}"
+
+  - sensor:
+      # 2026-07-28 (item 6): ÉT anker for "hvor længe siden sidste hel-hus-
+      # rengøring". 2026-09-01: sensoren er nu KUN informativ (dashboards +
+      # varsel-tekst). Selve gaten flyttede til
+      # sensor.roborock_aktive_timer_siden_rengoring, som måler vægtede
+      # aktiv-timer i stedet for kalenderdøgn.
+      # Kilden er input_datetime.roborock_last_completed, som stemples ved
+      # gennemført HEL-HUS-rengøring uanset hvem der startede den (auto, Styrbar,
+      # app — sidstnævnte via roborock_fremmed_clean_stamp). Måltids-spot-cleans
+      # af Living room stemples BEVIDST ikke: en delvis rengøring må ikke udskyde
+      # hele husets. 99 = aldrig rengjort/ukendt (fail-safe → auto-clean tillades).
+      # NB: timestamp-attributten (ikke as_timestamp på strengen) — en naiv
+      # input_datetime-streng parses som UTC og giver 2 t skew (fejlklasse B67).
+      - name: "Roborock dage siden rengøring"
+        # NB: HA-slugify laver ø→o (ikke "oe") → entity_id bliver
+        # sensor.roborock_dage_siden_rengoring. unique_id beholdes som den blev
+        # registreret (en ændring ville give et _2-suffix).
+        unique_id: roborock_dage_siden_rengoering
+        unit_of_measurement: "dage"
+        icon: mdi:calendar-refresh
+        state: >-
+          {% set t = state_attr('input_datetime.roborock_last_completed', 'timestamp') %}
+          {% if t is none or (t | float(0)) <= 0 %}99
+          {% else %}{{ (now().date() - (t | float(0) | as_datetime | as_local).date()).days }}{% endif %}
+        attributes:
+          sidste_rengoering: >-
+            {% set t = state_attr('input_datetime.roborock_last_completed', 'timestamp') %}
+            {% if t is none or (t | float(0)) <= 0 %}aldrig
+            {% else %}{{ (t | float(0) | as_datetime | as_local).strftime('%a %d-%m %H:%M') }}{% endif %}
+          # 2026-09-01: `interval_dage` + `maa_starte` FJERNET herfra. Gaten
+          # måles ikke længere i døgn, og en efterladt maa_starte-attribut ville
+          # være et andet svar end det gaten faktisk bruger (fejlklasse #2/#3).
+          # Nyt anker: sensor.roborock_aktive_timer_siden_rengoring.
+          # Denne sensor er nu rent informativ ("hvornår blev her sidst gjort
+          # rent?") og bruges i dashboards.

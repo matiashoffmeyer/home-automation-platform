@@ -1,0 +1,223 @@
+# =============================================================================
+# Morgen-gardiner — åbn open-plan ved akkumuleret bevægelse (item 2)
+# =============================================================================
+# Helpers + sensorer: packages/morning_curtains.yaml
+# =============================================================================
+
+- id: morning_curtains_open_on_activity
+  alias: "Gardiner: Åbn open-plan om morgenen ved akkumuleret bevægelse"
+  description: >
+    2026-06-17 (item 2 user-spec): Åbn open-plan-gardinerne (stue syd/vest +
+    spisestue vest) når der har været akkumuleret bevægelse i open-plan-rummet
+    om morgenen (06-12) — uafhængigt af godnat/auto-godnat. Default 10 min
+    akkumuleret (sidste 30 min); slider input_number.morning_curtain_accum_minutes.
+    2026-06-19: ENESTE åbner af open-plan-gardiner om morgenen — godmorgen-auto-
+    detect åbner kun soveværelse-gardiner (ikke instant på open-plan længere).
+    Åbner kun hvis mindst ét gardin stadig er lukket (= no-op hvis allerede åbne).
+  mode: single
+  trigger:
+    # Akkumuleret tid krydser tærskel. 2026-08-05: gennem ankeret, så trigger og
+    # condition ikke kan divergere (fejlklasse #2) — ankeret flipper også `on`
+    # kl. 12:00, men tids-conditionen nedenfor lukker den vej.
+    - platform: state
+      entity_id: binary_sensor.open_plan_gardin_op_tilladt
+      from: "off"
+      to: "on"
+    # Catch "allerede akkumuleret før 06:00" (fx vågnet 05:55): re-tjek ved
+    # vindue-åbning så et tidligt false→true-edge ikke går tabt.
+    - platform: time
+      at: "06:00:00"
+    # 2026-06-24 BACKSTOP (task 4): template-triggeren fyrer kun på false→true-
+    # EDGE. Står akkumuleringen allerede over tærsklen når automationen loader
+    # (HA-restart efter 06:00, eller history_stats genberegner 0→høj uden ren
+    # edge), går åbningen tabt for den dag (set 2026-06-24: last_triggered=None
+    # selvom betingelserne var opfyldt). Re-tjek hvert 15. min i vinduet —
+    # condition-gated, så det er no-op så snart gardinerne er åbne.
+    - platform: time_pattern
+      minutes: "/15"
+  condition:
+    - condition: time
+      after: "06:00:00"
+      before: "12:00:00"
+    # 2026-06-30 (user undtagelse 3): INGEN auto-gardin-OP i AirBnB.
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 🛋️ 2026-08-14 (user-incident 06:05:23): sover der en gæst i open-plan, er
+    # akkumulerings-ankeret hendes EGEN vending på sofaen — ikke "familien er
+    # vågnet" (fejlklasse #20: en akkumulator over en latchende sensor måler
+    # tid siden vinduets start). Motoren + dagslyset vækkede hende.
+    # Holdet ligger primært i sensor.gardiner_manual_hold, så ALLE åbnere arver
+    # det — men den læses med `| default([])`, så et template-udfald ville
+    # slippe præcis denne (daglige, 06-12) vej fri. Derfor eksplicit her også.
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    # Re-check akkumuleret bevægelse (template-trigger kan være kantet + time-trigger).
+    # 2026-08-05: gennem det fælles anker, så sommer-forsvaret ikke kan åbne
+    # gardinerne ad en anden vej med en anden regel (fejlklasse #2).
+    - condition: state
+      entity_id: binary_sensor.open_plan_gardin_op_tilladt
+      state: "on"
+    # Kun hvis MINDST ét open-plan-gardin (som IKKE er i manuel-ned-grace)
+    # endnu ikke er bekræftet OPPE — ellers no-op. Manuelt nedrullede gardiner
+    # springes over.
+    # 2026-06-24 FIX (task 4): tidligere krævede vi state == 'closed'. Disse
+    # Somfy RTS-gardiner er ENVEJS (ingen positions-feedback) → optimistic
+    # state. Efter en HA-restart står de 'unknown', og spisestue_vest deltager
+    # IKKE i nat-cyklussen (sættes derfor sjældent 'closed' i HA's model). Et
+    # `== closed`-krav sprang den derfor systematisk over (incident 2026-06-24:
+    # spisestue_vest stod 'unknown' siden restart 16:54 → morgen-åbning fyrede
+    # aldrig). Vi åbner nu så snart ÉT gardin IKKE er bekræftet 'open'
+    # (closed/unknown/unavailable) — at gen-sende OP til et allerede-åbent
+    # gardin er et harmløst no-op (motoren står i top).
+    - condition: template
+      value_template: >
+        {% from 'rosters.jinja' import open_plan_gardiner %}{{ open_plan_gardiner
+           | reject('in', state_attr('sensor.gardiner_manual_hold', 'held') | default([]))
+           | reject('is_state', 'open') | list | count > 0 }}
+  action:
+    - service: cover.open_cover
+      target:
+        # Spring gardiner over der er manuelt rullet ned indenfor grace-vinduet.
+        entity_id: >
+          {% from 'rosters.jinja' import open_plan_gardiner %}{{ open_plan_gardiner
+             | reject('in', state_attr('sensor.gardiner_manual_hold', 'held') | default([]))
+             | list }}
+    - service: logbook.log
+      data:
+        name: "Morgen-gardiner"
+        message: >
+          Open-plan-gardiner åbnet — {{ (states('sensor.open_plan_active_recent')
+          | float(0) * 60) | round(1) }} min akkumuleret bevægelse ≥
+          {{ states('input_number.morning_curtain_accum_minutes') }} min.
+
+- id: sovevaerelse_gardin_morgen_backstop
+  alias: "Gardiner: Åbn sove-gardin om morgenen når soveværelset er tomt"
+  description: >
+    2026-07-28 (item 7 user-spec: "åbner sove-gardinet automatisk om morgenen?
+    hvis ikke skal det åbne på open-plan-aktivitet + ingen sove-presence, med en
+    slider for hvor længe rummet skal være tomt").
+
+    HULLET (bekræftet i history 07-25→07-28): sove-gardinet havde KUN to
+    morgen-åbnere, og ingen af dem dækkede en almindelig hverdag hvor
+    morgen-beskyttelsen kører. godnat_auto_clear fyrer 06:00 og åbner gardinet
+    — men er betinget af `sovevaerelse_morgen_beskyttelse_aktiv == off`, og
+    beskyttelsesvinduet er 05:00–07:00. Man 07-27: godnat clearede 06:00:23 →
+    åbningen blev sprunget over, og INTET re-fyrede da beskyttelsen sluttede
+    07:00 (fejlklasse #4: flanke uden re-arm) → gardinet stod lukket til 08:40.
+    Den anden åbner (godmorgen_weekend_sovevaerelse_gardin, 09:00) er
+    weekend/ferie-only. Hverdage havde altså ingen backstop.
+
+    Åbner når (a) familien er vågnet — samme akkumulerede open-plan-bevægelse
+    som open-plan-gardinerne bruger (ét fælles anker, ikke et nyt magisk tal),
+    og (b) soveværelset har været tomt i mindst
+    `sovevaerelse_gardin_morgen_tom_minutter`.
+
+    2026-08-22: (b) er en DEBOUNCE, ikke et fraværs-bevis — sove-Apolloen kan
+    hverken holde et tomt rum stille (75 blip på en tom formiddag, længste ro
+    11,7 min) eller holde en sovende krop ON (17,1 min hul målt kl. 02:00).
+    Det der faktisk beskytter en der sover videre, er snoozen nedenfor +
+    open-plan-ankeret + manuel-ned-gracen. Kravet stod på 15 min = over det
+    målte loft, så backstoppen fyrede ALDRIG; se packages/morning_curtains.yaml.
+    /5-tick i vinduet er selve re-armen: så snart beskyttelsen slutter, eller
+    partneren har været ude af rummet længe nok, fyrer den.
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: time
+      after: "06:00:00"
+      before: "12:00:00"
+    # KUN HVERDAGE (2026-08-29, user-incident "utilgiveligt"). Backstoppen blev
+    # bygget fordi "Hverdage havde altså ingen backstop" — men den var gated på
+    # tid alene og kørte derfor ALLE dage, hvor den overhalede weekendens
+    # bevidste sleep-in med op til 3 timer. Lør 29/8 06:15:00 rullede den
+    # gardinet op over to sovende voksne: et barn i stuen 06:11 tændte
+    # open-plan-ankeret, og et 13,6-min hul i sove-occupancy (06:02→06:15)
+    # klarede tom-kravet. Occupancy kom retur 06:15:38 = 38 s EFTER motoren
+    # startede — det var dem der blev vækket.
+    # Weekend/ferie ejes af godmorgen_weekend_sovevaerelse_gardin kl. 09:00, og
+    # godnat_auto_clear har allerede præcis denne arbejdsdag-gate. Reglen stod
+    # altså i to af tre åbnere og manglede i den tredje (fejlklasse #1/#2).
+    - condition: state
+      entity_id: binary_sensor.arbejdsdag
+      state: "on"
+    # Samme AirBnB-undtagelse som open-plan-åbningen: INGEN auto-gardin-OP for
+    # en gæst (han kan ikke vide hvorfor gardinet kørte, og vi ved ikke om han
+    # ligger og sover videre i et rum radaren lige har tabt).
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # (a) Familien er vågnet: akkumuleret open-plan-bevægelse over samme tærskel
+    # som open-plan-gardinerne. Ét anker → de to åbninger kan ikke divergere
+    # (fejlklasse #2). 2026-08-05: læser nu selve anker-sensoren i stedet for en
+    # kopi af udtrykket. Automationen er selv gated 06-12, så ankerets
+    # "efter 12:00 = frit"-gren kan aldrig nås herfra.
+    - condition: state
+      entity_id: binary_sensor.open_plan_gardin_op_tilladt
+      state: "on"
+    # (b) Soveværelset er tomt og har været det længe nok. KRÆVER et ægte 'off'
+    # — `unavailable`/`unknown` må ALDRIG læses som "tomt" (fejlklasse #9), for
+    # så ville en Thread-flap kunne rulle gardinet op over en sovende.
+    # last_changed er gyldig her: occupancy er binær, så stemplet flytter sig
+    # kun ved reel flanke (fejlklasse #14 gælder analoge sensorer).
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+      state: "off"
+    - condition: template
+      value_template: >
+        {% set s = states.binary_sensor.sovevaerelse_apollo_occupancy %}
+        {{ s is not none
+           and (now() - s.last_changed).total_seconds() / 60
+               >= (states('input_number.sovevaerelse_gardin_morgen_tom_minutter')
+                   | float(15)) }}
+    # Sove-snoozen vinder fortsat (godnat-knap om morgenen = "sov videre",
+    # user-spec 07-29) — /5-tikket betyder at vi selv fyrer når den udløber.
+    # NB: 2026-07-29 blev ankeret lagt om fra fast tidsvindue til snooze, så
+    # hullet beskrevet ovenfor kan ikke længere opstå af sig selv — backstoppen
+    # bliver stående som net for de øvrige åbnere.
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+      state: "off"
+    # Manuel-ned-grace + putning holder gardinet nede.
+    - condition: template
+      value_template: >
+        {{ 'cover.gardin_sovevaerelse' not in
+           (state_attr('sensor.gardiner_manual_hold', 'held') | default([])) }}
+    # No-op hvis gardinet allerede er bekræftet oppe. `unknown` (efter restart /
+    # optimistic state) tæller som "ikke bekræftet oppe" → vi sender OP, hvilket
+    # er harmløst når motoren allerede står i top.
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: cover.gardin_sovevaerelse
+          state: "open"
+  action:
+    # 2026-07-29 (user-spec): bad-gated — scriptet holder på privacy indtil badet
+    # har været tomt i sove_gardin_bad_tomt_minutter og fuldfører selv bagefter.
+    - service: script.sove_gardin_op
+    - service: logbook.log
+      data:
+        name: "Morgen-gardiner"
+        message: >
+          Sove-gardin åbnet (backstop) — soveværelset tomt i
+          {{ ((now() - states.binary_sensor.sovevaerelse_apollo_occupancy.last_changed).total_seconds()
+              / 60) | round(0) | int }} min ≥
+          {{ states('input_number.sovevaerelse_gardin_morgen_tom_minutter') | int(15) }} min,
+          open-plan-bevægelse {{ (states('sensor.open_plan_active_recent')
+          | float(0) * 60) | round(1) }} min.

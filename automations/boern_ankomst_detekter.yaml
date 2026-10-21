@@ -1,0 +1,479 @@
+# =============================================================================
+# Børn ankommet — detektér på SAMMENHÆNGENDE børneværelses-ophold (2026-07-30)
+# =============================================================================
+# Baggrund, kalibrering og hvorfor flaget ikke er boern_sov_her_i_nat:
+# se headeren i packages/boern_ankomst.yaml.
+#
+# Tre automations:
+#   1) detekter  — ophold ≥ slider → input_boolean.boern_aktivitet_detekteret
+#                  (= 4. auto-signal i binary_sensor.kids_home) + spørg user
+#   2) ryd       — ro i børneværelset ≥ slider → flag off (selv-rydning)
+#   3) svar      — "❌ Nej" rydder flaget + undertrykker resten af aftenen
+#
+# Begge tilstands-automations har /15-backstop (fejlklasse #4): en HA-restart
+# midt i et ophold dræber `for:`-flanken, og så ville hverken sæt eller ryd ske.
+# =============================================================================
+
+- id: boern_ankomst_detekter
+  alias: "Børn: sammenhængende børneværelses-ophold → børn hjemme"
+  description: >
+    Ophold i børneværelset i boern_ankomst_ophold_minutter (12) sammenhængende
+    minutter → boern_aktivitet_detekteret on → kids_home on. Kalibreret mod 14
+    dages historik: voksen-dage maks 7,0 min, børne-dage ≥ 15 min.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+      to: "on"
+      for:
+        minutes: "{{ states('input_number.boern_ankomst_ophold_minutter') | int(12) }}"
+      id: flanke
+    # Fejlklasse #4: restart midt i opholdet = flanken tabt for altid.
+    - platform: time_pattern
+      minutes: "/15"
+      id: backstop
+    # 2026-09-14 (user-spec): "hvis der bevæger sig et barn forbi køkkenet vil
+    # Apollo køkken se det som movement væk fra apolloen. mens kameraet ikke vil
+    # se det. barnet er ikke højt nok. det kan hjælpe os med at sætte børn
+    # hjemme on." Child A løb frem og tilbage mellem børneværelset, køkkenet og
+    # entréen hele dagen — et barn der er hjemme går ikke ind i børneværelset og
+    # BLIVER der, og de 12 minutters ophold ovenfor er derfor det langsomme
+    # vidne. Beviset bygges i packages/koekken_kamera_krop.yaml; det kommer ind
+    # HER frem for i sin egen automation, så det arver hele gate-pakken nedenfor
+    # (kill-switch, "user sagde nej", voksen-guard, house_mode) i stedet for at
+    # åbne en parallel vej til flaget (fejlklasse #2/#21).
+    - platform: state
+      entity_id: binary_sensor.koekken_lav_krop_bevist
+      from: "off"
+      to: "on"
+      id: lav_krop
+  condition:
+    - condition: state
+      entity_id: input_boolean.boern_ankomst_detekt_enabled
+      state: "on"
+    # 2026-10-05: lav_krop-vejen skelner ikke barn fra voksen (24 tællinger på
+    # 70 min med kun voksne hjemme; user svarede nej 3 af 4 gange) → user:
+    # "slå børnedetektion fra på tapo". Samme kontakt gater også selve
+    # tælleren. Målingen står i packages/koekken_kamera_krop.yaml.
+    - condition: template
+      value_template: >-
+        {{ (trigger.id if trigger is defined else '') != 'lav_krop'
+           or is_state('input_boolean.koekken_lav_krop_boern_enabled', 'on') }}
+    - condition: state
+      entity_id: input_boolean.boern_aktivitet_detekteret
+      state: "off"
+    # Ved allerede at børnene er her (latch eller manuel) → intet at gøre.
+    - condition: state
+      entity_id: input_boolean.boern_sov_her_i_nat
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.kids_home_manual
+      state: "off"
+    # User har eksplicit sagt "børn er IKKE hjemme" → respektér det.
+    - condition: state
+      entity_id: input_boolean.kids_home_manual_off
+      state: "off"
+    # Familie-logik: Normal + Home Vacation (fejlklasse: 'Normal'-only udelukker
+    # Home Vacation). AirBnB tvinger kids_home false og må ikke arve familie-flag.
+    - condition: template
+      value_template: >-
+        {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+    # Samme hårde guard som kids_home selv: børn kan ikke være hjemme
+    # uden en voksen — uden det er et langt ophold en gæst/robot/spøgelse.
+    # 2026-08-13h: guarden måler "voksen MED telefon". Passer en anden voksen børnene mens
+    # begge forældre er ude, er begge flag off og ankomst-signalet er dødt hele
+    # aftenen. Escape = user's EKSPLICITTE force-on + et fysisk hus-vidne
+    # (samme par som binary_sensor.kids_home bruger) — ikke bare "nogen bevæger
+    # sig", så robot/spøgelse stadig er udelukket.
+    - condition: template
+      value_template: >-
+        {{ is_state('input_boolean.parent_a_home', 'on')
+           or is_state('input_boolean.parent_b_home', 'on')
+           or (is_state('input_boolean.kids_home_manual', 'on')
+               and is_state('binary_sensor.physical_presence_recent', 'on')) }}
+    # "Nej"-svar undertrykker resten af aftenen.
+    - condition: template
+      value_template: >-
+        {% set u = state_attr('input_datetime.boern_ankomst_suppress_until', 'timestamp') %}
+        {{ u is none or u == 0 or now().timestamp() > u }}
+    # Backstop-grenen skal selv bevise opholdet (flanke-grenen har `for:`).
+    # Binær sensor → last_changed ER gyldig varighed (fejlklasse #14 gælder
+    # kun analoge sensorer der re-rapporterer samme værdi).
+    - condition: template
+      value_template: >-
+        {% if trigger.id in ['flanke', 'lav_krop'] %}
+          true
+        {% else %}
+          {% set s = states.binary_sensor.boernevaerelse_apollo_occupancy %}
+          {% set need = (states('input_number.boern_ankomst_ophold_minutter') | float(12)) * 60 %}
+          {{ s is not none and s.state == 'on'
+             and (now() - s.last_changed).total_seconds() >= need }}
+        {% endif %}
+    # 2026-10-08 (user: "støvsugeren trigger børn hjemme notifikation"):
+    # robotten sad fast i børneværelset (cleaning → error → paused → cleaning
+    # 08:21-08:30) og holdt radaren on i 7m02s = præcis tærsklen → spørgsmål
+    # 08:30:19, svar nej. Masken (kører + people_robot_mask_minutter efterløb)
+    # frem for roborock_koerer_nu: opholdet MÅLES over tærsklen, og koerer_nu
+    # er off under paused/error, hvor robotten stadig stod i rummet. Så længe
+    # efterløbet (20) ≥ ophold-slideren (7), er ethvert ophold der overlapper
+    # en kørsel maskeret når det når tærsklen. Re-arm (#4): backstop-grenen
+    # fyrer ved første tick efter masken, hvis opholdet stadig holder. Målt 14
+    # døgn: 48 ophold ≥ 7 min, kun dette ene under masken. lav_krop er
+    # allerede robot-maskeret ved kilden (packages/koekken_kamera_krop.yaml).
+    - condition: template
+      value_template: >-
+        {{ (trigger.id if trigger is defined else '') == 'lav_krop'
+           or not is_state('binary_sensor.roborock_zone_maskering', 'on') }}
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.boern_aktivitet_detekteret
+    - service: logbook.log
+      data:
+        name: "Børn ankomst"
+        message: >-
+          {% if trigger.id == 'lav_krop' %}
+            {{ state_attr('binary_sensor.koekken_lav_krop_bevist', 'antal') | int(0) }}
+            passager forbi køkkenet som radaren så og kameraet ikke
+            (tærskel {{ states('input_number.koekken_lav_krop_antal') | int(3) }}
+            på {{ states('input_number.koekken_lav_krop_vindue_min') | int(30) }} min)
+            → børn hjemme (lav_krop).
+          {% else %}
+            Sammenhængende ophold i børneværelset
+            {{ ((now() - states.binary_sensor.boernevaerelse_apollo_occupancy.last_changed).total_seconds() / 60) | round(0) | int }}
+            min (tærskel {{ states('input_number.boern_ankomst_ophold_minutter') | int(12) }})
+            → børn hjemme ({{ trigger.id }}).
+          {% endif %}
+    # Bekræftelses-spørgsmål: sensorerne kan ikke skelne 20 min barn fra 20 min
+    # voksen der lægger tøj på plads. Svaret logges som facit til kalibrering
+    # af tærsklen (ai_feedback/boern_ankomst_feedback.jsonl).
+    # 2026-09-25: selve pushen bor i script.boern_ankomst_spoerg (packages/
+    # boern_ankomst.yaml) — samme blok, nu delt med latchen, people count og
+    # kids_home-akkumulatorerne (#2). Notifikations-master + "✅ Ja i dag"-
+    # tavsheden sidder i scriptet.
+    - action: script.boern_ankomst_spoerg
+      data:
+        kilde: "{{ trigger.id }}"
+        besked: >-
+          Der har været nogen i børneværelset i
+          {{ ((now() - states.binary_sensor.boernevaerelse_apollo_occupancy.last_changed).total_seconds() / 60) | round(0) | int }}
+          min, så jeg har slået Børn hjemme til. Passer det?
+
+
+- id: boern_ankomst_ryd_ved_ro
+  alias: "Børn: ro i børneværelset → ryd aktivitets-flaget"
+  description: >
+    Selv-rydning. boern_ankomst_ro_minutter (120) uden aktivitet → flaget off,
+    så besøgsbørn der tager hjem ikke efterlader kids_home on til næste morgen.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.boern_ankomst_ro_minutter') | int(120) }}"
+      id: flanke
+    - platform: time_pattern
+      minutes: "/15"
+      id: backstop
+  condition:
+    - condition: state
+      entity_id: input_boolean.boern_aktivitet_detekteret
+      state: "on"
+    # 'unavailable' er hverken on eller off (fejlklasse #9): en Thread-/WiFi-
+    # hikke må ikke tælle som ro. Kræv ægte 'off' i hele vinduet.
+    - condition: template
+      value_template: >-
+        {# 2026-09-25: roen skal ligge EFTER at flaget blev sat. Detektoren
+           sætter det mens rummet er optaget, så dér er det uændret — men et
+           "✅ Ja" til people count-spørgsmålet sætter flaget mens børnene er
+           i stuen, og uden dette led ville et tomt børneværelse rydde det
+           inden for ét backstop-tick (15 min). #}
+        {% set s = states.binary_sensor.boernevaerelse_apollo_occupancy %}
+        {% set f = states.input_boolean.boern_aktivitet_detekteret %}
+        {% set need = (states('input_number.boern_ankomst_ro_minutter') | float(120)) * 60 %}
+        {{ s is not none and s.state == 'off'
+           and (now() - s.last_changed).total_seconds() >= need
+           and f is not none
+           and (now() - f.last_changed).total_seconds() >= need }}
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.boern_aktivitet_detekteret
+    - service: logbook.log
+      data:
+        name: "Børn ankomst"
+        message: >-
+          Ro i børneværelset i
+          {{ states('input_number.boern_ankomst_ro_minutter') | int(120) }} min
+          → aktivitets-flaget ryddet (børn taget hjem / rummet tomt).
+
+- id: boern_ankomst_svar
+  alias: "Børn: svar på ankomst-spørgsmål → log + evt. ryd"
+  description: >
+    "❌ Nej" = falsk positiv → ryd flaget + undertryk detektionen i
+    boern_ankomst_suppress_timer (6t), så den ikke fyrer og spørger igen
+    resten af aftenen. Begge svar logges som facit til tærskel-kalibrering.
+  mode: queued
+  max: 5
+  trigger:
+    - platform: event
+      event_type: mobile_app_notification_action
+  condition:
+    - condition: template
+      value_template: >-
+        {{ (trigger.event.data.action | default('')).startswith('BOERN_ANKOMST_') }}
+    - condition: template
+      value_template: >-
+        {{ states('input_text.boern_ankomst_pending')
+           not in ['', 'unknown', 'unavailable'] }}
+  action:
+    - variables:
+        answer: "{{ trigger.event.data.action | replace('BOERN_ANKOMST_', '') | lower }}"
+        payload_b64: >-
+          {{ {
+            'type': 'answer',
+            'id': states('input_text.boern_ankomst_pending'),
+            'ts': now().isoformat(),
+            'answer': answer,
+            'ophold_min_at_answer': states('sensor.boern_occupancy_4h') | float(-1),
+            'occupancy_at_answer': states('binary_sensor.boernevaerelse_apollo_occupancy')
+          } | to_json | base64_encode }}
+    - service: shell_command.ai_feedback_append
+      data:
+        log_slug: boern_ankomst
+        payload_b64: "{{ payload_b64 }}"
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.boern_ankomst_pending
+      data:
+        value: ""
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ answer == 'nej' }}"
+          sequence:
+            # 2026-09-25: også latchen — morgen-latchen 06:30 spørger nu selv
+            # når den starter en ny periode, og et "Nej" dér skal rydde den.
+            # Harmløst for de andre afsendere: de spørger kun når den er off.
+            - service: input_boolean.turn_off
+              target:
+                entity_id:
+                  - input_boolean.boern_aktivitet_detekteret
+                  - input_boolean.boern_sov_her_i_nat
+            - service: input_datetime.set_datetime
+              target:
+                entity_id: input_datetime.boern_ankomst_suppress_until
+              data:
+                timestamp: >-
+                  {{ now().timestamp()
+                     + (state_attr('input_datetime.boern_ankomst_suppress_timer', 'timestamp') | float(21600)) }}
+            - service: logbook.log
+              data:
+                name: "Børn ankomst"
+                message: >-
+                  User: IKKE børn hjemme → flag ryddet + detektion undertrykt
+                  {{ ((state_attr('input_datetime.boern_ankomst_suppress_timer', 'timestamp') | float(21600)) / 3600) | round(1) }} t.
+            # Ingen kvitterings-push (2026-10-20, jf. user 14/10 "send ikke
+            # svar notifikations kvitteringer til os"): trykket fjerner selv
+            # spørgsmålet, og Børn hjemme-flaget ses på Status.
+      default:
+        # "✅ Ja" = user-bekræftet → tavs til næste midnat (den sætter stadig
+        # flaget automatisk, den spørger bare ikke igen i dag).
+        # 2026-09-25: people count- og akkumulator-spørgsmålene sætter IKKE
+        # flaget før de spørger (kun detektoren gør) — "✅ Ja" er dér selve
+        # beslutningen. For detektorens egne spørgsmål er flaget allerede on.
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.boern_aktivitet_detekteret
+        # 2026-10-07 (fejlklasse #12, spejlet af force-on-fixet): morgen-
+        # latchen spørger også mens en glemt "Børn IKKE hjemme" står on — og
+        # den vinder over alle auto-signaler i kids_home. Uden dette led svarede
+        # pushen "Bekræftet: børn hjemme" mens kids_home blev off.
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.kids_home_manual_off
+        - service: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.boern_ankomst_stille_until
+          data:
+            # timedelta, ikke +86400: natten til vinter-/sommertid har 25/23 t (H1).
+            timestamp: "{{ (today_at('00:00') + timedelta(days=1)).timestamp() }}"
+        # Runde 2 (user: "2. ja"): et bekræftet Ja efter putte-vinduets start
+        # betyder også "de sover her" → latch on, som når man putter (samme
+        # begrundelse som godnat_night.yaml: man putter kun et barn der ER
+        # hjemme). Et Ja midt på dagen siger intet om natten og sætter derfor
+        # ingen latch — dér er det selv-ryddende flag det rigtige.
+        # Sikkerhedsnet: wakeup_kids kræver selv boern_occupancy_overnight
+        # >= 2,0 t, og 06:30-jobbet rydder latchen efter en tom nat.
+        - choose:
+            - conditions:
+                - condition: template
+                  value_template: >-
+                    {% set v = state_attr('input_datetime.putning_vindue_start', 'timestamp') %}
+                    {{ v is not none
+                       and (now() - today_at('00:00')).total_seconds() >= v }}
+              sequence:
+                - service: input_boolean.turn_on
+                  target:
+                    entity_id: input_boolean.boern_sov_her_i_nat
+                - service: logbook.log
+                  data:
+                    name: "Børn ankomst"
+                    message: >-
+                      User bekræftede børn hjemme efter putte-vinduets start
+                      → boern_sov_her_i_nat sat (kids_home holder natten).
+        # Ingen Tak-push (2026-10-20): se nej-grenen.
+
+# ---------------------------------------------------------------------------
+# 2026-09-25 (user-spec): "du må også gerne spørge mig hvis du kommer op på 3 i
+# people count (igen kun hvis det er i en periode uden børn)".
+# Periode uden børn = samme porte som detektoren: ingen latch fra i nat, intet
+# ankomst-flag, ingen manuel override. Flaget sættes IKKE her — "✅ Ja" gør det
+# (boern_ankomst_svar), "❌ Nej" dæmper alle børne-spørgsmål i suppress-timeren.
+# Kun 06-22: en push om natten er værre end et sent facit.
+# Ingen backstop: tallet er analogt (#14 — last_changed beviser ikke "holdt"),
+# og et tabt spørgsmål koster kun et facit; `for:` på numeric_state ER holdet.
+# ---------------------------------------------------------------------------
+- id: boern_ankomst_people_spoerg
+  alias: "Børn: people count ≥ 3 i periode uden børn → spørg"
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.people_estimate
+      above: 2.5
+      for:
+        minutes: "{{ states('input_number.boern_people_spoerg_minutter') | int(10) }}"
+  condition:
+    - condition: time
+      after: "06:00:00"
+      before: "22:00:00"
+    - condition: state
+      entity_id: input_boolean.boern_ankomst_detekt_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.boern_aktivitet_detekteret
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.boern_sov_her_i_nat
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.kids_home_manual
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.kids_home_manual_off
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+    - condition: template
+      value_template: >-
+        {% set u = state_attr('input_datetime.boern_ankomst_suppress_until', 'timestamp') %}
+        {{ u is none or u == 0 or now().timestamp() > u }}
+  action:
+    - action: script.boern_ankomst_spoerg
+      data:
+        kilde: people
+        besked: >-
+          Jeg har talt {{ states('sensor.people_estimate') | int(0) }} hjemme i
+          {{ states('input_number.boern_people_spoerg_minutter') | int(10) }} min,
+          men ingen børn. Er der børn hjemme?
+
+# ---------------------------------------------------------------------------
+# 2026-09-25 (user-spec: "alle nye børnebesøg-perioder skal bekræftes af mig"):
+# kids_home har to akkumulator-signaler (overnight ≥ 4 t, i dag ≥ 4 t) der kan
+# starte en periode UDEN at nogen spørger. Denne lytter på RESULTATET i stedet
+# for at kode signalerne igen (#2): går kids_home on mens latch, ankomst-flag og
+# manuel override alle er off, var det en akkumulator — spørg.
+# "❌ Nej" virker via suppress_until, som kids_home nu respekterer (packages/
+# activity_state.yaml, override 2c). Kun 06-22; nattens overnight-flanke
+# fanges i stedet af morgen-latchen 06:30.
+# ---------------------------------------------------------------------------
+- id: boern_ankomst_akkumulator_spoerg
+  alias: "Børn: kids_home tændt af 4 t-signal (ingen periode) → spørg"
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.kids_home
+      from: "off"
+      to: "on"
+  condition:
+    - condition: time
+      after: "06:00:00"
+      before: "22:00:00"
+    - condition: state
+      entity_id: input_boolean.boern_aktivitet_detekteret
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.boern_sov_her_i_nat
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.kids_home_manual
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+  action:
+    - action: script.boern_ankomst_spoerg
+      data:
+        kilde: akkumulator
+        besked: >-
+          Der har været nogen i børneværelset i
+          {{ ([states('sensor.boern_occupancy_today') | float(0),
+               states('sensor.boern_occupancy_overnight') | float(0)] | max | round(1)
+              | string) | replace('.', ',') }} t, så Børn hjemme er slået til.
+          Passer det? Nej slår det fra i
+          {{ ((state_attr('input_datetime.boern_ankomst_suppress_timer', 'timestamp') | float(21600)) / 3600) | round(0) | int }} t.
+
+# ---------------------------------------------------------------------------
+# 2026-09-27 (user-bug "vi er 4 hjemme … der er også tegn på børn hjemme"):
+# et "❌ Nej" er et svar om DA — ikke om resten af de 6 t. Målt i dag: Nej
+# 15:41 (sandt: kun Parent A hjemme), huset tomt 18:07-18:21, Parent B kom hjem
+# 18:21 MED børnene. Pausen stod til 21:41 → kids_home off hele aftenen,
+# people count spørg-vejen stum (people_estimate 3 i 44 min fra 18:52),
+# puttelys-bagkanten 19:10 blokeret, people_estimate uden kids_add (gættede 2).
+# En voksen der KOMMER HJEM efter et reelt fravær er en ny situation → pausen
+# ophæves, så detektoren/people-count må SPØRGE igen (user-spec 2026-09-25:
+# nye perioder bekræftes af user — vi sætter intet flag, vi spørger bare igen).
+# Fravær < 10 min tæller ikke: Parent A's GPS flappede 18:52-18:56 hjemme.
+# ---------------------------------------------------------------------------
+- id: boern_ankomst_nej_pause_ophaev_ved_hjemkomst
+  alias: "Børn: voksen kommer hjem → ophæv Nej-pausen (spørg igen)"
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id:
+        - input_boolean.parent_a_home
+        - input_boolean.parent_b_home
+      from: "off"
+      to: "on"
+  condition:
+    - condition: template
+      value_template: >-
+        {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+    - condition: template
+      value_template: >-
+        {{ (state_attr('input_datetime.boern_ankomst_suppress_until', 'timestamp') | float(0))
+           > now().timestamp() }}
+    - condition: template
+      value_template: >-
+        {{ (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds()
+           >= 600 }}
+  action:
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.boern_ankomst_suppress_until
+      data:
+        timestamp: "{{ now().timestamp() | round(0) }}"
+    - service: logbook.log
+      data:
+        name: "Børn ankomst"
+        message: >-
+          {{ trigger.to_state.name }} kom hjem efter
+          {{ ((trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() / 60) | round(0) | int }}
+          min væk → Nej-pausen ophævet; detektionen må spørge igen.

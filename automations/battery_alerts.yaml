@@ -1,0 +1,254 @@
+# =============================================================================
+# Battery alerts — alle batteri-enheder (auto: alt undtagen telefoner)
+# =============================================================================
+# To lag, fordi de fanger HVER SIN fejltype:
+#
+#   1. %-tærskler (10 / 5 / 2%) — gradvis afladning. numeric_state below.
+#      - 10% + 5%: mobile push (notify.mobile_app_phone_a) med timeout 30 min
+#        (Android auto-rydder selv — kun en mild reminder, ingen persistent).
+#      - 2%: PERSISTENT notification (bliver stående til batteri skiftet) +
+#        kritisk push.
+#      Båndet (above/below) sikrer at hvert niveau kun fyrer i sit eget bånd.
+#
+#   2. "Holdt op med at rapportere" (dead-detector) — KUN knapper/remotes.
+#      En sleepy IKEA-remote dør ofte BRAT: den krydser aldrig en %-grænse,
+#      men hopper fra "unknown" direkte til "unavailable" (ZHA device_offline).
+#      Det skete for stue-Styrbar 2026-06-04 → INGEN %-alert fyrede nogensinde.
+#      Derfor: er en remote `unavailable` i >24t → persistent + push.
+#      Vi trigger på `unavailable`, IKKE `unknown` — sleepy remotes står
+#      normalt `unknown` i dagevis mens de virker helt fint (verificeret i
+#      recorder: stue-Styrbar var unknown i 4 dage før den faktisk døde).
+#
+# Baggrund for 2026-06-04-omskrivning: gammel liste var hardcoded til 8
+# enheder og missede bl.a. kalde-knappen + gardin-RODRET'er. numeric_state-
+# only missede brat-død. device_health_check fangede det, men dens
+# notifikationer blev slået fra (user 2026-05-07). Nu dækkes begge fejltyper
+# + alle batteri-enheder.
+#
+# Telefoner (parent_b iphone, phone_a) er bevidst UDELADT — deres % er normal
+# brug, ikke noget at advare om. Apollo RGB rød-indikator (<5%) ligger uændret
+# nederst i filen.
+# =============================================================================
+
+- id: battery_low_alert
+  alias: "Sikkerhed: Batteri lavt (10%)"
+  description: >
+    Mobil push når et batteri krydser ned i 10%-båndet (5–10%). Auto-rydder
+    efter 30 min (Android timeout) — kun en mild reminder. Mute i guest_mode.
+  mode: parallel
+  max: 15
+  trigger:
+    - platform: numeric_state
+      entity_id: &batt_all
+        - sensor.badevaerelse_badring_battery
+        - sensor.badevaerelse_styrbar_battery
+        - sensor.boernevaerelse_styrbar_battery
+        - sensor.depot_styrbar_battery
+        - sensor.depot_valhorn_battery
+        - sensor.entre_somrig_battery
+        - sensor.entre_styrbar_battery
+        - sensor.entre_valhorn_battery
+        - sensor.sove_knap_battery
+        - sensor.ikea_of_sweden_rodret_wireless_dimmer_battery_2
+        - sensor.ikea_of_sweden_rodret_wireless_dimmer_battery_3
+        - sensor.ikea_of_sweden_rodret_wireless_dimmer_battery_4
+        - sensor.ikea_of_sweden_rodret_wireless_dimmer_battery_5
+        - sensor.parasoll_terrassedoer_battery
+        - sensor.parasoll_hoveddoer_battery
+        - sensor.parasoll_badevaerelse_battery
+        - sensor.sovevaerelse_styrbar_battery
+        - sensor.stue_styrbar_battery
+        - sensor.terrasse_styrbar_battery
+      below: 10
+      above: 5
+  condition:
+    - condition: state
+      entity_id: input_boolean.guest_mode
+      state: "off"
+  action:
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: batteri
+        title: "🔋 Lavt batteri (10%)"
+        message: >
+          {{ state_attr(trigger.entity_id, 'friendly_name') | default(trigger.entity_id) }}:
+          {{ states(trigger.entity_id) }}%. Skift snart.
+        payload:
+          tag: "battery_low_{{ trigger.entity_id }}"
+          timeout: 1800
+
+- id: battery_warn_5
+  alias: "Sikkerhed: Batteri meget lavt (5%)"
+  description: >
+    Mobil push når et batteri krydser ned i 5%-båndet (2–5%). Auto-rydder
+    efter 30 min (Android timeout). Mute i guest_mode.
+  mode: parallel
+  max: 15
+  trigger:
+    - platform: numeric_state
+      entity_id: *batt_all
+      below: 5
+      above: 2
+  condition:
+    - condition: state
+      entity_id: input_boolean.guest_mode
+      state: "off"
+  action:
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: batteri
+        title: "🪫 Batteri meget lavt (5%)"
+        message: >
+          {{ state_attr(trigger.entity_id, 'friendly_name') | default(trigger.entity_id) }}:
+          {{ states(trigger.entity_id) }}%. Skift inden for få dage.
+        payload:
+          tag: "battery_warn5_{{ trigger.entity_id }}"
+          timeout: 1800
+
+- id: battery_critical_alert
+  alias: "Sikkerhed: KRITISK batteri (2%)"
+  description: >
+    Persistent notification (bliver stående til batteri skiftet) + kritisk
+    mobil push når et batteri falder under 2%. Ingen guest_mode-mute og ingen
+    timeout — dette skal IKKE forsvinde af sig selv.
+  mode: parallel
+  max: 15
+  trigger:
+    - platform: numeric_state
+      entity_id: *batt_all
+      below: 2
+  action:
+    - service: persistent_notification.create
+      data:
+        notification_id: "battery_critical_{{ trigger.entity_id | replace('sensor.', '') | replace('_battery', '') }}"
+        title: "🔴 KRITISK BATTERI"
+        message: >
+          {{ state_attr(trigger.entity_id, 'friendly_name') | default(trigger.entity_id) }}:
+          {{ states(trigger.entity_id) }}%.
+
+          Skift batteri NU — enheden kan stoppe med at virke når som helst.
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: batteri
+        title: "🔴 KRITISK BATTERI"
+        message: >
+          {{ state_attr(trigger.entity_id, 'friendly_name') | default(trigger.entity_id) }}
+          ({{ states(trigger.entity_id) }}%) — skift NU.
+        payload:
+          tag: "battery_critical_{{ trigger.entity_id }}"
+          importance: high
+
+# Auto-dismiss 2%-persistent når batteri stiger over 10% (= user skiftede).
+- id: battery_critical_dismiss
+  alias: "Sikkerhed: Ryd KRITISK-batteri-notifikation ved skift"
+  mode: parallel
+  max: 15
+  trigger:
+    - platform: numeric_state
+      entity_id: *batt_all
+      above: 10
+  action:
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: "battery_critical_{{ trigger.entity_id | replace('sensor.', '') | replace('_battery', '') }}"
+
+# =============================================================================
+# Dead-detector — remote/knap holdt op med at rapportere (>24t unavailable)
+# =============================================================================
+- id: battery_remote_dead
+  alias: "Sikkerhed: Remote/knap svarer ikke (>24t)"
+  description: >
+    En batteri-remote der står `unavailable` i 24t = sandsynligt dødt batteri
+    eller faldet af Zigbee-mesh. Fanger den BRATTE død som %-tærskler misser
+    (stue-Styrbar 2026-06-04: gik unknown → unavailable uden at krydse en
+    %-grænse). KUN knapper/remotes — IKKE flytte-rod-sensorer (parasoll-døre,
+    vejr-meter, vallhorn) som er offline pre-flyt og ville spam'e. Trigger på
+    `unavailable`, ikke `unknown` (sleepy remotes står normalt unknown længe).
+  mode: parallel
+  max: 15
+  trigger:
+    - platform: state
+      entity_id: &batt_remotes
+        - sensor.stue_styrbar_battery
+        - sensor.sovevaerelse_styrbar_battery
+        - sensor.boernevaerelse_styrbar_battery
+        - sensor.terrasse_styrbar_battery
+        - sensor.badevaerelse_styrbar_battery
+        - sensor.entre_styrbar_battery
+        - sensor.depot_styrbar_battery
+        - sensor.entre_somrig_battery
+        - sensor.sove_knap_battery
+        - sensor.ikea_of_sweden_rodret_wireless_dimmer_battery_2
+        - sensor.ikea_of_sweden_rodret_wireless_dimmer_battery_3
+        - sensor.ikea_of_sweden_rodret_wireless_dimmer_battery_4
+        - sensor.ikea_of_sweden_rodret_wireless_dimmer_battery_5
+      to: "unavailable"
+      for:
+        hours: 24
+  condition:
+    - condition: state
+      entity_id: input_boolean.guest_mode
+      state: "off"
+  action:
+    - service: persistent_notification.create
+      data:
+        notification_id: "battery_dead_{{ trigger.entity_id | replace('sensor.', '') | replace('_battery', '') }}"
+        title: "⚠️ Remote svarer ikke"
+        message: >
+          {{ state_attr(trigger.entity_id, 'friendly_name') | default(trigger.entity_id) }}
+          har været offline i 24t — sandsynligt dødt batteri eller ude af mesh.
+          Tjek / skift batteri (re-pair bevarer IEEE, automationer virker videre).
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: remote_offline
+        title: "⚠️ Remote svarer ikke"
+        message: >
+          {{ state_attr(trigger.entity_id, 'friendly_name') | default(trigger.entity_id) }}
+          offline i 24t — tjek batteri.
+        payload:
+          tag: "battery_dead_{{ trigger.entity_id }}"
+
+# Ryd dead-notifikation når remoten rapporterer et tal igen (= skiftet/re-paired).
+- id: battery_remote_dead_clear
+  alias: "Sikkerhed: Ryd 'remote svarer ikke' når den er online igen"
+  mode: parallel
+  max: 15
+  trigger:
+    - platform: numeric_state
+      entity_id: *batt_remotes
+      above: 0
+  action:
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: "battery_dead_{{ trigger.entity_id | replace('sensor.', '') | replace('_battery', '') }}"
+
+# =============================================================================
+# Apollo RGB rød-indikator ved kritisk batteri (<5%) — sprint 2026-05-20
+# =============================================================================
+# 2026-08-16h FLYTTET. `battery_rgb_on`/`_off` lå her indtil husets tre
+# RGB-varsler (dug, regn, batteri) gik over til blink med lange mørke pauser.
+# De tre skrev til de samme Apollo-LED'er og skelnede sig fra hinanden på hue +
+# brightness; da alle tre nu deler ÉN styrke-slider, holdt den ejerskabs-test op
+# med at virke (fejlklasse #1/#2). Nu ét sted:
+#
+#     packages/apollo_rgb_varsel.yaml
+#       sensor.apollo_rgb_varsel            → hvem vinder (Batteri > Regn > Dug)
+#       automation apollo_rgb_varsel_blink  → renderer vinderen som blink
+#
+# Batteri-DELEN er uændret: binary_sensor.battery_critical_any (ON hvis mindst
+# ét batteri <5 %, se packages/activity_state.yaml) → rød [255,0,0] på sove +
+# køkken, og rød vinder over både regn og dug. Batteri-varslet er fortsat det
+# eneste uden house_state-gate: et fladt batteri skal også kunne ses af den der
+# lige er kommet hjem til et Dormant hus.
+#
+# To ting kom til samme dag og gælder stadig, nu via ankeret:
+#   * AirBnB-gate (fejlklasse #12 — dug og regn havde begge haft en hele tiden,
+#     dette tredje varsel havde ingen, så en gæst fik rødt lys i soveværelset
+#     over et batteri han hverken kan se årsagen til eller skifte).
+#   * godnat slukker varslet (user-spec) — rødt lys i soveværelset kl. 23 var
+#     det mest påtrængende af de tre.
+# =============================================================================

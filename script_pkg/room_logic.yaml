@@ -1,0 +1,382 @@
+# =============================================================================
+# script_pkg/room_logic.yaml — per-rum mode/lys helper scripts
+# =============================================================================
+# Helper scripts for room mode + scene dispatching.
+# (room_mode_cycle, room_manual_adjust og room_hold_dim — Dim/Bright-cyklussen
+# og 31 %-tærsklen — blev slettet 2026-10-07, B198: ingen kaldte dem; L/R er
+# farve, OP/NED er styrbar_brightness_step-trappen.)
+#
+# CALLED-FROM:
+#   - automations/room_drift_back.yaml — calls room_drift_back periodisk
+#   - dashboards/main.yaml tile-tap → script.scene_toggle (dispatcher)
+#   - automations/entre_somrig.yaml (L/R mode cycle) → script.scene_zen direkte
+#
+# CROSS-CUTTING REFS (⚠️ se docs/cross_cutting_map.md):
+#   #1: light.{{ room }}_all groups — TARGETS for room_mode_apply og
+#       room_drift_back. Templated ref MISSED af validators!
+#   #2: godnat_any_active union sensor — scene_toggle gates here (A23 fix)
+#
+# Scripts:
+#   1. room_mode_apply    — glid tændte lys mod Auto-baseline (lux-aware;
+#                           vinduesløse rum højere). Kun kaldt af room_drift_back.
+#   2. room_drift_back    — sæt Auto; tændte lys glider over 600 s
+#                           Smart: skip re-apply hvis room er off + dark (audit-12 fix)
+#   3. gentle_fade_off    — smooth fade-off helper (transition based on input_number)
+#   4. scene_toggle       — dashboard tile-tap dispatcher: hvis scene allerede aktiv
+#                           → clear scene + slukke alt. Else → set active_scene + run scene.
+#                           ⭐ Gated på godnat_any_active (A23 fix sprint 2026-05-06 PM)
+#   5. toggle_all_rooms_mode — widget: flip alle 9 rum Auto <-> Manual
+#
+# All scripts: mode: parallel max: 7-10 (= rum-parallel, ingen mutual blocking).
+#
+# Splittet fra scripts.yaml 2026-05-05 (Phase 2.1 refactor).
+# =============================================================================
+
+# --- Apply the current mode to the lights ---
+
+room_mode_apply:
+  alias: "Room mode: apply to lights"
+  description: >
+    Glider rummets (tændte) lys mod Auto-baseline (lux-justeret, højere i
+    vinduesløse rum). Kaldes KUN af room_drift_back, lige efter at rummet er
+    sat til Auto — Off/Dim/Bright-grenene blev fjernet 2026-10-07 (B198), da
+    mode her altid er Auto.
+  mode: parallel
+  max: 7
+  fields:
+    room:
+      description: "Room id"
+    transition:
+      description: "Transition seconds (default 2)"
+      example: 2
+    only_on:
+      description: >
+        Hvis true: apply rammer KUN lys der allerede er 'on' i rummet —
+        tænder ALDRIG slukkede lys. Bruges af drift-back (2026-06-10 fix:
+        drift→Auto tændte stue_plug der var off, fordi gruppe-turn_on rammer
+        alle medlemmer). Default false = fuldt gruppe-apply som hidtil.
+      example: true
+  variables:
+    # G2 — LUX fallback strategi:
+    # depot, entre, terrasse har ingen egen Apollo-lux-sensor. De bruger
+    # stue_apollo_lux som proxy. Dette er IKKE perfekt:
+    #   - depot er vinduesløst (lux fra stue er meningsløs reference,
+    #     men bruges kun til Auto-baseline brightness, ikke kritisk)
+    #   - entre er nordvendt med lille gang-vindue — har typisk lavere
+    #     lux end stue, men proxy giver "godt nok" approksimation
+    #   - terrasse er udendørs, lux varierer dramatisk men terrasse-lys
+    #     er typisk manuel-styret (Styrbar) saa Auto-baseline sjældent
+    #     bruges
+    # Default-fallback til 'sensor.open_plan_lux' fanger ogsaa
+    # un-mappede rum (fx hvis nyt rum tilfojes uden eksplicit entry).
+    lux_sensor: >-
+      {# køkken + boern bruger open_plan_lux — køkken/spisestue-Apollos giver
+         ren ambient-lux (intet direkte lys på dem). Bad har ingen egen
+         lux-måler (bruger open_plan_lux).
+         2026-07-30: adfærds-logik læser ALTID sensor.<rum>_lux_reel, aldrig
+         den rå Apollo-sensor — Apolloens egen status-LED lyser ind i sin
+         LTR390 (op til +900 lx på grøn). open_plan_lux er allerede
+         LED-kompenseret i sin egen template. #}
+      {% set m = {
+        'stue': 'sensor.open_plan_lux',
+        'koekken': 'sensor.open_plan_lux',
+        'spisestue': 'sensor.spisestue_lux_reel',
+        'sovevaerelse': 'sensor.sovevaerelse_lux_reel',
+        'boernevaerelse': 'sensor.open_plan_lux',
+        'badevaerelse': 'sensor.open_plan_lux',
+        'depot': 'sensor.open_plan_lux',
+        'entre': 'sensor.open_plan_lux',
+        'terrasse': 'sensor.open_plan_lux'
+      } %}
+      {{ m[room] | default('sensor.open_plan_lux') }}
+    # A52 fix: failsafe → mid-bracket (was float(0) = brightest = wrong direction)
+    lux: "{{ states(lux_sensor) | float(50) }}"
+    windowless: "{{ room in ['badevaerelse', 'depot'] }}"
+    bright_pct: >-
+      {% if windowless %}65
+      {% elif lux < (states('input_number.lux_trin_moerkt') | float(5)) %}80
+      {% elif lux < (states('input_number.lux_trin_dunkelt') | float(20)) %}60
+      {% else %}35{% endif %}
+    # C1 refactor: targets nu ÉN group per rum (defineret i packages/light_groups.yaml).
+    # Ny paeret bulb tilfojes i light_groups.yaml; alle scripts picker den op uden edits.
+    # only_on=true: filtrer til kun tændte medlemmer (drift-back må ikke
+    # tænde slukkede lys).
+    # only_on (= drift-back, automatisk) springer lamper med et ejerskabs-
+    # register over (sensor.lys_ejerskab, genereret fra ejerskab/*.yaml): de har
+    # deres egen enforcer, og en ren styrke-skrivning ser enforceren aldrig.
+    # Før rampede stue-drift køkken-lyskæden til 80/60/35 % over 600 s midt i
+    # dens eget mål (2026-10-04). Tænd/sluk via gruppen er uændret.
+    targets: >-
+      {% if only_on | default(false) %}
+        {{ expand('light.' ~ room ~ '_all') | selectattr('state', 'eq', 'on')
+           | map(attribute='entity_id')
+           | reject('in', state_attr('sensor.lys_ejerskab', 'styrede') or [])
+           | list }}
+      {% else %}
+        light.{{ room }}_all
+      {% endif %}
+  sequence:
+    # only_on med 0 tændte lys → intet at gøre (turn_on på tom liste fejler).
+    - condition: template
+      value_template: "{{ targets is string or targets | length > 0 }}"
+    # continue_on_error: rum-grupperne indeholder Matter-lys, og et templatet
+    # mål ser `ha_validate.py --check matter` ikke (CLAUDE.md, Radio).
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ targets }}"
+      data:
+        brightness_pct: "{{ bright_pct | int }}"
+        transition: "{{ transition | default(2) }}"
+
+# --- Drift back: reset a room to Auto with a 10-min smooth transition ---
+
+room_drift_back:
+  alias: "Room mode: drift back to Auto"
+  description: >
+    Called by automations/room_drift_back.yaml when room has been empty long
+    enough or has hit ceiling/24h fallback. Sets mode to Auto.
+
+    Audit-runde 12 fix (2026-05-03):
+    Hvis ALLE lights i rummet er off, kun set mode til Auto + skip
+    room_mode_apply. Tidligere kaldte vi room_mode_apply som tændte lights
+    på 80% når mode driftede til Auto — selv hvis user havde slukket lyset
+    inden de gik. Resultat: lights tændes spontant 12h efter user pressed
+    Off (eller efter wall-switch off) fordi ceiling/24h fallback fyrer
+    drift_back på en tom + dark room.
+
+    Hvis lights ER on, re-apply Auto med 600s transition så handover er
+    imperceptible (oprindelig design).
+  mode: parallel
+  max: 10
+  fields:
+    room:
+      description: "Room id"
+  variables:
+    targets: "light.{{ room }}_all"
+    # Tjek om noget i rummet faktisk er on (group state OR expand and check)
+    any_light_on: >
+      {% set s = states(targets) %}
+      {{ s == 'on' }}
+  sequence:
+    # Altid set mode til Auto (release manual-lock)
+    - service: input_select.select_option
+      target:
+        entity_id: "input_select.room_mode_{{ room }}"
+      data:
+        option: "Auto"
+    # KUN re-apply hvis lights faktisk er on (else: skip, lad presence_lights
+    # eller user trigger næste tænd. Forhindrer spontan tænd af tom mørk rum)
+    - condition: template
+      value_template: "{{ any_light_on }}"
+    # 2026-06-19 (KRITISK root-fix): ALDRIG re-apply/brighten et SOVEVÆRELSE
+    # under godnat. Drift-back må sætte Auto-mode (ovenfor) men IKKE tænde/rampe
+    # lys i et sovende rum — den re-applyede børnelyset med 600s op-rampe ved
+    # midnat 2026-06-18 og vækkede Child B. Lyset skal blive på natlys/off; presence
+    # / morgen-vækning tager over når godnat slutter. (Backstop hvis denne gate
+    # nogensinde omgås: automations/bedroom_night_guard.yaml refleks-lås.)
+    - condition: template
+      value_template: >-
+        {{ not (
+             (room == 'boernevaerelse' and is_state('input_boolean.godnat_boern_active','on'))
+             or (room == 'sovevaerelse'
+                 and (is_state('input_boolean.godnat_voksne_active','on')
+                      or is_state('input_boolean.godnat_active','on')))
+           ) }}
+    - service: script.room_mode_apply
+      data:
+        room: "{{ room }}"
+        transition: 600
+        # 2026-06-10: kun lys der allerede er on — drift-back tændte før
+        # slukkede gruppe-medlemmer (fx light.stue_plug full-on kl 07:45/13:45
+        # 2026-06-09 fordi laesehygge var on og hele stue_all blev re-applied).
+        only_on: true
+
+# O19 (audit-runde 17): triangle_toggle slettet — markeret DEPRECATED siden
+# audit-runde 9, ingen automations brugte det (verificeret via grep).
+
+# --- Gentle fade off ---
+
+gentle_fade_off:
+  alias: "Gentle fade off"
+  description: "Soft turn-off helper for absence-driven automations. Never slams off."
+  mode: parallel
+  max: 20
+  fields:
+    target:
+      description: "Light entity_id (or list)"
+      example: "light.spisestue_loft"
+    transition:
+      description: "Fade seconds (default 30)"
+      example: 30
+  sequence:
+    - service: light.turn_off
+      target:
+        entity_id: "{{ target }}"
+      data:
+        transition: "{{ transition | default(30) }}"
+
+# --- Goodnight routine ---
+
+scene_toggle:
+  alias: "Scene: smart toggle (kør scene hvis off, clear hvis aktiv)"
+  description: >
+    Dashboard-bruger script. Tjekker input_select.active_scene mod 'name'
+    parameteren. Hvis allerede aktiv: clearer scene + slukker alle lys
+    (bruger giver eksplicit "off" signal). Ellers: setter active_scene til
+    'name' og kalder script.scene_<name>.
+    Mutual exclusion: én scene aktiv ad gangen, fordi input_select kan kun
+    hold én værdi. Tap på scene B mens A er aktiv = automatisk skift til B.
+    Tilfojet 2026-05-03 efter dashboard bug-rapport om scene toggle.
+
+    Audit-fund 2026-05-03: tilfoejet cross-mode-flag cleanup. Cinema scene
+    saetter cinema_active=on, cirkus saetter cirkus_active=on. Foer 2026-05-03
+    blev disse IKKE clearet ved scene-switch -> begge flags kunne være på
+    samtidig. Nu: enhver scene-switch clearer BEGGE flags først; cinema og
+    cirkus scene-scripts saetter deres egne flag igen efter.
+  mode: restart  # ny tap kan tage over (cancel forrige toggle hvis i gang)
+  fields:
+    name:
+      description: "Scene navn (cinema, zen, cirkus, party, full_bright, private, blue, happy, sunset, cyberpunk)"
+      example: cinema
+  sequence:
+    # A23 fix sprint 2026-05-06 PM: BLOCK alle scenes hvis godnat-flow aktiv.
+    # A14 fix dækkede kun cinema/cirkus i scene-scripts. MEN dashboard tile-tap
+    # går her gennem scene_toggle → bypasser cinema/cirkus block → wakes
+    # partner med scene-changes (zen/private/party/etc).
+    # Single point of fix dækker alle 10 scenes via dashboard path.
+    #
+    # 2026-07-21 fix (#1/#2): gate på godnat_COMMON_active, IKKE godnat_any_active.
+    # A23's hensigt er at undgå at vække den VOKSNE partner — ikke at blokere
+    # mens BØRN sover. godnat_any_active inkluderer godnat_boern_active → når
+    # børn puttes ~19:30 blev cinema/zen/etc. blokeret for de voksne der stadig
+    # er oppe (modsagde scene_cinema's C.11-gate + godnat_common_active-ankeret,
+    # activity_state.yaml:350, lavet 2026-06-06 mod præcis denne fejlklasse).
+    # common_active = union UDEN børne-putning. Larmende scener der SKAL blokere
+    # på børne-søvn (cirkus) har deres EGEN godnat_any_active-gate i scene-scriptet.
+    - if:
+        - condition: state
+          entity_id: binary_sensor.godnat_common_active
+          state: "on"
+      then:
+        - service: persistent_notification.create
+          data:
+            notification_id: scene_blocked_godnat
+            title: "Scene blokeret"
+            message: >
+              Godnat-flow er aktivt — kan ikke skifte til scene "{{ name }}".
+              Tryk Somrig op for at afslutte godnat først.
+        - stop: "A23: Scene blokeret af godnat-flow"
+    - choose:
+        # Hvis denne scene allerede er aktiv: clear + sluk alle lys
+        - conditions:
+            - condition: template
+              value_template: "{{ states('input_select.active_scene') == name }}"
+          sequence:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.active_scene
+              data:
+                option: "none"
+            # Clear cinema/cirkus mode-flags også (i tilfælde af at den
+            # toggled-off scene var cinema eller cirkus der saetter dem)
+            - service: input_boolean.turn_off
+              target:
+                entity_id:
+                  - input_boolean.cinema_active
+                  - input_boolean.cirkus_active
+            # Stemplet SKAL sættes FØR slukningen: app-justerings-detektoren
+            # fyrer på selve light.turn_off-kaldet og læser stemplet for at se
+            # at det er en fest-oprydning, ikke en overstyring.
+            - service: input_datetime.set_datetime
+              target: {entity_id: input_datetime.fest_slut_stempel}
+              data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: light.alle_lys
+              data:
+                transition: 1
+            # 2026-08-16 (user-spec: "tving ALLE rum til Auto ved exit"): fest
+            # slut = ren tavle. Rydder også Manual sat FØR/UNDER moden, så user
+            # aldrig skal trykke sig ud af låsen selv (målt 08-16: han gjorde
+            # det 68 min efter festen). Kører EFTER slukningen; detektoren
+            # holdes væk af input_datetime.fest_slut_stempel ovenfor, så den
+            # ikke låser rummene igen bagefter (automations/manual_override.yaml).
+            # Auto er den neutrale tilstand = at SLIPPE en blokering, derfor
+            # ingen AirBnB-gate: en gæst skal også kunne slippe ud.
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.all_rooms_manual
+            - service: input_select.select_option
+              target:
+                entity_id: !include ../rosters/alle_rum_mode.yaml
+              data:
+                option: "Auto"
+        # Ellers: kør scenen + saet active_scene
+        - conditions: []
+          sequence:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.active_scene
+              data:
+                option: "{{ name }}"
+            # Cross-mode-flag cleanup: clear cinema_active OG cirkus_active
+            # foer ny scene koeres. Hvis ny scene er cinema/cirkus, scriptet
+            # saetter sin egen flag igen som sidste step. Forhindrer dual-
+            # active state hvor begge mode-flags er on samtidig.
+            - service: input_boolean.turn_off
+              target:
+                entity_id:
+                  - input_boolean.cinema_active
+                  - input_boolean.cirkus_active
+            # Override-snapshot: hvis brugeren har trykket "Overskriv" på denne
+            # scene (script.scene_overwrite → scene.snap_<name>), anvend det
+            # gemte snapshot i stedet for den hardcodede mood. Ellers kør det
+            # normale scene-script.
+            - choose:
+                - conditions:
+                    - condition: template
+                      # scene-entities har state 'unknown' til de aktiveres
+                      # første gang → tjek eksistens via subscript (None hvis
+                      # snapshot ikke findes), ikke state-værdien. Slettede
+                      # snapshots lingrer som 'unavailable' (restored entity)
+                      # til næste HA-restart → ekskludér så fallback til default
+                      # scene-script virker straks efter sletning.
+                      value_template: >-
+                        {{ states['scene.snap_' ~ name] is not none
+                           and states('scene.snap_' ~ name) != 'unavailable' }}
+                  sequence:
+                    - service: scene.turn_on
+                      target:
+                        entity_id: "scene.snap_{{ name }}"
+                      data:
+                        transition: 2
+                    # Bevar cirkus mood-flag som cirkus-scriptet ellers sætter selv
+                    - if:
+                        - condition: template
+                          value_template: "{{ name == 'cirkus' }}"
+                      then:
+                        - service: input_boolean.turn_on
+                          target:
+                            entity_id: input_boolean.cirkus_active
+              default:
+                - service: "script.scene_{{ name }}"
+
+# =============================================================================
+# toggle_all_rooms_mode — widget-venlig global auto/manual toggle (item 2)
+# =============================================================================
+# Flipper input_boolean.all_rooms_manual (packages/all_rooms_mode.yaml), som
+# automation all_rooms_mode_apply oversætter til alle 9 room_mode_*.
+# Widget-navn: script.toggle_all_rooms_mode
+toggle_all_rooms_mode:
+  alias: "Rum: Toggle alle rum auto/manual"
+  description: >
+    Widget-indgang: flipper input_boolean.all_rooms_manual → alle 9 rum skifter
+    mellem Auto og Manual via all_rooms_mode_apply.
+  mode: single
+  sequence:
+    - service: input_boolean.toggle
+      target:
+        entity_id: input_boolean.all_rooms_manual
+

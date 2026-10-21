@@ -1,0 +1,275 @@
+# =============================================================================
+# Godnat Sub-Flag Safety Clear (O5 fix, audit-runde 10)
+# =============================================================================
+# Defensive auto-clear for godnat_voksne_active + godnat_boern_active hvis
+# de bliver hængende i ON-state uden at godnat_active er ON.
+#
+# Background:
+#   - Sub-flags settes ON af godnat_voksen_start / godnat_boern_start scripts
+#   - Cleares NORMALT af automations/godmorgen_godnat.yaml `godmorgen_forced`
+#     (Somrig click ned i sove → cancel godnat + gradual wake)
+#   - Pre-flyt: Somrig ikke paret → fake-IEEE → clear-path fyrer aldrig →
+#     sub-flags kan staa stuck on i dage/uger
+#   - Post-flyt: hvis Somrig batteri dør eller bruger glemmer at trykke ned,
+#     samme stuck state
+#
+# Konsekvens af stuck sub-flags:
+#   - drift-back blokeret i sove (godnat_voksne_active != off)
+#   - guest_mode auto-set kan misbehave (M3 race)
+#   - Ingen visuel impact (ingen lys-automation conditioner direkte paa dem)
+#
+# Strategy: safety-net der clearer sub-flags hvis godnat_active=off i 2+ timer.
+# Det respekterer aktiv godnat-session (begge flags forventet on under godnat),
+# men fanger "glemt-at-clear" cases naar morgenen kommer.
+#
+# 2026-08-06 — 2-TIMERS-TRIGGEREN ER DAG-SCOPET (06:00-18:00):
+#   `godnat_boern_active` ON mens `godnat_active` er OFF er IKKE en stuck state
+#   om aftenen — det er den HELT NORMALE tilstand fra børnene er puttet (~19:50)
+#   til de voksne går i seng. Den ramte os ikke i drift kun fordi flanken
+#   mangler: godnat_active gaar off kl 06:00, saa 2-timers-triggeren fyrer 08:00
+#   og er forlaengst passeret naar putningen begynder.
+#   MEN enhver aften-clear af godnat_active (godnat_auto_clear_on_activity,
+#   manuel godmorgen, eller — som 2026-08-06 — en reparation af et fejl-tryk)
+#   giver en FRISK off-flanke → 2 timer senere blev boernenes natbeskyttelse
+#   revet vaek over et sovende barn: `binary_sensor.godnat_any_active` falder,
+#   og `presence_light_boernevaerelse_on` er dermed armeret paa naeste
+#   radar-flanke = fuldt loft kl 23. Fejlklasse #19 i ren form (handlingen
+#   arvede gatens tidspunkt i stedet for at have sit eget).
+#   Triggerens formaal er ifoelge dens egen beskrivelse "burde vaere clearet i
+#   wakeup-flow" = et MORGEN-anliggende, saa dag-vinduet tager intet fra den.
+#   Bagkant 18:00 ligger foer `putning_vindue_start` (18:45) med margin.
+#   De to oevrige triggers (daglig 09:00 + ha_start) er urOrte.
+# =============================================================================
+
+- id: godnat_subflag_safety_clear
+  alias: "Godnat: safety-clear stuck sub-flags"
+  description: >
+    Auto-clear godnat_voksne_active + godnat_boern_active hvis godnat_active
+    er off i 2+ timer (= burde vaere clearet i wakeup-flow). Fyrer ogsaa
+    dagligt 09:00 som fallback. A19 fix sprint 2026-05-06: tilfojet
+    early-weekend-clear automation nedenfor for at fange voksen-only godnat
+    der lingerer hele weekend morgen.
+  mode: single
+  trigger:
+    # Daglig safety-net 09:00 (efter alle wakeup-automations skulle have fyret)
+    - platform: time
+      at: "09:00:00"
+      id: morning
+    # Når godnat_active har vaeret off i 2 timer (= ingen aktiv godnat-session)
+    - platform: state
+      entity_id: input_boolean.godnat_active
+      to: "off"
+      for:
+        hours: 2
+      id: godnat_off_long
+    # HA start (catch stale state efter restart)
+    - platform: homeassistant
+      event: start
+      id: ha_start
+  condition:
+    # Skip hvis godnat_active er on (= aktiv session, sub-flags burde vaere on)
+    - condition: state
+      entity_id: input_boolean.godnat_active
+      state: "off"
+    # Mindst en sub-flag skal vaere on for at handle
+    - condition: or
+      conditions:
+        - condition: state
+          entity_id: input_boolean.godnat_voksne_active
+          state: "on"
+        - condition: state
+          entity_id: input_boolean.godnat_boern_active
+          state: "on"
+        # 2026-06-06: fang også strandet puttelys-nedtrapning (fx HA-restart
+        # mid-descent → descent_active stuck on, suppress'er presence-lights).
+        - condition: state
+          entity_id: input_boolean.puttelys_descent_active
+          state: "on"
+        # 2026-06-12: phase1_fired er rutinemæssigt on morgenen efter (fase 1
+        # tændte i går aftes) — clear den dagligt så aftenens bad-trigger +
+        # slider-bagkant er armeret igen.
+        - condition: state
+          entity_id: input_boolean.puttelys_phase1_fired
+          state: "on"
+    # HA start: vent 60 sek saa flags har naaet at restore fra registry
+    - condition: template
+      value_template: >
+        {{ trigger.id != 'ha_start' or
+           (now() - states.input_boolean.godnat_active.last_changed).total_seconds() > 60 }}
+    # 2026-08-06: 2-timers-triggeren maa KUN rydde i dagtimerne — se headeren.
+    # Om aftenen er boern_active on + godnat_active off den normale
+    # putte-tilstand, ikke en stuck state, og en clear dér afvæbner
+    # godnat_any_active over et sovende barn.
+    - condition: template
+      value_template: >
+        {{ trigger.id != 'godnat_off_long'
+           or today_at('06:00') <= now() < today_at('18:00') }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Godnat safety-clear"
+        message: >
+          Trigger={{ trigger.id }} — auto-clearing stuck sub-flags
+          (voksne={{ states('input_boolean.godnat_voksne_active') }},
+          boern={{ states('input_boolean.godnat_boern_active') }})
+    # A53 + A59 fix audit-3 2026-05-06 PM: tilfojet godnat_pending + kalde_active
+    # til clear-list. Tidligere kun voksne + boern blev clearet → hvis HA restartede
+    # mid-godnat-flow, godnat_pending stuck on → blokerede next press OG
+    # presence_light_stue_off. Plus kalde_active stuck if restart mid-kalde.
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          - input_boolean.godnat_voksne_active
+          - input_boolean.godnat_boern_active
+          - input_boolean.godnat_pending
+          - input_boolean.kalde_active
+          - input_boolean.puttelys_descent_active
+          - input_boolean.puttelys_phase1_fired
+
+# =============================================================================
+# A19 — Weekend early voksne clear (sprint 2026-05-06)
+# =============================================================================
+# Hvorfor: weekend mornings = ingen alarm = wakeup_alarm_driven fyrer ikke =
+# godnat_voksne_active lingerer indtil 09:00 daily safety-clear. I de 3-4
+# timer mellem user wakeup (~06-07) og 09:00 fyrer arrival_welcome dim mode
+# (A22) selv om user er fuldt vågen → annoying.
+#
+# Fix: hvis user er fuldt vågen (sove apollo lux > 30 + sove ikke occupied
+# 5 min sustained = de er gået ud af sove), clear voksne_active tidligere.
+# Krav: Active state + weekend.
+# =============================================================================
+
+- id: godnat_voksne_weekend_early_clear
+  alias: "Godnat: Weekend early-clear voksne_active når user clearly oppe"
+  description: >
+    Detect "user wakeup" på weekend uden alarm-driven trigger.
+    A25+A26 fix sprint 2026-05-06 PM: refaktoreret trigger-pattern.
+    Tidligere brugte 2 separate triggers (still_target OR lux) men conditions
+    krævede BEGGE → effektivt fyrede kun ved overlap. Nu bruger template-
+    trigger der garanterer begge signaler er gyldige ved fire-tid.
+    Plus lux-fallback så det stadig fyrer hvis Apollo lux chip dør (jf B12).
+  mode: single
+  trigger:
+    # A25 fix: template-trigger der requires begge signaler ELLER time-fallback
+    # ELLER (lux unavailable + sove tom + tid efter 08:00 = lux fallback per A26).
+    - platform: template
+      value_template: >
+        {% set sove_off = is_state('binary_sensor.sovevaerelse_apollo_radar_still_target', 'off') %}
+        {% set lux = states('sensor.sovevaerelse_lux_reel') %}
+        {% set lux_avail = lux not in ['unknown', 'unavailable', 'none'] %}
+        {% set lux_high = lux_avail and (lux | float(0)) > (states('input_number.godnat_weekend_ryd_lux') | float(30)) %}
+        {% set lux_unavail_late = (not lux_avail) and now().hour >= 8 %}
+        {{ sove_off and (lux_high or lux_unavail_late) }}
+      for:
+        minutes: 5
+    # Plus daglig backup time-trigger 09:30 (catches case hvor sove blev tom
+    # før 06:00, eller hvor template-trigger ikke fyrer pga state-flickering).
+    - platform: time
+      at: "09:30:00"
+      id: backup_time
+  condition:
+    # Kun weekend (workday automation håndterer hverdage via wakeup_alarm_driven)
+    - condition: state
+      entity_id: binary_sensor.workday_sensor
+      state: "off"
+    # Voksne_active er stuck on
+    - condition: state
+      entity_id: input_boolean.godnat_voksne_active
+      state: "on"
+    # godnat_active off (= ikke aktiv full godnat)
+    - condition: state
+      entity_id: input_boolean.godnat_active
+      state: "off"
+    # Sove must be empty (sustained) — match trigger semantics
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_apollo_radar_still_target
+      state: "off"
+    # A26 fix: lux check med fallback. Hvis lux > godnat_weekend_ryd_lux (30) OK. Hvis lux unavailable
+    # OG tid >= 08:00, accept (= dagslys er sandsynligt, plus user er sikkert oppe
+    # på det tidspunkt på weekend).
+    - condition: template
+      value_template: >
+        {% set lux = states('sensor.sovevaerelse_lux_reel') %}
+        {% set lux_avail = lux not in ['unknown', 'unavailable', 'none'] %}
+        {% if lux_avail %}
+          {{ (lux | float(0)) > (states('input_number.godnat_weekend_ryd_lux') | float(30)) }}
+        {% else %}
+          {{ now().hour >= 8 }}
+        {% endif %}
+    # Morning vindue (skip nattetid hvor user måske bare er på toilet)
+    - condition: time
+      after: "06:00:00"
+      before: "12:00:00"
+    # House Active (= folk hjemme)
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+  action:
+    - service: logbook.log
+      data:
+        name: "Godnat weekend early-clear"
+        message: >
+          Weekend morning detect: sove tom 5 min + lux={{ states('sensor.sovevaerelse_lux_reel') }}
+          → clearing voksne_active early (wakeup_alarm_driven didn't fire).
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.godnat_voksne_active
+
+# =============================================================================
+# Puttelys-descent: forældreløst flag (2026-08-20)
+# =============================================================================
+# Hvorfor: puttelys_descent_run holder input_boolean.puttelys_descent_active on
+# gennem hele sin ~20 min koreografi (sat i trin 1, ryddet i sidste trin). En
+# `script.reload` — fx et helt normalt deploy — DRÆBER det kørende script midt i
+# dens delay, og så ryddes flaget aldrig. Det skete live 2026-08-20 19:06.
+#
+# Konsekvensen er ikke kosmetisk: fase 2 (natlys senest 20:30) og flere
+# presence-veje er gatet på descent_active == off, så et hængende flag betyder
+# at børnene slet ikke får natlys den nat.
+#
+# Den eksisterende safety-clear ovenfor fanger det IKKE: dens triggers er
+# `homeassistant.start` (en reload er ikke en restart) og "godnat_active off i
+# 2 t", som med vilje kun må rydde 06-18. En descent dør pr. definition om
+# aftenen. → egen backstop.
+#
+# Invariant: input_boolean.puttelys_descent_active tændes KUN af
+# puttelys_descent_run (verificeret 2026-08-20: alle andre referencer er
+# turn_off eller conditions). Flag on + script ikke kørende = strandet.
+# time_pattern frem for flanke, så den også rydder et flag der allerede stod
+# forkert da automationen blev loadet (fejlklasse #4/#15).
+# Ingen mode-gate: at rydde et strandet flag SLIPPER en blokering, og det skal
+# også ske for en gæst (AirBnB-regel 2/5).
+- id: puttelys_descent_flag_orphan_clear
+  alias: "Puttelys: ryd strandet descent-flag (script dræbt af reload)"
+  description: >
+    Rydder puttelys_descent_active når descent-scriptet ikke længere kører.
+    Uden den blokerer et forældreløst flag natlyset resten af natten.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "on"
+    - condition: state
+      entity_id: script.puttelys_descent_run
+      state: "off"
+    # Grace: scriptet sætter flaget i sit første trin, så et tick der lander
+    # præcis dér må ikke rydde det. 2 min > enhver opstartsrace.
+    - condition: template
+      value_template: >-
+        {{ (now() - states.input_boolean.puttelys_descent_active.last_changed).total_seconds() > 120 }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Puttelys (nedtrapning)"
+        message: >-
+          Strandet descent-flag ryddet: puttelys_descent_active stod on, men
+          script.puttelys_descent_run kører ikke (dræbt af reload/restart).
+          Natlys-bagkanten kl {{ states('input_datetime.natlys_start') }} er
+          nu ugated igen.
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.puttelys_descent_active

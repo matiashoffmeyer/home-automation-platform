@@ -1,0 +1,269 @@
+# =============================================================================
+# Entré Styrbar kort-NED → Dormant efter N min tomt hus (user-spec 2026-07-09)
+# =============================================================================
+# User: "short click down on entre styrbar should declare dormant after 15min
+# if there is no presence in the apartment and the terasse door is closed."
+#
+# Kort-NED = "sluk alt + jeg går nu"-intent. 2026-06-02-reglen ("entré-Styrbar
+# må ikke sætte Dormant DIREKTE") respekteres: vi sætter IKKE Dormant ved
+# trykket, men ARMERER en evaluering der løber fra N min efter trykket til
+# vinduet udløber (slidere, default 5 → 30 min):
+#
+#   Tryk kort-NED (Normal-mode) → stemp `entre_ned_dormant_armed`.
+#   Fra N min efter trykket evalueres HVERT minut; Dormant KUN hvis ALT holder:
+#     - huset stadig Active + ikke AirBnB (AirBnB har sin egen 60-min-regel)
+#     - INGEN senere entré-Styrbar-tryk (TOP=undo/hjemme igen → annullér)
+#     - activity_state == 'idle' (ingen presence i noget rum; med terrassedør-
+#       åben→terrasse_active-reglen kan 'idle' ikke opstå med åben dør)
+#     - køkken + depot occupancy off (activity_state's kendte gap, jf.
+#       dormant_idle.yaml; unavailable ≠ off → fail-closed)
+#     - terrassedøren LUKKET (user-spec: åben dør = vi er på terrassen)
+#     - wasp_dormant_allowed on. NED-trykket ARMERER selv udgangen (se nedenfor).
+#       Bliver nogen alligevel hjemme og slår sig ned, afvæbner wasp-guardens
+#       presence-gren den igen inden for ~20 s → ingen Dormant hen over hovedet
+#       på en sovende/stille person.
+#   Stemplet ryddes når Dormant erklæres, ved et senere entré-tryk, eller når
+#   vinduet udløber → ingen sen efter-fyring (fx om natten timer senere når
+#   radaren taber en sovende krop).
+#
+# 2026-08-29 (måling): one-shot'en var for skrøbelig. User trykkede NED 09:22:33
+# mens familien stadig pakkede; tjekket faldt 09:28:00 — 55 s FØR hoveddøren
+# overhovedet lukkede (09:28:55) — så huset var ikke tomt, stemplet blev ryddet,
+# og signalet var brændt. Huset stod Active i 2½ time med tomt hus. User-spec
+# samme dag: "det betyder at vi er ude af huset inden for de næste 30 min" →
+# evalueringen er nu et VINDUE (fejlklasse #4: den re-armer indtil vinduet
+# lukker), ikke ét skud. Slider = 0 → feature slået fra.
+#
+# Og trykket armerer nu selv wasp-udgangen: den gamle tekst antog at "hoveddøren
+# man går ud ad armerer den igen", men NED-trykkets egen stempling af
+# `styrbar_last_press_entre` afvæbnede waspen (knap = menneske indenfor), og går
+# man ud ad en dør der ALLEREDE stod åben, kommer der aldrig en ny åbne-flanke.
+# Målt 29/8: waspen faldt off 09:22:33 (= trykket) og blokerede derefter BÅDE
+# denne vej, dormant_idle og 3t-vejen resten af dagen. Trykket er en eksplicit
+# menneskelig udgangs-erklæring — det skal arme udgangen, ikke afvæbne den.
+# Restart-sikker: stemplet er input_datetime (persistent) + /1-poll.
+# =============================================================================
+
+input_number:
+  entre_ned_dormant_minutter:
+    name: "Entré NED: minutter til Dormant-tjek"
+    icon: mdi:home-clock-outline
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+  entre_ned_dormant_vindue_minutter:
+    name: "Entré NED: vindue for Dormant-tjek"
+    icon: mdi:timer-sand
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+    # Hvor længe efter trykket vi bliver ved med at gen-evaluere (user-spec
+    # 2026-08-29: "vi er ude af huset inden for de næste 30 min"). Klampes
+    # nedad til entre_ned_dormant_minutter — et vindue kortere end den første
+    # evaluering ville betyde nul forsøg.
+
+input_datetime:
+  # Runtime-stempel (IKKE config → ikke i snapshot). Sentinel 1970 = ikke armet.
+  entre_ned_dormant_armed:
+    name: "Entré NED: Dormant-tjek armet kl."
+    has_date: true
+    has_time: true
+
+automation:
+  # --- ARM: kort-NED på entré-Styrbar (samme event som sluk-alt-handleren) ---
+  - id: entre_ned_dormant_arm
+    alias: "Entré NED: armer Dormant-tjek (kort-NED)"
+    description: >
+      Stempler tidspunktet for kort-NED. Evalueringen (én gang, N min senere)
+      ligger i entre_ned_dormant_fire. AirBnB undtaget (har egen 60-min-regel).
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "8d:72:8b:88:07:4a:d1:aa"
+          command: "off"
+    condition:
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: template
+        value_template: "{{ (states('input_number.entre_ned_dormant_minutter') | float(0)) > 0 }}"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.entre_ned_dormant_armed
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      # Erklær udgangen over for wasp-guarden. Skal ligge EFTER en kort delay:
+      # NED-handleren stempler `styrbar_last_press_entre` i samme sekund, og
+      # wasp_disarm_on_indoor_presence' knap-gren afvæbner på netop det stempel.
+      # Rækkefølgen mellem de to automations er en lodtrækning, så vi skriver
+      # sidst i stedet for at slække knap-grenen (den beskytter alle de andre
+      # rums knapper korrekt — #2: rør ikke den delte regel for ét særtilfælde).
+      # Sikkert fordi wasp-guardens presence-gren afvæbner igen efter ~20 s
+      # vedvarende ophold, hvis nogen alligevel blev hjemme.
+      - delay:
+          seconds: 5
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.wasp_exit_armed
+      - service: logbook.log
+        data:
+          name: "Entré NED Dormant"
+          message: >-
+            Kort-NED → Dormant-tjek armeret: evalueres fra om
+            {{ states('input_number.entre_ned_dormant_minutter') | int(15) }} min
+            og indtil {{ states('input_number.entre_ned_dormant_vindue_minutter') | int(30) }}
+            min efter trykket (tomt hus + terrassedør lukket → Dormant).
+            Wasp-udgang armeret.
+
+  # --- FIRE: én evaluering når N min er gået ---
+  - id: entre_ned_dormant_fire
+    alias: "Entré NED: Dormant-tjek efter N min (vindue)"
+    description: >
+      /1-poll: fra N min efter stemplet evalueres tomt-hus-betingelserne hvert
+      minut, indtil huset går Dormant, et nyt entré-tryk annullerer, eller
+      vinduet udløber (stemplet ryddes i alle tre tilfælde).
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      # Armet + N min gået (sentinel 1970 / tom = ikke armet; slider 0 = fra).
+      - condition: template
+        value_template: >-
+          {% set a = states('input_datetime.entre_ned_dormant_armed') %}
+          {% set n = states('input_number.entre_ned_dormant_minutter') | float(0) %}
+          {% if n <= 0 or a in ['unknown','unavailable',''] or a.startswith('1970') %}
+            false
+          {% else %}
+            {{ (now() - strptime(a, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds()
+               >= n * 60 }}
+          {% endif %}
+    action:
+      # Fang armerings-tidspunktet FØR stemplet ryddes (bruges til "ingen
+      # senere entré-tryk"-tjekket nedenfor).
+      - variables:
+          armed_ts: >-
+            {{ as_timestamp(strptime(states('input_datetime.entre_ned_dormant_armed'),
+               '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)) }}
+          # Ingen senere entré-Styrbar-tryk (TOP=undo, nyt NED, L/R): sidste
+          # entré-tryk må ikke ligge EFTER armeringen (+5 s tolerance — NED
+          # selv stempler last_press i samme sekund). Et senere tryk = huset
+          # er i brug igen → annullér vinduet.
+          senere_tryk: >-
+            {% set lp = states('input_datetime.styrbar_last_press_entre') %}
+            {% if lp in ['unknown','unavailable',''] %}
+              {{ false }}
+            {% else %}
+              {{ as_timestamp(strptime(lp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo))
+                 > (armed_ts | float(0)) + 5 }}
+            {% endif %}
+          # Vinduet kan ikke være kortere end den første evaluering.
+          udloebet: >-
+            {% set v = states('input_number.entre_ned_dormant_vindue_minutter') | float(30) %}
+            {% set n = states('input_number.entre_ned_dormant_minutter') | float(5) %}
+            {{ (as_timestamp(now()) - (armed_ts | float(0))) >= ([v, n] | max) * 60 }}
+      - if:
+          - condition: state
+            entity_id: input_select.house_state
+            state: "Active"
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: input_select.house_mode
+                state: "AirBnB"
+          - condition: template
+            value_template: "{{ not senere_tryk }}"
+          # Ingen presence i lejligheden: activity_state idle + de to rum
+          # activity_state ikke dækker (jf. dormant_idle.yaml).
+          - condition: state
+            entity_id: sensor.activity_state
+            state: "idle"
+          - condition: state
+            entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+            state: "off"
+          - condition: state
+            entity_id: binary_sensor.depot_valhorn_occupancy
+            state: "off"
+          # Terrassedøren LUKKET (user-spec; åben = vi er på terrassen).
+          - condition: state
+            entity_id: binary_sensor.parasoll_terrassedoer
+            state: "off"
+          # Wasp-in-a-box: NED-trykket armerede selv udgangen — er den afvæbnet
+          # igen, har nogen slået sig ned indenfor siden trykket.
+          - condition: state
+            entity_id: binary_sensor.wasp_dormant_allowed
+            state: "on"
+        then:
+          # Ryd stemplet: vinduet er brugt.
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.entre_ned_dormant_armed
+            data:
+              datetime: "1970-01-01 00:00:00"
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.house_state
+            data:
+              option: "Dormant"
+          # 2026-07-10: entré-NED = MANUEL dvale-erklæring → engagér dvale-låsen
+          # (kun hoveddør/GPS må vække; flaps blokeres). Kører via time_pattern-
+          # poll (user_id none) → engage-automationen i dormant_door_lock.yaml
+          # fanger den ikke, så vi sætter låsen eksplicit her.
+          - if:
+              - condition: state
+                entity_id: input_boolean.dormant_door_lock_enabled
+                state: "on"
+            then:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.dormant_door_lock
+          # Samme oprydning som de øvrige Dormant-paths (dormant_idle.yaml /
+          # dormant_schedule.yaml): clear godnat-flags + sluk indvendige lys
+          # (idempotent — NED-trykket har typisk allerede slukket alt).
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !include ../rosters/godnat_flag.yaml
+          - service: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: light.alle_indvendige
+            data:
+              transition: 10
+          - service: logbook.log
+            data:
+              name: "Entré NED Dormant"
+              message: >-
+                Kort-NED for {{ states('input_number.entre_ned_dormant_minutter') }}+
+                min siden, huset tomt + terrassedør lukket + wasp tillader → Dormant.
+        else:
+          # Tjekket faldt. Vinduet holdes åbent så længe der er tid tilbage og
+          # ingen har trykket sig hjem igen — huset når typisk først til ro
+          # nogle minutter efter at man faktisk er ude ad døren.
+          - if:
+              - condition: template
+                value_template: "{{ senere_tryk or udloebet }}"
+            then:
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.entre_ned_dormant_armed
+                data:
+                  datetime: "1970-01-01 00:00:00"
+              - service: logbook.log
+                data:
+                  name: "Entré NED Dormant"
+                  message: >-
+                    Dormant-tjek opgivet ({{ 'nyt entré-tryk' if senere_tryk
+                    else 'vinduet udløb' }}) — huset forbliver
+                    {{ states('input_select.house_state') }}.

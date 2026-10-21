@@ -1,0 +1,480 @@
+# =============================================================================
+# Morning Lights Sanity Check — auto-sluk hvis lyst nok eller tomt for længe
+# =============================================================================
+# User-spec 2026-05-08:
+#   "i hele morgen-rutinen skal der jo ikke være lys i rum hvor der ikke er
+#    mennesker (i noget tid) og især ikke hvis der også er lyst i rummet?
+#    det skal fixes. lav et morgen-rutine check som sikre dig at ting giver
+#    logisk mening."
+#
+# Concrete trigger today (2026-05-08): wakeup_kids fyrede 06:05, blev killed
+# af HA restart 06:18 mid-Phase-2. Boern light stuck 18% warm i 36+ min mens
+# Child B var i rummet + dagslys steg. Lyset skulle have slukket sig selv da:
+#   - Lux over rummets dagslys-sluk (dagslys gør jobbet) ELLER
+#   - Occupancy off i 10+ min (rummet tomt)
+#
+# Per-room scope (kun rum med online sensorer pre-flyt):
+#   - boern (occupancy = boern Apollo; lux = sensor.boernevaerelse_lux_reel,
+#     der ER open_plan × andel — altså stadig BEVIDST ikke boern-Apollo-lux,
+#     hvor rummets egen pære ville påvirke målingen → selv-sluk-feedback.
+#     2026-08-19d: tærsklen er rummets fælles dagslys_sluk_effektiv, så denne
+#     og presence_lux_boernevaerelse_off ikke kan drifte fra hinanden.)
+#   - sove  (Apollo lux + occupancy ✓)
+#   - entre (Myggspray Matter lux + occupancy ✓)
+#
+# Pre-flyt skipped (Apollo offline per B14 backlog):
+#   - stue, spisestue, bad, depot
+# Disse fanges af eksisterende presence_lights_X_off (5-min absence rules).
+#
+# Time window: 06:00-12:00 (morgen vindue — efter dette tager normal
+# presence_lights over).
+#
+# IGNORE conditions (= respekter user-intent, skip auto-off):
+#   - cinema_active / cirkus_active = on (mood mode)
+#   - godnat_any_active = on (kids/voksne i seng — auto-off allerede sker via
+#     drift_back ceiling)
+# =============================================================================
+
+# --- BOERN: auto-off hvis lyst nok ELLER rummet tomt ---
+- id: morning_boern_auto_off_when_bright_or_empty
+  alias: "Morgen: Børn lys auto-sluk (lyst eller tomt)"
+  description: >
+    Slukker børnelyset hvis (a) rummet er lyst nok i 5 min ELLER (b) occupancy
+    off i 10 min, mellem 06:00-12:00. Forhindrer wakeup-script-rester i at
+    forblive on hele formiddagen.
+    2026-08-19d: lux-vejen målte `open_plan_lux > 50` — en anden SKALA end den
+    tærskel rummets egen dagslys-sluk bruger (rum-lux = open-plan × 35 %, så
+    de 50 svarede til 17,5 i rummet, under tænd-tærsklen = on/off-krig). Nu
+    rummets egen lux mod sensor.boernevaerelse_dagslys_sluk_effektiv, samme tal
+    som presence_lux_boernevaerelse_off.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # A) Rummet er lyst nok — for: 5 min så et kortvarigt glimt ikke tæller
+    - platform: numeric_state
+      entity_id: sensor.boernevaerelse_lux_reel
+      above: sensor.boernevaerelse_dagslys_sluk_effektiv
+      for:
+        minutes: 5
+      id: bright
+    # B) Occupancy off i 10 min (rummet tomt)
+    - platform: state
+      entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+      to: "off"
+      for:
+        minutes: 10
+      id: empty
+    # C) 2026-07-17 bug hunt (fejlklasse #4): kanten kan ligge FØR vinduet —
+    # sommer-morgen krydser open_plan_lux 50 før kl 06 → bright-triggeren
+    # fyrer ALDRIG den dag (og en occupancy-off-kant før 06 er også tabt).
+    # Re-tjek ved vindue-start (samme fix-mønster som morning_curtains
+    # 2026-06-24); recheck-condition nedenfor gater denne trigger på at
+    # bright/empty faktisk er opfyldt NU.
+    - platform: time
+      at: "06:01:00"
+      id: window_start
+  condition:
+    # 2026-09-02 (AirBnB-audit): denne fil havde NUL house_mode-gate. Alle fire
+    # automations SLUKKER lys i soveværelset/børneværelset 05-12 — præcis de to
+    # rum en gæst sover i, og præmissen (rester fra husets vækkekæde) findes
+    # ikke i AirBnB, hvor hele vækkekæden er lockdown-disabled. En gæst der
+    # tænder lyset en lys morgen fik det fadet ud efter 5 min uden escape-vej
+    # (standing instruction "ALT skal spille med AirBnB", punkt 2 + 5).
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+    # 2026-09-02: den ÆGTE "skip aktiv wakeup"-guard. Den gamle nedenfor tester
+    # godnat_any_active, som er RYDDET (~06:07) når vækningen kører — den var
+    # sand under hele rampen og beskyttede intet (fejlklasse #3).
+    - condition: state
+      entity_id: binary_sensor.boernevaerelse_vaekning_hold
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.morning_sanity_enabled
+      state: "on"
+    # Time vindue: morgen kun (efter 12:00 = lunch+nap, drift_back tager over)
+    - condition: time
+      after: "06:00:00"
+      before: "12:00:00"
+    # window_start-recheck: tids-triggeren må kun slukke hvis bright/empty
+    # reelt er opfyldt (edge-triggerne bærer selv deres krav via for:).
+    - condition: template
+      value_template: >
+        {% if trigger.id == 'window_start' %}
+          {% set thr = states('sensor.boernevaerelse_dagslys_sluk_effektiv') | float(0) %}
+          {% set bright = thr > 0 and states('sensor.boernevaerelse_lux_reel') | float(-1) > thr %}
+          {% set occ = states.binary_sensor.boernevaerelse_apollo_occupancy %}
+          {% set empty = occ is not none and occ.state == 'off'
+             and (now() - occ.last_changed).total_seconds() >= 600 %}
+          {{ bright or empty }}
+        {% else %}
+          true
+        {% endif %}
+    # Lyset skal være ON (ellers ingen point).
+    # 2026-08-19 (fejlklasse #1 + selv-afvæbning, user-bug "børneværelset brændte
+    # unødigt i morges"): gaten stod på loftet ALENE, mens action'en også kun
+    # slukkede loft+lampe. Målt samme dag: vækningen tændte 06:11 loft +
+    # hygge-strip (+ plug-lampen 06:12:30); sanity slukkede loftet 06:22:51 — og
+    # gjorde derved sin EGEN gate falsk, så den aldrig kunne fyre igen. Strip og
+    # plug-lampe brændte videre til et menneske trykkede på Styrbar 08:15:26 =
+    # 124 minutter. En automation der slukker en delmængde af rummet må ikke
+    # gate på den delmængde, ellers afvæbner den sig selv ved at gøre sit job
+    # halvt. Nattelyset er beskyttet af godnat-gaten + 06-12-vinduet nedenfor.
+    - condition: template
+      value_template: >-
+        {% from 'rosters.jinja' import boern_alle_lys %}{{ boern_alle_lys
+           | select('is_state', 'on') | list | length > 0 }}
+    # Skip mood modes (user intent: holdt lys)
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_boernevaerelse
+      state: "off"
+    # Skip godnat (= drift_back håndterer)
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+  action:
+    - service: logbook.log
+      data:
+        name: "Morgen sanity: børn auto-off"
+        message: >-
+          Trigger={{ trigger.id }} (rum-lux={{ states('sensor.boernevaerelse_lux_reel') }}
+          vs tærskel {{ states('sensor.boernevaerelse_dagslys_sluk_effektiv') }},
+          occupancy={{ states('binary_sensor.boernevaerelse_apollo_occupancy') }}).
+          Slukker {% from 'rosters.jinja' import boern_alle_lys %}{{ boern_alle_lys
+                     | select('is_state', 'on') | list | join(', ') }} (4s smooth fade).
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        # 2026-08-19: strip + plug-lampe TILFØJET — vækningen tænder dem, og
+        # uden dem her overlevede de hele formiddagen (se gaten ovenfor).
+        entity_id: !include ../rosters/boern_alle_lys.yaml
+      data:
+        transition: 4
+    # 2026-07-17 bug hunt (fejlklasse #1, skjult med-ejer): bright-grenen
+    # slukker mens occupancy=on → boernevaerelse_manual_off_lock's ARM
+    # ("loft off mens optaget") tolkede DENNE auto-sluk som bruger-intent og
+    # blokerede alt bevægelses-tænd resten af dagen (morgen-backstoppen 05:45
+    # var allerede passeret). Ryd låsen efter ARM'ens 2s-debounce — en
+    # sanity-sluk er ikke en manuel sluk.
+    - delay:
+        seconds: 5
+    # 2026-08-23: ryd IKKE under gæste-hold — dér er låsen bevidst holdt, og
+    # dens eneste udgange er Styrbar OP + 10:00-backstoppen.
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_gaest_sover
+      state: "off"
+    - service: input_boolean.turn_off
+      continue_on_error: true
+      target:
+        entity_id: input_boolean.boernevaerelse_manual_off_lock
+
+# --- SOVE: auto-off hvis lyst nok ELLER rummet tomt ---
+# Sove har samme issue: wakeup-script-rester (fra alarm-driven adult wakeup),
+# eller manual ON forglemt da parent gik. Lux > 50 + dagslys = unødvendigt.
+- id: morning_sove_auto_off_when_bright_or_empty
+  alias: "Morgen: Sove lys auto-sluk (lyst eller tomt)"
+  description: >
+    Slukker sove_loft hvis (a) Apollo lux > 50 i 5 min ELLER (b) occupancy
+    off i 10 min, mellem 07:00-12:00. NB: senere start (07:00) end boern
+    fordi sove kan være intentionelt tændt under alarm-driven wakeup
+    indtil ~06:30.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # 2026-08-19 (user-bug "soveværelse lyset brænder unødigt"): tærsklen var
+    # hardcodet 50 mens rummets TÆND-gate er sensor.sovevaerelse_lux_gate
+    # (11,2) = et dødbånd på 4,5× hvor lyset er ubegrundet men udødeligt.
+    # Nu udledt: min(50, max(gate × hysterese, 10)). Se sensorens kommentar i
+    # packages/room_lux_tuning.yaml for måledata.
+    - platform: numeric_state
+      entity_id: sensor.sovevaerelse_lux_reel
+      above: sensor.sovevaerelse_dagslys_sluk_effektiv
+      for:
+        minutes: 5
+      id: bright
+    - platform: state
+      entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+      to: "off"
+      for:
+        minutes: 10
+      id: empty
+    # 2026-07-17 bug hunt (fejlklasse #4): sommer-lux krydser 50 før kl 07 →
+    # bright-kanten tabt for dagen (automationen havde ALDRIG fyret, last_
+    # triggered=None). Re-tjek ved vindue-start, gated i condition nedenfor.
+    - platform: time
+      at: "07:01:00"
+      id: window_start
+  condition:
+    # 2026-09-02 (AirBnB-audit): denne fil havde NUL house_mode-gate. Alle fire
+    # automations SLUKKER lys i soveværelset/børneværelset 05-12 — præcis de to
+    # rum en gæst sover i, og præmissen (rester fra husets vækkekæde) findes
+    # ikke i AirBnB, hvor hele vækkekæden er lockdown-disabled. En gæst der
+    # tænder lyset en lys morgen fik det fadet ud efter 5 min uden escape-vej
+    # (standing instruction "ALT skal spille med AirBnB", punkt 2 + 5).
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+    - condition: state
+      entity_id: input_boolean.morning_sanity_enabled
+      state: "on"
+    - condition: time
+      after: "07:00:00"
+      before: "12:00:00"
+    - condition: template
+      value_template: >
+        {% if trigger.id == 'window_start' %}
+          {% set thr = states('sensor.sovevaerelse_dagslys_sluk_effektiv') | float(50) %}
+          {% set bright = states('sensor.sovevaerelse_lux_reel') | float(-1) > thr %}
+          {% set occ = states.binary_sensor.sovevaerelse_apollo_occupancy %}
+          {% set empty = occ is not none and occ.state == 'off'
+             and (now() - occ.last_changed).total_seconds() >= 600 %}
+          {{ bright or empty }}
+        {% else %}
+          true
+        {% endif %}
+    - condition: state
+      entity_id: light.spisestue_pendel
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_sovevaerelse
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+  action:
+    - service: logbook.log
+      data:
+        name: "Morgen sanity: sove auto-off"
+        message: >-
+          Trigger={{ trigger.id }} (lux={{ states('sensor.sovevaerelse_lux_reel') }},
+          tærskel={{ states('sensor.sovevaerelse_dagslys_sluk_effektiv') }},
+          occupancy={{ states('binary_sensor.sovevaerelse_apollo_occupancy') }}).
+          Slukker sove_loft (4s smooth fade).
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        transition: 4
+
+# --- ENTRE: auto-off hvis tomt (entre har Vallhorn lux + occupancy via Myggspray) ---
+# Entre er gennemgangs-rum, ingen "lyst nok"-trigger giver mening (man er der
+# kort). Kun "tomt for længe" → eksisterende entre_motion off-rule håndterer
+# allerede med 15s for_seconds. Ingen ekstra automation nødvendig.
+# DOKUMENTERET: entre_motion.yaml linje X covers entre auto-off.
+
+# =============================================================================
+# FAST LUX SURGE — gardin-roll → øjeblikkelig sluk (sprint 2026-05-13)
+# =============================================================================
+# User-spec 2026-05-13:
+#   "om morgenen, naar jeg manuelt ruller gardiner fra i sovevaerelserne saa
+#    stroemmer lyset ind og LUX stiger kraftigt. naar det sker, saa skal lyset
+#    me det samme finde et passende niveau og maaske slukke."
+#
+# Eksisterende slow-rules (5 min above 50 lux) fanger eventuelt steady-state,
+# men reagerer for langsomt naar user aktivt ruller gardiner. Disse 2 fast
+# variants reagerer paa 5 sek above (morgen_dagslys_lux × lux_threshold_factor) — fanger
+# surge fra rolled curtain inden user faar tid til at undre sig.
+#
+# THRESHOLD: 80 lux * global_lux_threshold_factor
+#   slider=0   → 24 lux (streng — sluk hurtigt)
+#   slider=50  → 80 lux (baseline)
+#   slider=100 → 240 lux (kun ved kraftigt dagslys)
+#
+# WINDOW: 05:00-12:00. Tidligere start end slow-rules fordi user kan rulle
+# gardiner under wakeup-phase (gates beskytter mod active wakeup anyway).
+#
+# FADE: 10 sek (lidt langsommere end instant for at undgaa pludselig moerkt
+# hvis user faktisk vil have lys taendt).
+# =============================================================================
+
+# --- BOERN: fast LUX surge → fade off ---
+- id: morning_boern_lux_surge_fast_off
+  alias: "Morgen: Børn lys fast-off ved LUX surge (gardin rolled)"
+  description: >
+    5 sek above 80*factor → fade off. Reagerer hurtigt naar user manuelt
+    ruller gardin fra om morgenen og LUX stiger pludseligt.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # Template-trigger (mere portabel end numeric_state med templated threshold).
+    # Fires naar lux > (morgen_dagslys_lux × factor) i 5 sek konstant.
+    - platform: template
+      value_template: >
+        {% set lux = states('sensor.open_plan_lux') | float(-1) %}
+        {% set f = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+        {{ lux >= 0 and lux > ((states('input_number.morgen_dagslys_lux') | float(80)) * f) }}
+      for:
+        seconds: 5
+    # 2026-07-17 bug hunt (fejlklasse #4): midsommer krydser lux tærsklen før
+    # kl 05 → template-kanten tabt for dagen. Re-tjek ved vindue-start.
+    - platform: time
+      at: "05:01:00"
+      id: window_start
+  condition:
+    # 2026-09-02 (AirBnB-audit): denne fil havde NUL house_mode-gate. Alle fire
+    # automations SLUKKER lys i soveværelset/børneværelset 05-12 — præcis de to
+    # rum en gæst sover i, og præmissen (rester fra husets vækkekæde) findes
+    # ikke i AirBnB, hvor hele vækkekæden er lockdown-disabled. En gæst der
+    # tænder lyset en lys morgen fik det fadet ud efter 5 min uden escape-vej
+    # (standing instruction "ALT skal spille med AirBnB", punkt 2 + 5).
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+    - condition: state
+      entity_id: input_boolean.morning_sanity_enabled
+      state: "on"
+    - condition: time
+      after: "05:00:00"
+      before: "12:00:00"
+    - condition: template
+      value_template: >
+        {% if trigger.id == 'window_start' %}
+          {% set lux = states('sensor.open_plan_lux') | float(-1) %}
+          {% set f = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {{ lux >= 0 and lux > ((states('input_number.morgen_dagslys_lux') | float(80)) * f) }}
+        {% else %}
+          true
+        {% endif %}
+    # 2026-08-19 (#12 — søster til sanity-reglen ovenfor, samme roster-hul):
+    # gate på HELE rummet, ikke kun loftet.
+    - condition: template
+      value_template: >-
+        {% from 'rosters.jinja' import boern_alle_lys %}{{ boern_alle_lys
+           | select('is_state', 'on') | list | length > 0 }}
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_boernevaerelse
+      state: "off"
+    # Skip aktiv wakeup. 2026-09-02: godnat_any_active kunne ALDRIG bære den
+    # påstand — godnat ryddes ~06:07, altså FØR rampen starter, så guarden var
+    # sand under hele vækningen (fejlklasse #3). Det rigtige anker er holdet.
+    - condition: state
+      entity_id: binary_sensor.boernevaerelse_vaekning_hold
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+    # Skip hvis lyset lige er taendt (= manual cycle / user intent indenfor
+    # sidste 90 sek — respekter manuel BRIGHT override som er det modsatte
+    # signal: user VIL have lys trods dagslys).
+    # 2026-08-19: måles nu på den SENEST tændte af rummets lys, ikke kun loftet
+    # — ellers beskytter guarden ikke en strip der lige er tændt manuelt.
+    - condition: template
+      value_template: >
+        {% set ns = namespace(nyest = 0) %}
+        {% from 'rosters.jinja' import boern_alle_lys %}{% for e in boern_alle_lys
+                     %}
+          {% if is_state(e, 'on') and states[e].last_changed is not none %}
+            {% set lc = as_timestamp(states[e].last_changed) %}
+            {% if lc > ns.nyest %}{% set ns.nyest = lc %}{% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.nyest == 0 or (as_timestamp(now()) - ns.nyest) > 90 }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Morgen surge: børn fast-off"
+        message: >-
+          LUX surge {{ states('sensor.open_plan_lux') }} lux >
+          {{ ((states('input_number.morgen_dagslys_lux') | float(80)) * (states('sensor.global_lux_threshold_factor') | float(1.0))) | round(0) }}.
+          Fade off 10 sek (gardin rolled — naturligt lys nok).
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: !include ../rosters/boern_alle_lys.yaml
+      data:
+        transition: 10
+
+# --- SOVE: fast LUX surge → fade off ---
+- id: morning_sove_lux_surge_fast_off
+  alias: "Morgen: Sove lys fast-off ved LUX surge (gardin rolled)"
+  description: >
+    5 sek above 80*factor → fade off. Reagerer hurtigt naar user manuelt
+    ruller gardin fra om morgenen og LUX stiger pludseligt.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: template
+      value_template: >
+        {% set lux = states('sensor.sovevaerelse_lux_reel') | float(-1) %}
+        {% set f = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+        {{ lux >= 0 and lux > ((states('input_number.morgen_dagslys_lux') | float(80)) * f) }}
+      for:
+        seconds: 5
+    # 2026-07-17 bug hunt (fejlklasse #4): midsommer krydser lux tærsklen før
+    # kl 05 → template-kanten tabt for dagen. Re-tjek ved vindue-start.
+    - platform: time
+      at: "05:01:00"
+      id: window_start
+  condition:
+    # 2026-09-02 (AirBnB-audit): denne fil havde NUL house_mode-gate. Alle fire
+    # automations SLUKKER lys i soveværelset/børneværelset 05-12 — præcis de to
+    # rum en gæst sover i, og præmissen (rester fra husets vækkekæde) findes
+    # ikke i AirBnB, hvor hele vækkekæden er lockdown-disabled. En gæst der
+    # tænder lyset en lys morgen fik det fadet ud efter 5 min uden escape-vej
+    # (standing instruction "ALT skal spille med AirBnB", punkt 2 + 5).
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+    - condition: state
+      entity_id: input_boolean.morning_sanity_enabled
+      state: "on"
+    - condition: time
+      after: "05:00:00"
+      before: "12:00:00"
+    - condition: template
+      value_template: >
+        {% if trigger.id == 'window_start' %}
+          {% set lux = states('sensor.sovevaerelse_lux_reel') | float(-1) %}
+          {% set f = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {{ lux >= 0 and lux > ((states('input_number.morgen_dagslys_lux') | float(80)) * f) }}
+        {% else %}
+          true
+        {% endif %}
+    - condition: state
+      entity_id: light.spisestue_pendel
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_sovevaerelse
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+    # Skip just-turned-on (respekter user intent inden for 90 sek).
+    - condition: template
+      value_template: >
+        {{ (now() - states.light.spisestue_pendel.last_changed).total_seconds() > 90 }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Morgen surge: sove fast-off"
+        message: >-
+          LUX surge {{ states('sensor.sovevaerelse_lux_reel') }} lux >
+          {{ ((states('input_number.morgen_dagslys_lux') | float(80)) * (states('sensor.global_lux_threshold_factor') | float(1.0))) | round(0) }}.
+          Fade off 10 sek (gardin rolled — naturligt lys nok).
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        transition: 10

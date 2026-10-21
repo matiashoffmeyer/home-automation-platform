@@ -1,0 +1,212 @@
+# =============================================================================
+# Per-rum SLUK-FORSINKELSE — sofa-stue + spisestue (2026-08-12, user-spec)
+# =============================================================================
+# "giv mig en slider der styrer hvor hurtigt sofa stue lysene slukker efter
+#  forladt rum, inkl. Global sluk-speed slider's effekt på det. giv mig så det
+#  samme for spisestuen."
+#
+# Model (samme opbygning som room_lux_tuning.yaml):
+#     effektiv ventetid = <rum>_off_minutter × 60 × global_absence_wait_factor
+#   - <rum>_off_minutter (denne fil): rummets EGEN basis-ventetid i minutter
+#     VED NEUTRAL global slider (50). Samme konvention som resten af huset —
+#     børneværelset har fx basis 5 min i presence_boernevaerelse.yaml.
+#     ⚠️ Slider-tallet er derfor IKKE den tid lyset faktisk står tændt; det
+#     står på "Effektiv ventetid"-tilen lige under slideren.
+#   - sensor.global_absence_wait_factor (packages/global_tuning.yaml, slider
+#     input_number.global_turn_off_aggressiveness, 50 = 1.0×): flytter ALLE rum
+#     samlet — 0 = 20× tålmodig, 100 = 0.01× næsten instant.
+#
+# DEFAULT 2,5 min er KALIBRERET, ikke gættet: presence_stue.yaml havde 20 min
+# HARDKODET og dermed U-SKALERET, mens alle andre rum ganges med den globale
+# faktor. Brugerens globale sluk-slider står på 30 = 8,6×, så en "pæn" default
+# på 20 ville have gjort de 20 min til 172 min i ét hug — en 8,6× ændring
+# ingen har bedt om. 2,5 × 8,6 = 21,5 min ≈ den adfærd huset havde i går, og
+# forholdet til børneværelset (basis 5 → 43 min) er dermed også bevaret.
+#
+# Clamp 30 s – 6 t: ved global-slider 0 ville 90 min × 20 blive 30 timer, og en
+# `for:` der er længere end en aften er i praksis "slukker aldrig" — det hører
+# til på 0-enden af en slider, ikke som et uheld af to slidere ganget sammen.
+#
+# SPISESTUENS HURTIG-SLUK (moved_to_sofa) er en FJERDEDEL af rummets egen
+# ventetid, gulv 60 s — den var 5 min mod 20 (2026-07-22), og forholdet skal
+# følge slideren, ellers ville en bruger der sætter spisestuen til 5 min stadig
+# have en 5-min "hurtig"-sluk der aldrig kan nå at være hurtigere (fejlklasse
+# #2: samme regel, to tal der drifter fra hinanden).
+#
+# SCOPE (jf. CLAUDE.md's slider-scope-regel):
+#   • stue_sofa_off_minutter  → light.stue_sofa_lampe(_2), stue_hjoernelampe,
+#     stue_plug, stue_laesehygge (automation presence_light_sofa_off).
+#     Rammer IKKE spisestue-loftet og IKKE køkkenets lys.
+#   • spisestue_off_minutter  → KUN light.spisestue_loft
+#     (automation presence_light_spisestue_off).
+#   Begge er ventetider EFTER rummet er tomt — de rører ikke lux-slukket
+#   ("Lysnet: Stue sluk ved LUX-stigning"), godnat, dormant eller watchdog'en.
+# =============================================================================
+
+input_number:
+  stue_sofa_off_minutter:
+    name: "Sofa-stue sluk-forsinkelse"
+    icon: mdi:sofa-outline
+    min: 0.5
+    max: 90
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: slider
+
+  spisestue_off_minutter:
+    name: "Spisestue sluk-forsinkelse"
+    icon: mdi:silverware-fork-knife
+    min: 0.5
+    max: 90
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-08-19f (user: "og hvor styrer jeg så entre sluk tid?"). Svaret var
+  # INGEN STEDER: entréen er en gennemgangs-zone med sin egen basis på 15 s
+  # (ikke husets 5 min), og de 15 stod HARDKODET to steder i entre_motion.yaml —
+  # i trigger-`for:` og igen i fallback-conditionens template. Samme #2 som de
+  # 12 kopier ovenfor, bare med et andet basistal. Sekunder, ikke minutter:
+  # basis er 15 s, og en minut-slider ville have et kornet-trin større end
+  # hele indstillingen.
+  entre_off_sekunder:
+    name: "Entré sluk-forsinkelse (basis)"
+    icon: mdi:door-open
+    min: 3
+    max: 300
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+template:
+  - sensor:
+      # =====================================================================
+      # HUSETS BASIS-VENTETID "tomt rum → sluk" (konsolideret 2026-08-19d,
+      # user-spec "der er rod i de sliders for lights off (empty until off)")
+      # =====================================================================
+      # De 5 minutter stod HARDCODET som `300 * global_absence_wait_factor` i
+      # 12 kopier fordelt på 6 filer (børn, sove ×3, bad, depot ×2, godnat ×4).
+      # Ingen af dem havde et sted man kunne AFLÆSE hvad de 5 minutter faktisk
+      # var blevet til — og det er hele forvirringen: den globale slider er en
+      # MULTIPLIKATOR på 0,01×-20×, så "5 min" var 43 min ved slider 30 og
+      # 14,5 min ved slider 45. Målt 08-19 kostede netop dét soveværelset 20
+      # minutters unødigt lys, uden at noget i huset viste tallet.
+      #
+      # Denne sensor ER de 12 kopier, samlet. Ren refaktorering: samme udtryk,
+      # ingen clamp tilføjet (de to depot-kald beholder deres egen 600 s-loft).
+      # Vil man ændre husets basis, ændres den ét sted; vil man ændre ét rum,
+      # har rummet sin egen slider (stue/spisestue nedenfor).
+      - name: "Rum tom sluk sekunder"
+        unique_id: rum_tom_sluk_sekunder
+        icon: mdi:timer-sand-complete
+        unit_of_measurement: "s"
+        state: >
+          {{ (300 * (states('sensor.global_absence_wait_factor') | float(1.0))) | int }}
+        attributes:
+          minutter: >
+            {{ ((300 * (states('sensor.global_absence_wait_factor') | float(1.0))) / 60) | round(1) }}
+          basis_minutter: 5
+          global_faktor: "{{ states('sensor.global_absence_wait_factor') | float(1.0) }}"
+          gaelder_for: "børneværelse · soveværelse · depot · godnat-oprydning"
+
+      # Badet er UNDTAGET den globale slider (user-spec 2026-09-17: "bad skal
+      # være undtaget den globale slider. skal ikke ganges op"). Se begrundelsen
+      # ved input_number.badevaerelse_off_minutter i packages/constants.yaml.
+      # Ingen `g` i udtrykket — det er hele pointen. Clamp 60 s – 2 t af samme
+      # grund som de øvrige: en `for:` længere end en aften er "slukker aldrig".
+      - name: "Badevaerelse tom sluk sekunder"
+        unique_id: badevaerelse_tom_sluk_sekunder
+        icon: mdi:shower
+        unit_of_measurement: "s"
+        state: >
+          {% set m = states('input_number.badevaerelse_off_minutter') | float(5) %}
+          {{ [[(m * 60) | round(0) | int, 60] | max, 7200] | min }}
+        attributes:
+          minutter: "{{ states('input_number.badevaerelse_off_minutter') | float(5) | round(1) }}"
+          global_faktor: "undtaget"
+          gaelder_for: "light.badevaerelse_all (Lysnet: Badeværelse gradvis sluk)"
+
+      - name: "Sofa stue off sekunder"
+        unique_id: sofa_stue_off_sekunder
+        icon: mdi:timer-sand
+        unit_of_measurement: "s"
+        # 2026-09-26: solo-hjemme uden for open plan → klampet til
+        # solo_tom_rum_sluk_minutter (packages/solo_hurtig_sluk.yaml).
+        state: >
+          {% set m = states('input_number.stue_sofa_off_minutter') | float(2.5) %}
+          {% set g = states('sensor.global_absence_wait_factor') | float(1.0) %}
+          {% set s = [[(m * 60 * g) | round(0) | int, 30] | max, 21600] | min %}
+          {% if is_state('binary_sensor.solo_uden_for_open_plan', 'on') %}
+            {% set s = [s, [(states('input_number.solo_tom_rum_sluk_minutter') | float(5) * 60) | int, 30] | max] | min %}
+          {% endif %}
+          {{ s }}
+        attributes:
+          # Genberegnes frem for at læse sensorens egen state: en self-reference
+          # lagger ét render bagud (CLAUDE.md, 2026-07-29e).
+          minutter: >
+            {% set m = states('input_number.stue_sofa_off_minutter') | float(2.5) %}
+            {% set g = states('sensor.global_absence_wait_factor') | float(1.0) %}
+            {% set s = [[(m * 60 * g) | round(0) | int, 30] | max, 21600] | min %}
+            {% if is_state('binary_sensor.solo_uden_for_open_plan', 'on') %}
+              {% set s = [s, [(states('input_number.solo_tom_rum_sluk_minutter') | float(5) * 60) | int, 30] | max] | min %}
+            {% endif %}
+            {{ (s / 60) | round(1) }}
+          basis_minutter: "{{ states('input_number.stue_sofa_off_minutter') | float(2.5) | round(1) }}"
+          global_faktor: "{{ states('sensor.global_absence_wait_factor') | float(1.0) }}"
+
+      - name: "Spisestue off sekunder"
+        unique_id: spisestue_off_sekunder
+        icon: mdi:timer-sand
+        unit_of_measurement: "s"
+        # 2026-09-26: solo-hjemme uden for open plan → klampet til
+        # solo_tom_rum_sluk_minutter (packages/solo_hurtig_sluk.yaml).
+        state: >
+          {% set m = states('input_number.spisestue_off_minutter') | float(2.5) %}
+          {% set g = states('sensor.global_absence_wait_factor') | float(1.0) %}
+          {% set s = [[(m * 60 * g) | round(0) | int, 30] | max, 21600] | min %}
+          {% if is_state('binary_sensor.solo_uden_for_open_plan', 'on') %}
+            {% set s = [s, [(states('input_number.solo_tom_rum_sluk_minutter') | float(5) * 60) | int, 30] | max] | min %}
+          {% endif %}
+          {{ s }}
+        attributes:
+          minutter: >
+            {% set m = states('input_number.spisestue_off_minutter') | float(2.5) %}
+            {% set g = states('sensor.global_absence_wait_factor') | float(1.0) %}
+            {% set s = [[(m * 60 * g) | round(0) | int, 30] | max, 21600] | min %}
+            {% if is_state('binary_sensor.solo_uden_for_open_plan', 'on') %}
+              {% set s = [s, [(states('input_number.solo_tom_rum_sluk_minutter') | float(5) * 60) | int, 30] | max] | min %}
+            {% endif %}
+            {{ (s / 60) | round(1) }}
+          basis_minutter: "{{ states('input_number.spisestue_off_minutter') | float(2.5) | round(1) }}"
+          global_faktor: "{{ states('sensor.global_absence_wait_factor') | float(1.0) }}"
+
+      # Entréen: gennemgangs-zone, bevidst UDEN husets 5-minutters basis.
+      # Clamp 3 s – 30 min: ved global-slider 0 (20×) ville 15 s blive 5 min i
+      # en zone hvis hele pointe er at falde mørk hurtigt, og ved 100 (0,01×)
+      # ville lyset dø før man har fået skoene af.
+      - name: "Entre tom sluk sekunder"
+        unique_id: entre_tom_sluk_sekunder
+        icon: mdi:door-closed
+        unit_of_measurement: "s"
+        state: >
+          {% set b = states('input_number.entre_off_sekunder') | float(15) %}
+          {% set g = states('sensor.global_absence_wait_factor') | float(1.0) %}
+          {{ [[(b * g) | round(0) | int, 3] | max, 1800] | min }}
+        attributes:
+          basis_sekunder: "{{ states('input_number.entre_off_sekunder') | float(15) | round(0) | int }}"
+          global_faktor: "{{ states('sensor.global_absence_wait_factor') | float(1.0) }}"
+          maaler_paa: binary_sensor.entre_valhorn_occupancy
+          gaelder_for: "light.entre_loft (automation entre_motion_off)"
+
+      # Sofa-gated hurtig-sluk: man er flyttet fra spisebordet til sofaen.
+      # Beregnes af spisestuens EGEN effektive tid (ikke af sliderne hver for
+      # sig), så de to aldrig kan bytte rækkefølge.
+      - name: "Spisestue sofa off sekunder"
+        unique_id: spisestue_sofa_off_sekunder
+        icon: mdi:sofa
+        unit_of_measurement: "s"
+        state: >
+          {% set m = states('input_number.spisestue_off_minutter') | float(2.5) %}
+          {% set g = states('sensor.global_absence_wait_factor') | float(1.0) %}
+          {% set fuld = [[(m * 60 * g) | round(0) | int, 30] | max, 21600] | min %}
+          {{ [[(fuld * 0.25) | round(0) | int, 60] | max, fuld] | min }}

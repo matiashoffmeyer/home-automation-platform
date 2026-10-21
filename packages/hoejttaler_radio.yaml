@@ -1,0 +1,947 @@
+# =============================================================================
+# Radio på højttaleren (AxiomAir N3, sofastuen) — B193, bygget 2026-10-05
+# =============================================================================
+# User-spec 2026-10-05:
+#   · "spille DR radio … tænde den automatisk om morgenen med lav volumen på p4
+#     når vi begynder at færdes i openplan (antaget at der ikke er nogen der
+#     ligger og sover i voksensoveværelset, hvilket vi jo allerede holder øje med)"
+#   · "lav volumen er nok, faktisk behøver det ikke at være vildt lavt for de
+#     [børnene] må gerne vågne" → 25 %, INGEN børne-gate.
+#   · "hvis jeg er alene hjemme kan du jo nemt se hvornår jeg er oppe … skal også
+#     ha morgenradio når jeg er alene hjemme"
+#   · "når radioen spiller skal styrbar stue blive til en radio kontrol. pilene
+#     skifter kanal (vi skal ha valgt favoritter) og op/ned skruer op og ned.
+#     langt ned slukker. langt op gør det samme som kort op."
+#   · Favoritter: P4 København, P1, P3, P6 Beat, P8 Jazz ("perfekt").
+#
+# STREAMS (verificeret 2026-10-05: alle svarer 200 audio/mpeg, icy-name passer).
+# Region = København (DK2, DMI-station 06180). Radio Browser-integrationen er
+# installeret (alle kanaler i HA's mediebrowser), men Volumio's play_media tager
+# KUN JSON — derfor spiller vi DR direkte med en webradio-JSON (som Volumio's
+# egen replaceAndPlay). Den renderede JSON parses af HA til en DictWrapper, hvis
+# str() er den originale streng, så cv.string giver integrationen præcis JSON'en.
+#
+# RADIO-TILSTAND (binary_sensor.hoejttaler_radio_tilstand) = vi startede en
+# kanal OG playeren spiller en WEBRADIO (media_content_type channel) OG
+# binary_sensor.hoejttaler_online er `on`. Spotify Connect overtager Volumio's
+# state uden at flaget ryddes (08/10 18:59: "playing" Chopin med flaget på P4)
+# → uden typen var pilene radio-skift midt i Spotify, og en besked genoptog
+# radioen i stedet for Spotify. Typen er IKKE nok: Music Assistants strøm
+# melder også 'channel' (13/10) → tilstanden kræver også at
+# binary_sensor.hoejttaler_anden_kilde er off, og Spotify-overtageren
+# (packages/hoejttaler.yaml) rydder kanal-flaget.
+# Volumio-entity'en FRYSER på sidste state når højttaleren slukkes med knappen,
+# så "playing" alene kunne låse Styrbar stue i radio-tilstand for evigt. Online-
+# sensoren (ping-integrationen, oprettes ved parring — tjekliste i
+# docs/hardware_shopping.md) er derfor KRAV: findes den ikke, er tilstanden
+# aldrig on, og fjernbetjeningen styrer lys som altid (fejler sikkert).
+#
+# STYRBAR STUE (IEEE 7e:44:f6:62:8e:f4:b1:23) i radio-tilstand ejes HELT af
+# styrbar_stue_radio herunder — og siden 18/10 også mens Spotify-broen spiller
+# (pile = forrige/næste nummer, langt NED = pause, OP i fortryd-vinduet =
+# genoptag). Alle andre lyttere på den fjernbetjening har
+# `not radio-tilstand` (fejlklasse #1/#21): styrbar_universal_instant +
+# styrbar_universal_lr_hold + styrbar_stue_lr_grace (automations/styrbar_rooms.yaml),
+# dark_mode_room_exempt_button (packages/dark_mode.yaml), open_plan_fuldt_lys_start
+# (packages/open_plan_fuldt_lys.yaml), sleepover_gaest_op_clear
+# (packages/sleepover.yaml). Et radio-tryk stempler derfor heller ikke
+# styrbar_last_press_stue (det spærrer Sofa Zen og nattur-lyset).
+#
+# AirBnB: morgenradioen er en familie-rutine → kun Normal/Home Vacation (🏡5).
+# Styrbar-radioen virker for alle (den kræver at nogen selv har startet radioen).
+# =============================================================================
+
+input_boolean:
+  hoejttaler_morgenradio_enabled:
+    name: "Højttaler: morgenradio"
+    icon: mdi:radio
+  # 2026-10-10 (user: "fuld slider kontrol over radioen"): start allerede når
+  # den FØRSTE voksne er oppe (dagens afgang fra soveværelset står), i stedet
+  # for at vente på at ingen sover. Default off = uændret adfærd (fresh install
+  # lander også på off).
+  hoejttaler_morgenradio_foerste_oppe:
+    name: "Højttaler: morgenradio ved første oppe"
+    icon: mdi:account-arrow-up
+
+input_select:
+  # Rækkefølgen er pilenes rækkefølge (venstre/højre cykler rundt).
+  hoejttaler_radio_favorit:
+    name: "Højttaler: radio-favorit"
+    icon: mdi:playlist-music
+    options:
+      - "DR P4 København"
+      - "DR P1"
+      - "DR P3"
+      - "DR P6 Beat"
+      - "DR P8 Jazz"
+  hoejttaler_morgenradio_kanal:
+    name: "Højttaler: morgenradio-kanal"
+    icon: mdi:radio-tower
+    options:
+      - "DR P4 København"
+      - "DR P1"
+      - "DR P3"
+      - "DR P6 Beat"
+      - "DR P8 Jazz"
+
+  # 2026-10-10: hvilke dage morgenradioen må starte. Hverdag = binary_sensor.
+  # workday_sensor (danske helligdage), fallback man-fre hvis den er væk.
+  # Første option = fresh-install-default = uændret adfærd.
+  hoejttaler_morgenradio_dage:
+    name: "Højttaler: morgenradio-dage"
+    icon: mdi:calendar-week
+    options:
+      - "Alle dage"
+      - "Kun hverdage"
+      - "Kun weekend og fridage"
+
+input_datetime:
+  # Hvornår Styrbar stue sidst stoppede radioen (langt NED) — fortryd-vinduet
+  # i binary_sensor.styrbar_stue_radio. Runtime-stempel: initial: nulstiller det
+  # ved restart (en urørt dato-helper står ellers på DAGENS midnat = "lige
+  # stoppet" kl. 00:00-00:05).
+  hoejttaler_styrbar_stop_at:
+    name: "Højttaler: radio stoppet fra Styrbar stue"
+    icon: mdi:radio-off
+    has_date: true
+    has_time: true
+    initial: "2000-01-01 00:00:00"
+  # 2026-10-10: tidligste klokkeslæt morgenradioen må starte. 00:00 (fresh
+  # install) = ingen grænse, som før — i praksis 04:00, hvor begge-oppe-
+  # beviserne nulstilles. Konfiguration → i DATETIME_CONFIG-allowlisten.
+  hoejttaler_morgenradio_tidligst:
+    name: "Højttaler: morgenradio tidligst kl."
+    icon: mdi:clock-start
+    has_time: true
+    has_date: false
+
+input_text:
+  # Kanalen VI startede (tom = ikke radio). Runtime-flag, ikke config.
+  hoejttaler_radio_kanal:
+    name: "Højttaler: radio-kanal der spiller"
+    icon: mdi:radio
+    max: 64
+
+input_number:
+  hoejttaler_morgenradio_volumen:
+    name: "Højttaler: morgenradio-volumen"
+    icon: mdi:volume-medium
+    min: 5
+    max: 80
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+  # B211 (user-spec 2026-10-10 "byg fade-in på radioen"): morgenradioen starter
+  # på fade-start-volumen og glider lineært op til morgenradio-volumen over så
+  # mange minutter (Volumio-procenten er allerede en lydstyrke-kurve, og
+  # trinnet er 1 %-point — målt: ny volumen ses i HA < 1 s efter kaldet).
+  # 0 min = ingen fade (start direkte på morgenradio-volumen = før B211).
+  hoejttaler_morgenradio_fade_minutter:
+    name: "Højttaler: morgenradio fade-in"
+    icon: mdi:volume-plus
+    min: 0
+    max: 15
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: slider
+  hoejttaler_morgenradio_fade_start_volumen:
+    name: "Højttaler: morgenradio fade-in fra"
+    icon: mdi:volume-low
+    min: 0
+    max: 50
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+  # Morgenen slutter her — står man op senere, starter radioen ikke af sig selv.
+  # User 14/10 (C2): "når jeg slukker med styrbar og så skruer op (fortryder)
+  # lige efter, tændte lys. der skal være en 5min grace." Så længe efter et
+  # langt NED er Styrbar stue stadig radio-fjernbetjening: OP/pile starter
+  # radioen igen, NED gør intet. 0 = fra. Siden 18/10 også efter en Spotify-
+  # pause fra Styrbar (OP/pile genoptager Spotify).
+  hoejttaler_styrbar_fortryd_minutter:
+    name: "Højttaler: Styrbar fortryd efter radio-stop"
+    icon: mdi:undo
+    min: 0
+    max: 15
+    step: 1
+    unit_of_measurement: min
+    mode: slider
+  hoejttaler_morgenradio_senest_time:
+    name: "Højttaler: morgenradio senest kl."
+    icon: mdi:clock-end
+    min: 6
+    max: 14
+    step: 1
+    mode: slider
+
+template:
+  - binary_sensor:
+      - name: "Hoejttaler radio tilstand"
+        unique_id: hoejttaler_radio_tilstand
+        icon: mdi:radio
+        # 13/10 17:46: Spotify via HA (Music Assistants DLNA-strøm) melder OGSÅ
+        # webradio/'channel' — med P4-flaget stående blev tilstanden on, så
+        # timer-beskeden "genoptog" P4 oven i Spotify (2×) og Styrbar skiftede
+        # til P8. Derfor: aldrig on mens en anden kilde spiller (ankeret
+        # binary_sensor.hoejttaler_anden_kilde, packages/hoejttaler.yaml).
+        state: >-
+          {{ states('input_text.hoejttaler_radio_kanal') not in ['', 'unknown', 'unavailable']
+             and is_state('media_player.hoejttaler', 'playing')
+             and is_state_attr('media_player.hoejttaler', 'media_content_type', 'channel')
+             and is_state('binary_sensor.hoejttaler_online', 'on')
+             and not is_state('binary_sensor.hoejttaler_anden_kilde', 'on') }}
+      # Styrbar stue ejes af radioen (styrbar_stue_radio): mens den spiller,
+      # og i fortryd-vinduet efter et langt NED (user 14/10: ellers tændte
+      # "OP for at fortryde" lyset). Ét anker for ALLE lys-veje der skal vige
+      # (styrbar_rooms ×3, dark_mode, open_plan_fuldt_lys, sleepover — #2/#21).
+      # Vinduet lukker hvis en anden kilde (Spotify/AirPlay) tager over.
+      # now() → genberegnes hvert minut (vinduet slutter ≤ 1 min for sent).
+      # 18/10 (user: "skal også være højttaler fjernbetjening når spotify
+      # spiller"): også mens Spotify-broen spiller (styrbar_stue_spotify).
+      # Navnet er beholdt — det er ankeret de seks lys-veje læser.
+      - name: "Styrbar stue radio"
+        unique_id: styrbar_stue_radio
+        icon: mdi:remote
+        state: >-
+          {% set n = states('input_number.hoejttaler_styrbar_fortryd_minutter') | float(5) %}
+          {% set t = state_attr('input_datetime.hoejttaler_styrbar_stop_at', 'timestamp') | float(0) %}
+          {{ is_state('binary_sensor.hoejttaler_radio_tilstand', 'on')
+             or is_state('binary_sensor.styrbar_stue_spotify', 'on')
+             or (n > 0 and (now().timestamp() - t) < n * 60
+                 and not is_state('binary_sensor.hoejttaler_anden_kilde', 'on')) }}
+      # Spotify-broen spiller på højttaleren, med 30 s hold: broen står
+      # 'stopped'/'paused' ~10 s ved hvert nummer-skift (målt 17-18/10: alle
+      # 5 huller 10 s, ejer_hoejttaler sand hele vejen) — uden holdet var
+      # Styrbar lys-fjernbetjening midt i et skift.
+      - name: "Styrbar stue spotify"
+        unique_id: styrbar_stue_spotify
+        icon: mdi:spotify
+        delay_off: 30
+        state: "{{ is_state('binary_sensor.spotify_bro_spiller', 'on') }}"
+      # "Ingen voksen sover i soveværelset" — husets morgen-bevis for at
+      # højttaleren må lave lyd i stuen (morgenradio + vejr-oplæsning).
+      # To voksne = sove_alarm_morgen_to_oppe (husets "begge oppe"). Én voksen
+      # hjemme = dagens afgang fra soveværelset, uden at rummet er blevet
+      # optaget igen siden (en toilettur kl. 4:30 og tilbage i seng tæller ikke).
+      # "Ikke optaget igen siden afgangen" måles på opholds-stemplet
+      # (packages/apollo_latch_detect.yaml), ALDRIG på sensorens last_changed:
+      # den nulstilles ved hver HA-restart, og huset genstartes typisk 1-3 gange
+      # hver morgen (målt 10-04/10-05) → radioen ville tavst ikke spille.
+      # Stemplet ryddes ved hver →off og overlever en restart; står det NYERE
+      # end afgangen mens rummet er off, var rummet optaget igen og forlod det
+      # uden en set afgang (on→unavailable→off under en restart).
+      # Flyttet hertil fra morgenradioens condition 2026-10-07 (uændret logik),
+      # da vejr-oplæsningen fik brug for samme bevis.
+      - name: "Sovevaerelse voksne oppe"
+        unique_id: sovevaerelse_voksne_oppe
+        icon: mdi:account-arrow-up
+        state: >-
+          {% set to_oppe = is_state('binary_sensor.sove_alarm_morgen_to_oppe', 'on') %}
+          {% set a = state_attr('input_datetime.sove_morgen_afgang_at', 'timestamp') | float(0) %}
+          {% set o = state_attr('input_datetime.sove_apollo_occ_since', 'timestamp') | float(0) %}
+          {% set alene_oppe = (state_attr('sensor.people_estimate', 'voksne') | int(0)) == 1
+             and a >= today_at('04:00').timestamp()
+             and is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'off')
+             and o < a %}
+          {{ to_oppe or alene_oppe }}
+
+script:
+  hoejttaler_radio:
+    alias: "Højttaler: spil DR-radio"
+    icon: mdi:radio
+    # queued: hurtige pil-tryk må hverken tabes eller køre oven i hinanden (#2).
+    mode: queued
+    max: 5
+    fields:
+      kanal:
+        description: "Kanal som i favorit-listen, fx 'DR P4 København'"
+        required: true
+      volumen:
+        description: "Valgfri start-volumen i % — sættes FØR afspilning (lav start)"
+        required: false
+    sequence:
+      - variables:
+          # &dr_streams: samme kort bruges af hoejttaler_radio_adopter (#2).
+          streams: &dr_streams
+            "DR P1": "https://live-icy.dr.dk/A/A03H.mp3"
+            "DR P2": "https://live-icy.dr.dk/A/A04H.mp3"
+            "DR P3": "https://live-icy.dr.dk/A/A05H.mp3"
+            "DR P4 København": "https://live-icy.dr.dk/A/A08H.mp3"
+            "DR P5": "https://live-icy.dr.dk/A/A25H.mp3"
+            "DR P6 Beat": "https://live-icy.dr.dk/A/A29H.mp3"
+            "DR P8 Jazz": "https://live-icy.dr.dk/A/A22H.mp3"
+          k: "{{ kanal if kanal is defined else '' }}"
+      - variables:
+          url: "{{ streams.get(k, '') }}"
+      - condition: template
+        value_template: "{{ url != '' }}"
+      - if:
+          - condition: template
+            value_template: "{{ volumen is defined and (volumen | float(-1)) >= 0 }}"
+        then:
+          - service: media_player.volume_set
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+            data:
+              volume_level: "{{ ([[volumen | float(25), 0] | max, 100] | min) / 100 }}"
+        else:
+          # Fra standby (volumen 0, packages/hoejttaler.yaml) uden egen volumen
+          # → hæv til start-volumen, ellers spiller favoritten lydløst.
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ (state_attr('media_player.hoejttaler', 'volume_level') | float(1)) < 0.05 }}
+            then:
+              - service: media_player.volume_set
+                continue_on_error: true
+                target:
+                  entity_id: media_player.hoejttaler
+                data:
+                  volume_level: "{{ (states('input_number.hoejttaler_standby_start_volumen') | float(25)) / 100 }}"
+      - service: media_player.play_media
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+        data:
+          media_content_type: channel
+          media_content_id: >-
+            {{ {'uri': url, 'service': 'webradio', 'type': 'webradio', 'title': k} | to_json }}
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.hoejttaler_radio_kanal
+        data:
+          value: "{{ k }}"
+      # Hold favorit-listen på den kanal der spiller, så pilene fortsætter herfra.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ k in (state_attr('input_select.hoejttaler_radio_favorit', 'options') or [])
+                 and not is_state('input_select.hoejttaler_radio_favorit', k) }}
+        then:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.hoejttaler_radio_favorit
+            data:
+              option: "{{ k }}"
+
+  # B211: morgenradioens fade-in. Fyr-og-glem (script.turn_on) fra
+  # morgenradioen, så automationen ikke hænger i minutter. Trin-planen er
+  # INDEKS-baseret (trin i = fra + (til-fra)·i/n), så "forrige trin" er kendt
+  # uden variabel-scope over løkken. Stopper:
+  #   · radioen er ikke længere i radio-tilstand (stoppet, Spotify, slukket)
+  #   · volumen afviger > 2 %-point fra forrige trin = nogen har skruet selv
+  #     (Styrbar stue, appen) — din hånd vinder, fade'en slipper.
+  # En besked/regnsang (hoejttaler_annoncer/_spil_sang) afbryder ikke radioen
+  # siden 14/10 (springes over når noget spiller) — ventet bevares som værn.
+  hoejttaler_morgenradio_fade:
+    alias: "Højttaler: morgenradio fade-in"
+    icon: mdi:volume-plus
+    mode: restart
+    fields:
+      fra:
+        description: "Start-volumen i %"
+      til:
+        description: "Slut-volumen i %"
+      sekunder:
+        description: "Fade-tid i sekunder"
+    sequence:
+      - variables:
+          v_fra: "{{ fra | default(5) | int(5) }}"
+          v_til: "{{ til | default(25) | int(25) }}"
+          v_sek: "{{ sekunder | default(0) | float(0) }}"
+          # Ét trin pr. %-point, men aldrig tættere end 5 s.
+          n: >-
+            {% set spring = (v_til - v_fra) | abs %}
+            {{ [[(v_sek / 5) | int, spring] | min, 1] | max }}
+          interval: "{{ (v_sek / n) | round(1) }}"
+      - condition: template
+        value_template: "{{ v_sek > 0 and v_til != v_fra }}"
+      - wait_template: "{{ is_state('binary_sensor.hoejttaler_radio_tilstand', 'on') }}"
+        timeout: 60
+        continue_on_timeout: false
+      - repeat:
+          count: "{{ n }}"
+          sequence:
+            - delay:
+                seconds: "{{ interval }}"
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ is_state('script.hoejttaler_annoncer', 'on')
+                       or is_state('script.hoejttaler_spil_sang', 'on') }}
+              then:
+                - wait_template: >-
+                    {{ is_state('script.hoejttaler_annoncer', 'off')
+                       and is_state('script.hoejttaler_spil_sang', 'off') }}
+                  timeout: 600
+                  continue_on_timeout: false
+                - delay: 5
+            - variables:
+                forrige: "{{ (v_fra + (v_til - v_fra) * (repeat.index - 1) / n) | round(0) | int }}"
+                naeste: "{{ (v_fra + (v_til - v_fra) * repeat.index / n) | round(0) | int }}"
+                nu: "{{ ((state_attr('media_player.hoejttaler', 'volume_level') | float(-1)) * 100) | round(0) | int }}"
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ not is_state('binary_sensor.hoejttaler_radio_tilstand', 'on')
+                       or (nu - forrige) | abs > 2 }}
+              then:
+                - service: logbook.log
+                  data:
+                    name: "Højttaler"
+                    message: >-
+                      Morgenradio fade-in stoppet ved {{ nu }} %
+                      ({{ 'radioen spiller ikke længere' if not is_state('binary_sensor.hoejttaler_radio_tilstand', 'on')
+                          else 'volumen skruet manuelt — forventede ' ~ forrige ~ ' %' }}).
+                - stop: "Fade-in afbrudt."
+            - service: media_player.volume_set
+              continue_on_error: true
+              target:
+                entity_id: media_player.hoejttaler
+              data:
+                volume_level: "{{ naeste / 100 }}"
+
+  # Entré NED (user 18/10: "fade højttaleren ned indenfor 10s"): volumen
+  # glider til 0 og afspilningen stoppes = samme software-standby som
+  # hoejttaler.yaml (stop + volumen 0); start-vejene hæver selv fra 0 til
+  # start-volumen. Kvadratisk kurve (hurtigt fra toppen, blødt mod bunden),
+  # ét trin pr. sekund. Fyr-og-glem (script.turn_on), så lyset ikke venter.
+  # Intet "hånden vinder"-tjek som i fade-in'en: Volumio's volume_level kan
+  # halte et trin bagefter og ville afbryde fade'en på sit eget ekko.
+  hoejttaler_fade_ud:
+    alias: "Højttaler: fade ud og stop"
+    icon: mdi:volume-minus
+    mode: restart
+    fields:
+      sekunder:
+        description: "Fade-tid i sekunder (1-10)"
+    sequence:
+      - condition: template
+        value_template: "{{ is_state('media_player.hoejttaler', 'playing') }}"
+      # Morgenradioens fade-in må ikke skrue op igen under os.
+      - service: script.turn_off
+        target:
+          entity_id: script.hoejttaler_morgenradio_fade
+      - variables:
+          n: "{{ [[sekunder | default(8) | int(8), 1] | max, 10] | min }}"
+          v_fra: "{{ ((state_attr('media_player.hoejttaler', 'volume_level') | float(0)) * 100) | round(0) | int }}"
+          spotify: >-
+            {{ 1 if (is_state('binary_sensor.styrbar_stue_spotify', 'on')
+                     or is_state('sensor.spotify_bro', 'playing')) else 0 }}
+      - repeat:
+          count: "{{ n }}"
+          sequence:
+            - service: media_player.volume_set
+              continue_on_error: true
+              target:
+                entity_id: media_player.hoejttaler
+              data:
+                volume_level: "{{ ((v_fra * (1 - repeat.index / n) ** 2) | round(0)) / 100 }}"
+            - delay: 1
+      - if:
+          - condition: template
+            value_template: "{{ (spotify | int) == 1 }}"
+        then:
+          - service: rest_command.spotify_bro_cmd
+            continue_on_error: true
+            data:
+              cmd: pause
+        else:
+          - service: script.hoejttaler_radio_stop
+      - service: logbook.log
+        data:
+          name: "Højttaler"
+          message: >-
+            {{ 'Spotify pauset' if (spotify | int) == 1 else 'Afspilning stoppet' }}
+            efter fade fra {{ v_fra }} % til 0 over {{ n }} s (entré NED). Volumen står på 0 = standby.
+
+  hoejttaler_radio_stop:
+    alias: "Højttaler: stop radioen"
+    icon: mdi:radio-off
+    mode: queued
+    max: 3
+    sequence:
+      - service: media_player.media_stop
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.hoejttaler_radio_kanal
+        data:
+          value: ""
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Morgenradio
+  # ---------------------------------------------------------------------------
+  - id: hoejttaler_morgenradio
+    alias: "Højttaler: morgenradio når I begynder at færdes i open plan"
+    description: >
+      Første open-plan-bevægelse om morgenen, når ingen sover i soveværelset:
+      to voksne = sove_alarm_morgen_to_oppe (husets eksisterende "begge oppe");
+      én voksen hjemme = dagens afgang fra soveværelset, uden at rummet er
+      blevet optaget igen siden (en toilettur kl. 4:30 og tilbage i seng tæller
+      ikke). Højst én gang pr. morgen.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.open_plan_occupied
+        from: "off"
+        to: "on"
+      # Står man i open plan i forvejen når "ingen sover" bliver sandt, er der
+      # ingen ny open-plan-flanke (fejlklasse #4) → beviset trigger selv.
+      # Triggeren er det FÆLLES anker, ikke dets kilder (to_oppe, afgangs-
+      # stemplet): en trigger på en kilde kunne evaluere conditionen herunder
+      # før ankeret havde re-renderet på samme state-ændring.
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_voksne_oppe
+        from: "off"
+        to: "on"
+      - platform: state
+        entity_id: binary_sensor.godnat_faelles_morgen_fri
+        from: "off"
+        to: "on"
+      # Sleep Over-holdet slipper (morgen-bevægelse, OP, tom-open-plan-udgangen):
+      # sleepover-conditionen herunder afviste morgenens flanker mens det stod,
+      # og står man allerede i open plan, kommer der ingen ny (#4). Målt 19/10:
+      # holdet slap 06:00:15, radioen startede først 06:13:47.
+      - platform: state
+        entity_id: input_boolean.sleepover_i_nat
+        from: "on"
+        to: "off"
+      # Tidligst-grænsen: var alle andre gates åbne før tidspunktet, sker der
+      # ingen ny flanke når det passeres (fejlklasse #4).
+      - platform: time
+        at: input_datetime.hoejttaler_morgenradio_tidligst
+      # "Ved første oppe": afgangs-stemplet ER beviset (open-plan-flanken kommer
+      # normalt efter, men står man allerede derude, er der ingen).
+      - platform: state
+        entity_id: input_datetime.sove_morgen_afgang_at
+    condition:
+      - condition: state
+        entity_id: input_boolean.hoejttaler_morgenradio_enabled
+        state: "on"
+      # Én gang pr. morgen. last_triggered hører i CONDITION, ikke i action
+      # (CLAUDE.md: den stemples før action-body'en kører).
+      - condition: template
+        value_template: >-
+          {% set lt = this.attributes.last_triggered if this is defined else none %}
+          {{ lt is none or lt < today_at('04:00') }}
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: state
+        entity_id: binary_sensor.godnat_faelles_morgen_fri
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ now().hour < (states('input_number.hoejttaler_morgenradio_senest_time') | int(11)) }}
+      - condition: template
+        value_template: >-
+          {% set t = states('input_datetime.hoejttaler_morgenradio_tidligst') %}
+          {{ t in ['unknown', 'unavailable', ''] or now() >= today_at(t) }}
+      - condition: template
+        value_template: >-
+          {% set d = states('input_select.hoejttaler_morgenradio_dage') %}
+          {% set ws = states('binary_sensor.workday_sensor') %}
+          {% set hverdag = (ws == 'on') if ws in ['on', 'off'] else now().weekday() < 5 %}
+          {{ (d == 'Kun hverdage' and hverdag)
+             or (d == 'Kun weekend og fridage' and not hverdag)
+             or d not in ['Kun hverdage', 'Kun weekend og fridage'] }}
+      # En gæst der sover i open plan (Sleep Over) skal ikke vækkes af radioen.
+      - condition: state
+        entity_id: input_boolean.sleepover_i_nat
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.open_plan_occupied
+        state: "on"
+      # Højttaleren skal være TÆNDT (ellers brændes morgenens ene forsøg af).
+      - condition: state
+        entity_id: binary_sensor.hoejttaler_online
+        state: "on"
+      # Spiller den REELT (ankeret, packages/hoejttaler.yaml)? En hængende
+      # 'playing' (AirPlay fra dagen før) blokerede morgenradioen 11/10.
+      - condition: template
+        value_template: >-
+          {{ not is_state('binary_sensor.hoejttaler_spiller_reelt', 'on')
+             and not is_state('binary_sensor.hoejttaler_anden_kilde', 'on') }}
+      # Ingen voksen sover i soveværelset. Definitionen bor i
+      # binary_sensor.sovevaerelse_voksne_oppe øverst i filen — delt med
+      # vejr-oplæsningen (packages/hoejttaler_annoncering.yaml), fejlklasse #2.
+      # Med "ved første oppe" rækker dagens (ikke-annullerede) afgang.
+      - condition: template
+        value_template: >-
+          {{ is_state('binary_sensor.sovevaerelse_voksne_oppe', 'on')
+             or (is_state('input_boolean.hoejttaler_morgenradio_foerste_oppe', 'on')
+                 and (state_attr('input_datetime.sove_morgen_afgang_at', 'timestamp') | float(0))
+                     >= today_at('04:00').timestamp()) }}
+    action:
+      - variables:
+          maal_vol: "{{ states('input_number.hoejttaler_morgenradio_volumen') | int(25) }}"
+          fade_sek: "{{ (states('input_number.hoejttaler_morgenradio_fade_minutter') | float(0) * 60) | int }}"
+          # Fade-starten ligger aldrig OVER målet (ellers en fade-ned).
+          fade_fra: "{{ [states('input_number.hoejttaler_morgenradio_fade_start_volumen') | int(5), maal_vol] | min }}"
+      - service: script.hoejttaler_radio
+        data:
+          kanal: "{{ states('input_select.hoejttaler_morgenradio_kanal') }}"
+          volumen: "{{ fade_fra if fade_sek > 0 else maal_vol }}"
+      - if:
+          - condition: template
+            value_template: "{{ fade_sek > 0 and fade_fra < maal_vol }}"
+        then:
+          - service: script.turn_on
+            target:
+              entity_id: script.hoejttaler_morgenradio_fade
+            data:
+              variables:
+                fra: "{{ fade_fra }}"
+                til: "{{ maal_vol }}"
+                sekunder: "{{ fade_sek }}"
+      - service: logbook.log
+        data:
+          name: "Højttaler"
+          message: >-
+            Morgenradio: {{ states('input_select.hoejttaler_morgenradio_kanal') }} på
+            {{ (fade_fra ~ ' → ' ~ maal_vol ~ ' % over ' ~ (fade_sek / 60) | round(1) ~ ' min')
+               if fade_sek > 0 and fade_fra < maal_vol else (maal_vol ~ ' %') }}
+            ({{ 'begge oppe' if is_state('binary_sensor.sove_alarm_morgen_to_oppe', 'on')
+                else ('alene hjemme og oppe' if is_state('binary_sensor.sovevaerelse_voksne_oppe', 'on')
+                else 'første voksne oppe') }}).
+
+  # ---------------------------------------------------------------------------
+  # Favorit valgt på dashboardet → spil den
+  # ---------------------------------------------------------------------------
+  - id: hoejttaler_radio_favorit_valgt
+    alias: "Højttaler: spil den radio-favorit der vælges på dashboardet"
+    description: >
+      Kun et MENNESKES valg (context.user_id, fejlklasse #3) — script'et og
+      Styrbar-pilene flytter selv listen, og det må ikke starte en ny afspilning.
+      Et script startet fra dashboard/Assist/API BÆRER user_id, og dets
+      listeflytning lignede et valg → samme kanal startede to gange med 0,2 s
+      mellemrum, og Volumio's state gik ud af takt med køen (målt 08/10). Derfor
+      også: kun når valget ikke er den kanal script'et lige har skrevet.
+    mode: queued
+    max: 3
+    trigger:
+      - platform: state
+        entity_id: input_select.hoejttaler_radio_favorit
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.to_state is not none and trigger.from_state is not none
+             and trigger.to_state.state != trigger.from_state.state
+             and trigger.to_state.context.user_id is not none
+             and trigger.to_state.state != states('input_text.hoejttaler_radio_kanal') }}
+    action:
+      - service: script.hoejttaler_radio
+        data:
+          kanal: "{{ trigger.to_state.state }}"
+
+  # ---------------------------------------------------------------------------
+  # Radio startet UDEN om script'et → sæt radio-flaget alligevel
+  # ---------------------------------------------------------------------------
+  # Play-knappen på dashboardet, Volumio-appen og højttalerens egen knap
+  # genoptager kanalen direkte i Volumio. Flaget forblev tomt, og Styrbar stue
+  # styrede lys i stedet for radioen (user 08/10 20:20). Kanalen genkendes på
+  # stream-URL'en (media_content_id fra custom_components/volumio).
+  - id: hoejttaler_radio_adopter
+    alias: "Højttaler: genkend en DR-favorit der startes uden om HA's radio-script"
+    mode: queued
+    max: 3
+    # 13/10 06:51: et kanalskift fra dashboardet får Volumio til at melde den
+    # GAMLE stream som "playing" i ~1 s, før den nye kommer → denne automation
+    # flyttede favoritten tilbage (P1→P4→P1→P4 på 6 s, din P1 tabt). Derfor:
+    # kun en stream der har HOLDT 3 s, og aldrig lige efter at HA's eget
+    # radio-script har valgt kanal.
+    trigger:
+      - platform: state
+        entity_id: media_player.hoejttaler
+        to: "playing"
+        for:
+          seconds: 3
+      - platform: state
+        entity_id: media_player.hoejttaler
+        attribute: media_content_id
+        for:
+          seconds: 3
+    variables:
+      streams: *dr_streams
+      kanal: >-
+        {% set uri = state_attr('media_player.hoejttaler', 'media_content_id') | default('', true) %}
+        {% set ns = namespace(k='') %}
+        {% for navn, url in streams.items() if url == uri %}{% set ns.k = navn %}{% endfor %}
+        {{ ns.k }}
+    condition:
+      - condition: template
+        value_template: >-
+          {{ is_state('media_player.hoejttaler', 'playing')
+             and kanal | trim != ''
+             and states('input_text.hoejttaler_radio_kanal') != kanal | trim }}
+      # Volumios metadata er STALE under en anden kilde (13/10: "DR P4" som
+      # titel/uri midt i Spotify via HA) → flaget må ikke sættes igen efter at
+      # Spotify-overtageren har ryddet det.
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.hoejttaler_anden_kilde', 'on') }}"
+      - condition: state
+        entity_id: script.hoejttaler_radio
+        state: "off"
+      - condition: template
+        value_template: >-
+          {{ (now() - states.input_text.hoejttaler_radio_kanal.last_changed).total_seconds() > 8 }}
+    action:
+      # Spotify-broen (B237): Volumio meldte P4 i 4 s EFTER broens start (17/10
+      # 15:29:43-47), og broens eget push kom først ~7 s efter → adopteren satte
+      # P4-flaget midt i Spotify. Spørg broen frisk; ejer den højttaleren, så
+      # giv dens takeover-tjek (2,5 s) tid — en radio valgt i Volumio-appen
+      # MENS broen spillede, slipper den inden for de 4 s.
+      - service: homeassistant.update_entity
+        continue_on_error: true
+        target:
+          entity_id: sensor.spotify_bro
+      - if:
+          - condition: template
+            value_template: >-
+              {{ is_state('sensor.spotify_bro', 'playing')
+                 and state_attr('sensor.spotify_bro', 'ejer_hoejttaler') == true }}
+        then:
+          - delay:
+              seconds: 4
+          - service: homeassistant.update_entity
+            continue_on_error: true
+            target:
+              entity_id: sensor.spotify_bro
+      - condition: template
+        value_template: >-
+          {{ not (is_state('sensor.spotify_bro', 'playing')
+                  and state_attr('sensor.spotify_bro', 'ejer_hoejttaler') == true)
+             and not is_state('binary_sensor.hoejttaler_anden_kilde', 'on')
+             and is_state('media_player.hoejttaler', 'playing')
+             and state_attr('media_player.hoejttaler', 'media_content_id') == streams.get(kanal | trim) }}
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.hoejttaler_radio_kanal
+        data:
+          value: "{{ kanal | trim }}"
+      # Uden user_id → hoejttaler_radio_favorit_valgt starter intet (og den
+      # tjekker også mod flaget, der er sat ovenfor).
+      - if:
+          - condition: template
+            value_template: >-
+              {{ kanal | trim in (state_attr('input_select.hoejttaler_radio_favorit', 'options') or [])
+                 and not is_state('input_select.hoejttaler_radio_favorit', kanal | trim) }}
+        then:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.hoejttaler_radio_favorit
+            data:
+              option: "{{ kanal | trim }}"
+
+  # ---------------------------------------------------------------------------
+  # Ryd radio-flaget når radioen ikke længere spiller
+  # ---------------------------------------------------------------------------
+  - id: hoejttaler_radio_flag_ryd
+    alias: "Højttaler: ryd radio-flaget når den ikke har spillet i 2 min"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: media_player.hoejttaler
+        from: "playing"
+        for:
+          minutes: 2
+      - platform: state
+        entity_id: binary_sensor.hoejttaler_online
+        to: "off"
+        for:
+          minutes: 2
+      # #4: en genstart dræber for:-flanken.
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_text.hoejttaler_radio_kanal') not in ['', 'unknown', 'unavailable']
+             and is_state('binary_sensor.hoejttaler_radio_tilstand', 'off') }}
+      - condition: template
+        value_template: >-
+          {% set p = states.media_player.hoejttaler %}
+          {{ p is none or p.state != 'playing'
+             or not is_state('binary_sensor.hoejttaler_online', 'on') }}
+      # Værn fra før 14/10, hvor en besked/sang pausede radioen og selv
+      # genoptog den. Siden 14/10 springes de over når noget spiller.
+      - condition: state
+        entity_id: script.hoejttaler_annoncer
+        state: "off"
+      - condition: state
+        entity_id: script.hoejttaler_spil_sang
+        state: "off"
+    action:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.hoejttaler_radio_kanal
+        data:
+          value: ""
+
+  # ---------------------------------------------------------------------------
+  # Styrbar stue = højttaler-fjernbetjening mens radioen eller Spotify spiller
+  # ---------------------------------------------------------------------------
+  - id: styrbar_stue_radio
+    alias: "Styrbar stue: højttaler-fjernbetjening når radio eller Spotify spiller"
+    description: >
+      Radio: pile = forrige/næste favorit, langt NED = stop. Spotify (broen):
+      pile = forrige/næste nummer, langt NED = pause. Begge: OP (kort og langt)
+      = højere, NED = lavere, OP inden for fortryd-vinduet = start igen.
+      Begge Styrbar-quirk-former håndteres (arrow_*_click og
+      'press' med retnings-kode — samme koder som styrbar_universal_instant).
+      Pil-hold/release og slip-events er bevidst no-op.
+    mode: queued
+    max: 10
+    trigger:
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "7e:44:f6:62:8e:f4:b1:23"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.styrbar_stue_radio
+        state: "on"
+    action:
+      - variables:
+          cmd: "{{ trigger.event.data.command }}"
+          # Fortryd-vinduet: radioen er stoppet fra Styrbar (eller ved at starte).
+          # 1/0, ikke true/false (en bar boolean bliver en truthy streng, ha_yaml).
+          spiller: >-
+            {{ 1 if (is_state('binary_sensor.hoejttaler_radio_tilstand', 'on')
+                     or is_state('script.hoejttaler_radio', 'on')
+                     or is_state('media_player.hoejttaler', 'playing')
+                     or is_state('sensor.spotify_bro', 'playing')) else 0 }}
+          # Spotify-broen spiller (med hold over nummer-skiftets ~10-s hul).
+          spotify: "{{ 1 if is_state('binary_sensor.styrbar_stue_spotify', 'on') else 0 }}"
+          # Spotify pauset med broen stadig som højttalerens ejer = det var
+          # Spotify der sidst spillede her (radio/anden kilde tager ejerskabet
+          # fra broen) → fortryd/pile genoptager Spotify, ikke radioen.
+          sp_pauset: >-
+            {{ 1 if (is_state('sensor.spotify_bro', 'paused')
+                     and state_attr('sensor.spotify_bro', 'ejer_hoejttaler') == true) else 0 }}
+          retning: >-
+            {% set args = trigger.event.data.args | default([]) %}
+            {% if cmd == 'arrow_left_click' %}venstre
+            {% elif cmd == 'arrow_right_click' %}hoejre
+            {% elif cmd == 'press' %}
+              {% set d = args[0] | default(-1) %}
+              {{ 'venstre' if d in [257, 0, 2, 258] else 'hoejre' }}
+            {% else %}ingen{% endif %}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ retning | trim in ['venstre', 'hoejre']
+                     and ((spotify | int) == 1 or (sp_pauset | int) == 1) }}
+            sequence:
+              - service: rest_command.spotify_bro_cmd
+                continue_on_error: true
+                data:
+                  cmd: "{{ 'prev' if retning | trim == 'venstre' else 'next' }}"
+              # Pauset (fortryd-vinduet): et nummer-skip starter også, som en
+              # pil starter næste kanal når radioen er stoppet.
+              - if:
+                  - condition: template
+                    value_template: "{{ (spiller | int) == 0 }}"
+                then:
+                  - service: rest_command.spotify_bro_cmd
+                    continue_on_error: true
+                    data:
+                      cmd: resume
+          - conditions:
+              - condition: template
+                value_template: "{{ retning | trim in ['venstre', 'hoejre'] }}"
+            sequence:
+              - service: >-
+                  input_select.select_{{ 'previous' if retning | trim == 'venstre' else 'next' }}
+                target:
+                  entity_id: input_select.hoejttaler_radio_favorit
+                data:
+                  cycle: true
+              - service: script.hoejttaler_radio
+                data:
+                  kanal: "{{ states('input_select.hoejttaler_radio_favorit') }}"
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ cmd in ['on', 'move_with_on_off'] and (spiller | int) == 0
+                     and (sp_pauset | int) == 1 }}
+            sequence:
+              - service: rest_command.spotify_bro_cmd
+                continue_on_error: true
+                data:
+                  cmd: resume
+              - service: logbook.log
+                data:
+                  name: "Højttaler"
+                  message: "Spotify genoptaget fra Styrbar stue (OP)."
+          # Spotify i et nummer-skift (spotify-holdet on, spiller 0) må ikke
+          # starte radioen — OP falder igennem til højere.
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ cmd in ['on', 'move_with_on_off'] and (spiller | int) == 0
+                     and (spotify | int) == 0 }}
+            sequence:
+              # Fortryd: samme kanal igen (Volumio's volumen er uændret af stop).
+              - service: script.hoejttaler_radio
+                data:
+                  kanal: "{{ states('input_select.hoejttaler_radio_favorit') }}"
+              - service: logbook.log
+                data:
+                  name: "Højttaler"
+                  message: "Radio startet igen fra Styrbar stue (OP inden for fortryd-vinduet)."
+          - conditions:
+              - condition: template
+                value_template: "{{ cmd in ['on', 'move_with_on_off'] }}"
+            sequence:
+              - service: media_player.volume_up
+                continue_on_error: true
+                target:
+                  entity_id: media_player.hoejttaler
+          - conditions:
+              - condition: template
+                value_template: "{{ cmd == 'off' and (spiller | int) == 1 }}"
+            sequence:
+              - service: media_player.volume_down
+                continue_on_error: true
+                target:
+                  entity_id: media_player.hoejttaler
+          - conditions:
+              - condition: template
+                value_template: "{{ cmd == 'move' and (spiller | int) == 1 }}"
+            sequence:
+              # Stemplet FØR stoppet: ellers var fjernbetjenings-ankeret off i
+              # ~0,5 s mellem radio-tilstand off og stemplet (målt 14:14:36).
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.hoejttaler_styrbar_stop_at
+                data:
+                  timestamp: "{{ now().timestamp() }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ (spotify | int) == 1 }}"
+                then:
+                  - service: rest_command.spotify_bro_cmd
+                    continue_on_error: true
+                    data:
+                      cmd: pause
+                  - service: logbook.log
+                    data:
+                      name: "Højttaler"
+                      message: "Spotify pauset fra Styrbar stue (langt NED)."
+                else:
+                  - service: script.hoejttaler_radio_stop
+                  - service: logbook.log
+                    data:
+                      name: "Højttaler"
+                      message: "Radio stoppet fra Styrbar stue (langt NED)."

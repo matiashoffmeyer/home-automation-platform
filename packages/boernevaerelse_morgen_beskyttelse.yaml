@@ -1,0 +1,198 @@
+# =============================================================================
+# Børneværelse MORGEN-BESKYTTELSE — barn 1 står op, barn 2 sover videre
+# =============================================================================
+# User-spec 2026-08-15: "om morgenen når vi har børn så skal mørket beskyttes
+# indtil der er mere aktivitet end der har været nu. barn 1 står op og barn 2
+# sover videre derinde. indtil 0730 skal der beskyttes og kræves mere apollo
+# aktivitet før presence light allowes."
+#
+# MÅLT ÅRSAG (08-15, logbook): godnat blev ryddet 06:10:27 (godmorgen-auto-off).
+# 06:15:54 gik `boernevaerelse_apollo_occupancy` on — flap-loggen siger
+# **"g3 still"**, altså et STILLE mål: en krop der ligger i sengen, ikke en der
+# er stået op. `presence_light_boernevaerelse_on` fyrer på den rå occupancy-
+# flanke og tændte loftet 06:16:00; brugeren slukkede selv 9 s senere.
+# Samme mønster hver morgen: 08-07 06:29:43 (55 s ophold → lys), 08-08 06:37:56
+# (16 s ophold → lys 1 s efter). Bursts på 15-60 s er husets normale
+# "barn vender sig", og ALLE gav lys i et rum hvor et barn sov videre.
+#
+# DESIGN — hæv beviskravet, bloker ikke blindt:
+# Occupancy DUER IKKE som mål for "nogen er stået op": den er ON både for en
+# sovende krop (still-target, latcher — målt 04:22:27→06:10:29 = 108 min
+# ubrudt) og for et barn der går rundt. En tærskel på occupancy-VARIGHED ville
+# derfor blive opfyldt af den sovende (fejlklasse #20: en akkumulator over en
+# latchende sensor måler tid siden vinduets start, ikke aktivitet).
+# Vi måler i stedet **moving_target** — ægte bevægelse gennem rummet. Et barn
+# der sover giver still-target; et barn der er oppe giver moving.
+#
+#   binary_sensor.boernevaerelse_morgen_beskyttelse_aktiv
+#     = vindue (06:00 → slut, børn hjemme, kill-switch on, ikke AirBnB)
+#       OG akkumuleret bevægelse i de sidste 15 min < tærskel
+#
+# ÉN autoritet, som soveværelsets snooze-anker: alle tænd-veje får ÉN condition
+# på sensoren, ingen af dem gentager reglen (fejlklasse #2).
+#
+# HVORFOR EN RULLENDE 15-MIN-VINDUE og ikke "siden 06:00": et enkelt burst
+# 06:05 må ikke frigive lyset resten af morgenen. Falder rummet til ro igen,
+# armeres beskyttelsen automatisk — lyset er da allerede tændt, og tænd-vejene
+# kræver alligevel `light == off`, så det rammer kun en GEN-tænding.
+#
+# HVORFOR moving_target SPEJLES I EN EGEN SENSOR: rå
+# `binary_sensor.*_apollo_radar_moving_target` er EKSKLUDERET fra recorderen
+# (se configuration.yaml — 5 Apolloer × høj flap-rate), og history_stats kan
+# kun læse det recorderen har. Spejlet er scopet til morgen-vinduet, så det kun
+# skriver i de ~90 minutter det bruges — og giver samtidig den historik en
+# fremtidig session skal bruge for at kalibrere tærsklen mod virkeligheden.
+#
+# EN KØRT VÆKNING SLIPPER BESKYTTELSEN (2026-09-04, user-bug: "move i
+# børneværelset tændte ikke lys efter børnevækningen ... efter en lysvækning
+# derinde skal mørke ikke beskyttes"). MÅLT samme morgen: rampen tændte loftet
+# 06:05:00, holdet slap 06:35:00 og lyset gik ud — hvorefter occupancy fyrede
+# 06:39:09, 06:47:13 og 06:48:06 uden at der kom lys, fordi ankeret stod
+# "beskytter — 14/45 s bevægelse" helt frem til 07:30.
+# Præmissen var forkert efter en vækning: hele konstruktionen findes for at
+# beskytte et barn der SOVER VIDERE, men en lysvækning har allerede tændt fuldt
+# loftslys i rummet i 30 min — der er ingen beskyttet mørke tilbage at værne om.
+# Beviset er `input_datetime.wakeup_kids_hold_stempel`, som BEGGE ramper
+# (hverdag + weekend) skriver — en SKREVET værdi, ikke en `last_changed`, så den
+# overlever en HA-restart (permanent faktum).
+#
+# HVAD RØRES IKKE (bevidst):
+#   • `wakeup_kids` (den planlagte alarm-vækning 06:05 hverdag / 07:30 weekend)
+#     — en sat vækning skal ALTID vække; beskyttelsen er ikke en gate foran den.
+#   • Styrbar / app / manuel tænding — vinder altid, som overalt ellers.
+#   • Sluk-vejene — beskyttelsen tænder ikke og slukker ikke noget selv.
+# DERFOR ER DER HELLER INGEN REAKTIV VAGT (som Sleep Over har): en vagt der
+# slukkede "uautoriseret" lys ville slås med den planlagte vækning kl. 06:05.
+# =============================================================================
+
+input_boolean:
+  # KILL-SWITCH (fejlklasse #21: skal sidde på hver vej ind — den er conditionen
+  # inde i selve ankeret, så alle konsumenter arver den gratis).
+  boern_morgen_beskyttelse_enabled:
+    name: "Børn: morgen-mørke beskyttet"
+    icon: mdi:sleep
+
+input_datetime:
+  # KONFIG (med i helpers_export DATETIME_CONFIG): hvornår beskyttelsen slipper.
+  # Default 07:30 = user-spec. Dækker vinduet fra godnat-flagenes rydning
+  # (~06:00-06:10) til børnene reelt er oppe.
+  boern_morgen_beskyttelse_slut:
+    name: "Børn: morgen-beskyttelse slutter"
+    icon: mdi:weather-sunset-up
+    has_date: false
+    has_time: true
+
+input_number:
+  # Hvor meget ÆGTE bevægelse der kræves i de sidste 15 min før presence-lys må
+  # tænde i vinduet. 0 = intet krav (beskyttelsen blokerer aldrig).
+  # Default 45 s: målte "barn vender sig"-ophold er 15-60 s occupancy, hvoraf
+  # kun få sekunder er moving-target — mens et barn der er oppe og går rundt
+  # akkumulerer 45 s bevægelse på under et minut.
+  boern_morgen_bevaegelse_sekunder:
+    name: "Børn: krævet morgen-bevægelse"
+    icon: mdi:motion-sensor
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+template:
+  - binary_sensor:
+      # ASCII-navn med vilje: name-slug SKAL matche unique_id (repo-gotcha).
+      # VINDUET er bevidst adskilt fra beskyttelsen: bevægelses-spejlet nedenfor
+      # hænger på vinduet, ikke på beskyttelsen — ellers ville spejlet gå false
+      # i samme øjeblik beskyttelsen slap, akkumulatoren dræne, og beskyttelsen
+      # armere igen med det samme (selvsvingning).
+      - name: "Boernevaerelse morgen vindue"
+        unique_id: boernevaerelse_morgen_vindue
+        icon: mdi:calendar-clock
+        state: >-
+          {% if is_state('input_boolean.boern_morgen_beskyttelse_enabled', 'on')
+                and is_state('binary_sensor.kids_home', 'on')
+                and states('input_select.house_mode') in ['Normal', 'Home Vacation'] %}
+            {# has_time-only input_datetime → timestamp = sekunder siden midnat #}
+            {% set slut = state_attr('input_datetime.boern_morgen_beskyttelse_slut', 'timestamp') | float(27000) %}
+            {% set nu = now().hour * 3600 + now().minute * 60 + now().second %}
+            {{ 21600 <= nu < slut }}
+          {% else %}
+            false
+          {% endif %}
+        attributes:
+          slut: "{{ states('input_datetime.boern_morgen_beskyttelse_slut') }}"
+
+      # RECORDER-SPEJL af moving_target (rå-entity'en er ekskluderet fra
+      # recorderen, og history_stats kan kun læse recorded historik).
+      # Scopet til vinduet → skriver kun i de ~90 min det faktisk bruges.
+      - name: "Boernevaerelse morgen bevaegelse"
+        unique_id: boernevaerelse_morgen_bevaegelse
+        icon: mdi:run
+        device_class: motion
+        state: >-
+          {{ is_state('binary_sensor.boernevaerelse_morgen_vindue', 'on')
+             and is_state('binary_sensor.boernevaerelse_apollo_radar_moving_target', 'on') }}
+
+      # "Har en lysvækning kørt i rummet i DAG?" — egen sensor, så reglen kun
+      # står ét sted (fejlklasse #2): både beskyttelsens state og dens aarsag
+      # læser den. Guarden mod `[11:] == '00:00:00'` er den permanente fælde:
+      # et urørt has_date-input_datetime står på DAGENS midnat, ikke 1970, og
+      # ville ellers ligne en vækning der lige var kørt.
+      - name: "Boernevaerelse vaekning koert i dag"
+        unique_id: boernevaerelse_vaekning_koert_i_dag
+        icon: mdi:alarm-check
+        state: >-
+          {% set st = states('input_datetime.wakeup_kids_hold_stempel') %}
+          {{ st not in ['unknown', 'unavailable', 'none', '']
+             and st[:10] == now().strftime('%Y-%m-%d')
+             and st[11:] != '00:00:00' }}
+        attributes:
+          stempel: "{{ states('input_datetime.wakeup_kids_hold_stempel') }}"
+
+      # ÉN AUTORITET: "hold børneværelset mørkt nu".
+      - name: "Boernevaerelse morgen beskyttelse aktiv"
+        unique_id: boernevaerelse_morgen_beskyttelse_aktiv
+        icon: mdi:shield-moon
+        state: >-
+          {% if is_state('binary_sensor.boernevaerelse_morgen_vindue', 'on')
+                and is_state('binary_sensor.boernevaerelse_vaekning_koert_i_dag', 'off') %}
+            {% set krav = states('input_number.boern_morgen_bevaegelse_sekunder') | float(45) %}
+            {# history_stats type: time returnerer TIMER → ×3600 = sekunder #}
+            {% set haves = (states('sensor.boernevaerelse_morgen_bevaegelse_recent') | float(0)) * 3600 %}
+            {{ krav > 0 and haves < krav }}
+          {% else %}
+            false
+          {% endif %}
+        attributes:
+          bevaegelse_sekunder: >-
+            {{ ((states('sensor.boernevaerelse_morgen_bevaegelse_recent') | float(0)) * 3600) | round(0) | int }}
+          kraevet_sekunder: "{{ states('input_number.boern_morgen_bevaegelse_sekunder') | int(45) }}"
+          aarsag: >-
+            {% if is_state('input_boolean.boern_morgen_beskyttelse_enabled', 'off') %}
+              kill-switch fra
+            {% elif is_state('binary_sensor.kids_home', 'off') %}
+              ingen børn hjemme
+            {% elif is_state('binary_sensor.boernevaerelse_morgen_vindue', 'off') %}
+              uden for morgen-vinduet (06:00-{{ states('input_datetime.boern_morgen_beskyttelse_slut') }})
+            {% elif is_state('binary_sensor.boernevaerelse_vaekning_koert_i_dag', 'on') %}
+              frigivet — lysvækning kørte
+              {{ states('input_datetime.wakeup_kids_hold_stempel')[11:16] }}
+            {% else %}
+              {% set krav = states('input_number.boern_morgen_bevaegelse_sekunder') | float(45) %}
+              {% set haves = (states('sensor.boernevaerelse_morgen_bevaegelse_recent') | float(0)) * 3600 %}
+              {{ 'beskytter — ' ~ (haves | round(0) | int) ~ '/' ~ (krav | round(0) | int)
+                 ~ ' s bevægelse' if haves < krav
+                 else 'frigivet — nok bevægelse (' ~ (haves | round(0) | int) ~ ' s)' }}
+            {% endif %}
+
+sensor:
+  # Akkumuleret ÆGTE bevægelse (minutter on → timer) i de sidste 15 min.
+  # Rullende vindue, ikke "siden 06:00" — se hoved-kommentaren.
+  - platform: history_stats
+    name: "Boernevaerelse morgen bevaegelse recent"
+    unique_id: boernevaerelse_morgen_bevaegelse_recent
+    entity_id: binary_sensor.boernevaerelse_morgen_bevaegelse
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      minutes: 15

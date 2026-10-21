@@ -1,0 +1,903 @@
+# =============================================================================
+# MORGEN-SOVEVÆRELSE: presence-lys bag privacy-gardinet + gardinet op efter bad
+# =============================================================================
+# User-spec 2026-07-30: "når vi er stået op om morgenen og alarmen har vækket os
+# og gardinet er på privacy mode, så har vi brug for presence lys i soveværelset
+# så vi kan finde ting."
+# User-spec 2026-07-31: "det skal også bare være når du mener vi er 2 personer
+# oppe."
+# User-spec 2026-07-31 runde 2 (DEN GÆLDENDE): "du må kunne se at jeg forlod
+# soveværelset først (movement i soveværelse, så i entre) og 30 min senere cirka
+# forlod parent_b soveværelset på samme måde? kan det ikke være vores signal på at
+# lys skal tændes så længe gardinet er nede eller på privacy mode, og når det
+# første badbesøg er ovre (10 min ro i bad), så ruller gardinet op og presence lys
+# normaliseres og tænder kun når lux kræver det?"
+#
+# -----------------------------------------------------------------------------
+# HVORFOR AFGANGS-SEKVENSEN OG IKKE "DUAL ROOM PRESENCE"
+# -----------------------------------------------------------------------------
+# Første udkast (07-31, forkastet af user samme dag) krævede bevægelse i
+# soveværelset SAMTIDIG med et andet rum optaget ≥ 120 s. Det var et gæt om
+# samtidighed, og samtidighed er beviseligt støjet her: over recorderens 14 dage
+# — hvor Parent B ikke var hjemme én eneste af dem, altså facit = ÉN person —
+# overlappede `sovevaerelse_apollo_occupancy` med open-plan/bad i op til 9,5 min,
+# fordi radar-trailing er ensidig (den efterlader "optaget", ikke bevægelse).
+#
+# AFGANGEN er derimod en HÆNDELSE, ikke en tilstand, og den kan efterprøves i
+# history. Sekvensen brugeren beskriver:
+#   AFGANG   soveværelsets occupancy falder til off, mens entréen var aktiv
+#            inden for `sove_morgen_afgang_entre_sekunder` = nogen gik UD af
+#            rummet (og ikke bare lagde sig stille).
+#   2. KROP  soveværelset bliver optaget IGEN ≥ `sove_morgen_anden_krop_minutter`
+#            senere, UDEN at entréen har været aktiv omkring den flanke = der kom
+#            ingen ind udefra → den der begynder at bevæge sig lå der allerede.
+#            = TO KROPPE, og den ene er i soveværelset lige nu (= dér hvor lyset
+#            skal bruges).
+#
+# KALIBRERING (9 gyldige morgener 23-31/07 — 18-22/07 var
+# `sovevaerelse_apollo_occupancy` unavailable og indgår ikke). Gap mellem afgang
+# og gen-optagelse UDEN entré-trafik imellem:
+#   radar-artefakter (samme krop, sensoren faldt kortvarigt):
+#       0,2 · 1,0 · 1,3 · 1,8 · 1,9 · 2,0 · 2,9 min
+#   ægte anden krop:
+#       13,6 · 15,3 · 17,0 · 38,9 min
+# Ren kløft mellem 2,9 og 13,6 → tærskel 8 min = midt imellem, 2,8× værste
+# artefakt. Ved 8 min fyrer detektoren på 3 af de 9 morgener (25/07, 27/07,
+# 31/07) — netop de morgener hvor to voksne beviseligt stod op.
+#
+# I DAG (31/07) matcher den brugerens egen beskrivelse på minuttet:
+#   05:43:45 afgang 1 → 06:00:44 rummet optaget igen (17,0 min, ingen entré)
+#   → anden krop → 06:11:09 afgang 2 (= "cirka 30 min senere").
+#
+# 2026-08-25 — KLØFTEN VAR IKKE REN, og ingen tærskel kan gøre den ren.
+# Kalibreringens 9 morgener havde ingen SOVENDE anden krop, så de målte kun
+# "krop der står op" mod "radar-artefakt". Men CLAUDE.md's permanente faktum
+# siger at sove-Apolloen taber en person der ligger stille i 5-15 min (målt
+# 15,0 min 08-11, 17,1 min 08-22c) — dvs. en sovende ligger MIDT i det band
+# der her hedder "ægte anden krop" (13,6-38,9). Målt i nat med Parent B
+# sovende hele tiden: off-huller på 11,3 · 10,7 · 7,0 · 8,3 min. Det sidste
+# er det der fyrede: afgang 06:15:17 → rummet optaget igen 06:23:35 = 8 min
+# 18 s, altså 18 SEKUNDER over tærsklen, hvorefter huset konkluderede "to
+# personer oppe" og rullede gardinet op kl. 06:35 over en sovende.
+# Fixet er derfor ikke en højere tærskel (bandene OVERLAPPER — samme fælde
+# som 08-22c's 15-min-krav: ingen værdi er både opnåelig og et bevis), men en
+# ANDEN AKSE: den anden krop skal give et MOVING target. En sovende der
+# gen-detekteres på vejrtrækningen giver kun still. Samme diskriminator som
+# børneværelsets morgenlys allerede bruger. Tærsklen er nu kun en debounce.
+# Og et moving target beviser kun BEVÆGELSE, ikke at nogen forlod sengen —
+# derfor skal den bevægelse ske tæt på døren — se næste afsnit.
+#
+# 2026-08-25b — RETNINGEN LIGGER I AFSTANDEN. Trin 2 var først bygget på
+# rækkefølgen alene ("moving target, EFTERFULGT af entré"), men det oprindelige
+# krav om at entréen skulle have været STILLE i 180 s før flanken kunne aldrig
+# blive sandt — kæden var ufyrbar som deployet. Tre live-ture målt med
+# 1 Hz-polling (radar-target-sensorerne er ude af recorderen, så de kan kun
+# ses live):
+#   GIK UD  moving_distance 151 → 87 → 47 cm  → rummet tomt bagefter (8 min)
+#   GIK IND moving_distance 100 → 147 → 240 cm → rummet optaget (2 min 5 s)
+#   I SENGEN still/moving 229-240 cm
+# Soveværelsets Apollo sidder LIGE VED DØREN til entréen (user-spec), så
+# afstanden er retnings-beviset: ud = faldende mod sensoren, ind/i sengen =
+# stigende. Kravet er derfor at kroppen bevæger sig INDEN FOR
+# `sove_morgen_2p_doerzone_cm` (120 cm) — sengen ligger dobbelt så langt væk,
+# så kløften er bred.
+# ENTRÉ-BEKRÆFTELSEN ER FJERNET (user-spec 2026-08-26: "lets just have it rely
+# on the apollo distance trigger, we dont need the pir entre"). Den var bygget
+# som et rækkefølge-krav ("dør-zone, DEREFTER entréens PIR inden 30 s"), men
+# testturen 08-25 viste præcis hvorfor den ikke bærer: PIR'en sås ON ét sekund
+# FØR radarens moving target, fordi en ANDEN person stod i entréen. Et
+# "A og derefter B"-krav over to rum kan forstyrres af en tredje krop, og
+# entréens VALLHORN er desuden blind 10,2 % af tiden (batteridrevet Matter,
+# målt over 14 døgn) — hvert udfald ville have gjort to-oppe uopnåelig den
+# morgen. Dør-zonen alene er både bredere målt og altid tilgængelig.
+# ENTRÉEN ER STADIG NØGLEN til AFGANGEN (afsnittet ovenfor):
+# `binary_sensor.entre_valhorn_occupancy` ligger mellem soveværelset og resten
+# af huset. Uden entré-tjekket tæller én person der går ud og ind som to (målt
+# 25/07: 5 rå "afgange" fra ÉN person).
+#
+# 2026-08-30e — DØREN ER NU DET DIREKTE VIDNE (user-spec: "en lukket dør skal
+# om morgenen holde det mørkt derinde mens en åben dør skal indikere at vi er
+# stået op begge to"). MYGGBETT'en `binary_sensor.parasoll_sovedoer` (Matter/
+# Thread, node 462, paret 30/8) giver maskinen dens første ikke-udledte input.
+# Alt ovenfor er indirekte: afgangs-sekvensen og dør-zonen slutter sig til to
+# kroppe ud fra radar-mønstre, og de mønstre overlapper beviseligt med en
+# sovendes off-huller — derfor de fire lag af debounce, retning og friskhed, og
+# derfor rullede gardinet alligevel op over en sovende 08-25. En dør-tilstand er
+# en HANDLING og kan ikke opstå af sensor-støj.
+#   ÅBEN (≥ `sove_morgen_doer_aaben_minutter`) → sætter to-oppe-latchen, side om
+#   side med dør-zonen. Den der først kan bevise det, gør det.
+#   LUKKET (`binary_sensor.sove_doer_moerkhold`, 04-12) → VETO: ankeret nedenfor
+#   falder, og gardin-tragten udskyder motoren. Bevidst et veto OVEN I de gamle
+#   krav og ikke en erstatning — en åben dør beviser ikke at rummet er tomt, kun
+#   at ingen har bedt om mørke.
+# `unavailable` betyder INGEN af delene (#9): døren er batteridrevet Matter, og
+# et udfald skal give husets hidtidige adfærd — ikke et evigt mørkelagt rum.
+#
+# 2026-09-01 — EN DØR DER ALDRIG BLEV LUKKET ER IKKE EN HANDLING. Dør-vejen
+# ovenfor målte "åben i >= 5 min" på sensorens `last_changed`, og den var 32
+# timer gammel: døren stod åben UAFBRUDT 30/8 21:40 → 1/9 06:14. Kravet var
+# derfor sandt i samme sekund 04:00-vinduet åbnede, og latchen blev indløst på
+# /5-ticket 06:05:00 — 3,5 min efter godnat blev ryddet 06:01:32 (fejlklasse
+# #19). 06:11:04 tændte presence-lyset pendlen over en sovende Parent B; user
+# slukkede den på godnat-knappen 4 sekunder senere. Samme falske latch ramte
+# også morgenen 31/8 = 2 ud af 2 morgener siden sensoren blev paret.
+# Det 08-30e beskrev var et PAR: døren LUKKES (nogen vil sove videre) og
+# ÅBNES igen (nu er de oppe). En dør der aldrig blev lukket bærer ingen af
+# delene. Vejen kræver nu at selve ÅBNINGEN er sket efter dagens 04:00, målt på
+# et SKREVET stempel (`input_datetime.sove_morgen_doer_aabnet_at`) — ikke på
+# `last_changed`, som en HA-restart ville gøre brandny (#23).
+#
+# 2026-09-01b — VOKSENVÆKNING SLÅET FRA ER ET EKSPLICIT "NOGEN SOVER VIDERE"
+# (user-spec): "jeg havde min alarm slået til men slog voksenvækning fra i ha
+# appen fordi parent_b ville sove videre. i det tilfælde skal sove lys ikke
+# tænde ... men holdes mørkt indtil nr 2 person oppe er konstateret."
+# Med `input_boolean.wakeup_adults_enabled` = off er en åben dør tvetydig på
+# præcis den dyre måde: person 1 der går ud og lader døren stå åben ser
+# identisk ud med "vi er begge oppe". Dør-vejen tier derfor i det tilfælde, og
+# kun dør-zone-vejen (2) kan bekræfte to-oppe — den kræver strukturelt et
+# afgangs-stempel, altså at rummet HAR været forladt, hvilket ikke kan ske
+# mens nogen ligger og sover derinde (målt 1/9: `sove_morgen_afgang_at` var
+# aldrig sat, netop fordi occupancy aldrig faldt).
+# Rummet kan ikke stå mørkt i det uendelige: `sove_morgen_moerklagt` slutter
+# kl. 11, en oprulning frigiver ankeret, og den manuelle knap virker altid.
+#
+# -----------------------------------------------------------------------------
+# HVAD SIGNALET STYRER
+# -----------------------------------------------------------------------------
+# 1) LYS bag gardinet. `binary_sensor.sove_alarm_morgen_lys` er ankeret ~12
+#    steder i huset læser. Det kræver nu BÅDE at rummet er bevidst mørkt (alarm-
+#    vinduet ELLER den mørklagte morgen) OG at to personer er bekræftet oppe.
+#    I det mørklagte vindue er ankeret en HÅRD GATE på ALLE TRE auto-tænd-veje
+#    (presence_sovevaerelse' presence-tænd + gang-early-detect pre-lys, samt
+#    presence_lights' lux-fald) — ingen bekræftelse = intet auto-lys. Early-
+#    detect kom til i runde 3 (user: "3. ja"); den er empirisk en no-op om
+#    sommeren (open_plan_lux-gaten) og bider først om vinteren.
+#    Facit der gjorde det til et krav: logbook 07-31 viser
+#    `presence_light_sovevaerelse_on` tænde pendlen 06:00:45 / 06:10:17 /
+#    06:29:48 med gardinet på position 0 og 2,6 lx i rummet, uden alarm.
+#    Manuel knap virker altid.
+# 2) GARDINET. Bekræftet to-oppe + dagens første bad-besøg overstået (badet tomt
+#    i `sove_gardin_bad_tomt_minutter`, "vi går nøgne rundt", 07-29b) → gardinet
+#    ruller helt op via `script.sove_gardin_op`. Så snart det er oppe falder
+#    `sove_morgen_moerklagt` af sig selv → presence-lyset normaliseres og tænder
+#    kun når lux kræver det, præcis som user-spec'en beder om.
+#    HULLET DET LUKKER (verificeret 31/07): `sove_gardin_bad_klar` stod on, men
+#    INTET havde bedt om en oprulning — bad-gaten frigiver kun en AFVENTENDE
+#    åbning, den udløser aldrig selv en. Husets eneste morgen-åbner
+#    (morning_curtains.yaml) kræver soveværelset TOMT i 15 min, hvilket aldrig
+#    sker mens to voksne står og gør sig klar: dens `last_triggered` var None —
+#    den har bogstavelig talt aldrig fyret.
+#
+# ALARM-VINDUET består uændret ved siden af (07-30): kørte den alarm-drevne
+# vækning færdig for < `sove_alarm_morgen_vindue_minutter` siden, og står gardinet
+# stadig på/under privacy, så er rummet mørkt af en grund vi kender. Det er
+# stadig KUN et vindue — to-oppe-kravet gælder også dér.
+#
+# VIL MAN SOVE VIDERE er svaret uændret det brugeren selv valgte 07-29b: tryk
+# godnat-knappen → snooze. `sovevaerelse_morgen_beskyttelse_aktiv` er fortsat en
+# hård gate på alle sove-tænd-stier og på `script.sove_gardin_op`.
+#
+# NULSTILLING: kl. 04:00 (afgangs-stempel, anden-krop-flag og to-oppe-latch).
+# Latchen holder altså resten af dagen — med vilje: går begge ind i soveværelset
+# sammen for at finde tøj, må lyset ikke falde tilbage til normal-reglerne igen.
+#
+# AirBnB: hele maskinen er mode-gatet, flagene ryddes ved entry, og alle fire
+# helpers er med i privacy-purgen (de afslører hvornår familien står op).
+# =============================================================================
+
+input_datetime:
+  # RUNTIME-stempler (ikke indstillinger) → holdes ude af helper-snapshottet,
+  # fordi input_datetime kun snapshottes via DATETIME_CONFIG-allowlisten i
+  # scripts/helpers_export.py. Skal IKKE tilføjes der.
+  wakeup_alarm_ramp_faerdig_at:
+    name: "Alarm-vækning fuldført (stempel)"
+    icon: mdi:alarm-check
+    has_date: true
+    has_time: true
+  # Dagens seneste afgang fra soveværelset (occupancy off + entré aktiv).
+  sove_morgen_afgang_at:
+    name: "Sove-morgen: seneste afgang (stempel)"
+    icon: mdi:door-open
+    has_date: true
+    has_time: true
+  # Latch: hvornår blev "to personer oppe" bekræftet i dag? Gyldig når stemplet
+  # er nyere end dagens 04:00-nulstilling.
+  sove_alarm_morgen_2p_at:
+    name: "Sove-morgen: to personer oppe (stempel)"
+    icon: mdi:account-multiple-check
+    has_date: true
+    has_time: true
+  # 2026-09-01: HVORNAAR blev sovedoeren AABNET? En SKREVET vaerdi, fordi
+  # `last_changed` nulstilles ved HA-restart (CLAUDE.md) — en restart kl. 07 over
+  # en doer der har staaet aaben hele natten ville ellers se 0 s gammel = frisk.
+  # Uden stempel latcher doer-vejen ikke (fejler lukket, #23).
+  sove_morgen_doer_aabnet_at:
+    name: "Sove-morgen: sovedoer aabnet (stempel)"
+    icon: mdi:door-open
+    has_date: true
+    has_time: true
+  # 2026-10-16: HVORNAAR blev sovedoeren sidst set LUKKET? Kun til at skille en
+  # aabning der skete MENS sensoren var unavailable (lukket → unavailable → on)
+  # fra Matter-ekkoet af en doer der allerede stod aaben (aaben → unavailable → on).
+  sove_morgen_doer_lukket_at:
+    name: "Sove-morgen: sovedoer lukket (stempel)"
+    icon: mdi:door-closed
+    has_date: true
+    has_time: true
+input_boolean:
+  # Anden krop set i soveværelset efter en afgang. Skilt fra latch-stemplet, så
+  # logbook/dashboard kan vise HVORFOR to-oppe er sat uden at parse et stempel.
+  sove_morgen_anden_krop:
+    name: "Sove-morgen: anden krop bekræftet"
+    icon: mdi:account-multiple
+
+input_number:
+  sovevaerelse_alarm_morgen_lux:
+    name: "Soveværelse alarm-morgen lux-grænse"
+    icon: mdi:brightness-6
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+  sove_alarm_morgen_vindue_minutter:
+    name: "Alarm-morgen lys-vindue"
+    icon: mdi:timer-sand
+    min: 0
+    max: 360
+    step: 15
+    unit_of_measurement: "min"
+    mode: slider
+  # Hvor længe soveværelset skal have været forladt før en gen-optagelse tæller
+  # som en ANDEN krop og ikke som et radar-dropout. Kalibreret: artefakter ≤ 2,9
+  # min, ægte ≥ 13,6 min over 9 morgener.
+  sove_morgen_anden_krop_minutter:
+    name: "Sove-morgen: anden krop efter"
+    icon: mdi:account-clock
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+  # Hvor tæt på soveværelsets flanke entréen skal have været aktiv, for at
+  # flanken tæller som en person der GIK UD (og modsat: for at en gen-optagelse
+  # forkastes som "nogen kom ind udefra").
+  # Min 10 (ikke 30) er bevidst: fresh-min-sentinellen i init_user_preferences
+  # skal være en værdi ingen ville VÆLGE (10 s er for stramt til at nå fra entré
+  # til at soveværelsets radar slipper) — ellers hæver hver HA-restart brugerens
+  # egen indstilling (fejlklasse #5, cykel-lader-varianten).
+  sove_morgen_afgang_entre_sekunder:
+    name: "Sove-morgen: entré-vindue omkring afgang"
+    icon: mdi:door-sliding
+    min: 10
+    max: 300
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+  # DØR-ZONEN. Soveværelsets Apollo sidder LIGE VED døren ud til entréen
+  # (user-spec 2026-08-25b), så en krop på vej ud kommer TÆTTERE på sensoren
+  # mens en krop i sengen bliver på afstand. Målt samme morgen med 1 Hz-polling:
+  #   på vej UD   moving_distance 151 → 87 → 47 cm
+  #   på vej IND  moving_distance 100 → 147 → 240 cm (sengen)
+  #   i sengen    still/moving 229-240 cm
+  # 120 cm ligger i kløften. Hæves den, bekræftes flere (også en der bare
+  # vender sig); sænkes den, skal man helt hen i døråbningen.
+  sove_morgen_2p_doerzone_cm:
+    name: "Sove-morgen: dør-zone (afstand til Apollo)"
+    icon: mdi:door-open
+    min: 30
+    max: 300
+    step: 10
+    unit_of_measurement: "cm"
+    mode: slider
+  # Hvor længe soveværelsets dør skal stå ÅBEN før det tæller som "vi er begge
+  # stået op". Debouncen findes kun for at skille en nat-/toilettur (hvor døren
+  # kan stå åben mens man går forbi) fra den åbne dør man efterlader når man er
+  # oppe for alvor. Min 1 = sentinel (#5).
+  sove_morgen_doer_aaben_minutter:
+    name: "Sove-morgen: dør åben før to-oppe"
+    icon: mdi:door-open
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+template:
+  - binary_sensor:
+      # RÅ alarm-vindue: vækningen kørte færdig for nylig OG gardinet er stadig
+      # nede. Siger intet om hvor mange der er oppe — det gør `..._to_oppe`.
+      - name: "Sove alarm morgen vindue"
+        unique_id: sove_alarm_morgen_vindue
+        icon: mdi:alarm-check
+        state: >
+          {% set stempel = state_attr('input_datetime.wakeup_alarm_ramp_faerdig_at', 'timestamp') | float(0) %}
+          {% set vindue = states('input_number.sove_alarm_morgen_vindue_minutter') | float(0) %}
+          {% set pos = state_attr('cover.gardin_sovevaerelse', 'current_position') %}
+          {% set privacy = 100 - (states('input_number.global_wakeup_curtain_privacy_pct') | float(70)) %}
+          {% set alder = as_timestamp(now()) - stempel %}
+          {{ stempel > 0 and vindue > 0 and pos is not none
+             and 0 <= alder <= (vindue * 60)
+             and (pos | float(100)) <= (privacy + 5) }}
+
+      # TO PERSONER OPPE = latchen fra afgangs-sekvensen, gyldig for I DAG.
+      # Sammenlignes mod dagens 04:00 (ikke mod "er stemplet fra i dag"): et
+      # 1970-stempel og et frisk input_datetime på dagens midnat falder BEGGE
+      # igennem, og udtrykket fejler dermed LUKKET ved boot (jf. 07-30e).
+      - name: "Sove alarm morgen to oppe"
+        unique_id: sove_alarm_morgen_to_oppe
+        icon: mdi:account-multiple-check
+        state: >
+          {% set p2 = state_attr('input_datetime.sove_alarm_morgen_2p_at', 'timestamp') | float(0) %}
+          {{ p2 > 0 and p2 >= today_at('04:00').timestamp() }}
+        attributes:
+          bekraeftet_kl: >
+            {% set p2 = state_attr('input_datetime.sove_alarm_morgen_2p_at', 'timestamp') | float(0) %}
+            {% if p2 > 0 and p2 >= today_at('04:00').timestamp() %}
+            {{ p2 | timestamp_custom('%H:%M', true) }}
+            {% else %}-{% endif %}
+          # 5-MIN-KVANTISERET (fejlklasse #24): et now()-afledt attribut med
+          # minut-oplosning skriver en recorder-raekke i minuttet, doegnet rundt.
+          # Forbrugeren er ren visning (settings.yaml "seneste afgang for N min
+          # siden") — 5 min er rigeligt praecist der.
+          minutter_siden_afgang: >
+            {% set a = state_attr('input_datetime.sove_morgen_afgang_at', 'timestamp') | float(0) %}
+            {% if a > 0 and a >= today_at('04:00').timestamp() %}
+            {{ (((as_timestamp(now()) - a) / 300) | int) * 5 }}
+            {% else %}-1{% endif %}
+
+      # DØREN SOM FYSISK MØRK-HOLD (2026-08-30e, user-spec: "en lukket dør skal
+      # om morgenen holde det mørkt derinde"). Står soveværelsets dør EKSPLICIT
+      # lukket i morgen-vinduet, vil nogen derinde sove videre — så hverken
+      # auto-lys eller gardin-motoren må bryde mørket.
+      #
+      # Dette er husets første DIREKTE vidne om intentionen. Alle de hidtidige
+      # beviser er indirekte og har hver deres kendte huller: sove-Apolloen
+      # taber en stille krop i 5-17 min (så `occupancy off` er ikke et fravær),
+      # og dør-zone-afgangen har fyret falsk og rullet gardinet op over en
+      # sovende (08-25). En lukket dør kan ingen af delene — den er en handling.
+      #
+      # `unavailable` tæller IKKE som lukket (#9): MYGGBETT'en er et
+      # batteridrevet Matter/Thread sleepy end device, og et udfald ville ellers
+      # slukke soveværelsets morgen-lys lydløst og for evigt. Ukendt dør = husets
+      # hidtidige regler, hverken mere eller mindre. Samme grund til at holdet er
+      # tids-afgrænset: en dør der bliver lukket kl. 14 er ikke et mørk-ønske.
+      - name: "Sove doer moerkhold"
+        unique_id: sove_doer_moerkhold
+        icon: mdi:door-closed-lock
+        state: >
+          {{ 4 <= now().hour < 12
+             and is_state('binary_sensor.parasoll_sovedoer', 'off') }}
+
+      # ANKERET som resten af huset læser: rummet er bevidst mørkt (alarm-vinduet
+      # ELLER den mørklagte morgen) OG to personer er bekræftet oppe i dag OG
+      # døren holder ikke rummet mørkt.
+      - name: "Sove alarm morgen lys"
+        unique_id: sove_alarm_morgen_lys
+        icon: mdi:alarm-light
+        state: >
+          {{ (is_state('binary_sensor.sove_alarm_morgen_vindue', 'on')
+              or is_state('binary_sensor.sove_morgen_moerklagt', 'on'))
+             and is_state('binary_sensor.sove_alarm_morgen_to_oppe', 'on')
+             and is_state('binary_sensor.sove_doer_moerkhold', 'off') }}
+        attributes:
+          doer_hold: "{{ is_state('binary_sensor.sove_doer_moerkhold', 'on') }}"
+          # 5-MIN-KVANTISERET (fejlklasse #24). Stemplet ryddes aldrig, saa den
+          # gamle minut-version tikkede doegnet rundt i al evighed. Vises kun
+          # mens sensoren selv er on (triggers.yaml) = samme morgen.
+          minutter_siden_vaekning: >
+            {% set stempel = state_attr('input_datetime.wakeup_alarm_ramp_faerdig_at', 'timestamp') | float(0) %}
+            {% if stempel <= 0 %}-1
+            {% else %}{{ (((as_timestamp(now()) - stempel) / 300) | int) * 5 }}{% endif %}
+          gardin_position: "{{ state_attr('cover.gardin_sovevaerelse', 'current_position') }}"
+          aarsag: >
+            {% if is_state('binary_sensor.sove_alarm_morgen_vindue', 'on') %}alarm-vindue
+            {% elif is_state('binary_sensor.sove_morgen_moerklagt', 'on') %}mørklagt morgen
+            {% else %}-{% endif %}
+
+      # Den bevidst mørklagte morgen: gardinet er stadig nede FØR kl. 11. I dette
+      # vindue er ankeret ovenfor et KRAV for auto-tænd (2026-07-31, user-spec) —
+      # ellers står soveværelset mørkt til nogen trykker selv. Efter kl. 11 eller
+      # når gardinet er rullet op gælder husets normale presence-regler igen.
+      #
+      # NEDRE GRÆNSE 05:00 (2026-08-01, var 06:00). Under 06 er soveværelset
+      # normalt beskyttet af godnat-flaget, som er den nat-spærre alle tre
+      # sove-tænd-veje deler. Men `godnat_auto_off_aktivitet` kunne rydde godnat
+      # fra 05:00 — og gjorde det 08-01 kl. 05:07 på en nat-tur — hvorefter
+      # gang-early-detect tændte pendlen 05:19 mens brugeren var inde ved
+      # pigerne. Mellem 05 og 06 var der altså hverken godnat-spærre eller
+      # mørklagt-gate. Auto-off er nu flyttet til 06:00 (den ægte rettelse), og
+      # dette vindue dækker samme time som anden forsvarslinje, så hullet ikke
+      # kan genåbnes af en anden clear-vej senere.
+      # Aftenen er urørt (h=22 rammer ikke vinduet), og vækningerne styrer lyset
+      # direkte — ikke gennem de tre presence-veje der gates her.
+      - name: "Sove morgen moerklagt"
+        unique_id: sove_morgen_moerklagt
+        icon: mdi:weather-night-partly-cloudy
+        state: >
+          {% set pos = state_attr('cover.gardin_sovevaerelse', 'current_position') %}
+          {% set privacy = 100 - (states('input_number.global_wakeup_curtain_privacy_pct') | float(70)) %}
+          {{ 5 <= now().hour < 11 and pos is not none
+             and (pos | float(100)) <= (privacy + 5) }}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # 1) AFGANG: nogen forlod soveværelset (occupancy off + entré aktiv omkring).
+  # ---------------------------------------------------------------------------
+  - id: sove_morgen_afgang_registrer
+    alias: "Sove-morgen: registrér afgang fra soveværelset"
+    description: >
+      Soveværelsets occupancy falder til off MENS entréen har været aktiv inden
+      for entré-vinduet = nogen gik UD af rummet (modsat: radaren tabte en der
+      ligger stille — da har entréen været død i timevis).
+      Stemplet må gerne overskrives: er der flere afgange før en anden krop
+      dukker op, er det den SENESTE der skal måles fra.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+        from: "on"
+        to: "off"
+    condition:
+      - condition: time
+        after: "04:00:00"
+        before: "12:00:00"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Færdig for i dag når to-oppe er bekræftet — så er der intet at måle.
+      - condition: state
+        entity_id: binary_sensor.sove_alarm_morgen_to_oppe
+        state: "off"
+    action:
+      # Entréen aktiv nu, eller faldt til off inden for vinduet. KRÆVER et ægte
+      # on/off — `unavailable` må ikke læses som "entréen var stille" (#9), for
+      # så ville enhver radar-dropout blive en afgang.
+      #
+      # EPISODE-KRAVET (2026-08-06): entré-aktiviteten skal ligge inden for DEN
+      # occupancy-episode vi netop forlod (`trigger.from_state.last_changed` =
+      # da rummet blev optaget). Uden det kan en afsluttet nat-toilettur
+      # GENBRUGES som afgang: 08-06 gik brugeren ud 05:36 (entré), tilbage i
+      # seng 05:38:43 — og da radaren tabte den stilleliggende krop 05:39:30,
+      # lå entré-stemplet fra UD-turen stadig kun 83 s tilbage i tiden, så
+      # dropoutet blev stemplet som en ny afgang. 14 min senere kom radaren
+      # igen → "to personer oppe" → gardinet rullede op 21 min før alarmen.
+      # I en ægte afgang passerer man altid entréen EFTER man rejser sig, så
+      # kravet kan kun afvise artefakter.
+      - variables:
+          afgang_ok: >-
+            {% set e = states.binary_sensor.entre_valhorn_occupancy %}
+            {% set w = states('input_number.sove_morgen_afgang_entre_sekunder') | float(180) %}
+            {% set fs = trigger.from_state | default(none, true)
+                        if trigger is defined else none %}
+            {% set ep = fs.last_changed.timestamp() if fs is not none else 0 %}
+            {{ e is not none and (e.state == 'on'
+               or (e.state == 'off'
+                   and (now() - e.last_changed).total_seconds() <= w
+                   and e.last_changed.timestamp() >= ep)) }}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ afgang_ok }}"
+            sequence:
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.sove_morgen_afgang_at
+                data:
+                  timestamp: "{{ as_timestamp(now()) | int }}"
+              - service: logbook.log
+                data:
+                  name: "Sove-morgen"
+                  message: >-
+                    Afgang registreret — soveværelset tomt, entréen aktiv
+                    {{ (now() - states.binary_sensor.entre_valhorn_occupancy.last_changed).total_seconds() | round(0) | int }}
+                    s siden. Venter på anden krop
+                    (≥ {{ states('input_number.sove_morgen_anden_krop_minutter') | int(8) }} min).
+                  entity_id: binary_sensor.sove_alarm_morgen_to_oppe
+        # Denne off-flanke var IKKE en afgang → et tidligere stempel er brugt op.
+        # Uden rydningen måler anden-krop-testen videre fra en afgang der for
+        # længst er annulleret af en hjemkomst: 08-01 stod stemplet fra 04:55,
+        # brugeren var tilbage i seng 05:20, og et radar-flap 05:26 blev derfor
+        # dømt "to personer oppe". Stemplet skal altid svare til den off-episode
+        # vi faktisk kommer ud af.
+        default:
+          - condition: template
+            value_template: >-
+              {{ (state_attr('input_datetime.sove_morgen_afgang_at', 'timestamp') | float(0))
+                 >= today_at('04:00').timestamp() }}
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.sove_morgen_afgang_at
+            data:
+              datetime: "1970-01-01 00:00:00"
+          - service: logbook.log
+            data:
+              name: "Sove-morgen"
+              message: >-
+                Afgangs-stemplet ryddet — soveværelset blev tomt igen uden
+                entré-trafik i samme ophold (radar-dropout eller en hjemkomst
+                der allerede har brugt afgangen), så der er intet gyldigt
+                udgangspunkt at måle en anden krop fra.
+              entity_id: binary_sensor.sove_alarm_morgen_to_oppe
+
+  # ---------------------------------------------------------------------------
+  # 2) ANDEN KROP: rummet optaget igen længe efter afgangen, uden entré-trafik,
+  #    med et MOVING target INDE I DØR-ZONEN. Sætter to-oppe-latchen direkte.
+  # ---------------------------------------------------------------------------
+  - id: sove_morgen_anden_krop_detekter
+    alias: "Sove-morgen: anden krop bevæger sig i dør-zonen → to personer oppe"
+    description: >
+      Soveværelset bliver optaget igen ≥ `sove_morgen_anden_krop_minutter` efter
+      afgangen, radaren ser et MOVING target (= det er ikke bare en sovende der
+      gen-detekteres på vejrtrækningen), OG kroppen er tæt nok på Apolloen til
+      at være på vej ud (`sove_morgen_2p_doerzone_cm`).
+
+      Dør-zonen er retnings-beviset (user-spec 2026-08-25b): Apolloen sidder
+      lige ved døren til entréen, så en krop på vej UD kommer tættere på
+      sensoren (målt 151 → 87 → 47 cm), mens en krop der bare vender sig i
+      sengen bliver på 229-240 cm.
+
+      Afstanden er hele beviset (user-spec 2026-08-26). En tidligere version
+      krævede desuden entréens PIR bagefter; det krav er væk, fordi det kunne
+      forstyrres af en tredje krop i entréen og fordi VALLHORN'en er blind
+      10,2 % af tiden.
+    mode: single
+    trigger:
+      # Kroppen kommer ind i dør-zonen. Dette ER hændelsen.
+      - platform: numeric_state
+        entity_id: sensor.sovevaerelse_apollo_radar_moving_distance
+        below: input_number.sove_morgen_2p_doerzone_cm
+      # Var kroppen allerede i zonen da den begyndte at bevæge sig, kommer der
+      # ingen numeric_state-krydsning.
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_apollo_radar_moving_target
+        from: "off"
+        to: "on"
+      # #4-backstop: sker flanken under en restart, findes den aldrig igen.
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: time
+        after: "04:00:00"
+        before: "12:00:00"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: state
+        entity_id: binary_sensor.sove_alarm_morgen_to_oppe
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+        state: "on"
+      # Den anden krop skal BEVÆGE sig. Occupancy alene er still ELLER moving,
+      # og en sovende der gen-detekteres på vejrtrækningen giver kun still —
+      # se 08-25-målingen i header-kommentaren: kløften er ikke ren.
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_apollo_radar_moving_target
+        state: "on"
+      # Afgangs-stemplet er fra i dag (efter 04:00-nulstillingen), og
+      # gen-optagelsen ligger langt nok efter den. Gen-optagelsen måles på
+      # opholds-stemplet (packages/apollo_latch_detect.yaml), IKKE på
+      # last_changed: en restart midt i opholdet flytter last_changed til
+      # boot-tiden og ville gøre en tilbagevenden 2 min efter afgangen til
+      # "en anden krop" (gardinet op over en sovende). Ikke stemplet endnu
+      # (samme sekund som on-flanken) = ikke bevist; næste trigger tager den.
+      - condition: template
+        value_template: >-
+          {% set a = state_attr('input_datetime.sove_morgen_afgang_at', 'timestamp') | float(0) %}
+          {% set o = state_attr('input_datetime.sove_apollo_occ_since', 'timestamp') | float(0) %}
+          {% set gap = states('input_number.sove_morgen_anden_krop_minutter') | float(8) %}
+          {{ a > 0 and a >= today_at('04:00').timestamp()
+             and (o - a) >= (gap * 60) }}
+      # DØR-ZONEN — retnings-beviset. Apolloen sidder lige ved døren ud til
+      # entréen, så en krop på vej UD kommer tættere på (målt 151 → 87 → 47 cm)
+      # mens en krop i sengen bliver på 229-240 cm. Skrevet som condition (ikke
+      # kun som trigger) så /5-backstoppen dømmer på samme krav.
+      # `unknown`-guarden er nødvendig: afstanden er `unknown` når der ikke er
+      # noget moving target, og `| float(0)` ville ellers gøre "intet mål" til
+      # den tætteste tænkelige afstand.
+      - condition: template
+        value_template: >-
+          {% set d = states('sensor.sovevaerelse_apollo_radar_moving_distance') %}
+          {% set z = states('input_number.sove_morgen_2p_doerzone_cm') | float(120) %}
+          {{ d not in ['unknown', 'unavailable', 'none'] and (d | float(9999)) < z }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.sove_morgen_anden_krop
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.sove_alarm_morgen_2p_at
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+      - service: logbook.log
+        data:
+          name: "Sove-morgen"
+          message: >-
+            To personer oppe BEKRÆFTET — anden krop bevæger sig i DØR-ZONEN
+            ({{ states('sensor.sovevaerelse_apollo_radar_moving_distance') }} cm,
+            grænse {{ states('input_number.sove_morgen_2p_doerzone_cm') | int(120) }} cm;
+            sengen ligger på 229-240 cm). Soveværelset optaget igen
+            {{ ((((state_attr('input_datetime.sove_apollo_occ_since', 'timestamp') | float(0))
+                  - (state_attr('input_datetime.sove_morgen_afgang_at', 'timestamp') | float(0))) / 60)
+                | round(1)) }} min efter afgangen. Presence-lys frigivet bag gardinet.
+          entity_id: binary_sensor.sove_alarm_morgen_to_oppe
+
+  # ---------------------------------------------------------------------------
+  # 2b) DØREN STÅR ÅBEN: det direkte bevis på at begge er oppe.
+  # ---------------------------------------------------------------------------
+  - id: sove_morgen_doer_aaben_to_oppe
+    alias: "Sove-morgen: døren har stået åben → to personer oppe"
+    description: >
+      User-spec 2026-08-30e: "en åben dør skal indikere at vi er stået op begge
+      to." Sidestillet med dør-zone-afgangen ovenfor — ikke en erstatning: begge
+      veje sætter samme latch, så den der først kan bevise det, gør det.
+
+      Hvorfor døren er det stærkere vidne: afgangs-sekvensen udleder to kroppe af
+      radar-mønstre, og de mønstre OVERLAPPER med en sovendes off-huller (08-25:
+      gardinet rullede op over Parent B). En åben dør er derimod en HANDLING —
+      den kan ikke opstå af sensor-støj.
+
+      Debouncen (`sove_morgen_doer_aaben_minutter`) skiller den dør man
+      efterlader åben fra den der står åben mens man går på toilettet. Godnat +
+      snooze er hårde krav, ikke for at være forsigtig, men for at latchen ikke
+      skal stå og vente på at blive indløst i det sekund de slipper
+      (fejlklasse #19) — gardin-motoren hænger på den.
+    mode: single
+    trigger:
+      # Præcis på debouncen. `from: "off"` er Matter-ekko-reglen: en node der
+      # kommer tilbage genopstår med sin sidste kendte værdi.
+      - platform: state
+        entity_id: binary_sensor.parasoll_sovedoer
+        from: "off"
+        to: "on"
+        for: >-
+          00:{{ '%02d' % (states('input_number.sove_morgen_doer_aaben_minutter') | float(5) | int) }}:00
+      # #4/#1-backstop: stod døren allerede åben ved HA-start — eller faldt
+      # flanken under en restart — findes den aldrig igen. Varigheden måles
+      # derfor som condition, ikke kun som trigger-kant.
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: time
+        after: "04:00:00"
+        before: "12:00:00"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: state
+        entity_id: binary_sensor.sove_alarm_morgen_to_oppe
+        state: "off"
+      # Sover huset stadig officielt, er en åben dør ikke et bevis på at nogen
+      # er oppe — og latchen ville blive indløst i samme sekund godnat ryddes.
+      - condition: state
+        entity_id: binary_sensor.godnat_common_active
+        state: "off"
+      # Godnat-knappen om morgenen = "lad os sove videre". Samme #19-hensyn.
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+        state: "off"
+      # VOKSENVAEKNING SLAAET FRA = nogen har BEDT om at sove videre (user-spec
+      # 2026-09-01: "jeg havde min alarm slaaet til men slog voksenvaekning fra
+      # ... fordi parent_b ville sove videre"). Saa er en aaben doer tvetydig paa
+      # praecis den maade der koster mest: person 1 der gaar ud og lader doeren
+      # staa aaben ser identisk ud med "vi er begge oppe". Doer-vejen tier i det
+      # tilfaelde, og kun doer-zone-vejen (2) kan bekraefte to-oppe — den kraever
+      # strukturelt at rummet HAR vaeret forladt (afgangs-stempel), hvilket ikke
+      # kan ske mens nogen ligger og sover derinde.
+      # Naturlige udgange saa rummet ikke kan staa moerkt i det uendelige:
+      # `sove_morgen_moerklagt` slutter kl. 11, gardinet op frigiver ankeret, og
+      # den manuelle knap virker altid.
+      - condition: state
+        entity_id: input_boolean.wakeup_adults_enabled
+        state: "on"
+      # VARIGHEDEN — maalt paa et SKREVET stempel, ikke paa `last_changed`.
+      # Kraever et EKSPLICIT `on` (#9: `unavailable`/`unknown` maa aldrig
+      # bekraefte to-oppe).
+      #
+      # FRISKHED (fejlklasse #20, maalt 2026-09-01): doeren stod aaben
+      # UAFBRUDT fra 30/8 21:40 til 1/9 06:14 — over 32 timer. "Aaben i >= 5
+      # min" var derfor sandt i det sekund 04:00-vinduet aabnede, og latchen
+      # blev indloest paa /5-ticket 06:05:00, 3,5 min efter godnat blev ryddet
+      # (06:01:32) — laerebogs-#19. Kl. 06:11:04 taendte
+      # `presence_light_sovevaerelse_on` pendlen over en sovende Parent B, og
+      # brugeren slog den fra paa godnat-knappen 4 sekunder senere.
+      # Samme falske latch ramte ogsaa morgenen 31/8. En doer der har staaet
+      # aaben siden sengetid er den tilstand de LAGDE sig til at sove i — ikke
+      # en handling nogen har foretaget i morges. Kravet er derfor at AABNINGEN
+      # selv er sket efter dagens 04:00 (samme anker som alle andre
+      # gyldigheds-tjek her). Sover de altid med doeren aaben, tier vejen
+      # helt — korrekt, for saa baerer doeren ingen information.
+      - condition: template
+        value_template: >-
+          {% set d = states.binary_sensor.parasoll_sovedoer %}
+          {% set a = state_attr('input_datetime.sove_morgen_doer_aabnet_at', 'timestamp') | float(0) %}
+          {% set m = states('input_number.sove_morgen_doer_aaben_minutter') | float(5) %}
+          {{ d is not none and d.state == 'on'
+             and a > 0 and a >= today_at('04:00').timestamp()
+             and (as_timestamp(now()) - a) >= (m * 60) }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.sove_morgen_anden_krop
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.sove_alarm_morgen_2p_at
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+      - service: logbook.log
+        data:
+          name: "Sove-morgen"
+          message: >-
+            To personer oppe BEKRÆFTET — soveværelsets dør har stået åben i
+            {{ ((now() - states.binary_sensor.parasoll_sovedoer.last_changed).total_seconds() / 60) | round(1) }}
+            min (kræver
+            {{ states('input_number.sove_morgen_doer_aaben_minutter') | int(5) }}).
+            Presence-lys frigivet bag gardinet.
+          entity_id: binary_sensor.sove_alarm_morgen_to_oppe
+
+  # ---------------------------------------------------------------------------
+  # 2c) STEMPEL: hvornår blev sovedøren åbnet? (2026-09-01)
+  # ---------------------------------------------------------------------------
+  - id: sove_morgen_doer_aabnet_stempel
+    alias: "Sove-morgen: stempl hvornår sovedøren blev åbnet"
+    description: >
+      Skriver åbnings-tidspunktet, så dør-vejen ovenfor kan måle BÅDE debounce
+      og friskhed på en værdi der overlever en HA-restart. `last_changed` gør
+      ikke: den nulstilles ved restart, så en restart kl. 07 over en dør der har
+      stået åben hele natten ville se en brandny åbning (#23).
+
+      Stemples hele døgnet — gyldigheden (>= dagens 04:00) afgøres hos
+      forbrugeren, ikke her, så et sent aften-stempel ikke kan forveksles med et
+      manglende. `from: "off"` er Matter-ekko-reglen: en node der kommer tilbage
+      genopstår med sin sidste kendte værdi.
+
+      2026-10-16: døren blev åbnet MENS sensoren var væk (05:13 lukket → 05:47
+      unavailable → 05:51 on) → intet stempel, ingen to-oppe, ingen morgenradio
+      selvom begge var oppe. `unavailable → on` tæller nu som en åbning når
+      døren sidst var set LUKKET (lukket-stemplet nyere end åbnings-stemplet);
+      stod den åben før udfaldet, er det ekkoet og ignoreres. Stemples med
+      genkomst-tiden (den ægte åbning lå i hullet → debouncen bliver kun længere).
+    mode: queued
+    max: 5
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_sovedoer
+        from: "off"
+        to: "on"
+        id: aabnet
+      - platform: state
+        entity_id: binary_sensor.parasoll_sovedoer
+        from: ["unavailable", "unknown"]
+        to: "on"
+        id: genkomst
+      - platform: state
+        entity_id: binary_sensor.parasoll_sovedoer
+        to: "off"
+        id: lukket
+    action:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.id == 'lukket' }}"
+            sequence:
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.sove_morgen_doer_lukket_at
+                data:
+                  timestamp: "{{ as_timestamp(now()) | int }}"
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ trigger.id == 'aabnet'
+                     or (state_attr('input_datetime.sove_morgen_doer_lukket_at', 'timestamp') | float(0))
+                        > (state_attr('input_datetime.sove_morgen_doer_aabnet_at', 'timestamp') | float(0)) }}
+            sequence:
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.sove_morgen_doer_aabnet_at
+                data:
+                  timestamp: "{{ as_timestamp(now()) | int }}"
+
+  # ---------------------------------------------------------------------------
+  # 3) GARDINET OP: to oppe + dagens første bad-besøg overstået.
+  # ---------------------------------------------------------------------------
+  - id: sove_morgen_gardin_op_efter_bad
+    alias: "Sove-morgen: to personer oppe + bad ovre → rul sove-gardinet op"
+    description: >
+      User-spec 07-31: "når det første badbesøg er ovre (10 min ro i bad), så
+      ruller gardinet op og presence lys normaliseres og tænder kun når lux
+      kræver det."
+      Dette er den manglende UDLØSER: bad-gaten (sove_gardin_bad_gate.yaml)
+      frigiver kun en AFVENTENDE oprulning, og husets eneste andre morgen-åbner
+      kræver soveværelset tomt i 15 min — hvilket aldrig sker mens to voksne gør
+      sig klar (dens last_triggered var None 31/07).
+      script.sove_gardin_op håndterer selv snooze, manuel-hold og bad-gate; her
+      gates kun på "er der overhovedet noget at rulle op".
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.sove_gardin_bad_klar
+        from: "off"
+        to: "on"
+      - platform: state
+        entity_id: binary_sensor.sove_alarm_morgen_to_oppe
+        from: "off"
+        to: "on"
+      # #4-backstop: begge kan stå on længe før vinduet åbner (eller ved restart).
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: time
+        after: "04:00:00"
+        before: "12:00:00"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: state
+        entity_id: binary_sensor.sove_alarm_morgen_to_oppe
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.sove_gardin_bad_klar
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+        state: "off"
+      # Kun hvis gardinet FAKTISK stadig er nede (≤ privacy+5). Ukendt position
+      # tæller som nede — at sende OP til et åbent gardin er et harmløst no-op,
+      # men vi vil ikke logge en åbning der ikke skete.
+      - condition: template
+        value_template: >-
+          {% set pos = state_attr('cover.gardin_sovevaerelse', 'current_position') %}
+          {% set privacy = 100 - (states('input_number.global_wakeup_curtain_privacy_pct') | float(70)) %}
+          {{ pos is none or (pos | float(0)) <= (privacy + 5) }}
+    action:
+      - service: script.sove_gardin_op
+      - service: logbook.log
+        data:
+          name: "Sove-morgen"
+          message: >-
+            Gardinet rulles op — to personer oppe (bekræftet
+            {{ state_attr('binary_sensor.sove_alarm_morgen_to_oppe', 'bekraeftet_kl') }}),
+            {% if state_attr('binary_sensor.sove_gardin_bad_klar', 'foerste_besoeg_ovre') %}
+            første badbesøg er registreret ovre
+            {% else %}
+            badet tomt
+            {{ state_attr('binary_sensor.sove_gardin_bad_klar', 'minutter_tomt') | int(0) }} min
+            {% endif %}
+            (bad tomt {{ state_attr('binary_sensor.sove_gardin_bad_klar', 'minutter_tomt') | int(0) }} min lige nu).
+            Presence-lyset normaliseres til lux-styring.
+          entity_id: cover.gardin_sovevaerelse
+
+  # ---------------------------------------------------------------------------
+  # 4) NULSTILLING kl. 04:00 — én dag, ét sæt observationer.
+  # ---------------------------------------------------------------------------
+  - id: sove_morgen_afgang_reset
+    alias: "Sove-morgen: nulstil afgangs-sekvensen (04:00)"
+    description: >
+      04:00 er valgt fordi husets nat-vindue er slut dér, og fordi alle
+      gyldigheds-tjek måler mod `today_at('04:00')` — ét fælles anker, så et
+      glemt reset (restart hen over 04:00) ikke kan give en latch fra i går.
+    mode: single
+    trigger:
+      - platform: time
+        at: "04:00:00"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id:
+            - input_datetime.sove_morgen_afgang_at
+            - input_datetime.sove_alarm_morgen_2p_at
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.sove_morgen_anden_krop

@@ -1,0 +1,574 @@
+# =============================================================================
+# Anomali-vagt — push når huset opfører sig dysfunktionelt (2026-07-15, user-spec)
+# =============================================================================
+# "Notifikationer til min tlf hvis noget lys brænder mistænkeligt længe, hvis
+#  et rum holdes mørkt trods bevægelse (ikke soveværelserne under godnat/
+#  putning), eller hvis terrasse-pluggen ikke slukker under regn."
+#
+# 3 DETEKTORER (alle periodiske scans = indbygget backstop, jf. fejlklasse #4;
+# alle gated på killswitch input_boolean.anomali_vagt_enabled + push via
+# script.push_notify med hver sin notif_id → per-type toggle/telefon/tidsvindue
+# på 🔔-fanen):
+#
+#   1) anomali_lys    — lys brænder i TOMT rum (/10 min scan).
+#      Rum-lys 'on' uafbrudt ≥ anomali_tomt_lys_minutter OG rummets occupancy
+#      'off' uafbrudt ≥ samme. Fanger fejlende auto-sluk LÆNGE før 6-timers
+#      super-watchdog'en (som stadig er sidste forsvarslinje + selv slukker).
+#      B60-fix (2026-07-15, user-valg b): occupancy UNAVAILABLE/unknown ≥ N
+#      mens lyset brænder ≥ N → egen "sensor død"-variant i SAMME push (ærlig
+#      tekst: rummet KAN være tomt, men ingen kan se det — jf. Thread-hang
+#      2026-07-04d). Samme skips + cooldown; device_health_check pusher
+#      bevidst ikke (B52), så dette er eneste end-to-end-varsling af hullet.
+#      Ekskluderet: BAD (egen max-on watchdog + wasp holder bevidst lys med
+#      lukket dør = PIR ser intet → ville false-positive), TERRASSE (pærelys-
+#      kæden brænder bevidst fra dusk uden occupancy-semantik), børneværelset
+#      under godnat_boern (1% natlys-strip brænder legitimt; sovende børn
+#      holder alligevel occupancy on), cinema/cirkus/dance (bevidst langtændt),
+#      rum i Manual/Off mode (bruger-intent vinder — super-watchdog dækker).
+#
+#   2) anomali_moerke — rum holdes MØRKT trods vedvarende bevægelse (/5 min).
+#      Occupancy 'on' uafbrudt ≥ anomali_moerke_minutter OG alle rum-lys off
+#      OG rummet er mørkt (lux < anomali_moerke_lux; rum uden lux-sensor =
+#      altid mørke-kvalificeret; unavailable lux → fallback open_plan_lux).
+#      Kun house_state == Active (ellers spammer en spøgelses-latch når ingen
+#      er hjemme — Apollo-ghost-alarmen ejer dét problem). Ekskluderet
+#      (bevidst mørke, IKKE dysfunktion): sove+børn under godnat/putning
+#      (user-spec), sove under morgen-beskyttelsen, børn under manual-off-lås,
+#      rum i Manual/Off mode, roborock_blokerer_lys (robot-bevægelse + bevidst
+#      lys-blok), cirkus/dance. Under godnat overvåges KUN bad+entré
+#      (de eneste rum hvor natlys-flowet bevidst TÆNDER lys om natten).
+#      FILM (2026-07-29, user-spec "de skal tage højde for hinanden"):
+#      binary_sensor.film_mode_aktiv (dark_mode | cinema_active |
+#      predark_active | projektor_aktiv) skipper stue/spisestue/køkken/depot +
+#      sove + børn — mørket er MENINGEN dér. Bad + entré mørklægges aldrig af
+#      film og overvåges videre, så et fejlende natlys midt i filmen fanges.
+#      AirBnB: børn skippes altid (lys blokeret by design), sove kun 12–22
+#      (spejler presence-gaten fra 2026-06-30).
+#
+#   3) anomali_plug   — terrasse-plug slukker IKKE når den skal (/10 min).
+#      switch.terrasse_plug 'on' uafbrudt ≥ anomali_plug_minutter SAMTIDIG med
+#      at en OFF-betingelse har stået uafbrudt ≥ samme: regn (terrasse_regn_
+#      aktiv), huset Dormant, eller vinter-kill-switchen (terrace_presence_
+#      enabled off). Spejler terrasse_plug.yaml's regel "eneste OFF: Dormant,
+#      regn nu, vinter-kill" — pluggen er udeområdets eneste strøm (redskaber).
+#
+# Cooldown: fælles slider anomali_cooldown_minutter + ét runtime-stempel pr.
+# detektor (anomali_*_sidste_push — has_date, BEVIDST ikke i snapshot-whitelist
+# = runtime-cursor). Detektorerne RØRER ALDRIG lys/plug selv — de observerer
+# kun og melder; ejerskabet af fix ligger hos de eksisterende automations.
+#
+# Snapshot: killswitch (endswith _enabled) + sliders (input_number) + notif_*
+# fanges automatisk af helpers_export.py. Init-defaults: init_user_preferences.
+# Tiles: dashboards/settings.yaml → 🔔 Notifikationer-fanen ("🕵️ Anomali-vagt").
+# =============================================================================
+
+input_boolean:
+  anomali_vagt_enabled:
+    name: "🕵️ Anomali-vagt aktiv (killswitch)"
+    icon: mdi:shield-search
+  # --- push_notify framework-nøgler (nid: anomali_lys / anomali_moerke / anomali_plug)
+  notif_anomali_lys_enabled:
+    name: "🕵️💡 Lys i tomt rum — send"
+    icon: mdi:lightbulb-alert-outline
+  notif_anomali_lys_parent_a:
+    name: "🕵️💡 Lys i tomt rum — Parent A"
+    icon: mdi:cellphone
+  notif_anomali_lys_parent_b:
+    name: "🕵️💡 Lys i tomt rum — Parent B"
+    icon: mdi:cellphone
+  notif_anomali_moerke_enabled:
+    name: "🕵️🌑 Mørkt trods bevægelse — send"
+    icon: mdi:lightbulb-off-outline
+  notif_anomali_moerke_parent_a:
+    name: "🕵️🌑 Mørkt trods bevægelse — Parent A"
+    icon: mdi:cellphone
+  notif_anomali_moerke_parent_b:
+    name: "🕵️🌑 Mørkt trods bevægelse — Parent B"
+    icon: mdi:cellphone
+  notif_anomali_plug_enabled:
+    name: "🕵️🔌 Terrasse-plug slukker ikke — send"
+    icon: mdi:power-plug-alert
+  notif_anomali_plug_parent_a:
+    name: "🕵️🔌 Terrasse-plug slukker ikke — Parent A"
+    icon: mdi:cellphone
+  notif_anomali_plug_parent_b:
+    name: "🕵️🔌 Terrasse-plug slukker ikke — Parent B"
+    icon: mdi:cellphone
+  # AirBnB-opt-in (2026-07-16): ON = send også i AirBnB-mode (gate i push_notify).
+  notif_anomali_lys_airbnb:
+    name: "🕵️💡 Lys i tomt rum — også i AirBnB"
+    icon: mdi:home-account
+  notif_anomali_moerke_airbnb:
+    name: "🕵️🌑 Mørkt trods bevægelse — også i AirBnB"
+    icon: mdi:home-account
+  notif_anomali_plug_airbnb:
+    name: "🕵️🔌 Terrasse-plug slukker ikke — også i AirBnB"
+    icon: mdi:home-account
+
+input_number:
+  anomali_tomt_lys_minutter:
+    name: "🕵️ Lys i tomt rum: min. tændt+tomt (min)"
+    icon: mdi:timer-alert-outline
+    min: 10
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+  anomali_moerke_minutter:
+    name: "🕵️ Mørkt trods bevægelse: min. varighed (min)"
+    icon: mdi:motion-sensor
+    min: 2
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+  anomali_moerke_lux:
+    name: "🕵️ Mørkt trods bevægelse: mørke-grænse (lx)"
+    icon: mdi:brightness-4
+    min: 0
+    max: 200
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+  anomali_plug_minutter:
+    name: "🕵️ Terrasse-plug: min. burde-være-slukket (min)"
+    icon: mdi:power-plug-off-outline
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+  anomali_cooldown_minutter:
+    name: "🕵️ Anomali-vagt: pause mellem push (min)"
+    icon: mdi:bell-sleep-outline
+    min: 15
+    max: 720
+    step: 15
+    unit_of_measurement: "min"
+    mode: slider
+
+input_datetime:
+  # Runtime-cooldown-stempler (ikke config → bevidst uden snapshot-whitelist).
+  anomali_lys_sidste_push:
+    name: "Anomali-vagt: sidste push (lys i tomt rum)"
+    has_date: true
+    has_time: true
+  anomali_moerke_sidste_push:
+    name: "Anomali-vagt: sidste push (mørkt trods bevægelse)"
+    has_date: true
+    has_time: true
+  anomali_plug_sidste_push:
+    name: "Anomali-vagt: sidste push (terrasse-plug)"
+    has_date: true
+    has_time: true
+  # --- push_notify framework-tidsvinduer
+  notif_anomali_lys_start:
+    name: "🕵️💡 Lys i tomt rum — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_anomali_lys_slut:
+    name: "🕵️💡 Lys i tomt rum — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_anomali_moerke_start:
+    name: "🕵️🌑 Mørkt trods bevægelse — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_anomali_moerke_slut:
+    name: "🕵️🌑 Mørkt trods bevægelse — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_anomali_plug_start:
+    name: "🕵️🔌 Terrasse-plug slukker ikke — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_anomali_plug_slut:
+    name: "🕵️🔌 Terrasse-plug slukker ikke — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+
+automation:
+  # ===========================================================================
+  # 1) Lys brænder i tomt rum
+  # ===========================================================================
+  - id: anomali_vagt_tomt_lys
+    alias: "Anomali-vagt: lys brænder i tomt rum"
+    description: >-
+      /10-min scan: rum-lys tændt uafbrudt ≥ N min mens rummets occupancy har
+      været off ≥ N min → push (observerer kun, slukker intet). Occupancy
+      unavailable/unknown ≥ N med lys tændt = "sensor død"-variant i samme
+      push (B60, valg b). Bad/terrasse ekskluderet (egen watchdog / bevidst
+      dusk-brænd). Se pakke-header.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/10"
+    condition:
+      - condition: state
+        entity_id: input_boolean.anomali_vagt_enabled
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ (now().timestamp()
+              - (state_attr('input_datetime.anomali_lys_sidste_push', 'timestamp') | float(0)))
+             >= (states('input_number.anomali_cooldown_minutter') | float(120)) * 60 }}
+      # BEVIDST cinema_active og ikke film_mode_aktiv (modsat mørke-vagten
+      # nedenfor, 2026-07-29): cinema_active er det flag der SUPPRESSER
+      # auto-sluk — derfor ville "lys i tomt rum" være falsk alarm mens det er
+      # on. Pre-Dark dæmper kun; den rører ikke auto-sluk, så et rum der tømmes
+      # under en pre-dark-film SKAL stadig slukke og er værd at varsle om.
+      - condition: template
+        value_template: >-
+          {{ not (is_state('input_boolean.cinema_active', 'on')
+                  or is_state('input_boolean.cirkus_active', 'on')
+                  or is_state('input_boolean.dance_mode', 'on')) }}
+    action:
+      - variables:
+          n_s: "{{ (states('input_number.anomali_tomt_lys_minutter') | float(45)) * 60 }}"
+          # Episode-anker (2026-08-13): samme episode må kun meldes ÉN gang.
+          # Uden dette re-pusher cooldown'en det stadig-brændende lys hver
+          # 2. time indtil super-watchdog'en slukker det.
+          # NB 'timestamp'-attributten er lokal-bevidst pr. stempel; en
+          # utcoffset()-korrektion bruger offsettet NU og bliver 1 t forkert
+          # hen over DST (B127).
+          siden: >-
+            {{ state_attr('input_datetime.anomali_lys_sidste_push',
+                          'timestamp') | float(0) }}
+          # ÉT scan bygger BEGGE lister (rum-listen må ikke kodes 2 steder =
+          # fejlklasse #2). Output som '||'-delt streng (jf. Jinja-gotcha:
+          # foldet blok = streng) → splittes i offenders/doede nedenfor.
+          scan: >-
+            {% set rooms = [
+              {'navn': 'Stue (sofa)',  'occ': 'binary_sensor.stue_apollo_occupancy',         'lys': 'light.stue_room',                          'mode': 'input_select.room_mode_stue'},
+              {'navn': 'Spisestue',    'occ': 'binary_sensor.spisestue_apollo_occupancy',    'lys': 'light.spisestue_loft',                     'mode': 'input_select.room_mode_spisestue'},
+              {'navn': 'Køkken',       'occ': 'binary_sensor.koekken_apollo_occupancy',      'lys': 'light.koekken_room,switch.koekken_spots',  'mode': 'input_select.room_mode_koekken'},
+              {'navn': 'Soveværelse',  'occ': 'binary_sensor.sovevaerelse_apollo_occupancy', 'lys': 'light.sovevaerelse_all',                   'mode': 'input_select.room_mode_sovevaerelse'},
+              {'navn': 'Børneværelse', 'occ': 'binary_sensor.boernevaerelse_apollo_occupancy', 'lys': 'light.boernevaerelse_all,light.boernevaerelse_hyggelys',               'mode': 'input_select.room_mode_boernevaerelse'},
+              {'navn': 'Entré',        'occ': 'binary_sensor.entre_valhorn_occupancy',       'lys': 'light.entre_all',                          'mode': 'input_select.room_mode_entre'},
+              {'navn': 'Depot',        'occ': 'binary_sensor.depot_valhorn_occupancy',       'lys': 'light.depot_all',                          'mode': 'input_select.room_mode_depot'},
+            ] %}
+            {% set ns = namespace(hits=[], dead=[], ents=[]) %}
+            {% for r in rooms %}
+              {% set skip = states(r.mode) in ['Manual', 'Off'] %}
+              {% if r.navn == 'Børneværelse' and is_state('input_boolean.godnat_boern_active', 'on') %}
+                {% set skip = true %}
+              {% endif %}
+              {% set occ = states[r.occ] %}
+              {% if not skip and occ is not none
+                 and occ.state in ['off', 'unavailable', 'unknown']
+                 and (now() - occ.last_changed).total_seconds() >= (n_s | float) %}
+                {% for l in r.lys.split(',') %}
+                  {% set st = states[l] %}
+                  {% if st is not none and st.state == 'on'
+                     and (now() - st.last_changed).total_seconds() >= (n_s | float)
+                     and [as_timestamp(st.last_changed, 0),
+                          as_timestamp(occ.last_changed, 0)] | max >= (siden | float(0)) %}
+                    {% set mins = ((now() - st.last_changed).total_seconds() / 60) | round(0) | int %}
+                    {% if occ.state == 'off' %}
+                      {% set ns.hits = ns.hits + [r.navn ~ ' (tændt ' ~ mins ~ ' min, rum tomt)'] %}
+                    {% else %}
+                      {% set ns.dead = ns.dead + [r.navn ~ ' (tændt ' ~ mins ~ ' min, sensor svarer ikke)'] %}
+                    {% endif %}
+                    {% set ns.ents = ns.ents + [l] %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.hits | unique | list | join(' · ') }}||{{ ns.dead | unique | list | join(' · ') }}||{{ ns.ents | unique | list | join(',') }}
+          offenders: "{{ scan.split('||')[0] | trim }}"
+          doede: "{{ scan.split('||')[1] | trim }}"
+          # De anomale lys-entities → sluk-knappen på pushen (bæres i action-
+          # strengen; handleren i notif_actions.yaml whitelist-filtrerer).
+          ents: "{{ scan.split('||')[2] | trim }}"
+      - condition: template
+        value_template: "{{ offenders | length > 0 or doede | length > 0 }}"
+      - service: logbook.log
+        data:
+          name: "Anomali-vagt"
+          message: >-
+            {{ ('Lys i tomt rum: ' ~ offenders) if offenders else '' }}{{ ' · ' if offenders and doede else '' }}{{ ('Sensor død + lys tændt: ' ~ doede) if doede else '' }}
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: anomali_lys
+          title: >-
+            {{ '🕵️💡 Lys brænder i tomt rum' if offenders else '🕵️📡 Sensor død — lys brænder' }}
+          message: >-
+            {% if offenders %}{{ offenders }}. Auto-sluk ser ud til at fejle —
+            tjek sensor/automation.{% endif %}
+            {% if doede %}{{ doede }}: occupancy-sensoren svarer ikke, så rummet
+            KAN stå tomt uden at auto-sluk kan se det — tjek sensorens
+            strøm/WiFi/Thread og sluk evt. lyset manuelt.{% endif %}
+            (Super-watchdog slukker selv efter {{ states('input_number.global_max_light_hours') }}t.)
+          payload:
+            tag: anomali_lys
+            # Knapper → notif_action_anomali (packages/notif_actions.yaml).
+            actions:
+              - action: "ANOM_LYS_SLUK:{{ ents }}"
+                title: "💡 Sluk nu"
+              - action: "ANOM_SNOOZE:lys"
+                title: "🔕 Ro til i morgen"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.anomali_lys_sidste_push
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ===========================================================================
+  # 2) Rum holdes mørkt trods vedvarende bevægelse
+  # ===========================================================================
+  - id: anomali_vagt_moerkt_trods_bevaegelse
+    alias: "Anomali-vagt: rum mørkt trods bevægelse"
+    description: >-
+      /5-min scan: occupancy on ≥ N min + alle rum-lys off + mørkt (lux-gate)
+      → push. Soveværelserne skippes under godnat/putning (user-spec); fuld
+      undtagelses-liste i pakke-headeren. Observerer kun — tænder intet.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: input_boolean.anomali_vagt_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: template
+        value_template: >-
+          {{ (now().timestamp()
+              - (state_attr('input_datetime.anomali_moerke_sidste_push', 'timestamp') | float(0)))
+             >= (states('input_number.anomali_cooldown_minutter') | float(120)) * 60 }}
+      # cinema_active er IKKE længere en hus-dækkende stopklods her — den er
+      # rullet ind i binary_sensor.film_mode_aktiv og gates PR. RUM nedenfor,
+      # så bad/entré stadig overvåges mens der ses film (2026-07-29).
+      - condition: template
+        value_template: >-
+          {{ not (is_state('input_boolean.cirkus_active', 'on')
+                  or is_state('input_boolean.dance_mode', 'on')
+                  or is_state('binary_sensor.roborock_blokerer_lys', 'on')) }}
+    action:
+      - variables:
+          n_s: "{{ (states('input_number.anomali_moerke_minutter') | float(10)) * 60 }}"
+          lux_max: "{{ states('input_number.anomali_moerke_lux') | float(30) }}"
+          # EPISODE-ANKER (2026-08-13, fejlklasse #19+#20): occupancy-forløbet
+          # skal være BEGYNDT efter at rummets undtagelser slap — ellers tæller
+          # uret op mens rummet lovligt er skippet, og gaten fyrer i det sekund
+          # den åbner. Målt: godnat off 06:14:28 → push 06:15:00 med "bevægelse
+          # 31 min" = familien lå i sengen. Samme anker på sidste push, så en
+          # igangværende episode ikke re-meldes når cooldown/snooze udløber.
+          # NB 'timestamp'-attributten er lokal-bevidst pr. stempel; læses
+          # state-strengen med as_timestamp() er den UTC-offsettet for sent, og
+          # en utcoffset()-korrektion bruger offsettet NU i stedet for offsettet
+          # da stemplet blev skrevet = 1 t galt hen over DST (B127).
+          siden: >-
+            {{ state_attr('input_datetime.anomali_moerke_sidste_push',
+                          'timestamp') | float(0) }}
+          # ÉT scan → display-streng + rum-lys-entities til tænd-knappen
+          # ('||'-split, jf. Jinja-gotcha: foldet blok = streng).
+          scan: >-
+            {# grp-semantik: 'faelles' = skip under godnat (fælles-rum er bevidst
+               mørke om natten); 'nat_ok' = natlys-flow TÆNDER bevidst lys om
+               natten (bad/entré) → overvåges også under godnat; 'sove'/'boern'
+               = soveværelses-undtagelserne (godnat/putning/morgen-beskyttelse/
+               manual-off-lås/AirBnB-gates). lux='' = rum uden lux-sensor →
+               altid mørke-kvalificeret (depot). #}
+            {% set rooms = [
+              {'navn': 'Stue (sofa)',  'occ': 'binary_sensor.stue_apollo_occupancy',         'lys': 'light.stue_room',                          'lux': 'sensor.open_plan_lux',      'mode': 'input_select.room_mode_stue',          'grp': 'faelles'},
+              {'navn': 'Spisestue',    'occ': 'binary_sensor.spisestue_apollo_occupancy',    'lys': 'light.spisestue_loft',                     'lux': 'sensor.spisestue_lux',      'mode': 'input_select.room_mode_spisestue',          'grp': 'faelles'},
+              {'navn': 'Køkken',       'occ': 'binary_sensor.koekken_apollo_occupancy',      'lys': 'light.koekken_room,switch.koekken_spots',  'lux': 'sensor.koekken_lux_effektiv', 'mode': 'input_select.room_mode_koekken',        'grp': 'faelles'},
+              {'navn': 'Soveværelse',  'occ': 'binary_sensor.sovevaerelse_apollo_occupancy', 'lys': 'light.sovevaerelse_all',                   'lux': 'sensor.sove_lux',           'mode': 'input_select.room_mode_sovevaerelse',  'grp': 'sove'},
+              {'navn': 'Børneværelse', 'occ': 'binary_sensor.boernevaerelse_apollo_occupancy', 'lys': 'light.boernevaerelse_all,light.boernevaerelse_hyggelys',               'lux': 'sensor.boern_lux',          'mode': 'input_select.room_mode_boernevaerelse', 'grp': 'boern'},
+              {'navn': 'Bad',          'occ': 'binary_sensor.badevaerelse_inde_occupancy',   'lys': 'light.badevaerelse_all',                   'lux': 'sensor.bad_lux',            'mode': 'input_select.room_mode_badevaerelse',  'grp': 'nat_ok'},
+              {'navn': 'Entré',        'occ': 'binary_sensor.entre_valhorn_occupancy',       'lys': 'light.entre_all',                          'lux': 'sensor.open_plan_lux',      'mode': 'input_select.room_mode_entre',         'grp': 'nat_ok'},
+              {'navn': 'Depot',        'occ': 'binary_sensor.depot_valhorn_occupancy',       'lys': 'light.depot_all',                          'lux': '',                          'mode': 'input_select.room_mode_depot',         'grp': 'faelles'},
+            ] %}
+            {% set godnat = is_state('binary_sensor.godnat_any_active', 'on') %}
+            {% set putning = is_state('binary_sensor.putning_vindue_aktivt', 'on') %}
+            {% set airbnb = is_state('input_select.house_mode', 'AirBnB') %}
+            {# 2026-07-29 (user-spec): "notifikationer som 'lys slukket trods
+               bevægelse' giver ingen mening nu hvor vi har dark mode". Under
+               film er mørket MENINGEN — men kun i de rum mørklægningen rammer
+               (Dark Mode + Pre-Dark rører KUN stue/sove/boern + fælles-rummenes
+               auto-tænd via cinema-suppression). Bad + entré (grp 'nat_ok')
+               mørklægges aldrig → de overvåges videre, så et fejlende natlys
+               midt i filmen stadig fanges. #}
+            {% set film = is_state('binary_sensor.film_mode_aktiv', 'on') %}
+            {# Ankre = hvornår en blokering sidst slap. Hus-brede først (de
+               gates der står som automation-conditions), gruppe-specifikke i
+               loopet — et rum må ikke arve et anker fra en gate der aldrig
+               blokerede DET rum. #}
+            {% set base = [siden | float(0),
+                           as_timestamp(states.input_select.house_state.last_changed, 0),
+                           as_timestamp(states.binary_sensor.roborock_blokerer_lys.last_changed, 0),
+                           as_timestamp(states.input_boolean.cirkus_active.last_changed, 0),
+                           as_timestamp(states.input_boolean.dance_mode.last_changed, 0)] | max %}
+            {% set g_film = as_timestamp(states.binary_sensor.film_mode_aktiv.last_changed, 0) %}
+            {% set g_godnat = as_timestamp(states.binary_sensor.godnat_any_active.last_changed, 0) %}
+            {% set g_putning = as_timestamp(states.binary_sensor.putning_vindue_aktivt.last_changed, 0) %}
+            {% set g_morgen = as_timestamp(states.binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv.last_changed, 0) %}
+            {% set g_bmorgen = as_timestamp(states.binary_sensor.boernevaerelse_morgen_beskyttelse_aktiv.last_changed, 0) %}
+            {% set ns = namespace(hits=[], ents=[]) %}
+            {% for r in rooms %}
+              {% set skip = states(r.mode) in ['Manual', 'Off'] %}
+              {% set anch = base %}
+              {% if r.grp in ['faelles', 'sove', 'boern'] %}{% set anch = [anch, g_film, g_godnat] | max %}{% endif %}
+              {% if r.grp in ['sove', 'boern'] %}{% set anch = [anch, g_putning] | max %}{% endif %}
+              {% if r.grp == 'sove' %}{% set anch = [anch, g_morgen] | max %}{% endif %}
+              {% if r.grp == 'boern' %}{% set anch = [anch, g_bmorgen] | max %}{% endif %}
+              {% if r.grp in ['faelles', 'sove', 'boern'] and film %}{% set skip = true %}{% endif %}
+              {% if r.grp == 'faelles' and godnat %}{% set skip = true %}{% endif %}
+              {% if r.grp in ['sove', 'boern'] and (godnat or putning) %}{% set skip = true %}{% endif %}
+              {% if r.grp == 'sove' and is_state('binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv', 'on') %}{% set skip = true %}{% endif %}
+              {# 2026-08-15: børneværelsets morgen-beskyttelse holder rummet mørkt
+                 MENS der er (stille) occupancy — det er featuren, ikke en anomali. #}
+              {% if r.grp == 'boern' and is_state('binary_sensor.boernevaerelse_morgen_beskyttelse_aktiv', 'on') %}{% set skip = true %}{% endif %}
+              {% if r.grp == 'sove' and airbnb and not (12 <= now().hour < 22) %}{% set skip = true %}{% endif %}
+              {% if r.grp == 'boern' and (airbnb or is_state('input_boolean.boernevaerelse_manual_off_lock', 'on')) %}{% set skip = true %}{% endif %}
+              {% set occ = states[r.occ] %}
+              {% if not skip and occ is not none and occ.state == 'on'
+                 and (now() - occ.last_changed).total_seconds() >= (n_s | float)
+                 and as_timestamp(occ.last_changed, 0) >= anch %}
+                {# Er ALLE rummets lys off? (unavailable tæller som off — et
+                   strømløst lys ER et mørkt rum, jf. fejlklasse #9-bevidsthed) #}
+                {% set l_ns = namespace(any_on=false) %}
+                {% for l in r.lys.split(',') %}
+                  {% if states(l) == 'on' %}{% set l_ns.any_on = true %}{% endif %}
+                {% endfor %}
+                {% if not l_ns.any_on %}
+                  {# Mørke-gate: rum-lux, fallback open_plan, ellers = mørkt. #}
+                  {% set dark = true %}
+                  {% if r.lux | length > 0 %}
+                    {% set v = states(r.lux) | float(-1) %}
+                    {% if v < 0 %}{% set v = states('sensor.open_plan_lux') | float(-1) %}{% endif %}
+                    {% if v >= 0 %}{% set dark = v < (lux_max | float) %}{% endif %}
+                  {% endif %}
+                  {% if dark %}
+                    {% set mins = ((now() - occ.last_changed).total_seconds() / 60) | round(0) | int %}
+                    {% set ns.hits = ns.hits + [r.navn ~ ' (bevægelse ' ~ mins ~ ' min, intet lys)'] %}
+                    {% set ns.ents = ns.ents + r.lys.split(',') %}
+                  {% endif %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.hits | unique | list | join(' · ') }}||{{ ns.ents | unique | list | join(',') }}
+          offenders: "{{ scan.split('||')[0] | trim }}"
+          ents: "{{ scan.split('||')[1] | trim }}"
+      - condition: template
+        value_template: "{{ offenders | trim | length > 0 }}"
+      - service: logbook.log
+        data:
+          name: "Anomali-vagt"
+          message: "Mørkt trods bevægelse: {{ offenders }}"
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: anomali_moerke
+          title: "🕵️🌑 Rum mørkt trods bevægelse"
+          message: >-
+            {{ offenders }}. Presence-lys ser ud til at fejle — tjek room mode,
+            lux-gates og sensor-health.
+          payload:
+            tag: anomali_moerke
+            # Knapper → notif_action_anomali (packages/notif_actions.yaml).
+            actions:
+              - action: "ANOM_MOERKE_TAEND:{{ ents }}"
+                title: "💡 Tænd lyset"
+              - action: "ANOM_SNOOZE:moerke"
+                title: "🔕 Ro til i morgen"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.anomali_moerke_sidste_push
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ===========================================================================
+  # 3) Terrasse-plug slukker ikke når den skal (regn / Dormant / vinter-kill)
+  # ===========================================================================
+  - id: anomali_vagt_terrasse_plug
+    alias: "Anomali-vagt: terrasse-plug slukker ikke (regn/Dormant)"
+    description: >-
+      /10-min scan: plug on ≥ N min SAMTIDIG med en vedvarende OFF-betingelse
+      (regn nu / huset Dormant / vinter-kill-switch off) → push. Spejler
+      terrasse_plug.yaml's regel "eneste OFF: Dormant, regn, vinter-kill".
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/10"
+    condition:
+      - condition: state
+        entity_id: input_boolean.anomali_vagt_enabled
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ (now().timestamp()
+              - (state_attr('input_datetime.anomali_plug_sidste_push', 'timestamp') | float(0)))
+             >= (states('input_number.anomali_cooldown_minutter') | float(120)) * 60 }}
+      - condition: template
+        value_template: >-
+          {% set n_s = (states('input_number.anomali_plug_minutter') | float(15)) * 60 %}
+          {% set plug = states['switch.terrasse_plug'] %}
+          {% if plug is none or plug.state != 'on'
+             or (now() - plug.last_changed).total_seconds() < n_s %}
+            false
+          {% else %}
+            {% set ns = namespace(hit=false) %}
+            {% for e in ['binary_sensor.terrasse_regn_aktiv'] %}
+              {% set s = states[e] %}
+              {% if s is not none and s.state == 'on'
+                 and (now() - s.last_changed).total_seconds() >= n_s %}
+                {% set ns.hit = true %}
+              {% endif %}
+            {% endfor %}
+            {% set hs = states['input_select.house_state'] %}
+            {% if hs is not none and hs.state == 'Dormant'
+               and (now() - hs.last_changed).total_seconds() >= n_s %}
+              {% set ns.hit = true %}
+            {% endif %}
+            {% set wk = states['input_boolean.terrace_presence_enabled'] %}
+            {% if wk is not none and wk.state == 'off'
+               and (now() - wk.last_changed).total_seconds() >= n_s %}
+              {% set ns.hit = true %}
+            {% endif %}
+            {{ ns.hit }}
+          {% endif %}
+    action:
+      - variables:
+          grunde: >-
+            {% set ns = namespace(g=[]) %}
+            {% if is_state('binary_sensor.terrasse_regn_aktiv', 'on') %}{% set ns.g = ns.g + ['det regner'] %}{% endif %}
+            {% if is_state('input_select.house_state', 'Dormant') %}{% set ns.g = ns.g + ['huset er Dormant'] %}{% endif %}
+            {% if is_state('input_boolean.terrace_presence_enabled', 'off') %}{% set ns.g = ns.g + ['vinter-kill-switch er slået fra'] %}{% endif %}
+            {{ ns.g | join(' + ') }}
+      - service: logbook.log
+        data:
+          name: "Anomali-vagt"
+          message: "Terrasse-plug burde være slukket ({{ grunde }}) men er stadig tændt."
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: anomali_plug
+          title: "🕵️🔌 Terrasse-plug slukker ikke"
+          message: >-
+            Pluggen har været tændt > {{ states('input_number.anomali_plug_minutter') | int(15) }}
+            min selvom {{ grunde }}. Plug-controlleren ser ud til at fejle —
+            udeområdets redskaber kan stå med strøm i regn.
+          payload:
+            tag: anomali_plug
+            # Knapper → notif_action_anomali (packages/notif_actions.yaml).
+            actions:
+              - action: "ANOM_PLUG_SLUK"
+                title: "🔌 Sluk plug nu"
+              - action: "ANOM_SNOOZE:plug"
+                title: "🔕 Ro til i morgen"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.anomali_plug_sidste_push
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"

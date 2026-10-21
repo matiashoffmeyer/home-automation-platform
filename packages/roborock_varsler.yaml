@@ -1,0 +1,400 @@
+# =============================================================================
+# Roborock-varsler — push ved dok-/robot-fejl + forbrugsstoffer (nid `roborock`)
+# =============================================================================
+# User-spec 2026-07-18: "lav et varselssystem til parent_a tlf på roborock
+# problemer (tank, filtre etc)". To vagter, begge OBSERVERER KUN:
+#
+# 1) FEJL-VAGT — dok-fejl (sensor.s8_maxv_ultra_dock_dock_error: water_empty,
+#    waste_water_tank_full, duct_blockage, ...), robot-fejl (vacuum_error:
+#    bumper_stuck, robot_trapped, ...), vandmangel (water_shortage) og
+#    charging_problem-status. Template-flanke m. 3 min sustain (cloud-flap-
+#    debounce) + /30-backstop (fejlklasse #4/#13: flanken re-fyrer aldrig i en
+#    vedvarende episode, og en episode der ALLEREDE er i gang ved reload har
+#    ingen flanke). Backstoppen må gerne opdage nye episoder: enum/binær
+#    last_changed ≥ 3 min BEVISER sustained (OK per fejlklasse #14 — det er kun
+#    analoge sensorer der ikke kan). Dedupe: cooldown-slider (default 6 t).
+#
+# 2) FORBRUGS-VAGT — dagligt tjek kl 11:00 af de 6 time_left-sensorer
+#    (hovedbørste/sidebørste/filter/dok-børste/dok-si/sensorer). Push når
+#    resttid ≤ slider (default 10 t; sensorerne går i MINUS når overskredet).
+#    Dedupe 71 t (~hver 3. dag indtil user nulstiller telleren i appen).
+#    Unavailable-sensorer springes over (cloud-integration nede ≠ slidt filter;
+#    device-offline-varsling er eksplicit fravalgt af user, B52).
+#
+# 3) PLAN-VARSEL (nid `robotplan`, user-spec 2026-08-31) — "hvis robotten har
+#    tænkt sig at dormant auto rengøre en dag, så skal jeg og Parent B ha
+#    notifikation om det den samme morgen kl. 06:30 så vi kan fjerne ting fra
+#    gulvet". Push til BEGGE telefoner på `notif_robotplan_tid`.
+#    FORUDSIGELSEN er bevidst kun det DAG-SKALEREDE udsnit af conditionerne i
+#    `roborock_dormant_start` (packages/roborock.yaml) — de øvrige kan ikke
+#    kendes kl. 06:30 og er derfor udeladt, hvilket får varslet til at fejle
+#    ÅBENT (hellere et overflødigt varsel end et misset, jf. formålet: nå at
+#    rydde gulvet). Udeladt med vilje:
+#      - Dormant selv → derfor siger teksten "når huset bliver tomt", ikke
+#        "kl. X". Bliver huset aldrig tomt, sker der bare ingenting.
+#      - Elpris-blokken → den UDSKYDER kun (block→off-triggeren re-forsøger).
+#      - Batteri ≥ 30 % → robotten lader stadig kl. 06:30; niveauet dér siger
+#        intet om hvad den kan kl. 10.
+#      - Hoveddør-åbnet-siden-sidst → gaten er kl. 06:30 typisk endnu ikke
+#        opfyldt på præcis de dage den BLIVER det (de går ud ad hoveddøren =
+#        selve den handling der gør huset tomt). Den ville altså slukke varslet
+#        netop når det skulle bruges.
+#    Interval-gaten læses som attributten `maa_starte` på
+#    sensor.roborock_aktive_timer_siden_rengoring — samme anker som selve
+#    dormant-starten bruger, så de to ikke kan divergere (fejlklasse #2).
+#    (2026-09-01: gaten måles i vægtede AKTIV-TIMER, ikke længere i døgn.)
+#    Default varsles KUN hel-hus-rengøringen (~hver 3. dag). De lette
+#    stue-ture på mellemdagene kører næsten hver Dormant-session (målt 21 dage:
+#    hel-hus 9 dage, let stue 8) og ville gøre pushen til daglig støj →
+#    `roborock_plan_varsel_let_enabled` (default OFF) slår dem til.
+#
+# Alt gennem push_notify-frameworket (master + nid-enable + vindue + routing).
+# Runtime-stempler (`*_sidste_push`) er BEVIDST uden for snapshot-whitelisten.
+# =============================================================================
+
+input_boolean:
+  notif_roborock_enabled:
+    name: "🤖 Roborock-problemer — send"
+    icon: mdi:robot-vacuum-alert
+  notif_roborock_parent_a:
+    name: "🤖 Roborock-problemer — Parent A"
+    icon: mdi:cellphone
+  notif_roborock_parent_b:
+    name: "🤖 Roborock-problemer — Parent B"
+    icon: mdi:cellphone
+  notif_roborock_airbnb:
+    name: "🤖 Roborock-problemer — også i AirBnB"
+    icon: mdi:home-account
+  notif_robotplan_enabled:
+    name: "🧹 Robot kører i dag — send"
+    icon: mdi:robot-vacuum
+  notif_robotplan_parent_a:
+    name: "🧹 Robot kører i dag — Parent A"
+    icon: mdi:cellphone
+  notif_robotplan_parent_b:
+    name: "🧹 Robot kører i dag — Parent B"
+    icon: mdi:cellphone
+  notif_robotplan_airbnb:
+    name: "🧹 Robot kører i dag — også i AirBnB"
+    icon: mdi:home-account
+  # Mellemdagenes lette stue-tur (segment 16, kun støvsug) varsles kun hvis
+  # denne er ON — ellers ville pushen komme næsten hver morgen.
+  roborock_plan_varsel_let_enabled:
+    name: "🧹 Varsl også de lette stue-ture"
+    icon: mdi:sofa-outline
+
+input_datetime:
+  notif_roborock_start:
+    name: "🤖 Roborock-problemer — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_roborock_slut:
+    name: "🤖 Roborock-problemer — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  notif_robotplan_start:
+    name: "🧹 Robot kører i dag — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_robotplan_slut:
+    name: "🧹 Robot kører i dag — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+  # Selve afsendelses-tidspunktet. Ligger under `notif_`-præfikset med vilje:
+  # helpers_export.py snapshotter alt `notif_*` automatisk.
+  notif_robotplan_tid:
+    name: "🧹 Robot kører i dag — varsel kl."
+    has_date: false
+    has_time: true
+    icon: mdi:alarm
+  # Runtime dedupe-stempler (IKKE i snapshot — cursors)
+  roborock_fejl_sidste_push:
+    name: "Runtime: sidste Roborock-fejl-push"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+  roborock_forbrug_sidste_push:
+    name: "Runtime: sidste Roborock-forbrugs-push"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+
+input_number:
+  roborock_forbrug_varsel_timer:
+    name: "🤖 Forbrugsstof — push ved resttid ≤ (timer)"
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "t"
+    icon: mdi:air-filter
+  roborock_fejl_cooldown_timer:
+    name: "🤖 Fejl-push — cooldown (timer)"
+    min: 1
+    max: 24
+    step: 1
+    unit_of_measurement: "t"
+    icon: mdi:timer-sand
+
+automation:
+  # ---------------------------------------------------------------------------
+  # 1) Fejl-vagt: dok-fejl + robot-fejl + vandmangel + charging_problem
+  # ---------------------------------------------------------------------------
+  - id: roborock_fejl_vagt
+    alias: "Roborock: dok-/robot-fejl → push"
+    description: >
+      Pusher når dokken eller robotten melder en fejl (tank tom/fuld, børste
+      fast, robot fanget, lade-problem ...) der har stået i ≥ 3 min. Flanke m.
+      for: + /30-backstop; backstoppen kræver selv 3 min via last_changed
+      (enum-states — OK per fejlklasse #14). Cooldown-slider dedupe.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: template
+        id: flanke
+        value_template: >-
+          {{ states('sensor.s8_maxv_ultra_dock_dock_error') not in ['ok', 'unavailable', 'unknown']
+             or states('sensor.s8_maxv_ultra_vacuum_error') not in ['none', 'unavailable', 'unknown']
+             or is_state('binary_sensor.s8_maxv_ultra_water_shortage', 'on')
+             or is_state('sensor.s8_maxv_ultra_status', 'charging_problem') }}
+        for:
+          minutes: 3
+      - platform: time_pattern
+        id: backstop
+        minutes: "/30"
+    variables:
+      problemer: >-
+        {% set dok_map = {
+             'duct_blockage': 'dok: kanal blokeret',
+             'water_empty': 'rent-vandstank TOM — fyld den',
+             'waste_water_tank_full': 'snavsevandstank FULD — tøm den',
+             'maintenance_brush_jammed': 'dok-børste sidder fast',
+             'dirty_tank_latch_open': 'snavsetank-låg åbent',
+             'no_dustbin': 'støvboks mangler',
+             'cleaning_tank_full_or_blocked': 'rensetank fuld/blokeret'} %}
+        {% set rob_map = {
+             'lidar_blocked': 'lidar blokeret',
+             'bumper_stuck': 'kofanger sidder fast',
+             'wheels_suspended': 'hjul i luften',
+             'cliff_sensor_error': 'kant-sensor-fejl',
+             'main_brush_jammed': 'hovedbørste sidder fast',
+             'side_brush_jammed': 'sidebørste sidder fast',
+             'wheels_jammed': 'hjul sidder fast',
+             'robot_trapped': 'robot fanget',
+             'no_dustbin': 'støvboks mangler',
+             'strainer_error': 'dok-si-fejl'} %}
+        {% set ns = namespace(p=[]) %}
+        {% set d = states('sensor.s8_maxv_ultra_dock_dock_error') %}
+        {% if d not in ['ok', 'unavailable', 'unknown']
+              and (now() - states.sensor.s8_maxv_ultra_dock_dock_error.last_changed).total_seconds() > 180 %}
+          {% set ns.p = ns.p + [dok_map.get(d, 'dok: ' ~ d | replace('_', ' '))] %}
+        {% endif %}
+        {% set r = states('sensor.s8_maxv_ultra_vacuum_error') %}
+        {% if r not in ['none', 'unavailable', 'unknown']
+              and (now() - states.sensor.s8_maxv_ultra_vacuum_error.last_changed).total_seconds() > 180 %}
+          {% set ns.p = ns.p + [rob_map.get(r, 'robot: ' ~ r | replace('_', ' '))] %}
+        {% endif %}
+        {# vandmangel-binæren dubler water_empty-dok-fejlen — vis kun én #}
+        {% if d != 'water_empty'
+              and is_state('binary_sensor.s8_maxv_ultra_water_shortage', 'on')
+              and (now() - states.binary_sensor.s8_maxv_ultra_water_shortage.last_changed).total_seconds() > 180 %}
+          {% set ns.p = ns.p + ['vandmangel — fyld rent-vandstanken'] %}
+        {% endif %}
+        {% if is_state('sensor.s8_maxv_ultra_status', 'charging_problem')
+              and (now() - states.sensor.s8_maxv_ultra_status.last_changed).total_seconds() > 180 %}
+          {% set ns.p = ns.p + ['lade-problem — tjek dok-kontakterne'] %}
+        {% endif %}
+        {{ ns.p | join(' · ') }}
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (now().timestamp()
+              - (state_attr('input_datetime.roborock_fejl_sidste_push', 'timestamp') | float(0)))
+             > (states('input_number.roborock_fejl_cooldown_timer') | float(6)) * 3600 }}
+      - condition: template
+        value_template: "{{ problemer | trim | length > 0 }}"
+    action:
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: roborock
+          title: "🤖 Roborock-problem"
+          message: >-
+            {{ problemer }}. Robotten kan ikke køre (ordentligt) før det er
+            løst.
+          payload:
+            tag: roborock_problem
+      - service: logbook.log
+        data:
+          name: "Roborock-vagt"
+          message: "Fejl-push sendt ({{ trigger.id }}): {{ problemer }}."
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.roborock_fejl_sidste_push
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ---------------------------------------------------------------------------
+  # 2) Forbrugs-vagt: filtre/børster/si — dagligt tjek kl 11:00
+  # ---------------------------------------------------------------------------
+  - id: roborock_forbrug_vagt
+    alias: "Roborock: forbrugsstoffer slidt → push"
+    description: >
+      Dagligt kl 11:00: en eller flere time_left-sensorer ≤ slider (default
+      10 t; negativ = overskredet) → push med listen. 71 t dedupe (~hver 3.
+      dag indtil telleren nulstilles i Roborock-appen). Unavailable springes
+      over (integration nede ≠ slidt del).
+    mode: single
+    trigger:
+      - platform: time
+        at: "11:00:00"
+    variables:
+      slidt: >-
+        {% set dele = {
+             'sensor.s8_maxv_ultra_main_brush_time_left': 'hovedbørste',
+             'sensor.s8_maxv_ultra_side_brush_time_left': 'sidebørste',
+             'sensor.s8_maxv_ultra_filter_time_left': 'filter',
+             'sensor.s8_maxv_ultra_dock_maintenance_brush_time_left': 'dok-vedligeholdelsesbørste',
+             'sensor.s8_maxv_ultra_dock_strainer_time_left': 'dok-si',
+             'sensor.s8_maxv_ultra_sensor_time_left': 'sensorer (rens)'} %}
+        {% set graense = states('input_number.roborock_forbrug_varsel_timer') | float(10) %}
+        {% set ns = namespace(p=[]) %}
+        {% for e, navn in dele.items() %}
+          {% set v = states(e) %}
+          {% if v not in ['unavailable', 'unknown'] and v | float(9999) <= graense %}
+            {% set h = v | float(0) | round(0) | int %}
+            {% if h < 0 %}
+              {% set ns.p = ns.p + [navn ~ ' (' ~ (h | abs) ~ ' t OVER tiden)'] %}
+            {% else %}
+              {% set ns.p = ns.p + [navn ~ ' (' ~ h ~ ' t tilbage)'] %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.p | join(' · ') }}
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (now().timestamp()
+              - (state_attr('input_datetime.roborock_forbrug_sidste_push', 'timestamp') | float(0)))
+             > 71 * 3600 }}
+      - condition: template
+        value_template: "{{ slidt | trim | length > 0 }}"
+    action:
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: roborock
+          title: "🤖 Roborock-vedligehold"
+          message: >-
+            Trænger til udskiftning/rens: {{ slidt }}. Nulstil telleren i
+            Roborock-appen bagefter (ellers minder jeg om det igen om ~3 dage).
+          payload:
+            tag: roborock_forbrug
+      - service: logbook.log
+        data:
+          name: "Roborock-vagt"
+          message: "Forbrugs-push sendt: {{ slidt }}."
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.roborock_forbrug_sidste_push
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ---------------------------------------------------------------------------
+  # 3) Plan-varsel: robotten kører i dag → morgen-push til begge telefoner
+  # ---------------------------------------------------------------------------
+  - id: roborock_plan_morgenvarsel
+    alias: "Roborock: auto-rengøring planlagt i dag → morgen-push"
+    description: >
+      User-spec 2026-08-31: varsl BEGGE telefoner om morgenen (default 06:30,
+      `input_datetime.notif_robotplan_tid`) når robottens dag-gates er opfyldt,
+      så der er tid til at rydde gulvet før huset bliver tomt. Forudsigelsen er
+      det dag-skalerede udsnit af `roborock_dormant_start` — se hoved-headeren
+      for hvad der bevidst er udeladt og hvorfor varslet fejler ÅBENT.
+    mode: single
+    variables:
+      # ALLE bool-variabler herunder er ÉT-udtryks-templates med vilje: en
+      # {% if %}/{% set %}-blok ville returnere STRENGEN "False", som er truthy
+      # (jf. 07-29e i roborock.yaml).
+      #
+      # Interval-gaten læses via det fælles anker, ikke som en kopi af
+      # udtrykket (fejlklasse #2). state_attr → None hvis sensoren er væk;
+      # `default(false, true)` fanger både None og False.
+      hus_ok: >-
+        {{ state_attr('sensor.roborock_aktive_timer_siden_rengoring', 'maa_starte')
+           | default(false, true) }}
+      # Mellemdagenes lette stue-tur: kræver BÅDE user's varsel-ønske og at
+      # selve funktionen er slået til.
+      let_ok: >-
+        {{ is_state('input_boolean.roborock_plan_varsel_let_enabled', 'on')
+           and is_state('input_boolean.roborock_let_stue_enabled', 'on') }}
+      dage: "{{ states('sensor.roborock_dage_siden_rengoring') | int(99) }}"
+      # SPEJLET fra roborock_dormant_start's `do_full` — teksten skal love det
+      # samme som automationen vælger. Ukendt sidste-full → FULL (samme
+      # 99-fallback). Short-circuit-`or` beskytter as_datetime mod en tom værdi.
+      kadence_full: >-
+        {{ is_state('binary_sensor.kids_home', 'on')
+           or states('input_datetime.roborock_last_full_completed')
+              in ['unknown', 'unavailable', 'none', '']
+           or (now().date() - as_datetime(
+                 states('input_datetime.roborock_last_full_completed')).date()).days >= 3 }}
+      # 2026-09-01: user kan tvinge udfaldet med
+      # input_select.roborock_auto_dormant_handling. Varslet skal love DET
+      # valg, ikke kadencen (fejlklasse #2 — samme regel to steder).
+      # "Grundig rengøring" er også en mop-tur → tæller som full i teksten.
+      do_full: >-
+        {{ states('input_select.roborock_auto_dormant_handling')
+           in ['Fuld rengøring', 'Grundig rengøring']
+           or (states('input_select.roborock_auto_dormant_handling')
+               not in ['Kun støvsugning'] and kadence_full) }}
+    trigger:
+      - platform: time
+        at: input_datetime.notif_robotplan_tid
+    condition:
+      # AirBnB: dormant-starten er selv vetoet dér, så der er intet at varsle
+      # om (og pushen ville alligevel være tavs uden notif_robotplan_airbnb).
+      # 'Home Vacation' skal MED — familien er hjemme og robotten kører.
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # User har selv sat auto-start på pause (rod på gulvet) → ingen tur i dag.
+      - condition: state
+        entity_id: input_boolean.roborock_auto_paused
+        state: "off"
+      # Hård robot-fejl = ingen tur uanset resten. unknown/unavailable regnes
+      # som rask: cloud-integrationen er nede ≠ robotten er i stykker, og et
+      # misset varsel er dyrere end et overflødigt.
+      - condition: template
+        value_template: >-
+          {{ states('sensor.s8_maxv_ultra_vacuum_error')
+             in ['none', 'ok', 'unknown', 'unavailable'] }}
+      # Er der overhovedet et udfald at varsle om?
+      - condition: template
+        value_template: "{{ hus_ok or let_ok }}"
+    action:
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: robotplan
+          title: >-
+            {{ '🧹 Robotten støvsuger i dag' if hus_ok
+               else '🧹 Robotten tager stuen i dag' }}
+          message: >-
+            {% if hus_ok %}Hele huset ({{ 'støvsug + mop' if do_full
+            else 'kun støvsug' }}) — {{ dage }} {{ 'dag' if dage == 1
+            else 'dage' }} siden sidste gang.{% else %}Let tur i stuen (kun
+            støvsug).{% endif %} Den starter når huset bliver tomt, så ryd
+            gulvet inden I går.
+          payload:
+            tag: roborock_plan
+      - service: logbook.log
+        data:
+          name: "Roborock-vagt"
+          message: >-
+            Plan-varsel sendt: {{ 'hel-hus ' ~ ('FULL' if do_full else 'QUICK')
+            if hus_ok else 'let stue-tur' }} ({{ dage }} dage siden hel-hus).

@@ -1,0 +1,192 @@
+# =============================================================================
+# openplan_putning_vaekning.yaml — open plan vågner hurtigt når man går ud
+# fra børneværelset efter putning (2026-09-17, user-spec)
+# =============================================================================
+# PROBLEM (user 2026-09-17): "om aftenen når jeg har puttet og jeg rejser mig op
+# i børneværelset og laver move aktivitet og dernæst bevæger mig til spisestue
+# apollo som move, så vil jeg gerne ha at open plan meget hurtigere lyser op,
+# alle tre rum, hvis de alle eller enkelte af open plan rummene har været mørke.
+# Det går pt. for langsomt (5-6 sek)."
+#
+# MÅLT (history 09-14..09-17, aftenerne 19-23): rå binary_sensor.
+# spisestue_apollo_occupancy → _filtered tog PRÆCIS 6,0 s ved HVER eneste
+# ankomst (36 flanker, nul spredning) — det er spisestue_debounce_varm_sekunder.
+# Derefter har presence_light_stue_on en `delay: 500ms` + `transition:` fra
+# sensor.fade_ind_effektiv (3 s). Samlet fra fod-i-rummet til fuldt lys: ~9,5 s,
+# hvoraf de 6 s er ren venten uden noget synligt. Det er de "5-6 sek".
+#
+# Og var børneværelset den eneste varme nabo, fyrede den KOLDE debounce i
+# stedet (spisestue_occupancy_debounce_seconds = 20 s): børneværelset stod ikke
+# i spisestue_nabo_varm-listen. Det er rettet i spisestue_curtain_ghost.yaml.
+#
+# LØSNING — to lag, så der aldrig bygges en ny lys-formel:
+#   1. Børneværelset er nu en varm nabo → den normale vej falder 20 s → 6 s.
+#   2. Denne pakke: en GENVEJ der springer debouncen helt over. Den trigger på
+#      RÅ binary_sensor.spisestue_apollo_radar_moving_target (0 s forsinkelse)
+#      og gen-trigger husets TRE eksisterende open plan-tændveje med
+#      `skip_condition: false`.
+#
+# HVORFOR automation.trigger frem for et nyt light.turn_on-sæt: de tre veje
+# ejer hver deres rums lux-gate, brightness-kurve, kelvin, Manual-respekt,
+# godnat-/cinema-/sleepover-gates og "kun hvis lyset er slukket"-check. Kopierede
+# vi dem hertil, ville vi have samme regel kodet to steder (fejlklasse #2) — og
+# de ER blevet rettet flere gange i år. `skip_condition: false` betyder at hvert
+# rum stadig selv afgør om DET rum er mørkt, hvilket rammer user-specens "hvis
+# de alle eller enkelte af open plan rummene har været mørke" præcist: køkkenet
+# tænder kun hvis køkkenet er mørkt, sofaen kun hvis sofa-zonen er det, osv.
+# Denne pakke bidrager med ÉN ting: tidspunktet.
+#
+# HVORFOR det er sikkert at springe gust-debouncen over her: debouncen findes
+# for at et blæsende gardin ikke skal se ud som en person (se
+# spisestue_curtain_ghost.yaml). Genvejen kræver at børneværelsets radar har
+# set ÆGTE bevægelse inden for vinduet — et gardin i spisestuen har ingen grund
+# til at falde sammen med det. Og genvejen rører ALDRIG
+# spisestue_apollo_occupancy_filtered: godnat, Dormant og wasp-in-a-box læser
+# stadig den debouncede sensor og kan ikke tage skade af den her.
+#
+# PRISEN ved en falsk positiv er bevidst valgt som den billige retning: et
+# 5-sekunders maskin-blip i spisestuen mens børneværelset lige var varmt,
+# tænder open plan ~30 s for tidligt for en bruger der beviseligt er i huset og
+# på vej. Det modsatte — at vente og gætte forkert — er præcis den klage der
+# startede sagen.
+#
+# AirBnB: genvejen er familie-rutine (putning) → kun Normal + Home Vacation.
+# En gæst får uændret den normale vej.
+# =============================================================================
+
+input_boolean:
+  # Kill-switch (fejlklasse #21). Genvejen har KUN denne ene vej ind, så
+  # conditionen nedenfor er tilstrækkelig — der findes ingen backstop-tick eller
+  # søster-automation der kan omgå den.
+  openplan_putning_vaekning_enabled:
+    name: "Open plan: hurtig-vækning fra børneværelset"
+    icon: mdi:run-fast
+
+input_number:
+  # Hvor længe børneværelsets radar-move tæller som "jeg var lige derinde".
+  # 180 s er sat ud fra turen selv, ikke fra en note: børneværelse → spisestue
+  # er få skridt, men man lukker en dør, retter en dyne og står stille et øjeblik
+  # på vejen. Vinduet skal dække den pause uden at strække sig så langt at en
+  # helt anden tur senere på aftenen stadig tæller som "på vej ud fra putning".
+  # Sættes den for kort, falder man tilbage på den normale 6 s-vej (harmløst);
+  # for lang, og genvejen mister sin kobling til putningen.
+  openplan_putning_vindue_sekunder:
+    name: "Open plan: børneværelse-move vindue"
+    icon: mdi:timer-outline
+    min: 30
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+
+template:
+  - binary_sensor:
+      # Samme konstruktion som binary_sensor.stue_apollo_bevaegelse_frisk
+      # (packages/stue_apollo_ghost.yaml) og koekken_apollo_bevaegelse_frisk:
+      # rå moving_target gjort KLÆBRIG med delay_off, så en enkelt flanke-dukkert
+      # midt i bevægelsen ikke lukker vinduet.
+      #
+      # RÅ moving_target — ikke en filtered/occupancy-sensor — er bevidst: det er
+      # den kanal der reagerer øjeblikkeligt, og hele opgaven her er tid. Den
+      # fodres desuden ind i spisestue_nabo_varm, og en filtered-kilde ville dér
+      # blive en selvforstærkende løkke (se advarslen i spisestue_curtain_ghost.yaml).
+      #
+      # NB delay_off skal være SEKUNDER som skalar når den er templated
+      # (permanent faktum), og der er BEVIDST intet delay_on: forsinket varme er
+      # værdiløs, jf. samme fil.
+      - name: "Boernevaerelse bevaegelse frisk"
+        unique_id: boernevaerelse_bevaegelse_frisk
+        device_class: motion
+        icon: mdi:motion-sensor
+        delay_off: >-
+          {{ states('input_number.openplan_putning_vindue_sekunder') | int(180) }}
+        state: >-
+          {{ is_state('binary_sensor.boernevaerelse_apollo_radar_moving_target', 'on') }}
+
+automation:
+  - id: openplan_putning_hurtig_vaekning
+    alias: "Open plan: hurtig-vækning på vej ud fra børneværelset"
+    description: >-
+      Møder RÅ move på spisebords-Apolloen mens børneværelset lige har haft
+      bevægelse, og gen-trigger de tre open plan-tændveje med det samme i stedet
+      for at vente de 6-20 s som gust-debouncen koster.
+    # single: to move-flanker inden for et sekund må ikke give to runder. De
+    # kaldte automationer er selv `single` og har hver deres "kun hvis lyset er
+    # slukket"-condition, så en gentagelse ville alligevel være en no-op — men
+    # den ville støje i logbogen.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.spisestue_apollo_radar_moving_target
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.openplan_putning_vaekning_enabled
+        state: "on"
+      # Selve præmissen: jeg kommer fra børneværelset.
+      - condition: state
+        entity_id: binary_sensor.boernevaerelse_bevaegelse_frisk
+        state: "on"
+      # Familie-rutine. En AirBnB-gæst putter ikke vores børn, og vi påtvinger
+      # ikke gæster vores rutiner — de får uændret den normale vej.
+      - condition: template
+        value_template: >-
+          {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+      # Fejlklasse #9: en død radar-kanal må ikke kunne "bevise" noget.
+      - condition: state
+        entity_id: binary_sensor.presence_sensors_available
+        state: "on"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      # Robotten ER den bevægelse Apollo'erne ser (permanent faktum) — og den
+      # kører gerne i både børneværelse og spisestue i træk, hvilket er præcis
+      # genvejens mønster. Uden denne ville støvsugeren tænde hele open plan.
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    action:
+      # Ingen `delay` her. De tre kaldte automationer har hver deres egen
+      # 500 ms debounce + re-check af at lyset stadig er slukket, så genvejen
+      # skal ikke lægge mere ventetid oveni — den skal fjerne ventetid.
+      #
+      # skip_condition: false = hver automation kører SINE EGNE conditions.
+      # Det er hele pointen: vi flytter tidspunktet, ikke beslutningen om
+      # hvorvidt et givent rum overhovedet skal tænde.
+      #
+      # continue_on_error: en enkelt vej der fejler (fx Matter-timeout 0x32,
+      # permanent faktum) må ikke afbryde de to andre rum.
+      # RÆKKEFØLGEN ER BETYDENDE, derfor tre separate kald frem for én liste.
+      # Køkkenets "første lys"-vej kræver at HELE light.stue_all er slukket, mens
+      # spisestue-/sofa-vejene kun ser på deres eget rum. Tændte vi spisestuen
+      # først, ville køkkenet se open plan som "ikke længere kulsort" og springe
+      # sig selv over. At det alligevel plejer at gå godt skyldes kun at de to
+      # andre har en `delay: 500ms` foran deres turn_on — altså et kapløb, og et
+      # kapløb er ikke et design. Køkkenet får derfor lov at dømme først.
+      - service: automation.trigger
+        continue_on_error: true
+        target:
+          entity_id: automation.kokken_lyskaede_forste_lys_kulsort_open_plan_bevaegelse
+        data:
+          skip_condition: false
+      # Spisestue-loftet (spisebords-zonen).
+      - service: automation.trigger
+        continue_on_error: true
+        target:
+          entity_id: automation.lysnet_stue_taend
+        data:
+          skip_condition: false
+      # Sofa-zonen: begge sofalamper + hjørnelampe + hygge-plug + læsehygge.
+      - service: automation.trigger
+        continue_on_error: true
+        target:
+          entity_id: automation.lysnet_sofa_stue_taend
+        data:
+          skip_condition: false
+      - service: logbook.log
+        data:
+          name: "Open plan"
+          message: >-
+            Hurtig-vækning: move i spisestuen mens børneværelset var frisk
+            ({{ states('input_number.openplan_putning_vindue_sekunder') | int(180) }} s
+            vindue) — de tre open plan-tændveje gen-triggeret uden gust-debounce.

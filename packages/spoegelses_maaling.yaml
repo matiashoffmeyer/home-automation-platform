@@ -1,0 +1,233 @@
+# =============================================================================
+# spoegelses_maaling.yaml — mål spøgelser i et BEVIST tomt hus (2026-08-21)
+# =============================================================================
+# User-spec: *"sørg for at vi lytter så vi kan se på data om 1 uge."*
+#
+# HVORFOR DEN HER FINDES: hver gang huset bliver ved med at stå Active, er
+# spørgsmålet det samme — hvor mange falske udslag var der, og i hvilket rum?
+# Indtil nu har svaret krævet at man FØRST manuelt fandt et vindue hvor huset
+# beviseligt var tomt, ved at læse GPS, dør-events og robot-status sammen i
+# hånden. Det er dét skridt der er dyrt, ikke selve tællingen.
+#
+# LØSNINGEN er ét MÆRKE: `binary_sensor.hus_bevist_tomt`. Den er med i
+# recorderen, så alt andet — rå occupancy, filtrene, xray, gates — kan bare
+# JOINES mod den bagefter. Riggen gemmer altså ikke data; den gemmer
+# *facit-labelen*, og resten ligger allerede i databasen.
+#
+# Tællerne ovenpå er kun til at kunne se det uden en SQL-forespørgsel.
+#
+# HÅRDT BEVIS, ikke bløde flag (jf. de latchende kilders systematiske
+# opad-fejl): `input_boolean.*_home` bruges IKKE — de har afgangs-grace og kan
+# hænge stale-ON. Parent A læses som tracker-zone + GPS-friskhed; Parent B's eneste
+# vidne er iOS-ankeret (hendes tracker er permanent frossen, se
+# packages/parent_b_ios_geofence.yaml).
+#
+# 10 min delay_on er ikke forsigtighed, det er selve målingen: de første
+# minutter efter en afgang er radarens efterslæb af den der GIK — målt i dag
+# hang rå stue-occupancy 137 s efter dør-luk, og 5 af 15 resterende flanker lå
+# i vinduet 07:25-07:32. Det efterslæb er ægte tilstedeværelse og ville
+# forurene spøgelses-tallet.
+# =============================================================================
+
+input_datetime:
+  spoegelsesmaaling_start:
+    name: "Spøgelsesmåling: tæller siden"
+    icon: mdi:timer-play-outline
+    has_date: true
+    has_time: true
+
+counter:
+  # Ét 5-minutters-blok pr. tick mens huset er bevist tomt = nævneren.
+  tomt_hus_blokke:
+    name: "Tomt hus: 5-min blokke"
+    icon: mdi:home-clock
+    step: 1
+  # Tællerne følger DVALE-ROSTERET, altså præcis de sensorer der kan blokere
+  # dvalen — ikke de rå sensorer. Rå tal ligger i recorderen og kan hentes med
+  # mærket ovenfor; det her skal svare på "hvad holder huset vågent".
+  ghost_stue:
+    name: "Spøgelser: stue"
+    icon: mdi:sofa-outline
+    step: 1
+  ghost_spisestue:
+    name: "Spøgelser: spisestue"
+    icon: mdi:silverware-fork-knife
+    step: 1
+  ghost_koekken:
+    name: "Spøgelser: køkken"
+    icon: mdi:countertop
+    step: 1
+  ghost_sovevaerelse:
+    name: "Spøgelser: soveværelse"
+    icon: mdi:bed-outline
+    step: 1
+  ghost_boernevaerelse:
+    name: "Spøgelser: børneværelse"
+    icon: mdi:teddy-bear
+    step: 1
+  ghost_oevrige:
+    name: "Spøgelser: bad/depot/entré"
+    icon: mdi:door-open
+    step: 1
+  # Hvor mange af flankerne faldt mens robotten kørte. Målt 21/8 var det 8 af
+  # 15 — hvis det tal holder over en uge, hører fixet i robot-håndteringen og
+  # ikke i flere rum-filtre.
+  ghost_under_robot:
+    name: "Spøgelser: heraf under robot-maske"
+    icon: mdi:robot-vacuum
+    step: 1
+
+template:
+  - binary_sensor:
+      # MÆRKET. Kun hårdt bevis. ON = ethvert occupancy-udslag lige nu er pr.
+      # definition falsk.
+      - name: "Hus bevist tomt"
+        unique_id: hus_bevist_tomt
+        device_class: presence
+        icon: mdi:home-search-outline
+        delay_on:
+          minutes: 10
+        state: >-
+          {{ states('device_tracker.phone_a') not in ['home', 'unknown', 'unavailable']
+             and is_state('binary_sensor.parent_a_gps_fresh', 'on')
+             and is_state('binary_sensor.parent_b_hjemme_anker', 'off')
+             and is_state('binary_sensor.parasoll_hoveddoer', 'off')
+             and is_state('binary_sensor.parasoll_terrassedoer', 'off')
+             and not is_state('input_select.house_mode', 'AirBnB') }}
+
+  - sensor:
+      # Flanker pr. tom time — det tal der skal sammenlignes om en uge.
+      # Referencepunkt fra 21/8: FØR fixene 51 flanker på 183 min = 16,7/time
+      # (og længste hul 19,9 min mod et krav på 15). EFTER: 15 flanker =
+      # 4,9/time, længste hul 61,5 min.
+      - name: "Spoegelser pr tom time"
+        unique_id: spoegelser_pr_tom_time
+        unit_of_measurement: "1/t"
+        state_class: measurement
+        icon: mdi:ghost-outline
+        state: >-
+          {% set blokke = states('counter.tomt_hus_blokke') | int(0) %}
+          {% set timer = blokke / 12 %}
+          {% set n = (states('counter.ghost_stue') | int(0))
+                   + (states('counter.ghost_spisestue') | int(0))
+                   + (states('counter.ghost_koekken') | int(0))
+                   + (states('counter.ghost_sovevaerelse') | int(0))
+                   + (states('counter.ghost_boernevaerelse') | int(0))
+                   + (states('counter.ghost_oevrige') | int(0)) %}
+          {{ (n / timer) | round(1) if timer >= 0.25 else 0 }}
+        attributes:
+          tomme_timer: >-
+            {{ ((states('counter.tomt_hus_blokke') | int(0)) / 12) | round(1) }}
+          flanker_i_alt: >-
+            {{ (states('counter.ghost_stue') | int(0))
+             + (states('counter.ghost_spisestue') | int(0))
+             + (states('counter.ghost_koekken') | int(0))
+             + (states('counter.ghost_sovevaerelse') | int(0))
+             + (states('counter.ghost_boernevaerelse') | int(0))
+             + (states('counter.ghost_oevrige') | int(0)) }}
+
+automation:
+  - id: spoegelsesmaaling_tik
+    alias: "Spøgelsesmåling: tæl tomme 5-min blokke"
+    description: >
+      Nævneren. Ét tick pr. 5 min mens huset er bevist tomt.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.hus_bevist_tomt
+        state: "on"
+    action:
+      - service: counter.increment
+        target:
+          entity_id: counter.tomt_hus_blokke
+
+  - id: spoegelsesmaaling_flanke
+    alias: "Spøgelsesmåling: tæl falske udslag"
+    description: >
+      Tælleren. Enhver ON-flanke i dvale-rosteret mens huset er bevist tomt er
+      pr. definition falsk. Trigger-id'et ER tællerens entity_id.
+    mode: queued
+    max: 25
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.stue_apollo_occupancy_filtered
+        from: "off"
+        to: "on"
+        id: counter.ghost_stue
+      - platform: state
+        entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+        from: "off"
+        to: "on"
+        id: counter.ghost_spisestue
+      - platform: state
+        entity_id: binary_sensor.koekken_apollo_occupancy_filtered
+        from: "off"
+        to: "on"
+        id: counter.ghost_koekken
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_dvale_vidne
+        from: "off"
+        to: "on"
+        id: counter.ghost_sovevaerelse
+      - platform: state
+        entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+        from: "off"
+        to: "on"
+        id: counter.ghost_boernevaerelse
+      - platform: state
+        entity_id:
+          - binary_sensor.badevaerelse_inde_occupancy
+          - binary_sensor.depot_valhorn_occupancy
+          - binary_sensor.entre_valhorn_occupancy
+        from: "off"
+        to: "on"
+        id: counter.ghost_oevrige
+    condition:
+      - condition: state
+        entity_id: binary_sensor.hus_bevist_tomt
+        state: "on"
+    action:
+      - service: counter.increment
+        target:
+          entity_id: "{{ trigger.id }}"
+      - if:
+          - condition: state
+            entity_id: binary_sensor.roborock_zone_maskering
+            state: "on"
+        then:
+          - service: counter.increment
+            target:
+              entity_id: counter.ghost_under_robot
+      - service: logbook.log
+        data:
+          name: "Spøgelse"
+          entity_id: "{{ trigger.entity_id }}"
+          message: >-
+            falsk udslag i bevist tomt hus{{ ' (robot kører)'
+              if is_state('binary_sensor.roborock_zone_maskering','on') else '' }}
+
+script:
+  spoegelsesmaaling_nulstil:
+    alias: "Spøgelsesmåling: nulstil og stempl"
+    icon: mdi:restart
+    mode: single
+    sequence:
+      - service: counter.reset
+        target:
+          entity_id:
+            - counter.tomt_hus_blokke
+            - counter.ghost_stue
+            - counter.ghost_spisestue
+            - counter.ghost_koekken
+            - counter.ghost_sovevaerelse
+            - counter.ghost_boernevaerelse
+            - counter.ghost_oevrige
+            - counter.ghost_under_robot
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.spoegelsesmaaling_start
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"

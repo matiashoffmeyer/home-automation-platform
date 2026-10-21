@@ -1,0 +1,338 @@
+# =============================================================================
+# Presence Detection
+# =============================================================================
+#
+# Two-layer presence for each person:
+#   1. GPS zone (Google Maps / HA Companion app) - "near home" geofence
+#   2. Bluetooth (local server detects phone BLE) - "actually in apartment"
+#
+# The input_booleans (parent_a_home, parent_b_home) from house_modes.yaml
+# are the single source of truth. This file contains the automations
+# that SET those booleans based on device tracker signals.
+#
+# HARDWARE INTEGRATION NOTES:
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# When you set up phones, you'll get device_tracker entities like:
+#   - device_tracker.parent_a_phone_gps     (HA Companion / Google Maps)
+#   - device_tracker.parent_a_phone_ble     (Bluetooth on local server)
+#   - device_tracker.parent_b_phone_gps
+#   - device_tracker.parent_b_phone_ble
+#
+# Update the entity IDs below to match your actual device trackers.
+# The zone "home" centers on the home address: home_latitude/home_longitude
+#   in secrets.yaml (contract: secrets.example.yaml).
+# =============================================================================
+
+# =============================================================================
+# Home zone — husets adresse (koordinater i secrets.yaml)
+# =============================================================================
+# 2026-07-15 fix (fejlklasse #17): zonen hed "Hjem" → HA oprettede zone.hjem
+# VED SIDEN AF den indbyggede zone.home (radius 100 fra core-config). Kun
+# zone.home giver tracker-state "home", så den tilsigtede 200 m-geofence
+# virkede aldrig — effektiv radius var 100 m, og "Hjem" var dødt lag.
+# Den ubrugte "Nærområde"-zone (500 m, ingen konsumenter) skyggede desuden
+# afgangs-detektion: state blev "Nærområde" (≠ not_home) indtil 500 m ude.
+# FIX (user-valg): navnet "Home" OVERRIDER den indbyggede home-zone (dokumen-
+# teret HA-adfærd) → 200 m er nu reel; Nærområde slettet.
+#
+# Phones i home zone → state="home" = parent_a_home/parent_b_home flag = ON.
+# Phones udenfor → state="not_home" = flag OFF (efter 5 min grace).
+#
+# GPS-fast Dormant logic (i house_modes.yaml) tjekker afstand til zone.home.
+# >1km i 30 min → Dormant.
+# =============================================================================
+zone:
+  - name: "Home"
+    latitude: !secret home_latitude    # samme punkt som homeassistant: i configuration.yaml
+    longitude: !secret home_longitude
+    radius: 200            # meters — covers apartment building + immediate approach
+    icon: mdi:home
+
+automation:
+  # ==========================================================================
+  # Parent A presence
+  # ==========================================================================
+  # 2026-05-07 fix: PLACEHOLDER device_trackers eksisterer ikke. Live entity
+  # er `device_tracker.phone_a` (Sony Xperia phone). Skiftet fra GPS+BLE
+  # multi-source design til single device_tracker.phone_a (HA Companion app).
+  # NB: tracker rapporterer "not_home" hvis Companion ikke har location-permission
+  # eller er manuelt paused. People_estimate har fallback via zone-counting.
+  - id: presence_parent_a_arrive
+    alias: "Tilstedeværelse: Parent A ankommer"
+    mode: single
+    trigger:
+      # zone.home = Example Street (eneste home zone efter flyt 2026-06-05).
+      # A91 fix audit-5 2026-05-12: `for: minutes: 2` debouncer GPS zone-flap
+      # (lat/lon attrs kan flappe zone-boundary).
+      - platform: state
+        entity_id: device_tracker.phone_a
+        to: "home"
+        for:
+          minutes: 2
+      # HA restart resilience (sprint 2026-05-10): hvis phone allerede ER i
+      # home zone ved restart, state-trigger fyrer ikke (ingen transition).
+      # HA-start re-evaluerer + condition catches det.
+      - platform: homeassistant
+        event: start
+      # Sprint 2026-05-17 (GPS expire): naar phone reporter igen efter stale-
+      # periode flipper freshness off→on UDEN at device_tracker state aendrer
+      # sig (var "home" hele tiden mens stale). Trigger her sikrer at
+      # parent_a_home flippes tilbage on hvis phone genuinely er hjemme.
+      - platform: state
+        entity_id: binary_sensor.parent_a_gps_fresh
+        from: "off"
+        to: "on"
+      # Bug hunt 2026-07-17c (fejlklasse #4): en home-transition tabt under
+      # automation-reload (eller mens 2-min 'for:' løb ved restart) har ingen
+      # re-arm — tracker er allerede 'home', state-triggeren fyrer aldrig igen.
+      # /15-backstop samler flaget op; stabilitets-guard i conditions bevarer
+      # 2-min debounce-semantikken for denne path.
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      # 2026-07-15 (user-valg): gate ændret Normal → ikke-AirBnB. Tracking skal
+      # også køre i Home Vacation (flagene frøs ellers på sidste værdi dér,
+      # mens Dormant-paths stadig kørte). AirBnB dækkes dobbelt: denne gate +
+      # lockdown slår hele automationen fra (defense-in-depth).
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Verificer phone faktisk er i home zone (gates HA-start path)
+      - condition: template
+        value_template: >-
+          {{ states('device_tracker.phone_a') == 'home' }}
+      # GPS freshness gate: kun fyr hvis data er friskt (= ikke baseret paa
+      # stale last-known location). Beskytter ogsaa freshness-recovery path
+      # mod off→unavailable→on flicker.
+      - condition: state
+        entity_id: binary_sensor.parent_a_gps_fresh
+        state: "on"
+      # Bug hunt 2026-07-17c: kun når flaget faktisk mangler — alle paths hvor
+      # action betyder noget har flag off (stale-clear satte det off). Dræber
+      # også logbook-støj fra /15-backstoppen.
+      - condition: state
+        entity_id: input_boolean.parent_a_home
+        state: "off"
+      # Bug hunt 2026-07-17c: /15-backstoppen må ikke omgå 2-min zone-flap-
+      # debouncen — kræv 'home' stabil ≥ ~2 min for time_pattern-pathen.
+      # (115s, ikke 120: primær-triggerens 'for: 2 min' lander præcis på 120s.)
+      - condition: template
+        value_template: >-
+          {{ trigger.platform != 'time_pattern'
+             or (now() - states.device_tracker.phone_a.last_changed).total_seconds() >= 115 }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.parent_a_home
+      # Dismiss stale-notification hvis aktiv (phone er tilbage online).
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: parent_a_gps_stale
+
+  - id: presence_parent_a_leave
+    alias: "Tilstedeværelse: Parent A forlader"
+    mode: restart
+    trigger:
+      # Sprint A.3 fix audit 2026-05-07: ændret fra `from: "home"` til
+      # `to: "not_home"`. iOS/Android Companion kan rapportere
+      # home → unknown → not_home — `from: home` fyrede på første transition,
+      # men condition checker derefter state=not_home som kan være "unknown"
+      # → parent_a_home stuck on. `to: not_home` fanger via destination.
+      - platform: state
+        entity_id: device_tracker.phone_a
+        to: "not_home"
+      # Bug hunt 2026-07-17c (fejlklasse #4/#15): 5-min grace-delayen dør ved
+      # restart OG ved automation-reload (in-flight runs dræbes) → flag stuck
+      # ON. gps_stale kan IKKE redde en LEVENDE telefon der pinger ude
+      # (freshness forbliver on → stale-clear fyrer aldrig) — eneste clear-path
+      # var selve transitionen. HA-start + /15 re-evaluerer; delay+recheck i
+      # action giver stadig 5-min grace mod GPS-jitter.
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      # 2026-07-15 (user-valg): gate ændret Normal → ikke-AirBnB. Tracking skal
+      # også køre i Home Vacation (flagene frøs ellers på sidste værdi dér,
+      # mens Dormant-paths stadig kørte). AirBnB dækkes dobbelt: denne gate +
+      # lockdown slår hele automationen fra (defense-in-depth).
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Bug hunt 2026-07-17c: backstop-gates — kun relevant når flaget er on
+      # og tracker faktisk er not_home (state-triggeren opfyldte altid begge;
+      # skipper no-op delay-runs fra HA-start//15).
+      - condition: state
+        entity_id: input_boolean.parent_a_home
+        state: "on"
+      - condition: state
+        entity_id: device_tracker.phone_a
+        state: "not_home"
+    action:
+      - delay:
+          minutes: 5  # Grace period (transient GPS jitter)
+      - condition: state
+        entity_id: device_tracker.phone_a
+        state: "not_home"
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.parent_a_home
+
+  # ==========================================================================
+  # Parent B presence
+  # ==========================================================================
+  # 2026-05-07: Parent B phone paret som device_tracker.phone_b
+  # (HA Companion app, iOS). Erstatter PLACEHOLDER GPS+BLE design.
+  # User-spec: Parent B får KUN kalde-notification (ikke battery, water_leak,
+  # device_health) — dvs. kun godnat_kalde_on bruger notify.mobile_app_phone_b.
+  - id: presence_parent_b_arrive
+    alias: "Tilstedeværelse: Parent B ankommer"
+    mode: single
+    trigger:
+      # zone.home = Example Street (eneste home zone efter flyt 2026-06-05).
+      # A91 fix audit-5 2026-05-12: `for: minutes: 2` debouncer GPS zone-flap.
+      - platform: state
+        entity_id: device_tracker.phone_b
+        to: "home"
+        for:
+          minutes: 2
+      # HA restart resilience (mirror parent_a_arrive)
+      - platform: homeassistant
+        event: start
+      # Sprint 2026-05-17 (GPS expire): freshness recovery trigger — se
+      # parent_a_arrive for forklaring.
+      - platform: state
+        entity_id: binary_sensor.parent_b_gps_fresh
+        from: "off"
+        to: "on"
+      # Bug hunt 2026-07-17c: /15-backstop mod tabte home-transitions — se
+      # parent_a_arrive for forklaring.
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      # 2026-07-15 (user-valg): gate ændret Normal → ikke-AirBnB. Tracking skal
+      # også køre i Home Vacation (flagene frøs ellers på sidste værdi dér,
+      # mens Dormant-paths stadig kørte). AirBnB dækkes dobbelt: denne gate +
+      # lockdown slår hele automationen fra (defense-in-depth).
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Verificer phone faktisk er i home zone (gates HA-start path)
+      - condition: template
+        value_template: >-
+          {{ states('device_tracker.phone_b') == 'home' }}
+      # GPS freshness gate (se parent_a_arrive).
+      - condition: state
+        entity_id: binary_sensor.parent_b_gps_fresh
+        state: "on"
+      # Bug hunt 2026-07-17c: flag-off + stabilitets-guard — se parent_a_arrive.
+      - condition: state
+        entity_id: input_boolean.parent_b_home
+        state: "off"
+      - condition: template
+        value_template: >-
+          {{ trigger.platform != 'time_pattern'
+             or (now() - states.device_tracker.phone_b.last_changed).total_seconds() >= 115 }}
+      # 2026-08-14b: er iOS-geofencen autoritativ (packages/parent_b_ios_geofence.yaml),
+      # må GPS ikke kunne sige HJEMME imod den. Efter opsætningen står appens
+      # lokations-adgang på "Kun mens appen bruges", så trackeren er permanent
+      # frossen på sin sidste zone — og en frossen `home` er nul evidens.
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.parent_b_ios_geofence_enabled', 'off')
+             or is_state('input_boolean.parent_b_hjemme_ios', 'on') }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.parent_b_home
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: parent_b_gps_stale
+
+  - id: presence_parent_b_leave
+    alias: "Tilstedeværelse: Parent B forlader"
+    mode: restart
+    trigger:
+      # Sprint A.3 fix audit 2026-05-07: same fix som parent_a_leave.
+      # `to: not_home` mere robust end `from: home` ved iOS unknown-states.
+      - platform: state
+        entity_id: device_tracker.phone_b
+        to: "not_home"
+      # Bug hunt 2026-07-17c: HA-start + /15 backstop mod stuck-on flag efter
+      # restart/reload-dræbt grace-delay — se parent_a_leave for forklaring.
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      # 2026-07-15 (user-valg): gate ændret Normal → ikke-AirBnB. Tracking skal
+      # også køre i Home Vacation (flagene frøs ellers på sidste værdi dér,
+      # mens Dormant-paths stadig kørte). AirBnB dækkes dobbelt: denne gate +
+      # lockdown slår hele automationen fra (defense-in-depth).
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # Bug hunt 2026-07-17c: backstop-gates — se parent_a_leave.
+      - condition: state
+        entity_id: input_boolean.parent_b_home
+        state: "on"
+      - condition: state
+        entity_id: device_tracker.phone_b
+        state: "not_home"
+      # 2026-08-18: SPEJLER gaten i presence_parent_b_arrive (ovenfor) og i
+      # presence_gps_stale. Begge dem fik den 08-14b; denne blev glemt (#12), og
+      # da trackeren er permanent frossen på `not_home`, fyrede /15-backstoppen
+      # hver eneste kvartér og slog hjemme-flaget fra 5 min efter hver ankomst.
+      # Målt: kontakten ON 08-17 16:46 → 08-18 07:30 (hun var hjemme hele
+      # natten), mens parent_b_home stod off fra 17:05:00.
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.parent_b_ios_geofence_enabled', 'off')
+             or is_state('input_boolean.parent_b_hjemme_ios', 'off') }}
+    action:
+      - delay:
+          minutes: 5  # Grace period (transient GPS jitter)
+      - condition: state
+        entity_id: device_tracker.phone_b
+        state: "not_home"
+      # Re-tjek EFTER ventetiden: der findes ingen trigger der genstarter os
+      # hvis iOS-kontakten bliver trykket ON i grace-vinduet (#4), så uden denne
+      # ville en ankomst midt i de 5 minutter blive slået fra igen med det samme.
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.parent_b_ios_geofence_enabled', 'off')
+             or is_state('input_boolean.parent_b_hjemme_ios', 'off') }}
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.parent_b_home
+
+  # ==========================================================================
+  # AirBnB mode: disable all personal presence tracking
+  # ==========================================================================
+  - id: presence_airbnb_reset
+    alias: "Tilstedeværelse: Nulstil ved AirBnB"
+    description: "Clear personal presence when switching to AirBnB mode"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.house_mode
+        to: "AirBnB"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.parent_a_home
+            - input_boolean.parent_b_home
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.house_state
+        data:
+          option: "Active"  # AirBnB always "active" - basic automations run

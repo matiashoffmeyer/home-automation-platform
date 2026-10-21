@@ -1,0 +1,217 @@
+# =============================================================================
+# ROBOROCK — konfigurerbar Styrbar-fjernbetjening (ex-depot)
+# =============================================================================
+# User-spec 2026-08-24: "på støvsuger siden skal jeg kunne styre hvad styrbar
+# robot gør, inkl. hvilke rum den targetter."
+#
+# Fjernbetjeningen (IEEE 99:a8:bb:14:4e:71:ce:67) havde sine to OP-handlinger
+# HARDKODET i automations-body'en (roborock.yaml → roborock_manual_buttons):
+# kort OP = segment 16, langt OP = MAX clean. Denne pakke flytter DE TO VALG ud
+# i helpers, så de kan sættes fra Støvsug-siden — automationen er nu en ren
+# tragt der stempler manuel-intent og kalder `script.roborock_styrbar_udfoer`.
+#
+# 🎯 ÉT sted for segment→rum (fejlklasse #2): rum-navne OG slug→segment står
+# KUN i attributterne på `sensor.roborock_rum_kort`
+# (packages/roborock_rum_scripts.yaml). Intet segment-nummer må skrives her
+# eller i dashboardet — hverken i kode eller i en tekst.
+#
+# 🔁 "Valgte rum" bruger husets eksisterende kø (`roborock_rum_koe_tilfoej`),
+# ikke et direkte `app_segment_clean`: så arver Styrbaren gratis batching (rum
+# med samme grundighed køres som ÉN tur), dedupe, samle-vinduet og
+# giv-op-oprydningen — nøjagtig samme motor som knapperne på Støvsug-siden.
+#
+# ⬇️ NED-knappen er BEVIDST ikke konfigurerbar. Den er husets eneste fysiske
+# stop-knap til robotten (kører → stop + dok · står stille → toggle pause på
+# auto-cleans, user-spec 2026-07-26). Kunne den konfigureres væk, ville et
+# uheldigt valg efterlade en kørende robot uden fysisk afbryder — og en gæst
+# (🏡 AirBnB-reglen: der skal altid være en udgang) ville ikke kende
+# dashboardet. Adfærden er dokumenteret på Støvsug-siden i stedet.
+# =============================================================================
+
+input_select:
+  # Options er identiske for de to tryk med vilje: brugeren skal ikke skulle
+  # huske hvilken knap der "kan" hvad. Rækkefølgen bestemmer fresh-install-
+  # defaulten (første option) — derfor står den hverdagsagtige først.
+  roborock_styrbar_kort_op:
+    name: "🔘 Styrbar: kort tryk OP"
+    icon: mdi:chevron-up
+    options: &styrbar_handlinger
+      - "Valgte rum — hurtig"
+      - "Valgte rum — grundig"
+      # 2026-10-04 (user-spec, eksperiment): robottens egen AI-plan pr. rum —
+      # packages/roborock_smartplan.yaml. Kø-grundighed `s`.
+      - "Valgte rum — SmartPlan"
+      - "Hele huset — hurtig (kun sug)"
+      - "Hele huset — normal (sug + mop)"
+      - "Hele huset — MAX (kraftigst)"
+      - "Stop + send i dok"
+      - "Gør ingenting"
+
+  roborock_styrbar_lang_op:
+    name: "🔘 Styrbar: langt tryk OP"
+    icon: mdi:chevron-double-up
+    options: *styrbar_handlinger
+
+input_boolean:
+  # Rum-valg pr. tryk. To uafhængige sæt, fordi de to knapper netop er til to
+  # forskellige ærinder (hverdags-runde vs. den store tur) — ét delt sæt ville
+  # gøre den ene knap til en kopi af den anden.
+  #
+  # BEVIDST uden `initial:` (💡 Permanente fakta: `initial:` PÅTVINGER ved hver
+  # HA-start) — valget skal overleve en restart.
+  roborock_styrbar_kort_op_stue:
+    name: "Kort OP: Stue"
+    icon: mdi:sofa-outline
+  roborock_styrbar_kort_op_spisestue:
+    name: "Kort OP: Spisestue"
+    icon: mdi:table-furniture
+  roborock_styrbar_kort_op_koekken:
+    name: "Kort OP: Køkken"
+    icon: mdi:countertop-outline
+  roborock_styrbar_kort_op_entre:
+    name: "Kort OP: Entré"
+    icon: mdi:door-open
+  roborock_styrbar_kort_op_sovevaerelse:
+    name: "Kort OP: Soveværelse"
+    icon: mdi:bed-outline
+  roborock_styrbar_kort_op_boernevaerelse:
+    name: "Kort OP: Børneværelse"
+    icon: mdi:teddy-bear
+  roborock_styrbar_kort_op_badevaerelse:
+    name: "Kort OP: Badeværelse"
+    icon: mdi:shower
+  roborock_styrbar_kort_op_depot:
+    name: "Kort OP: Depot"
+    icon: mdi:package-variant-closed
+
+  roborock_styrbar_lang_op_stue:
+    name: "Langt OP: Stue"
+    icon: mdi:sofa
+  roborock_styrbar_lang_op_spisestue:
+    name: "Langt OP: Spisestue"
+    icon: mdi:table-chair
+  roborock_styrbar_lang_op_koekken:
+    name: "Langt OP: Køkken"
+    icon: mdi:countertop
+  roborock_styrbar_lang_op_entre:
+    name: "Langt OP: Entré"
+    icon: mdi:door-open
+  roborock_styrbar_lang_op_sovevaerelse:
+    name: "Langt OP: Soveværelse"
+    icon: mdi:bed
+  roborock_styrbar_lang_op_boernevaerelse:
+    name: "Langt OP: Børneværelse"
+    icon: mdi:teddy-bear
+  roborock_styrbar_lang_op_badevaerelse:
+    name: "Langt OP: Badeværelse"
+    icon: mdi:shower-head
+  roborock_styrbar_lang_op_depot:
+    name: "Langt OP: Depot"
+    icon: mdi:package-variant
+
+script:
+  # ---------------------------------------------------------------------------
+  # Tragten: ÉN implementation for begge OP-tryk (fejlklasse #2)
+  # ---------------------------------------------------------------------------
+  roborock_styrbar_udfoer:
+    alias: "Roborock Styrbar: udfør konfigureret handling"
+    icon: mdi:remote
+    # queued: et hurtigt dobbelt-tryk må ikke tabes, men de to handlinger må
+    # heller ikke køre oveni hinanden og skrive robot-profilen samtidig.
+    mode: queued
+    max: 4
+    fields:
+      tryk:
+        description: "'kort_op' eller 'lang_op' — hvilken knap der blev trykket"
+        required: true
+        example: kort_op
+    variables:
+      handling: "{{ states('input_select.roborock_styrbar_' ~ tryk) }}"
+      # Slug→segment fra det fælles kort. Rækkefølgen i attributten er husets,
+      # og den bliver kø-rækkefølgen her.
+      slugs: >-
+        {{ state_attr('sensor.roborock_rum_kort', 'slugs') | default({}, true) }}
+      valgte: >-
+        {% set ns = namespace(o=[]) %}
+        {% for slug, seg in slugs.items() %}
+          {% if is_state('input_boolean.roborock_styrbar_' ~ tryk ~ '_' ~ slug, 'on') %}
+            {% set ns.o = ns.o + (seg if seg is list else [seg]) %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.o }}
+      grundighed: >-
+        {{ 's' if 'SmartPlan' in handling
+           else 'g' if 'grundig' in handling else 'h' }}
+      knap_navn: "{{ 'Kort OP' if tryk == 'kort_op' else 'Langt OP' }}"
+    sequence:
+      - choose:
+          # --- Valgte rum → læg dem i husets kø ------------------------------
+          - conditions:
+              - condition: template
+                value_template: "{{ handling.startswith('Valgte rum') }}"
+            sequence:
+              # Nul valgte rum er en TAVS knap. Et fysisk tryk der ikke gør
+              # noget skal sige hvorfor — ellers fejlsøger man robotten i
+              # stedet for indstillingen.
+              - if:
+                  - condition: template
+                    value_template: "{{ valgte | count == 0 }}"
+                then:
+                  - service: logbook.log
+                    data:
+                      name: "Roborock Styrbar"
+                      message: >-
+                        {{ knap_navn }} er sat til "{{ handling }}", men der er
+                        ikke valgt nogen rum — intet at gøre.
+                  - service: script.push_notify
+                    data:
+                      notif_id: roborock
+                      title: "🔘 Ingen rum valgt"
+                      message: >-
+                        Fjernbetjeningens {{ knap_navn | lower }} skal støvsuge
+                        "valgte rum", men der er ikke sat flueben ved nogen rum.
+                        Vælg rummene på Støvsug → Fjernbetjening.
+                  - stop: "Ingen rum valgt."
+              - repeat:
+                  for_each: "{{ valgte }}"
+                  sequence:
+                    - service: script.roborock_rum_koe_tilfoej
+                      data:
+                        segment: "{{ repeat.item }}"
+                        grundighed: "{{ grundighed }}"
+              - service: logbook.log
+                data:
+                  name: "Roborock Styrbar"
+                  message: >-
+                    {{ knap_navn }} → {{ valgte | count }} rum lagt i kø
+                    ({{ {'g': 'grundig', 's': 'SmartPlan'}.get(grundighed, 'hurtig') }}).
+
+          # --- Hele huset -----------------------------------------------------
+          - conditions:
+              - condition: template
+                value_template: "{{ handling == 'Hele huset — hurtig (kun sug)' }}"
+            sequence:
+              - service: script.roborock_start_quick
+          - conditions:
+              - condition: template
+                value_template: "{{ handling == 'Hele huset — normal (sug + mop)' }}"
+            sequence:
+              - service: script.roborock_start_full
+          - conditions:
+              - condition: template
+                value_template: "{{ handling == 'Hele huset — MAX (kraftigst)' }}"
+            sequence:
+              - service: script.roborock_start_max
+
+          # --- Stop ------------------------------------------------------------
+          - conditions:
+              - condition: template
+                value_template: "{{ handling == 'Stop + send i dok' }}"
+            sequence:
+              - service: script.roborock_stop_dock
+        default:
+          - service: logbook.log
+            data:
+              name: "Roborock Styrbar"
+              message: >-
+                {{ knap_navn }} er sat til "{{ handling }}" — ingen handling.

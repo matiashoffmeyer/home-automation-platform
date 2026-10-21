@@ -1,0 +1,93 @@
+# =============================================================================
+# HUSET ER BLEVET BLINDT — DIAGNOSTIK (B118, 2026-09-09f)
+# =============================================================================
+# LÆS DENNE FØRST når du undersøger noget presence-relateret. `unavailable`
+# læses som `off` i AL presence-logik (fejlklasse #9), så en død kanal svarer
+# "her er tomt" med fuld selvsikkerhed. Er `binary_sensor.presence_kanaler_
+# blinde` on, er DET sandsynligvis forklaringen på den adfærd du undersøger —
+# ikke den automation du er ved at læse.
+#
+# HVORFOR DER IKKE VARSLES (user-spec 2026-09-09f): "der skal ikke varsles med
+# notifikation til mig om blinde apolloer, men det skal være tydeligt for
+# claude sessions. At slukke vægkontakter som vores nuværende gæster gør skal
+# være en helt naturlig del af AirBnB-brugen af lejligheden og ikke skabe
+# problemer." En gæst der slukker på væggen gør ikke noget forkert — så der er
+# ingen at varsle og intet at rette. Varslet fra 09-09e er fjernet igen
+# (inkl. `notif_blind_*`-helperne); tilbage står MÅLINGEN, som er det eneste
+# der havde værdi. Synlig for sessions via `./scripts/ha_health.sh blind`,
+# som også kører i `deploy` og `all`.
+#
+# HVORFOR IKKE EN NY ROSTER: kanal-listen findes ÉT sted allerede
+# (`sensor.presence_signal_confidence`, packages/activity_state.yaml). Vi læser
+# dens `blinde_antal`/`blinde`-attributter i stedet for at kopiere de ti
+# entity_ids herind (fejlklasse #16 — rosters drifter ved device-tilføjelse).
+
+input_number:
+  presence_blind_min_kanaler:
+    name: "🕶️ Blindhed — antal døde kanaler før flaget"
+    min: 1
+    max: 10
+    step: 1
+    icon: mdi:eye-off
+  # Væg-kontakt-signaturen er ~10 min bred (ESPHome falder først, ZHA ~9 min
+  # senere), og et Thread partition-split heler sig selv på 20-30 min
+  # (permanent faktum). 30 min ligger over begge = flaget betyder "det her
+  # heler ikke af sig selv", ikke "en radio hikkede".
+  presence_blind_minutter:
+    name: "🕶️ Blindhed — minutter før flaget"
+    min: 5
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:timer-sand
+
+template:
+  - binary_sensor:
+      # BEVIS-sensor: kun `delay_on`, intet `delay_off` (permanent faktum —
+      # delay_on + delay_off på SAMME udtryk bevogter kun åbningen, og et blip
+      # re-armer holdet). Falder derfor med det samme når kanalerne kommer
+      # tilbage.
+      - name: "Presence kanaler blinde"
+        unique_id: presence_kanaler_blinde
+        device_class: problem
+        icon: mdi:eye-off-outline
+        delay_on: >-
+          {{ (states('input_number.presence_blind_minutter') | int(30)) * 60 }}
+        state: >-
+          {{ (state_attr('sensor.presence_signal_confidence', 'blinde_antal')
+              | int(0))
+             >= (states('input_number.presence_blind_min_kanaler') | int(2)) }}
+        attributes:
+          blinde: >-
+            {{ state_attr('sensor.presence_signal_confidence', 'blinde') }}
+          antal: >-
+            {{ state_attr('sensor.presence_signal_confidence', 'blinde_antal')
+               | int(0) }}
+          konfidens: "{{ states('sensor.presence_signal_confidence') }}"
+          # Hvilke af de blinde kanaler der er FORKLAREDE = deres vægkontakt er
+          # slukket, hvilket er normal brug og ikke en fejl. Vidne-kortet er
+          # målt over 30 døgns recorder (B125, sprint 09-09e): når kontakten
+          # ryger, falder både Apolloen og lampen på samme kontakt. Er en kanal
+          # blind UDEN at dens lampe er det, er det en ægte hardware-mistanke.
+          # NB `light.spisestue_pendel` er FYSISK soveværelsets loft
+          # (alias-slug fra 2026-06-05) — derfor parringen til sove-Apolloen.
+          forklaret: >-
+            {% set b = state_attr('sensor.presence_signal_confidence',
+                                  'blinde') %}
+            {% set lst = b.split(', ')
+                 if b not in ['-', '', 'unknown', 'unavailable', none]
+                 else [] %}
+            {% set kontakt = {
+                 'koekken_apollo_occupancy_filtered': 'light.koekken_lyskaede',
+                 'spisestue_apollo_occupancy_filtered':
+                   'light.koekken_lyskaede',
+                 'sovevaerelse_apollo_occupancy': 'light.spisestue_pendel'
+               } %}
+            {% set ns = namespace(f=[]) %}
+            {% for c in lst %}
+              {% set l = kontakt.get(c) %}
+              {% if l is not none and states(l) not in ['on', 'off'] %}
+                {% set ns.f = ns.f + [c] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.f | join(', ') if ns.f | count > 0 else '-' }}

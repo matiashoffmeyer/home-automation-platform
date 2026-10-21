@@ -1,0 +1,111 @@
+# =============================================================================
+# Fugt-varsel — TIMMERFLOTTE over tærskel (2026-08-29, user-spec)
+# =============================================================================
+# User: "giv mig en notifikation (når jeg kommer hjem eller er hjemme) hvis
+# luftfugtigheden kommer over 60% på timmerflotte."
+#
+# Læser `sensor.indoor_humidity_resilient` (15/10, user: "hvis den har fugt
+# måler så skal den med overalt vi måler fugt"): = køkkenets TIMMERFLOTTE
+# (node 434) når den svarer, ellers skønnet fra depotets Broadlink RM4 Pro
+# (±1-1,5 %RH, se activity_state.yaml). TIMMERFLOTTE var væk ~40 af 75 t
+# 13-15/10 — uden reserven var varslet blindt i den tid.
+#
+# "Når jeg kommer hjem" bygges IKKE her: `script.push_notify` + hjemkomst-køen
+# (packages/notif_hjemme.yaml) gør det allerede pr. modtager — er Parent A's GPS
+# væk, køes beskeden og leveres ved ankomst. Derfor er notif_fugt_hjemme = ON
+# hele mekanismen, og denne fil skal kun afgøre HVORNÅR der er noget at melde.
+#
+# Målt 25/8–29/8 (1131 samples): p50 53,2 %, min 39,7 %, max 64,5 %. Over 60 %
+# i fire episoder — én på 39 min, én på 6 t 46 min — og dagsmaks er STIGENDE
+# (54,8 → 55,5 → 60,4 → 60,8 → 64,5). 60 % er altså en tærskel der reelt
+# krydses, og episoderne er lange nok til at en ren flanke-trigger ville nøjes
+# med ét varsel pr. mange timer. Derfor episode-latch + /30-backstop.
+# =============================================================================
+
+input_number:
+  # Tærsklen user bad om. Slideren er autoriteten; 60 sættes af
+  # init_user_preferences ved fresh install (min = 40).
+  fugt_varsel_pct:
+    name: "Fugt-varsel: tærskel"
+    icon: mdi:water-percent
+    min: 40
+    max: 80
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+input_boolean:
+  # Episode-latch: ét varsel pr. fugt-episode, ikke ét pr. tick. Ryddes først
+  # når fugten er faldet 3 point UNDER tærsklen (hysterese) — uden den ville
+  # en sensor der vipper 59,8/60,2 give et varsel hver halve time.
+  # Bevidst UDEN `initial:` — den ville påtvinge off ved hver HA-start og
+  # dermed gen-varsle midt i en igangværende episode (CLAUDE.md: initial:
+  # restorer ikke, den påtvinger).
+  fugt_varsel_sendt:
+    name: "Fugt-varsel sendt (episode-latch)"
+    icon: mdi:water-alert
+
+automation:
+  - id: fugt_varsel_hoej
+    alias: "Klima: Luftfugtighed over tærskel (TIMMERFLOTTE)"
+    description: >
+      Varsler når lejlighedens fugt (TIMMERFLOTTE, ellers depotets
+      Broadlink) er over input_number.fugt_varsel_pct.
+      Leveres straks hvis Parent A er hjemme, ellers køes den og lander ved
+      hjemkomst (notif_fugt_hjemme). Ét varsel pr. episode.
+    mode: single
+    trigger:
+      # Flanken: 10 min over tærsklen = ikke et enkelt sample-udsving.
+      - platform: numeric_state
+        entity_id: sensor.indoor_humidity_resilient
+        above: input_number.fugt_varsel_pct
+        for:
+          minutes: 10
+        id: over
+      # Backstop (fejlklasse #4/#13 + restart-hullet): flanken kan være sket
+      # mens sensoren var unavailable, mens HA bootede, eller før user hævede
+      # tærsklen — og en latch gør at flanken aldrig kommer igen. Ticket
+      # re-evaluerer tilstanden i stedet for at vente på en kant.
+      - platform: time_pattern
+        minutes: "/30"
+        id: tick
+    action:
+      - variables:
+          # float(-1) = "ingen måling" (unavailable/unknown) → alle grene
+          # nedenfor kræver rh >= 0, så en død sensor hverken varsler eller
+          # rydder latchen (fejlklasse #9).
+          rh: "{{ states('sensor.indoor_humidity_resilient') | float(-1) }}"
+          graense: "{{ states('input_number.fugt_varsel_pct') | float(60) }}"
+      - choose:
+          # --- Varsl: over tærsklen og ikke varslet for denne episode ---
+          - conditions:
+              - condition: template
+                value_template: "{{ rh > graense }}"
+              - condition: state
+                entity_id: input_boolean.fugt_varsel_sendt
+                state: "off"
+            sequence:
+              - service: script.push_notify
+                data:
+                  notif_id: fugt
+                  title: "💧 Luftfugtighed {{ rh | round(0) }} %"
+                  message: >-
+                    {{ 'Køkkenet' if state_attr('sensor.indoor_humidity_resilient', 'kilde') == 'køkken'
+                       else 'Depotet (køkken-sensoren er væk) skønner' }} {{ rh | round(1) }} % —
+                    over din grænse på {{ graense | round(0) }} %.
+                    Luft ud (gennemtræk 5-10 min) eller tjek om der tørrer
+                    tøj / står noget og damper.
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.fugt_varsel_sendt
+          # --- Ryd latchen: episoden er slut (3 points hysterese) ---
+          - conditions:
+              - condition: template
+                value_template: "{{ rh >= 0 and rh < (graense - 3) }}"
+              - condition: state
+                entity_id: input_boolean.fugt_varsel_sendt
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.fugt_varsel_sendt

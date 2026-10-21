@@ -1,0 +1,496 @@
+# =============================================================================
+# koekken_stemme_arm.yaml — hånden op armerer mikrofonen (2026-09-17, user-spec)
+# =============================================================================
+# PROBLEMET, MÅLT: 81 transskriptioner på 56,1 minutters helt almindelig dansk
+# køkken-samtale. 14 af dem passerede kommando-allowlisten — altså ~én falsk
+# kommando hvert fjerde minut, hele dagen. "auto mode" alene blev accepteret 5
+# gange på den time. Det er user's oprindelige klage ("totalt buggy") målt.
+#
+# HVORFOR DET IKKE KAN FILTRERES I TEKSTEN: Speech-to-Phrase er en
+# FAST-SÆTNINGS-MATCHER uden "ved det ikke"-udgang — hver ytring snappes til
+# nærmeste trænede sætning, og transcript-eventet bærer KUN tekst, ingen
+# confidence. En klirrende gryde der bliver til 'timer eight minute' og et
+# menneske der SIGER 'timer eight minute' er derfor den præcis samme streng.
+# Intet filter på strengen kan skille dem.
+#
+# Og at beskære grammatikken gør det VÆRRE, ikke bedre: HA's store sætnings-
+# mængde virker som en skraldespand der opsuger det meste støj. Fjerner man
+# sætningerne, har støjen færre steder at lande — og lander oftere på vores.
+#
+# LØSNINGEN SKAL DERFOR KOMME UDEFRA LYDEN, og kameraet kan se TO bevidste
+# signaler:
+#
+#  1. EN HÅND (17/9). Den holdes op i mindst `stemme_arm_hold_frames` frames.
+#  2. ET BLIK IND I LINSEN (18/9, user-spec). Første måling — tre 1280×720-frames
+#     — sagde at ansigter lå uden for billedet, og på dét grundlag blev
+#     øjenkontakt afvist som fysisk umuligt. Det var en STIKPRØVE-fejl: de tre
+#     frames var taget i huller hvor ingen stod der. Målt ordentligt på 25
+#     frames fra selve sub-streamen er der ansigt i 15 af dem, 100-160 px brede.
+#     HOVED-ORIENTERING duer stadig ikke (solvePnP kan ikke skelne "kigger op i
+#     kameraet" fra "kigger ned i bordpladen" — kameraet hænger højt, så begge
+#     er yaw-symmetriske; fire formuleringer overlappede alle), men en rigtig
+#     BLIK-model kan: se `koekken_blik_taerskel_grader` nedenfor for kløften.
+#
+# At hånden er sjælden er ikke et gæt: 1 ud af 100 snapshots havde overhovedet
+# nogen hånd-detektion. En løftet hånd ER altså allerede et sjældent, bevidst
+# signal.
+#
+# REGNESTYKKET: 0,25 falske kommandoer/minut × et 12-sekunders vindue = ~5 %
+# risiko for én falsk kommando pr. armering, mod 100 % af døgnet i dag.
+#
+# HVOR GATEN HÅNDHÆVES: i shimmen (addons/gesture_frame_shim/shim.py, ArmGate),
+# ikke som en condition i hver af de seks stemme-automationer nedenfor i
+# voice_commands.yaml. To grunde: shimmen er ÉT anker (#2 — seks kopier af
+# samme regel ville drifte), og den kan afvise lyden FØR den sendes til STT, så
+# et uarmeret køkken heller ikke koster CPU. Det er samme sted og samme slags
+# gate som `body_window`, der allerede afviser lyd fra et tomt rum — arm-gaten
+# er dens strengere søskende.
+#
+# GATEN FEJLER LUKKET hvis HA ikke kan svare. Det er modsat VoiceGate i samme
+# fil (som fejler åbent), og bevidst: VoiceGate beskytter CPU, hvor en åben
+# gate koster ingenting, mens denne er hele forsvaret mod et problem der
+# beviseligt sker hvert fjerde minut.
+#
+# AirBnB: kameraet er fysisk pakket væk i AirBnB, og armerings-automationen har
+# alligevel sin egen mode-gate. En gæst får hverken kamera eller mikrofon.
+# =============================================================================
+
+input_boolean:
+  # Kill-switch (#21). Den skal stå som condition på HVER vej ind, og der er
+  # præcis to: armerings-automationen nedenfor, og kamera-løkkens betingelse i
+  # automations/gestus_koekken.yaml (som ellers ville holde op med at bede om
+  # billeder, fordi gestus-KOMMANDOERNE er slået fra).
+  koekken_stemme_arm_enabled:
+    name: "Køkken: hånd op armerer mikrofonen"
+    icon: mdi:hand-wave
+
+  # Kill-switch for den ANDEN vej ind (2026-09-18, user-spec: "hvis der er et
+  # ansigt der kigger direkte op i kameraet skal mic også armeres").
+  #
+  # Den håndhæves i shimmen (GazeWatcher.wanted()), hvor den slukker selve
+  # analysen — ikke bare dens virkning. Det er hele pointen med at have den:
+  # ansigts- og blik-modellen koster ~255 ms CPU pr. frame, og en gate der først
+  # sad i HA ville betale prisen alligevel.
+  koekken_blik_arm_enabled:
+    name: "Køkken: blik i kameraet armerer mikrofonen"
+    icon: mdi:eye-check-outline
+
+input_number:
+  # Hvor længe en løftet hånd holder mikrofonen åben.
+  #
+  # 12 s er sat ud fra de to ting der skal nå at ske: shimmen spørger HA om
+  # stemplet med 2 sekunders TTL (så op til 2 s går med at OPDAGE armeringen),
+  # og en talt kommando er målt 0,9-4,0 s lang plus den tavshed der lukker
+  # regionen. 12 s giver altså ~6 s til at nå at sige noget efter hånden er
+  # set, uden at vinduet bliver så langt at den falske-positiv-rate kryber
+  # tilbage mod udgangspunktet: hvert sekund vinduet forlænges koster 0,4 %
+  # risiko for en falsk kommando (0,25/min målt).
+  stemme_arm_vindue_sek:
+    name: "Stemme: armerings-vindue"
+    icon: mdi:timer-sand
+    min: 5
+    max: 60
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Hvor sikker hånd-genkendelsen skal være. En falsk ARMERING er billig — den
+  # åbner kun et 12-sekunders vindue, hvor allowlisten stadig gælder — så
+  # tærsklen står bevidst lavt nok til at en hånd i skrå vinkel stadig tæller.
+  # Går det den anden vej (vinduet åbner af sig selv under madlavning), er det
+  # HER man skruer først, ikke i vinduets længde.
+  stemme_arm_score_min:
+    name: "Stemme: armerings-gestus mindste score"
+    icon: mdi:hand-back-right
+    min: 0.4
+    max: 0.95
+    step: 0.05
+    mode: slider
+
+  # Hvor mange frames I TRÆK hånden skal ses, før vinduet åbner og kæden vinker.
+  #
+  # 2026-09-18 (user: "blinker nu en gang i mellem"): med krav = 1 frame armerede
+  # en enkelt tilfældig frame hele vinduet OG blinkede. Målt på de fire armeringer
+  # der fandtes efter deployet: striber på 1, 1, 2 og 2 frames, ingen af dem fulgt
+  # af en talt kommando — altså hænder i almindeligt morgenarbejde, ikke løftede
+  # hænder.
+  #
+  # 3 er målt, ikke valgt: fordelingen af stribe-længder i hånd-genkendelsens egen
+  # buffer (input_text.koekken_gestus_pending, 14.-18./9) er 204 striber på 1
+  # frame, 63 på 2, 21 på 3 og en hale ud til 17. En HOLDT flad hånd (kode 5) nåede
+  # 6 frames. Kravet lander altså over støjens tyngdepunkt og under det en bevidst
+  # hånd leverer. Kadencen er 1,05 s/frame, så 3 frames ≈ 2,1 s hold.
+  # 2026-10-11: gestus-bygen er nu 7 × 0,5 s → ~0,62 s/frame; slideren hævet
+  # 2 → 3 frames (≈ 1,2 s), så tiden en hånd skal holdes er den samme som før.
+  stemme_arm_hold_frames:
+    name: "Stemme: hold hånden oppe i (frames)"
+    icon: mdi:hand-clap
+    min: 1
+    max: 8
+    step: 1
+    unit_of_measurement: "frames"
+    mode: slider
+
+  # --- BLIK-VEJEN (2026-09-18) -----------------------------------------------
+  # Hvor mange grader blikket må være VED SIDEN AF kameraets optiske akse og
+  # stadig tælle som "kigger ind i linsen".
+  #
+  # Første forsøg var 24° — midtpunktet i en målt kløft: på 27 mærkede
+  # "kigger ind"- og 48 "kigger væk"-frames af user selv — 14 og 9 af dem med et
+  # ansigt stort nok til at måle på — med to passes (spejlet udgave med negeret
+  # yaw) og 3-frames rullende median, lå kigger-ind mellem
+  # 4,4° og 17,0° og kigger-væk mellem 31,2° og 46,0°.
+  #
+  # KLØFTEN LÅ IKKE DER. Tærsklen stod først på 24 — midt mellem de to sæt — og
+  # armerede 10 gange på 95 minutter uden at nogen kiggede. Det mærkede
+  # væk-sæt var ÉN positur (kig ned i bordpladen), og den ligger langt ude ved
+  # 31-46°. Almindelig bevægelse rundt i køkkenet fylder båndet 20-31° som
+  # sættet aldrig samplede: målt i drift 20,7-40,2°, median 23,8°, og ALDRIG
+  # under 20,7°. Et bevidst blik målte 15,4° — user bekræftede at de rigtige
+  # ligger under 15, og satte selv slideren på 15. Der er dermed 5,7° luft ned
+  # til den laveste falske. Signaturen på fejlen var at hver eneste falsk
+  # positiv klumpede sig LIGE under tærsklen i stedet for at sprede sig.
+  #
+  # NB 15 er STRAMT: det ene bevidste blik vi har målt lå på 15,4 og ville
+  # netop være afvist. Armerer et ægte kig ikke, er 16-19 stadig langt under
+  # støjen. Shimmen logger hver median (`gaze cal`) hvert 5. sekund, så næste
+  # justering kan læse den ÆGTE fordeling frem for en poseret:
+  # `curl .../addons/local_gesture_frame_shim/logs | grep "gaze cal"`.
+  koekken_blik_taerskel_grader:
+    name: "Køkken: blik-tærskel"
+    icon: mdi:angle-acute
+    min: 5
+    max: 60
+    step: 1
+    unit_of_measurement: "°"
+    mode: slider
+
+  # Hvor mange frames medianen løber over. Kadencen er 1 frame/sek, så tallet er
+  # også omtrent hvor mange sekunder blikket skal holdes.
+  #
+  # Medianen er nødvendig, ikke pæn: UDEN den overlapper de to sæt, fordi præcis
+  # én blink-frame (lukkede øjenlåg aflæses som et blik nedad, 31,1°) lander inde
+  # i det forkerte sæt.
+  #
+  # LIGE TAL ER STRENGERE END ULIGE, og det er ikke indlysende: koden tager
+  # `sorted(vindue)[len//2]`, så ved 2 frames er "medianen" den HØJESTE af de to
+  # — begge frames skal altså under tærsklen. Ved 3 må én af dem være over.
+  # User satte 2 (2026-09-18) efter at 24°/3 armerede 10 gange uden et blik;
+  # 2 giver samtidig en hurtigere armering end 3.
+  koekken_blik_frames:
+    name: "Køkken: blik-frames (median)"
+    icon: mdi:filmstrip
+    min: 1
+    max: 8
+    step: 1
+    unit_of_measurement: "frames"
+    mode: slider
+
+  # 2026-09-23 (B158, user-bug "face detection trigger også ofte utilsigtet,
+  # selv når jeg står med nakken til"). Målt 18-22/09: 43 af 47 armeringer blev
+  # aldrig fulgt af tale, og 21 af de 43 lå UNDER 15° — inde i det ægte-blik-
+  # område. Vinklen kan ikke skille dem; to UAFHÆNGIGE krav i shimmen (v0.11.0):
+  #   • ansigts-score: YuNets egen sikkerhed (dens default-gulv er 50 %),
+  #   • frontal: næsens vandrette afstand fra øjnenes midtpunkt i øjenbredder
+  #     (0 = vender mod kameraet, profil ≥ 0,5). Kun VANDRET — op/ned kan
+  #     kameraets højde ikke skelne.
+  # Startværdier 80 % / 0,30 er IKKE kalibreret: score og frontal blev aldrig
+  # logget før v0.11.0. Shimmen logger begge pr. ansigt hvert 5. sek
+  # (`gaze face w=… score=… frontal=…`) og ved hver armering — kalibrér mod den
+  # fordeling, ikke mod en poseret.
+  #
+  # TÆRSKLEN (målt 2026-09-23 på den NYE kameraplacering, flyttet 20/09): 28
+  # armeringer 20-22/09, NUL fulgt af tale inden for 20 s. 14 af dem lå i
+  # 16,8-18,9° — klumpet lige under tærsklen på 19° (signaturen for falske
+  # positiver), mens den pushede ambient aldrig gik under 21,1°. Sat 19 → 16:
+  # fjerner klumpen og ligger stadig over det bevidste blik (15,4°). De 14
+  # under 14° er dem frontal-/score-kravet skal tage.
+  koekken_blik_ansigt_score:
+    name: "Køkken: blik — min. ansigts-sikkerhed"
+    icon: mdi:face-recognition
+    min: 50
+    max: 99
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+  koekken_blik_frontal_max:
+    name: "Køkken: blik — max skævhed (næse fra øjenmidte, ×100)"
+    icon: mdi:face-man-outline
+    min: 5
+    max: 100
+    step: 1
+    mode: slider
+
+  # KIG MENS DU TALER (2026-10-03, shim v0.15.0; user: "brugte lige mange
+  # forsøg på at få en timer igang … kameraet sidder 30 cm over mit hoved, jeg
+  # skal vippe hovedet for at få øjenkontakt").
+  #
+  # Målt 03/10 16:59-17:02: fem ytringer droppet som "unarmed" på to minutter.
+  # Tæt på (ansigt 111-142 px) bestod ansigtet ALLE andre krav — score
+  # 0,85-0,93, frontal ≤ 0,2 — men 3-frames-medianen lå på 29,4 / 27,6 / 24,3 /
+  # 26,1 / 23,9 / 25,8 / 18,5 / 25,5, før én 14,5 endelig armerede. 01/10 målte
+  # det samme slags kig 6-10°. Et bevidst kig op i DENNE linse ligger altså
+  # ikke stabilt under 16. At sænke ansigts-sikkerheden 80 → 60 (prøvet samme
+  # dag) kunne ikke hjælpe: ansigtet der armerede havde 0,91. På afstand
+  # (60-85 px) dumpede ansigterne på score 0,50-0,68 OG frontal 0,29-2,7.
+  #
+  # Derfor en ANDEN vej, ikke en løsere blik-tærskel (den ville genåbne 18/9-
+  # problemet: vinduer der åbner uden at nogen taler): en ytring der ellers
+  # ville droppes, armeres hvis mindst 2 billeder fra 2 s før første ord til
+  # ytringens slut viser et ansigt der består score/frontal OG kigger inden for
+  # denne vinkel. Støj skal så både lande på allowlisten OG falde sammen med et
+  # sikkert, frontalt ansigt der kigger op mod linsen.
+  #
+  # 26° fanger 23,9-25,8-medianerne fra 03/10 og ligger 6° under den laveste
+  # ambient-median for ansigter der bestod score/frontal 23/09-03/10 (32,1;
+  # resten 33-58). n er lille (~15) — kalibrér på shimmens egne linjer:
+  # `look while speaking … armed` (ramte) og `spoke facing the lens, not
+  # looking in` (nær-forbi, med hver vinkel). 0 = slået fra.
+  koekken_blik_tale_taerskel_grader:
+    name: "Køkken: blik mens du taler — tærskel"
+    icon: mdi:account-voice
+    min: 0
+    max: 45
+    step: 1
+    unit_of_measurement: "°"
+    mode: slider
+
+input_text:
+  # HVILKEN gestus der armerer. En `input_text` frem for et `input_select`, så
+  # den kan tilføjes uden restart (`input_text.reload` er husets eneste gratis
+  # helper-reload).
+  #
+  # DEFAULT `call_me` (🤙 tommel + lillefinger) per 18/9, hvor
+  # `input_boolean.gestus_kommandoer_enabled` blev tændt igen efter user-spec.
+  #
+  # Den oprindelige default var `open_palm` — den flade hånd, præcis det user
+  # beskrev — med kollisionen bevidst accepteret så længe gestus-kommandoerne
+  # var slukkede. Den undtagelse gælder ikke længere: `open_palm` er OGSÅ 5 i
+  # fingertællingen (automations/gestus_koekken.yaml), så en flad hånd holdt
+  # op for at armere mikrofonen ville nu også starte en 5-minutters timer.
+  #
+  # `call_me` er valgt frem for `rock_on`/`pinky` — de tre er tællingens
+  # bevidste "ingen af delene" — fordi den kræver tre FOLDEDE fingre plus to
+  # strakte i hver sin ende af hånden. Genkenderen slår op i en fast tabel
+  # over (tommel, pege, lang, ring, lille), så den form opstår ikke som
+  # biprodukt af en hånd der griber eller rører i en gryde.
+  #
+  # ⚠️ IKKE verificeret med user's egen hånd endnu — kun at genkenderen kan
+  # udsende navnet (tabellen i /app/hand_recognizer.py). Armerer den ikke i
+  # praksis, er `rock_on` næste kandidat.
+  koekken_stemme_arm_gestus:
+    name: "Køkken: armerings-gestus"
+    icon: mdi:hand-front-right
+    max: 20
+
+  # Tidspunktet for sidste armering, som EPOCH-SEKUNDER i en streng.
+  #
+  # Epoch og ikke en formateret tid: shimmen sammenligner med `time.time()`,
+  # som også er epoch, og så findes der ingen tidszone, sommertid eller
+  # `as_timestamp`-fælde at falde i (jf. de to B121/B127-oprydninger).
+  # En urørt input_text står på 'unknown' → `| int(0)` gør den til 0 → aldrig
+  # armeret. Det er den rigtige startværdi.
+  koekken_stemme_armeret_at:
+    name: "Køkken: sidst armeret (epoch)"
+    icon: mdi:clock-check-outline
+    max: 20
+
+  # Den igangværende hånd-stribe: `<epoch for sidste frame>:<antal i træk>`.
+  # Samme form og samme grund som `koekken_gestus_pending` i
+  # automations/gestus_koekken.yaml (#2 — hold-to-confirm er ÉN regel, ikke to):
+  # en input_text kan tilføjes uden restart, og gyldigheden testes på FORMEN
+  # (antal kolon), aldrig på sandhedsværdien, fordi en urørt input_text står på
+  # 'unknown', som er truthy.
+  koekken_stemme_arm_run:
+    name: "Køkken: armerings-stribe (runtime)"
+    icon: mdi:counter
+    max: 24
+
+automation:
+  - id: koekken_stemme_arm_haand_op
+    alias: "🎙️ Køkken: hånd op armerer mikrofonen"
+    description: >-
+      Ser armerings-gestussen på hånd-genkendelsens MQTT-topic og skriver et
+      epoch-stempel som shimmen læser. Uden et friskt stempel bliver lyd fra
+      køkkenet aldrig engang sendt til talegenkendelsen.
+    # queued + silent: hånd-genkendelsen publicerer ~1 frame/sek, og en hånd der
+    # HOLDES oppe rammer derfor automationen flere gange. Det er meningen — hver
+    # frame forlænger vinduet — men siden 2026-09-18 TÆLLER vi frames, og så er
+    # `single` direkte skadeligt: den ville droppe frame nr. 2 lydløst, og kravet
+    # om en stribe ville aldrig kunne opfyldes. Præcis samme grund som
+    # fingertællingen står `queued` af (automations/gestus_koekken.yaml).
+    mode: queued
+    max: 12
+    max_exceeded: silent
+
+    triggers:
+      - trigger: mqtt
+        topic: hand-recognition/koekken
+
+    conditions:
+      - condition: state
+        entity_id: input_boolean.koekken_stemme_arm_enabled
+        state: "on"
+      # Er stemme-kommandoerne slået fra, er der ingenting at armere. Gaten
+      # sparer en input_text-skrivning pr. frame mens hånden er oppe.
+      - condition: state
+        entity_id: input_boolean.voice_kommandoer_enabled
+        state: "on"
+      # Familie-funktion. Home Vacation er familien hjemme (🏡 #1).
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+      # Selve gestussen, på ENTEN hånd. Scoren læses pr. hånd, ikke som et
+      # maksimum over begge: en sikker venstre hånd må ikke kunne låne sin
+      # score til en usikker højre.
+      - condition: template
+        value_template: >-
+          {% set oensket = states('input_text.koekken_stemme_arm_gestus') %}
+          {% set min_score = states('input_number.stemme_arm_score_min')
+                             | float(0.7) %}
+          {% set ns = namespace(ok=false) %}
+          {% for side in ['left', 'right'] %}
+            {% set haand = trigger.payload_json.get(side) or {} %}
+            {% if haand.get('gesture') == oensket
+                  and (haand.get('score') | float(0)) >= min_score %}
+              {% set ns.ok = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.ok }}
+
+    actions:
+      - variables:
+          nu: "{{ now().timestamp() | int }}"
+          # --- HOLD-TO-CONFIRM (2026-09-18) ---------------------------------
+          # Striben: `<epoch>:<antal>:<score×100>`. Gyldigheden testes på FORMEN,
+          # fordi en urørt input_text står på 'unknown' (truthy).
+          raw: "{{ states('input_text.koekken_stemme_arm_run') }}"
+          gyldig: "{{ raw is string and raw.count(':') == 2 }}"
+          sidste_frame: "{{ (raw.split(':')[0] | int(0)) if gyldig else 0 }}"
+          p_frames: "{{ (raw.split(':')[1] | int(0)) if gyldig else 0 }}"
+          # 3 s gab-tolerance, ikke `gestus_frisk_sek` (10 s): kadencen er målt
+          # til 1,05 s/frame, så 3 s tillader ét tabt frame midt i et hold — men
+          # binder ikke to tilfældige frames 6 s fra hinanden sammen til en
+          # "stribe". Præcis dét skete 18/9 kl. 07:00:07 + 07:00:13.
+          ubrudt: "{{ (nu | int(0)) - (sidste_frame | int(0)) <= 3 }}"
+          frames_ny: "{{ (p_frames | int(0)) + 1 if ubrudt else 1 }}"
+          krav: "{{ states('input_number.stemme_arm_hold_frames') | int(3) }}"
+          # Scoren gemmes KUN for at kunne måle på den senere: score_min er
+          # knappen der skal skrues på hvis vinduet stadig åbner af sig selv,
+          # og indtil nu fandtes der ingen historik at sætte den efter. Højeste
+          # score blandt de hænder der passerede gaten i denne frame.
+          score_pct: >-
+            {% set oensket = states('input_text.koekken_stemme_arm_gestus') %}
+            {% set ns = namespace(s=0) %}
+            {% for side in ['left', 'right'] %}
+              {% set haand = trigger.payload_json.get(side) or {} %}
+              {% if haand.get('gesture') == oensket %}
+                {% set ns.s = [ns.s, (haand.get('score') | float(0)) * 100] | max %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.s | round(0) | int }}
+
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_stemme_arm_run
+        data:
+          value: "{{ nu }}:{{ frames_ny | int(1) }}:{{ score_pct | int(0) }}"
+
+      # En enkelt frame armerer IKKE. Målt 18/9: alle fire armeringer siden
+      # deployet var striber på 1-2 frames uden en eneste talt kommando bagefter,
+      # og user bekræftede at ingen havde hånden oppe. En bevidst hånd leverer
+      # 6+ frames i træk. Striben er allerede skrevet ovenfor, så en afvist frame
+      # tæller stadig med i den næste.
+      - condition: template
+        value_template: "{{ (frames_ny | int(0)) >= (krav | int(3)) }}"
+
+      # Kvitteringen ligger IKKE her længere (18/9): den hænger på selve
+      # stemplet nedenfor, så blik-vejen — som skrives af shimmen og aldrig
+      # kommer gennem denne automation — kvitterer på præcis samme måde (#2).
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_stemme_armeret_at
+        data:
+          value: "{{ nu }}"
+
+  - id: koekken_arm_kvittering
+    alias: "🎙️ Køkken: kvittér på en armering"
+    description: >-
+      Vinker med lyskæden når mikrofonen ÅBNER — uanset om det var en hånd
+      (automationen ovenfor) eller et blik ind i kameraet (shimmens GazeWatcher,
+      som skriver stemplet direkte). Uden den ville armeringen være usynlig, og
+      en gate man ikke kan SE er åben, er umulig at bruge: man ville tale ud i
+      ingenting uden at vide hvorfor.
+    mode: single
+    max_exceeded: silent
+
+    triggers:
+      - trigger: state
+        entity_id: input_text.koekken_stemme_armeret_at
+
+    conditions:
+      # Tre ting skal passe, og de to sidste er de vigtige:
+      #  * stemplet er nyt (et større tal end det forrige),
+      #  * det er FRISKT — ellers ville en restart, hvor input_text restorerer
+      #    sin gemte værdi, vinke med lyskæden midt om natten,
+      #  * vinduet var LUKKET før. En hånd der holdes oppe skriver et nyt stempel
+      #    hver frame, og hvert af dem må forlænge vinduet uden at stroboskopere
+      #    køkkenlyset. Kun den frame der faktisk ÅBNER, kvitterer.
+      - condition: template
+        value_template: >-
+          {% set nu = states('input_text.koekken_stemme_armeret_at') | int(0) %}
+          {% set foer = (trigger.from_state.state | int(0))
+                        if (trigger is defined
+                            and trigger.from_state is not none) else 0 %}
+          {% set vindue = states('input_number.stemme_arm_vindue_sek') | int(12) %}
+          {% set alder = (now().timestamp() | int) - nu %}
+          {{ nu > foer and alder <= 5
+             and ((now().timestamp() | int) - foer) > vindue }}
+
+    actions:
+      # Husets EKSISTERENDE vink med lyskæden (packages/voice_commands.yaml) —
+      # ikke en ny lys-formel (#2). Den ved allerede at røgalarmens nødbelysning
+      # går forud, at kæden kan stå i color_temp eller hs, og hvordan den
+      # restorer sin egen lysstyrke.
+      # 2026-09-23 (user-spec "gør KLAR signalet meget mere subtilt"): armeringen
+      # kvitterer nu med den bløde PULS, ikke det hårde vink. Et HØRT ord
+      # (voice_commands.yaml) beholder vinket — det er den sjældne, vigtige
+      # kvittering. Samme queued lys-kanal (#2).
+      - action: script.koekken_lyskaede_signal
+        continue_on_error: true
+        data:
+          moenster: puls
+
+template:
+  - sensor:
+      # Dashboard-vinduet ind i blik-kanalen — og af samme grund som
+      # `sensor.koekken_stemme_sidst` i voice_commands.yaml: kilden
+      # `sensor.koekken_kamera_blik` er REST-pushet af shimmen og eksisterer
+      # SLET IKKE efter en HA-restart (ikke `unavailable` — væk), indtil nogen
+      # har stået i køkkenet med ansigtet mod kameraet. Et kort på den rå sensor
+      # ville derfor vise rødt "Entity not found" efter hver eneste reboot,
+      # hvilket ligner en død feature.
+      #
+      # Ingen `now()` (#24): shimmen pusher højst hvert 30. sekund, så denne
+      # sensor skriver kun en DB-række når vinklen faktisk har ændret sig.
+      - name: "Koekken blik sidst"
+        unique_id: koekken_blik_sidst
+        icon: mdi:eye-outline
+        state: >-
+          {% set s = states['sensor.koekken_kamera_blik'] %}
+          {% if s is none or s.state in ['unknown', 'unavailable'] %}
+            ikke målt siden genstart
+          {% else %}
+            {{ s.state }}° ({{ s.attributes.get('armeringer', 0) }} armeringer)
+          {% endif %}
+        attributes:
+          vinkel: >-
+            {{ states('sensor.koekken_kamera_blik') | float(-1) }}
+          taerskel: >-
+            {{ states('input_number.koekken_blik_taerskel_grader') | int(15) }}
+          sidst_armeret: >-
+            {% set t = state_attr('sensor.koekken_kamera_blik',
+                                  'sidst_armeret') | int(0) %}
+            {{ t | timestamp_custom('%d/%m %H:%M:%S', true) if t > 0 else '—' }}

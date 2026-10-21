@@ -1,0 +1,400 @@
+# =============================================================================
+# Presence GPS Stale Handling — clear home flags naar GPS expirer
+# =============================================================================
+# User-spec 2026-05-17: GPS data der er ældre end 30 min skal ikke længere
+# holde input_boolean.{parent_a,parent_b}_home oppe. Bekæmper "ferie + battery
+# saver"-scenariet hvor Companion app holder op med at rapportere men last-
+# known location indikerer "hjemme" i dagevis.
+#
+# DESIGN: binary_sensor.{parent_a,parent_b}_gps_fresh (packages/gps_freshness.yaml)
+# flipper off naar device_tracker.last_updated > 30 min siden. Disse automations
+# reagerer paa freshness off → clear home flag + persistent_notification.
+#
+# ⚠️ SCOPE (praeciseret 2026-08-02, fejlklasse #3): "notify" herover er en
+# persistent_notification i HA's sidebar-klokke — IKKE en push. Og hele
+# automationen har `input_boolean.<person>_home == on` som hard condition: den
+# rydder et hjemme-flag der staar forkert oppe, intet andet. Fryser en telefon
+# mens personen er UDE (flaget allerede off), fyrer den aldrig. Parent B's iPhone
+# stod frosset 235 timer (07-22 → 08-01) uden at disse automations saa noget.
+# Det hjoerne daekkes af packages/gps_watchdog.yaml (push ved lange udfald).
+#
+# RECOVERY: naar phone reporter igen, freshness flipper on. presence_*_arrive
+# (packages/presence.yaml) faar ekstra trigger paa freshness off→on transition
+# som re-evaluerer home zone og flipper home flag tilbage on hvis aktuel.
+#
+# 2026-05-20 fix: smart skip hvis sidst-kendte location er en home zone.
+# User slukker phone hver nat (sleep hygiene) — uden denne guard cleared
+# parent_a_home ~30 min efter phone-off og system troede han var ude hele
+# natten. Stale-clear skal kun ramme "phone died ude" cases (ferie/transit),
+# ikke "phone off mens hjemme".
+#
+# =============================================================================
+# 🔧 2026-08-05 (user item 6): "vi kan nu stole på Parent B's gps"
+# =============================================================================
+# 45-MINUTTERS-TÆRSKLEN VAR HUSETS DYRESTE ENKELTFEJL. Målt over 14 dages
+# recorder-historik (person.parent_b mod input_boolean.parent_b_home, minut for
+# minut):
+#   Parent B: 4707 min FAKTISK hjemme — heraf 3602 min (76,5 %) med
+#            parent_b_home = OFF, fordelt på 9 sammenhængende falske huller,
+#            det længste 1148 min = 19,1 timer.
+#   Parent A:  17101 min hjemme, 1315 min (7,7 %) off.
+# Hvert eneste falske clear landede på et EKSAKT kvarter (17:30:00, 18:30:00,
+# 08:00:00, 16:00:00, 15:15:00, 12:30:00) = signaturen på /15-backstoppen
+# nedenfor der fyrede sin "zone home + dag + stale > 45 min"-gren. Hendes
+# iPhone rapporterer via significant-location-change og er derfor rutinemæssigt
+# tavs i timevis mens den ligger stille hjemme — flaget oscillerede hele dagen.
+#
+# PRÆMISSEN FRA 2026-05-21 ER MÅLT FORKERT. Den lød: "Companion stopped
+# reporting længe før afgang, device_tracker stuck i home zone" → derfor måtte
+# staleness alene kunne rydde flaget. Men zone-EXITS rapporteres pålideligt nu:
+# person.parent_b → not_home 08-02 19:03:34, 08-03 07:47:31, 08-04 10:23:29, og
+# flaget faldt 08-03 07:52:32 = præcis +5 min grace = den normale leave-vej.
+# Afgang detekteres altså af presence_*_leave, ikke af staleness.
+#
+# 💡 STEMPLET, IKKE `last_updated` (fejlklasse #5 / gps_watchdog-headeren):
+# `device_tracker.last_updated` NULSTILLES ved hver HA-restart. Ved 45 min var
+# det en accepteret ~30-min grace; ved en tærskel i TIMER ville huset genstarte
+# oftere end tærsklen nås, og grenen ville aldrig kunne fyre = tavs feature.
+# Friskheden læses derfor fra `input_datetime.<person>_gps_sidst_rapport`, som
+# gps_watchdog.yaml kun stempler når lat/lon FAKTISK har flyttet sig.
+#
+# TÆRSKEL 26 TIMER (input_number.presence_gps_stale_hjemme_timer): over de
+# 20,6 t største legitime GPS-hul målt i CLAUDE.md 08-02 (telefon slukket +
+# stillestående hjemme et helt døgn), under gps_watchdog'ens 30 t så en ægte
+# frysning altid får sin push FØR flaget ryddes tavst. Fejler LUKKET på et
+# usået stempel: uden et troværdigt friskheds-tal rydder vi ikke flaget.
+#
+# ZONE ≠ HOME rydder stadig ØJEBLIKKELIGT — det er det ærlige afgangs-signal
+# (jf. CLAUDE.md 08-02b: presence_*_leave slukker kun flaget på `not_home`).
+#
+# ⚠️ 2026-08-14 — 26-TIMERS-TÆRSKLEN GÆLDER KUN EN TELEFON DER KAN MELDE AFGANG.
+# Den er kalibreret mod "iPhone tavs MENS hun er hjemme". Fratager iOS appen
+# baggrunds-lokation ("Authorized when in use"), er tavsheden ikke længere et
+# svagt signal om ophold — trackeren KAN aldrig melde `not_home`, og 26 timer
+# bliver til 26 timers garanteret falsk "hjemme". Parent B's gren skifter derfor
+# til `presence_gps_stale_degraderet_minutter` når
+# `binary_sensor.parent_b_gps_baggrund_ok` er off. Se varslet nederst i filen.
+# =============================================================================
+
+# --- Parent A: GPS stale → clear home flag ---
+- id: presence_parent_a_gps_stale
+  alias: "Tilstedeværelse: Parent A GPS stale (>30 min) → clear home flag"
+  description: >
+    Naar binary_sensor.parent_a_gps_fresh flipper off (= Companion ikke har
+    rapporteret i 30 min), clear parent_a_home flag + notify. Forhindrer
+    stale location data i at holde flag oppe under ferie / battery saver.
+
+    2026-05-21 fix: tidligere smart-skip "if zone=home, skip" blokerede
+    legitim "phone died ude men sidste known zone=home" scenario (fx
+    Companion stopped before user left). Ny logic:
+      - Zone NOT home → clear (klart bevis user er ude)
+      - Zone home + NIGHT (22-08) → skip (overnight phone-off-hjemme OK)
+      - Zone home + DAY + stale ≤ 45 min → skip (recent, ambigous)
+      - Zone home + DAY + stale > 45 min → clear (sandsynligvis ude med dødt phone)
+
+    2026-08-05 (item 6): dag/nat-skellet + 45-minutters-tærsklen er FJERNET
+    (se fil-headeren for målingen). Nu:
+      - Zone NOT home → clear (klart bevis user er ude)
+      - Zone home     → clear kun hvis SKREVET rapport-stempel er ældre end
+                        input_number.presence_gps_stale_hjemme_timer
+    Afgang ejes af presence_*_leave; denne automation er kun bagstopperen for
+    en telefon der dør i home-zonen og aldrig melder afgang.
+
+    Plus: time_pattern trigger gør at en failed clear-attempt re-evalueres
+    hvert kvarter (fx når stemplet krydser tærsklen).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parent_a_gps_fresh
+      from: "on"
+      to: "off"
+      for:
+        seconds: 30
+    # 2026-05-22: 15-min retry så stale > 45min tærskel re-evalueres tæt
+    # på når den faktisk krydses (ikke op til 60 min venten på næste hourly).
+    - platform: time_pattern
+      minutes: "/15"
+  condition:
+    # 2026-07-15 (user-valg): Normal → ikke-AirBnB, så stale-clearing også
+    # virker i Home Vacation (spejler presence_*_arrive/leave-gaten).
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    - condition: state
+      entity_id: input_boolean.parent_a_home
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.parent_a_gps_fresh
+      state: "off"
+    - condition: template
+      value_template: >-
+        {% set t = states.device_tracker.phone_a %}
+        {% if t is none %}true
+        {% elif t.state != 'home' %}true
+        {% else %}
+          {% set ts = state_attr('input_datetime.parent_a_gps_sidst_rapport', 'timestamp') | float(0) %}
+          {% set thresh = states('input_number.presence_gps_stale_hjemme_timer') | float(26) %}
+          {{ ts > 946771200 and (as_timestamp(now()) - ts) > thresh * 3600 }}
+        {% endif %}
+  action:
+    - service: logbook.log
+      data:
+        name: "Parent A GPS stale"
+        message: >-
+          Sidste ægte positions-rapport
+          {{ ((as_timestamp(now()) - (state_attr('input_datetime.parent_a_gps_sidst_rapport', 'timestamp') | float(0))) / 3600) | round(1) }} t siden,
+          sidste zone={{ states('device_tracker.phone_a') }}.
+          Clearer input_boolean.parent_a_home (= phone offline ude).
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.parent_a_home
+    - service: persistent_notification.create
+      data:
+        notification_id: parent_a_gps_stale
+        title: "Parent A GPS expired"
+        message: >-
+          Phone har ikke rapporteret i
+          {{ ((as_timestamp(now()) - (state_attr('input_datetime.parent_a_gps_sidst_rapport', 'timestamp') | float(0))) / 3600) | round(1) }} t,
+          sidste zone={{ states('device_tracker.phone_a') }}.
+          input_boolean.parent_a_home slået fra (= behandles som ikke-hjemme).
+          Recovery sker automatisk når Companion app pinger igen.
+
+# --- Parent B: GPS stale → clear home flag ---
+- id: presence_parent_b_gps_stale
+  alias: "Tilstedeværelse: Parent B GPS stale (>30 min) → clear home flag"
+  description: >
+    Mirror af parent_a_gps_stale for Parent B. Især relevant pga. iOS Companion
+    background restrictions / battery saver = ofte stale.
+
+    2026-08-05 (item 6): SAMME som parent_a — dag/nat + 45 min erstattet af det
+    skrevne rapport-stempel mod presence_gps_stale_hjemme_timer. Denne
+    automation var årsagen til at parent_b_home stod off 76,5 % af de minutter
+    hun faktisk var hjemme (se fil-headeren). Hendes iPhone rapporterer via
+    significant-location-change og er rutinemæssigt tavs i timevis hjemme —
+    det er normal iOS-adfærd, ikke et tegn på afgang.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parent_b_gps_fresh
+      from: "on"
+      to: "off"
+      for:
+        seconds: 30
+    # 2026-08-14: baggrunds-lokation frataget → tærsklen falder fra timer til
+    # minutter, og den nye tærskel er typisk allerede overskredet. Uden denne
+    # flanke ventede vi op til 15 min på backstoppen.
+    - platform: state
+      entity_id: binary_sensor.parent_b_gps_baggrund_ok
+      from: "on"
+      to: "off"
+    # 2026-05-22: 15-min retry (sammen med parent_a-automation — se rationale der)
+    - platform: time_pattern
+      minutes: "/15"
+  condition:
+    # 2026-07-15 (user-valg): Normal → ikke-AirBnB, så stale-clearing også
+    # virker i Home Vacation (spejler presence_*_arrive/leave-gaten).
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    - condition: state
+      entity_id: input_boolean.parent_b_home
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.parent_b_gps_fresh
+      state: "off"
+    # 2026-08-14b: er iOS-geofencen autoritativ og siger HJEMME, må staleness
+    # ikke kunne rydde flaget imod den. Efter opsætningen er trackeren bevidst
+    # permanent frossen ("Kun mens appen bruges"), så denne gren ville ellers
+    # rydde hjemme-flaget hver eneste gang hun faktisk er hjemme.
+    - condition: template
+      value_template: >-
+        {{ is_state('input_boolean.parent_b_ios_geofence_enabled', 'off')
+           or is_state('input_boolean.parent_b_hjemme_ios', 'off') }}
+    - condition: template
+      value_template: >-
+        {% set t = states.device_tracker.phone_b %}
+        {% if t is none %}true
+        {% elif t.state != 'home' %}true
+        {% else %}
+          {% set ts = state_attr('input_datetime.parent_b_gps_sidst_rapport', 'timestamp') | float(0) %}
+          {% if is_state('binary_sensor.parent_b_gps_baggrund_ok', 'off') %}
+            {% set sek = states('input_number.presence_gps_stale_degraderet_minutter') | float(45) * 60 %}
+          {% else %}
+            {% set sek = states('input_number.presence_gps_stale_hjemme_timer') | float(26) * 3600 %}
+          {% endif %}
+          {{ ts > 946771200 and (as_timestamp(now()) - ts) > sek }}
+        {% endif %}
+  action:
+    - service: logbook.log
+      data:
+        name: "Parent B GPS stale"
+        message: >-
+          Sidste ægte positions-rapport
+          {{ ((as_timestamp(now()) - (state_attr('input_datetime.parent_b_gps_sidst_rapport', 'timestamp') | float(0))) / 3600) | round(1) }} t siden,
+          sidste zone={{ states('device_tracker.phone_b') }}.
+          Clearer input_boolean.parent_b_home.
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.parent_b_home
+    - service: persistent_notification.create
+      data:
+        notification_id: parent_b_gps_stale
+        title: "Parent B GPS expired"
+        message: >-
+          Phone har ikke rapporteret i
+          {{ ((as_timestamp(now()) - (state_attr('input_datetime.parent_b_gps_sidst_rapport', 'timestamp') | float(0))) / 3600) | round(1) }} t,
+          sidste zone={{ states('device_tracker.phone_b') }}.
+          input_boolean.parent_b_home slået fra.
+          Recovery sker automatisk når Companion app pinger igen.
+
+# =============================================================================
+# 2026-08-14: Baggrunds-lokation frataget → varsel (root cause, ikke symptom)
+# =============================================================================
+# User: "parent_b er ikke hjemme men står som hjemme. det må ikke kunne ske."
+# Facit: iOS satte hendes Companion-app ned fra "Authorized Always" til
+# "Authorized when in use" 08-14 06:40:08. Fra det sekund kan appen ikke melde
+# zone-skift i baggrunden — device_tracker frøs på `home` (sidste ægte rapport
+# 08-13 21:12) og presence_parent_b_leave, der ejer afgangen, fik aldrig sin
+# `not_home`-flanke. Stale-clearet kunne heller ikke redde os: dets 26-timers
+# tærskel er kalibreret til "iPhone tavs MENS hun er hjemme" og havde først
+# ryddet flaget 08-14 ~23:12, ~17 t inde i en falsk hjemme-tilstand.
+# gps_watchdog'ens push ligger på 30 t og var endnu længere væk.
+#
+# Sensoren `sensor.phone_b_location_permission` har hele tiden vist
+# nedgraderingen — INGEN logik læste den (den stod kun som et tal på
+# status-dashboardet). Det er den eneste flade i huset der kan se årsagen,
+# og den er 100 % entydig: en tilladelse er ikke en måling der kan flappe.
+#
+# Rettelsen er brugerens, ikke husets — permission skal tilbage til "Altid" på
+# telefonen. Derfor et varsel, ikke en stille kompensation.
+# RE-ARM (#4/#15): flanken går tabt ved en HA-restart, fordi sensoren
+# restaureres i sin nedgraderede værdi uden ny flanke → dagligt 09:00-nag så
+# længe tilstanden består. Dedupe er implicit: samme `tag` erstatter
+# notifikationen på telefonen i stedet for at stable en ny op.
+- id: presence_parent_b_gps_permission_degraderet
+  alias: "Tilstedeværelse: Parent B's baggrunds-GPS er slået fra → varsel"
+  description: >
+    binary_sensor.parent_b_gps_baggrund_ok off = iOS har frataget Companion
+    baggrunds-lokation. Trackeren kan da ALDRIG melde afgang, så en frossen
+    `home` er nul evidens — hjemme-flaget falder nu tilbage på minut-tærsklen
+    (presence_gps_stale_degraderet_minutter) i stedet for 26-timers-tærsklen.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parent_b_gps_baggrund_ok
+      from: "on"
+      to: "off"
+      for:
+        minutes: 2
+    - platform: time
+      at: "09:00:00"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.parent_b_gps_baggrund_ok
+      state: "off"
+    # 2026-08-15: er iOS-geofencen autoritativ, er nedgraderingen selve
+    # designet (hun SKAL stå på "Kun mens appen bruges") — så varslet ville
+    # nagge dagligt om en tilstand vi bevidst har valgt.
+    - condition: state
+      entity_id: input_boolean.parent_b_ios_geofence_enabled
+      state: "off"
+  action:
+    - service: logbook.log
+      data:
+        name: "Parent B GPS-tilladelse"
+        message: >-
+          Baggrunds-lokation er
+          {{ states('sensor.phone_b_location_permission') }} —
+          trackeren kan ikke melde afgang. Hjemme-flaget styres nu af
+          {{ states('input_number.presence_gps_stale_degraderet_minutter') | int(45) }} min-tærsklen.
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: gps_stale
+        title: "📵 Parent B's telefon kan ikke melde afgang"
+        message: >-
+          Lokations-tilladelsen står på
+          "{{ states('sensor.phone_b_location_permission') }}" —
+          appen må kun se position mens den er åben, så huset opdager ikke
+          når hun går hjemmefra.
+
+          Fix: Indstillinger → Home Assistant → Placering → "Altid".
+
+          Indtil da regnes hun for ude
+          {{ states('input_number.presence_gps_stale_degraderet_minutter') | int(45) }} min
+          efter sidste ægte positions-rapport.
+        payload:
+          tag: gps_stale
+    - service: persistent_notification.create
+      data:
+        notification_id: parent_b_gps_permission
+        title: "Parent B: baggrunds-GPS slået fra"
+        message: >-
+          sensor.phone_b_location_permission =
+          {{ states('sensor.phone_b_location_permission') }}.
+          Zone-exits rapporteres ikke. Sæt tilladelsen til "Altid" i
+          Companion-appen.
+
+# --- Baggrunds-GPS tilbage → ryd varslet ---
+- id: presence_parent_b_gps_permission_ok
+  alias: "Tilstedeværelse: Parent B's baggrunds-GPS tilbage → ryd varsel"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parent_b_gps_baggrund_ok
+      from: "off"
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: input_boolean.parent_b_ios_geofence_enabled
+      state: "off"
+  action:
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: parent_b_gps_permission
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: gps_stale
+        title: "📍 Parent B's baggrunds-GPS er tilbage"
+        message: >-
+          Lokations-tilladelsen står igen på "Altid" — huset følger hendes
+          rigtige placering, og hjemme-flaget bruger den normale
+          {{ states('input_number.presence_gps_stale_hjemme_timer') | int(26) }}-timers tærskel igen.
+        payload:
+          tag: gps_stale
+
+# --- Recovery: freshness tilbage → ryd stale-notifikationer ---
+# Bug hunt 2026-07-17c (fejlklasse #3): notifikationsteksten lover "Recovery
+# sker automatisk når Companion app pinger igen" — men dismiss lå KUN i
+# presence_*_arrive, som kræver zone=home. Pinger telefonen igen UDE (fx fra
+# arbejde efter en battery-saver-periode) blev notifikationen hængende for
+# evigt. Dismiss nu på selve freshness-recovery, zone-uafhængigt (dismiss af
+# ikke-eksisterende id er no-op). Flag-recovery er stadig arrive-automationens.
+- id: presence_gps_stale_dismiss
+  alias: "Tilstedeværelse: GPS frisk igen → ryd stale-notifikation"
+  description: >
+    Freshness off→on (= Companion pinger igen, uanset zone) → dismiss den
+    tilhørende stale-notifikation. Selve home-flag-recovery ejes fortsat af
+    presence_*_arrive (kræver zone=home + fresh).
+  mode: parallel
+  max: 4
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parent_a_gps_fresh
+      from: "off"
+      to: "on"
+      id: parent_a
+    - platform: state
+      entity_id: binary_sensor.parent_b_gps_fresh
+      from: "off"
+      to: "on"
+      id: parent_b
+  action:
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: "{{ 'parent_a_gps_stale' if trigger.id == 'parent_a' else 'parent_b_gps_stale' }}"

@@ -1,0 +1,634 @@
+# =============================================================================
+# MORGENRAMPE — bliver natturen til "open-plan stået op"? (2026-08-30, user-spec)
+# =============================================================================
+# User: "på natture efter kl. 05 skal huset holde øje med om natturen bliver til
+#  openplan-stået-op (men med soveværelserne holdt mørkt). det skal ske ved
+#  gradvise løft af lysstyrken i stue og køkkenstrip indtil den låser på tændt …
+#  først efter 2min ophold i stuen skal det langsomt begynde at fade ind.
+#  lysstyrken skal afspejle hvor sikker huset er på at vi er stået op og opholder
+#  os i stuen. hvis der så begynder at være 1+ min ophold i spisestuen skal den
+#  være sikker (så spiser vi morgenmad)."
+#
+# HVORFOR EN RAMPE OG IKKE EN TÆRSKEL
+# -----------------------------------
+# Huset kan ikke VIDE om en nattur bliver til en morgen — det kan kun blive mere
+# og mere sikkert. En binær gate skal derfor gætte, og gætter den forkert, tænder
+# den fuldt lys på en der var på vej i seng igen. Rampen gør usikkerheden
+# SYNLIG: lysstyrken ER sandsynligheden. Er huset 30 % sikkert, lyser det 30 %
+# af målet, og bliver du i sofaen, vokser begge dele.
+#
+# SOVEVÆRELSERNE HOLDES MØRKE
+# ---------------------------
+# Rampen rører INTET godnat-flag. Den tænder kun stue-læsehygge og
+# køkken-lyskæden (hygge-pluggen ude af morgenen 2026-10-11, user-spec).
+# Soveværelse + børneværelse bliver i godnat til `godnat_auto_clear` rydder 06:00 — præcis samme aftale som
+# packages/openplan_tidlig_morgen.yaml har haft siden 2026-08-21.
+#
+# MÅLT 30/8 — HVOR MÅL-VÆRDIERNE KOMMER FRA (📏-reglen)
+# -----------------------------------------------------
+# User bad om "farve og styrker … ligesom jeg manuelt satte det til i morges".
+# Morgenens forløb, læst i recorderen og logbogen:
+#   05:31:59  godnat_adult_nightwalk  → spisestue-loft 8 % @ 2000 K, kæden 2 % orange
+#   05:35:49  Styrbar højre-klik      → sofa-zonen tændt (bart turn_on = pærernes
+#                                       egen sidst-kendte værdi)
+#   05:39:59  presence_koekken        → kæden hue 28 / sat 99 @ target × 0,5
+# Ingen af de to var et user-context-kald (recorderen har NUL manuelle
+# state-rækker i hele døgnet — trykket var en zha_event, som ikke bærer user_id,
+# fejlklasse #3). Værdierne stod derefter uændret 05:39:59 → 06:16 = de 36 min
+# han faktisk sad i, og dét er facit her:
+#   light.stue_laesehygge  bri 171/254 = 67 %  @ 2192 K
+#   light.stue_plug        on (onoff — 39 W glødepære, kan ikke rampes)
+#   light.koekken_lyskaede bri  51/254 = 20 %  @ hue 28 / sat 99
+#
+# ⚠️ De 20 % på kæden er IKKE en designet værdi: presence_koekken sender
+# SEGMENT 1 af en to-trins kurve (target × 0,5), og enforceren skulle have kørt
+# segment 2 op til de fulde 40 %. Enforceren er undtaget under godnat
+# (2026-08-26g), så segment 2 kom aldrig — kæden hang på sin halve vej i 36 min.
+# Præcis samme fejlklasse som 2026-08-29b's "kæden hang på råt 54 % mod sit mål
+# på 100 %", bare via godnat-undtagelsen i stedet for en restart. Vi bygger
+# alligevel målet på de 20 %, fordi user så dem og bad om dem — men tallet står
+# på sin EGEN slider (morgenrampe_lyskaede_pct), ikke som et afledt "target × 0,5",
+# så en fremtidig session ikke arver den halve fade som præmis (📏-reglen).
+#
+# HVORFOR RAMPEN IKKE SLÅS MED PRESENCE
+# -------------------------------------
+# Den vinder ved at være FØRST, ikke ved at blokere nogen:
+#   · presence_light_sofa_on kræver at HELE sofa-zonen er slukket → læsehygge on
+#     lukker den af sig selv.
+#   · presence_koekken's lyskæde-gren kræver at kæden er slukket.
+#   · Lyskæde-enforceren fyrer kun på off→unavailable→on-kanten; rampen tænder
+#     kæden mens godnat stadig er aktiv, hvor enforceren allerede ER undtaget.
+#     Undtagelsen er UDVIDET med binary_sensor.morgenrampe_aktiv i
+#     packages/koekken_lyskaede.yaml, fordi godnat rydder 06:00 midt i rampen.
+#   · presence_koekken_lyskaede_off's lux-gren kræver kæden `on`; vores sluk
+#     sætter state til off i samme sekund (permanent faktum om transition-sluk),
+#     så den står ned af sig selv i stedet for at afkorte vores fade.
+#
+# FEJLKLASSER DER ER TÆNKT PÅ
+# ---------------------------
+# #14/#20: alle varigheds-krav måles på BINÆRE occupancy-sensorer, hvor
+#          last_changed er gyldigt bevis for "sustained" — aldrig på en analog.
+# #4/#15:  ingen gren hænger på en enkelt flanke. Både arm og lås drives af en
+#          /1-backstop med et condition-template, så en HA-restart eller en
+#          slugt kant kun forsinker med op til 60 s i stedet for at aflyse.
+# #5:      urørt input_datetime står på DAGENS midnat → armerings-tjekket
+#          spørger til TIDSDELEN, ikke til datoen.
+# #19:     rampen har ingen langtids-gate der kan slippe ophobede triggers —
+#          den ejer kun sin egen session og rydder efter sig selv.
+# =============================================================================
+
+input_boolean:
+  morgenrampe_enabled:
+    name: "Morgenrampe: nattur → stået op"
+    icon: mdi:weather-sunset-up
+
+  # Latch, ikke en indstilling: sættes når spisestuen har bekræftet morgenmad,
+  # ryddes af morgenrampe_slut. Bevidst UDEN `initial:` — den PÅTVINGER ved hver
+  # HA-start (permanent faktum) og ville låse rampen på 100 % efter et deploy.
+  morgenrampe_laast:
+    name: "Morgenrampe: låst (morgenmad bekræftet)"
+    icon: mdi:lock-check-outline
+
+input_datetime:
+  # Stempel, ikke en indstilling. Urørt står den på DAGENS midnat (fejlklasse
+  # #5), derfor tjekkes tidsdelen != '00:00:00' overalt. Sættes med
+  # set_datetime — set_value giver 400: Bad Request (permanent faktum).
+  morgenrampe_start_at:
+    name: "Morgenrampe: fade-ind startet"
+    icon: mdi:timer-play-outline
+    has_date: true
+    has_time: true
+
+input_number:
+  # --- Hvornår rampen overhovedet begynder ---------------------------------
+  morgenrampe_stue_minutter:
+    name: "Morgenrampe: ophold i stuen før fade-ind (min)"
+    icon: mdi:sofa-outline
+    min: 0.5
+    max: 15
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Ophold ved spisebordet der gør huset SIKKERT (= morgenmad). Låser rampen på
+  # 100 % (tændte før også hygge-pluggen — ude 2026-10-11).
+  morgenrampe_spisestue_sekunder:
+    name: "Morgenrampe: ophold i spisestuen = sikker (s)"
+    icon: mdi:silverware-fork-knife
+    min: 15
+    max: 600
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # --- Selve kurven --------------------------------------------------------
+  # Hvor lang tid der går fra fade-ind starter til huset er 100 % sikkert af
+  # ren udholdenhed alene (uden spisestue-bekræftelsen).
+  morgenrampe_fuld_minutter:
+    name: "Morgenrampe: tid til fuld sikkerhed (min)"
+    icon: mdi:chart-timeline-variant
+    min: 2
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Sikkerheden i det øjeblik rampen starter. Må ikke være 0: så ville de første
+  # minutter være et slukket lys, og "langsomt fade ind" ville se ud som ingenting.
+  morgenrampe_start_pct:
+    name: "Morgenrampe: sikkerhed ved start (%)"
+    icon: mdi:percent-outline
+    min: 1
+    max: 50
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # --- Mål ved 100 % sikkerhed (målt 30/8, se header) ----------------------
+  morgenrampe_stue_pct:
+    # 2026-10-11: også sofa-zonens tænd-niveau på en mørk morgen
+    # (presence_light_sofa_on + presence_lux_sofa_on). Sat til 60 = user's
+    # hånd-niveau 11/10 06:09 (153/254).
+    name: "Morgen: stue-læselampe (%)"
+    icon: mdi:lamp-outline
+    min: 5
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  morgenrampe_stue_kelvin:
+    name: "Morgenrampe: stue-varme (K)"
+    icon: mdi:sun-thermometer-outline
+    min: 2000
+    max: 4000
+    step: 1
+    unit_of_measurement: "K"
+    mode: slider
+
+  # Kædens FARVE har bevidst ingen egen slider: den læser husets ene autoritet
+  # koekken_lyskaede_hue/_saturation (fejlklasse #2). Kun styrken er rampens egen.
+  morgenrampe_lyskaede_pct:
+    name: "Morgenrampe: køkken-lyskæde ved fuld sikkerhed (%)"
+    icon: mdi:string-lights
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # --- Udgange -------------------------------------------------------------
+  # Open-plan helt tom i så lang tid = han gik i seng igen → rampen dør.
+  morgenrampe_tom_minutter:
+    name: "Morgenrampe: open-plan tom → afbryd (min)"
+    icon: mdi:home-export-outline
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # "meget langsomt" (user-spec) når dagslyset overtager. Zigbee-transition er
+  # uint16 i 0,1 s = loft på 6553 s; max her er sat langt under.
+  morgenrampe_lux_off_sekunder:
+    name: "Morgenrampe: dagslys-sluk fade (s)"
+    icon: mdi:weather-sunny
+    min: 60
+    max: 3600
+    step: 30
+    unit_of_measurement: "s"
+    mode: slider
+
+template:
+  - binary_sensor:
+      # -----------------------------------------------------------------------
+      # Er der en rampe-session i gang? Ét svar, som BÅDE step-automationen,
+      # lås-grenen, sluk-grenen og lyskæde-enforceren læser (fejlklasse #2).
+      # -----------------------------------------------------------------------
+      - name: "Morgenrampe aktiv"
+        unique_id: morgenrampe_aktiv
+        icon: mdi:weather-sunset-up
+        state: >-
+          {% set s = states('input_datetime.morgenrampe_start_at') %}
+          {% if is_state('input_boolean.morgenrampe_enabled', 'off')
+                or s in ['unknown', 'unavailable', 'none', '']
+                or s[11:] == '00:00:00' %}
+            false
+          {% else %}
+            {% set t0 = strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo) %}
+            {% set el = (now() - t0).total_seconds() %}
+            {# Sanity-loft: en rampe-session er en morgen, ikke en tilstand. 4 t
+               er en watchdog (ikke en tuning-parameter) — uden den kunne et
+               stempel der aldrig blev ryddet holde rampen i live til næste nat. #}
+            {% set tom = states('input_number.morgenrampe_tom_minutter') | float(5) * 60 %}
+            {% set b = states.binary_sensor.openplan_beboet_langsom %}
+            {% set doed = b is not none and b.state == 'off'
+                          and (now() - b.last_changed).total_seconds() >= tom %}
+            {{ 0 <= el < 14400 and not doed }}
+          {% endif %}
+
+      # -----------------------------------------------------------------------
+      # HAR DAGSLYSET OVERTAGET? Ét svar, læst af BÅDE step-grenen (som holder op
+      # med at skrive) og sluk-grenen (som fader ud). Uden denne ene autoritet
+      # ville de to køre hver sit lux-tjek i samme sekund — og fordi begge
+      # hænger på minut-kanten, ville rækkefølgen afgøre om lyset blev slukket
+      # eller tændt igen (fejlklasse #2, og et ægte kapløb).
+      #
+      # "sin normale lux tærskel" (user-spec) = hvert lys sin egen, altså præcis
+      # de gates husets øvrige logik allerede bruger:
+      #   · kæden  : sensor.spisestue_lux_reel mod koekken_lyskaede_lux_haard_off
+      #              — kædens EGEN sluk-gate, flyttet til vindues-enden
+      #              2026-09-23. ALDRIG koekken_lyskaede_lux_effektiv (indeholder
+      #              kædens eget lys og ville måle sig selv, permanent faktum).
+      #              Og ALDRIG kædens TÆND-tærskel her: under en rampe ER kæden
+      #              tændt, og dens +56 lx i kanalen ville gøre en tænd-tærskel
+      #              på 40 lx sand med det samme og afbryde hver rampe.
+      #   · stuen  : sensor.open_plan_lux mod sensor.stue_lux_gate, samme par som
+      #              sofa-zonens egen tænd-vej. sensor.stue_lux_reel er urørlig:
+      #              den har været unavailable siden stue-LTR390'en døde.
+      # ENTEN-ELLER, ikke begge: bliver det lyst nok til ét af rummene, er
+      # morgenen i gang, og så skal hele rampe-sessionen afvikles samlet.
+      # -----------------------------------------------------------------------
+      - name: "Morgenrampe dagslys overtager"
+        unique_id: morgenrampe_dagslys_overtager
+        icon: mdi:weather-sunny
+        state: >-
+          {{ (states('sensor.open_plan_lux') | float(0))
+               > (states('sensor.stue_lux_gate') | float(40))
+             or ((states('sensor.spisestue_lux_reel') | is_number)
+                 and (states('sensor.spisestue_lux_reel') | float(0))
+                   > (states('input_number.koekken_lyskaede_lux_haard_off')
+                      | float(110))) }}
+
+  - sensor:
+      # -----------------------------------------------------------------------
+      # SIKKERHEDEN — hele feature'ns hjerte. 0-100 %, og lysstyrken er dette
+      # tal ganget på målene. now() gør at den re-renderer hvert minut, hvilket
+      # ER rampens urværk: step-automationen lytter på DENNE sensor i stedet for
+      # et time_pattern, så kurven og handlingen aldrig kan divergere.
+      #
+      # Uden for en session returnerer den en KONSTANT 0 — så minut-re-renderen
+      # skriver ingen DB-rækker resten af døgnet (fejlklasse #24).
+      # -----------------------------------------------------------------------
+      - name: "Morgenrampe sikkerhed"
+        unique_id: morgenrampe_sikkerhed
+        unit_of_measurement: "%"
+        icon: mdi:progress-question
+        state: >-
+          {% if is_state('binary_sensor.morgenrampe_aktiv', 'off') %}
+            0
+          {% elif is_state('input_boolean.morgenrampe_laast', 'on') %}
+            100
+          {% else %}
+            {% set s = states('input_datetime.morgenrampe_start_at') %}
+            {% set t0 = strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo) %}
+            {% set el = (now() - t0).total_seconds() %}
+            {% set fuld = [states('input_number.morgenrampe_fuld_minutter') | float(12), 0.5] | max * 60 %}
+            {% set p0 = states('input_number.morgenrampe_start_pct') | float(8) %}
+            {% set frac = [[el / fuld, 0] | max, 1] | min %}
+            {% set tid = p0 + (100 - p0) * frac %}
+            {# "…og opholder os i stuen" (user-spec): tiden alene beviser kun at
+               nogen ER oppe. Derfor skaleres kurven af HVOR beviset er lige nu.
+               Stuen er det rum spec'en spørger til; open-plan uden stuen (han
+               henter kaffe) er stadig godt bevis; helt tavst open-plan er det
+               ikke — dér holdes lyset nede til rampen enten får bevis igen
+               eller dør af morgenrampe_tom_minutter. #}
+            {% set i_stuen = is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on') %}
+            {% set i_openplan = is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'on')
+                                or is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'on') %}
+            {% set naer = 1.0 if i_stuen else (0.75 if i_openplan else 0.5) %}
+            {{ [[(tid * naer) | round(0) | int, 100] | min, 0] | max }}
+          {% endif %}
+
+automation:
+  # ===========================================================================
+  # 1) ARMÉR — natturen har varet ved i stuen, altså begynder vi at tro på den
+  # ===========================================================================
+  - id: morgenrampe_arm
+    alias: "Morgenrampe: 2 min i stuen under nattur → start fade-ind"
+    description: >
+      Efter kl. 05 under godnat: har stuen været optaget uafbrudt i
+      morgenrampe_stue_minutter, stemples fade-ind-starten. Derfra vokser
+      sikkerheden (sensor.morgenrampe_sikkerhed) og dermed lysstyrken.
+    mode: single
+    trigger:
+      # BEVIDST kun en /1-backstop og ingen `to: "on" for: N`-flanke. En
+      # flanke-trigger med `for:` dør ved enhver HA-restart der lander i
+      # ventetiden (permanent faktum), og stue-occupancy blinker desuden når man
+      # går ud i køkkenet — så flanken ville alligevel skulle re-armes. Et
+      # condition-template på en BINÆR sensors last_changed er gyldigt bevis for
+      # "uafbrudt i N min" (fejlklasse #14 gælder kun analoge), og prisen er
+      # højst 60 s forsinkelse på en rampe der tager 12 minutter.
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: state
+        entity_id: input_boolean.morgenrampe_enabled
+        state: "on"
+      # User-spec: "på natture efter kl. 05". Øvre grænse er rundhåndet: den
+      # ægte gate er godnat_common_active nedenfor, som normalt rydder 06:00.
+      - condition: time
+        after: "05:00:00"
+        before: "08:00:00"
+      # Kun én session pr. morgen — stemplet er selv sin dedupe.
+      - condition: state
+        entity_id: binary_sensor.morgenrampe_aktiv
+        state: "off"
+      - condition: template
+        value_template: >-
+          {% set s = states('input_datetime.morgenrampe_start_at') %}
+          {{ s in ['unknown', 'unavailable', 'none', ''] or s[11:] == '00:00:00' }}
+      # DET ER EN NATTUR: godnat kører stadig. Er godnat allerede ryddet, er
+      # morgenen begyndt ad normal vej og rampen har ingen opgave.
+      - condition: state
+        entity_id: binary_sensor.godnat_common_active
+        state: "on"
+      # Familie-logik → BEGGE familie-modes (CLAUDE.md: `Normal`-only udelukker
+      # også Home Vacation). AirBnB har sit eget nat-regime, og en gæst der går
+      # på toilettet kl. 05 skal ikke få stueetagen rampet op.
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+      # 🛋️ Sover der en gæst i open-plan, ER stue-Apolloen gæsten.
+      - condition: state
+        entity_id: binary_sensor.sleepover_openplan_moerkt
+        state: "off"
+      # Robotten ER den bevægelse Apollo'erne ser (permanent faktum).
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.roborock_zone_maskering', 'on') }}"
+      - condition: state
+        entity_id: input_boolean.kalde_active
+        state: "off"
+      # Rummet er brugerens, ikke husets, hvis han selv har taget over.
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.open_plan_manual', 'on') }}"
+      # Er der allerede lyst nok, er der intet at rampe op til. Samme sensor +
+      # samme gate som sofa-zonens egen tænd-vej (fejlklasse #2).
+      - condition: template
+        value_template: >-
+          {{ (states('sensor.open_plan_lux') | float(50))
+             < (states('sensor.stue_lux_gate') | float(40)) }}
+      # SELVE KRAVET: uafbrudt ophold i stuen. `for:` bor her og ikke i
+      # triggeren, netop så /1-backstoppen kan stille samme spørgsmål.
+      # 2026-09-05: OVERVEJET OG BEVIDST FRAVALGT at udvide til køkken/
+      # spisestue. Målt den morgen armede rampen aldrig, fordi stuens længste
+      # ubrudte ophold var 53 s mens køkkenet stod optaget i 6 min 35 s — og
+      # sikkerheds-sensoren nedenfor vægter i forvejen køkken/spisestue som
+      # gyldigt bevis (0,75). Men rampen "vinder ved at være FØRST" (se
+      # hoved-kommentaren): havde den armet, ville den have tændt køkkenet på
+      # 8 % og ejet det i 12 minutter, mens presence — som kræver at lyset er
+      # SLUKKET — havde trukket sig. Brugerens klage samme morgen var netop at
+      # han ville have NORMALT lys med det samme. En udvidelse her ville altså
+      # have gjort symptomet værre, ikke bedre. Rampen forbliver stuens
+      # nattur-komfort (user-spec "2 min i stuen"); det er godnat-clearet der
+      # skal være hurtigt, og den vej blev rettet i stedet
+      # (godmorgen_auto_clear_on_activity, gren `openplan_ophold`).
+      - condition: template
+        value_template: >-
+          {% set o = states.binary_sensor.stue_apollo_occupancy_filtered %}
+          {% set krav = states('input_number.morgenrampe_stue_minutter') | float(2) * 60 %}
+          {{ o is not none and o.state == 'on'
+             and (now() - o.last_changed).total_seconds() >= krav }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.morgenrampe_laast
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.morgenrampe_start_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: logbook.log
+        data:
+          name: "Morgenrampe"
+          message: >-
+            Nattur holder ved — stuen optaget uafbrudt i
+            {{ states('input_number.morgenrampe_stue_minutter') | float(2) }} min.
+            Fade-ind starter på
+            {{ states('input_number.morgenrampe_start_pct') | int(8) }} % sikkerhed
+            og vokser mod fuld over
+            {{ states('input_number.morgenrampe_fuld_minutter') | int(12) }} min.
+            Soveværelserne bliver i godnat.
+
+  # ===========================================================================
+  # 2) STEP — lysstyrken ER sikkerheden
+  # ===========================================================================
+  - id: morgenrampe_step
+    alias: "Morgenrampe: skriv lysstyrke = sikkerhed"
+    description: >
+      Lytter på sensor.morgenrampe_sikkerhed (re-renderer hvert minut) og skriver
+      stue-læsehygge + køkken-lyskæden til den andel af deres mål. Transition =
+      60 s, altså præcis til næste step, så kurven er sammenhængende og ikke
+      trappeformet.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: sensor.morgenrampe_sikkerhed
+    condition:
+      - condition: state
+        entity_id: binary_sensor.morgenrampe_aktiv
+        state: "on"
+      - condition: template
+        value_template: "{{ (states('sensor.morgenrampe_sikkerhed') | int(0)) > 0 }}"
+      # Tager brugeren selv over undervejs, holder rampen op med at skrive.
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.open_plan_manual', 'on') }}"
+      - condition: state
+        entity_id: input_boolean.cinema_active
+        state: "off"
+      # Dagslyset har overtaget → sluk-grenen ejer lyset nu. Uden denne ville de
+      # to grene skiftes til at slukke og tænde hen over minut-kanten.
+      - condition: state
+        entity_id: binary_sensor.morgenrampe_dagslys_overtager
+        state: "off"
+    variables:
+      # Bevidst uden mellemregning: en `variables:`-nøgle der læser en anden
+      # nøgle i SAMME blok er gyldig, men gør en talfejl svær at se. Zigbee
+      # accepterer ikke 0 % som "tændt", så 1 er gulvet i begge kald.
+      stue_bri: >-
+        {{ [ ((states('input_number.morgenrampe_stue_pct') | float(67))
+              * (states('sensor.morgenrampe_sikkerhed') | float(0)) / 100)
+             | round(0) | int, 1 ] | max }}
+      kaede_bri: >-
+        {{ [ ((states('input_number.morgenrampe_lyskaede_pct') | float(20))
+              * (states('sensor.morgenrampe_sikkerhed') | float(0)) / 100)
+             | round(0) | int, 1 ] | max }}
+    action:
+      # Farven sendes i HVERT step, ikke kun på tænd-kanten. Det er bevidst: så
+      # er der kun én kodesti at fejlsøge, og et gentaget kald med den SAMME
+      # farve er harmløst — kæden bliver i xy (permanent faktum: det er et
+      # KELVIN-kald der snapper en farvet strip til hvid, ikke et hs-kald med
+      # uændret værdi). Kædens farve læses fra husets ene autoritet,
+      # koekken_lyskaede_hue/_saturation, så rampen ikke får sin egen kopi af
+      # farvereglen (fejlklasse #2).
+      - service: light.turn_on
+        target:
+          entity_id: light.stue_laesehygge
+        data:
+          brightness_pct: "{{ stue_bri }}"
+          color_temp_kelvin: "{{ states('input_number.morgenrampe_stue_kelvin') | int(2200) }}"
+          transition: 60
+      # 2026-09-28: AirBnB-undtagelsen fjernet — den beskyttede mod et
+      # spots-spejl der døde 2026-09-03 (c6fafb6). Rampen er familie-gated i
+      # arm-grenen, så gæsten rammes aldrig af den (fejlklasse #2: samme
+      # forældede regel stod også i natturen).
+      # 2026-10-04 (ejerskab): kæden kun mens rampen EJER den. Før skrev hvert
+      # step videre efter at madlavningen havde overtaget (godnat ryddes 06:00,
+      # rampen kan køre 4 t) → rampe og enforcer kæmpede om kæden. Rangen står i
+      # ejerskab/koekken_lyskaede.yaml (kravet `morgenrampe`).
+      - if:
+          - condition: state
+            entity_id: sensor.koekken_lyskaede_ejer
+            state: morgenrampe
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: light.koekken_lyskaede
+            data:
+              brightness_pct: "{{ kaede_bri }}"
+              hs_color:
+                - "{{ states('input_number.koekken_lyskaede_hue') | float(28) }}"
+                - "{{ states('input_number.koekken_lyskaede_saturation') | float(99) }}"
+              transition: 60
+
+  # ===========================================================================
+  # 3) LÅS — 1+ min ved spisebordet = vi spiser morgenmad = huset er sikkert
+  # ===========================================================================
+  - id: morgenrampe_laas
+    alias: "Morgenrampe: ophold i spisestuen → lås på tændt"
+    description: >
+      User-spec: "hvis der så begynder at være 1+ min ophold i spisestuen skal
+      den være sikker (så spiser vi morgenmad)". Sætter sikkerheden på 100.
+      Hygge-pluggen tændes ikke længere (2026-10-11, user-spec).
+    mode: single
+    trigger:
+      # Samme /1-backstop-begrundelse som arm-grenen: ingen enkelt flanke må
+      # kunne aflyse låsen, og spisestue-occupancy blinker mens man henter mælk.
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.morgenrampe_aktiv
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.morgenrampe_laast
+        state: "off"
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.open_plan_manual', 'on') }}"
+      - condition: template
+        value_template: >-
+          {% set o = states.binary_sensor.spisestue_apollo_occupancy_filtered %}
+          {% set krav = states('input_number.morgenrampe_spisestue_sekunder') | float(60) %}
+          {{ o is not none and o.state == 'on'
+             and (now() - o.last_changed).total_seconds() >= krav }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.morgenrampe_laast
+      # 2026-10-11 (user-spec: "hyggelampen på 40w skal ikke være en del af
+      # morgen programmet"): låsen tændte før hygge-pluggen her. Den er ude —
+      # låsen er nu kun sikkerhed = 100 (stepppet løfter læselampen + kæden).
+      - service: logbook.log
+        data:
+          name: "Morgenrampe"
+          message: >-
+            Morgenmad bekræftet — spisebordet optaget i
+            {{ states('input_number.morgenrampe_spisestue_sekunder') | int(60) }} s.
+            Sikkerhed låst på 100 %.
+
+  # ===========================================================================
+  # 4) SLUT — dagslyset overtager, eller han gik i seng igen
+  # ===========================================================================
+  - id: morgenrampe_slut
+    alias: "Morgenrampe: dagslys over tærsklen → fade meget langsomt til off"
+    description: >
+      To udgange. (a) Lux over lysets EGEN normale tærskel → meget langsom fade
+      til off (user-spec). (b) Open-plan tom længe nok / sessionen udløbet →
+      rampen slipper uden at slukke, så husets normale sluk-veje ejer resten.
+      Begge rydder stemplet, så næste morgen kan armere igen.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/1"
+      # Rampen holdt op med at være aktiv (open-plan tom / 4-timers loftet).
+      - platform: state
+        entity_id: binary_sensor.morgenrampe_aktiv
+        from: "on"
+        to: "off"
+        id: doed
+    condition:
+      # Er stemplet allerede ryddet, er der intet at gøre — holder /1-ticket
+      # gratis resten af døgnet.
+      - condition: template
+        value_template: >-
+          {% set s = states('input_datetime.morgenrampe_start_at') %}
+          {{ s not in ['unknown', 'unavailable', 'none', ''] and s[11:] != '00:00:00' }}
+    action:
+      - choose:
+          # --- (a) Dagslyset har overtaget ------------------------------------
+          # Lux-reglen bor i binary_sensor.morgenrampe_dagslys_overtager, som
+          # step-grenen læser som sin stop-betingelse. Ét svar, to forbrugere.
+          - conditions:
+              - condition: state
+                entity_id: binary_sensor.morgenrampe_aktiv
+                state: "on"
+              - condition: state
+                entity_id: binary_sensor.morgenrampe_dagslys_overtager
+                state: "on"
+            sequence:
+              - variables:
+                  fade: "{{ states('input_number.morgenrampe_lux_off_sekunder') | int(900) }}"
+              # Kæden kun hvis rampen stadig ejer den (2026-10-04, ejerskab):
+              # har madlavningen taget den, må rampens slut ikke slukke den.
+              - service: light.turn_off
+                continue_on_error: true
+                target:
+                  entity_id: >-
+                    {# 2026-10-11: pluggen er ikke rampens længere — en
+                       hånd-tændt hyggelampe slukkes ikke af rampens slut. #}
+                    {{ ['light.stue_laesehygge']
+                       + (['light.koekken_lyskaede']
+                          if is_state('sensor.koekken_lyskaede_ejer', 'morgenrampe') else []) }}
+                data:
+                  transition: "{{ fade }}"
+              - service: logbook.log
+                data:
+                  name: "Morgenrampe"
+                  message: >-
+                    Dagslyset har overtaget (open-plan
+                    {{ states('sensor.open_plan_lux') }} lx mod
+                    {{ states('sensor.stue_lux_gate') }}, vindue
+                    {{ states('sensor.spisestue_lux_reel') }} lx mod
+                    {{ states('input_number.koekken_lyskaede_lux_haard_off') | int(110) }}).
+                    Rampe-lyset fader til off over {{ fade }} s.
+          # --- (b) Sessionen er død uden dagslys -------------------------------
+          # Rampen SLIPPER bare. At slukke her ville slå lyset i hovedet på en
+          # der lige er gået ud i badet — husets normale tomheds-sluk
+          # (godnat_adult_nightwalk_off, presence_koekken_lyskaede_off,
+          # nattur_retur_seng_sluk) ejer allerede den situation.
+          - conditions:
+              - condition: state
+                entity_id: binary_sensor.morgenrampe_aktiv
+                state: "off"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Morgenrampe"
+                  message: >-
+                    Sessionen slut uden dagslys-overtagelse (open-plan tom
+                    eller 4-timers loft). Rampen slipper lyset til husets
+                    normale sluk-veje.
+      # Fælles oprydning. Midnat = "ikke sat" (fejlklasse #5), og latchen skal
+      # ryddes så i morgen tidlig ikke arver i dag.
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.morgenrampe_laast
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.morgenrampe_start_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d') }} 00:00:00"

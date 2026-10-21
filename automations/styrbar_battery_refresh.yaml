@@ -1,0 +1,114 @@
+# =============================================================================
+# Styrbar Battery Health Check — daily reminder for unknown batteries
+# =============================================================================
+# F1 v2 fix B7.2 (audit-3 2026-05-06 PM).
+#
+# v1 (Sprint 1) brugte zha.issue_zigbee_cluster_command til force-poll, men
+# ZHA 2026.4 schema-change brød det → KeyError: 0 every fire (3×/day).
+# Sleepy ZEDs (IKEA Styrbar) kan ikke pålideligt force-polles uden hardware
+# wake-event. Vi accepterer at battery sensors er unknown indtil first-press.
+#
+# v2 strategy: daily check + notification HVIS battery er unknown >7 dage =
+# user agency at presse en gang at refresh. Gentle nudge, no error spam.
+# =============================================================================
+
+- id: styrbar_battery_health_check
+  alias: "Styrbar: Daily battery-health check (notification if unknown >7d)"
+  description: >
+    Daglig 09:00: tjek hvor længe hver Styrbar's battery sensor har været
+    unknown. Hvis >7 dage = send 1 notification til Parent A's telefon med
+    instruktion om at presse remote en gang for at refresh battery sensor.
+    Single notification (ikke spam) — auto-clearer ved næste valid reading.
+  mode: single
+  trigger:
+    - platform: time
+      at: "09:00:00"
+  condition:
+    # Skip i guest_mode + AirBnB
+    - condition: state
+      entity_id: input_boolean.guest_mode
+      state: "off"
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "Normal"
+  action:
+    - variables:
+        battery_sensors:
+          - sensor.sovevaerelse_styrbar_battery
+          - sensor.stue_styrbar_battery
+          - sensor.boernevaerelse_styrbar_battery
+          - sensor.terrasse_styrbar_battery
+          - sensor.badevaerelse_styrbar_battery
+          - sensor.entre_somrig_battery
+        # Find sensors der har været unknown >7 dage
+        stale: >
+          {% set ns = namespace(found=[]) %}
+          {% for s in battery_sensors %}
+            {% set state = states(s) %}
+            {% if state in ['unknown', 'unavailable', 'none'] %}
+              {% set obj = states[s] %}
+              {% if obj %}
+                {% set since = (now() - obj.last_changed).total_seconds() / 86400 %}
+                {% if since > 7 %}
+                  {% set ns.found = ns.found + [s] %}
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.found }}
+    # Send notification kun hvis stale list ikke tom
+    - if:
+        - condition: template
+          value_template: "{{ stale | length > 0 }}"
+      then:
+        - service: persistent_notification.create
+          data:
+            notification_id: styrbar_battery_stale
+            title: "Styrbar batteries unknown >7d"
+            message: >
+              Disse Styrbar/Somrig remotes har ikke rapporteret battery i 7+ dage:
+              {{ stale | map('replace', 'sensor.', '') | map('replace', '_battery', '') | list | join(', ') }}.
+              Tryk en knap én gang for at vække dem og refresh battery sensor.
+
+# =============================================================================
+# Auto-dismiss notification ved valid battery reading
+# =============================================================================
+- id: styrbar_battery_health_dismiss
+  alias: "Styrbar: Dismiss battery-stale notification ved valid reading"
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id:
+        - sensor.sovevaerelse_styrbar_battery
+        - sensor.stue_styrbar_battery
+        - sensor.boernevaerelse_styrbar_battery
+        - sensor.terrasse_styrbar_battery
+        - sensor.badevaerelse_styrbar_battery
+        - sensor.entre_somrig_battery
+      above: 0  # Any valid numeric reading
+  condition: []
+  action:
+    # Tjek om alle 6 sensors nu har valid reading; hvis ja, dismiss notification
+    - variables:
+        all_valid: >
+          {% set ns = namespace(all=true) %}
+          {% for s in [
+            'sensor.sovevaerelse_styrbar_battery',
+            'sensor.stue_styrbar_battery',
+            'sensor.boernevaerelse_styrbar_battery',
+            'sensor.terrasse_styrbar_battery',
+            'sensor.badevaerelse_styrbar_battery',
+            'sensor.entre_somrig_battery'
+          ] %}
+            {% if states(s) in ['unknown', 'unavailable', 'none'] %}
+              {% set ns.all = false %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.all }}
+    - if:
+        - condition: template
+          value_template: "{{ all_valid }}"
+      then:
+        - service: persistent_notification.dismiss
+          data:
+            notification_id: styrbar_battery_stale

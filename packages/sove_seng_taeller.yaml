@@ -1,0 +1,290 @@
+# =============================================================================
+# SENGETÆLLER — hvor mange ligger i soveværelsets seng (2026-09-23, B156)
+# =============================================================================
+# User-spec 2026-09-23: "jeg synes altid du skal ha en counter der holder øje
+# med hvor mange mennesker der ligger i sengen. hvis vi er 2 personer, så er der
+# ikke nogen mennesker i badeværelset eller entre eller noget, kun medmindre vi
+# har gæster sovende som der også er knapper til. du bruger move mod seng (væk
+# fra Apollo) til at tilføje en person til sengen (noget still presence i sengen
+# derefter kræves også), og vice versa når de forlader soveværelset bevæger de
+# sig mod Apollo (og går så ud og bliver set af entré sensoren)."
+#
+# SIGNALER (alle eksisterende, begge første er i recorderen):
+#   IND  = binary_sensor.sove_retur_til_seng (packages/nattur_retur.yaml):
+#          bevægende mål i dørzonen → bevægende mål ved sengen inden for 45 s.
+#   UD   = sensor.sove_doerzone_stempel skifter (bevægende mål i dørzonen)
+#          OG entréen er optaget inden for 20 s OG ingen IND-puls de næste 60 s
+#          (ellers var det nogen der kom IND fra entréen).
+#   STILL = sovevaerelse_apollo_radar_still_target on + still_distance ≥
+#          input_number.sove_retur_seng_cm (samme seng-grænse som nattur-retur,
+#          fejlklasse #2) i N s — "noget still presence i sengen derefter".
+#
+# MÅLT FØR BYGNING (9 nætter 14-23/09, replay af IND/UD på recorderen):
+#   - IND-pulsen fyrer 3-12 gange pr. indgang → én tælling pr. episode (60 s).
+#   - Uden krav om at blive liggende driver tælleren til 4 hver aften: ture ind
+#     for at hente noget / putte et barn tæller som +1. Kravet "ingen ny
+#     dørzone-passage i 150 s efter indgangen" (proxy for at blive liggende)
+#     fjernede det meste; STILL-kravet (live, kan ikke replayes — still_*
+#     er recorder-ekskluderet) strammer yderligere.
+#   - Sove-radaren taber en sovende i OVER 30 min (22:25-22:55 den 16/09), så
+#     "tomt rum" må ALDRIG nulstille tælleren om natten. Nulstilling: kl. 12
+#     og ved Dormant.
+#   - Der findes intet facit endnu → TRÆNER-knapper (0/1/2/3, Indstillinger)
+#     sætter tallet og logger i ai_feedback/sove_seng_feedback.jsonl, så en
+#     senere session kan kalibrere mod brugerens svar.
+#
+# FORBRUGER: binary_sensor.sove_alle_voksne_i_seng — på når tælleren ≥ antal
+# voksne hjemme OG tallet er PLAUSIBELT (≤ voksne + 2 hvis børnene er hjemme),
+# ingen sleepover-gæster og familie-mode. Tallet ud over plausibelt = tælleren
+# har talt forkert → stoler ikke på den (fejler LUKKET). Den gør
+# sensor.badevaerelse_sluk_alt_undtagelse tom, så godnat/sluk-alt også
+# slukker badet ("så er der ikke nogen mennesker i badeværelset").
+# =============================================================================
+
+input_boolean:
+  sove_seng_taeller_enabled:
+    name: "Sengetæller: aktiv (og må frigive badet ved godnat)"
+    icon: mdi:bed-double
+
+input_number:
+  # RUNTIME-tællingen. Ingen `initial:` → overlever restart.
+  sove_seng_personer:
+    name: "Sengetæller: personer i sengen"
+    icon: mdi:bed-double-outline
+    min: 0
+    max: 4
+    step: 1
+    mode: box
+  sove_seng_still_sekunder:
+    name: "Sengetæller: stille i sengen krævet (s)"
+    icon: mdi:sleep
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+  sove_seng_bliv_sekunder:
+    name: "Sengetæller: ingen tur til døren i (s) efter indgang"
+    icon: mdi:timer-sand
+    min: 30
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+
+input_datetime:
+  sove_seng_sidst_talt:
+    name: "Sengetæller: sidste op/ned-tælling"
+    has_date: true
+    has_time: true
+
+template:
+  - sensor:
+      - name: "Voksne hjemme antal"
+        unique_id: voksne_hjemme_antal
+        icon: mdi:account-multiple
+        state: >-
+          {{ (1 if is_state('input_boolean.parent_a_home', 'on') else 0)
+             + (1 if is_state('binary_sensor.parent_b_hjemme_anker', 'on') else 0) }}
+  - binary_sensor:
+      - name: "Sove alle voksne i seng"
+        unique_id: sove_alle_voksne_i_seng
+        icon: mdi:bed-double
+        state: >-
+          {% set n = states('input_number.sove_seng_personer') | int(0) %}
+          {% set v = states('sensor.voksne_hjemme_antal') | int(0) %}
+          {% set loft = v + (2 if is_state('binary_sensor.kids_home', 'on') else 0) %}
+          {{ is_state('input_boolean.sove_seng_taeller_enabled', 'on')
+             and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+             and is_state('input_boolean.sleepover_i_nat', 'off')
+             and v >= 1 and n >= v and n <= loft }}
+        attributes:
+          personer: "{{ states('input_number.sove_seng_personer') | int(0) }}"
+          voksne_hjemme: "{{ states('sensor.voksne_hjemme_antal') | int(0) }}"
+
+automation:
+  # ---------------------------------------------------------------------------
+  # IND: bevægelse mod sengen → stille i sengen → bliver liggende → +1
+  # ---------------------------------------------------------------------------
+  - id: sove_seng_ind
+    alias: "Sengetæller: +1 når nogen går i seng"
+    # single: IND-pulsen fyrer 3-12× pr. indgang; kørslen der venter ejer den.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.sove_retur_til_seng
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.sove_seng_taeller_enabled
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ as_timestamp(now())
+             - (state_attr('input_datetime.sove_seng_sidst_talt', 'timestamp') | float(0)) > 60 }}
+    action:
+      - variables:
+          t0: "{{ as_timestamp(now()) }}"
+          bliv: "{{ states('input_number.sove_seng_bliv_sekunder') | float(150) }}"
+      - wait_for_trigger:
+          - platform: template
+            value_template: >-
+              {{ is_state('binary_sensor.sovevaerelse_apollo_radar_still_target', 'on')
+                 and (states('sensor.sovevaerelse_apollo_radar_still_distance') | float(0))
+                     >= (states('input_number.sove_retur_seng_cm') | float(200)) }}
+            for:
+              seconds: "{{ states('input_number.sove_seng_still_sekunder') | int(20) }}"
+        timeout:
+          seconds: "{{ bliv | int }}"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ wait.trigger is none }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Sengetæller"
+              message: "Indgang uden stille-tilstedeværelse i sengen — ikke talt."
+              entity_id: input_number.sove_seng_personer
+          - stop: "ingen still i sengen"
+      # Bliver liggende: ingen ny dørzone-passage i resten af vinduet.
+      - delay:
+          seconds: "{{ [bliv - (as_timestamp(now()) - t0), 0] | max | int }}"
+      - condition: template
+        value_template: "{{ (states('sensor.sove_doerzone_stempel') | float(0)) < t0 }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.sove_seng_personer
+        data:
+          value: "{{ [states('input_number.sove_seng_personer') | int(0) + 1, 4] | min }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.sove_seng_sidst_talt
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+      - service: logbook.log
+        data:
+          name: "Sengetæller"
+          message: "+1 → {{ states('input_number.sove_seng_personer') | int(0) }} i sengen."
+          entity_id: input_number.sove_seng_personer
+
+  # ---------------------------------------------------------------------------
+  # UD: bevægelse mod døren → entréen optaget → ingen retur → −1
+  # ---------------------------------------------------------------------------
+  - id: sove_seng_ud
+    alias: "Sengetæller: −1 når nogen forlader soveværelset"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: sensor.sove_doerzone_stempel
+        not_from: ["unknown", "unavailable"]
+        not_to: ["unknown", "unavailable"]
+    condition:
+      - condition: state
+        entity_id: input_boolean.sove_seng_taeller_enabled
+        state: "on"
+      - condition: numeric_state
+        entity_id: input_number.sove_seng_personer
+        above: 0
+      - condition: template
+        value_template: >-
+          {{ as_timestamp(now())
+             - (state_attr('input_datetime.sove_seng_sidst_talt', 'timestamp') | float(0)) > 60 }}
+    action:
+      - wait_template: "{{ is_state('binary_sensor.entre_valhorn_occupancy', 'on') }}"
+        timeout:
+          seconds: 20
+        continue_on_timeout: true
+      - condition: template
+        value_template: "{{ wait.completed }}"
+      # Kom nogen IND fra entréen (dørzone → seng), var det ikke en udgang.
+      - wait_for_trigger:
+          - platform: state
+            entity_id: binary_sensor.sove_retur_til_seng
+            from: "off"
+            to: "on"
+        timeout:
+          seconds: 60
+        continue_on_timeout: true
+      - condition: template
+        value_template: "{{ wait.trigger is none }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.sove_seng_personer
+        data:
+          value: "{{ [states('input_number.sove_seng_personer') | int(0) - 1, 0] | max }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.sove_seng_sidst_talt
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+      - service: logbook.log
+        data:
+          name: "Sengetæller"
+          message: "−1 → {{ states('input_number.sove_seng_personer') | int(0) }} i sengen."
+          entity_id: input_number.sove_seng_personer
+
+  # ---------------------------------------------------------------------------
+  # NULSTIL: kl. 12 og ved Dormant — ALDRIG på "tomt rum" (radaren taber en
+  # sovende i over 30 min, målt 16/09).
+  # ---------------------------------------------------------------------------
+  - id: sove_seng_nulstil
+    alias: "Sengetæller: nulstil midt på dagen / ved Dormant"
+    mode: single
+    trigger:
+      - platform: time
+        at: "12:00:00"
+      - platform: state
+        entity_id: input_select.house_state
+        to: "Dormant"
+    condition:
+      - condition: numeric_state
+        entity_id: input_number.sove_seng_personer
+        above: 0
+    action:
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.sove_seng_personer
+        data:
+          value: 0
+
+script:
+  # TRÆNER: brugeren siger hvor mange der ligger i sengen. Sætter tallet OG
+  # logger (gæt, facit) til kalibrering.
+  sove_seng_facit:
+    alias: "Sengetæller: facit (træner)"
+    icon: mdi:bed-double
+    mode: queued
+    fields:
+      antal:
+        description: "Hvor mange ligger i sengen lige nu"
+        example: 2
+    sequence:
+      - variables:
+          facit: "{{ antal | default(0) | int(0) }}"
+          payload_b64: >-
+            {{ {'facit': facit,
+                'estimat': states('input_number.sove_seng_personer') | int(0),
+                'voksne_hjemme': states('sensor.voksne_hjemme_antal') | int(0),
+                'kids_home': is_state('binary_sensor.kids_home', 'on'),
+                'sove_occupancy': states('binary_sensor.sovevaerelse_apollo_occupancy'),
+                'godnat': states('input_boolean.godnat_active'),
+                'sidst_talt': states('input_datetime.sove_seng_sidst_talt'),
+                'tid': now().isoformat()} | to_json | base64_encode }}
+      - service: shell_command.ai_feedback_append
+        data:
+          log_slug: sove_seng
+          payload_b64: "{{ payload_b64 }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.sove_seng_personer
+        data:
+          value: "{{ [[facit, 0] | max, 4] | min }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.sove_seng_sidst_talt
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"

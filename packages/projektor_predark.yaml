@@ -1,0 +1,588 @@
+# =============================================================================
+# Pre-Dark Mode — auto-dæmpning når der afspilles på projektoren (2026-07-28)
+# =============================================================================
+# User-spec: "detection og auto dim af lys (ikke helt off bare dim) hvis man
+#  afspiller noget via chromecast eller en app. det skal være en slags pre-dark
+#  mode hvor gardiner kører ned og lyset dimmes i det rum hvor der er presence."
+#
+# DETEKTION — hvorfor projektorens NÅBARHED og ikke router-trafik:
+#   Router-sporet er AFPRØVET og DØDT (2026-07-28): Sagemcom Fast3896-15's
+#   UPnP WANCommonInterfaceConfig-tællere afspejler ikke rigtig WAN-trafik.
+#   Bevist med kontrolleret test — 100 MB download på 23 s (~70k pakker) gav
+#   delta 4235 pakker = præcis tomgangs-raten (183/s), og GetTotalBytesReceived
+#   står fast clampet på 2147483647 (INT32_MAX). Byg ALDRIG detektion på
+#   sensor.sagemcom_* trafik-tallene; de er kosmetiske.
+#
+#   Cast-state alene duer heller ikke: afspilning fra en APP PÅ projektoren
+#   (user-verificeret med DR-appen 2026-07-28) giver IKKE 'playing' — Cast-
+#   receiveren rapporterer kun når man caster TIL den. media_player.projector
+#   stod 'off' midt i live-tv.
+#
+#   Det der VIRKER: projektorens Cast-receiver er kun på nettet når projektoren
+#   er TÆNDT. Port 8009 var lukket kl. 07:20 (subnet-scan) og åben kl. 07:28
+#   da user tændte → entityen gik 'unavailable' → 'off'. Altså:
+#     unavailable/unknown = projektor slukket | alt andet = projektor tændt.
+#   ⚠️ ANTAGELSE DER SKAL VERIFICERES: at den går retur til 'unavailable' når
+#   projektoren slukkes (og ikke bliver hængende 'off' pga. standby-netværk).
+#   Ses den hænge, skift binary_sensor.projektor_aktiv til en ping/port-probe.
+#   NB: virker kun så længe Cast-integrationens known_hosts peger på
+#   192.0.2.97 — mDNS-discovery er brudt af HA-hostens to default-routes.
+#
+# HANDLING: gardiner ned + lys DÆMPET (ikke slukket) i ÉT rum —
+#   sensor.moerklaegning_scope_rum (packages/dark_mode.yaml): soveværelset hvis
+#   der har været aktivitet derinde indenfor dark_mode_meget_nylig_sekunder
+#   (90 s) før projektoren tændte, ellers børneværelset, ellers sofastuen.
+#   ⚠️ ÆNDRET 2026-08-12 (user-spec): pre-dark brugte før hele kandidat-listen
+#   (EVT. FLERE RUM) mens Dark Mode tog ét. Den forskel er væk — brugeren bad om
+#   samme stige begge steder, og de deler nu ÉN sensor så reglen ikke kan drifte
+#   i to kopier (fejlklasse #2). Lys der er SLUKKET tændes ALDRIG af pre-dark
+#   (kun allerede-tændte pærer dæmpes) — jf. "lights-tændt-spontant"-mønstret
+#   i CLAUDE.md's monitoring-afsnit.
+#
+#   GARDINER (2026-07-29): alle scopede gardiner lukkes via
+#   script.gardin_film_luk (packages/broadlink_gardiner.yaml) — også dem HA
+#   TROR er lukkede. RTS er envejs, så state er et gæt; et forkert 'closed'
+#   sprang vest-gardinet over (user-rapport). Spisestue-vest er nu med i
+#   rosteret; den manglede i BEGGE mørklægninger (fejlklasse #16).
+#
+# RESTORE: scene-snapshot ved ind, scene.turn_on ved ud (bevarer brightness/
+#   farve pr. pære). Gardiner genåbnes kun i dagslys + grace-stemplet ryddes —
+#   samme mønster som Dark Mode OFF. Genåbnings-snapshottet indeholder KUN de
+#   gardiner der stod ÅBNE inden filmen: var et allerede nede (sommerforsvar/
+#   godnat/manuelt), er det ikke vores at åbne bagefter.
+#
+# FILM-ANKER: binary_sensor.film_mode_aktiv (dark_mode | cinema_active |
+#   predark_active | projektor_aktiv) defineres her og bruges af anomali-vagten
+#   til IKKE at varsle "rum mørkt trods bevægelse" mens mørket er meningen
+#   (user-spec 2026-07-29). Ét anker frem for reglen kodet pr. forbruger.
+#
+# FORHOLD TIL DARK MODE: pre-dark er det SVAGE forstadie. Tændes Dark Mode
+#   (fuld mørklægning) overtager den, og pre-dark trækker sig UDEN restore —
+#   Dark Mode ejer nu gardiner + lys og rydder selv op ved sin egen OFF.
+#
+# AIRBNB: kører også for gæster (mode-agnostisk med vilje). Handlingen er blid
+#   og SELV-REVERSERENDE — slukker gæsten projektoren, ruller alt tilbage — så
+#   en gæst kan ikke havne i en tilstand han ikke kan komme ud af (jf. CLAUDE.md
+#   "ALT skal spille med AirBnB-mode", punkt 2). predark_active ryddes ved både
+#   entry og exit, og flaget er med i privacy-purgen (afslører tv-vaner).
+# =============================================================================
+
+input_boolean:
+  predark_enabled:
+    name: "Pre-Dark Mode aktiv (killswitch)"
+    icon: mdi:television-ambient-light
+  predark_active:
+    name: "Pre-Dark Mode kører nu"
+    icon: mdi:television-play
+
+input_text:
+  # Hvilke gardiner pre-dark FAKTISK lukkede (og som stod åbne før) — kun de
+  # genåbnes ved ud. Uden dette snapshot ville vi åbne gardiner der var lukket
+  # af helt andre grunde (godnat, vinter-forsvar, manuelt).
+  predark_curtains_prev:
+    name: "Pre-Dark: gardiner lukket af pre-dark"
+    max: 100
+    icon: mdi:window-shutter-cog
+
+  # 2026-08-19e: HVILKE rum pre-dark faktisk mørklagde — session-scope, præcis
+  # som input_text.dark_mode_rooms. Uden den kan ingen forbruger vide om DETTE
+  # rum er bevidst mørkt, og lux-tænd-vejene tændte lyset i det rum pre-dark
+  # lige havde mørklagt (se filmmoerke_* nedenfor).
+  predark_rooms:
+    name: "Pre-Dark: rum i sessionen"
+    max: 60
+    icon: mdi:home-floor-g
+
+input_number:
+  # Hvor længe projektoren skal have været væk fra nettet før pre-dark ruller
+  # tilbage. Minimum 40 s med vilje: Cast-forbindelser kan blinke kortvarigt, og
+  # en for kort forsinkelse ville rive gardinerne op midt i en film.
+  predark_off_delay_sekunder:
+    name: "Pre-Dark: sluk-forsinkelse"
+    min: 40
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    icon: mdi:timer-sand
+
+  predark_dim_pct:
+    name: "Pre-Dark: dæmp til"
+    min: 5
+    max: 60
+    step: 5
+    unit_of_measurement: "%"
+    icon: mdi:brightness-4
+
+template:
+  - binary_sensor:
+      # Projektoren er tændt = dens Cast-receiver svarer på nettet.
+      # delay_off = slider (min 40 s): et kort netværks-blink må ikke rulle
+      # pre-dark tilbage midt i en film. Live-målt 2026-07-28: fra fysisk sluk
+      # til media_player.projector = unavailable går der få sekunder, så
+      # slideren er reelt hele ventetiden før gardinerne kører op igen.
+      # Templated delay_off renderes ved hver state-evaluering (HA:
+      # `delay = self._rendered.get(CONF_DELAY_OFF) or self._delay_off`),
+      # så slider-ændringer slår igennem uden reload.
+      - name: "Projektor aktiv"
+        unique_id: projektor_aktiv
+        icon: mdi:projector
+        delay_on: 30
+        delay_off: >-
+          {{ states('input_number.predark_off_delay_sekunder') | int(60) }}
+        # 2026-09-26 (user-valg "dvale = slukket med det samme"): i dvale melder
+        # projektoren `off`, ikke `unavailable` — og `off` talte som AKTIV.
+        # media_player.projector stod off fra 21:45, men projektor_aktiv (og
+        # dermed Dark Mode i sove) hang on → soveværelset mørkt trods bevægelse.
+        # off/standby = slukket, efter delay_off (predark_off_delay_sekunder).
+        state: >-
+          {{ states('media_player.projector') not in
+             ['unavailable', 'unknown', 'none', '', 'off', 'standby'] }}
+
+      # Fælles anker for "huset er MED VILJE mørkt fordi der ses film"
+      # (user 2026-07-29: "notifikationer som 'lys slukket trods bevægelse'
+      # giver ingen mening nu hvor vi har dark mode. de skal tage højde for
+      # hinanden"). Der er FIRE indgange til filmmørke — dark_mode (manuel/
+      # scene), cinema_active (det gamle biograf-flag), predark_active og
+      # projektoren selv (dækker vinduet før pre-dark har nået at reagere, og
+      # tilfældet hvor pre-dark er slået fra på sin killswitch). Ét anker, så
+      # nye forbrugere ikke skal kode reglen om igen (fejlklasse #2).
+      - name: "Film mode aktiv"
+        unique_id: film_mode_aktiv
+        icon: mdi:movie-open
+        state: >-
+          {{ is_state('input_boolean.dark_mode', 'on')
+             or is_state('input_boolean.cinema_active', 'on')
+             or is_state('input_boolean.predark_active', 'on')
+             or is_state('binary_sensor.projektor_aktiv', 'on') }}
+
+      # ---------------------------------------------------------------------
+      # 2026-08-19e (user-bug: "dark mode er blevet overrulet på soveværelset
+      # lige nu"): film_mode_aktiv ovenfor er HUSDÆKKENDE og havde derfor kun
+      # ÉN forbruger (anomali-vagten). Alle lys-vejene gatede i stedet på
+      # `binary_sensor.dark_mode_<rum>` — som KUN kender den manuelle Dark
+      # Mode. Pre-dark lukker de samme gardiner og sænker den samme lux, men
+      # var usynlig for dem: 13:03 lukkede pre-dark sove-gardinet, sove-lux
+      # faldt 51,2 → 4,8, og 2 min senere tændte `presence_lux_sovevaerelse_on`
+      # pendlen midt i filmen. Mørklægningen tændte altså lyset.
+      #
+      # Dette er ankeret alle "må jeg tænde i dette rum?"-veje skal bruge.
+      # Tre indgange, alle RUM-SCOPEDE:
+      #   1. dark_mode_<rum>   — manuel/scene, scope = input_text.dark_mode_rooms
+      #   2. pre-dark          — scope = input_text.predark_rooms (sessionen)
+      #   3. projektoren selv  — dækker vinduet FØR pre-dark har nået at
+      #      reagere, og tilfældet hvor pre-dark er slået fra på killswitchen.
+      #      Scope = den LIVE kandidat (sensor.moerklaegning_scope_rum), som er
+      #      præcis det rum pre-dark ville have valgt. Ét rum ad gangen.
+      # Ankeret er pr. konstruktion et SUPERSÆT af den gamle dark_mode_<rum>-
+      # gate, så ingen kodesti bliver svagere af at skifte over (fejlklasse #2).
+      # ---------------------------------------------------------------------
+      - name: "Filmmoerke stue"
+        unique_id: filmmoerke_stue
+        icon: mdi:movie-filter
+        state: >-
+          {{ is_state('binary_sensor.dark_mode_stue', 'on')
+             or (is_state('input_boolean.predark_active', 'on')
+                 and 'stue' in states('input_text.predark_rooms').split())
+             or (is_state('binary_sensor.projektor_aktiv', 'on')
+                 and 'stue' in states('sensor.moerklaegning_scope_rum').split()) }}
+
+      - name: "Filmmoerke sove"
+        unique_id: filmmoerke_sove
+        icon: mdi:movie-filter
+        state: >-
+          {{ is_state('binary_sensor.dark_mode_sove', 'on')
+             or (is_state('input_boolean.predark_active', 'on')
+                 and 'sove' in states('input_text.predark_rooms').split())
+             or (is_state('binary_sensor.projektor_aktiv', 'on')
+                 and 'sove' in states('sensor.moerklaegning_scope_rum').split()) }}
+
+      - name: "Filmmoerke boern"
+        unique_id: filmmoerke_boern
+        icon: mdi:movie-filter
+        state: >-
+          {{ is_state('binary_sensor.dark_mode_boern', 'on')
+             or (is_state('input_boolean.predark_active', 'on')
+                 and 'boern' in states('input_text.predark_rooms').split())
+             or (is_state('binary_sensor.projektor_aktiv', 'on')
+                 and 'boern' in states('sensor.moerklaegning_scope_rum').split()) }}
+
+      # 2026-08-27b (user-valg): KØKKENET er som det eneste UNSCOPED. Det er
+      # ikke et presence-rum i stigen, men det er open-plan med lærredet —
+      # lyskæden og spottene lander direkte i billedet uanset hvilket rum
+      # stigen valgte. Begrundelsen er optisk, ikke presence-baseret.
+      # Foranledning: 27/8 kl. 20:29 valgte stigen `boern` (kun putning havde
+      # frisk aktivitet) mens familien sad i sofaen — en scope-bunden gate
+      # havde ikke rørt køkkenet, som stod 100 % gennem hele filmen.
+      # filmmoerke_stue er med, så et manuelt Dark Mode i stuen også dæmper
+      # køkkenet; open-plan-fysikken er den samme uden projektor.
+      #
+      # 2026-09-24 (user-bug: "køkkenet lyser ikke warm white ved bevægelse,
+      # holdes orange/red — vi ser jo film i soveværelset"): projektoren FLYTTER
+      # rundt. Står den i SOVEVÆRELSET, er lærredet ikke i open-plan, og den
+      # optiske begrundelse ovenfor falder bort — køkkenet er så bare stedet
+      # man henter snacks. Afgørelsen er det rum mørklægningen SELV valgte
+      # (Dark Mode: dark_mode_rooms, fastlåst ved filmstart; pre-dark:
+      # predark_rooms; ellers den live stige). Fejlvælger stigen et soverum
+      # mens filmen er i stuen, er stuen alligevel ikke mørklagt, så fejlen er
+      # synlig dér og ikke kun i køkkenet.
+      # 2026-09-25 (user-spec: "film i børne soveværelset skal heller ikke
+      # blokere for det hvide lys"): fritagelsen gælder nu begge soverum —
+      # køkkenet dæmpes kun når 'stue' er i rum-listen, eller når listen er
+      # TOM (projektor tændt, intet rum valgt = vi ved ikke hvor lærredet er;
+      # uændret adfærd). Pris: 27/8-sagen (stigen valgte 'boern' under en
+      # stue-film) giver nu et lyst køkken — men stuen var dér heller ikke
+      # mørklagt, og dobbelttrykket (alle tre rum) dæmper køkkenet igen.
+      - name: "Filmmoerke koekken"
+        unique_id: filmmoerke_koekken
+        icon: mdi:movie-filter
+        state: >-
+          {% set rum = states('input_text.dark_mode_rooms')
+                       if is_state('input_boolean.dark_mode', 'on')
+                       else (states('input_text.predark_rooms')
+                             if is_state('input_boolean.predark_active', 'on')
+                             else states('sensor.moerklaegning_scope_rum')) %}
+          {% set rl = rum.split() %}
+          {{ is_state('binary_sensor.filmmoerke_stue', 'on')
+             or (is_state('binary_sensor.projektor_aktiv', 'on')
+                 and (rl == [] or 'stue' in rl)) }}
+
+automation:
+  - id: predark_apply
+    alias: "Pre-Dark: dæmp + gardiner ned ved afspilning"
+    mode: queued
+    max: 4
+    trigger:
+      # Projektoren tændt (dækker BÅDE cast og app-afspilning).
+      - platform: state
+        entity_id: binary_sensor.projektor_aktiv
+        from: "off"
+        to: "on"
+        id: pd_on
+      - platform: state
+        entity_id: binary_sensor.projektor_aktiv
+        from: "on"
+        to: "off"
+        id: pd_off
+      # Dark Mode overtager → pre-dark trækker sig uden restore.
+      - platform: state
+        entity_id: input_boolean.dark_mode
+        to: "on"
+        id: dm_takeover
+    action:
+      - choose:
+          # ------------------- IND: dæmp + gardiner ned -------------------
+          - conditions:
+              - condition: trigger
+                id: pd_on
+              - condition: state
+                entity_id: input_boolean.predark_enabled
+                state: "on"
+              # 2026-09-23: i familie-modes starter projektoren fuld Dark Mode
+              # (dark_mode_projektor_styrer) — pre-dark kører kun i AirBnB eller
+              # når den knap er slået fra. Ellers ville to mørklægninger køre
+              # gardinerne på samme flanke (fejlklasse #2).
+              - condition: template
+                value_template: >-
+                  {{ is_state('input_select.house_mode', 'AirBnB')
+                     or not is_state('input_boolean.dark_mode_ved_projektor', 'on') }}
+              # Dark Mode er den stærkere tilstand — rør ikke ved dens opsætning.
+              - condition: state
+                entity_id: input_boolean.dark_mode
+                state: "off"
+              - condition: state
+                entity_id: input_boolean.predark_active
+                state: "off"
+            sequence:
+              - variables:
+                  # 2026-08-12 (user-spec): SAMME prioritets-stige som Dark Mode
+                  # — sove hvis der er meget nylig aktivitet der, ellers boern,
+                  # ellers sofa-stuen. ÉT rum. Før brugte pre-dark hele
+                  # kandidat-listen (evt. tre rum på én gang).
+                  rooms: "{{ states('sensor.moerklaegning_scope_rum').split() }}"
+                  # KUN allerede tændte pærer — pre-dark må aldrig tænde noget.
+                  # 2026-08-08: … og aldrig HÆVE noget. En pære der allerede
+                  # står UNDER dim-målet skal springes over: 08-06 21:12 løftede
+                  # pre-dark børnenes putte-natlys fra 1 % til 10 %, hvor det
+                  # brændte til 06:00 (8,8 t, heraf 6,0 t efter midnat) og gav
+                  # "hænger et lys?"-alarmen. Et dæmp der lyser op er en bug.
+                  dim_now: >-
+                    {% set tgt = ((states('input_number.predark_dim_pct') | float(20))
+                                  * 2.55) | round(0) | int %}
+                    {% set ns = namespace(l=[]) %}
+                    {% for k, g in [('stue', 'light.stue_room'),
+                                    ('sove', 'light.sovevaerelse_all'),
+                                    ('boern', 'light.boernevaerelse_all')] %}
+                    {% if k in rooms %}
+                    {% for e in expand(g) | selectattr('state', 'eq', 'on') %}
+                    {% if (e.attributes.get('brightness') | int(255)) > tgt %}
+                    {% set ns.l = ns.l + [e.entity_id] %}
+                    {% endif %}
+                    {% endfor %}
+                    {% endif %}
+                    {% endfor %}
+                    {{ ns.l | join(',') }}
+                  # ALLE gardiner i presence-rum — uanset hvad HA TROR de står
+                  # på. RTS er envejs, så state er et gæt; script.gardin_film_luk
+                  # giver hver cover den behandling dens fysik kræver (se
+                  # packages/broadlink_gardiner.yaml). Spisestue-vest er med
+                  # siden 2026-07-29: den er open-plan med stuen og manglede i
+                  # BEGGE mørklægninger (fejlklasse #16).
+                  close_now: >-
+                    {% set ns = namespace(l=[]) %}
+                    {% for k, c in [('stue', 'cover.gardin_stue_syd'),
+                                    ('stue', 'cover.gardin_stue_vest_1'),
+                                    ('stue', 'cover.gardin_spisestue_vest'),
+                                    ('sove', 'cover.gardin_sovevaerelse')] %}
+                    {% if k in rooms %}
+                    {% set ns.l = ns.l + [c] %}
+                    {% endif %}
+                    {% endfor %}
+                    {{ ns.l | join(',') }}
+                  # Genåbnings-snapshot: KUN dem der stod åbne inden filmen. Var
+                  # et gardin allerede nede (sommerforsvar/godnat/manuelt), er
+                  # det ikke vores at åbne bagefter. 'unknown' tæller som åben —
+                  # RTS-coverne står unknown til første kommando efter genstart.
+                  reopen_after: >-
+                    {% set ns = namespace(l=[]) %}
+                    {% for k, c in [('stue', 'cover.gardin_stue_syd'),
+                                    ('stue', 'cover.gardin_stue_vest_1'),
+                                    ('stue', 'cover.gardin_spisestue_vest'),
+                                    ('sove', 'cover.gardin_sovevaerelse')] %}
+                    {% if k in rooms
+                          and states(c) in ['open', 'opening', 'unknown'] %}
+                    {% set ns.l = ns.l + [c] %}
+                    {% endif %}
+                    {% endfor %}
+                    {{ ns.l | join(',') }}
+              # Intet at gøre hvis ingen af de tre rum har nylig presence.
+              - condition: template
+                value_template: "{{ rooms | length > 0 }}"
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.predark_active
+              # 2026-08-19e: sessionens rum-scope SKAL skrives i samme åndedrag
+              # som flaget — binary_sensor.filmmoerke_<rum> er sandt kun når
+              # BEGGE er sat, så et manglende scope ville gøre gaten falsk og
+              # lade lux-tænd-vejene tænde lyset midt i filmen igen.
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.predark_rooms
+                data:
+                  value: "{{ rooms | join(' ') }}"
+              - service: logbook.log
+                data:
+                  name: "Pre-Dark"
+                  message: >-
+                    Projektor tændt → dæmper til
+                    {{ states('input_number.predark_dim_pct') | int(20) }}% i
+                    {{ rooms | join(', ') }}
+                    ({{ dim_now.split(',') | reject('eq', '') | list | count }} pærer)
+                    + gardiner ned.
+                  entity_id: input_boolean.predark_active
+              # Snapshot FØR vi rører lyset (bevarer brightness + farve pr. pære).
+              - condition: template
+                value_template: "{{ dim_now != '' or close_now != '' }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ dim_now != '' }}"
+                then:
+                  # scene.create med tom liste ville efterlade en tom scene der
+                  # ser ud som et gyldigt snapshot ved ud — derfor kun når der
+                  # faktisk ER tændte pærer at huske.
+                  - service: scene.create
+                    data:
+                      scene_id: predark_restore
+                      snapshot_entities: >-
+                        {{ (dim_now.split(',') | reject('eq', '') | list) }}
+                  - service: light.turn_on
+                    continue_on_error: true
+                    target:
+                      entity_id: "{{ dim_now.split(',') }}"
+                    data:
+                      brightness_pct: "{{ states('input_number.predark_dim_pct') | int(20) }}"
+                      transition: 3
+              # Gardiner: markér manuel-ned FØRST (blokerer auto-genåbning),
+              # luk derefter — template-coverne blokerer op til ~30 s.
+              # NB: kun de gardiner vi SKAL åbne igen bogføres — resten var
+              # allerede nede og ejes af den rutine der lukkede dem.
+              #
+              # 2026-09-02b (user-spec: "gardiner der åbner af sig selv — det må
+              # de bare ikke"): i AirBnB rører pre-dark IKKE gardiner. Det er
+              # begge veje eller ingen — blokerede vi kun genåbningen, ville
+              # gæsten sidde tilbage med permanent lukkede gardiner uden at kende
+              # escape-vejen (standing instruction: der SKAL være en automatisk
+              # udgang). Snapshottet skrives derfor TOMT frem for at blive
+              # sprunget over, så et gammelt snapshot heller ikke kan rulle
+              # gardiner op senere. Lys-dæmpningen ovenfor beholder gæsten —
+              # det er kun motoren der er forbudt.
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.predark_curtains_prev
+                data:
+                  value: >-
+                    {{ '' if is_state('input_select.house_mode', 'AirBnB')
+                       else reopen_after }}
+              - if:
+                  - condition: template
+                    value_template: "{{ close_now != '' }}"
+                  - condition: template
+                    value_template: >-
+                      {{ not is_state('input_select.house_mode', 'AirBnB') }}
+                then:
+                  - repeat:
+                      for_each: "{{ close_now.split(',') }}"
+                      sequence:
+                        - service: script.gardin_mark_manual_down
+                          data:
+                            cover: "{{ repeat.item }}"
+                  - service: script.gardin_film_luk
+                    data:
+                      covers: "{{ close_now }}"
+          # ---------- Dark Mode overtager: træk dig uden restore ----------
+          - conditions:
+              - condition: trigger
+                id: dm_takeover
+              - condition: state
+                entity_id: input_boolean.predark_active
+                state: "on"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Pre-Dark"
+                  message: >-
+                    Dark Mode tændt → pre-dark trækker sig (Dark Mode ejer nu
+                    lys + gardiner og rydder selv op ved sin OFF).
+                  entity_id: input_boolean.predark_active
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.predark_active
+              # Dark Mode ejer nu scopet (input_text.dark_mode_rooms) →
+              # pre-darks eget scope skal ikke stå tilbage og lyve.
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.predark_rooms
+                data:
+                  value: ""
+          # ------------------- UD: genopret -------------------
+          - conditions:
+              - condition: trigger
+                id: pd_off
+              - condition: state
+                entity_id: input_boolean.predark_active
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.predark_active
+              - service: logbook.log
+                data:
+                  name: "Pre-Dark"
+                  message: "Projektor slukket → genopretter lysniveauer + gardiner."
+                  entity_id: input_boolean.predark_active
+              # scene.turn_on er ALT-ELLER-INTET: den genskaber HVER pære i
+              # snapshottet — også dem der er slukket siden. Derfor restaurerer
+              # vi KUN hvis alle stadig er tændt. Er bare én slukket, er huset
+              # gået videre (godnat, presence-sluk, manuelt) og vi holder fingrene
+              # væk — ellers ville pre-dark tænde lys efter godnat (jf. CLAUDE.md
+              # "lights-tændt-spontant").
+              - variables:
+                  snap: "{{ expand('scene.predark_restore') | list }}"
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ snap | count > 0
+                         and (snap | selectattr('state', 'eq', 'on') | list | count)
+                             == (snap | count) }}
+                then:
+                  - service: scene.turn_on
+                    continue_on_error: true
+                    target:
+                      entity_id: scene.predark_restore
+                    data:
+                      transition: 3
+                else:
+                  - service: logbook.log
+                    data:
+                      name: "Pre-Dark"
+                      message: >-
+                        {% if snap | count == 0 %}
+                        Ingen lysniveauer at genskabe (der var ingen tændte pærer
+                        da pre-dark startede). Kun gardiner håndteres.
+                        {% else %}
+                        Lysniveauer IKKE genskabt — {{ snap | rejectattr('state', 'eq', 'on')
+                        | list | count }} af {{ snap | count }} pærer er slukket siden
+                        (huset er gået videre). Kun gardiner håndteres.
+                        {% endif %}
+                      entity_id: input_boolean.predark_active
+              # Gardiner: genåbn kun dem pre-dark selv lukkede, og kun i dagslys
+              # (efter mørkefald er lukket den naturlige aften-tilstand — godnat/
+              # morgen-automatikken ejer dem derfra). Spejler Dark Mode OFF.
+              - variables:
+                  prev_covers: "{{ states('input_text.predark_curtains_prev') }}"
+                  # 2026-07-28 (user-spec): sove-gardinet bliver NEDE hvis der
+                  # puttes barn i forældresengen — det åbnes af brugeren selv
+                  # eller af næste auto-rutine (godmorgen/Active) efter
+                  # putningen. Samme undtagelse som Dark Mode OFF (fejlklasse
+                  # #12: søskende med samme fysik skal beskyttes ens).
+                  # 2026-09-29 (B170): spisestue-vest bliver også NEDE mens
+                  # mosbillede eller putte-glare holder det — de ejer det og
+                  # åbner selv (frigiv / morning_curtains).
+                  reopen: >-
+                    {{ (prev_covers.split(',')
+                        if prev_covers not in ['', 'unknown', 'unavailable'] else [])
+                       | reject('in', (['cover.gardin_sovevaerelse']
+                                       if is_state('input_boolean.putning_sove_active', 'on')
+                                       else [])
+                                  + (['cover.gardin_spisestue_vest']
+                                     if is_state('input_boolean.mosbillede_gardin_ned', 'on')
+                                        or is_state('input_boolean.putte_glare_spisestue_vest_ned', 'on')
+                                     else []))
+                       | join(',') }}
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.predark_curtains_prev
+                data:
+                  value: ""
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.predark_rooms
+                data:
+                  value: ""
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ prev_covers not in ['', 'unknown', 'unavailable']
+                         and is_state('sun.sun', 'above_horizon') }}
+                then:
+                  - if:
+                      - condition: template
+                        value_template: "{{ reopen != '' }}"
+                    then:
+                      - service: cover.open_cover
+                        continue_on_error: true
+                        target:
+                          entity_id: "{{ reopen.split(',') }}"
+                  # Grace ryddes på ALT vi lukkede — også det putning-holdte
+                  # sove, så stemplet ikke blokerer den senere auto-åbning.
+                  - repeat:
+                      for_each: "{{ prev_covers.split(',') }}"
+                      sequence:
+                        - variables:
+                            dt: >-
+                              {% set m = {
+                                   'cover.gardin_stue_syd': 'input_datetime.gardin_manual_down_syd',
+                                   'cover.gardin_stue_vest_1': 'input_datetime.gardin_manual_down_vest_1',
+                                   'cover.gardin_spisestue_vest': 'input_datetime.gardin_manual_down_spisestue_vest',
+                                   'cover.gardin_sovevaerelse': 'input_datetime.gardin_manual_down_sove' } %}
+                              {{ m.get(repeat.item, '') }}
+                        - if:
+                            - condition: template
+                              value_template: "{{ dt != '' }}"
+                          then:
+                            - service: input_datetime.set_datetime
+                              target:
+                                entity_id: "{{ dt }}"
+                              data:
+                                datetime: "1970-01-01 00:00:00"
+    variables:
+      predark_covers: !include ../rosters/alle_gardiner.yaml

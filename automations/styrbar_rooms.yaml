@@ -1,0 +1,900 @@
+# =============================================================================
+# Styrbar Remote Control N2 — Universal handler (C2 refactor)
+# =============================================================================
+# Erstatter den gamle styrbar_buttons.yaml (968 linjer copy-paste pr rum).
+# Nu: 7 automations total i stedet for 40, med ÉN single source of truth
+# for IEEE -> rum mapping.
+#
+# 8 actions per Styrbar:
+#   L/R quick klik       -> styrbar_color_cycle (16-color palette)
+#                           UNDTAGET stue (pile byttet 2026-06-15): HØJRE =
+#                           toggle sofa-zonen (5 lamper), VENSTRE = cykl
+#                           køkken + spisestue-loft gennem 4 on/off-combos.
+#                           UNDTAGET sove: L/R = varme-loop (styrbar_sove_warmth).
+#                           UNDTAGET børn (B211, ikke i AirBnB): L/R = festlys
+#                           i børneværelset til/fra (dance_mode). Pil-startet
+#                           fest slukker selv ved tomt rum, og langt OP/NED
+#                           mens børn danser = festlys fra
+#                           (packages/festlys_boern_styrbar.yaml).
+#   L/R hold              -> 80-color palette, 4 idx/tick @ no-delay
+#                           (~3 sek for fuld cycle = 20 visits, perceived smooth
+#                           via 150ms transition overlap), stop ved slip
+#                           UNDTAGET stue (2026-06-12): combo-shuffle gennem de
+#                           7 tændte kombinationer af sofa-stue/køkken/spisestue
+#                           @ ~1 step/sek, R = frem, L = tilbage, stop ved slip.
+# DARK MODE-BIVIRKNING (2026-07-28, user-spec): er Dark Mode tændt, FRITAGER et
+# OP-tryk (klik eller hold) rummet for mørklægningen resten af sessionen — det
+# håndteres af dark_mode_room_exempt_button i packages/dark_mode.yaml (lytter på
+# de samme zha_events; intet i denne fil kalder den). Gælder stue/sove/børn.
+#
+#   OP/NED klik          -> næste trin på trappen [0, 5, 10, 20 … 100]
+#                           (AirBnB: [0, 5, 25, 50, 75, 100]), farve bevares
+#   OP hold              -> snap til 100% brightness
+#   OP hold 2+ sek       -> reset til warm hvid (2700 K)
+#   NED hold             -> snap til off
+#
+# Short vs long press er separate cursors (input_number.styrbar_color_idx vs
+# styrbar_palette80_idx). Sequences er uafhaengige — ingen synkronisering.
+#
+# Arkitektur:
+#   1. styrbar_universal_instant — mode: parallel max=20. Haandterer 6 instant
+#      actions (lr_click, up_click, down_click, up_hold_start, up_hold_stop,
+#      down_hold). Templater room ud fra trigger.event.data.device_ieee.
+#   2. styrbar_lr_grace_<rum> — 5 per-rum (mode: restart). Bibeholder den
+#      restart-baserede grace-timer der skal restarte ved hver release.
+#   3. styrbar_universal_lr_hold — mode: parallel max=5. Haandterer hue scroll
+#      via state-flag (input_boolean.styrbar_lr_holding_<rum>). hold command
+#      saetter flag ON og kører while-loop; release saetter flag OFF og
+#      loopet exitter naturligt.
+#
+# Ny rum tilfojes ved:
+#   1. Tilfoj IEEE -> rum mapping i ieee_to_room (ses 2 steder herunder)
+#   2. Opret per-rum lr_grace automation (~12 linjer) hvis nyt rum
+#   3. Opret input_boolean.styrbar_lr_holding_<rum> i packages/room_modes.yaml
+#   4. Opret input_boolean.styrbar_lr_grace_<rum> i samme
+#   5. Opret input_boolean.styrbar_up_holding_<rum> i samme
+#   6. Opret input_number.styrbar_palette80_idx_<rum> i samme (long-press cursor)
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# UNIVERSAL INSTANT — 6 actions (lr_click, up/down_click, up_hold_*, down_hold)
+# ----------------------------------------------------------------------------
+- id: styrbar_universal_instant
+  alias: "Styrbar Universal: 6 instant actions for alle rum"
+  description: >
+    Centralized handler for L/R click, OP/NED click, OP hold start/stop,
+    NED hold paa alle 5 paerede Styrbars. Templater rum ud fra device_ieee.
+  mode: parallel
+  max: 20
+  variables:
+    # Single source of truth for IEEE -> rum mapping. Nyt rum tilfojes her.
+    ieee_to_room:
+      "c3:db:c9:b4:05:ef:1d:63": sovevaerelse
+      "7e:44:f6:62:8e:f4:b1:23": stue
+      "66:19:44:cc:2c:41:57:fe": boernevaerelse
+      "f7:11:9c:56:41:50:32:6b": terrasse
+      "06:0d:3a:e6:10:55:ae:30": badevaerelse
+      # FRIGJORT 2026-06-06 — Depot Styrbar (IKEA Remote N2, IEEE
+      # 99:a8:bb:14:4e:71:ce:67) er afkoblet fra depot. FoH/Hue-vaegkontakten
+      # styrer depotet nu (packages/depot_foh_switch.yaml), saa fjernbetjeningen
+      # er fri = "ready to be assigned". Device er STADIG paret (batteri-sensor
+      # sensor.depot_styrbar_battery virker, helpers + grace-block bevaret).
+      # TILDEL ET RUM: fjern '#' nedenfor og skift 'depot' -> oensket rum-navn.
+      #"99:a8:bb:14:4e:71:ce:67": depot
+  trigger:
+    - platform: event
+      event_type: zha_event
+  condition:
+    - condition: template
+      value_template: >
+        {{ trigger.event.data.device_ieee in ieee_to_room.keys() | list }}
+    # 2026-10-05 (B193): mens radioen spiller ejer styrbar_stue_radio
+    # (packages/hoejttaler_radio.yaml) HELE stue-fjernbetjeningen.
+    - condition: template
+      value_template: >-
+        {{ not (trigger.event.data.device_ieee == '7e:44:f6:62:8e:f4:b1:23'
+                    and is_state('binary_sensor.styrbar_stue_radio', 'on')) }}
+  action:
+    - variables:
+        room: "{{ ieee_to_room[trigger.event.data.device_ieee] }}"
+        cmd: "{{ trigger.event.data.command }}"
+        args: "{{ trigger.event.data.args | default([]) }}"
+    # TERRASSE: ALT håndteres separat af styrbar_terrasse_plug (top/bund styrer
+    # pærelyskæden, plug ejes af controlleren). L/R-pilene er BEVIDST no-op
+    # (user-spec 2026-06-22) → stop hele terrasse her, så hverken color-cycle
+    # eller brightness-ladder rammer den.
+    - if:
+        - condition: template
+          value_template: "{{ room == 'terrasse' }}"
+      then:
+        - stop: "Terrasse styres separat (styrbar_terrasse_plug); L/R bevidst no-op."
+    - choose:
+        # ============ L/R quick klik -> color cycle (direction-aware) ============
+        # IKEA Styrbar N2 emit'er enten:
+        #   a) Newer quirk: 'arrow_left_click' / 'arrow_right_click' commands
+        #   b) Older quirk: 'press' command med args[0] som direction-kode
+        # Vi haandterer begge. L = backward i palette, R = forward.
+        # L+R = tilbage til oprindelig farve.
+        # SPRINT 2026-06-22: Sove undtaget — L/R = loop gennem soveloftets
+        # varme (light.spisestue_pendel CCT), ikke color cycle. Se
+        # automations/styrbar_sove_warmth.yaml.
+        - conditions:
+            - condition: template
+              value_template: >
+                {{ cmd in ['press', 'arrow_left_click', 'arrow_right_click']
+                   and room != 'sovevaerelse' }}
+          sequence:
+            - variables:
+                # Detect direction. Default 'right' hvis ukendt encoding —
+                # diagnostisk logbook viser hvad args[0] var sa vi kan
+                # tilfoeje vaerdien til left-list nedenfor hvis noedvendigt.
+                direction: >-
+                  {% if cmd == 'arrow_left_click' %}left
+                  {% elif cmd == 'arrow_right_click' %}right
+                  {% else %}
+                    {% set d = args[0] | default(-1) %}
+                    {% if d in [257, 0, 2, 258] %}left
+                    {% else %}right{% endif %}
+                  {% endif %}
+            - service: logbook.log
+              data:
+                name: "Styrbar L/R debug"
+                message: >
+                  room={{ room }} cmd={{ cmd }} args={{ args }}
+                  → direction={{ direction }}
+            # STUE-UNDTAGELSE (2026-06-10; pile byttet + venstre-loop 2026-06-15):
+            # L/R klik er zone-styring i stedet for color cycle.
+            #   HØJRE  = toggle sofa-zonen (5 stue-lys: 2 sofalamper + hjørnelampe
+            #            + hygge-plug + læsehygge). NOGET on → sluk alt; ellers tænd.
+            #   VENSTRE = cykl køkken-loft + spisestue-loft gennem 4 on/off-combos
+            #            (begge on → køkken on/spise off → køkken off/spise on →
+            #            begge off → …) så man bl.a. kan ramme "køkken off,
+            #            spisestue on, sofa on".
+            - if:
+                - condition: template
+                  value_template: "{{ room == 'stue' }}"
+              then:
+                # 2026-06-15 (user): pile byttet + venstre cykler combos.
+                - choose:
+                    # HØJRE = toggle sofa-zonen (sofalamper, hjørne, hygge-plug, læsehygge)
+                    - conditions: "{{ direction == 'right' }}"
+                      sequence:
+                        - variables:
+                            sofa: >-
+                              {% from 'rosters.jinja' import stue_sofa_lys %}{{ stue_sofa_lys
+                                  }}
+                        - if:
+                            - condition: template
+                              value_template: "{{ sofa | select('is_state','on') | list | length > 0 }}"
+                          then:
+                            - service: light.turn_off
+                              target: {entity_id: "{{ sofa }}"}
+                              data: {transition: 1}
+                          else:
+                            - service: light.turn_on
+                              target: {entity_id: "{{ sofa }}"}
+                              data: {transition: 1}
+                  default:
+                    # VENSTRE = cykl KØKKEN (lyskæde + spots koblet; + loft når
+                    # online) mod SPISESTUE-loft gennem 4 combos:
+                    #   0 begge on → 1 køkken on/spise off → 2 køkken off/spise on
+                    #   → 3 begge off → 0 … Køkken-loft er pt. offline, så lyskæden
+                    #   er køkken-indikator og spots følger ALTID lyskæden (tænd/
+                    #   sluk sammen). Gør "sofa+køkken tændt" mulig (venstre→combo
+                    #   m. køkken on + højre→sofa on).
+                    - variables:
+                        nxt: >-
+                          {% set k = is_state('light.koekken_lyskaede','on') %}
+                          {% set s = is_state('light.spisestue_loft','on') %}
+                          {% set idx = 0 if (k and s) else (1 if (k and not s) else (2 if (not k and s) else 3)) %}
+                          {{ (idx + 1) % 4 }}
+                    # 2026-09-29 (bug-hunt): venstre styrer KØKKEN + SPISESTUE,
+                    # ikke sofa-zonen — men stemplede kun stue (nedenfor). Siden
+                    # room_mode-splittet 2026-09-03 dækker room_mode_stue kun
+                    # sofa-zonen, så køkkenet blev stående i Auto, og presence
+                    # tændte det igen: målt 24/9 21:37 — fire venstre-klik
+                    # slukkede køkkenet, "første lys" tændte lyskæden 161-179 s
+                    # senere, og madlavnings-spots fulgte (samme fejl som
+                    # 07-31-fixet, genåbnet af splittet). Stemples FØR lys-kaldene,
+                    # så ingen tænd-vej når at se Auto. Udgang: room_drift_back
+                    # (rummet tomt i 20 min → Auto) — også for en gæst.
+                    - service: script.styrbar_stamp_press
+                      data: {room: koekken, set_manual: true}
+                    - service: script.styrbar_stamp_press
+                      data: {room: spisestue, set_manual: true}
+                    # Køkken: lyskæde + loft (lights) sammen — spots-switch lige efter
+                    - service: "{{ 'light.turn_on' if (nxt|int in [0,1]) else 'light.turn_off' }}"
+                      continue_on_error: true
+                      target:
+                        entity_id: light.koekken_lyskaede
+                      data: {transition: 1}
+                    - service: "{{ 'switch.turn_on' if (nxt|int in [0,1]) else 'switch.turn_off' }}"
+                      target:
+                        entity_id: switch.koekken_spots
+                    # Spisestue-loft
+                    - service: "{{ 'light.turn_on' if (nxt|int in [0,2]) else 'light.turn_off' }}"
+                      target:
+                        entity_id: light.spisestue_loft
+                      data: {transition: 1}
+                # 2026-07-31: sætter nu Manual som ALLE andre Styrbar-handlinger.
+                # Den gamle "zone-handling = auto-korrektion"-antagelse (2026-06-12)
+                # efterlod rummet i Auto, så presence gen-tændte det brugeren lige
+                # havde slukket (målt: køkken-lyskæden 72 s efter et venstre-klik).
+                - service: script.styrbar_stamp_press
+                  data:
+                    room: stue
+                    set_manual: true
+              else:
+                - choose:
+                    # B211 (user-spec 2026-10-10): "pil til venstre eller højre
+                    # på styrbar børn starter festlys på børneværelset". Toggle,
+                    # begge pile ens:
+                    #   børn danser ikke + ingen fest → KUN børn vælges, fest on
+                    #     (rum-valget er husket — ellers startede en fest i stuen
+                    #     fra børneværelset).
+                    #   børn danser ikke + fest kører → børn føjes til festen.
+                    #   børn danser + eneste rum → fest slut (fest_smooth_stop).
+                    #   børn danser + andre rum → kun børn forlader festen
+                    #     (dance_room_change_restart giver rummet Auto + looket).
+                    # AirBnB: farve-cyklussen som før — en gæst der trykker en
+                    # pil forventer ikke diskolys (#5 i 🏡-reglerne).
+                    - conditions:
+                        - condition: template
+                          value_template: >-
+                            {{ room == 'boernevaerelse'
+                               and not is_state('input_select.house_mode', 'AirBnB') }}
+                      sequence:
+                        # Debounce: børn trykker flere gange — uden den slår
+                        # tryk nr. 2 festen fra igen inden den er kommet i gang.
+                        - if:
+                            - condition: template
+                              value_template: >-
+                                {{ (now() - states.input_boolean.dance_mode.last_changed).total_seconds() < 3
+                                   or (now() - states.input_boolean.dance_room_boern.last_changed).total_seconds() < 3 }}
+                          then:
+                            - stop: "Festlys-pil: debounce (< 3 s siden sidste skift)."
+                        - variables:
+                            fest: "{{ is_state('input_boolean.dance_mode', 'on') }}"
+                            boern_danser: >-
+                              {{ is_state('input_boolean.dance_mode', 'on')
+                                 and is_state('input_boolean.dance_room_boern', 'on') }}
+                            andre_rum: >-
+                              {# generisk — den faste liste manglede dance_room_sove (#16) #}
+                              {{ states.input_boolean
+                                 | selectattr('object_id', 'match', 'dance_room_')
+                                 | rejectattr('object_id', 'eq', 'dance_room_boern')
+                                 | selectattr('state', 'eq', 'on')
+                                 | map(attribute='entity_id') | list }}
+                        # Start/tilføj stempler festlys_boern_styrbar → selv-sluk
+                        # ved tomt rum (packages/festlys_boern_styrbar.yaml, 17/10).
+                        - choose:
+                            - conditions: "{{ boern_danser }}"
+                              sequence:
+                                - service: script.festlys_boern_slut
+                                  data:
+                                    kilde: "Styrbar børn pil"
+                            - conditions: "{{ fest }}"
+                              sequence:
+                                - service: input_boolean.turn_on
+                                  target: {entity_id: input_boolean.festlys_boern_styrbar}
+                                - service: input_boolean.turn_on
+                                  target: {entity_id: input_boolean.dance_room_boern}
+                          default:
+                            - service: input_boolean.turn_on
+                              target: {entity_id: input_boolean.festlys_boern_styrbar}
+                            - if:
+                                - condition: template
+                                  value_template: "{{ andre_rum | length > 0 }}"
+                              then:
+                                - service: input_boolean.turn_off
+                                  target: {entity_id: "{{ andre_rum }}"}
+                            - service: input_boolean.turn_on
+                              target: {entity_id: input_boolean.dance_room_boern}
+                            # sensor.dance_active_bulbs gen-renderer på rum-
+                            # skiftet; orkestratoren skal se det nye valg.
+                            - delay: {milliseconds: 300}
+                            - service: input_boolean.turn_on
+                              target: {entity_id: input_boolean.dance_mode}
+                        - service: logbook.log
+                          data:
+                            name: "Styrbar børn"
+                            message: >-
+                              Pil: festlys i børneværelset
+                              {{ 'slut' if boern_danser and andre_rum | length == 0
+                                 else ('fra (resten fester videre)' if boern_danser
+                                 else ('tilføjet festen' if fest else 'startet')) }}.
+                  default:
+                    - service: script.styrbar_color_cycle
+                      data:
+                        room: "{{ room }}"
+                        direction: "{{ direction }}"
+
+        # ============ OP klik -> ladder-step UP ============
+        # Blokeres af lr_grace flag (1.5-2 sek efter L/R release pga N2-quirk)
+        # Audit-runde 20 (2026-05-05): refactor til ladder-baseret stepping.
+        # Tilfojer 5% nat-niveau nederst (ramt direkte fra off).
+        # Normal ladder: [0, 5, 10, 20, 30, ..., 100] (12 steps)
+        # AirBnB ladder: [0, 5, 25, 50, 75, 100] (6 steps)
+        - conditions:
+            - condition: template
+              value_template: "{{ cmd == 'on' }}"
+          sequence:
+            # 2026-05-05: log ALLE up presses inkl blokerede (debug intermittent
+            # "kort press virkede ikke første gang" issue brugeren oplevede).
+            - service: logbook.log
+              data:
+                name: "Styrbar UP debug"
+                message: >
+                  room={{ room }} grace={{ states('input_boolean.styrbar_lr_grace_' ~ room) }}
+                  → {{ 'BLOCKED-by-grace' if is_state('input_boolean.styrbar_lr_grace_' ~ room, 'on') else 'fired' }}
+            - condition: template
+              value_template: >
+                {{ is_state('input_boolean.styrbar_lr_grace_' ~ room, 'off') }}
+            # 2026-09-23 (user-spec): "i et helt mørkt soveværelse skal det
+            # første tryk op på styrbar tænde pærelyskæden alene og derefter
+            # kommer loftet med ved følgende tryk eller langt tryk".
+            # Mørkt = loft OG kæde slukket → kun kæden, ingen loft-trappe. Står
+            # kæden allerede (tryk 2+), trapper loftet op som altid, og kæden
+            # sikres tændt (OP = kæden med, packages/sove_lyskaede.yaml).
+            # Klik-OP for kæden ejes HER alene — to automations der begge
+            # læser "er det mørkt?" på samme tryk ville race mod kædens egen
+            # tænding (#2). Langt OP / NED ejes fortsat af sove_lyskaede_knap.
+            - variables:
+                sove_kaede: >-
+                  {{ room == 'sovevaerelse'
+                     and is_state('input_boolean.sove_lyskaede_enabled', 'on')
+                     and states('light.sove_lyskaede') not in ['unavailable', 'unknown'] }}
+                moerkt: >-
+                  {{ is_state('light.spisestue_pendel', 'off')
+                     and is_state('light.sove_lyskaede', 'off') }}
+            - if:
+                - condition: template
+                  value_template: "{{ sove_kaede }}"
+              then:
+                - service: input_boolean.turn_off
+                  target:
+                    entity_id: input_boolean.sove_lyskaede_manuel_slukket
+                - service: light.turn_on
+                  continue_on_error: true
+                  target:
+                    entity_id: light.sove_lyskaede
+            - if:
+                - condition: template
+                  value_template: "{{ not (sove_kaede and moerkt) }}"
+              then:
+                - service: script.styrbar_brightness_step
+                  data:
+                    room: "{{ room }}"
+                    direction: up
+                    ladder: >-
+                      {% if is_state('input_select.house_mode', 'AirBnB') %}
+                      [0, 5, 25, 50, 75, 100]
+                      {% else %}
+                      [0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+                      {% endif %}
+
+        # ============ NED klik -> ladder-step DOWN ============
+        # 2026-05-05: tilføjet diagnostisk logging (uden behavior-change — NED
+        # har ikke lr_grace check som UP, og det bevares for nu indtil vi har
+        # data der bekræfter behavior bør være symmetrisk).
+        - conditions:
+            - condition: template
+              value_template: "{{ cmd == 'off' }}"
+          sequence:
+            - service: logbook.log
+              data:
+                name: "Styrbar NED debug"
+                message: >
+                  room={{ room }} grace={{ states('input_boolean.styrbar_lr_grace_' ~ room) }} → fired
+            - service: script.styrbar_brightness_step
+              data:
+                room: "{{ room }}"
+                direction: down
+                ladder: >-
+                  {% if is_state('input_select.house_mode', 'AirBnB') %}
+                  [0, 5, 25, 50, 75, 100]
+                  {% else %}
+                  [0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+                  {% endif %}
+
+        # ============ Langt OP/NED i børneværelset mens børn danser ============
+        # User 17/10: festlys "skal også slukke ved styrbar long ned eller op i
+        # børneværelset". Børn ud af festen (eneste rum = festen slut), uanset
+        # hvem der startede den. Snap'et springes over — dance_restore_auto
+        # giver rummet Auto + looket, og et snap oven i ville race mod den.
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ cmd in ['move', 'move_with_on_off'] and room == 'boernevaerelse'
+                   and is_state('input_boolean.dance_mode', 'on')
+                   and is_state('input_boolean.dance_room_boern', 'on') }}
+          sequence:
+            - service: script.festlys_boern_slut
+              data:
+                kilde: "Styrbar børn langt {{ 'OP' if cmd == 'move_with_on_off' else 'NED' }}"
+
+        # ============ OP hold start (~1 sek = snap full, ~3 sek = warm hvid) ============
+        # Saetter up_holding flag, snap til 100%, vent 2 sek, hvis flag stadig
+        # on (= bruger holder stadig) saa reset til warm hvid og clear flag.
+        - conditions:
+            - condition: template
+              value_template: "{{ cmd == 'move_with_on_off' }}"
+          sequence:
+            - service: input_boolean.turn_on
+              target:
+                entity_id: "input_boolean.styrbar_up_holding_{{ room }}"
+            - service: script.styrbar_snap_full
+              data:
+                room: "{{ room }}"
+            - delay:
+                seconds: 2
+            - condition: template
+              value_template: >
+                {{ is_state('input_boolean.styrbar_up_holding_' ~ room, 'on') }}
+            - service: script.styrbar_reset_warm_white
+              data:
+                room: "{{ room }}"
+            - service: input_boolean.turn_off
+              target:
+                entity_id: "input_boolean.styrbar_up_holding_{{ room }}"
+
+        # ============ OP hold stop -> rydder up_holding flag ============
+        - conditions:
+            - condition: template
+              value_template: "{{ cmd == 'stop_with_on_off' }}"
+          sequence:
+            - service: input_boolean.turn_off
+              target:
+                entity_id: "input_boolean.styrbar_up_holding_{{ room }}"
+
+        # ============ NED hold -> snap off ============
+        # 2026-10-17 (user-spec): "Guest knap som starter Gæst sover i stue mode
+        # skal også aktiveres hvis man trykker long press down på styrbar stue
+        # efter kl. 20.00 … det skal svare til at trykke ned på gæst knappen."
+        # → stue 20-06 = gæste-RODRET O (sluk open-plan + entré + terrasse,
+        # armér Sleep Over). Næste OP slipper holdet og giver rummene Auto
+        # (sleepover_gaest_op_clear). Superset af snap_off(stue), så den
+        # erstatter den. Kun familie-modes: en AirBnB-gæst der "slukker alt"
+        # med NED-hold sover ikke i stuen og skal ikke have mørk entré om
+        # natten (🏡 #5) — gæste-RODRET'en virker stadig i alle modes.
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ cmd == 'move' and room == 'stue'
+                   and (now().hour >= 20 or now().hour < 6)
+                   and states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+          sequence:
+            # B240 (2026-10-19): NED er også "alt fra" — 19/10 04:24 gik Parent A
+            # ud ad døren med det, og holdet mørklagde Parent B's morgen. Derfor
+            # skal en NED-armering bevises af radaren; ser open plan ingen i
+            # N min, slippes den (sleepover_ned_uden_bevis_slip).
+            - service: script.gaest_sover_sluk
+              data:
+                kilde: "Styrbar stue langt NED"
+                armer: true
+                radar_bevis: true
+        - conditions:
+            - condition: template
+              value_template: "{{ cmd == 'move' }}"
+          sequence:
+            - service: script.styrbar_snap_off
+              data:
+                room: "{{ room }}"
+
+# ----------------------------------------------------------------------------
+# UNIVERSAL L/R HOLD LOOP — hue scroll via state-flag pattern
+# ----------------------------------------------------------------------------
+# Mode: parallel saa hver rum kan have egen samtidig loop. State-flag styrer
+# loop-livstid (set ON ved hold, set OFF ved release). Loop bruger
+# repeat: while: med flag-condition saa den exit'er naar flag bliver off.
+- id: styrbar_universal_lr_hold
+  alias: "Styrbar Universal: L/R hold -> 80-palette curated scroll"
+  description: >
+    Hold L eller R = step gennem 80-element kureret palette @ 4 idx/tick,
+    delay 0 = ~3.2 sek for fuld cycle (20 visits sustained). Måling 2026-05-03:
+    HA + Zigbee giver ~10 ticks/sek burst, ~6 ticks/sek sustained efter buffer
+    saturation. Brugergodkendt cycle-tid.
+    18° hue-jump per visit maskeret af 150ms transition overlap.
+    Slip stopper. Bruger state-flag input_boolean.styrbar_lr_holding_<rum>.
+    Entity-id er legacy "..._continuous_hue_scroll" fra v1 implementation.
+    SPRINT 2026-05-20: Sove undtaget via condition — L/R hold bruges nu til
+    varme-loop (light.spisestue_pendel CCT). Se styrbar_sove_warmth.yaml.
+  mode: parallel
+  max: 5
+  variables:
+    ieee_to_room:
+      "c3:db:c9:b4:05:ef:1d:63": sovevaerelse
+      "7e:44:f6:62:8e:f4:b1:23": stue
+      "66:19:44:cc:2c:41:57:fe": boernevaerelse
+      "f7:11:9c:56:41:50:32:6b": terrasse
+      "06:0d:3a:e6:10:55:ae:30": badevaerelse
+      # FRIGJORT 2026-06-06 — Depot Styrbar (IKEA Remote N2, IEEE
+      # 99:a8:bb:14:4e:71:ce:67) er afkoblet fra depot. FoH/Hue-vaegkontakten
+      # styrer depotet nu (packages/depot_foh_switch.yaml), saa fjernbetjeningen
+      # er fri = "ready to be assigned". Device er STADIG paret (batteri-sensor
+      # sensor.depot_styrbar_battery virker, helpers + grace-block bevaret).
+      # TILDEL ET RUM: fjern '#' nedenfor og skift 'depot' -> oensket rum-navn.
+      #"99:a8:bb:14:4e:71:ce:67": depot
+  trigger:
+    # Newer quirk: arrow_left/right_hold + arrow_left/right_release
+    # NB: Sove (f0:fd:45:...:d2:6f) er teknisk i ieee_to_room men condition
+    # nedenfor undtager den — L/R hold på sove = varme-loop (sove_warmth.yaml).
+    - platform: event
+      event_type: zha_event
+      event_data:
+        command: "arrow_left_hold"
+      id: start
+    - platform: event
+      event_type: zha_event
+      event_data:
+        command: "arrow_right_hold"
+      id: start
+    - platform: event
+      event_type: zha_event
+      event_data:
+        command: "arrow_left_release"
+      id: stop
+    - platform: event
+      event_type: zha_event
+      event_data:
+        command: "arrow_right_release"
+      id: stop
+    # Older quirk: generic hold/release (ingen direction i command, men i args)
+    - platform: event
+      event_type: zha_event
+      event_data:
+        command: "hold"
+      id: start
+    - platform: event
+      event_type: zha_event
+      event_data:
+        command: "release"
+      id: stop
+  condition:
+    - condition: template
+      value_template: >
+        {{ trigger.event.data.device_ieee in ieee_to_room.keys() | list
+           and ieee_to_room[trigger.event.data.device_ieee]
+               not in ['sovevaerelse', 'terrasse'] }}
+    # 2026-10-05 (B193): radio-tilstand ejer stue-fjernbetjeningen.
+    - condition: template
+      value_template: >-
+        {{ not (trigger.event.data.device_ieee == '7e:44:f6:62:8e:f4:b1:23'
+                    and is_state('binary_sensor.styrbar_stue_radio', 'on')) }}
+  action:
+    - variables:
+        room: "{{ ieee_to_room[trigger.event.data.device_ieee] }}"
+        flag_entity: "input_boolean.styrbar_lr_holding_{{ room }}"
+        idx_entity: "input_number.styrbar_palette80_idx_{{ room }}"
+        light_group: "light.{{ room }}_all"
+        # 80-color curated palette — 4.5° hue-step = under JND threshold for
+        # de fleste folk = ingen synlige diskrete stops. Saturation varierer
+        # for at give pastel/vibrant variation (warm white zoner ved idx 0
+        # og 79 = loop continuity). Designet 2026-05-03 efter user-feedback
+        # at 40 farver kunne foeles for "stoppy".
+        # Layout:
+        #   idx 0-7:    warm white -> vibrant warm reds/oranges
+        #   idx 8-19:   yellows (vibrant, slight sat dip-and-rise for nuance)
+        #   idx 20-31:  yellow-greens to greens
+        #   idx 32-43:  greens to cyans
+        #   idx 44-55:  cyans to blues
+        #   idx 56-67:  blues to purples
+        #   idx 68-75:  magentas/pinks (vibrant)
+        #   idx 76-79:  bridge back to warm white (sat 75 -> 30)
+        # Loop continuity: idx 79 [355.5°/30%] -> idx 0 [0°/25%]
+        # = 4.5° hue + 5% sat shift. Seamless.
+        palette80: >-
+          {{ [[0, 25], [4.5, 35], [9, 45], [13.5, 55], [18, 65], [22.5, 75], [27, 85], [31.5, 95],
+              [36, 100], [40.5, 100], [45, 95], [49.5, 90], [54, 85], [58.5, 95], [63, 100], [67.5, 100], [72, 95], [76.5, 100], [81, 100], [85.5, 95],
+              [90, 90], [94.5, 95], [99, 100], [103.5, 100], [108, 95], [112.5, 90], [117, 95], [121.5, 100], [126, 100], [130.5, 95], [135, 90], [139.5, 95],
+              [144, 100], [148.5, 100], [153, 95], [157.5, 90], [162, 95], [166.5, 100], [171, 100], [175.5, 95], [180, 90], [184.5, 95], [189, 100], [193.5, 100],
+              [198, 95], [202.5, 90], [207, 95], [211.5, 100], [216, 100], [220.5, 95], [225, 90], [229.5, 95], [234, 100], [238.5, 100], [243, 95], [247.5, 90],
+              [252, 95], [256.5, 100], [261, 100], [265.5, 95], [270, 90], [274.5, 95], [279, 100], [283.5, 100], [288, 95], [292.5, 90], [297, 95], [301.5, 100],
+              [306, 100], [310.5, 95], [315, 90], [319.5, 95], [324, 100], [328.5, 100], [333, 95], [337.5, 90],
+              [342, 75], [346.5, 60], [351, 45], [355.5, 30]] }}
+    - choose:
+        # === STOP: release fired, sluk flag (loop exitter naturligt) ===
+        - conditions: "{{ trigger.id == 'stop' }}"
+          sequence:
+            - service: input_boolean.turn_off
+              target:
+                entity_id: "{{ flag_entity }}"
+        # === START (STUE): farve-loop på KUN køkken-lyskæden ===
+        # 2026-07-02 user-spec: L/R hold på stue/køkken-Styrbaren looper
+        # 80-paletten på light.koekken_lyskaede ALENE — højre = frem,
+        # venstre = tilbage, slip = stop. Erstatter zone-shufflet fra
+        # 2026-06-12 (user-valg: fjernet helt; korte klik + OP/NED urørt).
+        # Farven er MIDLERTIDIG (user-valg "kun til næste tænding"):
+        # sliders røres IKKE — enforceren (koekken_lyskaede_enforce)
+        # retter til slider-farven ved næste tænding, og er gated på
+        # holding-flaget så den ikke slås med loopet når loopet selv
+        # tænder lyskæden. Paletten har egen mætning → farverne ses
+        # uanset mætnings-slideren (user-valg "løft mætningen").
+        # Slukket lyskæde: tænd på target-styrke og loop straks (user-valg).
+        # Start-idx udledes af lampens NUVÆRENDE hue så første step er ét
+        # trin fra det du ser; off/ukendt farve → gemt cursor.
+        - conditions: "{{ trigger.id == 'start' and room == 'stue' }}"
+          sequence:
+            - variables:
+                hold_cmd: "{{ trigger.event.data.command }}"
+                hold_args: "{{ trigger.event.data.args | default([]) }}"
+                direction: >-
+                  {% if hold_cmd == 'arrow_left_hold' %}left
+                  {% elif hold_cmd == 'arrow_right_hold' %}right
+                  {% else %}
+                    {% set d = hold_args[0] | default(-1) %}
+                    {% if d in [3329, 257, 0, 2, 258] %}left
+                    {% else %}right{% endif %}
+                  {% endif %}
+                idx_step: "{{ -4 if direction == 'left' else 4 }}"
+                start_idx: >-
+                  {% set hs = state_attr('light.koekken_lyskaede', 'hs_color') %}
+                  {% if is_state('light.koekken_lyskaede', 'on') and hs %}
+                    {{ ((hs[0] / 4.5) | round(0) | int) % 80 }}
+                  {% else %}
+                    {{ (states(idx_entity) | int(43)) % 80 }}
+                  {% endif %}
+            - service: logbook.log
+              data:
+                name: "Styrbar stue lyskæde-farveloop"
+                message: >
+                  cmd={{ hold_cmd }} → direction={{ direction }}
+                  start_idx={{ start_idx }}
+            - service: input_number.set_value
+              target:
+                entity_id: "{{ idx_entity }}"
+              data:
+                value: "{{ start_idx }}"
+            # Flag FØR evt. turn_on — enforcerens off→on-trigger skal se
+            # flaget og holde sig væk mens loopet ejer farven.
+            - service: input_boolean.turn_on
+              target:
+                entity_id: "{{ flag_entity }}"
+            - if:
+                - condition: template
+                  value_template: "{{ not is_state('light.koekken_lyskaede', 'on') }}"
+              then:
+                - service: light.turn_on
+                  continue_on_error: true
+                  target:
+                    entity_id: light.koekken_lyskaede
+                  data:
+                    brightness_pct: "{{ states('sensor.koekken_lyskaede_target_brightness') | int(40) }}"
+                    hs_color: "{{ palette80[start_idx] }}"
+                    transition: 0.15
+            - repeat:
+                while:
+                  - condition: template
+                    value_template: "{{ is_state(flag_entity, 'on') }}"
+                sequence:
+                  - service: input_number.set_value
+                    target:
+                      entity_id: "{{ idx_entity }}"
+                    data:
+                      value: "{{ (states(idx_entity) | int + idx_step) % 80 }}"
+                  - service: light.turn_on
+                    continue_on_error: true
+                    target:
+                      entity_id: light.koekken_lyskaede
+                    data:
+                      hs_color: "{{ palette80[states(idx_entity) | int] }}"
+                      transition: 0.15
+                  - delay:
+                      milliseconds: 0
+            # 2026-07-31: sætter Manual (som L/R-klik ovenfor) — en bevidst
+            # farve-scroll må ikke overskrives af presence minutter senere.
+            # Driver også nightwalk's manuel-blok-vindue.
+            - service: script.styrbar_stamp_press
+              data:
+                room: stue
+                set_manual: true
+        # === START: hold fired, start while-loop ===
+        - conditions: "{{ trigger.id == 'start' }}"
+          sequence:
+            - variables:
+                # Direction: 'left' = decrement idx, 'right' = increment idx.
+                # L+R hold returnerer til oprindelig idx (samme antal ticks).
+                hold_cmd: "{{ trigger.event.data.command }}"
+                hold_args: "{{ trigger.event.data.args | default([]) }}"
+                direction: >-
+                  {% if hold_cmd == 'arrow_left_hold' %}left
+                  {% elif hold_cmd == 'arrow_right_hold' %}right
+                  {% else %}
+                    {# Older quirk: generic 'hold' command. Direction i args[0].
+                       Common encodings: 3329=L/3328=R, 257=L/256=R, 0=L/1=R. #}
+                    {% set d = hold_args[0] | default(-1) %}
+                    {% if d in [3329, 257, 0, 2, 258] %}left
+                    {% else %}right{% endif %}
+                  {% endif %}
+                # 80-palette: ±4 idx pr tick = 20 visiteringer per cycle.
+                # MÅLT 2026-05-03: HA's interne loop kører initial-burst
+                # ~10 ticks/sek, sustained ~6 ticks/sek (Zigbee throughput
+                # dominerer efter ~5 ticks). Med step 4: sustained = 6×4 =
+                # 24 idx/sek = ~3.2 sek for fuld 80-cycle (user-godkendt).
+                # 18° hue-jump per visit maskeres af 0.15s transition-overlap.
+                idx_step: "{{ -4 if direction == 'left' else 4 }}"
+            - service: logbook.log
+              data:
+                name: "Styrbar L/R hold debug"
+                message: >
+                  room={{ room }} cmd={{ hold_cmd }} args={{ hold_args }}
+                  → direction={{ direction }} idx_step={{ idx_step }}
+            # N1 fix (audit-runde 14): filter group-target til KUN color-capable
+            # lights (hs/xy/rgb modes). Hvis room har mixed color + non-color
+            # bulbs (Innr Tradfri WS = color_temp only), undgaa at sende
+            # hs_color til non-color bulbs hvor de bare ignorerer det mens
+            # cursor avancerer. Cursor og faktisk lys-state ville drift apart.
+            - variables:
+                color_targets: >
+                  {% set ns = namespace(t=[]) %}
+                  {% for l in expand(light_group) %}
+                    {% set modes = l.attributes.supported_color_modes or [] %}
+                    {% if 'hs' in modes or 'xy' in modes or 'rgb' in modes
+                       or 'rgbw' in modes or 'rgbww' in modes %}
+                      {% set ns.t = ns.t + [l.entity_id] %}
+                    {% endif %}
+                  {% endfor %}
+                  {{ ns.t }}
+            # Hvis ingen color-capable lights i rummet: skip palette scroll helt
+            # (gir ingen mening at scrolle paa color_temp-only bulbs).
+            - condition: template
+              value_template: "{{ color_targets | length > 0 }}"
+            - service: input_boolean.turn_on
+              target:
+                entity_id: "{{ flag_entity }}"
+            # Loop indtil flag bliver off (release fyrer separat).
+            # idx_step er +1 (right) eller -1 (left). Python-modulo
+            # haandterer negative tal: -1 % 80 = 79.
+            # Per user-request 2026-05-03 (Q4=Stay): cursor stay'er paa
+            # whatever idx loopet ramte ved release — ingen snap.
+            - repeat:
+                while:
+                  - condition: template
+                    value_template: "{{ is_state(flag_entity, 'on') }}"
+                sequence:
+                  - service: input_number.set_value
+                    target:
+                      entity_id: "{{ idx_entity }}"
+                    data:
+                      value: "{{ (states(idx_entity) | int + idx_step) % 80 }}"
+                  - service: light.turn_on
+                    target:
+                      # Filter to color-only target list (computed once above)
+                      entity_id: "{{ color_targets }}"
+                    data:
+                      hs_color: "{{ palette80[states(idx_entity) | int] }}"
+                      # transition (150ms) overlapper næste tick = bulb
+                      # konstant i transition-state = smooth perception
+                      transition: 0.15
+                  # delay: 0 = køre så hurtigt HA + Zigbee tillader
+                  - delay:
+                      milliseconds: 0
+            - service: script.styrbar_stamp_press
+              data:
+                room: "{{ room }}"
+
+# ----------------------------------------------------------------------------
+# PER-RUM LR GRACE — mode: restart bevarer "grace 2sek efter SENESTE release"
+# ----------------------------------------------------------------------------
+# 5 stk (en per rum) fordi mode: restart skal vaere device-scoped — kan ikke
+# laves universal uden timer-entity hack. Hvert er 12 linjer.
+- id: styrbar_sovevaerelse_lr_grace
+  alias: "Styrbar Sove: L/R grace 2-sek efter release"
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+        command: "release"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.styrbar_lr_grace_sovevaerelse
+    - delay:
+        milliseconds: "{{ states('input_number.lr_grace_milliseconds') | int(2000) }}"
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.styrbar_lr_grace_sovevaerelse
+
+- id: styrbar_stue_lr_grace
+  alias: "Styrbar Stue: L/R grace 2-sek efter release"
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "7e:44:f6:62:8e:f4:b1:23"
+        command: "release"
+  # 2026-10-05 (B193): radio-tilstand ejer stue-fjernbetjeningen.
+  condition:
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.styrbar_stue_radio', 'on') }}"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.styrbar_lr_grace_stue
+    - delay:
+        milliseconds: "{{ states('input_number.lr_grace_milliseconds') | int(2000) }}"
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.styrbar_lr_grace_stue
+
+- id: styrbar_boernevaerelse_lr_grace
+  alias: "Styrbar Boern: L/R grace 2-sek efter release"
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "66:19:44:cc:2c:41:57:fe"
+        command: "release"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.styrbar_lr_grace_boernevaerelse
+    - delay:
+        milliseconds: "{{ states('input_number.lr_grace_milliseconds') | int(2000) }}"
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.styrbar_lr_grace_boernevaerelse
+
+- id: styrbar_terrasse_lr_grace
+  alias: "Styrbar Terrasse: L/R grace 2-sek efter release"
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "f7:11:9c:56:41:50:32:6b"
+        command: "release"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.styrbar_lr_grace_terrasse
+    - delay:
+        milliseconds: "{{ states('input_number.lr_grace_milliseconds') | int(2000) }}"
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.styrbar_lr_grace_terrasse
+
+- id: styrbar_badevaerelse_lr_grace
+  alias: "Styrbar Bad: L/R grace 2-sek efter release"
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "06:0d:3a:e6:10:55:ae:30"
+        command: "release"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.styrbar_lr_grace_badevaerelse
+    - delay:
+        milliseconds: "{{ states('input_number.lr_grace_milliseconds') | int(2000) }}"
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.styrbar_lr_grace_badevaerelse
+
+# FRIGJORT 2026-06-06 — Depot Styrbar afkoblet (FoH/Hue styrer depot nu, se
+# ieee_to_room-blokken ovenfor). Grace-automationen er deaktiveret men bevaret
+# som skabelon: ved gen-tildeling, fjern '#' og ret IEEE + _depot-suffix til rum.
+# - id: styrbar_depot_lr_grace
+#   alias: "Styrbar Depot: L/R grace 2-sek efter release"
+#   mode: restart
+#   trigger:
+#     - platform: event
+#       event_type: zha_event
+#       event_data:
+#         device_ieee: "99:a8:bb:14:4e:71:ce:67"
+#         command: "release"
+#   action:
+#     - service: input_boolean.turn_on
+#       target:
+#         entity_id: input_boolean.styrbar_lr_grace_depot
+#     - delay:
+#         milliseconds: "{{ states('input_number.lr_grace_milliseconds') | int(2000) }}"
+#     - service: input_boolean.turn_off
+#       target:
+#         entity_id: input_boolean.styrbar_lr_grace_depot

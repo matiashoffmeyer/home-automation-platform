@@ -1,0 +1,239 @@
+# =============================================================================
+# El-pris-notifikation: varsel ved høj pris + hvornår den falder igen (2026-06-25)
+# =============================================================================
+# User-ønske: få en push-besked når elprisen er "relativt høj", der OGSÅ fortæller
+# hvornår prisen falder til et bedre niveau igen.
+#
+# DESIGN-VALG (user-spec 2026-06-25):
+#   • "Høj" = spot ≥ X% over rullende 30-dages-gennemsnit (sensor.elspot_30d_gns).
+#     Tilpasser sig sæson automatisk. X = slider elpris_notif_over_gns_pct (default 30).
+#   • "Faldet til bedre niveau" = næste kvarter hvor spot kommer UNDER samme tærskel
+#     igen (= ikke længere "høj"). Tidspunkt + pris med i beskeden.
+#   • Sendes til BEGGE telefoner (mig + Parent B).
+#   • Kun ÉN besked pr. høj-periode (rising edge off→on), ikke spam.
+#   • Stille-vindue 23:00–06:30: ingen push om natten (familie sover). Høje priser
+#     ligger reelt næsten altid i aften/morgen-peaks, så dette koster sjældent noget.
+#
+# PRIS-KILDE: HA-core Nord Pool-integrationen leverer kvarters-priser via action
+# `nordpool.get_prices_for_date` (96 intervaller/døgn, pris i DKK/MWh → /1000 = kr/kWh).
+# Vi henter i DAG + I MORGEN (i morgen kommer ~kl. 13; fejler stille indtil da) og
+# scanner fremad efter første interval under tærsklen. config_entry-id'et er bundet
+# til den nuværende Nord Pool-opsætning — RET det herunder hvis integrationen
+# fjernes/gentilføjes (find via Indstillinger → Enheder & tjenester → Nord Pool).
+#
+# 2026-10-20 (user: "tydelige notifikationer"): prisen står i titlen, beskeden
+# er én sætning med komma-decimaler, og pushen bærer tag elpris_hoej → en ny
+# høj periode ERSTATTER den gamle på telefonen, og elpris_hoej_ryd tager den
+# af igen når prisen er nede. En periode der er slut inden for
+# elpris_notif_min_minutter pushes ikke (målt 15-20/10: 2 af 12 pushes var én
+# kvarters-spids, "om 15 min" — forbi før man har læst den).
+# =============================================================================
+
+input_number:
+  # Hvor langt over 30-dages-gns spot skal være før prisen kaldes "høj".
+  elpris_notif_over_gns_pct:
+    name: "El-pris notifikation: tærskel (% over 30d-gns)"
+    icon: mdi:bell-alert
+    min: 0
+    max: 200
+    step: 5
+    mode: slider
+  # Spring en høj periode over hvis den er slut om under N min (0 = push altid).
+  # Uden morgendagens priser kender vi ikke slutningen → push.
+  elpris_notif_min_minutter:
+    name: "El-pris notifikation: kun hvis høj mindst (min)"
+    icon: mdi:timer-sand
+    min: 0
+    max: 120
+    step: 15
+    unit_of_measurement: min
+    mode: slider
+
+input_boolean:
+  # Kill-switch for hele notifikationen (default ON via init).
+  elpris_notif_enabled:
+    name: "El-pris notifikation aktiv"
+    icon: mdi:bell-ring
+
+template:
+  - trigger:
+      - platform: homeassistant
+        event: start
+      # 2026-07-02 (B46): /5-tick fjernet + elspot_30d_gns-trigger fjernet —
+      # hver fire koster 2 Nord Pool API-kald, og /5 + duplikat-triggers gav
+      # ~800 kald/dag. current_price skifter hvert kvarter (= friskt nok til
+      # naeste_tid-scanningen); gns er AFLEDT af current_price (duplikat-fire).
+      # Time-backstop hvis price-feeden går i stå.
+      - platform: time_pattern
+        hours: "/1"
+        minutes: 2
+      - platform: state
+        entity_id:
+          - sensor.nord_pool_dk2_current_price
+          - input_number.elpris_notif_over_gns_pct
+    action:
+      # Dagens kvarters-priser (96 intervaller, pris i DKK/MWh).
+      # continue_on_error (B46): fejler API'et beholder sensoren sin gamle
+      # state i st.f. at hele action-kæden dør med traceback ('today is
+      # defined'-guarden i detalje håndterer manglende svar).
+      - action: nordpool.get_prices_for_date
+        continue_on_error: true
+        data:
+          config_entry: "01KVFWCZ21H7FFVFY28Q0Z60HA"
+          date: "{{ now().strftime('%Y-%m-%d') }}"
+          areas: DK2
+          currency: DKK
+        response_variable: today
+      # I morgen — fejler stille før priserne er publiceret (~kl. 13).
+      - action: nordpool.get_prices_for_date
+        continue_on_error: true
+        data:
+          config_entry: "01KVFWCZ21H7FFVFY28Q0Z60HA"
+          date: "{{ (now() + timedelta(days=1)).strftime('%Y-%m-%d') }}"
+          areas: DK2
+          currency: DKK
+        response_variable: tomorrow
+    binary_sensor:
+      - name: "Elpris hoj nu"
+        unique_id: elpris_hoj_nu
+        icon: mdi:cash-alert
+        # Høj = 30d-gns kendt OG aktuel spot over tærsklen.
+        state: >-
+          {% set gns = states('sensor.elspot_30d_gns') | float(0) %}
+          {% set pct = states('input_number.elpris_notif_over_gns_pct') | float(30) %}
+          {% set cur = states('sensor.nord_pool_dk2_current_price') | float(0) %}
+          {{ gns > 0 and cur > gns * (1 + pct / 100) }}
+        attributes:
+          # Alt det notifikationen skal bruge — beregnet i ét loop (kr/kWh).
+          detalje: >-
+            {% set gns = states('sensor.elspot_30d_gns') | float(0) %}
+            {% set pct = states('input_number.elpris_notif_over_gns_pct') | float(30) %}
+            {% set cur = states('sensor.nord_pool_dk2_current_price') | float(0) %}
+            {% set thr = gns * (1 + pct / 100) %}
+            {% set t = today.get('DK2', []) if today is defined else [] %}
+            {% set tm = tomorrow.get('DK2', []) if tomorrow is defined else [] %}
+            {% set rows = t + tm %}
+            {% set nowts = now().timestamp() %}
+            {% set ns = namespace(found=none) %}
+            {% for r in rows %}
+              {% if ns.found is none and as_timestamp(r.start, 0) > nowts
+                    and (r.price | float(999999)) / 1000 < thr %}
+                {% set ns.found = r %}
+              {% endif %}
+            {% endfor %}
+            {% if ns.found %}
+              {% set ft = as_datetime(ns.found.start) | as_local %}
+              {{ {'hoej': (gns > 0 and cur > thr), 'taerskel_kr': thr | round(2),
+                  'spot_kr': cur | round(2), 'gns_kr': gns | round(2), 'har_data': true,
+                  'naeste_tid': ft.strftime('%H:%M'),
+                  'naeste_om_min': ((as_timestamp(ns.found.start) - nowts) / 60) | round(0) | int,
+                  'naeste_pris_kr': (ns.found.price / 1000) | round(2)} }}
+            {% else %}
+              {{ {'hoej': (gns > 0 and cur > thr), 'taerskel_kr': thr | round(2),
+                  'spot_kr': cur | round(2), 'gns_kr': gns | round(2), 'har_data': false} }}
+            {% endif %}
+
+automation:
+  - id: elpris_hoej_notifikation
+    alias: "El-pris høj – notifikation til begge telefoner"
+    mode: single
+    trigger:
+      - platform: state
+        id: edge
+        entity_id: binary_sensor.elpris_hoj_nu
+        from: "off"
+        to: "on"
+        for: "00:01:00"
+      # 2026-07-02 (B46): morgen-opsamling — en høj-periode der STARTER i
+      # stille-vinduet (23–06:30) fik aldrig sin edge-push, og ved vindues-
+      # udgang kom der ingen ny edge → ingen besked. Re-tjek ved vinduets
+      # udgang; last_changed-guarden nedenfor sikrer at en peak der allerede
+      # blev pushet i går aftes (edge før 23:00) IKKE pushes igen.
+      - platform: time
+        id: morgen
+        at: "06:30:30"
+    condition:
+      - condition: state
+        entity_id: input_boolean.elpris_notif_enabled
+        state: "on"
+      - condition: or
+        conditions:
+          # Ægte edge i dag-vinduet (stille-vindue 23:00–06:30: familie sover).
+          - condition: and
+            conditions:
+              - condition: template
+                value_template: "{{ trigger.id == 'edge' }}"
+              - condition: time
+                after: "06:30:00"
+                before: "23:00:00"
+          # Morgen-opsamling: stadig høj + perioden startede i stille-vinduet.
+          - condition: and
+            conditions:
+              - condition: template
+                value_template: "{{ trigger.id == 'morgen' }}"
+              - condition: state
+                entity_id: binary_sensor.elpris_hoj_nu
+                state: "on"
+              - condition: template
+                value_template: >-
+                  {{ as_timestamp(states.binary_sensor.elpris_hoj_nu.last_changed, 0)
+                     >= as_timestamp(today_at('23:00') - timedelta(days=1)) }}
+      # 2026-10-20: en kvarters-spids er forbi før man har læst pushen.
+      # naeste_om_min er regnet fra kvarterets start (15, 30, 45 …).
+      - condition: template
+        value_template: >-
+          {% set d = state_attr('binary_sensor.elpris_hoj_nu', 'detalje') %}
+          {% set n = states('input_number.elpris_notif_min_minutter') | int(30) %}
+          {{ d is mapping and (not d.har_data or (d.naeste_om_min | int(0)) >= n) }}
+    action:
+      - variables:
+          d: "{{ state_attr('binary_sensor.elpris_hoj_nu', 'detalje') }}"
+          titel: >-
+            ⚡ Høj elpris: {{ '%.2f' | format(d.spot_kr | float(0)) | replace('.', ',') }} kr/kWh
+          besked: >-
+            {% set over = ((d.spot_kr / d.gns_kr - 1) * 100) | round(0) | int %}
+            {% if d.har_data %}
+            {% set m = d.naeste_om_min | int(0) %}
+            {% set om = (m ~ ' min') if m < 60 else
+                        ((m // 60) ~ ' t' ~ ((' ' ~ (m % 60) ~ ' min') if m % 60 else '')) %}
+            {{ over }} % over 30-dages-snittet. Falder kl. {{ d.naeste_tid }}
+            (om {{ om }}) til ca.
+            {{ '%.2f' | format(d.naeste_pris_kr | float(0)) | replace('.', ',') }} kr/kWh.
+            {% else %}
+            {{ over }} % over 30-dages-snittet, og den holder sig høj resten af
+            døgnet. Morgendagens priser kommer ca. kl. 13.
+            {% endif %}
+      # 2026-07-12: routet via central dispatch (notif_id elpris). Telefon-valg
+      # (Parent A+Parent B default ON) styres nu fra 🔔 Notifikationer-fanen.
+      - action: script.push_notify
+        data:
+          notif_id: elpris
+          title: "{{ titel }}"
+          message: "{{ besked }}"
+          payload:
+            tag: elpris_hoej
+
+  # 2026-10-20: når prisen er nede igen, er "Høj elpris" forkert → tag den af
+  # begge telefoner. clear_notification er ingen besked → uden om push_notify
+  # (samme mønster som plant_notifications.yaml); uden en push er den en no-op.
+  - id: elpris_hoej_ryd
+    alias: "El-pris høj – fjern varslet når prisen er nede"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.elpris_hoj_nu
+        from: "on"
+        to: "off"
+        for: "00:01:00"
+    action:
+      - repeat:
+          for_each:
+            - mobile_app_phone_a
+            - mobile_app_phone_b
+          sequence:
+            - action: "notify.{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                message: clear_notification
+                data:
+                  tag: elpris_hoej

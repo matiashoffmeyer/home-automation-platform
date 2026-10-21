@@ -1,0 +1,388 @@
+# =============================================================================
+# Security Automations — door sensor monitoring
+# =============================================================================
+# Hoveddør (front door) + terrassedør monitoring via Matter Myggbett/Parasoll
+# door sensors (paret 2026-05-05). Smart notifications: kun ved suspekt events,
+# ikke ved hver normal usage.
+#
+# 2026-07-15b (F2-migrering): persistent_notification → script.push_notify
+# (nid `sikkerhed`, helpers + sliders i packages/system_varsler.yaml).
+# Persistent-notifikationerne er FJERNET (F2-risiko: synlige i HA UI for alle
+# med login — reparatør/gæst/AirBnB ser familie-pattern). Logbook-spor består.
+#
+# AUTOMATIONS (6):
+#   0. hoveddoer_stamp_altid (2026-07-18)
+#      - Stamper hoveddoer_last_open ved HVER åbning. Egen automation fordi
+#        stampingen før boede i security_front_door_opened, som er disabled i
+#        AirBnB-lockdown + manuelt i gæsteperioder → stemplet var stalet i
+#        ugevis. Roborocks dør-gate afhænger af det nu. Må ALDRIG i en
+#        lockdown/disable-liste.
+#   1. security_front_door_opened
+#      - Trigger: parasoll_hoveddoer → on.
+#      - Push KUN hvis Dormant (tomt hus = suspekt) OG ikke AirBnB (gæster
+#        ankommer til tomt hus hele tiden). "Ankomst?"-varianten (>30 min
+#        siden sidst, huset Active) er BEVIDST droppet ved push-migreringen
+#        (2026-07-15b) — ville pushe ved hver hjemkomst. Logbook dækker.
+#
+#   2. security_front_door_left_open
+#      - Trigger: hoveddør åben ≥ input_number.sikkerhed_hoveddoer_glemt_minutter
+#      - Push (alle modes — glemt dør er glemt dør; toggle på 🔔-fanen)
+#
+#   3. security_door_dormant_alert (Dormant only, ikke AirBnB)
+#      - Suspekt event: ingen hjemme + terrassedør åbnes = potential intrusion
+#
+#   4. security_altan_door_cold
+#      - Terrassedør åben ≥ slider min + stue-temp < slider °C (varme-tab)
+#      - Ekstra trigger: temp falder UNDER grænsen mens døren allerede er
+#        åben (fejlklasse #4 — flanken kan ske i begge rækkefølger)
+#      - 60 min dedupe-stempel (2026-07-15c): varmen kan holde temp oscillerende
+#        omkring grænsen med åben dør → hvert dyk-under+5min ville re-pushe
+#
+#   5. security_terrasse_door_rain (NY 2026-07-15b)
+#      - Terrassedør åben ≥ slider min MENS binary_sensor.terrasse_regn_aktiv
+#        er on (regn slår ind). Begge flanker dækket (dør-åben-for-N + regn
+#        starter mens døren står åben). 60 min dedupe-stempel (regn-sensoren
+#        kan flappe ved byger).
+#
+# CROSS-CUTTING REFS:
+#   - binary_sensor.parasoll_hoveddoer / parasoll_terrassedoer (Matter)
+#   - input_datetime.hoveddoer_last_open (packages/house_modes.yaml)
+#   - input_select.house_state — gates Dormant-only notifications
+#   - binary_sensor.terrasse_regn_aktiv (packages/terrasse_plug.yaml)
+#   - sliders + notif_sikkerhed_* helpers: packages/system_varsler.yaml
+# =============================================================================
+
+# --- Hoveddør-stempel: altid tændt (må ALDRIG i AirBnB-lockdown-listen) ---
+- id: hoveddoer_stamp_altid
+  alias: "Sikkerhed: Hoveddør-stempel (altid tændt)"
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parasoll_hoveddoer
+      to: "on"
+  action:
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.hoveddoer_last_open
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+# --- Front door opened: push kun ved Dormant (ikke AirBnB) ---
+# Audit-runde 13 fix (O11): tidligere notification ved HVER doer-aabning
+# (= 5-15 spam/dag). Stamp flyttet til hoveddoer_stamp_altid 2026-07-18.
+- id: security_front_door_opened
+  alias: "Sikkerhed: Hoveddør åbnet"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parasoll_hoveddoer
+      to: "on"
+  action:
+    # Altid log + stamp timestamp (også selv om vi ikke pusher)
+    - service: logbook.log
+      data:
+        name: "Hoveddør sikkerhed"
+        message: >
+          Hoveddoer aabnet
+          (house_state={{ states('input_select.house_state') }})
+        entity_id: binary_sensor.parasoll_hoveddoer
+    # Push kun: tomt hus (Dormant) og ikke AirBnB (gæste-ankomster er normale)
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Dormant"
+    - condition: template
+      value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: sikkerhed
+        title: "🚪 Hoveddør åbnet — tomt hus"
+        message: >-
+          Hoveddøren blev åbnet kl. {{ now().strftime('%H:%M') }} mens huset
+          står som tomt (Dormant).
+
+# --- Front door left open: push warning ---
+- id: security_front_door_left_open
+  alias: "Sikkerhed: Hoveddør glemt åben"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parasoll_hoveddoer
+      to: "on"
+      for:
+        minutes: "{{ states('input_number.sikkerhed_hoveddoer_glemt_minutter') | int(10) }}"
+  action:
+    - service: logbook.log
+      data:
+        name: "Hoveddør sikkerhed"
+        message: >
+          Hoveddoer aaben i
+          {{ states('input_number.sikkerhed_hoveddoer_glemt_minutter') | int(10) }}+
+          min — sender push.
+        entity_id: binary_sensor.parasoll_hoveddoer
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: sikkerhed
+        title: "🚪 Hoveddør glemt åben"
+        message: >-
+          Hoveddøren har stået åben i over
+          {{ states('input_number.sikkerhed_hoveddoer_glemt_minutter') | int(10) }}
+          minutter.
+
+# --- Terrassedør åben + kulde: push ---
+- id: security_altan_door_cold
+  alias: "Sikkerhed: Altandør åben i kulde"
+  mode: single
+  trigger:
+    # Dør har været åben N min (temp-condition tjekkes i condition-blok)
+    - platform: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      to: "on"
+      for:
+        minutes: "{{ states('input_number.sikkerhed_kulde_doer_minutter') | int(5) }}"
+    # Temp falder under grænsen MENS døren allerede står åben (fejlklasse #4)
+    - platform: numeric_state
+      entity_id: sensor.indoor_temperature_resilient
+      below: input_number.sikkerhed_kulde_temp_graense
+      for:
+        minutes: 5
+  condition:
+    - condition: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      state: "on"
+    - condition: numeric_state
+      entity_id: sensor.indoor_temperature_resilient
+      below: input_number.sikkerhed_kulde_temp_graense
+    # Ved temp-trigger: kræv at døren har været åben mindst kulde-dør-minutter
+    - condition: template
+      value_template: >-
+        {{ (now().timestamp() -
+            as_timestamp(states.binary_sensor.parasoll_terrassedoer.last_changed, 0))
+           >= states('input_number.sikkerhed_kulde_doer_minutter') | int(5) * 60 - 5 }}
+    # 60 min dedupe (spejler regn-varianten — temp kan flappe omkring grænsen)
+    - condition: template
+      value_template: >-
+        {{ (now().timestamp() -
+            (state_attr('input_datetime.sikkerhed_kulde_doer_sidste_push', 'timestamp') | float(0)))
+           > 3600 }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Altandør sikkerhed"
+        message: >
+          Altandoer aaben + inde-temp under
+          {{ states('input_number.sikkerhed_kulde_temp_graense') | int(18) }}°C
+          (current: {{ states('sensor.indoor_temperature_resilient') }}°C) — push.
+        entity_id: binary_sensor.parasoll_terrassedoer
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: sikkerhed
+        title: "🥶 Altandør åben i kulde"
+        message: >-
+          Altandøren har stået åben i
+          {{ states('input_number.sikkerhed_kulde_doer_minutter') | int(5) }}+ min
+          og inde-temperaturen er nede på {{ states('sensor.indoor_temperature_resilient') }}°C
+          (grænse {{ states('input_number.sikkerhed_kulde_temp_graense') | int(18) }}°C).
+        payload:
+          tag: sikkerhed_kulde_doer
+          actions:
+            - action: "SIKKERHED_SNOOZE:kulde"
+              title: "🔕 Ro 3t (lufter ud)"
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.sikkerhed_kulde_doer_sidste_push
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+# --- Terrassedør åben + gulvvarmen brænder for spurvene: push ---
+# (2026-09-01, user-spec) Søster til security_altan_door_cold ovenfor, men det
+# MODSATTE forløb: dér er inde-temperaturen faldet under grænsen = huset taber
+# kampen mod den åbne dør. Her STIGER badets temperatur mens døren står åben i
+# kulde = gulvvarmen har sat fuldt ind for at kompensere, og varmen går lige ud
+# ad døren. Begge kan i princippet være sande efter hinanden i samme episode;
+# de har hvert sit dedupe-stempel og hver sin tekst, så de ikke maskerer
+# hinanden (fejlklasse #12).
+#
+# BEVISET er at fugten IKKE følger med. Badets TIMMERFLOTTE (node 463) ser tre
+# ting løfte temperaturen: et brusebad, tørretumbleren og gulvvarmen. De to
+# første løfter fugten kraftigt med; gulvvarme er tør varme. Fugt-loftet er
+# derfor hele diskriminatoren — og brusebad-sessionen + tørretumbler-mistanken
+# vetoes eksplicit oveni, så en langsom tumbler-rampe aldrig kan blive
+# rapporteret som gulvvarme-spild.
+#
+# /5-tick i stedet for en flanke: en episode kan begynde længe efter døren blev
+# åbnet (gulvvarmen har termisk træghed), og en flanke + dedupe-stempel ville
+# aldrig re-fyre under et vedvarende forløb (fejlklasse #13).
+- id: security_gulvvarme_spild_aaben_doer
+  alias: "Sikkerhed: Gulvvarmen brænder for spurvene (terrassedør åben)"
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      state: "on"
+    # Døren skal have stået åben et stykke tid — gulvvarme reagerer langsomt.
+    - condition: template
+      value_template: >-
+        {{ (now().timestamp() -
+            as_timestamp(states.binary_sensor.parasoll_terrassedoer.last_changed, 0))
+           >= (states('input_number.sikkerhed_gulvvarme_doer_minutter') | int(15)) * 60 }}
+    # Koldt UDE (ikke inde — det er den anden automations job). Eksplicit
+    # is_number: `| float(99)` på en unavailable sensor ville gøre gaten
+    # stille-falsk for evigt i stedet for at fejle synligt (#9).
+    - condition: template
+      value_template: >-
+        {{ states('sensor.udetemp') | is_number
+           and (states('sensor.udetemp') | float)
+               < (states('input_number.sikkerhed_gulvvarme_ude_temp_graense') | float(12)) }}
+    # Badets temperatur stiger …
+    - condition: template
+      value_template: >-
+        {{ (states('sensor.badevaerelse_temp_stigning') | float(0))
+           >= (states('input_number.sikkerhed_gulvvarme_temp_stigning') | float(0.3)) }}
+    # … mens fugten IKKE gør. Det er hele beviset for at det er tør varme.
+    - condition: template
+      value_template: >-
+        {{ (states('sensor.badevaerelse_fugt_stigning') | float(99))
+           < (states('input_number.sikkerhed_gulvvarme_fugt_loft') | float(2)) }}
+    # Hverken bad eller tumbler i gang (begge ville løfte temperaturen af helt
+    # andre grunde — og tumbleren kan have et fugt-plateau der ligner tør varme).
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_brusebad_hold
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.badevaerelse_tumbler_mistanke
+      state: "off"
+    # 3 t dedupe — længere end kulde-varslets 60 min: en åben dør en hel
+    # sommeraften må ikke give 12 pushes.
+    - condition: template
+      value_template: >-
+        {{ (now().timestamp() -
+            (state_attr('input_datetime.sikkerhed_gulvvarme_spild_sidste_push', 'timestamp') | float(0)))
+           > 10800 }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Gulvvarme-spild"
+        message: >
+          Terrassedoer aaben, ude {{ states('sensor.udetemp') }}°C, bad-temp
+          +{{ states('sensor.badevaerelse_temp_stigning') }}°C/20min mens fugten
+          kun steg {{ states('sensor.badevaerelse_fugt_stigning') }} point/10min
+          = toer varme (gulvvarme kompenserer) — push.
+        entity_id: binary_sensor.parasoll_terrassedoer
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: sikkerhed
+        title: "🐦 Gulvvarmen varmer spurvene"
+        message: >-
+          Terrassedøren har stået åben i
+          {{ states('input_number.sikkerhed_gulvvarme_doer_minutter') | int(15) }}+ min,
+          det er {{ states('sensor.udetemp') }}°C ude — og badets temperatur er
+          steget {{ states('sensor.badevaerelse_temp_stigning') }}°C uden at
+          fugten fulgte med ({{ states('sensor.badevaerelse_fugt_stigning') }}
+          point). Det er gulvvarmen der kører fuldt for at kompensere.
+        payload:
+          tag: sikkerhed_gulvvarme_spild
+          actions:
+            - action: "SIKKERHED_SNOOZE:kulde"
+              title: "🔕 Ro 3t (lufter ud)"
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.sikkerhed_gulvvarme_spild_sidste_push
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+# --- Dormant + terrassedør åbnes: push (ikke AirBnB) ---
+- id: security_door_dormant_alert
+  alias: "Sikkerhed: Dør åbnet under Dormant"
+  description: "Alert when balcony door opens while nobody home"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Dormant"
+    - condition: template
+      value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+  action:
+    - service: logbook.log
+      data:
+        name: "Altandør sikkerhed"
+        message: >
+          ⚠️ Altandoer aabnet under Dormant (ingen hjemme) — sender push.
+        entity_id: binary_sensor.parasoll_terrassedoer
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: sikkerhed
+        title: "🚪 Altandør åbnet — tomt hus"
+        message: >-
+          Altandøren blev åbnet kl. {{ now().strftime('%H:%M') }} mens huset
+          står som tomt (Dormant).
+
+# --- NY: Terrassedør åben mens det regner (regn slår ind) ---
+- id: security_terrasse_door_rain
+  alias: "Sikkerhed: Terrassedør åben i regn"
+  description: >
+    Terrassedøren står åben ≥ slider min mens terrasse_regn_aktiv er on —
+    regn/fugt slår ind. Begge flanker: dør-åben-for-N (regn tjekkes i
+    condition) + regn starter mens døren allerede er åben. 60 min dedupe
+    (regn-sensoren kan flappe ved byger).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      to: "on"
+      for:
+        minutes: "{{ states('input_number.sikkerhed_regn_doer_minutter') | int(10) }}"
+    - platform: state
+      entity_id: binary_sensor.terrasse_regn_aktiv
+      from: "off"
+      to: "on"
+      for:
+        minutes: 3
+  condition:
+    - condition: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.terrasse_regn_aktiv
+      state: "on"
+    # 60 min dedupe
+    - condition: template
+      value_template: >-
+        {{ (now().timestamp() -
+            (state_attr('input_datetime.sikkerhed_regn_doer_sidste_push', 'timestamp') | float(0)))
+           > 3600 }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Altandør sikkerhed"
+        message: "Terrassedoer aaben mens det regner — sender push."
+        entity_id: binary_sensor.parasoll_terrassedoer
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: sikkerhed
+        title: "🌧️ Terrassedør åben i regn"
+        message: >-
+          Terrassedøren står åben og det regner — regnen kan slå ind.
+        payload:
+          tag: sikkerhed_regn_doer
+          actions:
+            - action: "SIKKERHED_SNOOZE:regn"
+              title: "🔕 Ro 3t (lufter ud)"
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.sikkerhed_regn_doer_sidste_push
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"

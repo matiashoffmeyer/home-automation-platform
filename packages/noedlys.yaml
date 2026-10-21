@@ -1,0 +1,387 @@
+# =============================================================================
+# NØDLYS — entré-Styrbaren tænder ALT lys fuldt hvidt og overstyrer alt andet
+# =============================================================================
+# User 2026-10-15: "nødlys hvis der sker en ulykke ... det skal over rule alt."
+# Afgrænset samme dag til ÉN knap: "så gør vi det kun på en bestemt styrbar,
+# entre styrbar" + "langt tryk op og 3 hurtige piletryk og 3 hurtige op tryk
+# skal alle starte nødlys på entre styrbar" — "selv om natten".
+#
+# HVORFOR KUN ENTRÉEN (målt 2026-10-15, 18 døgns zha_event i recorderen):
+# rum-Styrbarernes kort-op/ned er dæmp-TRIN, og 5-8 hurtige tryk på samme knap
+# sker flere gange om ugen (stue 13/10: 8 × ned med 0,35-0,45 s mellemrum; sove
+# 28/9, 6/10, 14/10: 5-6 × ned ved sengetid). En tryk-tæller dér ville tænde
+# huset fuldt hvidt hver gang nogen dæmpede ned. Entré-Styrbaren havde 0 op-tryk
+# og 1 piletryk på de 18 døgn → 3 tryk kolliderer ikke med noget målt.
+#
+# GESTUS (alle tre på 8d:72:8b:88:07:4a:d1:aa, i automations/entre_somrig.yaml):
+#   - TOP langt     ("move_with_on_off")  → direkte (erstatter "tænd alt lux-tilpasset")
+#   - 3 × TOP kort  ("on")                } inden for input_number.noedlys_tryk_vindue_sek,
+#   - 3 × pil       ("press"/"arrow_*")   } talt i ÉN fælles tæller (blandet tæller med)
+# Tælleren ER script.noedlys_tael_tryk og kaldes som det FØRSTE skridt i begge
+# kort-tryk-handlere — så det 3. tryk aldrig når at udføre sin normale handling
+# (dæmp-trin / mode-cyklus) i kapløb med nødlyset. Trykkene der tæller op til 3
+# gør deres normale ting; det er acceptabelt (de tænder højst lidt mere lys).
+#
+# MODE-GATES: INGEN. Hverken godnat, AirBnB eller Home Vacation blokerer — en
+# ulykke rammer også en gæst. Derfor SKAL der være en automatisk udgang
+# (CLAUDE.md AirBnB-regel #2): input_number.noedlys_max_minutter.
+#
+# PRIORITET — samme mekanik som røgalarmen (packages/roegalarm.yaml, 2/2b):
+#   1. Alle rum sættes i Manual → presence-logikken TÆNDER/dæmper ikke ind over
+#      (en presence-turn_on på 30 % fanges ikke af call_service-fangeren, som kun
+#      ser sluk-veje).
+#   2. noedlys_overstyr_interferens: ethvert light.turn_off/toggle,
+#      homeassistant.turn_off eller scene.turn_on → re-assert efter 400 ms.
+#   3. noedlys_loop: re-assert hvert 10. sek (fanger dæmpninger via turn_on).
+#   4. Lange sluk-/fade-scripts stoppes ved start (godnat_fuld m.fl.).
+# "Hvidt" defineres ÉT sted: script.roegalarm_lys_hvidt (ct 4000 K / rgb-hvid /
+# ren brightness pr. pære-type, transition 0 pga. TRADFRI WS 2 %-quirken) — vi
+# genbruger det, så nød- og flugtvejslys aldrig divergerer (fejlklasse #2).
+#
+# Røgalarmen vinder over nødlyset (rødt blink oven på hvidt) — begge maler hvidt,
+# og et tryk på entré-Styrbaren kvitterer røgalarmen uanset hvad.
+#
+# UDGANGE (alle via flaget → noedlys_aflevering):
+#   - kort eller langt NED på entré-Styrbaren (husets "sluk alt") — slukker
+#     nødlyset FØRST og lader derefter sluk-alt køre som normalt
+#   - flaget på Indstillinger → Lys
+#   - automatisk efter noedlys_max_minutter
+# Afleveringen gengiver IKKE lyset fra før (fejlklasse #27): alle rum → Auto,
+# og husets presence-logik overtager derfra.
+# =============================================================================
+
+input_boolean:
+  # Runtime: nødlyset kører. Ingen initial: — skal overleve en restart.
+  noedlys_aktiv:
+    name: "Nødlys aktivt"
+    icon: mdi:alarm-light
+
+input_number:
+  # Automatisk udgang (AirBnB-regel #2). 60 min: længe nok til en ambulance,
+  # kort nok til at en gæst der ramte langt-op ved et uheld ikke sidder i
+  # projektørlys hele aftenen.
+  noedlys_max_minutter:
+    name: "Nødlys: stopper selv efter"
+    min: 5
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:timer-off
+    mode: box
+  # Hvor tæt de 3 tryk skal ligge (første → tredje). 3 s: målte hurtige
+  # gentagne tryk ligger 0,35-1,0 s fra hinanden (2026-10-15), så 3 tryk
+  # tager typisk 0,7-2 s — med margin til panik-fumleri.
+  noedlys_tryk_vindue_sek:
+    name: "Nødlys: 3 tryk inden for"
+    min: 1
+    max: 6
+    step: 0.5
+    unit_of_measurement: "s"
+    icon: mdi:gesture-tap
+    mode: box
+
+input_datetime:
+  # Restart-sikkert stempel til timeouten (last_changed nulstilles ved restart).
+  noedlys_start:
+    name: "Nødlys startet"
+    icon: mdi:clock-alert
+    has_date: true
+    has_time: true
+
+input_text:
+  # Runtime: epoch-stempler for de seneste kort-tryk (op/pil), mellemrums-adskilt.
+  noedlys_tryk:
+    name: "Nødlys: seneste tryk (runtime)"
+    max: 255
+
+script:
+  # ---------------------------------------------------------------------------
+  # TRYK-TÆLLER. Kaldes BLOKERENDE som første skridt af entré-Styrbarens kort-
+  # op- og pil-handlere. `mode: queued` serialiserer op- og pil-tryk der rammer
+  # samtidig (ellers kunne to kald læse samme gamle liste og tabe et tryk).
+  # Når 3. tryk lander, tændes flaget HER, synkront — så kalderen kan læse
+  # flaget lige efter og droppe sin normale handling.
+  # `ts` = zha_event'ets time_fired: en queued kalder (kort-op) kan starte
+  # flere hundrede ms efter trykket, og det er TRYKKETS tid der tæller.
+  # ---------------------------------------------------------------------------
+  noedlys_tael_tryk:
+    alias: "Nødlys: tæl hurtige tryk på entré-Styrbaren"
+    icon: mdi:gesture-tap
+    mode: queued
+    max: 20
+    fields:
+      ts:
+        description: "Trykkets epoch-tid (as_timestamp(trigger.event.time_fired))"
+        required: true
+    sequence:
+      - variables:
+          t_nu: "{{ ts | default(as_timestamp(now())) | float(as_timestamp(now())) }}"
+          vindue: "{{ states('input_number.noedlys_tryk_vindue_sek') | float(3) }}"
+          # Det ledende "t" er bevidst: ét enkelt stempel ville ellers RENDERE
+          # som et tal, som HA native-parser til float — og så har variablen
+          # ingen .split() (Jinja-gotcha, jf. TupleWrapper). "t" → float(0) →
+          # springes over ved næste læsning.
+          liste: >-
+            {% set ns = namespace(t=[]) %}
+            {% for x in states('input_text.noedlys_tryk').split(' ') %}
+              {% set v = x | float(0) %}
+              {% if v > 0 and (t_nu - v) <= vindue and v <= t_nu %}
+                {% set ns.t = ns.t + [v | string] %}
+              {% endif %}
+            {% endfor %}
+            t {{ (ns.t + [t_nu | string]) | join(' ') }}
+          antal: "{{ (liste | string).split(' ') | length - 1 }}"
+      - if:
+          - condition: template
+            value_template: "{{ antal | int(0) >= 3 }}"
+        then:
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.noedlys_tryk
+            data:
+              value: ""
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.noedlys_aktiv
+        else:
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.noedlys_tryk
+            data:
+              value: "{{ liste }}"
+
+automation:
+  # ===========================================================================
+  # 1) START. Flanken på flaget — så tryk-tæller, langt-op og en manuel tænding
+  # fra dashboardet går samme vej. Lyset FØRST (det er det der haster), så
+  # rum-modes, script-stop og varsel.
+  # ===========================================================================
+  - id: noedlys_start
+    alias: "Nødlys: tænd alt lys fuldt hvidt"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_boolean.noedlys_aktiv
+        from: "off"
+        to: "on"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.noedlys_start
+        data:
+          timestamp: "{{ as_timestamp(now()) }}"
+      - service: script.roegalarm_lys_hvidt
+      # Lange fades/sluk-sekvenser der ellers ville dæmpe eller slukke ind over
+      # os via turn_on-kald som fangeren ikke ser. continue_on_error: et script
+      # der ikke findes (omdøbt) må ikke stoppe resten.
+      - service: script.turn_off
+        continue_on_error: true
+        target:
+          entity_id:
+            - script.godnat_fuld
+            - script.sluk_alt
+            - script.entre_ned_sluk_alt
+            - script.gentle_fade_off
+            - script.entre_fade_ud
+            - script.boern_morgen_nedtoning_rampe
+      # Manual = presence-logikken holder fingrene væk (et Styrbar-tryk gør det
+      # samme for ét rum). Afleveringen sætter Auto igen.
+      - service: input_select.select_option
+        target:
+          entity_id: !include ../rosters/alle_rum_mode.yaml
+        data:
+          option: "Manual"
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.house_state
+        data:
+          option: "Active"
+      # Runder #2: fik en sen sluk-vej landet mellem første maling og Manual.
+      - delay:
+          seconds: 2
+      - service: script.roegalarm_lys_hvidt
+      - service: logbook.log
+        data:
+          name: "Nødlys"
+          message: "Startet fra entré-Styrbaren — alt lys fuldt hvidt, alle rum i Manual."
+      - service: persistent_notification.create
+        data:
+          notification_id: noedlys
+          title: "Nødlys tændt"
+          message: >-
+            Alt lys fuldt hvidt. Sluk med kort NED på entré-Styrbaren — eller det
+            stopper selv efter {{ states('input_number.noedlys_max_minutter') | int(60) }} min.
+      # Push direkte (som røgalarmen), ikke via push_notify: en type-toggle
+      # eller et tidsvindue må ikke kunne sluge et ulykkes-varsel. AirBnB =
+      # silent (CLAUDE.md 📲) — telefonen kan være i gæstens hænder.
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+        then:
+          - service: notify.mobile_app_phone_a
+            continue_on_error: true
+            data:
+              title: "🚨 Nødlys tændt"
+              message: >-
+                Nogen startede nødlyset på entré-Styrbaren — alt lys er fuldt
+                hvidt. Slukkes med kort NED på entré-Styrbaren.
+              data:
+                importance: high
+                priority: high
+                ttl: 0
+                tag: noedlys
+          - service: notify.mobile_app_phone_b
+            continue_on_error: true
+            data:
+              title: "🚨 Nødlys tændt"
+              message: >-
+                Nogen startede nødlyset på entré-Styrbaren — alt lys er fuldt
+                hvidt. Slukkes med kort NED på entré-Styrbaren.
+              data:
+                push:
+                  interruption-level: time-sensitive
+                tag: noedlys
+
+  # ===========================================================================
+  # 2) LOOP — re-assert hvert 10. sek. Fanger DÆMPNINGER (turn_on med lavere
+  # brightness), som call_service-fangeren ikke ser. /1-min-triggeren
+  # genstarter loopet efter en HA-restart (en kørende sekvens overlever ikke).
+  # ===========================================================================
+  - id: noedlys_loop
+    alias: "Nødlys: hold alt lys fuldt hvidt"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_boolean.noedlys_aktiv
+        from: "off"
+        to: "on"
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: state
+        entity_id: input_boolean.noedlys_aktiv
+        state: "on"
+    action:
+      - repeat:
+          sequence:
+            - delay:
+                seconds: 10
+            - if:
+                - condition: state
+                  entity_id: input_boolean.noedlys_aktiv
+                  state: "on"
+              then:
+                - service: script.roegalarm_lys_hvidt
+          while:
+            - condition: state
+              entity_id: input_boolean.noedlys_aktiv
+              state: "on"
+
+  # ===========================================================================
+  # 2b) FANGEREN — kopi af roegalarm_overstyr_interferens' mekanik: én
+  # call_service-trigger ser ENHVER sluk-vej i huset uden at kende et entity-
+  # navn. Vi kalder kun turn_on/script, så vi kan ikke trigge os selv. 400 ms
+  # så vores turn_on ikke lander FØR det sluk vi reagerer på.
+  # ===========================================================================
+  - id: noedlys_overstyr_interferens
+    alias: "Nødlys: overstyr alt andet lys øjeblikkeligt"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: light
+          service: turn_off
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: light
+          service: toggle
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: homeassistant
+          service: turn_off
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: scene
+          service: turn_on
+    condition:
+      - condition: state
+        entity_id: input_boolean.noedlys_aktiv
+        state: "on"
+    action:
+      - delay:
+          milliseconds: 400
+      - service: script.roegalarm_lys_hvidt
+
+  # ===========================================================================
+  # 3) AUTOMATISK UDGANG. for:-flanken i drift + /5-backstop på STEMPLET (en
+  # restart giver flaget nyt last_changed → for: alene kunne forlænge for evigt).
+  # ===========================================================================
+  - id: noedlys_timeout
+    alias: "Nødlys: stop automatisk efter max-tid"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_boolean.noedlys_aktiv
+        to: "on"
+        for:
+          minutes: "{{ states('input_number.noedlys_max_minutter') | int(60) }}"
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: input_boolean.noedlys_aktiv
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set ts = state_attr('input_datetime.noedlys_start', 'timestamp') | float(0) %}
+          {% set maks = states('input_number.noedlys_max_minutter') | float(60) * 60 %}
+          {{ ts > 0 and (as_timestamp(now()) - ts) >= maks - 5 }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.noedlys_aktiv
+      - service: logbook.log
+        data:
+          name: "Nødlys"
+          message: >-
+            Stoppet automatisk efter {{ states('input_number.noedlys_max_minutter') }} min.
+
+  # ===========================================================================
+  # 4) AFLEVERING — uanset hvilken udgang der slukkede flaget. Lyset røres
+  # ikke her (NED-udgangen slukker selv bagefter; de andre lader huset
+  # overtage): alle rum → Auto, så presence-logikken gen-evaluerer rummene.
+  # ===========================================================================
+  - id: noedlys_aflevering
+    alias: "Nødlys: aflevér huset til Auto"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.noedlys_aktiv
+        from: "on"
+        to: "off"
+    action:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.noedlys_tryk
+        data:
+          value: ""
+      - service: input_select.select_option
+        target:
+          entity_id: !include ../rosters/alle_rum_mode.yaml
+        data:
+          option: "Auto"
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: noedlys
+      - service: logbook.log
+        data:
+          name: "Nødlys"
+          message: "Slukket — alle rum tilbage i Auto."

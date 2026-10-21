@@ -1,0 +1,109 @@
+# =============================================================================
+# Wake-up Automation - Soveværelse (Adults) - DISABLED audit-runde 19
+# =============================================================================
+# REPLACED med wakeup_alarm_driven.yaml (phone-alarm-driven, 30 min lead).
+# Per user-request 2026-05-04: alarm-driven er mere fleksibelt end fixed-time.
+# Hvis du vil revertere til fixed 05:55: re-enable trigger nedenfor +
+# disable wakeup_alarm_driven.yaml.
+#
+# LEGACY (oprindelig 05:55 hverdage):
+#   05:55 — Phase 1: Very dim warm (5%) starts fading in
+#   05:57 — Phase 2: Medium warm (40%)
+#   06:00 — Phase 3: Bright (80%) + curtains open + godnat ends
+# =============================================================================
+
+- id: wakeup_adults_weekday
+  alias: "Vækning: Voksne kl. 05:55 hverdage [DISABLED]"
+  description: "DISABLED audit-runde 19 — replaced af wakeup_alarm_driven.yaml"
+  mode: single
+  initial_state: false  # disabled by default; alarm-driven version tager over
+  trigger:
+    # Legacy time trigger — disabled. Beholdt så automation kan re-enables
+    # via UI hvis alarm-driven approach fejler.
+    - platform: time
+      at: "05:55:00"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.arbejdsdag
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "Normal"
+    # Someone was in the bedroom recently — check current OR last 30 min
+    # (sensor blips at exactly 05:55 would skip the wakeup otherwise)
+    - condition: template
+      value_template: >
+        {{ is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'on')
+           or (as_timestamp(now()) - as_timestamp(states.binary_sensor.sovevaerelse_apollo_occupancy.last_changed)) < 1800 }}
+    # Skip kunstig sunrise hvis det allerede er lyst (sommer-morgen, sol
+    # staar tidligt op gennem gardin-sprække). Lux > morgen_dagslys_lux (80) = ingen grund til
+    # at simulate sunrise — naturligt lys gor jobbet.
+    - condition: numeric_state
+      entity_id: sensor.sovevaerelse_lux_reel
+      below: input_number.morgen_dagslys_lux
+  action:
+    # Phase 1: Very dim warm light (even during godnat)
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        brightness_pct: 5
+        color_temp_kelvin: 2000
+        transition: 60
+    # Phase 2: Medium warm after 2 min
+    - delay:
+        minutes: 2
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        brightness_pct: 40
+        color_temp_kelvin: 2500
+        transition: 60
+    # Phase 3: At 06:00 — bright + curtains open
+    - delay:
+        minutes: 3
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        brightness_pct: 80
+        color_temp_kelvin: 2700
+        transition: 60
+    # Explicitly end godnat — clear ALL flags so sub-flags don't linger all day
+    # (godnat_auto_clear at 06:00 checks godnat_active first; if this runs
+    # first and clears it, the sub-flags would never be cleared otherwise)
+    - service: input_boolean.turn_off
+      target:
+        entity_id: !include ../rosters/godnat_flag.yaml
+    # Open bedroom curtains partially for privacy (neighbours).
+    # 2026-07-28: position + vindue er slider-styret (var hardcoded 50 % / 60 min
+    # — alarm-versionen brugte allerede vindue-slideren, denne divergerede).
+    # 2026-08-05 (fejlklasse #12): samme lys-før-gardin-rækkefølge som alarm-
+    # versionen. Her ER kl. 06:00 (Phase 3) selve "alarmen", så after_alarm-kravet
+    # er automatisk opfyldt af ventetiden — kun lys-før-gardin skal bruges.
+    - delay:
+        seconds: >-
+          {{ ((states('input_number.global_wakeup_light_before_curtain_minutes')
+               | float(5)) * 60) | int }}
+    # 2026-08-05: snooze-escape ("sov videre") skal også stoppe motoren her, hvis
+    # nogen re-enabler denne legacy-vej. Den har ingen snooze-condition i toppen,
+    # så tjekket her er dens eneste — og motorlarmen er selve klagen.
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+      state: "off"
+    - service: cover.set_cover_position
+      target:
+        entity_id: cover.gardin_sovevaerelse
+      data:
+        position: "{{ 100 - (states('input_number.global_wakeup_curtain_privacy_pct') | int(70)) }}"
+    - delay:
+        minutes: "{{ states('input_number.global_wakeup_curtain_window_minutes') | int(60) }}"
+    # 2026-07-29: bad-gated auto-op (se packages/sove_gardin_bad_gate.yaml).
+    - service: script.sove_gardin_op

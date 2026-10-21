@@ -1,0 +1,645 @@
+# =============================================================================
+# Sove-gardin: bad-tomt-gate på AUTO-oprulning (2026-07-29, user-spec)
+# =============================================================================
+# USER: "auto oprulning af sove gardinet skal først ske når vores obligatoriske
+# bad besøg er ovre, så der skal ha været tomt i badet i 10 min (default) før
+# auto-op kører gardinet over privacy niveauet — for vi går nøgne rundt.
+# Privacy niveauet skal bruges indtil bad aktivitet er væk. Early detect tæller
+# ikke som bad aktivitet."
+#
+# MODEL — ét script som ALLE auto-åbnere kalder i stedet for cover.open_cover:
+#   script.sove_gardin_op
+#     0c. Aftenluk-vinduet åbent (efter solnedgang+N)?    → gør INTET, ingen gæld
+#        (2026-09-03h). Gardinet har lukket sig selv for aftenen.
+#     1. Snooze aktiv (godnat-knappen om morgenen)?      → gør INTET.
+#     2. Manuel-ned-grace / putning holder gardinet?      → gør INTET.
+#     2b. Alarm på vej, eller godnat stadig aktivt?       → gør INTET med motoren,
+#        men husk gælden (2026-08-06). Motorlarmen må aldrig komme før alarmen.
+#     3. Bad ikke tomt længe nok?                         → kør til PRIVACY
+#        (kun hvis gardinet er LAVERE end privacy — et allerede åbent gardin
+#        må aldrig køres NED af en åbne-anmodning) + husk at vi skylder en
+#        fuld oprulning (input_boolean.sove_gardin_op_afventer).
+#     4. Ellers                                           → HELT op.
+#   Når badet så bliver tomt længe nok, fuldfører sove_gardin_op_fuldfoer den
+#   ventende oprulning (fejlklasse #4: en flanke-gate skal have en re-arm).
+#
+# HVORFOR ét script og ikke en condition i hver åbner: sove-gardinet har NI
+# auto-åbnere (vækning Phase 3 + restart-recovery, wakeup_adults, morning_
+# curtains-backstop, godnat_auto_clear, weekend-09:00, godmorgen_auto_detect,
+# hjemkomst ×2). En regel kopieret ni steder divergerer (fejlklasse #2/#16).
+#
+# BAD-AKTIVITET = KUN sensorer INDE i badet (inde-PIR 1+2 og deres union).
+# Entré-valhorn (binary_sensor.entre_valhorn_occupancy) er EARLY-DETECT — den
+# fyrer på bevægelse i entréen, ikke i badet — og tæller derfor IKKE (user-spec).
+# Baddøren tæller heller ikke: den står åben om natten (user-bekræftet), så den
+# er ubrugelig som optaget-signal.
+#
+# unavailable ≠ tomt (fejlklasse #9): en droppet sensor må ikke læses som "badet
+# er tomt". Men badets PIR'er er Matter-sleepy-end-devices der HAR droppet af
+# Thread før (2026-07-23-incidenten) → falder ALLE ud, ville gardinet hænge på
+# privacy for evigt. Kompromis: ignorér de unavailable sensorer, brug resten;
+# er ALLE væk → fail-open (gardinet må op), da et permanent halvt lukket gardin
+# er en værre og mere forvirrende fejltilstand end et tabt privacy-minut.
+#
+# 2026-07-30 (user-spec): "det er jo KUN det aller første bad besøg for en dag
+# hvor vi er nøgne hvor bad besøg skal påvirke sove gardinet." Gaten afvæbnes
+# derfor permanent for resten af dagen så snart dagens første ÆGTE bad-besøg er
+# overstået (input_boolean.sove_gardin_bad_foerste_besoeg_ovre).
+#
+# "ÆGTE besøg" = binary_sensor.badevaerelse_visit_serious (stadie Medium/Fuld,
+# packages/badevaerelse_visit_quality.yaml) der falder tilbage til off — IKKE rå
+# PIR. Grunden er målt: 07-30 flappede badets to inde-PIR'er ~15 gange mellem
+# 15:07 og 16:06 med under 10 min mellemrum (lys slukket, bad-lux 1, aktiv_fase
+# 'ingen', døren åben siden 15:26) = spøgelses-blip, ikke mennesker. Fordi hvert
+# blip nulstiller tomt-timeren kunne den ventende oprulning aldrig fuldføres, og
+# gardinet stod på privacy 30 til 18:00-rydningen. Det var netop symptomet
+# "sove gardin er stuck nede".
+#
+# Nat-toiletbesøg må IKKE bruge dagens billet — så ville morgenens brusebad
+# stå ugated, hvilket er præcis det privacy-tilfælde gaten findes for. Derfor
+# stemples billetten kun når godnat er SLUKKET (= huset er reelt stået op;
+# husets kanoniske "vi sover"-flag, ikke et nyt klokkeslæt), og nulstilles både
+# ved godnat-start og ved midnat (backstop for nætter uden godnat).
+#
+# Flaget kan kun gøre gaten MERE åben: sker stemplingen aldrig (fx et besøg helt
+# uden lys, så stadie-maskinen aldrig nulstilles), falder vi tilbage til den rene
+# tomt-i-N-minutter-logik nedenfor.
+#
+# 2026-08-01 (user-spec): "det bad besøg var ikke langt nok til at tælle som det
+# første morgen besøg. der skal være akkumuleret mere end 5 min aktivitet derinde
+# før det gælder." Dagens billet kræver nu OGSÅ at der er akkumuleret
+# `sove_gardin_bad_min_aktivitet_minutter` (5) bad-aktivitet i de sidste 30 min.
+#
+# HVORFOR: stadie-maskinen måler besøgets KARAKTER (hvilke PIR'er, dør, wasp),
+# ikke dets LÆNGDE — et nat-toiletbesøg kan sagtens nå Medium. 08-01 kl. 05:19
+# tændte et besøg på 52 SEKUNDERS akkumuleret occupancy (05:19:15-39 + 05:19:58-
+# 05:20:26) stadiet Medium; da det faldt til off 05:24:30 blev dagens billet
+# stemplet, og bad-gaten var afvæbnet resten af dagen — selvom morgenens ægte
+# nøgen-besøg slet ikke havde fundet sted endnu. (Grundårsagen til at godnat
+# overhovedet var af kl. 05:07 er fikset separat, se packages/godnat_autooff.yaml;
+# dette er den anden forsvarslinje, og den virker uanset hvem der rydder godnat.)
+#
+# Kalibreret mod 10 dages historik — akkumuleret occupancy i de 30 min før
+# billetten blev stemplet: ægte morgenbesøg 5,9 / 11,4 / 12,1 / 13,5 / 18,9 /
+# 21,4 / 22,6 min mod korte besøg 0,4 / 0,9 / 2,9 min. 5 min ligger i kløften.
+# AKKUMULERET, ikke spændvidde: badets to inde-PIR'er flapper (08-01 gav 71 s
+# spændvidde men kun 52 s reel occupancy), så et span-mål ville overvurdere.
+#
+# Fejler LUKKET (billetten stemples ikke) hvis sensoren mangler: gaten forbliver
+# armeret = gardinet holdes på privacy. Det er den rigtige retning — hele gaten
+# findes for privacy, og prisen for at fejle er et par tabte privacy-minutter,
+# ikke at nogen står nøgen bag et åbent gardin.
+# =============================================================================
+
+input_number:
+  sove_gardin_bad_tomt_minutter:
+    name: "Sove-gardin: bad skal være tomt (min)"
+    icon: mdi:shower-head
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Hvor meget akkumuleret bad-aktivitet (i de sidste 30 min) et besøg skal have
+  # for at bruge dagens billet. Min 1, ikke 0: 0 ville betyde "ethvert besøg
+  # tæller" = præcis den fejl vi lige har fikset.
+  sove_gardin_bad_min_aktivitet_minutter:
+    name: "Sove-gardin: min. bad-aktivitet for dagens billet"
+    icon: mdi:timer-sand
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+input_boolean:
+  sove_gardin_op_afventer:
+    name: "Sove-gardin: fuld oprulning afventer bad"
+    icon: mdi:arrow-up-bold-box-outline
+
+  # Dagens billet er brugt: første ægte bad-besøg efter oppe-tid er overstået →
+  # resten af dagens bad-aktivitet rører ikke gardinet. Intet `initial:` →
+  # overlever restart (off-fallback er den sikre retning: gaten armeres igen).
+  sove_gardin_bad_foerste_besoeg_ovre:
+    name: "Sove-gardin: dagens første bad-besøg er ovre"
+    icon: mdi:shower-head
+
+sensor:
+  # Akkumuleret tid (timer — history_stats' enhed) hvor badet var optaget i de
+  # sidste 30 min. Mønster som sensor.faelles_aktivitet_30min. Union'en bruges,
+  # ikke de to PIR'er hver for sig: de overlapper, så en sum ville dobbelttælle.
+  - platform: history_stats
+    name: "Badevaerelse aktivitet 30min"
+    unique_id: badevaerelse_aktivitet_30min
+    entity_id: binary_sensor.badevaerelse_inde_occupancy
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      minutes: 30
+
+template:
+  - binary_sensor:
+      # now() i templaten → re-render hvert minut, så sensoren tipper inden for
+      # et minut efter badet har været tomt længe nok.
+      # last_changed er gyldig her: occupancy er BINÆR (fejlklasse #14 rammer
+      # kun analoge sensorer der rapporterer løbende).
+      - name: "Sove gardin bad klar"
+        unique_id: sove_gardin_bad_klar
+        icon: mdi:shower
+        state: >-
+          {% if is_state('input_boolean.sove_gardin_bad_foerste_besoeg_ovre', 'on') %}
+          true
+          {% else %}
+          {% from 'rosters.jinja' import bad_occupancy %}{% set roster = bad_occupancy
+                           %}
+          {% set ns = namespace(valid=0, optaget=false, yngste=99999) %}
+          {% for e in roster %}
+            {% set s = states[e] %}
+            {% if s is not none and s.state in ['on','off'] %}
+              {% set ns.valid = ns.valid + 1 %}
+              {% if s.state == 'on' %}
+                {% set ns.optaget = true %}
+              {% else %}
+                {% set age = (now() - s.last_changed).total_seconds() %}
+                {% if age < ns.yngste %}{% set ns.yngste = age %}{% endif %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {% if ns.valid == 0 %}
+            true
+          {% elif ns.optaget %}
+            false
+          {% else %}
+            {{ ns.yngste >= (states('input_number.sove_gardin_bad_tomt_minutter')
+                             | float(10)) * 60 }}
+          {% endif %}
+          {% endif %}
+        attributes:
+          foerste_besoeg_ovre: >-
+            {{ is_state('input_boolean.sove_gardin_bad_foerste_besoeg_ovre', 'on') }}
+          # 5-MIN-KVANTISERET (fejlklasse #24): et now()-afledt attribut med
+          # minut-oplosning skriver en recorder-raekke i minuttet, doegnet rundt.
+          # Forbrugerne er to logbook-linjer; vaerdien rundes NED, saa den altid
+          # er en nedre graense for "badet har vaeret tomt N min".
+          minutter_tomt: >-
+            {% from 'rosters.jinja' import bad_occupancy %}{% set roster = bad_occupancy
+                             %}
+            {% set ns = namespace(optaget=false, yngste=99999) %}
+            {% for e in roster %}
+              {% set s = states[e] %}
+              {% if s is not none and s.state == 'on' %}{% set ns.optaget = true %}
+              {% elif s is not none and s.state == 'off' %}
+                {% set age = (now() - s.last_changed).total_seconds() %}
+                {% if age < ns.yngste %}{% set ns.yngste = age %}{% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ 0 if ns.optaget or ns.yngste == 99999 else ((ns.yngste / 300) | int) * 5 }}
+
+script:
+  # ---------------------------------------------------------------------------
+  # DEN ENESTE VEJ AUTO-LOGIK MÅ ÅBNE SOVE-GARDINET.
+  # Manuelle knap-tryk (Somrig/godmorgen) går UDEN OM — brugerens egen hånd
+  # vinder altid, også over bad-gaten.
+  # ---------------------------------------------------------------------------
+  sove_gardin_op:
+    alias: "Sove-gardin: åbn (auto — bad-gated)"
+    icon: mdi:window-shutter-open
+    mode: single
+    sequence:
+      # 0. AirBnB: INGEN auto-gardin-op overhovedet (2026-08-16d, user-spec
+      # "ingen gardin op automations"). Alle 6 kaldere bærer i dag hver sin
+      # AirBnB-gate — dvs. reglen er kodet 6 steder og divergerer ved den
+      # syvende kalder (fejlklasse #2/#21: en gate der ikke står på hver vej
+      # ind, er pynt). Tragten er stedet: her ejer ÉN linje reglen, og en ny
+      # auto-åbner arver den gratis. Manuelle tryk (Somrig/Styrbar → cover.*
+      # direkte) går bevidst UDEN OM tragten og virker uændret for gæsten.
+      - condition: template
+        value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+      # 0b. DAGENS VÆKNING ER SPRUNGET OVER (2026-08-25, user-spec "ja også
+      # gardin skal stoppes"). Godnat-knappen om morgenen skipper alle tre
+      # alarm-kanaler; men gardinet har auto-åbnere der IKKE hænger på en alarm
+      # — "to personer oppe + bad ovre" rullede op 06:35 selv med
+      # reservevækningen slået fra. Motorlarmen ER en vækning, så et skip der
+      # ikke også stopper motoren er kun et halvt skip.
+      #
+      # Her sættes `sove_gardin_op_afventer` BEVIDST IKKE: user bad om skip,
+      # ikke udskydelse ("ikke bare snoozes"). En gæld ville blive betalt i det
+      # sekund skippet slipper = præcis fejlklasse #19.
+      # Af samme grund er der heller ingen tids-grænse på skippet: en gate der
+      # udløb kl. 12 ville få motoren til at køre 12:00:01. Udgangene er
+      # bevidste handlinger — godmorgen-knappens OP rydder skippet, Somrig
+      # kører motoren direkte uden om tragten, og stemplet udløber ved midnat.
+      - if:
+          - condition: state
+            entity_id: binary_sensor.wakeup_skip_i_dag
+            state: "on"
+        then:
+          - service: logbook.log
+            data:
+              name: "Sove-gardin"
+              message: >-
+                Auto-op afvist: dagens vækning er sprunget over
+                (godnat-knappen kl.
+                {{ state_attr('binary_sensor.wakeup_skip_i_dag', 'sat_kl') }}).
+                Motoren ville selv være en vækning. Tryk OP på godmorgen-knappen
+                — eller kør gardinet manuelt på Somrig.
+              entity_id: cover.gardin_sovevaerelse
+          - stop: "Dagens vækning er sprunget over — motoren rører sig ikke"
+      # 0c. AFTENLUK-VINDUET (2026-09-03h, user-valg): når sove-gardinet har
+      # lukket sig selv N min efter solnedgang, må ingen AUTO-vej rulle det op
+      # igen samme aften. Gaten hører her og ikke i den enkelte åbner: fra ca.
+      # 5. oktober ligger solnedgang+30 før house_state→Active's 19:00-grænse,
+      # så en helt normal hjemkomst kl. 17 i december ville ellers annullere
+      # aftenluk hver hverdag — og der findes ingen anden vej der lukker igen.
+      #
+      # Gælden sættes BEVIDST IKKE (samme grund som 0b, fejlklasse #19): den
+      # ville blive betalt i det sekund vinduet lukker = motoren kører ved
+      # midnat. Vinduet lukker af sig selv efter midnat (`now().hour >= 12`),
+      # så morgenens åbnere — vækning, morning_curtains, godmorgen — er urørte.
+      # Manuelle veje går uden om tragten: Somrig kører motoren direkte, og
+      # godmorgen-knappens lange OP-tryk kalder cover.open_cover selv.
+      # 2026-09-29 (B170, fejlklasse #21): vinduet er ren sol+klokke og ved
+      # intet om kill-switchen → slået fra blokerede det stadig alle åbnere.
+      - if:
+          - condition: state
+            entity_id: binary_sensor.sove_gardin_aftenluk_vindue
+            state: "on"
+          - condition: state
+            entity_id: input_boolean.sove_gardin_aftenluk_enabled
+            state: "on"
+        then:
+          - service: logbook.log
+            data:
+              name: "Sove-gardin"
+              message: >-
+                Auto-op afvist: aftenluk-vinduet er åbent (gardinet lukker/lukkede
+                {{ states('input_number.sove_gardin_aftenluk_offset_min') | int(30) }} min
+                efter solnedgang). Kør det manuelt på Somrig hvis det skal op.
+              entity_id: cover.gardin_sovevaerelse
+          - stop: "Aftenluk-vinduet er åbent — auto-op afvist"
+      # 1. Snooze: soveværelset skal holdes mørkt → rør ikke gardinet.
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+        state: "off"
+      # 2. Manuel-ned-grace / putning.
+      - condition: template
+        value_template: >-
+          {{ 'cover.gardin_sovevaerelse' not in
+             (state_attr('sensor.gardiner_manual_hold', 'held') | default([])) }}
+      # 2b. MOTOREN MÅ IKKE KØRE FØR ALARMEN (2026-08-06, user-spec 08-05).
+      # Motorlarmen er selve vækningen — derfor venter den alarm-drevne vækning
+      # `global_wakeup_curtain_after_alarm_minutes` efter alarmen. Den regel sad
+      # KUN i vækningen, så enhver anden auto-åbner kunne køre motoren før
+      # alarmen (fejlklasse #1: single-owner-designet havde med-ejere). Målt
+      # 08-06: gardinet rullede HELT op 05:53:46 med alarm 06:15 og godnat
+      # stadig aktiv.
+      # Vækningens egen sti rammes ikke: den sætter privacy direkte med
+      # cover.set_cover_position, og dens kald hertil ligger efter
+      # privacy-vinduet (~alarm + 65 min), hvor imminent for længst er af.
+      # Gælden huskes, så oprulningen fuldføres af sove_gardin_op_fuldfoer når
+      # alarmen er gået af / huset er stået op (fejlklasse #4).
+      # 2c. …OG SLET IKKE MENS DER LIGGER NOGEN I SENGEN (2026-08-14,
+      # user-incident). 2b antog at "ingen alarm på vej + godnat ryddet" =
+      # huset er stået op. Begge dele kan være falske samtidig: målt 14/8
+      # ryddede godnat_auto_clear godnat-flaget og kaldte hertil i SAMME
+      # action (så 2b's godnat-tjek var pr. konstruktion blindt), og der var
+      # slet ingen alarm sat — så `wakeup_alarm_imminent` kunne aldrig blive
+      # on. Gardinet rullede helt op 06:00:21 over to sovende voksne.
+      # Rummets EGEN occupancy er det manglende vidne: er den on, ligger der
+      # nogen, og motoren er så selve vækningen. Vinduet er begrænset til før
+      # 12:00 fordi Apolloen kan latche on (fejlklasse #20) — en latch må
+      # kunne koste en morgen-oprulning, ikke hele dagens.
+      # NB: dette gør IKKE morgen-backstoppen overflødig (den kræver TOMT i
+      # N min); her afvises kun det positive bevis "nogen er her nu".
+      - if:
+          - condition: or
+            conditions:
+              - condition: state
+                entity_id: binary_sensor.wakeup_alarm_imminent
+                state: "on"
+              - condition: state
+                entity_id: input_boolean.godnat_active
+                state: "on"
+              - condition: and
+                conditions:
+                  - condition: state
+                    entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+                    state: "on"
+                  - condition: time
+                    before: "12:00:00"
+              # 2d. …OG HELLER IKKE PÅ ET FRAVÆR DER KUN ER ET SENSOR-HUL
+              # (2026-08-29, user-incident "utilgiveligt"). 2c afviser det
+              # POSITIVE bevis "nogen er her nu" — men sove-Apolloen taber en
+              # stille krop i 5-17 min ad gangen, så `off` er ikke et fravær.
+              # Målt natten til 29/8 med begge voksne i sengen: off-huller på
+              # 7,3 / 11,2 / 13,6 min. Backstoppens tom-krav stod på 5 min =
+              # langt under støjgulvet, så motoren kørte 06:15:00 og occupancy
+              # kom retur 06:15:38.
+              # Ingen tids-tærskel kan skille en sovendes off-hul fra et tomt
+              # rum (permanent faktum). Derfor kræves om morgenen et POSITIVT
+              # bevis for at nogen er STÅET OP, på en kanal radaren ikke kan
+              # tie ihjel: enten dør-zone-afgangen (`..._to_oppe`) eller en
+              # vækning der faktisk kørte færdig i dag. Er ingen af delene sket,
+              # er motoren selv den første vækning → udskyd.
+              # Fejler LUKKET: et usat/1970-stempel giver "ingen vækning i dag".
+              # Sikkerhedsventil: gaten slipper efter 12:00, og
+              # sove_gardin_op_fuldfoer's /15-tick betaler gælden (fejlklasse #4).
+              - condition: and
+                conditions:
+                  - condition: time
+                    before: "12:00:00"
+                  - condition: state
+                    entity_id: binary_sensor.sove_alarm_morgen_to_oppe
+                    state: "off"
+                  - condition: template
+                    value_template: >-
+                      {% set r = state_attr('input_datetime.wakeup_alarm_ramp_faerdig_at',
+                                            'timestamp') | float(0) %}
+                      {{ not (r > 0 and r >= today_at('04:00').timestamp()) }}
+              # 2e. …OG SLET IKKE MENS DØREN STÅR LUKKET (2026-08-30e, user-spec
+              # "en lukket dør skal om morgenen holde det mørkt derinde").
+              # 2c/2d er begge udledt af radaren og deler dens svaghed: de kan
+              # kun gætte på om der ligger nogen. Døren er en HANDLING, og den er
+              # derfor det eneste af de fire kriterier her der ikke kan lyve.
+              # Den er bevidst et VETO oven i 2c/2d, ikke en erstatning: en åben
+              # dør beviser ikke at rummet er tomt, kun at ingen har bedt om
+              # mørke. `binary_sensor.sove_doer_moerkhold` ejer unavailable- og
+              # tids-reglen ét sted (packages/sove_alarm_morgen.yaml), så gaten
+              # ikke divergerer mellem sine to forbrugere (#2).
+              - condition: state
+                entity_id: binary_sensor.sove_doer_moerkhold
+                state: "on"
+        then:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.sove_gardin_op_afventer
+          - service: logbook.log
+            data:
+              name: "Sove-gardin"
+              message: >-
+                Auto-op udskudt: motoren må ikke køre
+                {% if is_state('binary_sensor.sove_doer_moerkhold', 'on') %}
+                mens soveværelsets dør står lukket — en lukket dør om morgenen
+                betyder at nogen vil sove videre
+                {% elif is_state('binary_sensor.wakeup_alarm_imminent', 'on') %}
+                {{ state_attr('binary_sensor.wakeup_alarm_imminent', 'minutter_til_alarm') | int(0) }}
+                min før alarmen
+                {% elif is_state('input_boolean.godnat_active', 'on') %}
+                mens godnat stadig er aktivt
+                {% elif is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'on') %}
+                mens soveværelset stadig er optaget (nogen ligger i sengen)
+                {% else %}
+                før nogen er bevist stået op i dag — rummet melder ganske vist
+                tomt, men sove-radaren taber en stille krop i op mod 17 min, så
+                det er ikke et fravær. Venter på dør-zone-afgang eller en vækning
+                {% endif %}
+                — larmen ville være selve vækningen. Oprulningen fuldføres
+                bagefter.
+              entity_id: cover.gardin_sovevaerelse
+          - stop: "Alarm på vej / huset sover — motoren venter"
+      - variables:
+          privacy_pos: >-
+            {{ 100 - (states('input_number.global_wakeup_curtain_privacy_pct') | int(70)) }}
+          # float→round→int, ikke `| int` direkte: `"30.0" | int(0)` giver 0
+          # (Jinja-fælden fra apollo_gate_decay). -1 = ukendt position.
+          pos: >-
+            {% set p = state_attr('cover.gardin_sovevaerelse', 'current_position') %}
+            {{ (p | float(-1)) | round(0) | int if p is not none else -1 }}
+      - choose:
+          # 3. Badet er klar → helt op, og gælden er betalt.
+          - conditions:
+              - condition: state
+                entity_id: binary_sensor.sove_gardin_bad_klar
+                state: "on"
+            sequence:
+              - service: cover.open_cover
+                continue_on_error: true
+                target:
+                  entity_id: cover.gardin_sovevaerelse
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.sove_gardin_op_afventer
+        # 4. Bad-aktivitet (eller lige-tomt) → privacy, og husk oprulningen.
+        default:
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ pos | int(-1) < 0 or pos | int(-1) < (privacy_pos | int(30)) - 5 }}
+            then:
+              - service: cover.set_cover_position
+                continue_on_error: true
+                target:
+                  entity_id: cover.gardin_sovevaerelse
+                data:
+                  position: "{{ privacy_pos | int(30) }}"
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.sove_gardin_op_afventer
+          - service: logbook.log
+            data:
+              name: "Sove-gardin"
+              message: >-
+                Auto-op holdt på privacy: badet har været tomt
+                {{ state_attr('binary_sensor.sove_gardin_bad_klar', 'minutter_tomt') | int(0) }} min
+                (kræver {{ states('input_number.sove_gardin_bad_tomt_minutter') | int(10) }}).
+                Ruller helt op når badet er tomt længe nok.
+              entity_id: cover.gardin_sovevaerelse
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Dagens billet: stemples når dagens FØRSTE ægte bad-besøg er overstået.
+  # ---------------------------------------------------------------------------
+  - id: sove_gardin_bad_foerste_besoeg_slut
+    alias: "Sove-gardin: dagens første bad-besøg er ovre → afvæbn bad-gaten"
+    description: >
+      binary_sensor.badevaerelse_visit_serious (stadie Medium/Fuld) faldt til off
+      = det committede besøg er slut. Er godnat af (huset er stået op), er det
+      dagens nøgen-besøg → resten af dagens bad-aktivitet må ikke holde
+      sove-gardinet på privacy.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_visit_serious
+        from: "on"
+        to: "off"
+    condition:
+      # Nat-toilet under godnat bruger ikke dagens billet — så ville morgenens
+      # brusebad stå ugated.
+      - condition: state
+        entity_id: input_boolean.godnat_active
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.sove_gardin_bad_foerste_besoeg_ovre
+        state: "off"
+      # LÆNGDE-krav (2026-08-01, user-spec): stadiet siger hvad slags besøg det
+      # var, ikke hvor længe det varede. Uden dette brugte et 52-sekunders
+      # nat-toiletbesøg dagens billet. Fejler LUKKET: kan sensoren ikke læses
+      # (0-default) stemples billetten ikke, og gaten bliver stående armeret.
+      - condition: template
+        value_template: >-
+          {{ (states('sensor.badevaerelse_aktivitet_30min') | float(0)) * 60
+             >= (states('input_number.sove_gardin_bad_min_aktivitet_minutter')
+                 | float(5)) }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.sove_gardin_bad_foerste_besoeg_ovre
+      - service: logbook.log
+        data:
+          name: "Sove-gardin"
+          message: >-
+            Dagens første bad-besøg er overstået
+            ({{ ((states('sensor.badevaerelse_aktivitet_30min') | float(0)) * 60) | round(1) }} min
+            akkumuleret) → bad-gaten afvæbnet resten af dagen (senere
+            bad-aktivitet holder ikke længere gardinet på privacy).
+          entity_id: cover.gardin_sovevaerelse
+
+  # Synlighed når et besøg IKKE var langt nok — ellers er den eneste observerbare
+  # effekt "der skete ingenting", som er umuligt at fejlsøge bagudrettet.
+  - id: sove_gardin_bad_besoeg_for_kort
+    alias: "Sove-gardin: bad-besøg for kort til dagens billet (log)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_visit_serious
+        from: "on"
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.godnat_active
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.sove_gardin_bad_foerste_besoeg_ovre
+        state: "off"
+      - condition: template
+        value_template: >-
+          {{ (states('sensor.badevaerelse_aktivitet_30min') | float(0)) * 60
+             < (states('input_number.sove_gardin_bad_min_aktivitet_minutter')
+                | float(5)) }}
+    action:
+      - service: logbook.log
+        data:
+          name: "Sove-gardin"
+          message: >-
+            Bad-besøg slut, men kun
+            {{ ((states('sensor.badevaerelse_aktivitet_30min') | float(0)) * 60) | round(1) }} min
+            akkumuleret aktivitet (kræver
+            {{ states('input_number.sove_gardin_bad_min_aktivitet_minutter') | int(5) }})
+            → dagens billet IKKE brugt, bad-gaten er stadig armeret.
+          entity_id: cover.gardin_sovevaerelse
+
+  - id: sove_gardin_bad_foerste_besoeg_nulstil
+    alias: "Sove-gardin: nulstil dagens bad-billet (godnat / midnat)"
+    description: >
+      Gaten armeres igen til næste morgens nøgen-besøg. Godnat-start er det
+      primære anker (dagen slutter når vi går i seng); midnat er backstop for
+      nætter hvor godnat aldrig blev aktiveret.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.godnat_active
+        to: "on"
+      - platform: time
+        at: "00:00:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.sove_gardin_bad_foerste_besoeg_ovre
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.sove_gardin_bad_foerste_besoeg_ovre
+
+  # Re-arm (fejlklasse #4): fuldfør den ventende oprulning når badet bliver klar.
+  - id: sove_gardin_op_fuldfoer
+    alias: "Sove-gardin: fuldfør ventende oprulning når badet er tomt"
+    description: >
+      En auto-åbner blev holdt på privacy fordi badet var i brug. Når badet har
+      været tomt længe nok (input_number.sove_gardin_bad_tomt_minutter) ruller
+      gardinet resten af vejen op. /15-backstop dækker tilfældet hvor flanken
+      falder mens en anden betingelse blokerer.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.sove_gardin_bad_klar
+        from: "off"
+        to: "on"
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: state
+        entity_id: input_boolean.sove_gardin_op_afventer
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.sove_gardin_bad_klar
+        state: "on"
+      # Dag-vindue: en ventende oprulning må aldrig fyre om aftenen/natten.
+      - condition: time
+        after: "04:00:00"
+        before: "18:00:00"
+      - condition: state
+        entity_id: input_boolean.godnat_active
+        state: "off"
+      # Samme tre vetoer som scriptet (snooze + skip + manuel-hold) — scriptet
+      # tjekker dem selv, men vi undgår støjende no-op-kald. Uden skip-tjekket
+      # her ville /15-backstoppen logge "den ventende oprulning fuldføres" hvert
+      # kvarter til 18:00 på en dag hvor motoren aldrig kommer til at køre.
+      - condition: state
+        entity_id: binary_sensor.wakeup_skip_i_dag
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+        state: "off"
+      # Samme grund som de tre ovenfor: uden dør-tjekket her ville /15-backstoppen
+      # love en oprulning hvert kvarter på en morgen hvor døren holder mørket.
+      - condition: state
+        entity_id: binary_sensor.sove_doer_moerkhold
+        state: "off"
+      # Samme grund igen: dag-vinduet ovenfor slutter 18:00, men i december
+      # åbner aftenluk-vinduet allerede 16:07 — uden dette tjek ville /15-
+      # backstoppen love en oprulning hvert kvarter i det hul, som scriptets
+      # gate 0c så afviser.
+      # Spejler gate 0c inkl. kill-switchen (fejlklasse #2).
+      - condition: template
+        value_template: >-
+          {{ not (is_state('binary_sensor.sove_gardin_aftenluk_vindue', 'on')
+                  and is_state('input_boolean.sove_gardin_aftenluk_enabled', 'on')) }}
+      - condition: template
+        value_template: >-
+          {{ 'cover.gardin_sovevaerelse' not in
+             (state_attr('sensor.gardiner_manual_hold', 'held') | default([])) }}
+    action:
+      - service: logbook.log
+        data:
+          name: "Sove-gardin"
+          message: >-
+            Badet tomt i {{ state_attr('binary_sensor.sove_gardin_bad_klar', 'minutter_tomt') | int(0) }} min
+            → den ventende oprulning fuldføres.
+          entity_id: cover.gardin_sovevaerelse
+      - service: script.sove_gardin_op
+
+  # Ryd gælden ved godnat / dag-slut, så en gammel ventende oprulning ikke
+  # pludselig fyrer i morgen tidlig (eller kæmper mod et bevidst lukket gardin).
+  - id: sove_gardin_op_afventer_ryd
+    alias: "Sove-gardin: ryd ventende oprulning (godnat / 18:00)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.godnat_active
+        to: "on"
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+        from: "off"
+        to: "on"
+      - platform: time
+        at: "18:00:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.sove_gardin_op_afventer
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.sove_gardin_op_afventer

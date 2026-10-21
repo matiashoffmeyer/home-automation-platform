@@ -1,0 +1,646 @@
+# =============================================================================
+# Stue Presence Lights
+# =============================================================================
+# Open-plan room (~11m) bruger TWO Apollo MSR-2 sensors:
+#   - stue_apollo: covers sofa stue + koekken area (south/middle of open-room)
+#   - spisestue_apollo: covers spisestue + boernevaerelse adjacency (north)
+#
+# Open plan occupied = either sensor reports occupancy
+# Open plan clear    = BOTH sensors clear simultaneously for 20+ min
+#
+# Hold-alive modes (NEVER overridden): cirkus_active, cinema_active,
+# kalde_active, godnat_pending, godnat_active.
+#
+# Splittet ud fra presence_lights.yaml 2026-05-05 (Phase 2 refactor).
+# =============================================================================
+
+- id: presence_light_stue_on
+  alias: "Lysnet: Spisestue tænd"
+  # 2026-06-19 (user-spec): spisestue-loftet er DINING-zonens lys og må KUN
+  # styres af spisebords-Apolloen — IKKE af sofa-/køkken-presence (stue_apollo).
+  # Sofa-zonen har nu sin egen presence (presence_light_sofa_on nedenfor).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+      from: "off"
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-06-10 (opg 4): Manual mode = bruger har selv indstillet lyset i
+    # app/Styrbar — auto-tænd holder fingrene væk indtil drift-back → Auto.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_spisestue', 'Manual') }}"
+    # B216 (user-spec 2026-10-11): morgen 04-12 efter en nat med børn må loftet
+    # kun tænde på spisestue-Apolloen. Egen trigger = Apolloen → altid OK; et
+    # kald via automation.trigger (entré-morgenvelkomsten 10/8 06:21, dance-/
+    # mode-genoptag) skal selv kunne vise spisestue-Apolloen — filtreret ELLER
+    # rå bevægelse, så putnings-hurtigvækningen (rå move) stadig virker.
+    # Søstre: godnat_adult_nightwalk, arrival_welcome_light (grep B216).
+    - condition: template
+      value_template: >-
+        {{ trigger is defined
+           or not (now().hour >= 4 and now().hour < 12
+                   and is_state('input_boolean.boern_sov_her_i_nat', 'on'))
+           or is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'on')
+           or is_state('binary_sensor.spisestue_apollo_radar_moving_target', 'on') }}
+    # 2026-06-23 (user-spec): robot-spærre gælder nu KUN når huset er Dormant
+    # (binary_sensor.roborock_blokerer_lys). Er huset Active må robottens motion
+    # gerne tænde lys — KUN early-detect spærres (se early-detect-rummene).
+    # Dormant-wake er robot-filtreret centralt i house_state_to_active.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    # 2026-05-05 fix: gate på godnat-union.
+    # 2026-05-23 fix: tilfojet morgen-override 06-12. Real-life lørdag
+    # 2026-05-23: Parent A op weekend morgen, Parent B sover videre. Strict
+    # gate blokerede stue-light → kan ikke bruge huset uden manuel godmorgen.
+    # Ny logic: tillad common-rum light i morgenvindue 06-12 selv hvis
+    # godnat-flag stadig on. Bedrooms (sove/børn) beholder strict gate via
+    # deres egne automations → partner forbliver beskyttet i søvn.
+    # Aften (21-06) bevarer block (godnat_night handler dim red).
+    # 2026-06-06 fix: godnat_any_active → godnat_common_active. Børne-putning
+    # (godnat_boern_active) må IKKE blokere stuen for de voksne der er oppe;
+    # kun voksen-/fuld-godnat + pending + kalde blokerer fælles-rum.
+    - condition: template
+      value_template: >
+        {{ is_state('binary_sensor.godnat_common_active', 'off')
+           or is_state('binary_sensor.godnat_faelles_morgen_fri', 'on') }}
+    # 2026-08-13g (Sleep Over): gæst sover i open-plan → INTET natlys her, heller
+    # ikke i 6-12-morgenundtagelsen ovenfor. Ét delt anker, se packages/sleepover.yaml.
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_stue
+      state: "off"
+    # 2026-09-04e (user-spec): AFTENLYS sol-gaten er FJERNET her og i
+    # presence_lux_stue_on (fejlklasse #2: de to skal følges ad). Den var
+    # tilføjet 2026-07-03 som VETO oven på lux. Spisestuen er VESTVENDT og
+    # bliver mørk FØR solen når tærsklen: målt 04/9 lå rummet på 17-20 lx
+    # (tærskel 85) fra ~18:47 med solen på 7,4-7,7° mod aftenlys_sol_elevation
+    # = 5,0 → begge veje vetoet, og lyset kom først 18:56 via
+    # presence_openplan_moerk_indedag_on. Rummets egen målte lux bestemmer nu.
+    # 2026-10-16 (S1a): sol-gaten er også fjernet på sofa-vejene
+    # (presence_light_sofa_on + presence_lux_sofa_on) — ingen vej har den mere.
+    # NB konsekvens: gaten er nu ren lux hele døgnet, så spisestue-loftet kan
+    # også tænde midt på dagen når kanalen er under 85 lx — mere tilladeligt
+    # end mørk-indedag-vejens egen grænse (open_plan_mork_indedag_lux_gate).
+    # 2026-07-27 (user-spec): spisestue-loftet gates nu på spisestuens EGEN lux-
+    # tærskel (input_number.spisestue_lux_threshold) mod spisestuens EGEN sensor
+    # (sensor.spisestue_lux_reel, fallback open_plan) — SEPARAT fra stue. FØR
+    # sammenlignede den open_plan_lux mod sensor.stue_lux_gate = spisestuen var
+    # reelt "inkluderet i stue". Rå lx (IKKE global-faktor/dag-skaleret) — samme
+    # kilde+tærskel som måltids-spiselyset (maaltid_detektion.yaml, fejlklasse #2).
+    # 2026-07-08 (#6, user-spec): UNDER GODNAT gates spisestue-loftet KUN på solens
+    # position (input_number.godnat_spisestue_sol_elevation, default -6°), IKKE lux
+    # ("og kun det"). Rettede "spisestue tænder under godnat selvom der ikke er
+    # mørkt" — sove-Apollo bag nedrullet gardin læste kunstigt lav lux → lux-gaten
+    # passerede. Udenfor godnat er lux-gaten uændret (bortset fra egen-tærskel).
+    - condition: template
+      value_template: >-
+        {% if is_state('binary_sensor.godnat_common_active', 'on')
+              and not is_state('binary_sensor.godnat_faelles_morgen_fri', 'on') %}
+          {{ is_state('binary_sensor.godnat_spisestue_sol_under_graense', 'on') }}
+        {% else %}
+          {# 2026-09-03b: sensor.spisestue_dagslys_lx = spisestuens EGEN Apollo,
+             men målt sidst open-plannet var mørkt (lyskæden lyser ind i den).
+             Skal blive ved med at være SAMME kilde+tærskel som måltids-
+             spiselyset i packages/maaltid_detektion.yaml (fejlklasse #2). #}
+          {% set raw = states('sensor.spisestue_dagslys_lx') %}
+          {% set lux = (raw | float) if raw not in ['unknown','unavailable','none','']
+                       else (states('sensor.open_plan_lux') | float(50)) %}
+          {{ lux < (states('input_number.spisestue_lux_threshold') | float(150)) }}
+        {% endif %}
+    # NEW (audit-runde 5): kun fyr hvis stue-loft er off — re-entry til
+    # open-plan skal IKKE overskrive manuelt sat brightness. Hvis I sidder
+    # ved hyggelampe og stue-loft er off pa formaal, undgaa at det tendes
+    # når en person bevaeger sig ved sensor.
+    - condition: state
+      entity_id: light.spisestue_loft
+      state: "off"
+    # 2026-06-16: entré NED-grace blokerer relight i 5 min (hele huset).
+    - condition: state
+      entity_id: input_boolean.entre_shutdown_grace
+      state: "off"
+  action:
+    # 500ms delay + light=off re-check: kort debounce, og spring over hvis
+    # lyset allerede blev tændt manuelt i mellemtiden. transition: 3 = smooth fade.
+    - delay:
+        milliseconds: 500
+    - condition: state
+      entity_id: light.spisestue_loft
+      state: "off"
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_loft
+      data:
+        # Light Aggressiveness factor (Phase 2 sprint 2026-05-07)
+        # 2026-06-29 BUG-fix (user-spec): dæmpet natlys gælder KUN når godnat er
+        # trykket (= bruger er gået i seng), IKKE bare "sol nede". Tidligere
+        # elev<0 dæmpede også mørke vinter-aftener/middagsselskaber til 1%.
+        # Nu: godnat ON → RÅ dæmpet natlys (1%); ellers normal lux-baseret styrke.
+        # 2026-07-02 (user-valg, review): morgen-override 06-12 = normalt
+        # dagsniveau, IKKE natlys (1% var usynligt → undtagelsen ubrugelig).
+        brightness_pct: >
+          {% if is_state('binary_sensor.godnat_common_active', 'on')
+                and not is_state('binary_sensor.godnat_faelles_morgen_fri', 'on') %}
+            {{ states('input_number.spisestue_natlys_brightness') | int(8) }}
+          {% else %}
+            {{ states('input_number.spisestue_auto_brightness') | int(60) }}
+          {% endif %}
+        # Godnat = ekstra varm 2000K natlys; ellers spisestue auto-farve-slider.
+        color_temp_kelvin: >
+          {% if is_state('binary_sensor.godnat_common_active', 'on')
+                and not is_state('binary_sensor.godnat_faelles_morgen_fri', 'on') %}2000
+          {% else %}{{ states('input_number.spisestue_auto_kelvin') | int(2700) }}{% endif %}
+        # 2026-10-07 (user-spec "blid ramp som køkken"): mens entré-velkomsten
+        # venter (packages/openplan_entre_velkomst.yaml — open plan tændes FØR
+        # nogen er der) rampes i køkkenets langsomme morgen-tempo. 2026-10-08:
+        # + mørk morgen × slider. Reglen bor i sensoren (#2), ikke her.
+        transition: "{{ states('sensor.open_plan_fade_ind_effektiv') | int(3) }}"
+
+# =============================================================================
+# Sofa-zone presence (2026-06-19, user-spec) — sofa-lamperne tænder selv
+# =============================================================================
+# Hidtil tændte INGEN automation sofa-lamperne ud fra bevægelse — kun spisestue-
+# loftet + læsehygge fulgte presence. Bruger forventede at sofa-zonen tænder af
+# sig selv (måtte tænde manuelt). Nu: sofa-Apolloen (stue_apollo, dækker sofa +
+# køkken-område) tænder alle 5 sofa-lys (begge sofalamper + hjørnelampe + hygge-
+# plug + læsehygge) = samme sæt som Styrbar højre-klik. Slukker når sofa-zonen
+# har været tom i sofa-slideren × global sluk-speed (default 20 min).
+# Respekterer Manual + samme gates som spisestuen.
+# =============================================================================
+- id: presence_light_sofa_on
+  alias: "Lysnet: Sofa-stue tænd"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.stue_apollo_occupancy_filtered
+      from: "off"
+      to: "on"
+    # 2026-10-08 (user-spec: "stue lyset må om morgenen gerne tænde ved apollo
+    # køkken eller entre bevægelse også, det ser mørkt ud det hjørne" + "det er
+    # kun for mørke morgener"). Målt 08/10: user i køkkenet 06:34-06:40, men
+    # sofa-hjørnet var mørkt til stue-radaren fik et blip 06:37:38. Kun på en
+    # mørk morgen (binary_sensor.open_plan_mork_morgen) — se conditionen.
+    # Sluk-siden (presence_light_sofa_off) lader de samme to holde zonen tændt.
+    - platform: state
+      entity_id:
+        - binary_sensor.koekken_apollo_occupancy_filtered
+        - binary_sensor.entre_valhorn_occupancy
+      from: "off"
+      to: "on"
+      id: moerk_morgen_nabo
+  variables:
+    sofa_lights: !include ../rosters/stue_sofa_lys.yaml
+    # 2026-07-31: LUKSUS-BLOK (mønster A, packages/luksus_lys.yaml). Er el-prisen
+    # høj, tændes de sofa-lys der står i light.luksus_lys ikke — resten af zonen
+    # tænder som normalt. Gruppen er single source of truth, så listen skal ikke
+    # vedligeholdes her. `sofa_lights` bruges UÆNDRET til "er zonen helt slukket"-
+    # tjekket nedenfor: en manuelt tændt hyggelampe skal stadig tælle som "zonen
+    # er i brug". Counterfactual: packages/luksus_besparelse.yaml.
+    # AIRBNB (user-valg 2026-07-31): en GÆST får den fulde sofa-zone — vi
+    # påtvinger ikke husets spare-optimeringer på nogen der ikke kender husets
+    # escape-veje. Derfor Normal/Home Vacation, ikke `!= AirBnB` (house_mode har
+    # TRE options). Samme gate som counterfactualet i luksus_besparelse.yaml.
+    # 2026-10-17: hyggelampe-fravalg (app-sluk af kun den) → zonen tænder
+    # uden den, til sessionen er slut (packages/stue_plug.yaml). ⚠️ SAMME regel
+    # i presence_stue.yaml og presence_lights.yaml — ret begge (#2).
+    sofa_on_targets: >-
+      {% set l = (sofa_lights | reject('in', state_attr('light.luksus_lys', 'entity_id') or []) | list)
+         if (is_state('binary_sensor.luksus_lys_elpris_block', 'on')
+             and states('input_select.house_mode') in ['Normal', 'Home Vacation'])
+         else sofa_lights %}
+      {{ l | reject('eq', 'light.stue_plug') | list
+         if is_state('input_boolean.stue_hyggelampe_fravalgt', 'on') else l }}
+    # 2026-10-11 (user-spec: "læselampen op på det niveau jeg har sat den til nu
+    # om morgenen og hyggelampen på 40w skal ikke være en del af morgen
+    # programmet"): på en mørk morgen tænder zonen UDEN pluggen, og læselampen
+    # går på morgen-slideren (morgenrampe_stue_pct — samme mål som rampen; sat
+    # til hans 60 % = 153/254, som han stillede i hånden 11/10 06:09). Kun
+    # familie: en gæst får den fulde sofa-zone (luksus-valget ovenfor).
+    # ⚠️ SAMME regel i presence_lux_sofa_on (presence_lights.yaml) — ret begge (#2).
+    morgen: >-
+      {{ is_state('binary_sensor.open_plan_mork_morgen', 'on')
+         and states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+  condition:
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_stue', 'Manual') }}"
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_stue
+      state: "off"
+    - condition: template
+      value_template: >
+        {{ is_state('binary_sensor.godnat_common_active', 'off')
+           or is_state('binary_sensor.godnat_faelles_morgen_fri', 'on') }}
+    # 2026-10-08: køkken/entré-vejen kun på en mørk morgen (04-12, godnat ryddet,
+    # open plan under velkomstens lux-gate), kun familie (samme valg som entré-
+    # velkomsten: en gæst får ikke husets morgen-rutine), og ikke når robotten ER
+    # bevægelsen (roborock.md). `trigger is defined`: velkomst og re-arm
+    # kvitterer hertil via automation.trigger (ha_yaml.md).
+    # 2026-10-09 (user: "selvom vi er i køkkenet skal stuerne holdes lyse og
+    # hyggeligt" → 17:07 "det er for mørkt herinde ret det!"): KØKKENET tænder nu
+    # zonen hele dagen — sluk-siden holdt den allerede, men intet tændte den
+    # igen efter en sluk mens I stod i køkkenet. Entréen kun på en mørk morgen
+    # som før. Mørke-beviset er stadig sol-/indedag-gaten + lux-gaten nedenfor.
+    - condition: template
+      value_template: >-
+        {{ (trigger.id if trigger is defined else '') != 'moerk_morgen_nabo'
+           or ((is_state('binary_sensor.open_plan_mork_morgen', 'on')
+                or trigger.entity_id == 'binary_sensor.koekken_apollo_occupancy_filtered')
+               and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+               and states('vacuum.s8_maxv_ultra') not in ['cleaning', 'returning']) }}
+    # 2026-08-13g (Sleep Over): sofa-zonen ER gæstens seng — hold den mørk.
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    # 2026-10-03: den automatiske Sofa Zen ejer sofa-zonen → ingen auto-tænd på
+    # normalt aftenniveau oven i scenen (packages/sofa_zen_auto.yaml; holderen er
+    # afledt, så et hængende flag aldrig kan spærre zonen).
+    - condition: state
+      entity_id: binary_sensor.sofa_zen_holder_sofa
+      state: "off"
+    # 2026-10-16 (S1a, user-valg): AFTENLYS sol-gaten er FJERNET her og i
+    # presence_lux_sofa_on (#2: de to følges ad) — som spisestue-vejene 09-04e.
+    # Historik: 07-03 veto (sol < aftenlys_sol_elevation 5°); 09-12 blødt op
+    # til et fallback med open_plan_mork_indedag + `not day` som ekstra grene.
+    # Selv blødt op vetoede proxyen en MÅLT mørk stue: om dagen kunne kun
+    # indedag-grenen åbne (køkkenets < 15 lx i 10 min), ikke stuens egen
+    # dag-tærskel. Målt 9/10-16/10: stuen sad optaget under sin tærskel i
+    # 50 min (≈ 7 min/døgn) uden lys; 11/10 17:21 13,7 lx mod gate 24,7, lys
+    # først efter 5¼ min. Prisen er ≈ 7 min/døgn mere sofa-lys i dagslys, mest
+    # ved 30-41,5 lx. Lux-gaten nedenfor er nu eneste krav, hele døgnet.
+    # Day-aware lux (mirror spisestue): kun tænd hvis reelt mørkt nok.
+    - condition: template
+      value_template: >-
+        {% set lux = states('sensor.open_plan_lux') | float(50) %}
+        {{ lux < (states('sensor.stue_lux_gate') | float(40)) }}
+    - condition: state
+      entity_id: input_boolean.entre_shutdown_grace
+      state: "off"
+    # Kun hvis HELE sofa-zonen er slukket — respektér delvist manuelt sat lys.
+    - condition: template
+      value_template: "{{ sofa_lights | select('is_state', 'on') | list | length == 0 }}"
+  action:
+    - delay:
+        milliseconds: 500
+    - condition: template
+      value_template: "{{ sofa_lights | select('is_state', 'on') | list | length == 0 }}"
+    # Luksus-blokken kan have tømt listen (kun hvis ALLE fem er luksus) → intet at tænde.
+    - condition: template
+      value_template: "{{ sofa_on_targets | count > 0 }}"
+    # 2026-10-13 (user-spec: "på mørke morgener må ilden i stuen gerne starte op
+    # lige før du forudser vi går ind i open plan … i starten skal læselampen
+    # holdes slukket og så skal den fade langsomt ind over 15 min"): ilden
+    # tænder sofa-zonen, læselampen fader ind når nogen er inde
+    # (packages/stue_ild_morgen.yaml). ⚠️ SAMME omdirigering i presence_lux_sofa_on (presence_lights.yaml) — ret begge (#2).
+    - if:
+        - condition: template
+          value_template: "{{ morgen and is_state('binary_sensor.stue_ild_morgen_mulig', 'on') }}"
+      then:
+        - service: script.turn_on
+          target:
+            entity_id: script.stue_ild_morgen
+        - stop: "Mørk morgen: ilden tænder sofa-zonen"
+    - service: light.turn_on
+      target:
+        # FILM (user-bug 2026-08-23): sad man i sofaen mens projektoren kørte,
+        # tændte denne vej på normalt aftenniveau — 20:19:45 midt i filmen.
+        # De tre andre open-plan tænd-veje fik `filmmoerke_stue off` som hård
+        # blok 08-19e; denne blev overset (fejlklasse #12/#16). User vil IKKE
+        # blokeres — "det skulle ha været mere dim pga projektoren" — så vi
+        # dæmper i stedet. light.stue_plug er onoff (39 W glødepære, kan ikke
+        # dæmpes) og ryger derfor ud af listen: den ville være rummets
+        # kraftigste lyskilde midt i filmen.
+        entity_id: >-
+          {{ sofa_on_targets | reject('eq', 'light.stue_plug') | list
+             if is_state('binary_sensor.filmmoerke_stue', 'on') or morgen
+             else sofa_on_targets }}
+      data:
+        # Cozy sofa-niveau (lavere end loft-task-lys). Plug-lamper (onoff)
+        # ignorerer CT/brightness — harmløst. Læsehygge er fra 2026-07-02 en
+        # Innr-farvepære og følger CT'en (før: IKEA brightness-only).
+        brightness_pct: >
+          {% set lux = states('sensor.open_plan_lux') | float(50) %}
+          {% set elev = state_attr('sun.sun', 'elevation') | float(0) %}
+          {# 2026-09-28 (user: "det er det her niveau jeg vil ha" — læsehygge
+             80 %, spots 100 %, sat i hånden 19:23 ved skyder 70). Auto gav
+             40 × 1,74 = 70 %. Alle fire trin × 80/70 → 46/63/52/40, så auto
+             rammer 80 % ved skyder 70 (faktor 3,0 × el-pris 0,58). #}
+          {% if elev < 0 %}{% set base = 46 %}
+          {% elif lux < (states('input_number.lux_trin_moerkt') | float(5)) %}{% set base = 63 %}
+          {% elif lux < (states('input_number.lux_trin_dunkelt') | float(20)) %}{% set base = 52 %}
+          {% else %}{% set base = 40 %}{% endif %}
+          {# 2026-09-28 (user-spec): loft på skyder-delen, el-pris EFTER
+             ("fast max på 80% for auto-lys. el-pris må gerne tage den ned").
+             Kun læselampen er et levende sofa-lys; de tre skabs-pærer og
+             onoff-pluggen deler kaldet og er uden betydning. #}
+          {% set sb = state_attr('sensor.global_brightness_factor', 'base') | float(1.0) %}
+          {% set pf = [states('sensor.elpris_dim_factor') | float(1.0), 1.0] | min %}
+          {% set loft = states('input_number.stue_laeselampe_auto_max_pct') | float(80) %}
+          {% set pct = [([base * sb, loft] | min * pf) | round(0) | int, 2] | max %}
+          {# 2026-10-11: mørk morgen → hans morgen-niveau (se `morgen` ovenfor),
+             under samme loft og el-pris-dæmpning. #}
+          {% if morgen %}
+            {% set m = states('input_number.morgenrampe_stue_pct') | float(60) %}
+            {% set pct = [([m, loft] | min * pf) | round(0) | int, 2] | max %}
+          {% endif %}
+          {% if is_state('binary_sensor.filmmoerke_stue', 'on') %}
+            {{ [pct, states('input_number.predark_dim_pct') | int(20)] | min }}
+          {% else %}{{ pct }}{% endif %}
+        color_temp_kelvin: "{{ states('sensor.auto_color_temp_evening') | int(2700) }}"
+        # 2026-10-07/08: velkomstens rampe + mørk morgen — se presence_light_stue_on.
+        transition: "{{ states('sensor.open_plan_fade_ind_effektiv') | int(3) }}"
+
+- id: presence_light_spisestue_off
+  alias: "Lysnet: Spisestue gradvis sluk"
+  description: >
+    2026-06-19 (user-spec): spisestue-loftet slukker når spisebords-Apolloen
+    har været tom i input_number.spisestue_off_minutter (default 20) × global
+    sluk-speed. 2026-07-22: + SOFA-gated hurtig-sluk på ¼ af den tid (optaget
+    sofa + tomt spisebord = flyttet til sofaen) og en /5 restart-proof backstop,
+    fordi loftet stadig hang mens familien sad i sofaen (edge-flanker armerede
+    ikke efter et HA-restart).
+  mode: restart
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ states('sensor.spisestue_off_sekunder') | int(1200) }}"
+    # 2026-07-12 (fejlklasse #4 — re-arm mod FORÆLDRELØSE tændinger): velkomst-
+    # lyset (airbnb_dormant_to_active_entre "comfort welcome") + power-recovery
+    # m.fl. kan tænde spisestue-loftet MENS occupancy allerede er off → den rene
+    # off→-flanke ovenfor armerer aldrig, og loftet brændte til watchdog'en (5h)
+    # for AirBnB-gæster natten 2026-07-11. Denne template-trigger fyrer når
+    # loftet har stået tændt i et TOMT rum (occupancy off) i rummets sluk-tid — uanset
+    # HVORDAN det blev tændt. Occupancy on nulstiller timeren (gæst ved bordet
+    # forstyrres ikke).
+    - platform: template
+      value_template: >-
+        {{ is_state('light.spisestue_loft', 'on')
+           and is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'off') }}
+      for:
+        seconds: "{{ states('sensor.spisestue_off_sekunder') | int(1200) }}"
+    # 2026-07-22 (user-spec: "spisestue lys har hængt mens vi sad i sofaen"):
+    # SOFA-gated hurtig-sluk. Er sofa-zonen (stue_apollo) optaget mens
+    # spisebordet (spisestue_apollo) har været tomt i ¼ af sluk-tiden = man er flyttet fra
+    # bordet til sofaen → sluk spiselyset uden at vente den fulde 20-min room-
+    # tomme (den holdt loftet tændt mens familien sad i sofaen).
+    - platform: state
+      entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ states('sensor.spisestue_sofa_off_sekunder') | int(300) }}"
+      id: moved_to_sofa
+    # 2026-07-22 (fejlklasse #4/#15 — RESTART-proof backstop): et HA-restart mens
+    # loftet er tændt nulstiller `for:`-flankerne (de armerer IKKE fra en startup-
+    # transition) → loftet hang til godnat (bevist 2026-07-22: off-automationen
+    # havde ikke fyret siden 07-13 trods 45 min tomt spisebord; house_state/timers
+    # blev nulstilt 19:49:59). Denne /5-scan re-evaluerer uafhængigt af flanker,
+    # med varigheden tjekket via last_changed i condition nedenfor.
+    - platform: time_pattern
+      minutes: "/5"
+      id: backstop
+  condition:
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_stue
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.kalde_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.godnat_pending
+      state: "off"
+    # 2026-07-04 (måltids-detektion): mens spiselyset er aktivt ejer måltids-
+    # flowet spisestue-loftet — den 20-min room-tomme-sluk må ikke dræbe
+    # hyggelyset før HELE open-plan-området er tomt (maaltid_spiselys_off_tomt).
+    - condition: state
+      entity_id: input_boolean.maaltid_spiselys_aktiv
+      state: "off"
+    # 2026-08-19 (user-spec: "manuel, også fra app, skal persiste 3 t"): et
+    # manuelt tryk/app-kald i stuen holder lyset i room_manual_on_hold_hours.
+    # Denne automation måler kun Apolloens tomhed — og den stod off mens user
+    # sad ved bordet 08-18 21:05, så /5-backstoppen slukkede hans lampe 5 min
+    # efter hver tænding. Holdet slipper af sig selv når huset er tomt.
+    - condition: state
+      entity_id: binary_sensor.stue_manuel_lys_hold
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+      state: "off"
+    - condition: state
+      entity_id: light.spisestue_loft
+      state: "on"
+    # 2026-10-09 (user: "vi er mange hjemme og selvom vi er i køkkenet skal
+    # stuerne holdes lyse og hyggeligt"): køkkenet holder spisestue-loftet —
+    # optaget, eller tomt i mindre end rummets egen sluk-tid. Spejl af sofa-
+    # søsterens køkken-hold nedenfor (#2/#12). Gælder også moved_to_sofa: stue-
+    # Apolloen dækker køkken-enden, så "flyttet til sofaen" kan være køkkenet.
+    # unavailable holder ikke (#9). Re-arm: /5-backstoppen (#4).
+    - condition: template
+      value_template: >-
+        {% set k = states.binary_sensor.koekken_apollo_occupancy_filtered %}
+        {{ not (is_state('binary_sensor.godnat_common_active', 'off')
+                and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+                and k is not none
+                and (k.state == 'on'
+                     or (k.state == 'off' and (now() - k.last_changed).total_seconds()
+                         < states('sensor.spisestue_off_sekunder') | int(1200)))) }}
+    # 2026-07-22: trigger-specifik varighed/sofa-gyldighed. moved_to_sofa kræver
+    # sofaen optaget (ellers er man gået helt ud → den fulde 20-min/backstop tager
+    # den). backstop tjekker varigheden via last_changed: hurtig-sluk-tiden hvis
+    # sofaen er optaget (flyttet til sofa), ellers den fulde. Edge-flankerne
+    # bærer selv varigheden → true.
+    - condition: template
+      value_template: >-
+        {% set t = states.binary_sensor.spisestue_apollo_occupancy_filtered.last_changed %}
+        {% set empty_for = (now() - t).total_seconds() if t is not none else 0 %}
+        {% set sofa = is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on') %}
+        {% if trigger.id == 'moved_to_sofa' %}
+          {{ sofa }}
+        {% elif trigger.id == 'backstop' %}
+          {{ empty_for >= (states('sensor.spisestue_sofa_off_sekunder') | int(300)
+                           if sofa else
+                           states('sensor.spisestue_off_sekunder') | int(1200)) }}
+        {% else %}
+          true
+        {% endif %}
+  action:
+    - service: light.turn_off
+      target:
+        entity_id: light.spisestue_loft
+      data:
+        transition: "{{ states('sensor.fade_extended_effective') | int(60) }}"
+
+- id: presence_light_sofa_off
+  alias: "Lysnet: Sofa-stue gradvis sluk"
+  description: >
+    2026-06-19: sofa-lamperne slukker når sofa-Apolloen (stue_apollo) har været
+    tom i input_number.stue_sofa_off_minutter (default 20) × global sluk-speed.
+    Læsehygge inkluderet (flyttet hertil fra spisestue-flowet).
+  mode: restart
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.stue_apollo_occupancy_filtered
+      from: "on"
+      to: "off"
+      for:
+        seconds: "{{ states('sensor.sofa_stue_off_sekunder') | int(1200) }}"
+    # 2026-07-12 (fejlklasse #4 — re-arm mod forældreløse tændinger, spejler
+    # spisestue-fixet): AirBnB power-recovery + sofa-plug-mirror kan tænde
+    # sofa-lys MENS stue-occupancy allerede er off → off→-flanken ovenfor
+    # armerer aldrig. Fyrer når et sofa-lys har stået tændt i tom stue i sluk-tiden.
+    # (Eksplicitte is_state-kald = entity-tracking i template-triggeren.)
+    - platform: template
+      value_template: >-
+        {{ is_state('binary_sensor.stue_apollo_occupancy_filtered', 'off')
+           and (is_state('light.stue_sofa_lampe', 'on')
+                or is_state('light.stue_sofa_lampe_2', 'on')
+                or is_state('light.stue_hjoernelampe', 'on')
+                or is_state('light.stue_plug', 'on')
+                or is_state('light.stue_laesehygge', 'on')) }}
+      for:
+        seconds: "{{ states('sensor.sofa_stue_off_sekunder') | int(1200) }}"
+    # 2026-09-23 (user-bug 21/09: "sofa stuen tændt trods lang tids tomhed"):
+    # RE-ARM (fejlklasse #4). Begge triggere ovenfor fyrer ÉN gang pr. tom-
+    # periode — 20:58 var de blokeret af manuel-holdet (app-tænd 20:17), og
+    # fra 21:20 af cinema_active. Da blokeringerne slap, var flanken for længst
+    # brugt, og lyset brændte til user slukkede selv 21:41. Nu re-evalueres
+    # når en blokering slipper (+ /10-backstop); tom-tiden måles i conditionen.
+    - platform: state
+      entity_id: binary_sensor.stue_manuel_lys_hold
+      from: "on"
+      to: "off"
+    - platform: state
+      entity_id: input_boolean.cinema_active
+      from: "on"
+      to: "off"
+    - platform: state
+      entity_id: binary_sensor.mood_pause_stue
+      from: "on"
+      to: "off"
+    # 2026-10-03: Sofa Zen slipper sofa-zonen → re-evaluér tom-tiden (samme re-arm
+    # som mood-pausen; flanken er brugt mens holderen var on, #4/#19).
+    - platform: state
+      entity_id: binary_sensor.sofa_zen_holder_sofa
+      from: "on"
+      to: "off"
+    - platform: time_pattern
+      minutes: "/10"
+  variables:
+    sofa_lights: !include ../rosters/stue_sofa_lys.yaml
+  condition:
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_stue
+      state: "off"
+    # 2026-10-03: Sofa Zen holder sofa-zonen (re-arm-triggeren står ovenfor).
+    - condition: state
+      entity_id: binary_sensor.sofa_zen_holder_sofa
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.kalde_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.godnat_pending
+      state: "off"
+    # Samme manuel-hold som spisestue-søsteren (#12 — de deler fysik og skal
+    # dele beskyttelse).
+    - condition: state
+      entity_id: binary_sensor.stue_manuel_lys_hold
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.stue_apollo_occupancy_filtered
+      state: "off"
+    # Tom LÆNGE NOK — for re-arm-triggerne. For for:-triggerne er den sand pr.
+    # konstruktion. last_changed nulstilles ved restart → udskyder kun slukket
+    # (den sikre retning).
+    - condition: template
+      value_template: >-
+        {{ (as_timestamp(now())
+            - as_timestamp(states.binary_sensor.stue_apollo_occupancy_filtered.last_changed))
+           >= (states('sensor.sofa_stue_off_sekunder') | int(1200)) }}
+    # 2026-10-08 (user-spec, spejl af køkken/entré-tændingen i presence_light_sofa_on):
+    # om morgenen holder køkkenet og entréen også zonen tændt — ellers tændte
+    # køkkenet sofaen, og /10-backstoppen slukkede den igen (stue-radaren har
+    # været tom i timer). Målt 08/10: velkomsten tændte 06:21, backstoppen
+    # slukkede 06:30 mens user var på badet, og hjørnet var mørkt da user stod i
+    # køkkenet 06:34. Samme tom-tid som rummets egen, målt fra den SENESTE af de
+    # to. Gaten er MORGEN-vinduet (04-12, godnat ryddet), ikke lux: ved daggry
+    # krydser open_plan_lux 32 lx længe før dagslys-sluk, og så ville hjørnet gå
+    # i sort mens du står i køkkenet. Dagslyset slukker via sin egen vej.
+    # unavailable holder IKKE lyset (#9: en blind entré-kanal må ikke brænde
+    # zonen til middag) — så gælder rummets egen regel. Ingen ny trigger: /10-
+    # backstoppen ovenfor re-evaluerer når køkken/entré er blevet tomme (#4).
+    # 2026-10-09 (user: "vi er mange hjemme og selvom vi er i køkkenet skal
+    # stuerne holdes lyse og hyggeligt"): KØKKENET holder nu zonen HELE dagen,
+    # ikke kun om morgenen; entréen kun i morgen-vinduet som før. Samme hold
+    # står på spisestue-søsteren ovenfor (#2/#12 — ret begge).
+    - condition: template
+      value_template: >-
+        {% if is_state('binary_sensor.godnat_common_active', 'off')
+              and states('input_select.house_mode') in ['Normal', 'Home Vacation'] %}
+          {% set graense = states('sensor.sofa_stue_off_sekunder') | int(1200) %}
+          {% set ns = namespace(holder=false) %}
+          {% for s in expand(['binary_sensor.koekken_apollo_occupancy_filtered']
+                             + (['binary_sensor.entre_valhorn_occupancy']
+                                if 4 <= now().hour < 12 else [])) %}
+            {% if s.state == 'on'
+                  or (s.state == 'off' and (now() - s.last_changed).total_seconds() < graense) %}
+              {% set ns.holder = true %}
+            {% endif %}
+          {% endfor %}
+          {{ not ns.holder }}
+        {% else %}
+          true
+        {% endif %}
+    - condition: template
+      value_template: "{{ sofa_lights | select('is_state', 'on') | list | length > 0 }}"
+  action:
+    - service: light.turn_off
+      target:
+        entity_id: "{{ sofa_lights }}"
+      data:
+        transition: "{{ states('sensor.fade_extended_effective') | int(60) }}"
+
+# =============================================================================
+# 2026-07-02: 'stue_laesehygge_ghost_poll' + 'stue_laesehygge_phantom_off'
+# FJERNET. De var workarounds for IKEA TRADFRI-pærens off-with-transition-
+# fantom + power-blip-glød. Pæren er fysisk udskiftet med Innr RB 282 C
+# (farve, ex "Køkken Loft"); IKEA'en ligger i skabet som light.reserve_hvid_1.
+# GENINDFØR reaper+poll (se git-historik) hvis IKEA-pæren sættes i brug igen —
+# reaperen må IKKE køre mod Innr-pæren (den kan legitimt dæmpes < bri 3).
+# =============================================================================

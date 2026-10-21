@@ -1,0 +1,239 @@
+# =============================================================================
+# Terrasse MORGENLYS — pærelyskæden 20 % når det er mørkt om morgenen og der er
+# nogen i open plan (2026-10-02, user-spec)
+# =============================================================================
+# User: "du må også gerne sætte lyskæden udenfor på terassen til at tænde på 20%
+# når det er mørkt om morgenen og der er nogen i open plan."
+#
+# DEFINITIONER (målt 18/9-2/10, ikke gættet):
+# - MORGEN = 04-12 OG godnat_active off. Godnat er husets egen "nu er det
+#   morgen"-autoritet (knap, auto-detect eller 06:00-clear; målt 05:49-07:24).
+#   De tre tidlige open-plan-blip i målingen (04:45, 04:50, 05:01) lå ALLE mens
+#   godnat stadig var aktiv → natture holdes ude gratis.
+# - MØRKT = sol under input_number.terrasse_morgenlys_sol_elevation (default
+#   −4° = samme grænse som dusk-tændingen bruger for "mørkt nok til at kæden
+#   ses"). Slukker når solen passerer den.
+# - NOGEN I OPEN PLAN = binary_sensor.open_plan_occupied_frisk (morning_
+#   curtains.yaml): samme spørgsmål som morgen-gardinerne stiller ("er familien
+#   vågnet i open plan?"), og den maskerer en latchet stue-Apollo (35 t målt).
+#   Den er IKKE selv morgen-begrænset (frisk hele aftenen) → tidsvinduet ovenfor
+#   er bærende. Omvendt er den altid off FØR 06:00 − morning_curtain_frisk_grace_
+#   minutter (default 05:30), så morgenlyset tidligst tænder dér.
+# - SLUK også når open plan har været i ro (binary_sensor.open_plan_occupied off)
+#   i terrasse_lys_nat_ro_minutter — samme slider og samme logik som
+#   nat-auto-sluk (G). Hysterese: tænd kræver ophold NU, sluk kræver N min ro.
+#
+# EJERSKAB (fejlklasse #3/#27): reglen slukker KUN en kæde den selv har tændt
+# (input_boolean.terrasse_morgenlys_ejer). Er kæden allerede tændt (Styrbar,
+# app), tager den ikke ejerskab. Slukker NOGEN ANDEN kæden mens vi ejer den
+# (Styrbar bund, app, stikkontakten = unavailable, godnat, regn/Dormant), er det
+# et valg: ingen ny auto-tænd resten af den morgen (terrasse_morgenlys_respekt).
+# Vores egen sluk rydder ejer-flaget FØR kaldet, så detektoren ikke ser den.
+#
+# GATES (spejlet fra dusk-tændingen C, fejlklasse #12): kun familie-modes
+# (Normal + Home Vacation — en gæst får ingen familie-rutine), Active, vinter-
+# kill-switch, sleepover i open plan, mood-pause, luksus-elpris-blok, manuel
+# plug-hold. Pluggen tændes ALDRIG herfra (controlleren A ejer den — regn/
+# Dormant/hold) → kæden skal være 'off' (strøm på), ikke 'unavailable'.
+# Re-arm (#4): kæden kommer tilbage fra unavailable (regn slut), godnat
+# slukker, og en /5-backstop (restart, slugte flanker).
+#
+# DUSK-TÆNDINGEN (C) fik samtidig en morgen-spærre (ikke kl. 04-12): dens re-arm-
+# triggere (regn ophører / huset Active) fyrede også om morgenen under −4°
+# (18/9 06:24 → dekorative 40-90 %), hvilket ville overtrumfe de 20 % her.
+#
+# AirBnB: kun-familie → 0 for en gæst. Ejer-flaget rydder sig selv (sluk-
+# grenen er IKKE mode-gatet), så intet til flag-clear-listerne. Luksus-
+# besparelsen tæller bevidst ikke denne vej (1,2 W) — se luksus_besparelse.yaml.
+# =============================================================================
+
+input_number:
+  terrasse_morgenlys_pct:
+    name: "Terrasse morgenlys: styrke"
+    icon: mdi:string-lights
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+  terrasse_morgenlys_sol_elevation:
+    name: "Terrasse morgenlys: slukker når solen er over"
+    icon: mdi:weather-sunset-up
+    min: -10
+    max: 5
+    step: 0.5
+    unit_of_measurement: "°"
+    mode: slider
+
+input_boolean:
+  # Runtime: morgenlyset har tændt kæden og ejer den (må slukke den igen).
+  terrasse_morgenlys_ejer:
+    name: "Terrasse morgenlys: tændt af morgenlyset"
+    icon: mdi:string-lights
+
+input_datetime:
+  # Runtime: hvornår en ANDEN slukkede kæden mens morgenlyset ejede den.
+  # Samme morgen (efter 04:00) = ingen ny auto-tænd.
+  terrasse_morgenlys_respekt:
+    name: "Terrasse morgenlys: slukket af andre"
+    icon: mdi:hand-back-right
+    has_date: true
+    has_time: true
+
+automation:
+  - id: terrasse_morgenlys
+    alias: "Terrasse: morgenlys (mørkt + nogen i open plan)"
+    mode: queued
+    max: 3
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.open_plan_occupied_frisk
+        from: "off"
+        to: "on"
+      - platform: state
+        entity_id: input_boolean.godnat_active
+        from: "on"
+        to: "off"
+      - platform: state
+        entity_id: light.terrasse_paerelyskaede
+        from: "unavailable"
+        to: "off"
+      - platform: numeric_state
+        entity_id: sun.sun
+        attribute: elevation
+        above: input_number.terrasse_morgenlys_sol_elevation
+      - platform: state
+        entity_id: binary_sensor.open_plan_occupied
+        from: "on"
+        to: "off"
+        for:
+          minutes: "{{ states('input_number.terrasse_lys_nat_ro_minutter') | int(20) }}"
+      - platform: time_pattern
+        minutes: "/5"
+      - platform: homeassistant
+        event: start
+    action:
+      - variables:
+          vindue: >-
+            {{ 4 <= now().hour < 12 and is_state('input_boolean.godnat_active', 'off') }}
+          moerkt: >-
+            {{ state_attr('sun.sun', 'elevation') | float(99)
+               < states('input_number.terrasse_morgenlys_sol_elevation') | float(-4) }}
+          ro: >-
+            {% set ro_min = states('input_number.terrasse_lys_nat_ro_minutter') | float(20) %}
+            {% set op = states.binary_sensor.open_plan_occupied %}
+            {{ op is not none and op.state == 'off'
+               and (now() - op.last_changed).total_seconds() >= ro_min * 60 }}
+      - choose:
+          # ---- SLUK: kun en kæde vi selv har tændt ----
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.terrasse_morgenlys_ejer
+                state: "on"
+              - condition: template
+                value_template: "{{ not vindue or not moerkt or ro }}"
+            sequence:
+              # Ejer-flaget FØR sluk → detektoren nedenfor ser ikke vores eget sluk.
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.terrasse_morgenlys_ejer
+              - service: light.turn_off
+                continue_on_error: true
+                target:
+                  entity_id: light.terrasse_paerelyskaede
+                data:
+                  transition: 5
+              - service: logbook.log
+                data:
+                  name: "Terrasse morgenlys"
+                  message: >-
+                    Slukket ({{ 'solen er oppe' if not moerkt
+                                else ('open plan i ro' if ro else 'morgenen er slut') }}).
+          # ---- TÆND ----
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.terrasse_morgenlys_ejer
+                state: "off"
+              - condition: template
+                value_template: "{{ vindue and moerkt }}"
+              - condition: state
+                entity_id: binary_sensor.open_plan_occupied_frisk
+                state: "on"
+              - condition: numeric_state
+                entity_id: input_number.terrasse_morgenlys_pct
+                above: 0
+              # Strøm på (controlleren ejer pluggen) og ikke allerede tændt.
+              - condition: state
+                entity_id: light.terrasse_paerelyskaede
+                state: "off"
+              - condition: template
+                value_template: >-
+                  {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+              - condition: state
+                entity_id: input_select.house_state
+                state: "Active"
+              - condition: state
+                entity_id: input_boolean.terrace_presence_enabled
+                state: "on"
+              - condition: state
+                entity_id: binary_sensor.sleepover_openplan_moerkt
+                state: "off"
+              - condition: state
+                entity_id: binary_sensor.mood_pause_terrasse
+                state: "off"
+              - condition: state
+                entity_id: input_boolean.terrasse_plug_manual_off_hold
+                state: "off"
+              - condition: template
+                value_template: >-
+                  {{ not (is_state('binary_sensor.luksus_lys_elpris_block', 'on')
+                          and 'light.terrasse_paerelyskaede'
+                              in (state_attr('light.luksus_lys', 'entity_id') or [])) }}
+              # Slukket af andre i morges → respektér det resten af morgenen.
+              - condition: template
+                value_template: >-
+                  {% set r = state_attr('input_datetime.terrasse_morgenlys_respekt', 'timestamp') %}
+                  {{ r is none or r < today_at('04:00').timestamp() }}
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.terrasse_morgenlys_ejer
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.terrasse_paerelyskaede
+                data:
+                  brightness_pct: "{{ states('input_number.terrasse_morgenlys_pct') | int(20) }}"
+                  transition: 3
+
+  # En ANDEN slukker kæden mens morgenlyset ejer den → valget gælder morgenen.
+  # `from: "on"` uden `to:` = kun state-skift (off ELLER unavailable =
+  # stikkontakten/pluggen), aldrig attribut-ændringer.
+  - id: terrasse_morgenlys_slukket_af_andre
+    alias: "Terrasse: morgenlys slukket af andre (respektér resten af morgenen)"
+    mode: queued
+    max: 3
+    trigger:
+      - platform: state
+        entity_id: light.terrasse_paerelyskaede
+        from: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.terrasse_morgenlys_ejer
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.terrasse_morgenlys_ejer
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.terrasse_morgenlys_respekt
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: logbook.log
+        data:
+          name: "Terrasse morgenlys"
+          message: >-
+            Kæden blev {{ 'slukket' if trigger.to_state.state == 'off' else 'strømløs' }}
+            af andre → ingen ny auto-tænd i morges.

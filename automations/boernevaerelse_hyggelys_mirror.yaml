@@ -1,0 +1,153 @@
+# =============================================================================
+# Børnehygge plug-lampe følger hygge-strippen (2026-06-03, user-request)
+# =============================================================================
+# light.boernevaerelse_hyggelys (= switch.sove_plug) spejler børnehygge-strippen
+# on/off. Resultat:
+#   - Tænd kids-hyggelys i APPEN (= light.boernevaerelse_hygge_strip) → plug tænder.
+#   - Børneværelse-STYRBAR tænder rummet (boernevaerelse_all inkl. strippen) →
+#     strippen tænder → plug tænder med.
+# Spejler kun on/off (lampen er non-dimmable). Ingen loop: automationen styrer
+# KUN plug-lampen, aldrig strippen.
+#
+# NATLYS-/SOVE-GUARD (2026-06-05, efter natlig full-on hændelse):
+# Plug-lampen er NON-DIMMABLE → tænder altid full on. Den må ALDRIG følge med,
+# når strippen blot bruges som diskret natlys, eller når vi ved børnene sover.
+# Derfor tænder plug-lampen KUN hvis BEGGE gælder:
+#   1) godnat_boern_active == off  (= børnene er IKKE puttet/sover)
+#   2) strip-brightness >= 26 (~10%)  (= rigtigt hyggelys, ikke 1% natlys)
+# Incident 2026-06-04 23:23: bruger satte strip på 1% som natlys MENS
+# godnat_boern_active var on → den gamle ubetingede mirror tændte plug-lampen
+# full on over de sovende børn. Begge guards ville hver især have stoppet det.
+#
+# BRIGHTNESS-RACE FIX (2026-06-12, efter incident 2026-06-11 22:18):
+# ZHA rapporterer ofte "on" FØR level-attributten → trigger.to_state har
+# INGEN brightness, og den gamle `| int(255)` fallback tolkede manglende
+# brightness som fuld styrke → plug tændte over natlys. Nu: vent 2s, læs
+# FAKTISK brightness fra state, og fald restriktivt tilbage til 0 (= bloker
+# hellere en legit tænd end at vække børnene).
+# =============================================================================
+- id: boernevaerelse_hyggelys_mirror_strip
+  alias: "Børnehygge: plug-lampe følger hygge-strip (app + Styrbar)"
+  description: >
+    Plug-lampen følger light.boernevaerelse_hygge_strip on/off, så den tænder
+    både når man tænder kids-hyggelys i appen og via børneværelse-Styrbaren.
+  # queued (ikke single): 'taend'-grenen venter 2s på brightness — et hurtigt
+  # on→off må ikke droppe 'sluk'-håndteringen mens delayen kører.
+  mode: queued
+  max: 3
+  trigger:
+    - platform: state
+      entity_id: light.boernevaerelse_hygge_strip
+      to: "on"
+      id: taend
+    # 2026-06-20: KUN on→off (ikke unavailable→off). Innr-strippen flapper
+    # unavailable; en reconnect (unavailable→off) må ikke slukke en hyggelys
+    # som OP-tryk har tændt direkte (se boernevaerelse_styrbar_op_hyggelys).
+    - platform: state
+      entity_id: light.boernevaerelse_hygge_strip
+      from: "on"
+      to: "off"
+      id: sluk
+  action:
+    - choose:
+        # Tænd plug-lampen KUN ved rigtigt hyggelys og kun når børnene ikke sover.
+        - conditions: "{{ trigger.id == 'taend' }}"
+          sequence:
+            # Brightness-race fix: ZHA rapporterer ofte 'on' før level →
+            # vent 2s og læs FAKTISK brightness fra state. Fallback 0 =
+            # restriktiv (manglende brightness blokerer, tænder ikke).
+            - delay: "00:00:02"
+            - condition: template
+              value_template: >-
+                {{ is_state('input_boolean.godnat_boern_active', 'off')
+                   and is_state('input_boolean.puttelys_descent_active', 'off')
+                   and is_state('light.boernevaerelse_hygge_strip', 'on')
+                   and (state_attr('light.boernevaerelse_hygge_strip', 'brightness') | int(0)) >= 26 }}
+            - service: light.turn_on
+              target:
+                entity_id: light.boernevaerelse_hyggelys
+        - conditions: "{{ trigger.id == 'sluk' }}"
+          sequence:
+            - service: light.turn_off
+              target:
+                entity_id: light.boernevaerelse_hyggelys
+
+# =============================================================================
+# Børne-Styrbar OP → tænd hyggelys (+ strip) DIREKTE i dagstimerne (2026-06-20)
+# =============================================================================
+# User-spec: "I dagstimerne vil jeg kunne tænde hyggelys og strip på
+# børneværelset med Styrbar OP og LONG CLICK OP — det kunne jeg ikke her til
+# formiddag. Pigerne sover ikke derinde i dagstimerne."
+#
+# Rod-årsag (diagnose 2026-06-20): hyggelys-pluggen er IKKE i boernevaerelse_all,
+# så OP-ladderen (brightness_step → boernevaerelse_all = loft+strip) rører den
+# aldrig. Pluggen kom hidtil KUN på via strip-mirror'en ovenfor — og da Innr-
+# strippen var unavailable her til formiddag, kom hverken strip eller plug på
+# (kun loftet). Denne automation tænder hyggelys DIREKTE ved OP (klik + langklik)
+# uafhængigt af strippen, så den altid kommer på når børnene ikke sover.
+#
+# Loft + strip kommer fortsat på via den normale OP-ladder/snap (brightness_step
+# / snap_full → boernevaerelse_all). Putte-vinduet (≥18:30) ejes af fase-1, som
+# selv tænder loft+strip+plug → derfor gated FRA dér for at undgå dobbelt-styring.
+# Pluggen er non-dimmable → ALDRIG under godnat/putning (blæser ellers fuld
+# styrke over sovende børn).
+# =============================================================================
+- id: boernevaerelse_styrbar_op_hyggelys
+  alias: "Børn: Styrbar OP tænder hyggelys direkte (dagstime)"
+  description: >
+    OP-klik ('on') + OP-langklik ('move_with_on_off') på børne-Styrbaren tænder
+    hyggelys-pluggen direkte (+ forsøger strippen) når børnene ikke sover/puttes.
+  mode: single
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "66:19:44:cc:2c:41:57:fe"
+        command: "on"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "66:19:44:cc:2c:41:57:fe"
+        command: "move_with_on_off"
+  condition:
+    # Aldrig under aktiv putning/sengetid — non-dimmable plug må ikke blæse fuld
+    # styrke over sovende børn.
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+    # Putte-vinduet (≥18:30, børn hjemme) ejes af fase-1 (OP → loft+strip+plug)
+    # → undgå dobbelt-styring; her dækker vi dagstimerne/før-vinduet.
+    - condition: state
+      entity_id: binary_sensor.putning_vindue_aktivt
+      state: "off"
+    # Kun hvis hyggelys ikke allerede er tændt (undgå redundant plug-write +
+    # undgå at nulstille strippen ved hvert OP brightness-step på et tændt rum).
+    - condition: template
+      value_template: "{{ not is_state('light.boernevaerelse_hyggelys', 'on') }}"
+  action:
+    # Strip: cozy 50% (continue_on_error — Innr-strippen kan være offline).
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.boernevaerelse_hygge_strip
+      data:
+        # 2026-06-28 (user-spec): hygge-styrke er nu en slider (rå %). Default 50.
+        brightness_pct: "{{ states('input_number.boernevaerelse_hyggelys_brightness') | int(50) }}"
+        transition: 2
+    # Hyggelys-plug DIREKTE — uafhængigt af strip-mirror, så den kommer på selv
+    # når strippen er offline.
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.boernevaerelse_hyggelys
+    - service: logbook.log
+      data:
+        name: "Børn Styrbar OP"
+        message: "Hyggelys tændt direkte (+ strip-forsøg) — dagstime OP-tryk."
+        entity_id: light.boernevaerelse_hyggelys

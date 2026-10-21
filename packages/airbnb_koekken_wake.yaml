@@ -1,0 +1,94 @@
+# =============================================================================
+# AirBnB: køkken-Apollo vedvarende bevægelse → Active (Thread-uafhængig backup)
+# =============================================================================
+# 2026-07-10 (user-spec): I AirBnB-mode skal huset også kunne vågne fra Dormant
+# UDEN Thread. Entré-PIR-vejen findes allerede (airbnb_dormant_to_active_entre i
+# airbnb_mode.yaml, Zigbee/ZHA — Thread-uafhængig). Her tilføjes en ANDEN
+# Thread-uafhængig vej: køkken-Apolloen (ESPHome/WiFi).
+#
+# "Vedvarende bevægelse" = AKKUMULERET moving_target-tid over de sidste 5 min
+# skal overstige slider-tærsklen (default 20 s). 5-min-vinduet + 20-s-kravet
+# filtrerer enkelt-flaps fra, men fanger en gæst der reelt bevæger sig i køkkenet.
+#
+# User accepterer robot-risikoen ("støvsugeren kører sjældent i AirBnB"), men vi
+# beholder for en sikkerheds skyld SAMME vacuum-gate som entré-vejen +
+# house_state_to_active (robottens egen køkken-radar-motion må ikke vække huset
+# under en sjælden manuel clean).
+#
+# 5-min-vinduet er hardcodet (history_stats `duration` kan ikke templates);
+# sustain-tærsklen er en slider (0 = deaktiver køkken-vejen helt).
+# =============================================================================
+
+input_number:
+  airbnb_koekken_wake_sustain_sekunder:
+    name: "AirBnB: køkken-vække sustain"
+    icon: mdi:motion-sensor
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+sensor:
+  # Akkumuleret køkken-Apollo MOVING-target-tid (i timer) over de sidste 5 min.
+  # history_stats type:time returnerer TIMER som float.
+  - platform: history_stats
+    name: "Koekken apollo bevaegelse 5min"
+    unique_id: koekken_apollo_bevaegelse_5min
+    entity_id: binary_sensor.koekken_apollo_radar_moving_target
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      minutes: 5
+
+template:
+  - sensor:
+      # Samme akkumulering udtrykt i SEKUNDER (til slider-sammenligning + tile).
+      - name: "Koekken bevaegelse 5min sekunder"
+        unique_id: koekken_bevaegelse_5min_sekunder
+        unit_of_measurement: "s"
+        icon: mdi:timer-outline
+        state: >-
+          {{ (states('sensor.koekken_apollo_bevaegelse_5min') | float(0) * 3600) | round(0) }}
+
+automation:
+  - id: airbnb_koekken_sustained_wake
+    alias: "AirBnB: Køkken vedvarende bevægelse -> Active (Thread-uafhængig)"
+    description: >
+      AirBnB + Dormant: akkumuleret køkken-Apollo-bevægelse over 5 min > slider
+      (default 20 s) → Active. Thread-uafhængig backup ved siden af entré-PIR.
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.koekken_bevaegelse_5min_sekunder
+        above: input_number.airbnb_koekken_wake_sustain_sekunder
+    condition:
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "AirBnB"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Dormant"
+      # slider 0 = deaktiveret (numeric_state fyrer stadig ved seconds>0 → blokér)
+      - condition: template
+        value_template: >-
+          {{ states('input_number.airbnb_koekken_wake_sustain_sekunder') | float(0) > 0 }}
+      # vacuum-gate: robottens egen køkken-radar-motion må ikke vække huset
+      - condition: template
+        value_template: >-
+          {{ states('vacuum.s8_maxv_ultra') not in ['cleaning', 'returning'] }}
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.house_state
+        data:
+          option: "Active"
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.manual_dormant_override
+      - service: logbook.log
+        data:
+          name: "AirBnB køkken-vække"
+          message: >
+            Køkken-Apollo vedvarende bevægelse (Thread-uafhængig backup) → Active.

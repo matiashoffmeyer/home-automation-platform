@@ -1,0 +1,192 @@
+# =============================================================================
+# Soveværelse nat-lys-lås — HÅRD refleks (2026-06-19, user-spec, KRITISK)
+# =============================================================================
+# INCIDENT 2026-06-18→19 ~23:45: room_drift_back returnerede børneværelset
+# Manual→Auto og kaldte room_mode_apply, der re-applyede presence-lys med 600 s
+# op-rampe MENS barnet sov (godnat_boern_active on) → lyset rampede mod fuldt →
+# vækkede Child B + far. Må ALDRIG ske igen.
+#
+# Dette er en UAFHÆNGIG catch-all der ikke kan brydes af nogen enkelt automation:
+# rammer et soveværelse-lys OP over natlys-tærsklen MENS rummet er i godnat —
+# uanset kilde (drift-back, presence, restart-recovery, fremtidige bugs) →
+# snappes ØJEBLIKKELIGT tilbage til nat-tilstand (strip→natlys, alt andet→off).
+#
+# Designet til at fejle SIKKERT (mod mørke):
+#   - Trigger kun på OP-rampe (to_brightness > from_brightness) → den bløde
+#     natlys-NED-fade (Fase 2, 40%→1%) rammes IKKE.
+#   - Undtaget morgen-vækning (05:45–08:00) så vakning_voksne/pigerne må rampe op.
+#   - Undtaget ÆGTE manuelle handlinger: app/dashboard (context.user_id) ELLER
+#     nyligt Styrbar-tryk i rummet (<30 s) — så en forælder KAN tænde lys til et
+#     grædende barn. KUN "auto" (ingen menneske-handling) blokeres.
+# Hardcodede tærskler/vinduer (ingen slider) = færrest mulige bryde-punkter.
+# =============================================================================
+
+- id: bedroom_night_no_auto_bright_guard
+  alias: "Sikkerhed: Soveværelser ALDRIG auto-fuldt-lys om natten (refleks-lås)"
+  description: >
+    Snapper et soveværelse-lys tilbage til nat-tilstand hvis det auto-ramper OP
+    over natlys-tærsklen under godnat. Catch-all mod auto-fuldt-lys. Tillader
+    morgen-vækning + ægte manuelle handlinger.
+  mode: parallel
+  max: 25
+  trigger:
+    - platform: state
+      entity_id:
+        - light.boernevaerelse_loft
+        - light.boernevaerelse_hygge_strip
+        - light.boernevaerelse_lampe
+        - light.boernevaerelse_hyggelys
+        - light.boernevaerelse_apollo_rgb_light
+        - light.spisestue_pendel            # = sove-loft (flyttet 2026-06-05)
+        - light.sovevaerelse_loft            # orphan/dvale farve-pære (safety)
+        - light.sovevaerelse_apollo_rgb_light
+  condition:
+    # 1) Lyset RAMPER OP og er over natlys-tærsklen (>20 raw ≈ 8 %). Natlys = 1 %.
+    #    'to > from' sikrer at den bløde natlys-NED-fade (40%→1%) IKKE rammes.
+    - condition: template
+      value_template: >-
+        {% set to_b = trigger.to_state.attributes.brightness | int(0) %}
+        {% set from_b = trigger.from_state.attributes.brightness | int(0)
+                        if trigger.from_state else 0 %}
+        {{ trigger.to_state.state == 'on' and to_b > 20 and to_b > from_b }}
+    # 2) Rummet er i godnat (= sovende). Boern → godnat_boern; sove → voksne/master.
+    - condition: template
+      value_template: >-
+        {% if 'boernevaerelse' in trigger.entity_id %}
+          {{ is_state('input_boolean.godnat_boern_active','on')
+             or is_state('input_boolean.godnat_active','on') }}
+        {% else %}
+          {{ is_state('input_boolean.godnat_voksne_active','on')
+             or is_state('input_boolean.godnat_active','on') }}
+        {% endif %}
+    # 3) IKKE morgen-vækningsvinduet (05:45–08:00) — vakning må rampe op.
+    - condition: template
+      value_template: >-
+        {% set m = now().hour * 60 + now().minute %}
+        {{ not (345 <= m < 480) }}
+    # 4) IKKE app/dashboard-manuel: de har context.user_id (Styrbar/automation =
+    #    none). User_id-tjek er race-frit (kendt på trigger-tidspunktet). Det
+    #    FYSISKE Styrbar-nød-tryk tjekkes RACE-FRIT i action nedenfor via det
+    #    dedikerede intent-stempel — IKKE her, fordi styrbar_last_press først
+    #    stemples EFTER lyset (op til 2s ved hold→snap-full).
+    - condition: template
+      value_template: "{{ trigger.to_state.context.user_id is none }}"
+    # 5) IKKE AirBnB (2026-08-16d, user-spec "kun manuelt lys i soveværelset").
+    #    Præmissen for hele vagten er at godnat-flaget = et menneske har SAGT
+    #    godnat. I AirBnB sætter airbnb_natmode_auto_godnat flagene på klokken
+    #    alene (packages/airbnb_natmode.yaml) — ren inferens, intet samtykke.
+    #    Og gæstens vægkontakt tænder via firmware (StartUpOnOff=On) uden
+    #    user_id og uden zha_event, så BEGGE undtagelser ovenfor misser den:
+    #    gæsten ville få lys i 0,5 s og så mørke, uden nogen forklaring og uden
+    #    at kende husets escape-veje. Sikkert fordi intet automatisk kan lyse
+    #    soveværelset op om natten i AirBnB (presence hårdt gated 12–22 i
+    #    presence_sovevaerelse.yaml, alle vækninger lockdown-slukkede), og
+    #    børne-/depot-lys dækkes af airbnb_block_depot_boern_lights.
+    #    Normal + Home Vacation er URØRT — dér er vagten fuldt aktiv.
+    #    FEJLKLASSE #12: dens spejl-søster sovevaerelse_morgen_beskyttelse_
+    #    suppressor (packages/sovevaerelse_morgen_beskyttelse.yaml) fik PRÆCIS
+    #    denne gate 2026-07-08 med præcis denne begrundelse — vagten her, der
+    #    deler roster, manuel-undtagelser og snap-mekanik 1:1, fik den ikke.
+    - condition: template
+      value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+  action:
+    # RACE-FRI nød-tryk-tilladelse: vent 0,5 s så bedroom_styrbar_emergency_intent
+    # (der fyrer ØJEBLIKKELIGT på Styrbar-zha_event'en, før lys-logikken) har nået
+    # at stemple. Var en soveværelse-Styrbar trykket indenfor 8 s → ABORT (= lad
+    # nød-lyset være). Ellers = ægte auto → snap tilbage.
+    - delay:
+        milliseconds: 500
+    - condition: template
+      value_template: >-
+        {% set ia = states('input_datetime.bedroom_styrbar_intent_at') %}
+        {% set ia_e = (state_attr('input_datetime.bedroom_styrbar_intent_at', 'timestamp') | float(0)) if ia not in ['unknown','unavailable','',none] else 0 %}
+        {{ (as_timestamp(now()) - ia_e) >= 8 }}
+    # Re-tjek: lyset er stadig tændt + bright (kan være ændret i de 0,5 s).
+    - condition: template
+      value_template: >-
+        {{ is_state(trigger.entity_id, 'on')
+           and (state_attr(trigger.entity_id, 'brightness') | int(0)) > 20 }}
+    - service: logbook.log
+      data:
+        name: "Soveværelse nat-lås"
+        message: >-
+          BLOKERET auto-lys: {{ trigger.entity_id }} rampede op til
+          {{ ((trigger.to_state.attributes.brightness | int(0)) / 2.55) | round(0) }}%
+          under godnat → snappet til nat-tilstand.
+        entity_id: "{{ trigger.entity_id }}"
+    # Hygge-strip → natlys (1 % blå-hvid). Alt andet → off. Hurtig (1 s).
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.entity_id == 'light.boernevaerelse_hygge_strip' }}"
+          sequence:
+            # Bevidst hurtig (1 s), men via samme RGB-vej som fadet — så strippen
+            # aldrig efterlades i color_temp-mode (ville snappe hvidt næste fade).
+            - service: script.boern_natlys_set
+              data:
+                transition: 1
+      default:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id: "{{ trigger.entity_id }}"
+          data:
+            transition: 1
+    # Persistent (lydløs — buzz IKKE en telefon om natten). Synlig om morgenen.
+    - service: persistent_notification.create
+      data:
+        notification_id: "bedroom_night_guard_{{ trigger.entity_id }}"
+        title: "🌙 Blokeret: auto-lys om natten"
+        message: >-
+          {{ trigger.entity_id | replace('light.','') }} forsøgte auto-tænde
+          ({{ ((trigger.to_state.attributes.brightness | int(0)) / 2.55) | round(0) }}%)
+          under godnat kl. {{ now().strftime('%H:%M') }} og blev snappet tilbage
+          til nat-tilstand. Undersøg hvad der trigger (drift-back / presence).
+
+# =============================================================================
+# Sove-knap nød-intent — stempl ØJEBLIKKELIGT (før lys-logik) så nat-låsen kan
+# tillade nød-lys race-frit (user-spec 2026-06-19: "styrbar skal stadig kunne
+# tænde lys ved nødstilfælde på børneværelset under nat, men ikke automations").
+# =============================================================================
+# Fyrer direkte på soveværelse-knappernes zha_event og sætter intent-stemplet i
+# ÉT hurtigt set_datetime — INGEN ventetid (modsat knap-lys-handleren der
+# stempler styrbar_last_press FØRST EFTER lyset, op til 2 s ved hold→snap-full).
+# Nat-låsen venter 0,5 s og læser dette stempel → et nød-tryk bliver ALDRIG
+# fejlagtigt snappet væk, mens rene automations (intet tryk) stadig blokeres.
+#
+# 2026-07-28 (user-bug "kunne ikke tænde sovelyset om morgenen"): sove-SOMRIG
+# (godmorgen/hygge-knap, 6c:fd:22) manglede her. Dens kort-op tænder sove-lyset
+# via automation (context.user_id = none) og stempler IKKE bedroom_styrbar_intent_
+# at → sovevaerelse_morgen_beskyttelse-suppressoren så et "auto"-tænd i 05–07-
+# vinduet og snappede brugerens godmorgen-tryk slukket 1 s efter. Somrig'en er nu
+# med her → ÉN autoritet (bedroom_styrbar_intent_at) dækker BEGGE nat-vagter
+# (denne + sove-morgen-beskyttelse) for BÅDE Styrbar OG Somrig (fejlklasse #1).
+# =============================================================================
+- id: bedroom_styrbar_emergency_intent
+  alias: "Sikkerhed: Stamp soveværelse-knap nød-intent (FØR lys-logik)"
+  description: >
+    Stempler input_datetime.bedroom_styrbar_intent_at øjeblikkeligt når en
+    soveværelse-knap (boern-Styrbar, sove-Styrbar eller sove-Somrig) berøres — så
+    nat-låsen + sove-morgen-beskyttelsen race-frit kan tillade et manuelt/nød-tryk.
+    Enhver berøring tæller (en forælder ved knappen = til stede).
+  mode: parallel
+  max: 10
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "66:19:44:cc:2c:41:57:fe"   # Børneværelse Styrbar
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"   # Soveværelse Styrbar
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "b3:47:dd:fa:8c:68:31:05"   # Soveværelse Somrig (godmorgen/hygge-knap)
+  action:
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.bedroom_styrbar_intent_at
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"

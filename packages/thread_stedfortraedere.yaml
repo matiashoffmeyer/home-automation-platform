@@ -1,0 +1,140 @@
+# =============================================================================
+# Thread-stedfortrædere — når et Thread-device er væk, tager en nabo over
+# =============================================================================
+# 2026-10-15 (user-spec, B234-natten hvor entré-loftet, stue-spots og sove-
+# lyskæden faldt ud af OTBR'ens partition og ikke kom igen):
+#
+#   1. STUE: spots væk og NOGET beder dem tænde (presence, scene, Styrbar,
+#      sofa-zen, gruppe-kald …) → hyggelampen (light.stue_plug) tænder i
+#      stedet, "lige meget hvad". Vi lytter på selve call_service-eventet, så
+#      ingen af de ~15 kaldere skal kende reglen — et gruppe-kald udfoldes af
+#      light-group til medlemmerne og ses derfor også (group/light.py).
+#      Slukkes spots igen, slukker hyggelampen — men KUN hvis den stadig står
+#      på vores eget tænd (context-ejerskab), så en hyggelampe som en scene
+#      eller du selv har tændt aldrig slukkes af denne regel.
+#   2. ENTRÉ: VALLHORN'en væk → naboernes occupancy-øjne (stue, køkken, bad, depot) pulserer
+#      binary_sensor.entre_stedfortraeder_bevaegelse, som entre_motion.yaml
+#      (tænd dag/nat + sluk) og entre_fade_ud læser ved siden af VALLHORN'en.
+#   3. BAD: dør-PIR'en (inde_1) væk → entré-bevægelse tænder badet på normalt
+#      niveau i stedet for approach-niveau (presence_badevaerelse.yaml,
+#      is_approach). Sluk-vejene er urørte: unionen rendrer `off` uden sine
+#      medlemmer, så den almindelige ophold-sluk (fugt-frisk-gatet) rydder op.
+# =============================================================================
+
+input_text:
+  stue_hyggelampe_stedfortraeder_context:
+    name: "Stue: hyggelampe stedfortræder-context"
+    icon: mdi:identifier
+    max: 64
+
+template:
+  # Pulsen tænder på en off→on-flanke hos entréens naboer — stue, køkken,
+  # bad og depot (user-spec 15/10: spisestue/sove/børne holdt entréen tændt
+  # 27 min ad gangen uden at nogen gik forbi den) og står kun `on` mens
+  # VALLHORN'en er væk. auto_off genstartes af hver ny flanke; entre_motion_off
+  # venter derefter sin normale entre_tom_sluk_sekunder ovenpå.
+  - trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.stue_apollo_occupancy_filtered
+          - binary_sensor.koekken_apollo_occupancy_filtered
+          - binary_sensor.badevaerelse_inde_occupancy
+          - binary_sensor.depot_valhorn_occupancy
+        from: "off"
+        to: "on"
+    binary_sensor:
+      - name: "Entré stedfortræder bevægelse"
+        unique_id: entre_stedfortraeder_bevaegelse
+        device_class: motion
+        icon: mdi:motion-sensor-off
+        state: >-
+          {{ states('binary_sensor.entre_valhorn_occupancy') in ['unavailable', 'unknown'] }}
+        auto_off:
+          seconds: 30
+
+automation:
+  - id: stue_hyggelampe_stedfortraeder_for_spots
+    alias: "Stue: hyggelampen tænder når stue-spots er væk og skulle lyse"
+    description: >
+      2026-10-15 (user-spec): stue-spots unavailable + et tænd-kald til dem →
+      light.stue_plug tænder i stedet, uanset øvrige gates. Et sluk-kald til
+      spots slukker hyggelampen igen, hvis den stadig står på dette tænd
+      (state-context = det gemte run-context). Ikke mens hyggelampen er fravalgt
+      (input_boolean.stue_hyggelampe_fravalgt, packages/stue_plug.yaml).
+    mode: queued
+    max: 10
+    trigger:
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: light
+          service: turn_on
+        id: taend
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: light
+          service: turn_off
+        id: sluk
+    condition:
+      - condition: template
+        value_template: >-
+          {% set e = trigger.event.data.service_data.entity_id | default([]) %}
+          {% set e = [e] if e is string else e %}
+          {% set ramt = e | select('in', ['light.stue_spot_1', 'light.stue_spot_2']) | list %}
+          {% if ramt | length == 0 %}
+            false
+          {% elif trigger.id == 'taend' %}
+            {{ ramt | select('is_state', 'unavailable') | list | length > 0
+               and is_state('light.stue_plug', 'off')
+               and is_state('input_boolean.stue_hyggelampe_fravalgt', 'off') }}
+          {% else %}
+            {{ is_state('light.stue_plug', 'on')
+               and states.light.stue_plug.context.id
+                   == states('input_text.stue_hyggelampe_stedfortraeder_context') }}
+          {% endif %}
+    action:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: taend
+            sequence:
+              # Rammer samme kald også hyggelampen selv (scene, sofa-gruppe),
+              # er den tændt af dem inden for sekundet — så ejer de den.
+              - delay:
+                  seconds: 1
+              - condition: state
+                entity_id: light.stue_plug
+                state: "off"
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.stue_plug
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.stue_hyggelampe_stedfortraeder_context
+                data:
+                  value: "{{ context.id }}"
+              - service: logbook.log
+                data:
+                  name: "Stue stedfortræder"
+                  message: "Stue-spots er væk og skulle tænde → hyggelampen i stedet"
+                  entity_id: light.stue_plug
+          - conditions:
+              - condition: trigger
+                id: sluk
+            sequence:
+              - service: light.turn_off
+                continue_on_error: true
+                target:
+                  entity_id: light.stue_plug
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.stue_hyggelampe_stedfortraeder_context
+                data:
+                  value: ""
+              - service: logbook.log
+                data:
+                  name: "Stue stedfortræder"
+                  message: "Stue-spots slukket → hyggelampen (vores stedfortræder-tænd) slukker"
+                  entity_id: light.stue_plug

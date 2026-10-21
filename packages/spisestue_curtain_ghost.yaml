@@ -1,0 +1,195 @@
+# =============================================================================
+# spisestue_curtain_ghost.yaml — afvis "blæsende gardin"-spøgelse (2026-06-27)
+# =============================================================================
+# PROBLEM (user-bekræftet 2026-06-27): et gardin der blæser ~2,7 m fra spise-
+# bords-Apolloen giver et STÆRKT still-target (still_energy = 100, maxet ud) der
+# LÅSER binary_sensor.spisestue_apollo_occupancy = on i timevis mens huset er
+# tomt. Det blokerer auto-godnat + Dormant og holder rummet "optaget".
+#
+# HVORFOR IKKE threshold-tuning: still_energy = 100 er over ENHVER gate-tærskel
+# (de capper lavere) → følsomheds-slideren kan ikke dæmpe det. Per-gate-skriv
+# ville desuden blive overskrevet af den per-Apollo radar-tuner. En
+# afstands-cap (max_still_distance) er udelukket: stort åbent rum, folk opholder
+# sig OGSÅ > 2,25 m (user-spec) → ville tabe ægte tilstedeværelse.
+#
+# LØSNING: rent SOFTWARE-filter. Det eneste der skiller et blæsende gardin fra en
+# siddende person er ADFÆRD over TID: gardinet er et fladt, bevægelsesløst
+# still-latch på fast fjern-afstand i timevis; en ægte person bevæger sig
+# (moving_target fyrer) og/eller tripper nabo-sensorerne i det åbne plan.
+#
+# Ghost-detektoren ANDer flere korroborerende signaler — ALLE skal holde i hele
+# vinduet (templated delay_on) før vi maskerer, så en ægte person ALDRIG maskeres:
+#   • occupancy on, OG
+#   • moving_target off (ingen bevægelse overhovedet), OG
+#   • still_distance > 230 cm (en nærfelt-person maskeres aldrig), OG
+#   • stue_apollo (sofa, nabo i åbent plan) off (ingen er reelt i åbent plan).
+# Bryder ÉT signal (person bevæger sig / kommer nærmere / tripper sofaen) →
+# kandidaten falder → delay_on nulstiller → ghost forbliver off.
+#
+# binary_sensor.spisestue_apollo_occupancy_filtered = rå occupancy OG IKKE ghost.
+# Den ER det signal alle presence-/tomheds-forbrugere nu læser (masking everywhere
+# — user-spec). availability-passthrough bevarer 'unavailable'-semantik for de
+# forbrugere der lister sensoren i tomheds-sæt.
+# =============================================================================
+
+input_number:
+  # Hvor længe ALLE ghost-signaler skal holde uafbrudt før vi erklærer spøgelse.
+  # Stort vindue = sikkert (en person skal være TOTALT bevægelsesløs + nabo-stille
+  # + fjern i hele vinduet før maskering). Default 25 min (fresh-install via init).
+  spisestue_ghost_reject_minutes:
+    name: "Spisestue: gardin-ghost afvis-vindue"
+    icon: mdi:ghost-off
+    min: 5
+    max: 120
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-07-05 (user): det stuck-on filter (ovenfor) fanger KUN gardin-spøgelser
+  # der holder i timevis. KORTE gust-flaps (<25 min) slap forbi → 56-67 nat-flaps
+  # på filtered + de fyldte morgen-gardin-akkumulatoren (union open_plan_occupied)
+  # for tidligt (~30 sek ægte tilstedeværelse føltes nok). delay_on = debounce:
+  # filtered går først ON når rå occupancy har holdt uafbrudt i N sek → gust-blip
+  # forsvinder helt (renser presence-lys + morgen-akkumulator + Dormant/godnat).
+  # Ægte ophold forsinkes tilsvarende. 0 = fra (øjeblikkelig, som før).
+  spisestue_occupancy_debounce_seconds:
+    name: "Spisestue: occupancy debounce (gust-flap)"
+    icon: mdi:timer-sand
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-08-26f: debouncen ovenfor var UBETINGET, og spisestuen var husets eneste
+  # rum uden hurtig-vej — målt 7 døgn: latens rå→filtered median 20,0 s / p90
+  # 20,0 s (99 % af ankomsterne ventede > 10 s), mod stue 2,0 s og køkken 1,0 s.
+  # Denne slider er debouncen når et NABO-rum lige har set et menneske. 6 s er
+  # ikke et gæt: number.spisestue_apollo_radar_timeout = 5,0 s, og 496 af 897
+  # nabo-varme rå-episoder varede PRÆCIS 5 s = maskin-blip (permanent faktum).
+  # 6 s = ét radar-timeout + 1 → blippene dør stadig, mennesket slipper 14 s
+  # hurtigere ind. 0 = ingen debounce når naboen er varm.
+  spisestue_debounce_varm_sekunder:
+    name: "Spisestue: debounce når nabo er varm"
+    icon: mdi:timer-fast
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Hvor længe et nabo-rum tæller som "lige har været aktivt" efter det er blevet
+  # tomt. Målt på ÆGTE ophold (rå episode ≥ 60 s): 85 % havde en varm nabo inden
+  # for 120 s, 92 % inden for 300 s, 99 % inden for 600 s. 5 min rammer knækket.
+  spisestue_nabo_varm_minutter:
+    name: "Spisestue: nabo-varm hukommelse"
+    icon: mdi:home-clock
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+template:
+  - binary_sensor:
+      # "Et menneske er lige nu — eller var for nylig — i et af spisestuens
+      # naborum." Dette er hurtig-vejens BEVIS: en gardin-gust har ingen grund
+      # til at falde sammen med aktivitet i stue/køkken/entré, mens et menneske
+      # ved spisebordet pr. konstruktion er KOMMET fra et af de tre rum.
+      #
+      # 2026-09-17 (user-spec): BØRNEVÆRELSET tilføjet som fjerde nabo. Det er
+      # samme adjacency som presence_stue.yaml:6 allerede beskriver
+      # ("spisestue_apollo: covers spisestue + boernevaerelse adjacency"), men
+      # rummet manglede her — så den der rejser sig efter putning og går mod
+      # spisestuen ramte den KOLDE debounce (20 s) i stedet for den varme (6 s).
+      # Kilden er RÅ radar-move via binary_sensor.boernevaerelse_bevaegelse_frisk
+      # (packages/openplan_putning_vaekning.yaml), ikke en filtered/estimat-
+      # sensor → ingen selvforstærkende løkke, jf. advarslen nedenfor.
+      #
+      # Hvorfor ikke people_estimate/activity_state (user spurgte efter dem):
+      # BEGGE læser spisestue_apollo_occupancy_filtered (people_estimate.yaml:196,
+      # activity_state.yaml:169) → at fodre dem tilbage i filterets delay_on ville
+      # være en SELVFORSTÆRKENDE template-løkke: spisestue on → estimat op →
+      # debounce kortere → spisestue bliver on. Naborummenes egne filtrerede
+      # sensorer er den løkke-frie del af præcis samme evidens.
+      #
+      # delay_off (slider) gør sensoren KLÆBRIG, og det er bevidst: HA
+      # om-planlægger ikke en allerede armeret delay_on, så varmen skal være der
+      # FØR rå occupancy flanker. Det passer fysikken — man går ind i spisestuen
+      # fra et naborum, ikke omvendt. delay_on = 0 (implicit): varme må aldrig
+      # ankomme for sent.
+      #
+      # unavailable nabo → is_state False → KOLD → fuld debounce. Fail-safe i den
+      # konservative retning (fejlklasse #9).
+      - name: "Spisestue nabo varm"
+        unique_id: spisestue_nabo_varm
+        device_class: occupancy
+        icon: mdi:account-arrow-right
+        delay_off: >-
+          {{ (states('input_number.spisestue_nabo_varm_minutter') | float(5)) * 60 }}
+        state: >-
+          {{ is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on')
+             or is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'on')
+             or is_state('binary_sensor.entre_valhorn_occupancy', 'on')
+             or is_state('binary_sensor.boernevaerelse_bevaegelse_frisk', 'on') }}
+
+      # Øjebliks-kandidat: "ligner et gardin-spøgelse lige nu". delay_on (nedenfor)
+      # kræver at den holder i hele vinduet før den rigtige ghost tænder.
+      - name: "Spisestue gardin-ghost kandidat"
+        unique_id: spisestue_curtain_ghost_candidate
+        device_class: problem
+        icon: mdi:ghost
+        state: >-
+          {{ is_state('binary_sensor.spisestue_apollo_occupancy', 'on')
+             and is_state('binary_sensor.spisestue_apollo_radar_moving_target', 'off')
+             and (states('sensor.spisestue_apollo_radar_still_distance') | float(0)) > 230
+             and is_state('binary_sensor.stue_apollo_occupancy_filtered', 'off')
+             and is_state('binary_sensor.entre_valhorn_occupancy', 'off') }}
+
+      # Den faktiske ghost: kandidaten har holdt uafbrudt i afvis-vinduet. delay_on
+      # er templated fra slideren (HA binder den ved load + ved hver state-eval).
+      # delay_off = 0 → så snart en person bevæger sig / nabo tripper falder den
+      # straks, og filtered afspejler igen rå occupancy.
+      - name: "Spisestue gardin-ghost"
+        unique_id: spisestue_curtain_ghost
+        device_class: problem
+        icon: mdi:ghost-off
+        delay_on: >-
+          {{ (states('input_number.spisestue_ghost_reject_minutes') | float(25)) * 60 }}
+        state: "{{ is_state('binary_sensor.spisestue_gardin_ghost_kandidat', 'on') }}"
+
+      # Filtreret occupancy = rå occupancy OG IKKE ghost. ALLE presence-/tomheds-
+      # forbrugere læser denne (masking everywhere). availability-passthrough →
+      # når rå er unavailable bliver filtered også unavailable (bevarer semantik).
+      - name: "Spisestue Apollo Occupancy Filtered"
+        unique_id: spisestue_apollo_occupancy_filtered
+        device_class: occupancy
+        icon: mdi:account-check
+        availability: >-
+          {{ states('binary_sensor.spisestue_apollo_occupancy') not in ['unknown','unavailable'] }}
+        # delay_on = gust-flap debounce (slider). Rå occupancy skal holde uafbrudt
+        # i N sek før filtered går ON → korte gardin-blip maskeres. delay_off = 0
+        # (implicit) → slukker straks (taber aldrig ægte fravær-detektion).
+        #
+        # 2026-08-26f: debouncen er nu KONTEKST-afhængig i stedet for fast.
+        # KOLD (ingen nabo-aktivitet) = uændret fuld debounce — det er præcis det
+        # scenarie filteret blev bygget til: tomt hus, blæsende gardin, ingen der
+        # kan modsige radaren. VARM = det korte vindue. Rækkefølgen er vigtig:
+        # vi SLÆKKER kun når huset selvstændigt kan bevise at et menneske er
+        # inden for gåafstand, så tomheds-forbrugerne (godnat, Dormant, wasp)
+        # ikke kan tage skade — de er pr. definition irrelevante når en nabo er
+        # varm. `| min` gør varm-vejen til en GARANTI om aldrig at være
+        # langsommere end den kolde, også hvis sliderne sættes i omvendt orden.
+        delay_on: >-
+          {% set kold = states('input_number.spisestue_occupancy_debounce_seconds') | int(20) %}
+          {% set varm = states('input_number.spisestue_debounce_varm_sekunder') | int(6) %}
+          {{ [varm, kold] | min if is_state('binary_sensor.spisestue_nabo_varm', 'on')
+             else kold }}
+        # frossen ghost (packages/apollo_frossen_ghost.yaml): gardin-filteret ovenfor
+        # venter 25 min OG kræver at naboerne er stille — et blæsende gardin
+        # jitrer i øvrigt, så de to fanger hver sin fysik. Findes sensoren
+        # ikke, er is_state False = ingen maskering.
+        state: >-
+          {{ is_state('binary_sensor.spisestue_apollo_occupancy', 'on')
+             and not is_state('binary_sensor.spisestue_apollo_frossen_ghost', 'on')
+             and not is_state('binary_sensor.spisestue_gardin_ghost', 'on') }}

@@ -1,0 +1,164 @@
+# =============================================================================
+# sofa_hygge_stabil — stabiliseret "vi er i en sofa-hygge-session" (2026-10-03)
+# =============================================================================
+# Forbruger: den automatiske Sofa Zen (packages/sofa_zen_auto.yaml). Kan genbruges
+# af enhver feature der vil vide "sidder nogen i sofaen, for alvor".
+#
+# HVORFOR IKKE `sensor.activity_state == sofa_relax` (målt 19/9-3/10, opus-analyse):
+#   * sofa_relax er hakket: 938 episoder på 14 døgn, median 25 s, 69 % af hullerne
+#     ≤ 2 min — en trigger på den flimrer hele aftenen.
+#   * Værre: `activity_state` står på `godnat` så snart børnenes putning-flag går on
+#     (auto-detekteret 6 af 7 aftener siden 27/9). 2/10: 51,9 min stue-ophold efter
+#     20:30, ALLE mærket godnat = 0 % sofa_relax. Signalet bygges på stue-ZONEN +
+#     godnat_COMMON (voksen-godnat), ikke på klassifikatoren.
+#   * Zone-baseret dækker 94-98 % af den åbenlyse sofa-tid; aktivitets-baseret 64-72 %.
+#
+# PIPELINE (BEVIS/HOLD-split — CLAUDE.md: delay_on+delay_off på SAMME udtryk
+# bevogter kun åbningen):
+#   tilstede (delay_off 60)  → bevis (delay_on = tænd-slideren, kun i vinduet)
+#   → stabil (delay_off = slip-slideren; STARTER kun på bevis + stue NU; HOLDES af
+#     bevis ELLER en stille bro = stue set < 10 min siden og intet andet rum
+#     aktivt → radaren har tabt en stille krop). Broen kan kun HOLDE en session,
+#     aldrig starte en (latch via this.state).
+# Vinduet (tidsrum + mørkt udenfor) ligger INDE i beviset, ikke på outputtet: gatede
+# man outputtet, blev en session der sluttede 20:25 synlig 20:30-20:32 (3 af 13
+# synlige tænd i replayet var præcis den hale).
+#
+# RESTART/RELOAD: delay-sensorer restorer deres state (verificeret på 2026.9.2:
+# 2/10 20:33 + 21:58 midt i en sofa-session var usynlige i stue_filtered). Falder
+# beviset under et reload, holder `stabil` i slip-tiden. Forbrugere SKAL bruge
+# eksplicit from:/to: (unavailable → on/off ved reload).
+# REPLAY af den ENDELIGE pipeline (2026-10-03e, 19/9-3/10, per-sekund-sim mod
+# history): 120/300 = 93,3 % dækning af sofa-sessioner ≥ 10 min, 0 flaps (60/120:
+# 97,2 %). Signalet er ikke flaskehalsen — gaterne er (se sofa_zen_auto.yaml MANUEL).
+# =============================================================================
+
+input_number:
+  # Ingen `initial:` — seedes via init_user_preferences + API (fejlklasse #5).
+  sofa_zen_taend_efter_s:
+    name: "Sofa Zen: tænd efter (s)"
+    icon: mdi:sofa-outline
+    min: 30
+    max: 600
+    step: 30
+    unit_of_measurement: "s"
+    mode: slider
+  # Effektivt slip efter at have forladt stuen med bevis andetsteds = 60 s (tilstede-
+  # broen) + denne værdi. Rolig 600 / aggressiv 120.
+  sofa_zen_slip_efter_s:
+    name: "Sofa Zen: slip efter (s)"
+    icon: mdi:sofa
+    min: 60
+    max: 1200
+    step: 60
+    unit_of_measurement: "s"
+    mode: slider
+
+template:
+  - binary_sensor:
+      # TIDSRUM: input_datetime-vinduet. Slut før start = vinduet vrider sig over
+      # midnat; slut == start = hele døgnet (HA's `time`-semantik). Urørt/ukendt
+      # værdi = IKKE bevist åbent (fejler lukket). `now()` i en STATE giver kun en
+      # DB-række ved grænserne, ikke én i minuttet (#24).
+      - name: "Sofa Zen tidsrum"
+        unique_id: sofa_zen_tidsrum
+        icon: mdi:clock-outline
+        state: >-
+          {% set n = now().hour * 3600 + now().minute * 60 %}
+          {% set a = state_attr('input_datetime.sofa_zen_fra', 'timestamp') %}
+          {% set b = state_attr('input_datetime.sofa_zen_til', 'timestamp') %}
+          {% if a is none or b is none %}false
+          {% elif (a | float(0)) < (b | float(0)) %}{{ (a | float(0)) <= n < (b | float(0)) }}
+          {% else %}{{ n >= (a | float(0)) or n < (b | float(0)) }}{% endif %}
+
+      # MØRKT UDENFOR: solhøjde under Sofa Zens egen slider (ikke husets natlys/
+      # aftenlys — en ændring her må ikke flytte andre auto-lys).
+      - name: "Sofa Zen moerkt"
+        unique_id: sofa_zen_moerkt
+        icon: mdi:weather-night
+        state: >-
+          {% set sol = state_attr('sun.sun', 'elevation') %}
+          {{ sol is not none
+             and (sol | float(90)) < (states('input_number.sofa_zen_sol_graense') | float(-3)) }}
+
+      # VINDUET = tidsrum + mørkt + familie-logik. `not is_state(.., 'on')` på godnat:
+      # en reload-blip (unavailable) må ikke lukke vinduet.
+      - name: "Sofa Zen vindue"
+        unique_id: sofa_zen_vindue
+        icon: mdi:weather-night
+        state: >-
+          {{ is_state('binary_sensor.sofa_zen_tidsrum', 'on')
+             and is_state('binary_sensor.sofa_zen_moerkt', 'on')
+             and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+             and not is_state('input_select.house_state', 'Dormant')
+             and not is_state('binary_sensor.godnat_common_active', 'on') }}
+
+      # Bro over korte stue-dropouts (før-fix-hakket: 10-40 s). Kun delay_off.
+      - name: "Sofa hygge tilstede"
+        unique_id: sofa_hygge_tilstede
+        device_class: occupancy
+        icon: mdi:sofa-single
+        delay_off: 60
+        state: "{{ is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on') }}"
+
+      # BEVIS: broet stue-ophold har holdt `tænd` sekunder i vinduet. Kun delay_on.
+      - name: "Sofa hygge bevis"
+        unique_id: sofa_hygge_bevis
+        device_class: occupancy
+        icon: mdi:sofa-outline
+        delay_on: "{{ states('input_number.sofa_zen_taend_efter_s') | int(120) }}"
+        state: >-
+          {{ is_state('binary_sensor.sofa_hygge_tilstede', 'on')
+             and is_state('binary_sensor.sofa_zen_vindue', 'on') }}
+
+      # Stue set inden for 10 min — loftet på den stille bro (en stille krop radaren
+      # har tabt). Post-fix aften-huller: max 195 s; hele døgnet p90 496 s for huller
+      # ≥ 60 s. Kandidat til 3. slider.
+      - name: "Sofa hygge stue nylig"
+        unique_id: sofa_hygge_stue_nylig
+        device_class: occupancy
+        icon: mdi:history
+        delay_off: 600
+        state: "{{ is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on') }}"
+
+      # Bevis for at være gået ANDETSTEDS. delay_off 60: et øjebliks-hul i køkken-
+      # radaren må ikke ligne "stille i sofaen" og annullere slip-nedtællingen.
+      - name: "Sofa hygge andet rum"
+        unique_id: sofa_hygge_andet_rum
+        device_class: occupancy
+        icon: mdi:home-export-outline
+        delay_off: 60
+        state: >-
+          {{ ['binary_sensor.koekken_apollo_occupancy_filtered',
+              'binary_sensor.spisestue_apollo_occupancy_filtered',
+              'binary_sensor.entre_valhorn_occupancy',
+              'binary_sensor.badevaerelse_inde_occupancy',
+              'binary_sensor.sovevaerelse_apollo_occupancy',
+              'binary_sensor.boernevaerelse_apollo_occupancy',
+              'binary_sensor.depot_valhorn_occupancy',
+              'binary_sensor.terrasse_active']
+             | select('is_state', 'on') | list | length > 0 }}
+
+      # HOLD. Start kræver bevis OG stue NU (ellers tændte replayet 28 s efter at
+      # personen var gået, på bro-tid). Ved første render efter boot kan this.state
+      # være udefineret → holder=False → en restoret 'on' får `slip` sekunder til at
+      # genfinde bevis (fail-safe retning: scene → auto).
+      - name: "Sofa hygge stabil"
+        unique_id: sofa_hygge_stabil
+        device_class: occupancy
+        icon: mdi:sofa
+        delay_off: "{{ states('input_number.sofa_zen_slip_efter_s') | int(300) }}"
+        state: >-
+          {% set stue = is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on') %}
+          {% set bevis = is_state('binary_sensor.sofa_hygge_bevis', 'on') %}
+          {% set holder = this is defined and this.state == 'on' %}
+          {% set stille = is_state('binary_sensor.sofa_hygge_stue_nylig', 'on')
+                          and not is_state('binary_sensor.sofa_hygge_andet_rum', 'on')
+                          and not is_state('input_select.house_state', 'Dormant')
+                          and not is_state('binary_sensor.godnat_common_active', 'on') %}
+          {{ (bevis and stue) or (holder and (bevis or stille)) }}
+        attributes:
+          bevis: "{{ states('binary_sensor.sofa_hygge_bevis') }}"
+          stille_bro: >-
+            {{ is_state('binary_sensor.sofa_hygge_stue_nylig', 'on')
+               and not is_state('binary_sensor.sofa_hygge_andet_rum', 'on') }}

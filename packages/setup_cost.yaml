@@ -1,0 +1,336 @@
+# =============================================================================
+# Setup-omkostning pr. dag — "hvad koster vores smart-home reelt?" (2026-06-21)
+# =============================================================================
+# user-spec: lys-prisen pr. dag skal afspejle hvad vi RENT FAKTISK betaler (så
+# Parent A kan sige til Parent B hvad lys-setuppet koster), OG inkludere NUC +
+# dongles (Thread/Bluetooth/Zigbee) + batterier divideret ind. Den gamle flade
+# elpris-slider er fjernet (legacy) — prisen bygges nu af komponenter og er
+# dynamisk-klar (følger spot-prisen når elpris-integrationen leverer data).
+#
+# DANSK ALL-IN PRIS (kr/kWh) = (spot + nettarif + elafgift + leverandør) × moms.
+#   • spot      = engros-prisen fra elpris-integrationen (Nord Pool DK2), time-
+#                 for-time. Leverer den ikke (unavailable / ≤0) bruges et
+#                 fallback-estimat, så tallet aldrig kollapser til 0.
+#   • nettarif  = transport (Cerius/Radius DK2), elafgift = statsafgift,
+#                 leverandør = AltidEnergi-tillæg. ALLE er ANTAGELSER du retter
+#                 på Statistik-siden (Antagelser-sektionen) efter din regning —
+#                 IKKE den "elpris-slider" vi fjernede, men de faste komponenter.
+#   • moms      = 25 % (fast).
+#
+# SETUP-OVERHEAD (ud over lyset):
+#   • NUC          : ~konstant effekt døgnet rundt (cost_nuc_watt).
+#   • dongles ×3   : Thread (ZBDongle-E) + Bluetooth (CSR8510) + Zigbee (ZBT-2),
+#                    samlet cost_dongles_watt.
+#   • Apollo ×5    : de netdrevne MSR-2'ere, 0,5 W stykket = cost_apollo_watt
+#                    (2026-09-10, user-spec — manglede helt før).
+#   • Tapo-kamera  : C210'eren i køkkenet + dens billedbehandling på NUC'en,
+#                    samlet i cost_kamera_watt (2026-09-16, user-spec). Målingen
+#                    af NUC-andelen står ved slideren.
+#   • højttaler    : AxiomAir N3 på konstant strøm, cost_hoejttaler_watt
+#                    (målt på en lånt plug 10/10-2026, B212).
+#   • batterier    : årlig udskiftnings-budget (cost_batteri_kr_aar) ÷ 365 =
+#                    fast kr/dag amortiseret.
+#
+# Lys-delen genbruger den PRIS-VÆGTEDE rate-integration fra elpris_styring.yaml
+# (sensor.lys_kost_faktisk_*) — energi i dyre timer koster mere = ægte regning,
+# ikke energi × fladt gennemsnit. Setup-totalen = lys + overhead.
+#
+# Defaults sættes af init_user_preferences (fresh-install) + snapshot.
+# =============================================================================
+
+input_number:
+  # --- Nettarif (transport) — TIDS-DIFFERENTIERET (dansk tariffmodel 3.0) ------
+  # 2026-06-21 (user-spec): en flad nettarif straffer regnskabet det meste af
+  # døgnet (natten er meget billigere, aften-spidslast dyrere). Net-selskaberne
+  # (Radius/Cerius/N1 …) bruger 3 tids-zoner — samme VINDUER landet over, men
+  # VÆRDIERNE er selskabs- + sæson-specifikke (vinter-spidslast ~3× sommer).
+  # Vinduer (sensor.cost_net_tariff_aktuel vælger pr. time):
+  #   Lavlast   = 00–06   (nat, billigst)
+  #   Spidslast = 17–21   (aften-peak, dyrest)
+  #   Højlast   = resten  (06–17 + 21–24)
+  # Defaults = grove DK2-SOMMER-estimater (juni) — RET efter din regning, og bump
+  # især spidslast om vinteren. Ægte dynamisk "fra integrationen" kræver
+  # Stromligning/EDS (HACS/UI). Alle ekskl. moms.
+  cost_tariff_lavlast:
+    name: "Nettarif lavlast 00–06 (kr/kWh)"
+    icon: mdi:weather-night
+    min: 0
+    max: 3
+    step: 0.01
+    unit_of_measurement: "kr/kWh"
+    mode: box
+  cost_tariff_hojlast:
+    name: "Nettarif højlast (kr/kWh)"
+    icon: mdi:weather-partly-cloudy
+    min: 0
+    max: 3
+    step: 0.01
+    unit_of_measurement: "kr/kWh"
+    mode: box
+  cost_tariff_spidslast:
+    name: "Nettarif spidslast 17–21 (kr/kWh)"
+    icon: mdi:transmission-tower-export
+    min: 0
+    max: 5
+    step: 0.01
+    unit_of_measurement: "kr/kWh"
+    mode: box
+  cost_elafgift_kr_kwh:
+    name: "Pris: elafgift (statsafgift, kr/kWh)"
+    icon: mdi:bank
+    min: 0
+    max: 3
+    step: 0.01
+    unit_of_measurement: "kr/kWh"
+    mode: box
+  cost_markup_kr_kwh:
+    name: "Pris: leverandør-tillæg (kr/kWh)"
+    icon: mdi:account-cash
+    min: 0
+    max: 2
+    step: 0.01
+    unit_of_measurement: "kr/kWh"
+    mode: box
+  cost_spot_fallback_kr_kwh:
+    name: "Pris: spot fallback når feed mangler (kr/kWh)"
+    icon: mdi:transmission-tower
+    min: 0
+    max: 3
+    step: 0.01
+    unit_of_measurement: "kr/kWh"
+    mode: box
+
+  # --- Setup-overhead-antagelser ---------------------------------------------
+  cost_nuc_watt:
+    name: "Setup: NUC effekt (W, døgn-gns.)"
+    icon: mdi:server
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "W"
+    mode: box
+  cost_dongles_watt:
+    name: "Setup: dongles effekt i alt (W)"
+    icon: mdi:usb
+    min: 0
+    max: 20
+    step: 0.5
+    unit_of_measurement: "W"
+    mode: box
+  # 2026-09-10 (user-spec): de 5 netdrevne Apollo MSR-2'ere kører døgnet rundt
+  # og manglede helt i regnskabet. 5 × 0,5 W = 2,5 W. Slideren er TOTALEN for
+  # flåden (samme form som dongles ovenfor) — bliv 6 Apolloer, så hæv til 3,0.
+  cost_apollo_watt:
+    name: "Setup: Apollo-sensorer i alt (W)"
+    icon: mdi:motion-sensor
+    min: 0
+    max: 20
+    step: 0.5
+    unit_of_measurement: "W"
+    mode: box
+  # 2026-09-16 (user-spec: "indfør elprisen af det nye tapo kamera"): køkkenets
+  # Tapo C210 kører døgnet rundt, og dens billedbehandling kører på NUC'en.
+  # Slideren er TOTALEN for begge dele, fordi de er uadskillelige i praksis —
+  # kameraet uden shimmen ville ingen nytte gøre, og shimmen uden kameraet
+  # intet forbruge. MÅLT 16/9 mod de kørende add-ons (Supervisor /stats,
+  # cpu_percent er docker-konventionen: 100 % = ÉN kerne, maskinen har 4):
+  #   gesture_frame_shim, tomgang  : 2,4 % af en kerne, 24/7 (holder RTSP åben)
+  #   gesture_frame_shim, under byge: 7-11 % i ~6 s
+  #   hand_recognition, tomgang    : 0,01 %  (klassificerer kun på forespørgsel)
+  #   hand_recognition, under byge : 1,5-2,7 % i ~2 s
+  #   byger 15/9                   : 1416 stk. × 6 s = 9,7 % af døgnet
+  # ⇒ ~3,0 % af én kerne i døgn-gennemsnit ≈ 0,2 W ekstra på NUC'en. Den er
+  # altså IKKE den dyre del — kameraet selv er. C210'erens adapter er 9 V ×
+  # 0,6 A = 5,4 W maks; i drift ligger den lavere, og IR-lysdioderne om natten
+  # trækker den op. 3,5 W er et konservativt døgn-snit.
+  # VIL DU HAVE DET MÅLT: flyt kameraets adapter til entré-pluggen i et par
+  # minutter og aflæs sensor.entre_cykel_lader_effekt — det er husets eneste
+  # ledige effektmåler. Ret så slideren; intet andet skal røres.
+  cost_kamera_watt:
+    name: "Setup: Tapo-kamera + billedbehandling (W)"
+    icon: mdi:cctv
+    min: 0
+    max: 20
+    step: 0.1
+    unit_of_measurement: "W"
+    mode: box
+  # Højttaleren (AxiomAir N3) — 2026-10-10, user-spec "højttaleren skal
+  # tælles med i setup i alt". Målt på GRILLPLATS-pluggen mens den stod der
+  # (B212): fuldt batteri 10,45 W tids-vægtet (p50 10,4 / p75 10,7), afspilning
+  # ~11-11,7 W, ~3 t afspilning/døgn ⇒ ~10,6 W døgn-snit (≈ 93 kWh/år). Pluggen
+  # blev fjernet samme dag (konstant strøm) → herfra en fast slider som kameraet.
+  cost_hoejttaler_watt:
+    name: "Setup: højttaler (W)"
+    icon: mdi:speaker
+    min: 0
+    max: 30
+    step: 0.1
+    unit_of_measurement: "W"
+    mode: box
+  cost_batteri_kr_aar:
+    name: "Setup: batteri-budget (kr/år)"
+    icon: mdi:battery-sync
+    min: 0
+    max: 2000
+    step: 10
+    unit_of_measurement: "kr"
+    mode: box
+
+template:
+  - sensor:
+      # --- Nettarif/transport lige nu (kr/kWh, ekskl. moms) -------------------
+      # 2026-06-21: nu REEL + dynamisk fra Energi Data Service (EDS) — Radius'
+      # time-differentierede nettarif + Energinet transmission + systemtarif,
+      # time-for-time. Falder tilbage til mit 3-tids-estimat hvis EDS er nede.
+      - name: "Cost net tariff aktuel"
+        unique_id: cost_net_tariff_aktuel
+        unit_of_measurement: "kr/kWh"
+        icon: mdi:transmission-tower
+        state: >-
+          {% set t = state_attr('sensor.energi_data_service', 'tariffs') %}
+          {% if t is mapping and t.get('tariffs') %}
+            {% set net = t['tariffs'].get(now().hour | string) | float(0) %}
+            {% set add = t.get('additional_tariffs', {}) %}
+            {{ (net + (add.get('transmissions_nettarif', 0) | float(0))
+                    + (add.get('systemtarif', 0) | float(0))) | round(3) }}
+          {% else %}
+            {% set h = now().hour %}
+            {% if h < 6 %}{{ states('input_number.cost_tariff_lavlast') | float(0.22) }}
+            {% elif 17 <= h < 21 %}{{ states('input_number.cost_tariff_spidslast') | float(0.53) }}
+            {% else %}{{ states('input_number.cost_tariff_hojlast') | float(0.27) }}{% endif %}
+          {% endif %}
+        attributes:
+          zone: >-
+            {% set h = now().hour %}
+            {{ 'lavlast' if h < 6 else ('spidslast' if 17 <= h < 21 else 'højlast') }}
+          kilde: >-
+            {% set t = state_attr('sensor.energi_data_service', 'tariffs') %}
+            {{ 'EDS (Radius, live)' if (t is mapping and t.get('tariffs')) else 'estimat (EDS nede)' }}
+
+      # --- ALL-IN pris lige nu (kr/kWh inkl. moms) ---------------------------
+      # 2026-06-21: PRIMÆR kilde = Energi Data Service (EDS), der bundter REEL +
+      # dynamisk spot + Radius nettarif + Energinet transmission/system + elafgift
+      # (alt ekskl. moms, da vi valgte vat=False). Vi lægger kun leverandør-
+      # tillægget (AltidEnergi, ikke i EDS) oveni og ganger med moms. Det matcher
+      # præcis hvad sensor.energi_data_service viser → ingen to forskellige priser.
+      #
+      # NB elafgift: EDS rapporterer 0,008 kr/kWh (dansk elafgift-lempelse). Mit
+      # gamle estimat var 0,76 → den nye pris er markant lavere. Stemmer det ikke
+      # med din regning, så sig til, så lægger jeg et elafgift-tillæg på.
+      #
+      # FALLBACK (EDS unavailable): min komponent-model — spot fra Nord Pool (ægte
+      # 0/negativt flyder igennem; fallback-estimat kun ved manglende feed) +
+      # tids-tarif-estimat + elafgift-slider + tillæg, × moms.
+      - name: "Elpris allin aktuel"
+        unique_id: elpris_allin_aktuel
+        unit_of_measurement: "kr/kWh"
+        # 2026-07-13: state_class measurement → long-term statistics til
+        # Statistik-sidens pris-historik-graf (all-in mean/dag). Bygger fremad.
+        state_class: measurement
+        icon: mdi:cash
+        state: >-
+          {% set eds = states('sensor.energi_data_service') %}
+          {% if eds not in ['unavailable', 'unknown', 'none', ''] and (eds | float(-99)) > -90 %}
+            {{ ((eds | float(0) + (states('input_number.cost_markup_kr_kwh') | float(0.10)))
+                * 1.25) | round(3) }}
+          {% else %}
+            {% set raw = states('sensor.elpris_spot_aktuel') %}
+            {% if raw in ['unavailable', 'unknown', 'none', '', none] %}
+              {% set spot = states('input_number.cost_spot_fallback_kr_kwh') | float(0.40) %}
+            {% else %}
+              {% set spot = raw | float(0) %}
+            {% endif %}
+            {% set ex_vat = spot
+                            + (states('sensor.cost_net_tariff_aktuel') | float(0.27))
+                            + (states('input_number.cost_elafgift_kr_kwh') | float(0.76))
+                            + (states('input_number.cost_markup_kr_kwh') | float(0.10)) %}
+            {{ (([ex_vat, 0] | max) * 1.25) | round(3) }}
+          {% endif %}
+        attributes:
+          kilde: >-
+            {% set eds = states('sensor.energi_data_service') %}
+            {{ 'EDS (live)' if eds not in ['unavailable','unknown','none',''] else 'fallback-estimat' }}
+
+      # --- Setup-overhead effekt (W): NUC + dongles + Apolloer + kamera + højttaler
+      # (batteri er ikke effekt — det er et kr/år-budget, se overhead-raten)
+      # Tilføjer du en SJETTE post, så husk den er kodet 4 steder: slideren her,
+      # summen nedenfor, snapshottet (config_snapshots/, helpers_export.py) og
+      # tilen i dashboards/settings.yaml. Fallback-tallet i `| float(...)` skal
+      # matche snapshot-værdien, ellers lyver sensoren mens helperen loader.
+      - name: "Setup overhead effekt"
+        unique_id: setup_overhead_effekt
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:server-network
+        state: >-
+          {{ ((states('input_number.cost_nuc_watt') | float(14))
+              + (states('input_number.cost_dongles_watt') | float(1.5))
+              + (states('input_number.cost_apollo_watt') | float(2.5))
+              + (states('input_number.cost_kamera_watt') | float(3.5))
+              + (states('input_number.cost_hoejttaler_watt') | float(10.6))) | round(1) }}
+
+      # --- Overhead-RATE (kr/h): (NUC+dongles)/1000 × all-in pris + batteri/time
+      # Single source of truth for overhead-raten → integreres til daglig andel
+      # OG bruges af setup_kost_rate (så total = lys + overhead, ingen divergens).
+      - name: "Setup overhead rate"
+        unique_id: setup_overhead_rate
+        unit_of_measurement: "kr/h"
+        icon: mdi:server-network
+        state: >-
+          {% set oh_w = states('sensor.setup_overhead_effekt') | float(32.1) %}
+          {% set allin = states('sensor.elpris_allin_aktuel') | float(2.25) %}
+          {% set batt_h = (states('input_number.cost_batteri_kr_aar') | float(250)) / 365 / 24 %}
+          {{ (oh_w / 1000 * allin + batt_h) | round(5) }}
+
+      # --- Setup-omkostnings-RATE (kr/h) = lys (pris-vægtet) + overhead --------
+      # Lys-rate (kr/h) kommer fra elpris_styring.yaml (effekt × all-in pris).
+      - name: "Setup kost rate"
+        unique_id: setup_kost_rate
+        unit_of_measurement: "kr/h"
+        icon: mdi:cash-clock
+        state: >-
+          {% set lys = states('sensor.lys_kost_rate_faktisk') | float(0) %}
+          {% set oh = states('sensor.setup_overhead_rate') | float(0) %}
+          {{ (lys + oh) | round(5) }}
+
+      # --- Tile-tal: overhead i dag (setup-total − lys) -----------------------
+      - name: "Setup overhead i dag"
+        unique_id: setup_overhead_i_dag
+        unit_of_measurement: "kr"
+        icon: mdi:server
+        state: >-
+          {{ [ (states('sensor.setup_kost_i_dag') | float(0))
+               - (states('sensor.lys_kost_faktisk_i_dag') | float(0)), 0 ] | max | round(2) }}
+
+sensor:
+  # --- Riemann-integration: setup-rate (kr/h) → akkumuleret kr ---------------
+  - platform: integration
+    name: "Setup kost total"
+    unique_id: setup_kost_total
+    source: sensor.setup_kost_rate
+    method: left
+    unit_time: h
+    round: 4
+
+  # Overhead-andel (NUC+dongles+batteri) med egne long-term statistics, så
+  # Forbrug-grafen kan stakke lys vs overhead = andelen. left-metode matcher
+  # lys+setup → ∫setup = ∫lys + ∫overhead (lineær) → søjlerne stakker til totalen.
+  - platform: integration
+    name: "Setup overhead total"
+    unique_id: setup_overhead_total
+    source: sensor.setup_overhead_rate
+    method: left
+    unit_time: h
+    round: 4
+
+# --- Dagsforbrug i kr: utility_meter (rene dag-grænser) ---------------------
+utility_meter:
+  setup_kost_idag:
+    source: sensor.setup_kost_total
+    cycle: daily
+    name: "Setup kost i dag"
+  setup_overhead_kost_idag:
+    source: sensor.setup_overhead_total
+    cycle: daily
+    name: "Setup overhead kost i dag"

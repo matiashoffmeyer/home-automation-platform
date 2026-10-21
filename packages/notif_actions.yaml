@@ -1,0 +1,453 @@
+# =============================================================================
+# Notifikations-handlinger — knapper på push-varsler → effekt i HA (2026-07-16)
+# =============================================================================
+# User-spec: "Gødningsvarsel skal have snooze 1 uge, snooze til i morgen og
+# mark as done. Ghost flap varsler skal ha tuner forslag jeg kan vælge mellem.
+# Find andre oplagte kandidater og implementér dem."
+#
+# ARKITEKTUR: afsenderne (plant_notify.py, apollo_ghost_alert, anomali_vagt,
+# system_varsler/backup) lægger `actions:` i push_notify-payloaden. Når user
+# trykker en knap på telefonen, sender companion-appen eventet
+# `mobile_app_notification_action` med `action`-strengen retur — automationerne
+# her router på prefix og udfører effekten. Virker på både Android + iOS
+# (dynamiske actions).
+#
+# ACTION-FORMAT (prefix:payload — payload er ALDRIG shell-interpoleret og
+# entity-payloads whitelist-filtreres med regex før brug, da event-data
+# principielt kan komme fra en kompromitteret telefon):
+#   PLANT_FERT_{DONE|SNOOZE7} (+ gl. SNOOZE1) → script.planter_goedning_kvitter
+#   APOLLO_GHOST_HUNT                        → flap-jagt ON i 2t (auto-off)
+#   APOLLO_GHOST_NEARFIELD:{slug,slug}       → g0+g1 still/move +5 på synder-rum
+#   APOLLO_GHOST_SNOOZE24                    → ghost-alarm stille i ~24t
+#   ANOM_LYS_SLUK:{ent,ent}                  → sluk de udpegede lys
+#   ANOM_MOERKE_TAEND:{ent,ent}              → tænd de udpegede rum-lys
+#   ANOM_PLUG_SLUK                           → sluk terrasse-pluggen
+#   ANOM_SNOOZE:{lys|moerke|plug}            → den detektor stille til i morgen 08
+#   BACKUP_RUN_NU                            → backup.create_automatic
+#
+# Runde 2 (2026-07-16, "andre notifikationer der kan blive smartere"):
+#   SIKKERHED_SNOOZE:{kulde|regn}            → dør-varslet stille i 3t (lufter ud)
+#   APOLLO_ESP_SNOOZE24                      → ESP-temp-canary stille i ~24t
+#   VANDLAEK_LYS_SLUK                        → falsk alarm: sluk rødt bad-lys
+#   DUG_SENS_NED / DUG_SENS_FRA              → dug-følsomhed −10 / slå fra (0)
+#   Lys-KPI's "sluk rummet"-knap GENBRUGER ANOM_LYS_SLUK (samme handler,
+#   samme whitelist — reglen bor ét sted, fejlklasse #2).
+#
+# Runde 3 (2026-09-20, user-spec "jeg skal fra min tlf godkende alle roborock
+# dormant kørsler") — handlerne bor i packages/roborock_dormant_godkend.yaml,
+# ikke her, fordi de læser og rydder samme pending-stempel som afsenderen:
+#   ROBOROCK_GODKEND                         → start den planlagte dormant-tur nu
+#   ROBOROCK_AFVIS                           → stempl afvisning; ingen tur før
+#                                              næste house_state-skift
+#
+# SNOOZE-MEKANIK: cooldown-betingelserne sammenligner "sidste push"-stemplet
+# med now() — et stempel SAT I FREMTIDEN blokerer altså indtil (stempel +
+# cooldown). Snooze-målet sættes derfor til ønsket-vækketid MINUS cooldown,
+# så re-arm lander præcis på målet.
+#
+# FLAP-JAGT AUTO-OFF: knappen armerer `apollo_flap_hunt_auto_off` — kun
+# knap-startede jagter auto-slukkes efter 2t (hardcodet). Manuelt tændte
+# jagter (user tænder selv slideren på Indstillinger) røres IKKE; flaget
+# ryddes altid når jagten slukker, uanset hvem der slukkede.
+# =============================================================================
+
+input_boolean:
+  apollo_flap_hunt_auto_off:
+    name: "Flap-jagt: auto-sluk armeret (startet fra ghost-push)"
+    icon: mdi:timer-off-outline
+
+automation:
+  # ---------------------------------------------------------------------------
+  # 1) Plante-gødning: ✅ Gødet / 📅 +1 uge → script.planter_goedning_kvitter
+  # ---------------------------------------------------------------------------
+  - id: notif_action_plant_fert
+    alias: "Notif-knap: gødning kvittering"
+    description: >
+      Knapperne på 🌿-gødningspushen. Pushen er SAMLET for alle forfaldne
+      planter (2026-07-29), så knappen bærer intet plante-ID — den gælder hele
+      den seneste påmindelse. 2026-10-05 (user-spec): ✅ Gødet er tilbage, og
+      uden den kommer pushen igen næste morgen. SNOOZE1 (😴) findes kun på
+      pushes sendt før den dato og virker stadig.
+    mode: queued
+    max: 5
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: "{{ (trigger.event.data.action | default('')).startswith('PLANT_FERT_') }}"
+    action:
+      - variables:
+          act: >-
+            {{ (trigger.event.data.action | replace('PLANT_FERT_', '')) | lower }}
+      - condition: template
+        # Whitelist FØR shell_command (event-data kan principielt komme fra en
+        # kompromitteret telefon). Scriptet whitelister også selv.
+        value_template: "{{ act in ['done', 'snooze1', 'snooze7'] }}"
+      - service: script.planter_goedning_kvitter
+        data:
+          act: "{{ act }}"
+
+  # ---------------------------------------------------------------------------
+  # 2) Apollo ghost-flap: tuner-forslag
+  # ---------------------------------------------------------------------------
+  - id: notif_action_apollo_ghost
+    alias: "Notif-knap: Apollo ghost tuner-valg"
+    description: >
+      Knapperne på 👻-spøgelses-pushen: (a) flap-jagt 2t = tænd
+      apollo_flap_hunt_enabled (auto-tuner der bumper præcis den flappende
+      gate) + armer auto-off; (b) nærfelt +5 = hæv g0+g1 still/move-sliderne
+      5 point på synder-rummene (klassisk near-field-spøgelses-fix; per-gate
+      write-automationerne propagerer chip-wear-sikkert til NVRAM); (c) ro 24t.
+    mode: queued
+    max: 5
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: "{{ (trigger.event.data.action | default('')).startswith('APOLLO_GHOST_') }}"
+    action:
+      - variables:
+          act: "{{ trigger.event.data.action }}"
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ act == 'APOLLO_GHOST_HUNT' }}"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id:
+                    - input_boolean.apollo_flap_hunt_enabled
+                    - input_boolean.apollo_flap_hunt_auto_off
+              - service: logbook.log
+                data:
+                  name: "Apollo spøgelse"
+                  message: "Push-knap: flap-jagt startet (auto-off om 2t)."
+
+          - conditions:
+              - condition: template
+                value_template: "{{ act.startswith('APOLLO_GHOST_NEARFIELD:') }}"
+            sequence:
+              - variables:
+                  # Slug-whitelist (= rummene med per-gate sliders). sove har
+                  # slug 'sove', resten fulde rumnavne — jf. apollo_per_gate.
+                  gate_sliders: >-
+                    {% set allowed = ['stue', 'spisestue', 'koekken', 'boernevaerelse', 'sove'] %}
+                    {% set slugs = act.split(':', 1)[1].split(',')
+                                   | map('trim') | select('in', allowed) | list %}
+                    {% set ns = namespace(e=[]) %}
+                    {% for s in slugs %}
+                      {% for g in ['g0_still', 'g0_move', 'g1_still', 'g1_move'] %}
+                        {% set ns.e = ns.e + ['input_number.' ~ s ~ '_' ~ g] %}
+                      {% endfor %}
+                    {% endfor %}
+                    {{ ns.e | join(',') }}
+              - condition: template
+                value_template: "{{ gate_sliders | trim | length > 0 }}"
+              - repeat:
+                  for_each: "{{ gate_sliders.split(',') }}"
+                  sequence:
+                    # +5, cap 100. Ukendt slider (unavailable) springes over.
+                    - if:
+                        - condition: template
+                          value_template: "{{ states(repeat.item) | float(-1) >= 0 }}"
+                      then:
+                        - service: input_number.set_value
+                          data:
+                            entity_id: "{{ repeat.item }}"
+                            value: "{{ [100, (states(repeat.item) | float(0)) + 5] | min }}"
+              - service: logbook.log
+                data:
+                  name: "Apollo spøgelse"
+                  message: "Push-knap: nærfelt-gates (+5 på g0/g1) — {{ gate_sliders }}."
+
+          - conditions:
+              - condition: template
+                value_template: "{{ act == 'APOLLO_GHOST_SNOOZE24' }}"
+            sequence:
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.apollo_ghost_last_alert
+                data:
+                  datetime: >-
+                    {{ (now() + timedelta(hours=24)
+                        - timedelta(minutes=states('input_number.apollo_ghost_alert_cooldown_minutes') | int(120)))
+                       .strftime('%Y-%m-%d %H:%M:%S') }}
+              - service: logbook.log
+                data:
+                  name: "Apollo spøgelse"
+                  message: "Push-knap: spøgelses-alarm snoozet 24t."
+
+  # Flap-jagt auto-off: KUN knap-startede jagter (flag armeret) slukkes efter 2t.
+  - id: apollo_flap_hunt_auto_off_efter_2t
+    alias: "Apollo: flap-jagt auto-off efter 2t (ghost-push-startet)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.apollo_flap_hunt_enabled
+        to: "on"
+        for: "02:00:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.apollo_flap_hunt_auto_off
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.apollo_flap_hunt_enabled
+      - service: logbook.log
+        data:
+          name: "Apollo spøgelse"
+          message: "Flap-jagt auto-slukket efter 2t (startet fra ghost-push)."
+
+  # Flaget ryddes ALTID når jagten slukker (manuel eller auto) — ellers ville et
+  # efterladt flag auto-slukke en SENERE manuelt startet jagt (fejlklasse #4).
+  - id: apollo_flap_hunt_auto_off_flag_clear
+    alias: "Apollo: flap-jagt auto-off-flag ryddes ved sluk"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.apollo_flap_hunt_enabled
+        to: "off"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.apollo_flap_hunt_auto_off
+
+  # ---------------------------------------------------------------------------
+  # 3) Anomali-vagt: sluk/tænd/snooze
+  # ---------------------------------------------------------------------------
+  - id: notif_action_anomali
+    alias: "Notif-knap: anomali-vagt handlinger"
+    description: >
+      Knapperne på 🕵️-pushene. Entity-payloads fra eventet whitelist-filtreres
+      (kun light.* + switch.koekken_spots) før turn_on/off — detektoren selv er
+      eneste autoritet på HVILKE entities der er anomale (listen beregnes ved
+      push-tid og bæres i action-strengen, så handleren ikke duplikerer
+      scan-logikken = fejlklasse #2). Snooze sætter detektorens
+      "sidste push"-stempel frem i tiden → stille til i morgen kl 08.
+    mode: queued
+    max: 5
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: "{{ (trigger.event.data.action | default('')).startswith('ANOM_') }}"
+    action:
+      - variables:
+          act: "{{ trigger.event.data.action }}"
+          ents: >-
+            {% if ':' in act %}
+              {{ act.split(':', 1)[1].split(',') | map('trim')
+                 | select('match', '^(light\.[a-z0-9_]+|switch\.koekken_spots)$')
+                 | list }}
+            {% else %}{{ [] }}{% endif %}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ act.startswith('ANOM_LYS_SLUK:') and ents | length > 0 }}"
+            sequence:
+              - service: homeassistant.turn_off
+                target:
+                  entity_id: "{{ ents }}"
+              - service: logbook.log
+                data:
+                  name: "Anomali-vagt"
+                  message: "Push-knap: slukkede {{ ents | join(', ') }}."
+
+          - conditions:
+              - condition: template
+                value_template: "{{ act.startswith('ANOM_MOERKE_TAEND:') and ents | length > 0 }}"
+            sequence:
+              - service: homeassistant.turn_on
+                target:
+                  entity_id: "{{ ents }}"
+              - service: logbook.log
+                data:
+                  name: "Anomali-vagt"
+                  message: "Push-knap: tændte {{ ents | join(', ') }}."
+
+          - conditions:
+              - condition: template
+                value_template: "{{ act == 'ANOM_PLUG_SLUK' }}"
+            sequence:
+              - service: switch.turn_off
+                target:
+                  entity_id: switch.terrasse_plug
+              - service: logbook.log
+                data:
+                  name: "Anomali-vagt"
+                  message: "Push-knap: terrasse-plug slukket."
+
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ act.startswith('ANOM_SNOOZE:')
+                     and act.split(':', 1)[1] in ['lys', 'moerke', 'plug'] }}
+            sequence:
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: "input_datetime.anomali_{{ act.split(':', 1)[1] }}_sidste_push"
+                data:
+                  datetime: >-
+                    {{ ((now() + timedelta(days=1)).replace(hour=8, minute=0, second=0)
+                        - timedelta(minutes=states('input_number.anomali_cooldown_minutter') | int(120)))
+                       .strftime('%Y-%m-%d %H:%M:%S') }}
+              - service: logbook.log
+                data:
+                  name: "Anomali-vagt"
+                  message: "Push-knap: {{ act.split(':', 1)[1] }}-detektoren snoozet til i morgen kl 08."
+
+  # ---------------------------------------------------------------------------
+  # 5) Sikkerhed dør-varsler: snooze 3t (kulde/regn — "jeg lufter ud med vilje")
+  # ---------------------------------------------------------------------------
+  - id: notif_action_sikkerhed_snooze
+    alias: "Notif-knap: dør-varsel ro 3t"
+    description: >
+      Snooze-knappen på 🥶-kulde- og 🌧️-regn-dør-pushene. Begge varsler har
+      60-min dedupe-stempler (temp/regn-sensoren flapper omkring grænsen) —
+      snooze sætter stemplet 2t frem = stille i 3t i alt (stempel + 1t dedupe).
+      Til bevidst udluftning med åben dør.
+    mode: queued
+    max: 3
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default('')).startswith('SIKKERHED_SNOOZE:') }}
+    action:
+      - variables:
+          typ: "{{ trigger.event.data.action.split(':', 1)[1] | trim }}"
+      - condition: template
+        value_template: "{{ typ in ['kulde', 'regn'] }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: "input_datetime.sikkerhed_{{ typ }}_doer_sidste_push"
+        data:
+          datetime: "{{ (now() + timedelta(hours=2)).strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: logbook.log
+        data:
+          name: "Altandør sikkerhed"
+          message: "Push-knap: {{ typ }}-dør-varslet snoozet 3t (bevidst udluftning)."
+
+  # ---------------------------------------------------------------------------
+  # 6) Apollo ESP-temp-canary: ro 24t
+  # ---------------------------------------------------------------------------
+  - id: notif_action_apollo_esp_snooze
+    alias: "Notif-knap: ESP-temp-canary ro 24t"
+    description: >
+      Snooze-knappen på 🌡️-ESP-temp-pushen. Canary'en har 6t dedupe + /30-
+      backstop — stemplet sættes 18t frem så både flanke og backstop er stille
+      i 24t (stempel + 6t dedupe). Til "jeg kalibrerer bevidst / kendt varm dag".
+    mode: single
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: "{{ trigger.event.data.action | default('') == 'APOLLO_ESP_SNOOZE24' }}"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.apollo_esp_temp_sidste_push
+        data:
+          datetime: "{{ (now() + timedelta(hours=18)).strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: logbook.log
+        data:
+          name: "Apollo ESP-canary"
+          message: "Push-knap: ESP-temp-varslet snoozet 24t."
+
+  # ---------------------------------------------------------------------------
+  # 7) Vandlæk: falsk alarm → sluk det røde lys
+  # ---------------------------------------------------------------------------
+  - id: notif_action_vandlaek_falsk
+    alias: "Notif-knap: vandlæk falsk alarm (sluk rødt lys)"
+    description: >
+      Knappen på 🚨-vandlæk-pushen. Kondens/håndbruser-sprøjt kan holde Badring
+      våd i timevis = rødt 100%-lys der brænder til sensoren tørrer. Knappen
+      slukker bad-lyset + dismisser persistent-notifikationen NU. Kommer der
+      ÆGTE vand igen, re-fyrer alarmen på næste on-flanke (sensoren skal tørre
+      og blive våd igen — en STADIG våd sensor re-fyrer ikke; det er accepteret:
+      user har lige stået i rummet og vurderet falsk alarm).
+    mode: single
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: "{{ trigger.event.data.action | default('') == 'VANDLAEK_LYS_SLUK' }}"
+    action:
+      - service: light.turn_off
+        target:
+          entity_id: light.badevaerelse_all
+        data:
+          transition: 2
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: water_leak
+      - service: logbook.log
+        data:
+          name: "Water leak ALARM"
+          message: "Push-knap: falsk alarm — rødt lys slukket + notifikation dismissed."
+
+  # ---------------------------------------------------------------------------
+  # 8) Dug-varsel: følsomheds-tuner (−10 / slå fra)
+  # ---------------------------------------------------------------------------
+  - id: notif_action_dug_sens
+    alias: "Notif-knap: dug-følsomhed ned/fra"
+    description: >
+      Tuner-knapperne på 💧-dug-pushen (spejler ghost-tuner-mønstret): varsler
+      den for ofte → −10 på dug_varsel_sensitivitet (gulv 0) direkte fra
+      telefonen; FRA sætter 0 (= detektoren helt slukket, samme semantik som
+      slideren på Indstillinger).
+    mode: queued
+    max: 3
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.event.data.action | default('') in ['DUG_SENS_NED', 'DUG_SENS_FRA'] }}
+    action:
+      - variables:
+          ny: >-
+            {{ 0 if trigger.event.data.action == 'DUG_SENS_FRA'
+               else [0, (states('input_number.dug_varsel_sensitivitet') | float(50)) - 10] | max }}
+      - service: input_number.set_value
+        data:
+          entity_id: input_number.dug_varsel_sensitivitet
+          value: "{{ ny }}"
+      - service: logbook.log
+        data:
+          name: "Dug-varsel"
+          message: >-
+            Push-knap: følsomhed →
+            {{ ny }}{{ ' (slået fra)' if ny | float(0) == 0 else '' }}.
+
+  # ---------------------------------------------------------------------------
+  # 4) Backup-vagt: kør backup nu
+  # ---------------------------------------------------------------------------
+  - id: notif_action_backup_run
+    alias: "Notif-knap: kør backup nu"
+    description: >
+      Knappen på 💾-backup-pushen — starter en automatisk backup med det samme
+      (samme service som nat-backuppen, backup.create_automatic, så
+      backup-sensorerne opdateres og morgendagens vagt-tjek ser den).
+    mode: single
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: "{{ trigger.event.data.action | default('') == 'BACKUP_RUN_NU' }}"
+    action:
+      - service: backup.create_automatic
+      - service: logbook.log
+        data:
+          name: "Backup-vagt"
+          message: "Push-knap: manuel backup startet."

@@ -1,0 +1,895 @@
+# =============================================================================
+# Constants — central tunable konfiguration (C3)
+# =============================================================================
+# Single source of truth for de magic numbers der bruges flere steder.
+# Hver er eksponeret som input_number saa du kan justere fra HA UI uden at
+# redigere YAML.
+#
+# DESIGN-FILOSOFI:
+#   Vi ekstraherer kun konstanter der:
+#     1. Bruges 3+ steder MED SAMME BETYDNING
+#     2. Er "policy" (kan tunes uden at scenarie-specifik logik braekkes)
+#     3. Vil benefitte fra UI-justerbarhed
+#
+#   Vi ekstraherer IKKE:
+#     - One-off magic numbers (fx 8% nightwalk brightness)
+#     - Scene-specific tal (cinema lighting choices)
+#     - Tal der TILFAELDIGT er ens men har forskellig semantik (fx
+#       transition: 60 i wakeup-fade vs presence-absence-fade)
+#
+# Hvis du vil aendre en vaerdi: gor det her, og alle automations der bruger
+# konstantet picker det op uden YAML edits.
+# =============================================================================
+
+input_number:
+  # 2026-06-11 (user-spec): minimum tid bad-lyset skal holde efter at
+  # inde-Myggspray'en (binary_sensor.badevaerelse_inde_occupancy) har set
+  # aktivitet. Lyset kan ALDRIG auto-slukke før der er gået X minutter
+  # siden sidste bevægelse derinde — uanset global Turn-Off-slider.
+  # Consumer: automations/presence_badevaerelse.yaml (off-conditions).
+  # Default 10 min sættes af init_user_preferences. Tile på diagnostics.
+  badevaerelse_min_on_minutes:
+    name: "Bad: minimum lys efter aktivitet (minutter)"
+    icon: mdi:shower-head
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-06-15 (user-spec): max-on watchdog. Hvis bad-presence-sensorerne
+  # (VALLHORN/Myggspray, Thread/Matter) falder af mens lyset er tændt, nægter
+  # gradvis-sluk at slukke ('sluk aldrig i blinde') → lyset hænger. Denne cap
+  # slukker bad-lyset hvis det har været tændt sammenhængende i X min, UANSET
+  # sensor-state. Robust mod enhver Thread-dropout.
+  #
+  # 2026-06-18 (robust wasp rewrite): SAMME slider er nu det fælles "max
+  # besøgs-tid"-loft og styrer TRE ting:
+  #   1. max-on watchdog (presence_badevaerelse.yaml) — slukker lyset + rydder
+  #      wasp efter X min uafbrudt tændt.
+  #   2. wasp safety auto-clear (badevaerelse_wasp.yaml) — tvinger disarm når
+  #      wasp har stået armeret > X min (fjerner hængende lås).
+  #   3. bug-notifikation (badevaerelse_lys_metrics.yaml) fyrer ved X+5 min
+  #      uafbrudt tændt = selv watchdog'en svigtede.
+  # Sæt den til lidt OVER det længste reelle bad (user 2026-06-18: ~30 min →
+  # default 40). For lavt = klipper et langt brusebad; for højt = længere
+  # worst-case stuck. Default 40 min via init_user_prefs.
+  badevaerelse_max_on_minutes:
+    name: "Bad: max besøgs-tid (watchdog + wasp-loft)"
+    icon: mdi:timer-alert-outline
+    min: 20
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-06-18 (user-spec): bad-spots hopper ALDRIG direkte til 100%. Ved dør-
+  # åbning / inde-bevægelse tændes 60%, og DERFRA trappes langsomt op mod 100%
+  # over denne tid — KUN så længe inde-sensoren bliver ved at se bevægelse.
+  # Stopper bevægelsen (kort toilet-besøg), bliver lyset på det niveau det nåede
+  # → sparer strøm. Consumer: presence_badevaerelse.yaml (badevaerelse_spots_ramp).
+  badevaerelse_ramp_minutes:
+    name: "Bad: optrapning 60→100% (minutter)"
+    icon: mdi:transfer-up
+    min: 1
+    max: 20
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-07-02 (B42 fix 3a, user-valgt): re-konfirmations-probe for wasp-hold.
+  # Problem: exit med LUKKET dør bag sig → wasp holder Fuld-lyset 100 % i tomt
+  # bad til max_on-watchdogen (fx 09:29-burnet: 20 min tomt på fuld styrke).
+  # Løsning: lukket dør + Fuld + ingen inde-motion i N min → dæmp til probe-
+  # niveau; stadig intet i M min → sluk + ryd wasp. Motion under proben →
+  # straks Fuld igen. (Stille karbad = vift med armen efter N min.)
+  # Consumer: presence_badevaerelse.yaml (badevaerelse_wasp_probe_dim).
+  # Defaults 10/3/40 via init_user_prefs.
+  badevaerelse_wasp_probe_minutes:
+    name: "Bad: wasp-probe efter stilhed (minutter)"
+    icon: mdi:timer-sand
+    min: 2
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  badevaerelse_wasp_probe_off_minutes:
+    name: "Bad: wasp-probe → sluk efter (minutter)"
+    icon: mdi:timer-off-outline
+    min: 1
+    max: 15
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Rå %, IKKE factor-skaleret (probe = signal, ikke hygge). Kun-nedad:
+  # proben dæmper aldrig OP (natlys 8 % røres ikke).
+  badevaerelse_wasp_probe_brightness:
+    name: "Bad: wasp-probe niveau (%)"
+    icon: mdi:lightbulb-on-40
+    min: 10
+    max: 80
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-06-19 (user-spec): bad-lyset blev for GULT om aftenen. Dette er et
+  # GULV for bad-farvetemperaturen: badet bliver aldrig varmere (lavere K) end
+  # denne værdi — hverken via adaptiv-memory, presence-fallback eller den
+  # globale Aften-varme-slider. HØJERE = køligere/hvidere (mindre gult).
+  # UNDTAGELSE: godnat-natlys (8% / 2000K under godnat+mørke) er bevidst
+  # varmere for at beskytte nattesyn og ligger UNDER gulvet. Default 2700 via
+  # init_user_preferences. Consumer: presence_badevaerelse.yaml. Tile på Indstillinger.
+  badevaerelse_min_kelvin:
+    name: "Bad: mindste farvetemperatur (anti-gul gulv)"
+    icon: mdi:thermometer-low
+    min: 2200
+    max: 4000
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+
+  # 2026-06-21 (user-spec to-PIR sok-filter): hvor LÆNGE dør-PIR'en (inde_1,
+  # ved døren mod vask/spejl) skal være uafbrudt tændt ALENE, før besøget
+  # tælles som rigtigt selvom deep-PIR'en (inde_2) aldrig fyrede. Diskriminerer
+  # sok (PIR holdes kun tændt i clear-delay'en ~25 s) fra reelt vask-ophold
+  # (tandbørstning = minutter). SKAL ligge OVER PIR-clear-delay'en (~20-30 s)
+  # for at betyde noget — derfor default 40. Lavere = stol hurtigere på dør-
+  # PIR alene (kortere vask-besøg løftes til fuld); højere = kræv mere ophold.
+  # Consumer: packages/badevaerelse_visit_quality.yaml (serious arm-sustain).
+  # NB: trigger-`for:` binder værdien ved load → fuld effekt efter HA-restart.
+  badevaerelse_serious_sustain_seconds:
+    name: "Bad: dør-PIR alene → Medium efter (sek)"
+    icon: mdi:account-clock
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-06-26 (user-spec): Fuld må også trigges af VEDVARENDE tilstedeværelse
+  # ved sensorerne — selv med ÅBEN dør (uden wasp). Tæller ophold (union inde-
+  # occupancy uafbrudt tændt) fra entrance; når det overstiger denne tærskel
+  # løftes besøget til Fuld (komplet badebesøg uanset dør-status). Default 70 s.
+  # Lavere = løft hurtigere til Fuld (risiko: langt vask-besøg ved åben dør
+  # bliver Fuld); højere = kræv mere ophold. Wasp-pathen (lukket dør) er urørt
+  # og uafhængig. Consumer: packages/badevaerelse_visit_quality.yaml
+  # (badevaerelse_stage_full_sustained).
+  # NB: trigger-`for:` binder værdien ved load → fuld effekt efter HA-restart.
+  badevaerelse_full_sustain_seconds:
+    name: "Bad: ophold ved sensor → Fuld efter (sek)"
+    icon: mdi:account-clock-outline
+    min: 20
+    max: 300
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-06-21 (user-spec to-PIR sok-filter): bekræftelses-/sok-vindue. Et
+  # ubekræftet besøg (kun dør-PIR, ikke serious) quick-off'es når dør-PIR'en har
+  # været i ro i SÅ mange sekunder (PIR clear-delay + buffer) uden at besøget
+  # blev bekræftet. = en sok koster kun probe-brightness i ~clear-delay+grace
+  # sek, ikke 60 % i 10+ min. Lavere = slukker sok-lyset hurtigere (men risiko
+  # for at klippe et besøg der lige skulle bekræftes); højere = mere tålmodig.
+  # Consumer: presence_badevaerelse.yaml (badevaerelse_probe_quick_off).
+  # NB: trigger-`for:` binder værdien ved load → fuld effekt efter HA-restart.
+  badevaerelse_probe_grace_seconds:
+    name: "Bad: Quick-besøg sluk-vindue (sek)"
+    icon: mdi:timer-sand-complete
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-06-21 (user-spec to-PIR sok-filter): brightness for et UBEKRÆFTET
+  # besøg (kun dør-PIR fyrede, endnu ikke serious). Bekræftes besøget (deep-PIR
+  # ELLER dør-PIR vedvarende) løftes lyset til normal 60 %-entry + ramp. Rå %,
+  # IKKE ganget med global aggressiveness (samme som approach-brightness).
+  # Sæt LAVT for "en sok skal næsten ikke kunne ses"; sæt = 60 for "tænd altid
+  # fuldt og lad kun quick-off'en spare" (= probe-tier slået fra i praksis).
+  # Godnat-8 % natlys er urørt (eget flow). Consumer: presence_badevaerelse.yaml
+  # (presence_light_badevaerelse_on else-gren). Default 40 via init_user_prefs.
+  badevaerelse_probe_brightness:
+    name: "Bad: probe-brightness (ubekræftet besøg)"
+    icon: mdi:lightbulb-question
+    min: 2
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-06-21 (user-spec stadier): MEDIUM-besøg sluk-tid. Stadie Medium = ét
+  # commitment-signal (deep-PIR én gang ELLER dør-PIR vedvarende) men IKKE wasp
+  # = reelt men kort besøg med åben dør (tisse-tur / hentede noget). Lyset slukker
+  # efter så mange minutter UDEN bevægelse. PIR ser ikke stilstand → måles fra
+  # sidste bevægelse. Lavere = slukker hurtigere efter korte besøg; højere = mere
+  # tålmodig. 2026-08-29: den gamle NB ("capper reelt ved den globale
+  # absence-wait") er RETTET i koden — presence_light_badevaerelse_off venter nu
+  # det længste af sit eget vindue og DENNE ved stadie Medium + åben dør, så
+  # slideren ejer hele holdet. Den er dermed husets "hvor længe må bruseren være
+  # usynlig for PIR'en"-knap (målt brusebad = 14,5 min).
+  # Consumer: presence_badevaerelse.yaml (badevaerelse_medium_off +
+  # presence_light_badevaerelse_off's wait-beregning).
+  # NB: trigger-`for:` binder værdien ved load → fuld effekt efter HA-restart.
+  badevaerelse_medium_off_minutes:
+    name: "Bad: Medium-besøg sluk efter (minutter)"
+    icon: mdi:timer-outline
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-06-21 (user-spec stadier): FULD-besøg leave-off. Et Fuld-besøg (wasp /
+  # bag lukket dør) holdes mens døren er lukket; når døren ÅBNES er man på vej ud
+  # → sluk efter så mange sekunder hvis ingen bevægelse genoptages. Dræber den
+  # store burn (2-min tissetur → 8 min efterlys). Lavere = slukker hurtigere når
+  # du går; højere = mere grace (åbnede du bare for at hente noget). Consumer:
+  # presence_badevaerelse.yaml (badevaerelse_full_leave_off). Default 25 s.
+  badevaerelse_leave_off_seconds:
+    name: "Bad: Fuld-besøg sluk efter dør åbnes (sek)"
+    icon: mdi:door-open
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-09-17 (user-spec: "bad skal være undtaget den globale slider, skal ikke
+  # ganges op"). Badet delte husets `sensor.rum_tom_sluk_sekunder` = 300 s ×
+  # global_absence_wait_factor. Med den globale slider på 30 (= 3,34×) blev de
+  # 5 minutter til 16,7 — målt 17/9: rummet blev tomt 13:38:31, lyset slukkede
+  # 13:55:14, præcis på det beregnede tidspunkt. Badet er ikke en stue: her er
+  # den rigtige knap "hvor længe må bruseren være usynlig for PIR'en", og den
+  # skal ikke flytte sig fordi man skruer på husets stue-tålmodighed.
+  # DENNE slider er derfor U-SKALERET — 17 betyder 17 minutter.
+  #
+  # DEFAULT 17 ER MÅLT, IKKE PÆN (📏). Første udkast satte den til husets basis
+  # på 5 min, og det ville have været en adfærdsændring ingen bad om: over 14
+  # døgn ligger der 73 PIR-stilhedshuller (≈5/døgn) i vinduet 5-16,7 min hvor
+  # lyset var tændt og INTET veto kunne holde — brusebad-vetoet var off, og
+  # wasp/visit_serious kræver LUKKET dør. Ved 5 min slukker lyset i dem alle.
+  # En del er et reelt tomt rum (= featuren virker), men resten er præcis den
+  # bug user meldte 2026-08-29: "bad med åben dør gør at lyset slukker på os".
+  # 17 ≈ de 16,7 min huset faktisk har kørt med (300 s × global 3,34) — altså
+  # ren undtagelse fra den globale slider uden nogen adfærdsændring oveni.
+  # Skal den ned, er det nu en BEVIDST beslutning på en slider der betyder det
+  # den siger. Populationen kan ikke renses yderligere: med døren stående åben
+  # giver den ingen flanke, så "stille person" og "tomt rum" er samme kurve.
+  # Badets EGNE faktorer gælder stadig og er med vilje: AirBnB-forsigtighed
+  # (`sensor.badevaerelse_airbnb_off_factor`) og bruser-vagten
+  # (`sensor.badevaerelse_bruser_off_factor`) ganges stadig ovenpå, fordi de
+  # beskytter mod at slukke på et menneske ingen sensor kan se.
+  # Consumer: presence_badevaerelse.yaml ("Lysnet: Badeværelse gradvis sluk",
+  # både trigger-`for:` og /5-fallbackens wait-beregning) via
+  # sensor.badevaerelse_tom_sluk_sekunder (packages/room_absence_tuning.yaml).
+  # NB: trigger-`for:` binder værdien ved load → fuld effekt efter HA-restart.
+  badevaerelse_off_minutter:
+    name: "Bad: tomt rum sluk efter (minutter)"
+    icon: mdi:shower-head
+    min: 1
+    max: 60
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-06-21 (user-spec): under godnat (+ mørke) gælder hele det smarte stadie-
+  # system OGSÅ — men lysstyrken sænkes godt ned vs. dagtimer. ALLE stadier (Quick/
+  # Medium/Fuld) bruger denne ene lave brightness om natten (rå %, ikke factor-
+  # skaleret — beskytter mørketilpasset syn / vækker ikke baby). Stadierne styrer
+  # stadig SLUK-timingen (Quick hurtig, Medium kort, Fuld hold-til-dør). Efter
+  # solopgang (stadig godnat) falder den igennem til normalt dag-niveau (natlys
+  # gælder kun i mørke). Erstatter den hardcodede 8 %-natlys. Consumer:
+  # presence_badevaerelse.yaml (on-automation natlys-gren). Default 8 %.
+  badevaerelse_godnat_brightness:
+    name: "Bad: godnat-brightness (alle stadier, mørke)"
+    icon: mdi:weather-night
+    min: 2
+    max: 50
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-07-27 (user-bug: "godnat bad lys hang efter mit night walk"): under
+  # godnat skal et nat-toilet-besøg slukke HURTIGT når man er ude — den gamle
+  # 90 s godnat-timeout forsvandt i 05-20-rewriten (fladt private-tier ~5 min).
+  # Antal SEKUNDER inde-occupancy skal have været i ro UNDER GODNAT før badet
+  # slukkes, UANSET besøgs-stadie. Døren holdes åben om natten (user 2026-07-27)
+  # → wasp armerer ikke, så denne styrer natten. Lavere = slukker hurtigere efter
+  # du er ude (risiko: klipper hvis du sidder helt stille > vinduet ved ÅBEN dør
+  # uden at deep-PIR inde_2 fanger mikro-bevægelse); højere = mere grace. Wasp-
+  # hold ved LUKKET dør (nat-brusebad) er urørt. Gælder KUN godnat (dag = stadie-
+  # systemet). Consumer: presence_badevaerelse.yaml (badevaerelse_godnat_
+  # nightwalk_off). NB: trigger-`for:` binder værdien ved load → fuld effekt
+  # efter HA-restart. Default 90 via init_user_preferences.
+  badevaerelse_godnat_off_seconds:
+    name: "Bad: godnat nat-toilet sluk efter (sek)"
+    icon: mdi:sleep
+    min: 15
+    max: 300
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-06-15 (user-spec): entré-specifik lux-tærskel. Entré er vinduesløs og
+  # bruger open_plan_lux (nu spisestue/vindue) som proxy. Slideren styrer hvor
+  # lyst der må være, før entre_motion IKKE længere tænder loftet. Lavere =
+  # tænder kun når mørkere. Consumer: automations/entre_motion.yaml. Default 40.
+  entre_lux_threshold:
+    name: "Entré: lux-tærskel for auto-tænd"
+    icon: mdi:door-open
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-07-03 (user-bug): børneværelses-presence målte open_plan_lux (lyst i
+  # sommer-aften) i st.f. rummets egen → tændte ikke selv om rummet var mørkt.
+  # RÅ lux-tærskel på rummets EGEN sensor (sensor.boernevaerelse_lux_reel):
+  # auto-tænder når rummet er under N lux. IKKE global-faktor-skaleret (rå),
+  # 0 = auto-tænder ALDRIG (kun manuel/Styrbar). Consumer:
+  # automations/presence_boernevaerelse.yaml (primary presence-gren). Default 15.
+  # 2026-10-05 (user: "har været så meget tændt i dag … juster også lux
+  # tærsklen"): 20 → 10. Med andelen 18 % (28/9) var 20 lx i rummet = open-plan
+  # 111 lx — søskendenes højeste (spisestue tænder under 25 af sin egen,
+  # open-plan-indedag 37). En grå dag (open-plan 60-150 hele dagen) holdt
+  # gaten åben fra morgen til aften: 4 af dagens 8 tændinger skete ved
+  # open-plan 59-105 (10:20, 11:08, 13:08, 14:35 = 206 min lys). 10 lx = open-
+  # plan ~56 → de fire falder væk; morgengryet (23-42) og skumringen (fra
+  # ~16) tænder stadig. Sluk-siden følger med (effektiv sluk 20 lx = ~111).
+  # NB 28/9 ville user have lys ved open-plan 110 kl. 16:53 — den sag tænder
+  # ikke længere automatisk (spurgt).
+  boernevaerelse_lux_threshold:
+    name: "Børneværelse: lux-tærskel for auto-tænd"
+    icon: mdi:teddy-bear
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-07-27 (user-spec): spisestuen fik sin EGEN direkte lux-tærskel. FØR var
+  # (a) spisestue-loftets normale presence-tænd gated på STUE's gate
+  # (sensor.stue_lux_gate) → spisestue reelt "inkluderet i stue", og (b)
+  # måltids-spiselyset havde sin egen løsrevne maaltid_spiselys_lux_reference.
+  # Nu ÉN rå lux-tærskel på spisestuens EGEN sensor (sensor.spisestue_lux_reel,
+  # fallback sensor.open_plan_lux) — SEPARAT fra stue, IKKE global-faktor/dag-
+  # skaleret (rå lx = det du sætter er hvad der sammenlignes). Consumers:
+  # automations/presence_stue.yaml (spisestue_loft normal presence) +
+  # packages/maaltid_detektion.yaml (spiselys tænd-gate + styrke-skalering).
+  # Auto-tænder når spisestue-lux < tærskel. 0 = auto-tænder ALDRIG (kun manuel/
+  # Styrbar). Default 150 (arvet fra den tidligere maaltid-lux-værdi).
+  # 2026-09-24: 25 lx på sensor.spisestue_dagslys_lx (vinduesnær, ren kanal).
+  # 85 gav ping-pong med stue-dagslys-sluk (> 40) på grå dage; user slukkede
+  # selv ved 31,5 lx. DELT med måltids-spiselyset (maaltid_detektion.yaml).
+  spisestue_lux_threshold:
+    name: "Spisestue: lux-tærskel for auto-tænd"
+    icon: mdi:silverware-fork-knife
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-08-10 (user-bug): "Godmorgen: Auto-detect ved fælles-rum presence"
+  # (entré-presence efter 06:00 → tænder spisestue_loft) brugte det BLANDEDE
+  # sensor.open_plan_lux (gennemsnit af køkken+spisestue-Apollo) med hardkodet
+  # 20/40 lx. Køkken-siden trækker gennemsnittet ned → spisestue_loft tændte
+  # kl. 06:49 selvom spisestuens EGEN sensor viste ~29-31 lx (målt). Egen
+  # slider på spisestuens EGEN sensor (sensor.spisestue_lux_reel, samme
+  # fallback-kæde som spisestue_lux_threshold), SEPARAT fra den — denne gate
+  # er en engangs-safety-net-trigger ved opvågning, ikke løbende presence-tænd,
+  # og skal kunne tunes uafhængigt. 0 = auto-tænder ALDRIG.
+  godmorgen_auto_detect_lux_threshold:
+    name: "Godmorgen auto-detect: lux-tærskel (spisestue)"
+    icon: mdi:weather-sunset-up
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-08-16g (user-spec): entré-lysstyrken skaleres nu MED lux i stedet for
+  # at være ét fast tal. Retning valgt af user: MØRKERE → SVAGERE (øjen-
+  # tilpasning — i bælgmørke blændes man af meget lidt, i skumring skal der
+  # mere til for at lyset overhovedet ses). De to slidere er kurvens
+  # endepunkter og interpoleres lineært mellem 0 lx og entre_lux_threshold:
+  #
+  #   lux = entre_lux_threshold  →  entre_brightness_taerskel  (kraftigst)
+  #   lux = 0                    →  entre_brightness_moerke    (svagest)
+  #
+  # Begge skaleres til sidst af global_brightness_factor (master bevares).
+  # Sætter du moerke > taerskel, vender kurven — det er tilladt.
+  # Consumer: automations/entre_motion.yaml (entre_motion_on).
+  # Erstatter den faste entre_brightness (2026-06-24 → 2026-08-16g).
+  entre_brightness_taerskel:
+    name: "Entré: lysstyrke ved lux-tærsklen"
+    icon: mdi:lightbulb-on-70
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  entre_brightness_moerke:
+    name: "Entré: lysstyrke i bælgmørke"
+    icon: mdi:lightbulb-on-30
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-09-12 (user: "entrelys skal fade meget langsommere ud og blusse op
+  # hvis der kommer bevægelse mens den fader").
+  # Entréen læste før husets fælles input_number.fade_passage_seconds (10 s),
+  # men det tal har 7 andre forbrugere (depot · terrasse · soveværelse ·
+  # badeværelset 3 steder · godnat) og kan derfor ikke skrues op for ét rums
+  # skyld (#2/#16). Vigtigere: entré-pæren er MATTER, og HA videregiver
+  # aldrig `transition` til et Matter-`turn_off` — det gamle tal har aldrig
+  # gjort noget som helst i entréen. Nedtoningen drives nu i trin af
+  # packages/entre_fade_ud.yaml, og DETTE er dens varighed.
+  #
+  # BEVIDST literal, ikke skaleret: varigheds-slidere ganges ikke med
+  # Sluk-aggressivitet eller lignende (det gør kun niveauer). Tallet her er
+  # den fade man får, hele døgnet.
+  # NB scope: kun bevægelses-sluk i entréen. Godnat slukker ad sin egen vej.
+  entre_fade_ud_sekunder:
+    name: "Entré: fade-ud varighed"
+    icon: mdi:transition-masked
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-08-27b (user: "entre lyset er også for gult"). Entréen fulgte husets
+  # fælles sensor.auto_color_temp_evening, som om aftenen lander på ~2190 K —
+  # stemningslys, og forkert for et gennemgangsrum hvor man skal se hvad man
+  # tager på og hvor nøglerne ligger. Sensoren har 25 forbrugere og må derfor
+  # ikke røres for ét rums skyld (fejlklasse #2/#16); entréen får sin egen.
+  #
+  # BEVIDST absolut, ikke adaptiv: en gang skal se ens ud hver gang man går
+  # igennem. NAT-vejen er urørt og har sin egen hårdkodede 2000 K
+  # (entre_motion.yaml, godnat/winddown-grenen) — skruer du denne op, bliver
+  # natturen altså ikke koldere.
+  # Consumers: entre_motion.yaml (bevægelses-tænd), entre_somrig.yaml,
+  # arrival.yaml — de læser slideren direkte; der er ingen modifikatorer at
+  # samle i en effektiv-sensor, og sliderens min/max holder den allerede
+  # inden for pærens fysiske 1801-6535 K.
+  entre_kelvin:
+    name: "Entré: farvetemperatur"
+    icon: mdi:thermometer-lines
+    min: 2000
+    max: 5000
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+
+  # 2026-06-24 (user-spec): entré/gang-lysstyrke under godnat/winddown (nat ved
+  # siden af soveværelset). Erstatter den hardcodede 5%-base i entre_motion_night.
+  # Default 1% (min=1 → kan gå helt ned til 1, under det globale 2%-gulv).
+  entre_godnat_brightness:
+    name: "Entré: lysstyrke under godnat"
+    icon: mdi:lightbulb-night
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-06-28 (user-spec): spisestue-natlys (open-plan dusk/aften-presence-lys)
+  # skal være DÆMPET + ekstra varmt, ikke fuld styrke. BUG-fix: nat-grenen i
+  # presence_light_stue_on + presence_lux_stue_on gangede basen med
+  # global_brightness_factor (×2.86 ved aggressiveness=70) → 35/60% sprang til
+  # 100%. Denne slider er RÅ % (IKKE factor-skaleret — spejler bad/entré-natlys-
+  # mønstret) og bruges KUN når solen er under horisonten (elev < 0 = nat).
+  # Farven låses samtidig til 2000K varm. Default 8 % (init: fresh-install min=1
+  # → sættes til 8; live sat via API + snapshot). Consumer: automations/
+  # presence_stue.yaml + automations/presence_lights.yaml.
+  spisestue_natlys_brightness:
+    name: "Spisestue: natlys-brightness (rå, mørke)"
+    icon: mdi:lightbulb-night
+    min: 1
+    max: 50
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-07-10 (user-spec): dedikeret styrke + farve for spisestue-loftet i
+  # NORMAL auto-drift (bevægelses- OG lux-tænd). Erstatter de gamle lux-brackets
+  # (80/60/35 × global_brightness_factor) + den delte farve (auto_color_temp_
+  # evening / hardcodet 2630K) med ÉT autoritativt sæt sliders. RÅ værdier —
+  # IKKE skaleret af global_brightness_factor (spejler natlys/bad-natlys-mønstret)
+  # → hvad du sætter er hvad du får. Gælder KUN spisestue-loftet i normal auto:
+  # godnat-natlys bruger fortsat spisestue_natlys_brightness + 2000K, og måltids-
+  # spiselyset har sit eget (maaltid_spiselys_brightness/_kelvin).
+  # Consumer: presence_light_stue_on (presence_stue.yaml) + presence_lux_stue_on
+  # (presence_lights.yaml). Defaults via init (60% / 2700K) + API-set + snapshot.
+  spisestue_auto_brightness:
+    name: "Spisestue: auto styrke (rå)"
+    icon: mdi:lightbulb-on
+    min: 5
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  spisestue_auto_kelvin:
+    name: "Spisestue: auto farve (kelvin)"
+    icon: mdi:palette
+    min: 2000
+    max: 4000
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+
+  # 2026-06-12 (user-spec): hvor hurtigt BAD drifter tilbage til Auto efter
+  # manuelt tryk (Styrbar/app). Bad-specifik override af de globale drift-
+  # gates — overstyrer for bad: occupied-fallbacken (room_manual_on_hold_
+  # hours), det hardcodede 30-min race-vindue OG tom-rum-kravet (global
+  # 20 min). Uden alle tre overrides ville en 15-min slider være
+  # virkningsløs (de globale gates dominerer).
+  # Consumer: automations/room_drift_back.yaml. Default 15 min sættes af
+  # init_user_preferences. Tile på diagnostics.
+  # NB: bad-sensorens trigger-`for:` binder værdien ved HA-start — backup-
+  # ticket (/15 min) bruger live værdi, så slider-ændringer virker indenfor
+  # ~15 min uden restart; restart giver fuld præcision.
+  badevaerelse_manual_til_auto_minutes:
+    name: "Bad: manuel → Auto efter (minutter)"
+    icon: mdi:backup-restore
+    min: 1
+    max: 240
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-06-13 (user-spec): approach/early-detect tænder badet på sin EGEN
+  # faste brightness (denne slider, rå procent — IKKE ganget med global
+  # aggressiveness) i stedet for de sol-baserede 45/55/70%-niveauer. Når man
+  # faktisk går ind (døråbning/inde-motion), opgraderes til normalniveau —
+  # se badevaerelse_approach_lit-flowet i presence_badevaerelse.yaml.
+  # Godnat-nattens 8% er urørt. Default 30 sættes af init_user_preferences.
+  badevaerelse_approach_brightness:
+    name: "Bad: approach/early-detect brightness"
+    icon: mdi:lightbulb-on-30
+    min: 2
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-06-18 (robust wasp rewrite): slideren badevaerelse_wasp_entry_arm_
+  # seconds er FJERNET. Den gamle entry-timer arm-sti er udgået — wasp armeres
+  # nu udelukkende event-drevet (frisk inde-PIR off→on bag lukket dør), så der
+  # er ingen timer der kan fejlkonfigureres. Wasp-loftet styres nu af
+  # badevaerelse_max_on_minutes ("max besøgs-tid", se ovenfor).
+  # 2026-09-17: YAML'en var væk siden 18/6, men registry-entry'en blev stående og
+  # meldte `unavailable` med `restored: true` i femten måneder — harmløs i drift
+  # (nul forbrugere), men den skulle gen-klassificeres ved HVER health-triage.
+  # Nu slettet via `config/entity_registry/remove`. Denne note bliver stående, så
+  # den ikke bliver gen-opfundet som "en manglende slider".
+
+  # 2026-06-13 (user-spec): hvor hurtigt EARLY-DETECT/approach-lys (bad + depot)
+  # forsvinder igen når der ALDRIG kom reel indgang. Approach tænder lyset på
+  # vej derhen; går man ikke faktisk ind (ingen dør-åbning / inde-motion i bad,
+  # ingen depot-valhorn), slukkes pre-lyset efter denne korte ventetid i stedet
+  # for den normale ophold-ventetid (5 min). Måles fra approach-sensorerne er
+  # gået i ro. Consumers: presence_badevaerelse.yaml (bad approach fast-clear) +
+  # depot_harry_potter.yaml (depot approach fast-clear). Default 30 s sættes af
+  # init_user_preferences. Tile på diagnostics.
+  # NB: trigger-`for:` binder værdien ved automation-load → slider-ændring slår
+  # først fuldt igennem efter HA-restart (samme som de øvrige `for:`-sliders).
+  early_detect_clear_seconds:
+    name: "Early-detect: hurtig-sluk (bad + depot)"
+    icon: mdi:timer-sand
+    min: 5
+    max: 300
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-06-28 (user-spec): hvor KRAFTIGT depot-strippen pre-tændes ved
+  # EARLY-DETECT (entré-valhorn ser nogen på vej → depot pre-lyses som
+  # forvarsel, før man når valhornen INDE i depotet). Rå procent — IKKE ganget
+  # med global aggressiveness (bevidst direkte kontrol, jf. bad-approach-
+  # slideren). Går man faktisk ind, skruer depot_harry_potter_on HELT op og
+  # overskriver dette niveau. Consumer: presence_badevaerelse.yaml (entré-
+  # early-detect → light.depot_strip). Default 40 sættes af init_user_preferences.
+  depot_approach_brightness:
+    name: "Depot: approach/early-detect brightness"
+    icon: mdi:lightbulb-on-30
+    min: 2
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-07-14 (B49): dagslys-sluk for open-plan (spisestue-loft + sofa-zonen).
+  # 2026-10-15: skaleres som stue_lux_threshold (× dag-halvering × global
+  # lux-faktor) — se sensor.stue_dagslys_sluk_effektiv. 0 = fra. Max 600, så
+  # den kan stå over tænd-sliderens max 400 (sluk ≥ tænd × 1,2).
+  # Rod-incident: flapping presence holdt sofa-lysene tændt hele natten IND i
+  # lyst dagslys — den gamle lux-stignings-sluk dækkede ikke sofa-zonen og
+  # var ren flanke-trigger uden re-arm. Consumer: presence_lights.yaml
+  # (presence_lux_stue_off). Default 60 sættes af init_user_preferences.
+  stue_dagslys_sluk_lux:
+    name: "Stue/open-plan: dagslys-sluk LUX-tærskel"
+    icon: mdi:weather-sunny-off
+    min: 0
+    max: 600
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-07-14 (B49): hvor længe lux skal have været over tærsklen (med lys
+  # tændt) før dagslys-sluk fyrer. Default 5 sættes af init_user_preferences.
+  stue_dagslys_sluk_minutter:
+    name: "Stue/open-plan: dagslys-sluk varighed"
+    icon: mdi:timer-sand
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-07-24 (user-spec "solid ikke gaffatape"): dagslys-sluk-tærskler for
+  # sove + børn — parallelt til stue_dagslys_sluk_lux, så alle tre rum har samme
+  # robuste dagslys-sluk (edge-trigger + /15-backstop). 0 = fra.
+  # 2026-10-15: skaleres som rummets TÆND-slider (sove: × dag × global; børn:
+  # rå) — se *_dagslys_sluk_effektiv i room_lux_tuning.yaml. Hysterese: sove tænder <40 / børn tænder <15 → sluk >50
+  # giver rigelig margin (ingen on/off-flapping). Consumers: presence_lights.yaml
+  # (presence_lux_sovevaerelse_off / presence_lux_boernevaerelse_off). Default 50
+  # sættes af init_user_preferences.
+  sovevaerelse_dagslys_sluk_lux:
+    name: "Soveværelse: dagslys-sluk LUX-tærskel"
+    icon: mdi:weather-sunny-off
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  boernevaerelse_dagslys_sluk_lux:
+    name: "Børneværelse: dagslys-sluk LUX-tærskel"
+    icon: mdi:weather-sunny-off
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-06-28 (user-spec, slider-hunt): børneværelsets hygge-strip-styrke når
+  # Styrbar-OP (dagstime) tænder hyggelyset. Tidligere hardcodet 50 %. Rå %.
+  # Consumer: automations/boernevaerelse_hyggelys_mirror.yaml
+  # (boernevaerelse_styrbar_op_hyggelys). Default 50 sættes af init_user_preferences.
+  boernevaerelse_hyggelys_brightness:
+    name: "Børn: hyggelys-strip styrke (Styrbar-OP)"
+    icon: mdi:lightbulb-on-50
+    min: 2
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Fade-tid for "passage-zone" (KUN entré — det eneste aldrig-ophold rum).
+  # Kort fade fordi entré er pure pass-through — bruger forventer hurtig
+  # respons. Brugt i: entre_motion off, godnat_night entre nightwalk off,
+  # terrace_presence off.
+  # SPRINT 2026-05-20: Renamed fra fade_hallway_seconds. Depot + bad er
+  # flyttet til fade_ophold_seconds (de er sit-still rum, ikke passage).
+  # PERSISTENCE: removed `initial:` (audit-fix 2026-05-07). HA `initial:` field
+  # forces reset on every restart. Without it, HA preserves last-set value via
+  # state registry. init_user_preferences_first_boot automation sets sensible
+  # defaults if value is at min (= fresh install).
+  fade_passage_seconds:
+    name: "Fade-tid: passage-zone (entré)"
+    icon: mdi:run
+    min: 1
+    max: 1800
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Fade-tid for "ophold-zoner" (depot hyggehjørne, badeværelse).
+  # SPRINT 2026-05-20: Ny constant. Depot + bad er NOT passage — pigerne
+  # sidder stille og læser i depot, bad bruges til bad/toilet. Skal have
+  # længere fade end entré så lyset ikke brat slukker midt i ophold.
+  # Brugt i: depot_harry_potter off, presence_badevaerelse off.
+  fade_ophold_seconds:
+    name: "Fade-tid: ophold-zoner (depot/bad)"
+    icon: mdi:book-open-page-variant
+    min: 5
+    max: 1800
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-06-28 (user-spec): depot besøgs-STADIER (Quick/Medium/Long) — sluk-tid
+  # skaleret efter hvor seriøst besøget er. Depot har KUN én Vallhorn-PIR (motion,
+  # ingen still-radar), så "detection" = en frisk motion-burst (occupancy off→on).
+  # 1 burst = Quick (kig-ind-og-tag-tøj), 2 = Medium, 3+ = Long (ægte ophold).
+  # Disse to sliders styrer hvor hurtigt lyset slukker efter PIR er gået i ro for
+  # Quick hhv. Medium. LONG bruger fortsat den globale Turn-Off-slider (300 s ×
+  # global_absence_wait_factor, clampet 600 s) = uændret ophold-adfærd.
+  # Logik i packages/depot_visit_quality.yaml. NB: trigger-`for:` binder værdien
+  # ved automation-load → slider-ændring slår først igennem efter HA-restart.
+  depot_quick_off_seconds:
+    name: "Depot Quick-sluk (1 detection)"
+    icon: mdi:numeric-1-circle
+    min: 10
+    max: 300
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  depot_medium_off_seconds:
+    name: "Depot Medium-sluk (2 detections)"
+    icon: mdi:numeric-2-circle
+    min: 30
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-09-26 (user: "25. sep kl 19:23. Depot lyset burde være slukket
+  # hurtigere"). Long brugte min(rum_tom_sluk_sekunder, 600) — og da
+  # rum_tom_sluk_sekunder står på 1340, var 600 s-loftet ALTID det bindende:
+  # 18 af 19 Long-sluk de sidste 7 døgn kom præcis 600 s efter sidste PIR,
+  # uanset besøgets længde. 25/9: sidste bevægelse ~19:19, slukket 19:38:40.
+  # Egen slider nu, default 300 s. Min 60 = aldrig kortere end en PIR-hold.
+  depot_long_off_seconds:
+    name: "Depot Long-sluk (3+ detections)"
+    icon: mdi:numeric-3-circle
+    min: 60
+    max: 900
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Fade-tid for "private rum" (sove, boern). Mellemlang fade — gemmer
+  # mod brat slukning men sluger ikke for laenge. Brugt i: presence_lights
+  # sove/boern off, godnat sovelys, godnat_night kalde-lys.
+  fade_living_seconds:
+    name: "Fade-tid: private rum (sove/børn)"
+    icon: mdi:bed
+    min: 2
+    max: 1800
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Fade-tid for "open-plan absence" (stue/koekken). Lang fade saa motion
+  # midt i fade kan bringe lys tilbage. Brugt i: presence_lights stue og
+  # koekken off automations.
+  fade_extended_seconds:
+    name: "Fade-tid: open-plan absence (stue/køkken)"
+    icon: mdi:sofa
+    min: 5
+    max: 1800
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Godnat kort-tryk (Somrig kort-ned) langsom fade-tid (2026-07-08, #4 user-spec).
+  # Antal SEKUNDER alt lys fader NEDAD til off ved godnat kort-tryk. Konsumeres af
+  # script.godnat_fuld via godnat_voksen_start (kort-ned). Langt-ned = instant 6s
+  # (uændret). Robust ramp (turn_on→1% over N, så off) i godnat_fuld, fordi mange
+  # pærer ikke honorerer transition på turn_off. Default 60 via init + snapshot.
+  godnat_fade_seconds:
+    name: "Godnat kort-tryk: fade-tid"
+    icon: mdi:weather-night
+    min: 2
+    max: 300
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # L/R grace window — antal millisekunder hvor UP-klik blokeres efter
+  # L/R release for at undgaa N2-quirkens spurious 'on' event. Brugt i 5
+  # styrbar_<rum>_lr_grace automations.
+  lr_grace_milliseconds:
+    name: "Styrbar L/R grace efter release"
+    icon: mdi:timer-sand
+    min: 500
+    max: 5000
+    step: 100
+    unit_of_measurement: "ms"
+    mode: slider
+
+  # Entré nedluknings-grace varighed (2026-06-30). Antal MINUTTER hvor ALLE
+  # presence/motion-relight-automationer er blokeret efter et entré-Styrbar NED
+  # (input_boolean.entre_shutdown_grace holdes on). Bruges af
+  # entre_shutdown_grace_clear (gælder BÅDE Normal og AirBnB — AirBnB NED sætter
+  # samme flag). Var hardcodet 5 min. 0 = ingen grace (relight straks tilladt).
+  entre_shutdown_grace_minutes:
+    name: "Entré NED grace (sluk-hold)"
+    icon: mdi:power-sleep
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Godnat target brightness/CT (audit-runde 14, O14 fix). Hardcoded 5+ steder
+  # tidligere — extracted som constants. Bruges i:
+  # - light_power_recovery (bath + sove godnat branch)
+  # - bulb_firmware_defaults (bath + sove godnat NVRAM)
+  # - godnat_night.yaml (kalde-knap red light)
+  # Konversioner inline i forbrugende automations:
+  #   raw brightness (0-254): pct * 2.54
+  #   mireds: 1000000 / kelvin
+  godnat_brightness_pct:
+    name: "Godnat: target brightness %"
+    icon: mdi:weather-night
+    min: 5
+    max: 50
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  godnat_kelvin:
+    name: "Godnat: target color temperature"
+    icon: mdi:thermometer
+    min: 1800
+    max: 3200
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+
+# =============================================================================
+# Time-window template_sensors (B5.3 fix sprint 2026-05-06)
+# =============================================================================
+# Standardiserer 4 fast windows til præcis konsistens på tværs af automations.
+# Tidligere brugt: presence_*_on (after 06:00), godnat_kids_morning (06-09),
+# wakeup-tider (05:55-07:30) — usammenhængende tærskler ledte til race-windows.
+#
+# Definitioner (DK aktivitets-rytme):
+#   night         23:00-05:00  (deep-sleep, kun nightwalk + kalde-knap)
+#   early_morning 05:00-09:00  (wakeup-flow, godnat-clear, kids op)
+#   day           09:00-21:00  (presence_lights normal mode)
+#   evening       21:00-23:00  (winddown, dim-down)
+#
+# Bruges af presence_*_on, wakeup_*, godnat_*. Constants i automations
+# erstattes incrementelt — ny automations bør ALTID bruge disse.
+# =============================================================================
+template:
+  - binary_sensor:
+      - name: "Time window early morning"
+        unique_id: time_window_early_morning
+        icon: mdi:weather-sunny-alert
+        state: >
+          {% set h = now().hour %}
+          {{ 5 <= h < 9 }}
+
+      - name: "Time window day"
+        unique_id: time_window_day
+        icon: mdi:weather-sunny
+        state: >
+          {% set h = now().hour %}
+          {{ 9 <= h < 21 }}
+
+      - name: "Time window evening"
+        unique_id: time_window_evening
+        icon: mdi:weather-sunset
+        state: >
+          {% set h = now().hour %}
+          {{ 21 <= h < 23 }}
+
+      - name: "Time window night"
+        unique_id: time_window_night
+        icon: mdi:weather-night
+        state: >
+          {% set h = now().hour %}
+          {{ h >= 23 or h < 5 }}
+
+      # Combined: morning + day = "active hours" (bredt vindue)
+      - name: "Time window active hours"
+        unique_id: time_window_active_hours
+        icon: mdi:home-clock
+        state: >
+          {% set h = now().hour %}
+          {{ 5 <= h < 23 }}

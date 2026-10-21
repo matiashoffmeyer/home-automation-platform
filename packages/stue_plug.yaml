@@ -1,0 +1,111 @@
+# =============================================================================
+# Stue Plug — hyggelampe på smart wall plug (paret 2026-04-28, lampe 2026-05-31)
+# =============================================================================
+# switch.stue_plug = IKEA GRILLPLATS Thread-plug ved sofaen (Matter node 498,
+# siden 15/10 — byttet med den gamle Innr SP 240, som kort var switch.depot_plug
+# og fra 15/10 aften driver sove-lyskæden som switch.sove_lyskaede). GRILLPLATS'en er samtidig en THREAD-ROUTER i
+# stuen, så stue-spotsene får en bro der ikke er entré-loftet (B234). Der
+# sidder en IKKE-smart hyggelampe i den → kan KUN tænde/slukke.
+#
+# THREAD-BUDGET: kun et Matter-kald når pluggen SKAL skifte (scener og
+# drift-back kalder light.turn_on igen og igen på en tændt lampe) — og
+# continue_on_error, så en CHIP-timeout ikke aborterer kalderens script.
+#
+# Dette template-light wrapper switchen så lampen:
+#   - vises som en LYS-knap (ikke en plug-switch) på lights-siden i appen
+#   - kan targetes af light.turn_on i scenes (scenes kalder light.*, ikke switch.*)
+#   - indgår i light.stue_all / alle_indvendige / alle_lys grupper
+#
+# Da pæren er non-dimmable ignoreres brightness_pct/rgb/color_temp fra scenes —
+# light.turn_on tænder bare plug'en (full blus). Det er bevidst (user-valg
+# 2026-05-31: "tændt i alle scener"). value = ON når plug har strøm.
+# =============================================================================
+template:
+  - light:
+      # unique_id bevaret ⇒ registry-entry'en genbruges ⇒ light.stue_plug
+      # beholder sit entity_id, uanset hvad `name:` slugifier til.
+      - name: "Stue Hyggelampe (plug)"
+        unique_id: stue_plug_light
+        icon: mdi:floor-lamp
+        state: "{{ is_state('switch.stue_plug','on') }}"
+        turn_on:
+          - if: "{{ not is_state('switch.stue_plug', 'on') }}"
+            then:
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.stue_plug
+                continue_on_error: true
+        turn_off:
+          - if: "{{ not is_state('switch.stue_plug', 'off') }}"
+            then:
+              - action: switch.turn_off
+                target:
+                  entity_id: switch.stue_plug
+                continue_on_error: true
+
+# =============================================================================
+# Hyggelampe-fravalg (2026-10-17, user-spec: "det skal ikke sætte stuen i
+# manuel tilstand at jeg slukker hyggelampen, men mit valg skal respekteres.")
+# =============================================================================
+# 17/10 06:36 slukkede user hyggelampen fra appen → manual_override satte HELE
+# stuen i Manual → ild-løkken (og al anden auto i stuen) stod stille. Et app-
+# sluk af KUN hyggelampen (light.stue_plug / switch.stue_plug) er nu et fravalg
+# af den ene lampe, ikke en overstyring af rummet: manual_override sætter dette
+# flag i stedet for Manual.
+#
+# Gates der tjekker flaget (fejlklasse #21 — hver auto-vej der tænder den):
+#   - presence_light_sofa_on: sofa_on_targets   (automations/presence_stue.yaml)
+#   - presence_lux_sofa_on:   sofa_on_targets   (automations/presence_lights.yaml)
+#   - stue_hyggelampe_stedfortraeder_for_spots  (packages/thread_stedfortraedere.yaml)
+#   - luksus_besparelse: et fravalg er ikke el-pris-besparelse
+# Bevidst IKKE: scener, Styrbar og app-tænd (en finger) — de tænder den, og så
+# rydder flaget sig selv (udgang 1).
+#
+# Udgange (automatiske, så en gæst aldrig hænger i det — AirBnB-reglen):
+#   1. hyggelampen tænder, uanset kilde
+#   2. stuen har været tom med hele sofa-zonen slukket i 10 min (= sessionen
+#      er slut; næste gang man sætter sig, er lampen med igen)
+#   3. AirBnB entry/exit (flag-clear-listerne i automations/airbnb_mode.yaml)
+input_boolean:
+  # Ingen `initial:` — et fravalg skal overleve en restart midt i aftenen.
+  stue_hyggelampe_fravalgt:
+    name: "Stue: hyggelampe fravalgt"
+    icon: mdi:floor-lamp-outline
+
+automation:
+  - id: stue_hyggelampe_fravalg_ryd
+    alias: "Stue: ryd hyggelampe-fravalg (tændt / sessionen slut)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: light.stue_plug
+        from: "off"
+        to: "on"
+        id: taendt
+      # Eksplicitte is_state-kald = entity-tracking i template-triggeren.
+      - platform: template
+        value_template: >-
+          {{ is_state('binary_sensor.stue_apollo_occupancy_filtered', 'off')
+             and not is_state('light.stue_sofa_lampe', 'on')
+             and not is_state('light.stue_sofa_lampe_2', 'on')
+             and not is_state('light.stue_hjoernelampe', 'on')
+             and not is_state('light.stue_plug', 'on')
+             and not is_state('light.stue_laesehygge', 'on') }}
+        for:
+          minutes: 10
+        id: tomt
+    condition:
+      - condition: state
+        entity_id: input_boolean.stue_hyggelampe_fravalgt
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.stue_hyggelampe_fravalgt
+      - service: logbook.log
+        data:
+          name: "Hyggelampe-fravalg"
+          message: >-
+            {{ 'hyggelampen blev tændt' if trigger.id == 'taendt'
+               else 'stuen tom og sofa-zonen slukket i 10 min' }} → fravalget ryddet
+          entity_id: light.stue_plug

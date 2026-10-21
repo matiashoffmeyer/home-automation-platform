@@ -1,0 +1,260 @@
+# =============================================================================
+# script_pkg/scene_spread.yaml — Scene spread mechanics
+# =============================================================================
+# 3 scripts:
+#   1. apply_scene_with_spread — kerne: kør scene + spread til ring N rum
+#   2. scene_spread_plus       — +1 level, re-apply (dashboard button)
+#   3. scene_spread_minus      — -1 level, re-apply (dashboard button)
+#
+# MVP scope: 4 scener (cinema, zen, sofa_laesning, spisestue_middag).
+# Andre 8 scener har ingen spread (full_bright/party/happy/cirkus er allerede
+# whole-house; private/blue/sunset/cyberpunk har andre design-prioriteter).
+#
+# ADJACENCY-GRAF fra plantegningen (simulator slettet 2026-07-17; grafen her er autoritativ):
+#   stue:        koekken, sovevaerelse, entre, terrasse, altan
+#   koekken:     stue, spisestue, entre, bad, terrasse
+#   spisestue:   koekken, bad, tek, boernevaerelse, terrasse
+#   sovevaerelse: stue, entre
+#   entre:       sovevaerelse, stue, koekken, bad, depot
+#   bad:         entre, depot, koekken, spisestue, tek
+#   depot:       bad, entre
+#   boernevaerelse: spisestue, tek
+#   terrasse:    stue, koekken, spisestue
+#   altan:       stue, koekken (no light, skip i spread)
+#   tek:         bad, boernevaerelse, spisestue (no light, skip)
+#
+# Rings hard-coded per scene fordi BFS i Jinja er klodset. Adjacency er
+# stabil arkitektur (rummet flytter ikke), så hardcoding er OK.
+# =============================================================================
+
+apply_scene_with_spread:
+  alias: "Scene: Apply with spread level"
+  description: >
+    Kerne-dispatcher: kører base-scene + tænder ring-rum (level 1+) med
+    samme CT/brightness. Slukker rum der falder UDENFOR new spread (så
+    minus-knap rydder ordentligt op).
+  fields:
+    scene:
+      description: "Scene id (cinema, zen, sofa_laesning, spisestue_middag)"
+      required: true
+      example: zen
+    spread_level:
+      description: "0=epicenter only, 1-3=expand rings"
+      required: true
+      example: 1
+  mode: restart
+  variables:
+    # Per-scene metadata: epicenter + 3 rings + mood color/brightness.
+    # Rings beregnet manuelt via BFS fra adjacency-graf (se file-header).
+    # Sprint 2026-05-22 PM:
+    # - bad EXCLUDET fra spread (bad = funktions-rum, ikke stemning).
+    # - Per-ring brightness/CT (user-spec: "farver behøver ikke være ens,
+    #   bare passe sammen i stil og mood"). Decay-mønster: outer rings er
+    #   dimmer/varmere = atmosfærisk dybde, ikke flad jordskælv.
+    scene_meta:
+      zen:
+        epicenter: [stue]
+        rings:
+          1: { rooms: [koekken, sovevaerelse, entre, terrasse], bri_pct: 15, ct_k: 2200 }
+          2: { rooms: [spisestue, depot],                        bri_pct: 12, ct_k: 2300 }
+          3: { rooms: [boernevaerelse],                          bri_pct: 10, ct_k: 2400 }
+      sofa_laesning:
+        epicenter: [stue]
+        rings:
+          1: { rooms: [koekken, sovevaerelse, entre, terrasse], bri_pct: 40, ct_k: 2700 }
+          2: { rooms: [spisestue, depot],                        bri_pct: 30, ct_k: 2700 }
+          3: { rooms: [boernevaerelse],                          bri_pct: 20, ct_k: 2700 }
+      spisestue_middag:
+        epicenter: [spisestue]
+        rings:
+          1: { rooms: [koekken, boernevaerelse, terrasse],      bri_pct: 60, ct_k: 2700 }
+          2: { rooms: [stue, entre],                             bri_pct: 45, ct_k: 2700 }
+          3: { rooms: [sovevaerelse, depot],                     bri_pct: 30, ct_k: 2800 }
+      # Sprint 2026-05-22 PM: madlavning er ny daily-scene med spread.
+      # Køkken-epicenter (80%/3000K). Rings dim outward, lidt varmere.
+      # Bad excluded (samme regel som andre scenes — bad er funktions-rum).
+      madlavning:
+        epicenter: [koekken]
+        rings:
+          1: { rooms: [stue, spisestue, entre, terrasse],       bri_pct: 50, ct_k: 2800 }
+          2: { rooms: [sovevaerelse, boernevaerelse, depot],    bri_pct: 30, ct_k: 2700 }
+          3: { rooms: [],                                        bri_pct: 20, ct_k: 2700 }
+    # Room → main light entity. Skipper rum uden loft (altan, tek).
+    # 2026-06-05: spisestue droppet — pendlen flyttet til soveloft, spisestue
+    # har intet dedikeret loft endnu (skip som altan/tek). sovevaerelse peger
+    # nu på pendlen (= soveloft).
+    room_to_light:
+      stue: light.spisestue_loft
+      sovevaerelse: light.spisestue_pendel
+      entre: light.entre_loft
+      bad: light.badevaerelse_spot_1
+      depot: light.depot_loft
+      boernevaerelse: light.boernevaerelse_loft
+      terrasse: light.terrasse_paerelyskaede
+    meta: "{{ scene_meta.get(scene, {}) }}"
+    rings: "{{ meta.get('rings', {}) }}"
+    lvl: "{{ spread_level | int(0) }}"
+    # 2026-05-22 PM: når børn sover, EKSKLUDÉR boernevaerelse fra spread
+    # uanset scene. Wake-protection. Samme regel som bad (funktions-rum)
+    # — men dynamisk gated på godnat_boern_active i stedet for statisk.
+    skip_boern: "{{ is_state('input_boolean.godnat_boern_active', 'on') }}"
+    # Active rings (1..lvl) — list of {ring_num, rooms, bri_pct, ct_k}.
+    # Boernevaerelse filtreres fra hver rings.rooms hvis godnat_boern_active=on.
+    active_rings: >-
+      {% set ns = namespace(rings=[]) %}
+      {% for n in [1, 2, 3] %}
+        {% if lvl >= n %}
+          {% set r = rings.get(n) %}
+          {% if r %}
+            {% set filtered = r.rooms | reject('eq', 'boernevaerelse') | list if skip_boern else r.rooms %}
+            {% set ns.rings = ns.rings + [{'n': n, 'rooms': filtered, 'bri': r.bri_pct, 'ct': r.ct_k}] %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.rings }}
+    # Rum der falder UDENFOR new spread (= rings > lvl) — slukkes for at
+    # bevare definitivt scope ved minus. Hvis kids sover, INKLUDÉR boern her
+    # som ekstra wake-protection (slukker hvis allerede tændt fra tidligere).
+    rooms_to_clear: >-
+      {% set ns = namespace(rooms=[]) %}
+      {% for n in [1, 2, 3] %}
+        {% if lvl < n %}
+          {% set r = rings.get(n) %}
+          {% if r %}
+            {% set ns.rooms = ns.rooms + r.rooms %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {% if skip_boern and 'boernevaerelse' not in ns.rooms %}
+        {% set ns.rooms = ns.rooms + ['boernevaerelse'] %}
+      {% endif %}
+      {{ ns.rooms }}
+    clear_lights: >-
+      {% set ns = namespace(lights=[]) %}
+      {% for r in rooms_to_clear %}
+        {% if r in room_to_light %}
+          {% set ns.lights = ns.lights + [room_to_light[r]] %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.lights }}
+  sequence:
+    # Run base scene (epicenter logic). Override-snapshot aware: hvis brugeren
+    # har trykket "Overskriv" på denne scene (script.scene_overwrite →
+    # scene.snap_<scene>), anvend snapshottet som epicenter i stedet for den
+    # hardcodede mood — ellers ville spread clobbe snapshottet. Kun scene_zen
+    # har check'et indbygget; cinema/sofa_laesning/spisestue_middag/madlavning
+    # gør ikke, så det skal håndteres her (mirror af scene_toggle's gate).
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ states['scene.snap_' ~ scene] is not none
+                   and states('scene.snap_' ~ scene) != 'unavailable' }}
+          sequence:
+            - service: scene.turn_on
+              target:
+                entity_id: "scene.snap_{{ scene }}"
+              data:
+                transition: 2
+      default:
+        - service: "script.scene_{{ scene }}"
+    # Per-ring spread: hver ring får sit eget brightness/CT (atmosfærisk
+    # dybde — outer rings dimmer/varmere = ikke flad jordskælv).
+    - repeat:
+        for_each: "{{ active_rings }}"
+        sequence:
+          - variables:
+              ring_lights: >-
+                {% set ns = namespace(lights=[]) %}
+                {% for r in repeat.item.rooms %}
+                  {% if r in room_to_light %}
+                    {% set ns.lights = ns.lights + [room_to_light[r]] %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.lights }}
+              # F4 workaround: split entre fra (bug på TRADFRI WS bri+ct+transition)
+              ring_lights_safe: "{{ ring_lights | reject('eq', 'light.entre_loft') | list }}"
+              ring_has_entre: "{{ 'light.entre_loft' in ring_lights }}"
+          - if:
+              - condition: template
+                value_template: "{{ ring_lights_safe | length > 0 }}"
+            then:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: "{{ ring_lights_safe }}"
+                data:
+                  brightness_pct: "{{ repeat.item.bri }}"
+                  color_temp_kelvin: "{{ repeat.item.ct }}"
+                  transition: 2
+          - if:
+              - condition: template
+                value_template: "{{ ring_has_entre }}"
+            then:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.entre_loft
+                data:
+                  brightness_pct: "{{ repeat.item.bri }}"
+                  color_temp_kelvin: "{{ repeat.item.ct }}"
+                  transition: 0
+    # Clear rum der nu er UDENFOR spread
+    - if:
+        - condition: template
+          value_template: "{{ clear_lights | length > 0 }}"
+      then:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id: "{{ clear_lights }}"
+          data:
+            transition: 2
+    # Stash level for plus/minus
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.scene_spread_level
+      data:
+        value: "{{ lvl }}"
+
+scene_spread_plus:
+  alias: "Scene spread: +1 (ring expand)"
+  description: >
+    Inkrementer scene_spread_level (max 3) og re-applikér aktiv scene.
+    No-op hvis ingen scene er aktiv eller hvis scene ikke supporterer spread.
+  mode: restart
+  variables:
+    supported: ['zen', 'sofa_laesning', 'spisestue_middag', 'madlavning']
+    active: "{{ states('input_select.active_scene') }}"
+    cur: "{{ states('input_number.scene_spread_level') | int(0) }}"
+    new_lvl: "{{ [cur + 1, 3] | min }}"
+  sequence:
+    - condition: template
+      value_template: "{{ active in supported }}"
+    - condition: template
+      value_template: "{{ new_lvl != cur }}"
+    - service: script.apply_scene_with_spread
+      data:
+        scene: "{{ active }}"
+        spread_level: "{{ new_lvl }}"
+
+scene_spread_minus:
+  alias: "Scene spread: -1 (ring contract)"
+  description: >
+    Decrementer scene_spread_level (min 0) og re-applikér aktiv scene.
+    Slukker rum der falder UDENFOR new spread (definitivt scope).
+  mode: restart
+  variables:
+    supported: ['zen', 'sofa_laesning', 'spisestue_middag', 'madlavning']
+    active: "{{ states('input_select.active_scene') }}"
+    cur: "{{ states('input_number.scene_spread_level') | int(0) }}"
+    new_lvl: "{{ [cur - 1, 0] | max }}"
+  sequence:
+    - condition: template
+      value_template: "{{ active in supported }}"
+    - condition: template
+      value_template: "{{ new_lvl != cur }}"
+    - service: script.apply_scene_with_spread
+      data:
+        scene: "{{ active }}"
+        spread_level: "{{ new_lvl }}"

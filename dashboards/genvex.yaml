@@ -1,0 +1,259 @@
+# =============================================================================
+# Genvex — trin vs. fugt (B226, 2026-10-12)
+# =============================================================================
+# User: "lav en side i ha som tracker det og viser effekten tydeligt, hvis der
+# er nogen … vurder også om det har en mærkbar positiv effekt hvis vi kobler
+# genvex på HA og forklar hvilken effekt med tal på genvex siden."
+# → User bad EKSPLICIT om forklaring med tal på siden, derfor mere tekst end
+#   tekst-reglen ellers tillader. Metode, fit og baseline: packages/genvex_fugt.yaml.
+# Lovelace mode: yaml — registreret i configuration.yaml (genvex-dash).
+#
+# Statistik-konstanter i markdown'en (fra baseline, se pakken):
+#   0,35 g/m³ = døgn-spredning på afvigelsen fra trin 2-modellen
+#   1,57 /t   = spredning på badets henfalds-rate k (21 bade, trin 2)
+# =============================================================================
+title: Genvex
+icon: mdi:fan
+views:
+  - title: Genvex
+    path: genvex
+    type: sections
+    max_columns: 3
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: Genvex
+            heading_style: title
+          - type: tile
+            entity: input_number.genvex_trin
+            name: Trin
+            features:
+              - type: numeric-input
+                style: buttons
+          - type: tile
+            entity: input_number.genvex_fugtstyring
+            name: Fugtstyring
+          - type: tile
+            entity: input_datetime.genvex_trin_skiftet
+            name: Trin skiftet
+          # A/B: skift hver lørdag fra 17/10 (trin 2 først); push med Gjort-knap når
+          # du er hjemme og trinnet står forkert (packages/genvex_fugt.yaml).
+          - type: tile
+            entity: input_boolean.genvex_ab_eksperiment
+            name: Skift trin hver uge
+          - type: tile
+            entity: sensor.genvex_trin_denne_uge
+            name: Trin denne uge
+          - type: markdown
+            content: Ret trinnet her, når du skifter det på panelet.
+          # Tøjtørring inde: trykkets døgn 00:00 → næste dag 12:00 tæller ikke
+          # med i målingerne, og dagens allerede talte data trækkes ud
+          # (binary_sensor.genvex_toj_inde, header TØJ TØRRET INDE).
+          - type: tile
+            entity: input_button.genvex_toej_inde
+            name: Vi tørrede tøj indendørs i dag
+            hide_state: true
+            tap_action:
+              action: perform-action
+              perform_action: input_button.press
+              target:
+                entity_id: input_button.genvex_toej_inde
+              confirmation:
+                text: Springe dagens målinger over (til i morgen kl. 12)?
+            icon_tap_action:
+              action: perform-action
+              perform_action: input_button.press
+              target:
+                entity_id: input_button.genvex_toej_inde
+              confirmation:
+                text: Springe dagens målinger over (til i morgen kl. 12)?
+          - type: tile
+            entity: binary_sensor.genvex_toj_inde
+            name: Tøj-døgn springes over
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Effekt
+            heading_style: title
+          # A/B (12/10): trin 1 mod trin 2, uanset hvilket der kører nu. Trin 2
+          # tæller kun fra fyringen 12/10 (radiatorerne tændt samme dag som
+          # trin 1 — se pakkens header); første trin 2-uge fra lør 17/10.
+          # Døgn = 15-min-samples / 96. ± = 2 × 0,35 × √(1/d1 + 1/d2).
+          - type: markdown
+            content: |-
+              {% set acc = state_attr('sensor.genvex_effekt', 'acc') or {} %}
+              {% set ml = state_attr('sensor.bad_torretid', 'maalinger') or {} %}
+              {% set T = states('sensor.indoor_temperature_resilient') | float(22) %}
+              {% set sat = 216.7 * 6.112 * (e ** (17.62 * T / (243.12 + T))) / (273.15 + T) %}
+              {% set b1 = ml.get('1', []) %}{% set b2 = ml.get('2', []) %}
+              {% set a1 = acc.get('1', [0, 0]) %}{% set a2 = acc.get('2', [0, 0]) %}
+              {% set d1 = a1[1] / 96 %}{% set d2 = a2[1] / 96 %}
+              {% set m1 = a1[0] / a1[1] if a1[1] > 0 else 0 %}{% set m2 = a2[0] / a2[1] if a2[1] > 0 else 0 %}
+              {% set dif = m1 - m2 %}
+              {% set fejl = 2 * 0.35 * ((1 / d1 + 1 / d2) ** 0.5) if d1 > 0 and d2 > 0 else 0 %}
+              | | Trin 2 | Trin 1 |
+              |---|---|---|
+              | Fugt over forventet | {% if a2[1] > 0 %}{{ '%+.2f' | format(m2) | replace('.', ',') }} g/m³{% else %}—{% endif %} | {% if a1[1] > 0 %}{{ '%+.2f' | format(m1) | replace('.', ',') }} g/m³{% else %}—{% endif %} |
+              | Målt i | {{ '%.1f' | format(d2) | replace('.', ',') }} døgn | {{ '%.1f' | format(d1) | replace('.', ',') }} døgn |
+              | Badet tørt efter | {% if b2 | count > 0 %}{{ b2 | map('first') | list | median | round(0) | int }} min ({{ b2 | count }} bade){% else %}ingen bade endnu{% endif %} | {% if b1 | count > 0 %}{{ b1 | map('first') | list | median | round(0) | int }} min ({{ b1 | count }} bade){% else %}ingen bade endnu{% endif %} |
+
+              {% if d1 < 3 or d2 < 3 %}**For tidligt:** vent til 3 døgn på begge trin (trin 1: {{ '%.1f' | format(d1) | replace('.', ',') }}, trin 2: {{ '%.1f' | format(d2) | replace('.', ',') }}).
+              {% elif dif | abs > fejl %}**Trin 1 giver {{ '%+.2f' | format(dif) | replace('.', ',') }} ± {{ '%.2f' | format(fejl) | replace('.', ',') }} g/m³ fugt** ≈ {{ '%+.0f' | format(dif / sat * 100) }} %RH i stuen.
+              {% else %}**Ingen målbar forskel** på lejlighedens fugt (± {{ '%.2f' | format(fejl) | replace('.', ',') }} g/m³).{% endif %}
+              Fugten tæller kun, når mindst 2 er hjemme.
+              {% if b1 | count >= 5 and b2 | count > 0 %}
+              {% set k2 = b2 | map('last') | list %}{% set k1 = b1 | map('last') | list %}
+              {% set dk = (k1 | median) - (k2 | median) %}
+              {% set fk = 2 * 1.57 * ((1 / (k2 | count) + 1 / (k1 | count)) ** 0.5) %}
+              {% if dk | abs > fk %}**Badet tørrer {{ 'langsommere' if dk < 0 else 'hurtigere' }} på trin 1:** {{ (k1 | median / (k2 | median) * 100) | round(0) | int }} % af trin 2's udsugningstakt.
+              {% else %}Badets tørretid: ingen målbar forskel endnu.{% endif %}
+              {% endif %}
+
+      # Radiatorerne tændt 12/10, samme dag som trin 1 (user 13/10). Pr. rum:
+      # temperatur minus model uden fyring (a + b × udetemp 24 t, fit 14/9–12/10,
+      # packages/genvex_fugt.yaml header RADIATORER), akkumuleret fra 12/10 12:00
+      # i sensor.radiator_effekt. ± = 2 × døgn-sd / √døgn; døgn-sd fra fittet.
+      # RH-linjen: samme vandmængde ved T − Δ → hvad køkkenets %RH ville være.
+      - type: grid
+        cards:
+          - type: heading
+            heading: Radiatorer
+            heading_style: title
+          # Termostat-trin 0-5 pr. radiator (user 17/10). Logges i hånden;
+          # sensor.radiator_effekt.pr_trin tæller pr. Genvex-trin OG opsætning.
+          - type: tile
+            entity: input_number.radiator_trin_sove
+            name: Soveværelse
+          - type: tile
+            entity: input_number.radiator_trin_stue
+            name: Stue
+          - type: tile
+            entity: input_number.radiator_trin_spisestue
+            name: Spisestue
+          - type: tile
+            entity: input_number.radiator_trin_boernevaerelse
+            name: Børneværelse
+          - type: tile
+            entity: input_number.radiator_trin_bad
+            name: Gulvvarme bad
+          - type: markdown
+            content: Ret trinnet her, når du drejer på en radiator.
+          - type: markdown
+            content: |-
+              {% set acc = state_attr('sensor.radiator_effekt', 'acc') or {} %}
+              {% set sd = {'sove': 0.56, 'stue': 0.81, 'kokken': 0.19, 'bad': 0.15} %}
+              {% set navn = {'sove': 'Soveværelse', 'stue': 'Stue', 'kokken': 'Køkken', 'bad': 'Bad'} %}
+              Varmere end udeluften tilsiger, siden radiatorerne kom på 12/10:
+
+              | Rum | Over forventet | |
+              |---|---|---|{% for r in ['sove', 'stue', 'kokken', 'bad'] %}{% set a = acc.get(r, [0, 0]) %}{% set d = a[1] / 96 %}{% set m = a[0] / a[1] if a[1] > 0 else 0 %}{% set f = 2 * sd[r] / (d ** 0.5) if d > 0 else 0 %}
+              | {{ navn[r] }} | {{ '%+.1f' | format(m) | replace('.', ',') }} ± {{ '%.1f' | format(f) | replace('.', ',') }} °C | {% if d < 3 and m | abs <= f %}for tidligt ({{ '%.1f' | format(d) | replace('.', ',') }} døgn){% elif m | abs > f %}**{{ 'varmere' if m > 0 else 'koldere' }}**{% else %}ingen forskel{% endif %} |{% endfor %}
+
+              {% set k = acc.get('kokken', [0, 0]) %}{% set dk = k[0] / k[1] if k[1] > 0 else 0 %}
+              {% set T = states('sensor.indoor_temperature_resilient') | float(22.5) %}
+              {% set rh = states('sensor.indoor_humidity_resilient') | float(50) %}
+              {% set s1 = 6.112 * (e ** (17.62 * T / (243.12 + T))) / (273.15 + T) %}
+              {% set s0 = 6.112 * (e ** (17.62 * (T - dk) / (243.12 + T - dk))) / (273.15 + T - dk) %}
+              **Sådan tager forsøget højde for det**
+              - Fugt måles i g/m³ (vandmængden) — varme ændrer kun %RH. I køkkenet, hvor fugten måles, svarer {{ '%+.1f' | format(dk) | replace('.', ',') }} °C til {{ '%+.1f' | format(rh - rh * s1 / s0) | replace('.', ',') }} %RH.
+              - Trin 2 tæller kun fra 12/10, så begge trin måles med radiatorerne tændt. Første uge på trin 2: fra 17/10.
+              - Genvex' fugtstyring (44 %) booster mindre, når varmen sænker %RH — det rammer begge trin ens.
+          # Trin 1 mod trin 2 ved SAMME radiator-opsætning (nøgle = nuværende
+          # input_number.radiator_trin_*). ± som ovenfor, kun når begge har data.
+          - type: markdown
+            content: |-
+              {% set p = state_attr('sensor.radiator_effekt', 'pr_trin') or {} %}
+              {% set ns = namespace(o=[]) %}{% for r in ['sove', 'stue', 'spisestue', 'boernevaerelse', 'bad'] %}{% set ns.o = ns.o + ['%g' | format(states('input_number.radiator_trin_' ~ r) | float(0))] %}{% endfor %}
+              {% set opst = ns.o | join('-') %}
+              {% set g1 = p.get('1|' ~ opst, {}) %}{% set g2 = p.get('2|' ~ opst, {}) %}
+              {% set sd = {'sove': 0.56, 'stue': 0.81, 'kokken': 0.19, 'bad': 0.15} %}
+              {% set navn = {'sove': 'Soveværelse', 'stue': 'Stue', 'kokken': 'Køkken', 'bad': 'Bad'} %}
+              {% if opst == '0-0-0-0-0' %}Log radiatorernes trin ovenfor for at sammenligne Genvex-trinnene.{% else %}
+              Genvex-trin ved denne radiator-opsætning, °C over forventet:
+
+              | Rum | Trin 2 | Trin 1 | Forskel |
+              |---|---|---|---|{% for r in ['sove', 'stue', 'kokken', 'bad'] %}{% set a = g2.get(r, [0, 0]) %}{% set b = g1.get(r, [0, 0]) %}{% set d2 = a[1] / 96 %}{% set d1 = b[1] / 96 %}{% set m2 = a[0] / a[1] if a[1] > 0 else 0 %}{% set m1 = b[0] / b[1] if b[1] > 0 else 0 %}{% set f = 2 * sd[r] * ((1 / d1 + 1 / d2) ** 0.5) if d1 > 0 and d2 > 0 else 0 %}
+              | {{ navn[r] }} | {% if a[1] > 0 %}{{ '%+.1f' | format(m2) | replace('.', ',') }} ({{ '%.1f' | format(d2) | replace('.', ',') }} d){% else %}—{% endif %} | {% if b[1] > 0 %}{{ '%+.1f' | format(m1) | replace('.', ',') }} ({{ '%.1f' | format(d1) | replace('.', ',') }} d){% else %}—{% endif %} | {% if f > 0 and (d1 >= 3 and d2 >= 3 or (m1 - m2) | abs > f) %}{% if (m1 - m2) | abs > f %}**trin 2 {{ '%+.1f' | format(m2 - m1) | replace('.', ',') }} °C**{% else %}ingen{% endif %}{% else %}for tidligt{% endif %} |{% endfor %}
+              {% endif %}
+
+      - type: grid
+        column_span: 2
+        cards:
+          - type: heading
+            heading: Grafer
+            heading_style: title
+          # Afvigelsen er backfillet 30/8 → 12/10 (trin 2); 0 = som trin 2 uden
+          # fyring. Radiatorerne kom på 12/10 → niveau-skift samme dag som trin 1.
+          - type: statistics-graph
+            title: Fugt over forventet — g/m³ pr. dag
+            entities:
+              - entity: sensor.fugt_overskud_afvigelse
+                name: Over forventet
+            period: day
+            days_to_show: 45
+            stat_types:
+              - mean
+            chart_type: bar
+          - type: history-graph
+            title: Trin
+            hours_to_show: 1080
+            entities:
+              - entity: input_number.genvex_trin
+                name: Trin
+          - type: statistics-graph
+            title: Fugt-overskud inde − ude — g/m³ pr. time
+            entities:
+              - entity: sensor.fugt_overskud
+                name: Målt
+              - entity: sensor.fugt_overskud_forventet
+                name: Forventet på trin 2
+            period: hour
+            days_to_show: 7
+            stat_types:
+              - mean
+            chart_type: line
+          # Backfillet 1/9 → 13/10 fra rummenes LTS (samme fit-formel); 0 = som
+          # før fyringen. Køkken = fugt-målets rum.
+          - type: statistics-graph
+            title: Radiatorer — °C over forventet pr. dag
+            entities:
+              - entity: sensor.radiator_effekt_sove
+                name: Soveværelse
+              - entity: sensor.radiator_effekt_stue
+                name: Stue
+              - entity: sensor.radiator_effekt_kokken
+                name: Køkken
+              - entity: sensor.radiator_effekt_bad
+                name: Bad
+            period: day
+            days_to_show: 45
+            stat_types:
+              - mean
+            chart_type: line
+          - type: history-graph
+            title: Badet over stuen — g/m³
+            hours_to_show: 48
+            entities:
+              - entity: sensor.bad_fugt_overskud
+                name: Bad − stue
+
+      # Tallene er skøn (header i pakken + svaret 12/10): ventilator ~10-20 W
+      # pr. trin, varmetab 0,34 Wh/m³K × ~50 m³/h × 15 K × (1 − 0,85) ≈ 40 W i
+      # fyringssæsonen, elpris ~2,95 kr/kWh all-in. Tørretid trin 2 = målt.
+      - type: grid
+        cards:
+          - type: heading
+            heading: Koble Genvex på HA?
+            heading_style: title
+          - type: markdown
+            content: |-
+              | Gevinst | Tal |
+              |---|---|
+              | Bad-boost | Trin 3 i 45 min når HA ser et bad. Tørretid i dag 20 min (trin 2) — resten af døgnet kan køre trin 1 |
+              | Fugt-styring | Op når overskuddet passerer ~3 g/m³, ned når luften er tør. Erstatter 44 %-styringen, som lejligheden (49-55 %) næsten altid ligger over |
+              | Energi | Trin 1 frem for 2: ~300-500 kr/år (skøn). Koblingen lægger kun ~50-150 kr/år oveni |
+              | Data | Filter-alarm, indblæsnings-temperatur og reel virkningsgrad |
+
+              **Vurdering:** mærkbar for badet og vinterens tørre luft, lille for elregningen. Kræver Genvex Connect eller Modbus på din model.

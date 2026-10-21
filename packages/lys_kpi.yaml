@@ -1,0 +1,571 @@
+# =============================================================================
+# Lys-forbrug KPI — timer pr. pære, pr. rum + hele huset (2026-06-18, user-spec)
+# =============================================================================
+# Føder forbrug-siden (dashboards/forbrug.yaml). Mål: SYNLIGHED på hvor meget
+# lyset brænder, så stuck/overforbrug fanges tidligt (jf. bad-wasp-fejlen der
+# brændte 10-12 t/dag).
+#
+# METRIK — "timer pr. pære pr. dag":
+#   Pr. rum måler vi rummets lys-gruppe ON-tid siden midnat (history_stats,
+#   type:time → timer). For et rum hvis pærer styres SAMLET (tændes/slukkes
+#   sammen — gælder ~alle rum her) er gruppe-ON-tid = den enkelte pæres
+#   brænde-tid. Badet: 5 spots der altid følges ad → ON-tid = timer pr. spot.
+#   (Multi-pære-rum hvor pærer nogle gange er delvist tændt: ON-tid er et let
+#   OVER-estimat af pr-pære — men netop derfor et godt "noget brænder"-signal.)
+#
+#   Hele huset: PÆRE-VÆGTET gennemsnit = Σ(rum-ON-timer × pære-antal) /
+#   Σ(pære-antal). Plus samlet pære-timer (Σ rum-ON × antal) = energi-proxy.
+#
+# Pære-antal pr. rum (kilde: packages/light_groups.yaml, 2026-06-18):
+#   stue 5 · køkken 2 · spisestue 1 · sove 1 · børn 2 · bad 5 · depot 4 ·
+#   entré 1 · terrasse 1   =   22 pærer i alt.
+#
+# Badet genbruger sensor.badevaerelse_lys_on_idag (packages/badevaerelse_lys_
+# metrics.yaml) — ingen dobbelt-måling.
+#
+# Grafer (forbrug.yaml) bruger long-term statistics: per-dag = daglig MAX af
+# disse midnat-nulstillende sensorer. LTS bygger FREMAD fra i dag — historik før
+# 2026-06-18 findes ikke (kan ikke backfilles).
+# =============================================================================
+
+input_number:
+  # Tærskel for høj-forbrug-notifikation (pr. rum, timer/dag). USER-VALGT 4 t
+  # (2026-06-19): stram watchdog-alarm — et rum tændt > 4 t/dag flagges. Brugeren
+  # vil bevidst have den lavt (= slider-min); ingen init-override rører den mere.
+  # 2026-10-20 (user): HÆVET TIL 10 t — 5 t gav 54 varsel-dage på 24 dage
+  # (normal aftenbrug), 10 t havde givet 5. Den er nu en "glemt lys"-alarm.
+  # Bad har desuden sin egen finere stuck-alarm (uafbrudt > 45 min,
+  # badevaerelse_lys_metrics.yaml). Tile på forbrug-siden.
+  lys_kpi_alarm_timer:
+    name: "Lys-KPI: alarm-tærskel (timer/dag pr. rum)"
+    icon: mdi:lightbulb-alert
+    min: 4
+    max: 24
+    step: 1
+    unit_of_measurement: "t"
+    mode: slider
+
+sensor:
+  # --- Per-rum ON-tid siden midnat (timer) — én history_stats pr. rum ---------
+  - platform: history_stats
+    name: "Stue lys on idag"
+    unique_id: stue_lys_on_idag
+    entity_id: binary_sensor.stue_lys_on_effektiv
+    state: "on"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+
+  - platform: history_stats
+    name: "Koekken lys on idag"
+    unique_id: koekken_lys_on_idag
+    entity_id: binary_sensor.koekken_lys_on_effektiv
+    state: "on"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+
+  - platform: history_stats
+    name: "Spisestue lys on idag"
+    unique_id: spisestue_lys_on_idag
+    entity_id: binary_sensor.spisestue_lys_on_effektiv
+    state: "on"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+
+  - platform: history_stats
+    name: "Sovevaerelse lys on idag"
+    unique_id: sovevaerelse_lys_on_idag
+    entity_id: binary_sensor.sovevaerelse_lys_on_effektiv
+    state: "on"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+
+  - platform: history_stats
+    name: "Boernevaerelse lys on idag"
+    unique_id: boernevaerelse_lys_on_idag
+    # 2026-06-27: var light.boernevaerelse_all (loft+strip) → hygge-plug talte
+    # ikke med. Nu binary_sensor der dækker alle tre boern-lys (inkl. plug).
+    entity_id: binary_sensor.boernevaerelse_lys_on_effektiv
+    state: "on"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+
+  - platform: history_stats
+    name: "Depot lys on idag"
+    unique_id: depot_lys_on_idag
+    entity_id: binary_sensor.depot_lys_on_effektiv
+    state: "on"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+
+  - platform: history_stats
+    name: "Entre lys on idag"
+    unique_id: entre_lys_on_idag
+    entity_id: binary_sensor.entre_lys_on_effektiv
+    state: "on"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+
+  - platform: history_stats
+    name: "Terrasse lys on idag"
+    unique_id: terrasse_lys_on_idag
+    entity_id: binary_sensor.terrasse_lys_on_effektiv
+    state: "on"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+
+  # --- Pære-timer: Riemann-integration af live tændt-antal (2026-06-25) -------
+  # Integrerer sensor.hus_paerer_taendt_antal (vægtet antal FYSISK tændte pærer,
+  # defineret i template-blokken nedenfor) over tid → ægte akkumuleret pære-timer.
+  # method:left = trappe-funktion (antallet er konstant mellem state-changes).
+  # ERSTATTER det gamle gruppe-ON-tid × pære-antal-estimat (overtalte fordi en
+  # gruppe er "on" når bare ÉN pære lyser — badets fase-fravalgte spots talte med).
+  - platform: integration
+    name: "Hus paeretimer total"
+    unique_id: hus_paeretimer_total
+    source: sensor.hus_paerer_taendt_antal
+    method: left
+    unit_time: h
+    round: 3
+
+template:
+  # --- "Et eller andet boern-lys er tændt" (2026-06-27) -----------------------
+  # history_stats for boern on-tid pegede før på light.boernevaerelse_all (= loft
+  # + strip), så hygge-plug-lampen (light.boernevaerelse_hyggelys = switch.sove_
+  # plug) talte ALDRIG med → "15 min" mens strip+plug brændte i timevis. Denne
+  # binary_sensor dækker alle tre boern-lys; history_stats peger nu på den.
+  # 2026-08-01: NATLYS tæller IKKE med. Putningens fase 2 fader strippen til
+  # 1 % (brightness 3, ~0,1 W) og lader den brænde til gradvis-sluk om morgenen
+  # — 9 t 51 min natten 07-31→08-01. Da KPI'en måler ren tændt-tid, krydsede
+  # Børn alarm-tærsklen (5 t) kl. 05:00:53 og sendte "hænger et lys?", og
+  # Statistik-siden viste 5,8 t = ser ud som et hængt lys. Det ville gentage sig
+  # HVER nat børnene er hjemme. Tærsklen 26 raw (~10 %) er den samme grænse
+  # boernevaerelse_hyggelys_mirror bruger til at skelne natlys fra hyggelys.
+  - binary_sensor:
+      - name: "Boernevaerelse any lys"
+        unique_id: boernevaerelse_any_lys
+        state: >-
+          {% set strip_b = state_attr('light.boernevaerelse_hygge_strip', 'brightness') | int(0) %}
+          {{ is_state('light.boernevaerelse_loft', 'on')
+             or is_state('light.boernevaerelse_hyggelys', 'on')
+             or (is_state('light.boernevaerelse_hygge_strip', 'on') and strip_b >= 26) }}
+        attributes:
+          natlys: >-
+            {% set strip_b = state_attr('light.boernevaerelse_hygge_strip', 'brightness') | int(0) %}
+            {{ is_state('light.boernevaerelse_hygge_strip', 'on') and strip_b < 26 }}
+
+      # --- Rummets lys "effektivt tændt" (2026-08-13, user-spec) --------------
+      # = gruppen lyser ELLER rummet har et spøgelse (pære der lyser videre uden
+      # radio, se packages/light_watchdog.yaml). Rummenes history_stats måler på
+      # DISSE, så en pære der falder af nettet mens den lyser stadig optjener
+      # timer på Statistik-siden. Rum-medlemskabet står eksplicit (IKKE som
+      # entity_id-præfiks): light.spisestue_pendel hænger fysisk i soveværelset.
+      - name: "Stue lys on effektiv"
+        unique_id: stue_lys_on_effektiv
+        icon: mdi:sofa
+        state: >-
+          {% set g = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {{ is_state('light.stue_room', 'on')
+             or g | select('in', ['light.stue_plug', 'light.stue_laesehygge'])
+                  | list | count > 0 }}
+      - name: "Koekken lys on effektiv"
+        unique_id: koekken_lys_on_effektiv
+        icon: mdi:silverware-fork-knife
+        state: >-
+          {% set g = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {{ is_state('light.koekken_room', 'on')
+             or 'light.koekken_lyskaede' in g }}
+      - name: "Spisestue lys on effektiv"
+        unique_id: spisestue_lys_on_effektiv
+        icon: mdi:table-chair
+        state: >-
+          {% set g = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {{ is_state('light.spisestue_loft', 'on')
+             or 'light.spisestue_loft' in g }}
+      - name: "Sovevaerelse lys on effektiv"
+        unique_id: sovevaerelse_lys_on_effektiv
+        icon: mdi:bed
+        state: >-
+          {% set g = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {{ is_state('light.sovevaerelse_all', 'on')
+             or 'light.spisestue_pendel' in g }}
+      - name: "Boernevaerelse lys on effektiv"
+        unique_id: boernevaerelse_lys_on_effektiv
+        icon: mdi:teddy-bear
+        state: >-
+          {% set g = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {{ is_state('binary_sensor.boernevaerelse_any_lys', 'on')
+             or g | select('in', ['light.boernevaerelse_loft',
+                                  'light.boernevaerelse_hygge_strip',
+                                  'light.boernevaerelse_hyggelys'])
+                  | list | count > 0 }}
+      - name: "Depot lys on effektiv"
+        unique_id: depot_lys_on_effektiv
+        icon: mdi:package-variant
+        state: >-
+          {% set g = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {{ is_state('light.depot_all', 'on')
+             or g | select('in', ['light.depot_loft_hue_1',
+                                  'light.depot_loft_hue_2',
+                                  'light.depot_strip']) | list | count > 0 }}
+      - name: "Entre lys on effektiv"
+        unique_id: entre_lys_on_effektiv
+        icon: mdi:door-open
+        state: >-
+          {% set g = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {{ is_state('light.entre_all', 'on') or 'light.entre_loft' in g }}
+      - name: "Terrasse lys on effektiv"
+        unique_id: terrasse_lys_on_effektiv
+        icon: mdi:string-lights
+        state: >-
+          {% set g = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {{ is_state('light.terrasse_all', 'on')
+             or 'light.terrasse_paerelyskaede' in g }}
+      - name: "Badevaerelse lys on effektiv"
+        unique_id: badevaerelse_lys_on_effektiv
+        icon: mdi:shower
+        state: >-
+          {% set g = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {{ is_state('light.badevaerelse_all', 'on')
+             or g | select('match', 'light.badevaerelse_spot_')
+                  | list | count > 0 }}
+
+  - sensor:
+      # --- Live VÆGTET antal fysisk tændte pærer (2026-06-25, user-spec) ------
+      # Tæller pr. controlbar light-entity om den er 'on' (dæmpning ignoreres
+      # bevidst → "tændt-tid", ikke effekt). Vægte: depot-strip = 2 (lang strip),
+      # depot-loftets to Hue-pærer 1 hver → listens total = 22 tændbare pærer
+      # (per-pære-gns deler med 22). Integreres til pære-timer ovenfor.
+      # 2026-08-13: light.depot_loft (GRUPPE, vægt 2) erstattet af sine to leaf-
+      # pærer, ellers ville en gruppe der melder 'on' med ét unavailable medlem
+      # tælle dobbelt sammen med spøgelses-tillægget nedenfor.
+      # SPØGELSER: en pære der taber radioen mens den lyser står 'unavailable'
+      # og talte før som slukket — den lyser fysisk videre (depot_strip 15 t
+      # 08-12). Den tæller nu med, indtil den er tilbage (user-spec 2026-08-13,
+      # bevidst uden cap). Delt resultat: sensor.lys_spoegelser.
+      - name: "Hus paerer taendt antal"
+        unique_id: hus_paerer_taendt_antal
+        unit_of_measurement: "pærer"
+        state_class: measurement
+        icon: mdi:lightbulb-on
+        state: >-
+          {% set bulbs = [
+            ('light.stue_sofa_lampe', 1), ('light.stue_sofa_lampe_2', 1),
+            ('light.stue_hjoernelampe', 1), ('light.stue_plug', 1),
+            ('light.stue_laesehygge', 1),
+            ('light.koekken_lyskaede', 1),
+            ('light.spisestue_loft', 1),
+            ('light.spisestue_pendel', 1),
+            ('light.boernevaerelse_loft', 1), ('light.boernevaerelse_hygge_strip', 1),
+            ('light.boernevaerelse_hyggelys', 1),
+            ('light.badevaerelse_spot_1', 1), ('light.badevaerelse_spot_2', 1),
+            ('light.badevaerelse_spot_3', 1), ('light.badevaerelse_spot_4', 1),
+            ('light.badevaerelse_spot_5', 1),
+            ('light.depot_loft_hue_1', 1), ('light.depot_loft_hue_2', 1),
+            ('light.depot_strip', 2),
+            ('light.entre_loft', 1),
+            ('light.terrasse_paerelyskaede', 1) ] %}
+          {% set ghosts = state_attr('sensor.lys_spoegelser', 'entities') or [] %}
+          {% set ns = namespace(c=0) %}
+          {% for eid, w in bulbs %}
+            {% if states(eid) == 'on' or eid in ghosts %}
+              {% set ns.c = ns.c + w %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.c }}
+
+      # Pære-vægtet gennemsnit pr. pære for HELE huset (timer/dag) = dagens
+      # pære-timer / 22. Nulstiller ved midnat (utility_meteret er dagligt) →
+      # daglig slut-state = dagstotal (graf stat_type:[state]).
+      # 2026-07-13: divisor 23 → 22 (køkkenloftets pære fandtes ikke); loftet er
+      # helt nedlagt 2026-07-28, så 22 er nu det ægte antal. Hæv divisoren igen
+      # hvis der senere hænges en ny pære op i et fælles-rum.
+      # availability-guard (alle spejle her): ved restart er kilden kortvarigt
+      # unknown → float(0) → 0 → recorder tolkede det som meter-reset → dagens
+      # hidtidige timer taltes DOBBELT i statistics-sum (verificeret 07-12: 5 rum
+      # oppustet). unavailable registreres ikke → intet falsk reset.
+      - name: "Hus lys per paere idag"
+        unique_id: hus_lys_per_paere_idag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:lightbulb-group
+        availability: "{{ has_value('sensor.hus_paeretimer_i_dag') }}"
+        state: >-
+          {{ ((states('sensor.hus_paeretimer_i_dag') | float(0)) / 22) | round(2) }}
+
+      # Samlet pære-timer i dag (Σ faktisk tændte pærer integreret over tid).
+      - name: "Hus lys paeretimer idag"
+        unique_id: hus_lys_paeretimer_idag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:counter
+        availability: "{{ has_value('sensor.hus_paeretimer_i_dag') }}"
+        state: >-
+          {{ states('sensor.hus_paeretimer_i_dag') | float(0) | round(1) }}
+
+      # --- Per-rum dags-grafkilder (total_increasing) -----------------------
+      # Tynde spejle af history_stats-sensorerne ovenfor, men med state_class
+      # total_increasing så Pr.-rum-sammenlignings-grafen får rene dag-søjler
+      # (samme 00:00-spids-fix som hus-sensorerne). Tiles/alarmer bruger fortsat
+      # de rå *_lys_on_idag (measurement) — kun graferne peger på disse.
+      - name: "Stue lys timer dag"
+        unique_id: stue_lys_timer_dag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:lightbulb
+        availability: "{{ has_value('sensor.stue_lys_on_idag') }}"
+        state: "{{ states('sensor.stue_lys_on_idag') | float(0) | round(3) }}"
+      - name: "Koekken lys timer dag"
+        unique_id: koekken_lys_timer_dag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:lightbulb
+        availability: "{{ has_value('sensor.koekken_lys_on_idag') }}"
+        state: "{{ states('sensor.koekken_lys_on_idag') | float(0) | round(3) }}"
+      - name: "Spisestue lys timer dag"
+        unique_id: spisestue_lys_timer_dag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:lightbulb
+        availability: "{{ has_value('sensor.spisestue_lys_on_idag') }}"
+        state: "{{ states('sensor.spisestue_lys_on_idag') | float(0) | round(3) }}"
+      - name: "Sovevaerelse lys timer dag"
+        unique_id: sovevaerelse_lys_timer_dag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:lightbulb
+        availability: "{{ has_value('sensor.sovevaerelse_lys_on_idag') }}"
+        state: "{{ states('sensor.sovevaerelse_lys_on_idag') | float(0) | round(3) }}"
+      - name: "Boernevaerelse lys timer dag"
+        unique_id: boernevaerelse_lys_timer_dag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:lightbulb
+        availability: "{{ has_value('sensor.boernevaerelse_lys_on_idag') }}"
+        state: "{{ states('sensor.boernevaerelse_lys_on_idag') | float(0) | round(3) }}"
+      - name: "Badevaerelse lys timer dag"
+        unique_id: badevaerelse_lys_timer_dag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:lightbulb
+        availability: "{{ has_value('sensor.badevaerelse_lys_on_idag') }}"
+        state: "{{ states('sensor.badevaerelse_lys_on_idag') | float(0) | round(3) }}"
+      - name: "Depot lys timer dag"
+        unique_id: depot_lys_timer_dag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:lightbulb
+        availability: "{{ has_value('sensor.depot_lys_on_idag') }}"
+        state: "{{ states('sensor.depot_lys_on_idag') | float(0) | round(3) }}"
+      - name: "Entre lys timer dag"
+        unique_id: entre_lys_timer_dag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:lightbulb
+        availability: "{{ has_value('sensor.entre_lys_on_idag') }}"
+        state: "{{ states('sensor.entre_lys_on_idag') | float(0) | round(3) }}"
+      - name: "Terrasse lys timer dag"
+        unique_id: terrasse_lys_timer_dag
+        unit_of_measurement: "t"
+        state_class: total_increasing
+        icon: mdi:lightbulb
+        availability: "{{ has_value('sensor.terrasse_lys_on_idag') }}"
+        state: "{{ states('sensor.terrasse_lys_on_idag') | float(0) | round(3) }}"
+
+automation:
+  # ===========================================================================
+  # Høj-forbrug-notifikation — et rum har brændt for længe i dag (bug-synlighed)
+  # ===========================================================================
+  # Fyrer når et rums tændt-timer i dag krydser slider-tærsklen. Per-rum (=
+  # per-pære for samlet-styrede rum). Mute i guest_mode. Én notifikation pr.
+  # rum pr. dag (numeric_state fyrer kun ved selve krydset; sensorerne nulstiller
+  # ved midnat → klar igen næste dag).
+  - id: lys_kpi_hoejt_forbrug_alert
+    alias: "Forbrug: rum har brændt for længe i dag"
+    description: >
+      Et rums lys tændt-timer i dag > alarm-tærskel → push + persistent, så
+      stuck/overforbrug fanges. Tærskel = input_number.lys_kpi_alarm_timer.
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: numeric_state
+        entity_id:
+          - sensor.stue_lys_on_idag
+          - sensor.koekken_lys_on_idag
+          - sensor.spisestue_lys_on_idag
+          - sensor.sovevaerelse_lys_on_idag
+          - sensor.boernevaerelse_lys_on_idag
+          - sensor.badevaerelse_lys_on_idag
+          - sensor.depot_lys_on_idag
+          - sensor.entre_lys_on_idag
+          - sensor.terrasse_lys_on_idag
+        # HA accepterer ikke template i numeric_state above → entity-ref
+        # (var disabled siden commit pga. template). Fyrer når et rums on-timer
+        # krydser input_number-værdien.
+        above: input_number.lys_kpi_alarm_timer
+    condition:
+      - condition: state
+        entity_id: input_boolean.guest_mode
+        state: "off"
+    action:
+      - variables:
+          # Rigtige rum-navne (2026-10-20): friendly_name gav "Koekken",
+          # "Badevaerelse" og "Entre" i pushen.
+          rum: >-
+            {{ {'sensor.stue_lys_on_idag': 'Stue',
+                'sensor.koekken_lys_on_idag': 'Køkken',
+                'sensor.spisestue_lys_on_idag': 'Spisestue',
+                'sensor.sovevaerelse_lys_on_idag': 'Soveværelse',
+                'sensor.boernevaerelse_lys_on_idag': 'Børneværelse',
+                'sensor.badevaerelse_lys_on_idag': 'Badeværelse',
+                'sensor.depot_lys_on_idag': 'Depot',
+                'sensor.entre_lys_on_idag': 'Entré',
+                'sensor.terrasse_lys_on_idag': 'Terrasse'
+               }.get(trigger.entity_id, trigger.entity_id) }}
+          timer: "{{ (trigger.to_state.state | float(0) | round(1) | string) | replace('.', ',') }}"
+          graense: "{{ states('input_number.lys_kpi_alarm_timer') | float(5) | round(0) | int }}"
+          # Sluk-knappens target = det lys-sæt timeren faktisk måler (single
+          # authority — genbruger ANOM_LYS_SLUK-handleren i notif_actions.yaml).
+          sluk_target: >-
+            {{ {'sensor.stue_lys_on_idag': 'light.stue_room',
+                'sensor.koekken_lys_on_idag': 'light.koekken_room',
+                'sensor.spisestue_lys_on_idag': 'light.spisestue_loft',
+                'sensor.sovevaerelse_lys_on_idag': 'light.sovevaerelse_all',
+                'sensor.boernevaerelse_lys_on_idag': 'light.boernevaerelse_all',
+                'sensor.badevaerelse_lys_on_idag': 'light.badevaerelse_all',
+                'sensor.depot_lys_on_idag': 'light.depot_all',
+                'sensor.entre_lys_on_idag': 'light.entre_all',
+                'sensor.terrasse_lys_on_idag': 'light.terrasse_all'
+               }.get(trigger.entity_id, '') }}
+      - service: persistent_notification.create
+        data:
+          notification_id: "lys_kpi_hoejt_{{ trigger.entity_id }}"
+          title: "💡 Lys tændt længe: {{ rum }}"
+          message: >-
+            {{ rum }} har haft lys tændt i {{ timer }} t i dag — over grænsen på
+            {{ graense }} t. Tjek om et lys hænger. (Grænsen står på Forbrug-siden.)
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: lys_forbrug
+          title: "💡 Lys tændt længe: {{ rum }}"
+          message: "{{ timer }} t i dag, over din grænse på {{ graense }} t. Er det glemt, så sluk her."
+          payload:
+            tag: "lys_kpi_hoejt_{{ trigger.entity_id }}"
+            group: lys_kpi
+            actions: >-
+              {{ [{'action': 'ANOM_LYS_SLUK:' ~ sluk_target,
+                   'title': '💡 Sluk nu'}] if sluk_target else [] }}
+
+  # ===========================================================================
+  # Daglig 21:00-summering (user-spec 2026-06-21) — kommer ALTID
+  # ===========================================================================
+  # Ud over tærskel-krydset (ovenfor, ad-hoc bug-fangst) skal der hver aften kl.
+  # 21:00 komme en push med dagens TOTAL: Σ pære-timer, dyreste rum, lys-pris og
+  # setup-total (lys + NUC + dongles + batteri). Så Parent A kan sige til Parent B
+  # hvad dagen kostede. Mute i guest_mode.
+  - id: lys_kpi_daglig_21_summering
+    alias: "Forbrug: daglig 21:00-summering (push)"
+    description: >
+      Hver aften 21:00: dagens lys-timer + pris + setup-total samlet i én push.
+    mode: single
+    trigger:
+      # 20:59, ikke 21:00 (B215): push_notify's vindue er halvåbent
+      # (start <= nu < slut), og notif_lys_forbrug_slut står på 21:00 — en
+      # 21:00-trigger blev droppet HVER aften. Flyt ikke tilbage uden at flytte slut.
+      - platform: time
+        at: "20:59:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.guest_mode
+        state: "off"
+    action:
+      - variables:
+          rooms:
+            sensor.stue_lys_on_idag: "Stue"
+            sensor.koekken_lys_on_idag: "Køkken"
+            sensor.spisestue_lys_on_idag: "Spisestue"
+            sensor.sovevaerelse_lys_on_idag: "Soveværelse"
+            sensor.boernevaerelse_lys_on_idag: "Børneværelse"
+            sensor.badevaerelse_lys_on_idag: "Badeværelse"
+            sensor.depot_lys_on_idag: "Depot"
+            sensor.entre_lys_on_idag: "Entré"
+            sensor.terrasse_lys_on_idag: "Terrasse"
+          # Dyreste rum (flest tændt-timer) + liste over rum over tærsklen.
+          top: >-
+            {% set ns = namespace(name='-', h=0) %}
+            {% for e, n in rooms.items() %}
+              {% set v = states(e) | float(0) %}
+              {% if v > ns.h %}{% set ns.h = v %}{% set ns.name = n %}{% endif %}
+            {% endfor %}
+            {{ ns.name }} ({{ ns.h | round(1) }} t)
+          over: >-
+            {% set thr = states('input_number.lys_kpi_alarm_timer') | float(4) %}
+            {% set ns = namespace(l=[]) %}
+            {% for e, n in rooms.items() %}
+              {% if states(e) | float(0) > thr %}{% set ns.l = ns.l + [n] %}{% endif %}
+            {% endfor %}
+            {{ ns.l | join(', ') if ns.l else '' }}
+          paeretimer: "{{ states('sensor.hus_lys_paeretimer_idag') | float(0) | round(1) }}"
+          lyspris: "{{ states('sensor.lys_kost_faktisk_i_dag') | float(0) | round(2) }}"
+          setup: "{{ states('sensor.setup_kost_i_dag') | float(0) | round(2) }}"
+          graense: "{{ states('input_number.lys_kpi_alarm_timer') | float(5) | round(0) | int }}"
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: lys_forbrug
+          title: "💡 Lyset i dag: {{ '%.2f' | format(lyspris | float(0)) | replace('.', ',') }} kr"
+          message: >-
+            {{ (paeretimer | string) | replace('.', ',') }} pære-timer, mest i
+            {{ top | replace('.', ',') }}. Hele opsætningen:
+            {{ '%.2f' | format(setup | float(0)) | replace('.', ',') }} kr i dag.{{
+            ' Over ' ~ graense ~ ' t: ' ~ over ~ '.' if over else '' }}
+          payload:
+            tag: "lys_kpi_daglig_summering"
+      - service: logbook.log
+        data:
+          name: "Lys-KPI 21:00"
+          message: >-
+            Dag-summering: {{ paeretimer }} pære-t, lys {{ lyspris }} kr,
+            setup {{ setup }} kr{{ ' (over: ' ~ over ~ ')' if over else '' }}
+
+  # Ryd persistent-notifikationerne ved midnat (ny dag, sensorerne nulstiller).
+  - id: lys_kpi_hoejt_forbrug_clear
+    alias: "Forbrug: ryd høj-forbrug-notifikationer ved midnat"
+    mode: single
+    trigger:
+      - platform: time
+        at: "00:01:00"
+    action:
+      - repeat:
+          for_each:
+            - sensor.stue_lys_on_idag
+            - sensor.koekken_lys_on_idag
+            - sensor.spisestue_lys_on_idag
+            - sensor.sovevaerelse_lys_on_idag
+            - sensor.boernevaerelse_lys_on_idag
+            - sensor.badevaerelse_lys_on_idag
+            - sensor.depot_lys_on_idag
+            - sensor.entre_lys_on_idag
+            - sensor.terrasse_lys_on_idag
+          sequence:
+            - service: persistent_notification.dismiss
+              data:
+                notification_id: "lys_kpi_hoejt_{{ repeat.item }}"
+
+# --- Dagens pære-timer: utility_meter på integrations-totalen (ren dag-grænse) -
+# 2026-06-25: erstatter midnat-vindue-history_stats-tilgangen for hus-aggregatet.
+# sensor.hus_paeretimer_i_dag = akkumulerede pære-timer siden midnat (nulstilles
+# dagligt). Føder hus_lys_paeretimer_idag (mirror) + hus_lys_per_paere_idag (/22).
+utility_meter:
+  hus_paeretimer_idag_meter:
+    source: sensor.hus_paeretimer_total
+    cycle: daily
+    name: "Hus paeretimer i dag"

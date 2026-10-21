@@ -1,0 +1,111 @@
+# =============================================================================
+# Open-plan presence re-sync ved HA-start (2026-06-15, user-bug)
+# =============================================================================
+# BUG: efter en HA-restart booter stue/spisestue/koekken Apollo-occupancy nogle
+# gange "on" (nogen VAR til stede) mens lyset booter "off". Presence-lys er
+# edge-trigget (occupancy off→on), så uden en frisk edge fyrer presence_light_
+# *_on aldrig → open-plan-lyset forbliver slukket HELE tiden selvom rummet er
+# optaget (set 2026-06-15: restart kl 16:12 → lys slukket til 22:53).
+#
+# FIX: efter boot ARMERES et vindue hvor den første ÆGTE bevægelse i open-plan
+# tænder det rum bevægelsen blev set i. Startup-only, så den ALDRIG fighter
+# manuel-sluk i normal drift.
+#
+# 2026-08-15 (user-bug, kritisk): den gamle udgave lavede ét one-shot-tjek 2 min
+# efter boot og tændte `light.stue_all` (= HELE open-plan) på 60 % hvis bare én
+# Apollo stod `on`. En restart kl 06:38 tændte stue+køkken+spisestue 06:40:01
+# over en sovende familie: `stue_apollo_occupancy` var `on` med last_changed =
+# selve boot-tidspunktet, altså en GENSKABT latch, og `moving_target` var off
+# hele vejen. Occupancy-latchen er præcis den tilstand automationen findes for
+# at kompensere for — den kan derfor pr. konstruktion ikke bruges som bevis for
+# et menneske (fejlklasse #20). To ændringer:
+#   1. Der ventes nu på en `moving_target`-flanke (op til 15 min). Et menneske
+#      der sidder stille bevæger sig indenfor vinduet; et tomt rum med en hængt
+#      latch gør aldrig. Gatesne re-tjekkes EFTER ventetiden, da den er lang.
+#   2. Kun det rum bevægelsen blev set i tændes — ikke hele open-plan
+#      (user-spec: fælles-rums lys tændes af presence, ikke af "mørkt + slukket").
+# =============================================================================
+
+- id: presence_resync_open_plan_on_start
+  alias: "Lysnet: open-plan re-sync ved HA-start (stuck-occupancy fix)"
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: homeassistant
+      event: start
+  action:
+    # Boot-tidspunktet fanges FØR delayen (huset har ingen sensor.uptime for
+    # selve HA). En restored entity får last_changed = restore-tidspunktet, så
+    # dette er skillelinjen mellem "genskabt latch" og "rigtig flanke".
+    - variables:
+        boot: "{{ now().timestamp() }}"
+    # Lad Apollo-occupancy + open_plan_lux + grupper settle efter boot.
+    - delay:
+        minutes: 2
+    # Signaturen på bug'en: mindst én open-plan Apollo står `on` UDEN at have
+    # flanket siden boot → presence_light_*_on får aldrig sin edge. Er der ingen
+    # hængt latch, findes problemet ikke, og vi skal slet ikke armere.
+    - condition: template
+      value_template: >-
+        {% set ns = namespace(stuck=false) %}
+        {% from 'rosters.jinja' import open_plan_occupancy %}{% for e in open_plan_occupancy
+                     %}
+          {% if is_state(e, 'on')
+                and as_timestamp(states[e].last_changed, 0) <= boot + 60 %}
+            {% set ns.stuck = true %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.stuck }}
+    # Vent på et ÆGTE bevægelses-vidne. En genskabt occupancy-latch flanker
+    # aldrig her; et menneske i rummet gør det indenfor få minutter.
+    - wait_for_trigger:
+        - platform: state
+          entity_id: !include ../rosters/open_plan_bevaegelse.yaml
+          from: "off"
+          to: "on"
+      timeout:
+        minutes: 15
+      continue_on_timeout: false
+    - variables:
+        rum: >-
+          {{ wait.trigger.entity_id.split('.')[1].split('_')[0] }}
+        maal: >-
+          {{ {'stue': 'light.stue_room',
+              'koekken': 'light.koekken_room',
+              'spisestue': 'light.spisestue_loft'}.get(rum, 'light.stue_room') }}
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_select.house_state
+              state: "Active"
+            - condition: state
+              entity_id: binary_sensor.godnat_any_active
+              state: "off"
+            # 2026-08-13g (Sleep Over): en restart må ikke "re-synce" lys ind
+            # over en gæst der sover i open-plan.
+            - condition: state
+              entity_id: binary_sensor.sleepover_openplan_moerkt
+              state: "off"
+            # mørkt nok til at lys giver mening (Apollo-lux; unavailable → skip)
+            - condition: numeric_state
+              entity_id: sensor.open_plan_lux
+              below: 40
+            # rummets lys er HELT slukket (ingen edge har tændt det imens)
+            - condition: template
+              value_template: >-
+                {{ expand(maal)
+                   | selectattr('state', 'eq', 'on') | list | count == 0 }}
+          sequence:
+            - service: light.turn_on
+              target:
+                entity_id: "{{ maal }}"
+              data:
+                brightness_pct: 60
+                color_temp_kelvin: 2700
+                transition: 2
+            - service: logbook.log
+              data:
+                name: "Open-plan re-sync"
+                message: >-
+                  HA-start: {{ rum }} havde hængt occupancy-latch + mørkt + lys
+                  slukket, og bevægelse blev set → {{ maal }} tændt på 60%.

@@ -1,0 +1,215 @@
+# =============================================================================
+# Afgangs-dvale (Active → Dormant via hoveddørs-afgang)
+# =============================================================================
+# User-spec 2026-07-18: "active to dormant kræver jo også main door open event,
+# ikke? det skal det." + algoritmen:
+#   "i en tidsperiode efter door open event skal vi holde øje med bevægelse i
+#    huset. hvis ingen bevægelse i 10min (slider bestemt) og entreen var helt
+#    stille efter door close eventet der fulgte door open eventet, så erklær
+#    dormant."
+# + blokke: "terasse dør åben eller wasp bad armed skal blokere for at der i den
+#    sekvens erklæres dormant for så blev den anden person hjemme. gps active og
+#    på adressen skal også blokere for dormant erklæringen."
+#
+# SEKVENS (mode: restart — ny hoveddørs-åbning genstarter overvågningen):
+#   1. Hoveddør åbnes (off→on)         = afgangs-kandidat.
+#   2. Vent på at hoveddøren LUKKER     (10 min timeout → ellers afbryd; en dør
+#      der står åben er ikke en ren afgang).
+#   3. Fra dør-luk: vent på ENHVER occupancy-transition til 'on' i huset.
+#      Timeout = slider-minutter. Fyrer en sensor = bevægelse = nogen hjemme
+#      (eller kom ind igen) → afbryd. Timeout uden fyring = huset helt stille.
+#      (wait_for_trigger fanger kun NYE transitioner → radar-trailing efter
+#       afgang, der stadig står 'on', afbryder ikke fejlagtigt.)
+#   4. Blokke (user-spec) før Dormant erklæres — enhver = anden person hjemme:
+#        - terrassedør åben
+#        - wasp bad armed (wasp_dormant_allowed off = nogen på badet)
+#        - FRISK GPS på adressen (tracker 'home' + *_gps_fresh on). KUN friske
+#          koordinater blokerer — stale GPS (offline/batterisparer) strander
+#          ikke huset. Se gps_freshness.yaml. (user-spec 2026-07-18b)
+#        - entré occupancy on (ikke helt stille)
+#      + stadig Active + ikke AirBnB (waits kan have varet længe).
+#
+# Dette er den HURTIGE afgangs-sti (~10 min). De langsomme idle/GPS-stier i
+# packages/house_modes.yaml + dormant_schedule.yaml + dormant_idle.yaml bliver
+# som backstop. Roborock-ghost-flap kan ikke vække huset (dormant_door_lock).
+# =============================================================================
+
+input_number:
+  house_dormant_departure_minutes:
+    name: "Dvale: stilhed efter afgang (min)"
+    icon: mdi:door-closed-lock
+    min: 3
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: box
+
+automation:
+  - id: house_departure_dormant_detect
+    alias: "Hus: Afgangs-dvale (dør → stilhed → Dormant)"
+    description: >
+      Hoveddør åbnes → lukkes → ingen bevægelse i huset i slider-minutter →
+      Dormant. Blokke: terrassedør åben / wasp bad armed / GPS hjemme / entré
+      ikke stille. User-spec 2026-07-18.
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_hoveddoer
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+    action:
+      # 1) Vent på at hoveddøren lukker igen (afgang = åbn→luk).
+      - wait_for_trigger:
+          - platform: state
+            entity_id: binary_sensor.parasoll_hoveddoer
+            to: "off"
+        timeout:
+          minutes: 10
+        continue_on_timeout: false
+      # 1b) SETTLE-GRACE (2026-08-21): den der lige gik ud, er STADIG i radarens
+      # felt et stykke tid efter døren lukkede. Stue-Apolloen rækker 6 m og ind i
+      # entréen (08-20d), og dens latch slipper ikke på dør-flanken.
+      # Målt i dag: dør lukket 07:21:35 → rå stue-occupancy ON 07:21:54, OFF
+      # 07:23:52 (137 s efter dør-luk) → `stue_apollo_occupancy_filtered` fyrede
+      # 07:22:01, dvs. **26 sekunder** inde i stilhedsvinduet, og hele
+      # afgangs-dvalen blev afbrudt af afgangens eget efterslæb. Huset stod
+      # derefter Active i over to timer med et tomt hus.
+      # Det er fejlklasse #23's mønster: beviset må ikke hentes i den kanal som
+      # netop den udløsende hændelse forurener. Robot-masken har allerede 180 s
+      # pre-roll af samme grund — afgangen selv fortjener den samme.
+      # Sikkert, fordi en der FAKTISK er hjemme fyrer igen inden for de
+      # efterfølgende slider-minutter; graceperioden udskyder, den blinder ikke.
+      - delay:
+          seconds: 180
+      # 2) Fra dør-luk + grace: vent på ENHVER occupancy-transition. Timeout = slider.
+      #
+      # ROBOT-MASKE (2026-08-17): robotten ER den bevægelse Apollo'erne ser, og
+      # "start robotten og gå på arbejde" er husets mest typiske hverdagsmorgen.
+      # Målt i dag: afgang 07:47:56 → dør lukket 07:48:02 → robottens
+      # segment-clean tændte spisestuen 07:51:05, ~3 min inde i stilhedsvinduet
+      # → hele afgangs-dvalen afbrudt, køkkenlyset brændte videre, og huset stod
+      # Active resten af formiddagen (de langsomme backstops er vetoet af
+      # afgangens EGEN dør-flanke i physical_presence_credible).
+      # Derfor: en occupancy-flanke der falder mens robot-masken er ON beviser
+      # ingenting → stilhedsvinduet ARMES FORFRA i stedet for at afbryde.
+      # Masken har 180 s pre-roll (sky-forsinkelsen) og 20 min delay_off
+      # (Apollo-latchen), så tail'en efter dokning er dækket.
+      # Loft på 6 runder: hænger masken (eller kører robotten en time), giver vi
+      # op og lader de langsomme stier om det — aldrig en uendelig løkke.
+      - repeat:
+          sequence:
+            - wait_for_trigger:
+                - platform: state
+                  entity_id:
+                    - binary_sensor.stue_apollo_occupancy_filtered
+                    - binary_sensor.spisestue_apollo_occupancy_filtered
+                    - binary_sensor.koekken_apollo_occupancy_filtered
+                    - binary_sensor.badevaerelse_inde_occupancy
+                    # 2026-08-21: dvale-VIDNET, ikke den rå sensor. Den rå
+                    # fyrede 22 gange i det tomme hus 07:25-09:42 og afbrød
+                    # afgangen igen og igen. Vidnet holder først når rummet er
+                    # holdt i 150 s — se packages/sove_dvale_vidne.yaml. Fordi
+                    # vidnet er klæbrigt (16 min bro over Apolloens drop-outs)
+                    # giver en sovende partner ikke nødvendigvis en NY flanke
+                    # her, så det er i stedet en BLOK nedenfor.
+                    - binary_sensor.sovevaerelse_dvale_vidne
+                    - binary_sensor.boernevaerelse_apollo_occupancy
+                    - binary_sensor.depot_valhorn_occupancy
+                    - binary_sensor.entre_valhorn_occupancy
+                  to: "on"
+              timeout:
+                minutes: "{{ states('input_number.house_dormant_departure_minutes') | int(10) }}"
+              continue_on_timeout: true
+          until:
+            - condition: template
+              value_template: >-
+                {{ wait.trigger is none
+                   or not is_state('binary_sensor.roborock_zone_maskering', 'on')
+                   or repeat.index >= 6 }}
+      # Fyrede en occupancy-sensor (uden robot-maske)? = bevægelse = nogen
+      # hjemme → afbryd.
+      - condition: template
+        value_template: "{{ wait.trigger is none }}"
+      # 3) Blokke (user-spec) — enhver = anden person stadig hjemme.
+      - condition: state
+        entity_id: binary_sensor.parasoll_terrassedoer
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.wasp_dormant_allowed
+        state: "on"
+      # GPS-blok (user-spec 2026-07-18b): KUN FRISKE GPS-koordinater på adressen
+      # blokerer. Vi bruger IKKE input_boolean.parent_a_home/parent_b_home — de har
+      # 5-min afgangs-grace + kan hænge stale-ON når GPS lagger, hvilket ville
+      # strande huset i Active. En stale telefon (offline/batterisparer →
+      # last_updated >30 min, se gps_freshness.yaml) der stadig står "home" fra i
+      # går må IKKE blokere. Fresh = tracker pinger lige nu → ægte hjemme.
+      # Afgangs-vinduet (slider-min stilhed) giver samtidig tid til at nå væk fra
+      # ejendommen (home-zonen) før tjekket → en aktiv telefon er ude af zonen da.
+      # 2026-08-15c: Parent B's gren læses via ankeret. Hendes tracker er frossen
+      # på 'home' og `parent_b_gps_fresh` er derfor permanent OFF → hendes blok
+      # kunne ALDRIG udløses, dvs. huset kunne gå Dormant mens hun sad hjemme.
+      # Ankeret er hendes eneste vidne, og det har ingen friskheds-dimension:
+      # står det ON, er hun hjemme til det modsatte er trykket.
+      - condition: template
+        value_template: >-
+          {{ not (
+               (is_state('device_tracker.phone_a','home')
+                and is_state('binary_sensor.parent_a_gps_fresh','on'))
+            or is_state('binary_sensor.parent_b_hjemme_anker','on')
+          ) }}
+      # Entré helt stille efter dør-luk (user-spec eksplicit).
+      - condition: state
+        entity_id: binary_sensor.entre_valhorn_occupancy
+        state: "off"
+      # Ingen der sover videre i soveværelset (2026-08-21). Vidnet er klæbrigt,
+      # så det kan ikke leveres som en flanke i stilhedsvinduet — men som
+      # TILSTAND er det stærkere end en flanke: det holder også hvis den
+      # sovende ikke rører sig i hele vinduet.
+      # NB template, ikke `condition: state ... "off"`: vidnet har delay_off, og
+      # en template-sensor med delay bliver stående `unknown` i hele
+      # delay-perioden efter en HA-restart. Et state-tjek på "off" ville derfor
+      # blokere afgangs-dvalen i 16 min efter hver restart (#9). Kun et
+      # bekræftet `on` må blokere.
+      - condition: template
+        value_template: >-
+          {{ not is_state('binary_sensor.sovevaerelse_dvale_vidne', 'on') }}
+      # Waits kan have varet længe — re-tjek grund-state.
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # === Erklær Dormant (samme oprydning som dormant_idle.yaml) ===
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.house_state
+        data:
+          option: "Dormant"
+      - service: input_boolean.turn_off
+        target:
+          entity_id: !include ../rosters/godnat_flag.yaml
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.alle_indvendige
+        data:
+          transition: 10
+      - service: logbook.log
+        data:
+          name: "Afgangs-dvale"
+          message: >-
+            Hoveddørs-afgang → ingen bevægelse i
+            {{ states('input_number.house_dormant_departure_minutes') }} min →
+            Dormant.

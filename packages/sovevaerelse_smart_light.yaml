@@ -1,0 +1,195 @@
+# =============================================================================
+# Soveværelse smart-lys (sprint 2026-07-01, user-spec opg 2+3+4)
+# =============================================================================
+# Sove-lyset (light.spisestue_pendel, CCT 1798-6535K) får en "getting-to-bed"-
+# model med tunable sliders:
+#
+#   1. GANG-EARLY-DETECT (opg 2): bevægelse i entréen tænder sove-lyset svagt
+#      (early_brightness, default 5%) VARMT, når det er mørkt i open-plan + ikke
+#      godnat — så man ikke går ind i et bælgmørkt soveværelse (Apolloen ser
+#      først når man er helt inde). Går man IKKE ind, slukker det hurtigt igen
+#      (early_detect_clear_seconds, samme som depot). Går man ind, løftes lyset
+#      til START-niveau (Apollo bekræfter). Flag: sove_approach_lit.
+#
+#   2. START-NIVEAU (opg 4): når man er i rummet tændes lyset på start_brightness
+#      (default 30%, "find ting i skufferne") på default_warmth_k (opg 3, varm).
+#      Bruges af presence-auto-tænd + RODRET top-tryk + gang-early-detect-upgrade.
+#
+#   3. VARM DEFAULT (opg 3): default_warmth_k er sove-lysets standard-farve ved
+#      knap-tryk/auto-tænd — varmere end den gamle auto_color_temp_evening
+#      (~2326-2500K aften). Styrbar OP/hold rører IKKE farven (ren manuel).
+#
+#   4. HYGGE-FADE (opg 4): når man LIGGER STILLE (still-target on + ingen
+#      bevægelse i settle_delay_seconds = man ligger i sengen) fader lyset
+#      gradvist ned til cozy_brightness (default 6%) på cozy_warmth_k (endnu
+#      varmere) over cozy_fade_minutes. Bliver på hygge (ingen op-lys igen ved
+#      bevægelse — user-valg 2026-07-01) indtil godnat / tomt rum / knap-tryk.
+#      Fade er KUN NEDAD → rører aldrig bedroom_night_guard (den fanger kun
+#      OP-ramper under godnat).
+#
+# Defaults: init_user_preferences (fresh) + REST ved deploy (live) + snapshot.
+# Tiles på Indstillinger → "🌙 Søvn & døgnrytme".
+# =============================================================================
+input_number:
+  # --- Opg 3: varm default-farve ved knap-tryk / auto-tænd -------------------
+  sovevaerelse_default_warmth_k:
+    name: "Sove: varm default-farve (K)"
+    icon: mdi:white-balance-incandescent
+    min: 1800
+    max: 3500
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+
+  # --- Opg 4: start-niveau (find ting i skuffer) ----------------------------
+  sovevaerelse_start_brightness:
+    name: "Sove: start-lysstyrke (find ting)"
+    icon: mdi:lightbulb-on-70
+    min: 5
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # --- Opg 2: gang-early-detect pre-lys -------------------------------------
+  sovevaerelse_early_brightness:
+    name: "Sove: gang-early-detect lysstyrke"
+    icon: mdi:lightbulb-night
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Lux-gate for gang-early-detect: pre-lyset tænder kun når open_plan_lux er
+  # UNDER denne grænse. 0 = early-detect aldrig (gaten kan ikke opfyldes).
+  # Rå lx, IKKE skaleret af global_lux_sensitivity (samme mønster som
+  # koekken_spots_lux_threshold).
+  sovevaerelse_early_lux_threshold:
+    name: "Sove: gang-early-detect lux-grænse"
+    icon: mdi:theme-light-dark
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # --- Opg 4: hygge-fade parametre ------------------------------------------
+  sovevaerelse_settle_delay_seconds:
+    name: "Sove: ligge-stille før hygge-fade (sek)"
+    icon: mdi:bed-clock
+    min: 10
+    max: 600
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  sovevaerelse_cozy_brightness:
+    name: "Sove: hygge-lysstyrke (i sengen)"
+    icon: mdi:lightbulb-on-10
+    min: 1
+    max: 50
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  sovevaerelse_cozy_warmth_k:
+    name: "Sove: hygge-farve (i sengen, K)"
+    icon: mdi:candle
+    min: 1800
+    max: 3000
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+
+  sovevaerelse_cozy_fade_minutes:
+    name: "Sove: hygge-fade varighed (min)"
+    icon: mdi:transition
+    min: 0.5
+    max: 30
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-07-08 (user-bug: "sovelyset tændt 20+ min efter jeg gik"): sove-Apolloens
+  # STILL-target kan hænge ON i et tomt rum (spøgelse — still-gates er bevidst
+  # følsomme for at se en sovende krop) → den normale sluk-regel (venter på
+  # still→off) fyrer aldrig. Denne slider styrer no-motion-watchdoggen
+  # (sove_no_motion_watchdog_off): ingen MOVING-target i N min → sluk, uanset
+  # still-target. 0 = watchdog fra (stol på still). Manual/Off-mode +
+  # aften-hygge-hold er undtaget (bevidst tændt lys holdes).
+  #
+  # 30 MIN ER MÅLT, IKKE GÆTTET (2026-08-19d). Værdien stod på 65 arvet fra en
+  # tidlig session — helper-historikken viser 30 rækker over 14 døgn, ALLE med
+  # tomt context_user_id (= restart-restore), altså nul menneskehænder.
+  # Kommentaren ovenfor påstod at "ægte sengelæsning giver småbevægelser der
+  # nulstiller timeren". Det er FALSK: watchdoggen fyrede præcis én gang på 14
+  # døgn (08-18 21:02) og ramte et OPTAGET rum — 4 hjemme, room_mode Auto, og
+  # sove-occupancy skiftede 29 gange i den foregående time. Et menneske kan
+  # altså ligge stille i 65+ min uden ét moving-udslag, så INGEN værdi under
+  # ~90 min undgår fejl-slukninger.
+  #
+  # Når fejl er uundgåelige, vælges den billigste: presence tændte lyset igen
+  # efter 89 sekunder (fejl-sluk koster et blink der selv-heler), mens den
+  # modsatte fejl koster N minutters lys i et tomt rum — netop det user har
+  # klaget over to dage i træk. Derfor tilbage mod design-defaulten 20, med
+  # luft: 30 ≈ 2× husets normale tomt-rum-sluk (sensor.rum_tom_sluk_sekunder),
+  # dvs. "den normale vej burde have klaret det for et kvarter siden".
+  #
+  # ⚠️ Skaleres bevidst IKKE med global_absence_wait_factor (jf. 08-19d-
+  # konsolideringen): et værn mod en hængt sensor må ikke kunne slås fra ved at
+  # skrue på en komfort-slider. Absolut tal, ét sted, aflæseligt.
+  sovevaerelse_no_motion_off_minutes:
+    name: "Sove: sluk uden bevægelse (min, 0=fra)"
+    icon: mdi:motion-sensor-off
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-07-09 (user-spec "alt synligt som sliders"): lysstyrken for godnat-
+  # knappens kort-OP aften-hygge-toggle (18–04, godmorgen_forced aften-gren).
+  # Var hardcodet 10 %. Rå %, IKKE factor-skaleret. NB: toggle-ON rydder selv
+  # voksen-godnat FØR tændingen, så bedroom_night_guard (8 %-tærskel under
+  # godnat) rører den ikke — slideren kan sættes frit over 8 %.
+  sove_hygge_brightness:
+    name: "Sove: aften-hygge lysstyrke (kort-OP)"
+    icon: mdi:sofa-single
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+# 2026-07-09 (user-bug "sengelys-slideren træder ikke i kraft" + "aften-slider
+# mangler"): skillelinjen mellem presence-STARTs ejerskab (06→grænsen, tænder
+# på start_brightness) og sengelysets ejerskab (grænsen→23:59, tænder på
+# sove_sengelys_brightness) var hardcodet 22:00 to steder. Nu ÉN autoritet:
+# presence_light_sovevaerelse_on gater `before:` og sove_sengelys_ved_sengetid
+# gater `after:` på samme input_datetime → ingen hul/overlap når den flyttes.
+input_datetime:
+  sove_aften_graense:
+    name: "Sove: aften-grænse (START → sengelys)"
+    icon: mdi:clock-time-ten
+    has_date: false
+    has_time: true
+
+input_boolean:
+  # on = sove-lyset blev PRE-tændt (early_brightness) af gang-early-detect uden
+  # at nogen (endnu) gik ind. Lader sove_early_detect_fast_clear slukke igen
+  # hurtigt hvis man ikke gik ind; cleares når Apollo bekræfter (upgrade til
+  # START) og når sove-lyset slukker. Spejler depot_approach_lit-mønstret.
+  sove_approach_lit:
+    name: "Sove approach-lys aktivt (pre-niveau)"
+    icon: mdi:lightbulb-on-30
+
+  # 2026-07-08 (#4a/c, user-spec): on = sove-lyset blev toggle-tændt via godnat-
+  # knappens kort-OP om AFTENEN (18–04). Sætter room_mode_sovevaerelse=Manual og
+  # HOLDER den (INGEN drift mod Auto) resten af aftenen/natten. Frigives kl 04:00
+  # (fast) af sove_evening_hold_release → Manual→Auto. Konsumeres af
+  # room_drift_back_watcher (skip sove mens flaget er on) + godmorgen_forced
+  # (aften-gren sætter, dag-gren rydder).
+  sove_evening_hold:
+    name: "Sove aften-hygge hold (ingen drift til 04:00)"
+    icon: mdi:hand-back-left-off

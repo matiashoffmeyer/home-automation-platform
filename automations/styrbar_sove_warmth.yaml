@@ -1,0 +1,222 @@
+# =============================================================================
+# Sove Styrbar — L/R = loop gennem soveloftets varme (sprint 2026-06-22)
+# =============================================================================
+# IEEE c3:db:c9:b4:05:ef:1d:63 (Soveværelse Styrbar).
+#
+# ERSTATTER styrbar_sove_curtain.yaml: soveloftet er nu en hvid/varm CCT-pære
+# (light.spisestue_pendel, color_temp-only, hardware 1798–6535K). Brugeren vil
+# styre VARMEN fra væggen i stedet for gardinet (gardin-rolle droppet — covers
+# styres fortsat fra Rodret på natbordet + godnat/godmorgen-automations).
+#
+# Adfærd:
+#   L (venstre) klik  = ét skridt VARMERE  (kelvin ned, step_k)
+#   R (højre)   klik  = ét skridt KØLIGERE (kelvin op,  step_k)
+#   L/R hold          = kontinuerlig loop gennem varmen (~6 ticks/sek),
+#                       wrap ved enderne = "loope rundt". Slip stopper.
+# Mnemonic: venstre = "tilbage mod stearinlys" = varmere. Højre = køligere.
+#
+# ⚠️ QUIRK-FIX 2026-06-24 (task 1 — "virkede ikke"): Den FYSISKE sove-Styrbar
+# emit'er den GAMLE ZHA-quirk for pilene: `press`/`hold`/`release` (retning i
+# args[0]) — IKKE `arrow_left_click`/`arrow_left_hold`/`arrow_left_release`.
+# Bevis: styrbar_sovevaerelse_lr_grace (trigger på bart `release`) fyrede
+# 2026-06-23 19:48 mens disse warmth-automations IKKE havde fyret siden
+# sprint-API-testen 2026-06-22 (den fyrede syntetiske arrow_*-events). Vi
+# lytter nu på BEGGE quirk-former (præcis som den universelle handler i
+# styrbar_rooms.yaml gør for de andre rum). Retnings-encoding spejlet derfra:
+#   click `press`: args[0] in [257, 0, 2, 258] = venstre/varmere, ellers højre.
+#   hold  `hold` : args[0] in [3329, 257, 0, 2, 258] = venstre/varmere, ellers højre.
+#
+# Startpunkt (default): når lyset er slukket / uden kendt CT, starter loopet på
+# sensor.auto_color_temp_evening = den sol/tid-på-dagen-tilpassede varme-hvid
+# (global evening-warmth-kurve, ikke læring). Er lyset allerede tændt,
+# fortsætter vi fra dens nuværende kelvin → præcis ét skridt fra det du ser.
+#
+# Grænser + skridt er tunable (Indstillinger):
+#   input_number.styrbar_sove_ct_warm_k  (default 2000)
+#   input_number.styrbar_sove_ct_cool_k  (default 4500)
+#   input_number.styrbar_sove_ct_step_k  (default 150)
+# Cursor: input_number.styrbar_ct_kelvin_sove (runtime).
+#
+# PERSISTENS 2026-06-24 (task 5): en manuel varme-justering sætter nu rummet i
+# Manual mode (set_manual: true). Det blokerer presence fra at overskrive din
+# varme på næste bevægelse, så Manual er den eneste vej til at den persisterer.
+# Drift-back returnerer til Auto efter sove-specifik hold-tid
+# (input_number.sovevaerelse_manual_on_hold_hours, default 1t).
+#
+# UNDTAGET fra universal handler (styrbar_rooms.yaml): L/R click+hold skipper
+# allerede 'sovevaerelse'. OP/NED dim-step bevares via universal handler.
+# =============================================================================
+
+# --- L/R klik = ét varme-skridt -----------------------------------------------
+- id: styrbar_sove_warmth_click
+  alias: "Styrbar Sove: varme ét skridt (L/R klik)"
+  mode: queued
+  max: 8
+  trigger:
+    # Nyere quirk
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+        command: "arrow_left_click"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+        command: "arrow_right_click"
+    # Ældre quirk (denne fysiske remote): `press` med retning i args[0]
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+        command: "press"
+  action:
+    - variables:
+        warm_k: "{{ states('input_number.styrbar_sove_ct_warm_k') | int(2000) }}"
+        cool_k: "{{ states('input_number.styrbar_sove_ct_cool_k') | int(4500) }}"
+        step_k: "{{ states('input_number.styrbar_sove_ct_step_k') | int(150) }}"
+        # Retning fra command (ny quirk) ELLER args[0] (gammel quirk).
+        direction: >-
+          {% set c = trigger.event.data.command %}
+          {% set a = trigger.event.data.args | default([]) %}
+          {% if c == 'arrow_left_click' %}warmer
+          {% elif c == 'arrow_right_click' %}cooler
+          {% elif (a[0] | default(-1)) in [257, 0, 2, 258] %}warmer
+          {% else %}cooler{% endif %}
+        # -1 = varmere (L), +1 = køligere (R)
+        sign: "{{ -1 if direction == 'warmer' else 1 }}"
+        # Baseline: lysets faktiske kelvin hvis tændt, ellers tid-på-dagen-default
+        base_k: >-
+          {% set lk = state_attr('light.spisestue_pendel','color_temp_kelvin') %}
+          {% if is_state('light.spisestue_pendel','on') and lk not in [none, 'unknown'] %}
+            {{ lk | int }}
+          {% else %}
+            {{ states('sensor.auto_color_temp_evening') | int(2700) }}
+          {% endif %}
+        # Wrap ind i [warm, cool] (Python-modulo håndterer wrap ved enderne).
+        span: "{{ [cool_k - warm_k, step_k] | max }}"
+        new_k: >-
+          {{ warm_k + (((base_k - warm_k) + sign * step_k) % span) }}
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.styrbar_ct_kelvin_sove
+      data:
+        value: "{{ new_k }}"
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        color_temp_kelvin: "{{ new_k }}"
+        transition: 0.3
+    # task 5: manuel varme = Manual mode → presence overskriver ikke.
+    - service: script.styrbar_stamp_press
+      data:
+        room: sovevaerelse
+        set_manual: true
+
+# --- L/R hold = kontinuerlig varme-loop ---------------------------------------
+- id: styrbar_sove_warmth_hold
+  alias: "Styrbar Sove: varme-loop (L/R hold)"
+  mode: parallel
+  max: 4
+  trigger:
+    # Nyere quirk
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+        command: "arrow_left_hold"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+        command: "arrow_right_hold"
+    # Ældre quirk (denne fysiske remote): `hold` med retning i args[0]
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+        command: "hold"
+  action:
+    - variables:
+        warm_k: "{{ states('input_number.styrbar_sove_ct_warm_k') | int(2000) }}"
+        cool_k: "{{ states('input_number.styrbar_sove_ct_cool_k') | int(4500) }}"
+        step_k: "{{ states('input_number.styrbar_sove_ct_step_k') | int(150) }}"
+        direction: >-
+          {% set c = trigger.event.data.command %}
+          {% set a = trigger.event.data.args | default([]) %}
+          {% if c == 'arrow_left_hold' %}warmer
+          {% elif c == 'arrow_right_hold' %}cooler
+          {% elif (a[0] | default(-1)) in [3329, 257, 0, 2, 258] %}warmer
+          {% else %}cooler{% endif %}
+        sign: "{{ -1 if direction == 'warmer' else 1 }}"
+        span: "{{ [cool_k - warm_k, step_k] | max }}"
+        # Init cursor fra lysets faktiske kelvin (hvis tændt) ellers default.
+        start_k: >-
+          {% set lk = state_attr('light.spisestue_pendel','color_temp_kelvin') %}
+          {% if is_state('light.spisestue_pendel','on') and lk not in [none, 'unknown'] %}
+            {{ lk | int }}
+          {% else %}
+            {{ states('sensor.auto_color_temp_evening') | int(2700) }}
+          {% endif %}
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.styrbar_ct_kelvin_sove
+      data:
+        value: "{{ start_k }}"
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.styrbar_lr_holding_sovevaerelse
+    - repeat:
+        while:
+          - condition: template
+            value_template: "{{ is_state('input_boolean.styrbar_lr_holding_sovevaerelse','on') }}"
+        sequence:
+          - variables:
+              cur_k: "{{ states('input_number.styrbar_ct_kelvin_sove') | int(2700) }}"
+              next_k: "{{ warm_k + (((cur_k - warm_k) + sign * step_k) % span) }}"
+          - service: input_number.set_value
+            target:
+              entity_id: input_number.styrbar_ct_kelvin_sove
+            data:
+              value: "{{ next_k }}"
+          - service: light.turn_on
+            target:
+              entity_id: light.spisestue_pendel
+            data:
+              color_temp_kelvin: "{{ next_k }}"
+              transition: 0.2
+          - delay:
+              milliseconds: 150
+    # task 5: manuel varme = Manual mode → presence overskriver ikke.
+    - service: script.styrbar_stamp_press
+      data:
+        room: sovevaerelse
+        set_manual: true
+
+# --- Release = stop loop ------------------------------------------------------
+- id: styrbar_sove_warmth_stop
+  alias: "Styrbar Sove: stop varme-loop (L/R release)"
+  mode: single
+  trigger:
+    # Nyere quirk
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+        command: "arrow_left_release"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+        command: "arrow_right_release"
+    # Ældre quirk (denne fysiske remote): bart `release`
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+        command: "release"
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.styrbar_lr_holding_sovevaerelse

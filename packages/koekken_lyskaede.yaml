@@ -1,0 +1,2366 @@
+# =============================================================================
+# Køkken-lyskæde — egen farve/styrke/lux-styring (2026-07-02, user-spec)
+# =============================================================================
+# Lyskæden (5 m bølge gennem hele køkkenet, fuld RGB + CCT) er en VIGTIG
+# open-plan-lampe og styres nu med EGNE sliders, AFKOBLET fra de globale
+# faktorer:
+#   • Styrke  = koekken_lyskaede_brightness (rå %, IKKE global_brightness_factor)
+#               × sensor.elpris_dim_factor (el-sparefunktionen GÆLDER, user-spec)
+#   • Farve   = hue + mætning (fuld farve; mætning 0 = hvid)
+#   • Auto-tænd-lux = koekken_lyskaede_lux_threshold (rå lx, EGEN slider —
+#               uafhængig af køkken-loftets grænse + global lux; 0 = aldrig
+#               auto-tænd). Lyskæden er BEVIDST undtaget køkkenets hårde
+#               natlys-sol-gate (user-valg 2026-07-02) — kun lux tæller.
+#   • ENFORCER (user-valg: "altid egne indstillinger"): ENHVER tænding
+#     (gruppe/Styrbar/app/recovery) rettes til husets mål ~2 s efter — med
+#     mindre et KRAV ejer kæden. HVEM der må skrive kæden og i hvilken RANG står
+#     ét sted: ejerskab/koekken_lyskaede.yaml (→ sensor.koekken_lyskaede_ejer,
+#     kontrakt: docs/auto/ejerskab/koekken_lyskaede.md). Pre-commit afviser en
+#     ny skriver der ikke står i registret. Skriv aldrig en undtagelses-liste
+#     her igen — den drev fra koden (2026-10-04).
+#   • COOKING-MODE (user-spec 2026-07-02): mens switch.koekken_spots er tændt
+#     (= køkken-session) er mål-lyset IKKE hygge-farven men kraftigt medium-
+#     varmt arbejdslys (cooking_brightness rå % uden el-spare + cooking_kelvin).
+#     Spots-tænd i aften-vinduet (cooking_taend_start→slut, default 17-22)
+#     TÆNDER også lyskæden selv om dens lux-gate ikke er mødt; udenfor vinduet
+#     omfarves kun en allerede tændt kæde. Spots-sluk → tilbage til hygge.
+#     Enforceren er ENESTE farve-autoritet — reglen bor ét sted (dette apply).
+#   • MORGEN-VARME (runde 3a 2026-07-03, user-spec): cooking-lyset er VARMERE
+#     om morgenen ("øjnene er trætte") — indtil kl. 09:00 (hardcodet, slider på
+#     request) bruges cooking_morgen_kelvin (default 2700 K) i stedet for
+#     cooking_kelvin. Én autoritet: sensor.koekken_lyskaede_cooking_kelvin_
+#     effektiv (enforcerens 2 grene læser den — fejlklasse #2).
+#   • MORGENLYS (2026-09-25, user-spec): 05-09 (efter godnat, uden morgenrampe/
+#     film/Dark Mode) er morgenen SELV et arbejdslys — binary_sensor.koekken_
+#     morgenlys → cooking-styrke + cooking-kelvin på ALLE tænd-veje via
+#     script.koekken_lyskaede_maal (presence-segment 1 inkl.). Spots venter
+#     om morgenen til tænd-kurven er HELT færdig (sensor.koekken_lyskaede_
+#     kurve_slut), uanset input_number.koekken_spots_ramp_pct.
+#   • MANUEL-SLUK GRACE (runde 2 2026-07-03, user-valg): slukker brugeren SELV
+#     lyskæden (app/fysisk — context uden automation-parent) må presence ikke
+#     gen-tænde i koekken_manual_off_grace_minutes (default 5; 0 = fra).
+#     Rod-årsag 2026-07-02: manuelt app-sluk 21:49 → gennemgangs-presence
+#     (tur mod badet) gen-tændte 2,8 min senere. Cooking-tænd (spots-session/
+#     akkumulering = ægte madlavning) er BEVIDST undtaget, ligesom manuel/
+#     Styrbar/varsler/recovery. Gate bor i presence_koekken.yaml (gren 2).
+#   • DARK MODE (2026-08-05, user-spec) VINDER OVER ALT ANDET i mål-sensoren.
+#     Baggrund: dark mode sætter OGSÅ input_boolean.cinema_active, som er en hård
+#     off-condition på BEGGE køkken-tænd-veje (presence_light_koekken_on +
+#     presence_koekken_cooking_spots_on) — spots kan altså ikke starte mens filmen
+#     kører, uanset hvilke rum mørklægningen er scopet til. Målt 08-03: dark mode
+#     on 20:45:48, rum-scope 'sove' (senere 'sove boern') = sofastuen var slet
+#     ikke i scope, men lyskæden kørte alligevel på hygge-niveau 19:38-22:14 og
+#     ingen spots fyrede efter 20:39. Lyskæden ER derfor køkkenlyset under en
+#     film, og styres nu efter det: tomt køkken → koekken_lyskaede_dark_pct
+#     (default 1 %, "helt ned"), nogen i køkkenet → dark_session_pct (40 %),
+#     rampet med fade_ind_langsom så niveauskiftet ikke blænder biografen.
+#     Spots forbliver BEVIDST blokeret — de 40 % er substituttet, ikke et
+#     forsøg på at gøre cinema_active rum-opløst (blast-radius over hele
+#     open-plan).
+#     RUNDE 2 (2026-08-05, user-svar "ja køkken midt i film skal tænde 40 %"):
+#     var kæden SLUKKET da filmen startede, tændte intet den — mørklægningen
+#     tænder aldrig noget, og presence-tænd er cinema-blokeret. Enforceren har
+#     nu en egen tænd-gren (trigger-id `dark_on`) med samme grace- og lux-gates
+#     som presence. Niveauet holdes desuden i dark_hold_sekunder efter køkkenet
+#     melder tomt: radaren flipper 14 gange i timen 19-23 (3 døgns historik,
+#     median tomt-hul 33 s), og uden hold ville kæden pumpe 40 % ↔ 1 % gennem
+#     hele filmen. Holdet bor i mål-SENSOREN, ikke i triggeren, så tænd-grenen
+#     og tune-grenen ikke kan blive uenige.
+#
+# Skrive-steder (54 statiske + dynamiske): `python3 scripts/ejerskab.py steder light.koekken_lyskaede`.
+# =============================================================================
+
+input_number:
+  # 2026-09-23: KLAR-pulsens styrke (procentpoint over kædens aktuelle niveau).
+  koekken_klar_puls_pct:
+    name: "Køkken: KLAR-puls styrke (+%-point)"
+    icon: mdi:pulse
+    min: 2
+    max: 40
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  koekken_lyskaede_brightness:
+    name: "Køkken-lyskæde: lysstyrke"
+    icon: mdi:brightness-6
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  koekken_lyskaede_hue:
+    name: "Køkken-lyskæde: farvetone"
+    icon: mdi:palette
+    min: 0
+    max: 360
+    step: 1
+    unit_of_measurement: "°"
+    mode: slider
+
+  koekken_lyskaede_saturation:
+    name: "Køkken-lyskæde: mætning"
+    icon: mdi:invert-colors
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-10-17 (user-spec): FARVE-PREVIEW — skruer du på farvetone/mætning/
+  # lysstyrke, viser kæden værdierne i så mange sekunder og går så tilbage.
+  koekken_lyskaede_preview_sekunder:
+    name: "Køkken-lyskæde: farve-preview varighed"
+    icon: mdi:eye-outline
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-09-23: måler VINDUES-enden (sensor.spisestue_lux_reel), ikke længere
+  # køkkenets dagslys_lx. Tallet er derfor ~3,4× større end før ved samme
+  # virkelige lysniveau — se sluk-sliderens note nedenfor for målingen.
+  # PAR-REGEL: denne (tænd) og lux_haard_off (sluk) læser SAMME kanal og skal
+  # holdes mindst 56 lx fra hinanden, fordi kæden selv lyser +56 lx ind i den
+  # kanal. Rykker du én, tjek den anden — ellers slukker kæden sig selv i ring.
+  koekken_lyskaede_lux_threshold:
+    name: "Køkken-lyskæde: lux-grænse ved vinduet (auto-tænd)"
+    icon: mdi:theme-light-dark
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-08-05: hvor længe dagslyset skal ligge over tærsklen (+5 lx hysterese)
+  # UDEN at en anden gate spærrer, før lyskæden slukkes. Dæmper madlavnings-
+  # churn: under en session flipper spots on/off med bevægelsen, og uden
+  # forsinkelse ville hver spots-pause slukke arbejdslyset. 0 = sluk med det
+  # samme. NB: `for:` binder ved load → ændring kræver automation-reload.
+  koekken_lyskaede_lux_off_minutter:
+    name: "Køkken-lyskæde: forsinkelse før dagslys slukker den"
+    icon: mdi:timer-sand
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: box
+
+  # --- DARK MODE (2026-08-05, user-spec: "lyskæden skal helt ned i styrke og
+  # skal rampes op til et meget lavt niveau (40 % lysstyrke) ved køkken
+  # sessions"). Spots forbliver hård-blokeret af cinema_active — lyskæden på
+  # 40 % ER erstatningen for arbejdslyset mens filmen kører.
+  # 2026-08-26d (user-spec): lyskæden skal have en egen udløbsdato — "fade ud
+  # til sidst og dø", men MEGET langsommere end husets andre lys (de bruger
+  # open_plan_empty_for_20m = 20 min). Måles af
+  # binary_sensor.openplan_beboet_langsom, hvis delay_on på 3 s gør at et
+  # radar-spøgelse ikke kan nulstille nedtællingen.
+  koekken_lyskaede_doed_minutter:
+    name: "Køkken-lyskæde: dør efter (open-plan tomt)"
+    icon: mdi:timer-sand-complete
+    min: 20
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-09-03d (user: "køkkenlyskæden står for længe tændt på orange efter
+  # endt køkken session"). Målt 5 døgn / 77 spots-off-flanker: fra SIDSTE
+  # spots-off i en session til kæden faktisk slukkede var medianen 64 min, og
+  # i de aftener hvor nogen blev siddende i open-plan slukkede den slet ikke af
+  # sig selv (08-28: 396 min, 09-03: 200 min) — den ventede på dagslys, godnat
+  # eller `doed`, og `doed` kræver at HELE open-plan er tomt.
+  # Denne vej måler i stedet fra selve SESSIONENS slutning
+  # (input_boolean.koekken_session_active on→off, som selv kræver køkkenet tomt
+  # i koekken_session_timeout_minutes = 15). Samlet ventetid efter man forlader
+  # køkkenet = 15 + denne slider.
+  # SCOPE er bevidst snævert: den armeres KUN af en ægte madlavnings-session,
+  # så open-plan-ambient-spec'en fra 2026-07-22 ("kæden må ikke slukke bare
+  # fordi køkken-zonen er tom") står urørt for de aftener hvor kæden er tændt
+  # af presence/lux uden madlavning. 0 = fra.
+  koekken_lyskaede_efter_session_minutter:
+    name: "Køkken-lyskæde: sluk efter køkken-session"
+    icon: mdi:timer-off-outline
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Fade-tid på selve dødsfaldet. Husets normale tom-rum-sluk bruger
+  # sensor.fade_extended_effective (~60 s) — den her skal være mærkbart
+  # langsommere, så lyskæden sygner hen i stedet for at blinke ud.
+  koekken_lyskaede_doed_fade_sekunder:
+    name: "Køkken-lyskæde: fade-tid når den dør"
+    icon: mdi:weather-sunset-down
+    min: 10
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-08-26d (user-spec: "den skal også slukke ved meget høj lux som 65 fx").
+  # HÅRD grænse: ignorerer spots-vetoet (ved ægte dagslys er en dekorativ
+  # lyskæde usynlig, og spots leverer stadig arbejdslyset). Manual vetoer
+  # stadig. 0 = fra. Siden 2026-09-23 er den kædens ENESTE lux-sluk —
+  # 'bright'-grenen blev en dublet og er fjernet (se presence_koekken.yaml).
+  #
+  # 2026-09-23 KANAL + VÆRDI (user-bug "køkkenlyset har hængt i dag"):
+  # læser sensor.spisestue_lux_reel. Målt på 129 rene dagslys-par over 4 døgn
+  # (alt open-plan-lys slukket): spisestue-enden er median 3,37× lysere end
+  # køkkenets dagslys_lx (p25 2,76, p75 3,74). Den gamle 90 lx KØKKEN = ~303 lx
+  # spisestue, som september-solen ikke nåede → gaten kunne ikke fyre, og kæden
+  # brændte til brugeren slukkede selv. Ny værdi 110 lx spisestue er valgt af
+  # TO målte krav: (1) over tænd-tærsklen 40 + kædens eget bidrag 56 = 96, ellers
+  # ring; (2) under hang-dagens 124 lx kl. 08:35, ellers fixer den ikke bugget.
+  # Spisestuens døgnkurve (vest-vendt): nat 0-5 · 07:15-07:45 33-81 ·
+  # 08:15-08:35 83-124 · middag 100-340 · eftermiddagstop 463-932.
+  koekken_lyskaede_lux_haard_off:
+    name: "Køkken-lyskæde: hård lux-grænse ved vinduet (slukker altid)"
+    icon: mdi:white-balance-sunny
+    min: 0
+    max: 400
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-09-24 (user: "hvorfor mangler jeg køkken session lys nu?"): den hårde
+  # grænse ovenfor dræbte kæden MIDT i en madlavnings-session kl. 17:51 —
+  # vindues-enden målte 196 lx i aftensolen (435 lx kl. 17:57 med gardinet
+  # oppe), mens køkkenet selv målte ~40. Under en session (binary_sensor.
+  # koekken_madlavningslys) læser grenen derfor KØKKENETS egen kanal
+  # sensor.koekken_dagslys_lx mod DENNE grænse. 300 lx: køkkenet målte 12-167
+  # lx under sessionen 17:48-17:58 (167 med spisestue-gardinet helt oppe) og
+  # 300-433 lx i direkte eftermiddagssol 17:38-17:45 — kun det sidste er
+  # "ægte dagslys" hvor kæden er usynlig (26/8-specen). 0 = aldrig dagslys-
+  # sluk under madlavning.
+  koekken_lyskaede_lux_haard_off_session:
+    name: "Køkken-lyskæde: hård lux-grænse i KØKKENET under madlavning"
+    icon: mdi:chef-hat
+    min: 0
+    max: 1000
+    step: 10
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-08-27: lyskæden lyser ind i køkken-Apolloens LTR390. Målt i morges
+  # (chain on/off-par 2 min fra hinanden, samme dagslys): 92,3→17,0 · 97,1→19,9
+  # · 98,5→22,1 · 91,0→17,9 = +73..79 lx. Spots måltes til ~0 (07:18: spots on,
+  # kæde off, lux 22,1 mod dagslys ~22). Trækkes fra i sensor.koekken_dagslys_lx.
+  #
+  # VÆRDIEN GÆLDER FULD STYRKE (brightness 254) — begge målinger ovenfor er
+  # taget med kæden på 254. Fradraget skaleres med den aktuelle brightness,
+  # for bidraget er selvsagt ikke det samme når kæden kører 2 % natlys.
+  # Sæt HELLERE lidt for højt end for lavt: over-fradrag = lyset bliver hængende,
+  # under-fradrag = lyset slukker sig selv (fejlen vi lige rettede).
+  koekken_lyskaede_eget_lys_lx:
+    name: "Køkken-lyskæde: eget lysbidrag ved FULD styrke"
+    icon: mdi:lightbulb-on-outline
+    min: 0
+    max: 150
+    step: 1
+    unit_of_measurement: "lx"
+    mode: slider
+
+  koekken_lyskaede_dark_pct:
+    name: "Køkken-lyskæde: styrke under Dark Mode (tomt køkken)"
+    icon: mdi:theater
+    min: 1
+    max: 40
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  koekken_lyskaede_dark_session_pct:
+    name: "Køkken-lyskæde: styrke ved køkken-session under Dark Mode"
+    icon: mdi:silverware-fork-knife
+    min: 5
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Runde 2 (2026-08-05): hvor længe 40 %-niveauet HOLDER efter køkkenet melder
+  # tomt. Målt på 3 døgns radar-historik: køkken-occupancy flipper 14 gange i
+  # timen i film-vinduet 19-23, og 270 af 576 tomme-huller er under 30 s (median
+  # 33 s) — uden hold ville lyskæden rampe 40 % ↔ 1 % hvert par minutter midt i
+  # en film, altså præcis den uro mørklægningen findes for at undgå. Holdet er
+  # ENVEJS: opad reagerer vi straks (man går ud i et mørkt køkken), nedad venter
+  # vi. Minimum er 10 s og IKKE 0, fordi init-guardens fresh-min-sentinel så
+  # ville overskrive et bevidst "intet hold" ved hver restart (fejlklasse #5) —
+  # 10 s ér i praksis intet hold.
+  koekken_lyskaede_dark_hold_sekunder:
+    name: "Køkken-lyskæde: hold 40 %-niveauet efter køkkenet er tomt (Dark Mode)"
+    icon: mdi:timer-pause-outline
+    min: 10
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: box
+
+  # --- Cooking-mode (2026-07-02 user-spec): når køkken-spots er tændt af en
+  # køkken-session skal lyskæden IKKE stå i hyggefarve men give kraftigt,
+  # medium-varmt arbejdslys. Kun hvis lyskæden allerede er tændt (lux osv.) —
+  # cooking-mode TÆNDER den aldrig selv. Spots off → tilbage til hygge-sliders.
+  koekken_lyskaede_cooking_brightness:
+    name: "Køkken-lyskæde: cooking-styrke"
+    icon: mdi:chef-hat
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  koekken_lyskaede_cooking_kelvin:
+    name: "Køkken-lyskæde: cooking-varme"
+    icon: mdi:thermometer
+    min: 2200
+    max: 5000
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+
+  # 2026-09-28 (user-spec): "hold et hyggeligere aftenlys i varm hvid nuance,
+  # tonet meget ned (40%) på køkkenstrip mens vi spiser (spisestue apollo). det
+  # bliver meget abrupt med lyst og mørkt open plan rum ved siden af hinanden."
+  # Læses af binary_sensor.koekken_maaltidslys-grenene i mål-styrken + maleren.
+  koekken_lyskaede_maaltid_pct:
+    name: "Køkken-lyskæde: styrke mens vi spiser"
+    icon: mdi:silverware-fork-knife
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  koekken_lyskaede_maaltid_kelvin:
+    name: "Køkken-lyskæde: varme mens vi spiser"
+    icon: mdi:thermometer-low
+    min: 2200
+    max: 4000
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+
+  # Runde 3a (2026-07-03, user-spec): varmere cooking-lys om morgenen (trætte
+  # øjne). Gælder indtil kl. 09:00 (hardcodet — slider på request). Default
+  # 2700 K via init + API-set (fresh = min 2200).
+  koekken_lyskaede_cooking_morgen_kelvin:
+    name: "Køkken-lyskæde: cooking-varme morgen"
+    icon: mdi:weather-sunset-up
+    min: 2200
+    max: 5000
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+
+  # --- LANGSOM FADE-IND — KUN Dark Mode + godnat (2026-08-21, user-spec:
+  # "de 10 sek skal bare være 10sek uanset hvornår på døgnet (undtagen dark
+  # mode og godnat mode selvfølgelig)").
+  # 2026-08-08 → 08-21: gaten VAR husets nat-vinkel (natlys_sol_under_graense),
+  # så hver eneste aften-tænd blev ganget: 10 s + 20 s blev til 30 s + 60 s ved
+  # 3,0×, og køkkenet føltes som om det startede langsomt. Sliderne er
+  # RAMP-HASTIGHED, ikke ventetid før lyset kommer — de står literal hele
+  # døgnet nu. Kun de to modes hvor et blødt optræk ER pointen, skalerer.
+  # (Nat-vinklen styrer stadig cooking-STYRKEN, se cooking_moerk_brightness —
+  # det er niveau, ikke tempo, og er urørt.)
+  # Faktoren rammer BEGGE fade-segmenter (hurtig + langsom) og dermed også
+  # on_edge-grenens delay, så kurvens to dele ikke kan komme ud af sync.
+  koekken_lyskaede_moerk_fade_faktor:
+    name: "Køkken-lyskæde: fade-ind langsommere i Dark Mode/godnat (×)"
+    icon: mdi:weather-night
+    min: 1
+    max: 6
+    step: 0.1
+    unit_of_measurement: "×"
+    mode: slider
+
+  # Cooking-styrken når solen er i nat-vinkel. Erstatter cooking_brightness
+  # (pt. 100 %) — fuld arbejdsbelysning kl. 23 er det brugeren vil undgå.
+  koekken_lyskaede_cooking_moerk_brightness:
+    name: "Køkken-lyskæde: cooking-styrke når mørkt ude"
+    icon: mdi:weather-night-partly-cloudy
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # --- FØRSTE LYS (2026-09-13e, user-spec) --------------------------------
+  # "der er intet hurtigt lys når det er virkelig mørkt ... open plan står
+  # meget lang tid meget mørkt når man kommer ind i det fra putning."
+  # Lyskæden er open-plan-AMBIENT på SLUK-siden (2026-07-22: de hurtige
+  # køkken-tomt-flanker er neutraliseret for hygge-kæden) men KØKKEN-ONLY på
+  # TÆND-siden: presence-tænd kræver køkken-occupancy OG køkken-bevægelse på
+  # 250 cm-aksen. Kommer man ind i open-plan fra børneværelset, ser stue-/
+  # spisestue-Apolloen én først — og køkken-Apolloen kan slet ikke bevise
+  # hende. Målt 09-08 15:50-19:00: people_estimate 1-2, alt open-plan-lys
+  # slukket, dagslys 1-8 lx, og koekken_apollo_occupancy_filtered havde NUL
+  # state-skift i hele vinduet.
+  # 0 lx = feature slået fra. Bevidst LAVERE end lyskædens normale tænd-gate
+  # (lux_threshold): det her er "man kan ikke se hånden for sig", ikke
+  # "det er ved at blive mørkt".
+  koekken_lyskaede_foerste_lys_lux:
+    name: "Køkken-lyskæde: første lys under X lux (0=fra)"
+    icon: mdi:lightbulb-night
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # Niveauet for det FØRSTE glimt. Bevidst lavt: øjet er mørkeadapteret
+  # (husets "mørkere → svagere"-regel), og enforcerens on_edge-gren løfter
+  # alligevel kæden videre til target_brightness over langsom-fadet ~10 s
+  # senere. Det her er kun "der ER lys nu".
+  koekken_lyskaede_foerste_lys_pct:
+    name: "Køkken-lyskæde: første lys styrke"
+    icon: mdi:brightness-2
+    min: 1
+    max: 40
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # --- HJEMKOMSTLYS (2026-09-26, user-spec) ------------------------------
+  # "stadig for langsomt lys i køkkenet når jeg kommer hjem og der er mørkt.
+  # den rampe op til hvidt lys er for forsigtig ... der er vist en curved
+  # rampe for det allerede. den aktiverer bare for forsigtigt."
+  # Hvor længe efter hoveddøren (i mørke, kæden slukket) køkkenet tænder
+  # DIREKTE i arbejdslyset via tænd-kurven. 0 = fra. Se
+  # binary_sensor.koekken_hjemkomstlys.
+  koekken_hjemkomstlys_minutter:
+    name: "Køkken-lyskæde: hvidt lys efter hjemkomst i mørke (min, 0=fra)"
+    icon: mdi:home-import-outline
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-07-08 (user-spec): CURVED fade-IND i to segmenter + lineær fade-NED.
+  # Tænd: hurtigt op til 50 % af målet (stejl del, hurtig-slideren) → langsomt
+  # videre mod 100 % (langsom-slideren). Mekanik: tænd-kilden (presence/cooking)
+  # sender segment 1; enforceren (fyrer på enhver tænd-kant) venter hurtig-tiden
+  # og fuldfører segment 2 — én autoritet, ingen dubleret kurve-logik.
+  # 2026-09-03: gælder nu ALLE modes — AirBnB-undtagelsen er fjernet (user-spec:
+  # core-lys skal opføre sig ens i AirBnB og Normal).
+  koekken_lyskaede_fade_ind_hurtig:
+    name: "Køkken-lyskæde: fade-ind hurtig del (0→50%)"
+    icon: mdi:chart-bell-curve-cumulative
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  koekken_lyskaede_fade_ind_langsom:
+    name: "Køkken-lyskæde: fade-ind langsom del (50→100%)"
+    icon: mdi:chart-sankey
+    min: 1
+    max: 120
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Lineær fade NED til default-farven (hygge-sliders) når cooking-sessionen
+  # slutter (spots off → arbejdslys → hygge). Rammer KUN dén overgang — tom-rum-
+  # sluk bruger stadig fade_extended; varsler/dance restorer selv.
+  koekken_lyskaede_fade_ned:
+    name: "Køkken-lyskæde: fade-ned til default (cooking→hygge)"
+    icon: mdi:chart-line-variant
+    min: 1
+    max: 120
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Runde 2 (2026-07-03, user-valg): minutter efter et MANUELT sluk af lyskæden
+  # hvor presence ikke må gen-tænde den. 0 = grace fra. Default 5 via init +
+  # API-set. KUN lyskædens presence-tænd — cooking/spots, manuel, Styrbar,
+  # varsler og power-recovery er undtaget.
+  koekken_manual_off_grace_minutes:
+    name: "Køkken-lyskæde: manuel-sluk grace"
+    icon: mdi:hand-back-left-off
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+input_datetime:
+  # Runde 2 (2026-07-03): tidsstempel for seneste MANUELLE sluk af lyskæden
+  # (sat af koekken_lyskaede_manual_off_track). Konsumeres af presence-gren 2
+  # i presence_koekken.yaml (grace-gate). Aldrig sat = unknown → gate passerer.
+  koekken_lyskaede_manual_off_at:
+    name: "Køkken-lyskæde: manuelt slukket kl."
+    icon: mdi:clock-alert-outline
+    has_date: true
+    has_time: true
+
+  # Aften-vindue hvor en køkken-session (spots-tænd) også TÆNDER lyskæden
+  # (user-spec 2026-07-02: "efter kl 17.00 og før kl 22.00 i hvert fald").
+  # Udenfor vinduet tænder cooking-mode aldrig selv — den omfarver kun en
+  # allerede tændt kæde. HA's `condition: time` WRAPPER midnat når slut < start
+  # (user kører pt. 17:00→01:00 = aktivt 17-01) — det er IKKE "aldrig". slut ==
+  # start = altid aktivt. Der findes ingen "sluk vinduet"-tidsværdi; skal
+  # cooking-tænd deaktiveres helt, er det et separat behov (spørg user).
+  koekken_lyskaede_cooking_taend_start:
+    name: "Køkken-lyskæde: cooking-tænd fra"
+    icon: mdi:clock-start
+    has_date: false
+    has_time: true
+  koekken_lyskaede_cooking_taend_slut:
+    name: "Køkken-lyskæde: cooking-tænd til"
+    icon: mdi:clock-end
+    has_date: false
+    has_time: true
+
+input_text:
+  # 2026-10-04 (ejerskab, kravet `haand`): epoch-sekund for sidste gang
+  # BRUGEREN selv satte kædens udseende mens den lyste. Kravet er aktivt så
+  # længe stemplet er nyere end kædens tænd-periode (last_changed) — dvs. det
+  # slipper af sig selv ved sluk. Runtime: uden `initial:`, ude af snapshottet.
+  # En urørt input_text står på 'unknown' → `| int(0)` = 0 = aldrig sat.
+  koekken_lyskaede_haand_ts:
+    name: "Køkken-lyskæde: din hånd (stempel, internal)"
+    icon: mdi:hand-back-right
+    max: 20
+  # 2026-10-17: farve-preview kører. '' = nej; ellers kædens tilstand FØR
+  # previewet ('taendt'/'slukket') — det er det kravet `farve_preview` og
+  # slut-scriptet læser. Runtime: uden `initial:`; boot rydder den.
+  koekken_lyskaede_preview:
+    name: "Køkken-lyskæde: farve-preview (internal)"
+    icon: mdi:eye-outline
+    max: 10
+
+template:
+  # =========================================================================
+  # LANGSOM DØD (2026-08-26d, user-spec: "den skal jo fade ud til sidst og dø,
+  # det skal bare være meget langsommere end de andre lys")
+  # =========================================================================
+  # Lyskæden var open-plan-AMBIENT uden nogen egen udløbsdato: eneste
+  # ikke-dagslys-sluk var det DELTE binary_sensor.open_plan_empty_for_20m, og
+  # dét nulstilles af hvert eneste sub-sekund radar-spøgelse. Natten til 26/8
+  # hang den 3 t 41 min fordi spøgelserne blev ved med at genstarte den timer.
+  #
+  # Denne sensor er spøgelses-TÆT ved konstruktion:
+  #   delay_on  = 3 s  → et blip kan ikke sætte den on, og kan derfor heller
+  #                      ikke nulstille delay_off-nedtællingen nedenfor.
+  #   delay_off = slider (langsom) → når den falder, er lyskæden reelt udløbet.
+  # Det er forskellen på den DELTE 20-min-timer: dér er "on" øjeblikkelig, så
+  # et spøgelse er nok til at forlænge livet i det uendelige.
+  - binary_sensor:
+      - name: "Openplan beboet langsom"
+        unique_id: openplan_beboet_langsom
+        device_class: occupancy
+        icon: mdi:sofa-outline
+        availability: >-
+          {{ states('binary_sensor.koekken_apollo_occupancy_filtered')
+             not in ['unknown', 'unavailable'] }}
+        delay_on: 3
+        # NB: delay_off som dict (minutes:) accepterer IKKE et template — det
+        # afviser hele binary_sensor-blokken ved config-load. En bar template
+        # skal rendere til SEKUNDER.
+        delay_off: >-
+          {{ (states('input_number.koekken_lyskaede_doed_minutter') | int(90)) * 60 }}
+        state: >-
+          {{ is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on')
+             or is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'on')
+             or is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'on') }}
+
+      # 2026-08-29d (konsolidering, #2): "er der mørkt nok til at tænde
+      # lyskæden?" var kodet TO steder — presence_koekken_lyskaede_on og
+      # lyskædens egen dark_on-gren — og BEGGE læste sensor.koekken_lux_effektiv,
+      # altså den RÅ kanal inkl. vores eget lys. Det bryder husets permanente
+      # regel (enhver "er der lyst nok?"-gate læser koekken_dagslys_lx), og det
+      # gør gaten selvopfyldende under kædens 200 s fade-ud: effektiv står
+      # stadig ~78 lx for højt, så en gen-tænd blokeres af det lys der er ved at
+      # forsvinde. Ét anker nu — begge veje læser DENNE.
+      # 0 lx på slideren = auto-tænd slået fra (uændret betydning).
+      # 2026-09-25 (user-spec: "køkkenet om morgenen: det går for langsomt før
+      # det bløde hvide lys kommer"): ÉT anker for "morgen i køkkenet". Målt
+      # 20-25/9: presence tændte kæden ORANGE (hygge-farven), og det bløde
+      # hvide lys kom først når madlavnings-sessionen blev opdaget 25-80 s
+      # senere — 25/9 hang natturens 2 % orange endda fra 05:57 til 06:13,
+      # fordi intet omfarver en tændt kæde når godnat ryddes. Nu er morgenen
+      # selv et arbejdslys: mål-styrke = cooking-styrken, farve = cooking-
+      # kelvin (morgen-varmen), for ALLE tænd-veje via maleren.
+      # Vinduet 05-09 deler 09:00-grænsen med cooking_kelvin_effektiv. Godnat,
+      # morgenrampen (nattur → stået op, user-spec 08-30: bevidst orange),
+      # Dark Mode og filmmørke vinder alle — de har hver deres egen farve.
+      - name: "Koekken morgenlys"
+        unique_id: koekken_morgenlys
+        icon: mdi:weather-sunset-up
+        state: >-
+          {{ 5 <= now().hour < 9
+             and is_state('binary_sensor.godnat_common_active', 'off')
+             and not is_state('binary_sensor.morgenrampe_aktiv', 'on')
+             and not is_state('binary_sensor.dark_mode_stue', 'on')
+             and not is_state('binary_sensor.filmmoerke_koekken', 'on') }}
+
+      # 2026-09-26 (user-spec: "stadig for langsomt lys i køkkenet når jeg
+      # kommer hjem og der er mørkt"). Målt 18-25/9, fire hjemkomster i mørke
+      # med kæden slukket: presence tændte kæden ORANGE (hygge), og det hvide
+      # arbejdslys kom først når madlavnings-sessionen blev opdaget 23-135 s
+      # efter man gik ind i køkkenet (25/9: dør 19:07:37, kæde orange +208 s,
+      # hvid +231 s; 23/9: orange +34 s, hvid +169 s). Nu er hjemkomsten selv
+      # et arbejdslys, præcis som morgenen: hoveddøren åbnet for under
+      # koekken_hjemkomstlys_minutter siden, mørkt (kædens egen lux-kanal
+      # koekken_dagslys_lx under dens tænd-gate, eller solen under nat-vinklen),
+      # og kæden var SLUKKET da døren gik op (tændt efter døren = vores egen
+      # tænding) — kommer man hjem til et hus hvor nogen sidder i hygge-lys,
+      # omfarves deres kæde ikke. Samme undtagelser som morgenlyset.
+      - name: "Koekken hjemkomstlys"
+        unique_id: koekken_hjemkomstlys
+        icon: mdi:home-import-outline
+        state: >-
+          {% set n = states('input_number.koekken_hjemkomstlys_minutter') | float(0) %}
+          {% set d = state_attr('input_datetime.hoveddoer_last_open', 'timestamp') | float(0) %}
+          {% set l = states.light.koekken_lyskaede %}
+          {{ n > 0 and d > 0
+             and (now().timestamp() - d) < n * 60
+             and (l is none or l.state != 'on' or l.last_changed.timestamp() >= d - 5)
+             and ((states('sensor.koekken_dagslys_lx') | float(1000))
+                    < (states('input_number.koekken_lyskaede_lux_threshold') | float(0))
+                  or is_state('binary_sensor.natlys_sol_under_graense', 'on'))
+             and is_state('binary_sensor.godnat_common_active', 'off')
+             and not is_state('binary_sensor.dark_mode_stue', 'on')
+             and not is_state('binary_sensor.filmmoerke_koekken', 'on') }}
+
+      # 2026-09-26: ÉT anker for "kæden skal være arbejdslys uden en madlavnings-
+      # session" = morgenlys ∪ hjemkomstlys. Alle læsere (mål-styrke, maleren,
+      # enforcerens flanke + selvheling, spots-ventetiden) læser DENNE (#2).
+      - name: "Koekken arbejdslys"
+        unique_id: koekken_arbejdslys
+        icon: mdi:lightbulb-on-outline
+        state: >-
+          {{ is_state('binary_sensor.koekken_morgenlys', 'on')
+             or is_state('binary_sensor.koekken_hjemkomstlys', 'on') }}
+
+      # 2026-09-28 (user-spec): "mens vi spiser" = et ophold ved spisebordet.
+      # MÅLT 18-28/9, spisestue-Apolloen 17-22: ON-episoder median 13 s, p75
+      # 35 s (ture igennem), mens måltiderne er sammenhængende sessioner på
+      # 20-40 min (fx 20/9 18:43-19:05, 27/9 18:48-19:16) når huller < 2 min
+      # lægges sammen. Derfor to led (permanent faktum: delay_on + delay_off på
+      # SAMME udtryk bevogter kun åbningen):
+      #   BEVIS: 45 s sammenhængende ophold — over ~80 % af turene igennem.
+      #   HOLD:  3 min efter sidste bevis — dækker huller op til ~2 min + 45 s
+      #          genopbygning, mens nogen sidder stille og radaren taber dem.
+      - name: "Spisestue ophold bevis"
+        unique_id: spisestue_ophold_bevis
+        icon: mdi:table-chair
+        state: "{{ is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'on') }}"
+        delay_on:
+          seconds: 45
+
+      # Familie-modes: måltidslyset er en husrutine, og i AirBnB beholder
+      # gæsten husets neutrale hyggelys (🏡 #5). Prioritet i mål-styrken:
+      # Dark Mode > film > madlavning/arbejdslys > MÅLTID > hygge — rejser
+      # nogen sig og laver mad, får køkkenet arbejdslys, og cook_end afleverer
+      # tilbage til måltidslyset.
+      - name: "Koekken maaltidslys"
+        unique_id: koekken_maaltidslys
+        icon: mdi:silverware-fork-knife
+        state: >-
+          {{ is_state('binary_sensor.spisestue_ophold_bevis', 'on')
+             and states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+        delay_off:
+          seconds: 180
+
+      # 2026-09-03 (user-spec): ÉT anker for "køkkenet er i madlavnings-lys".
+      # Var tidligere switch.koekken_spots aflæst 5 steder i denne fil — og det
+      # gjorde rækkefølgen umulig at vende: kæden kunne først skifte til
+      # arbejdslys EFTER spots var tændt. Nu er ankeret spots ∪ ramp-flaget
+      # (input_boolean.koekken_cooking_ramp), som sættes før spots, så kæden
+      # ramper først og spots tændes til sidst.
+      # availability bevarer flap-immuniteten: går spots unavailable, bliver
+      # ankeret unavailable (ikke off), og enforcerens from:on/to:off-par
+      # (cook_end) fyrer derfor stadig ikke på et Zigbee-drop.
+      # Tids-loftet er et sikkerhedsnet, ikke en timing: normalt ryddes flaget
+      # af selve automationen ~1 s efter spots tændte.
+      - name: "Koekken madlavningslys"
+        unique_id: koekken_madlavningslys
+        icon: mdi:stove
+        availability: >-
+          {{ states('switch.koekken_spots') not in ['unknown', 'unavailable'] }}
+        state: >-
+          {% set r = states.input_boolean.koekken_cooking_ramp %}
+          {% set loft = (states('sensor.koekken_lyskaede_fade_hurtig_effektiv') | int(2))
+                        + (states('sensor.koekken_lyskaede_fade_langsom_effektiv') | int(15)) + 30 %}
+          {{ is_state('switch.koekken_spots', 'on')
+             or (r is not none and r.state == 'on'
+                 and (now() - r.last_changed).total_seconds() < loft) }}
+
+      # 2026-09-13e: ÉT anker for "open plan er kulsort OG der er intet lys
+      # tændt" — første-lys-vejens eneste eksistens-berettigelse.
+      # Lys-rosteret er `light.stue_all`, ikke en håndskrevet liste: gruppen ER
+      # open-plan (spisestue_loft + køkken-lyskæden + de fire stue-lamper), og
+      # en ny open-plan-pære havner automatisk i den (fejlklasse #16).
+      # spisestue_pendel er BEVIDST udenfor — den hedder spisestue, men hænger
+      # fysisk i soveværelset siden 2026-06-05, og stue_all afspejler det.
+      # Lux-kilden er dagslys_lx (ikke lux_effektiv): den er husets anker for
+      # "er der lyst nok UDEFRA". Her er den desuden fri for eget-lys-fradragets
+      # usikkerhed — gruppen er pr. definition slukket når leddet evalueres.
+      # `is_state(...,'off')` er stramt med vilje: er gruppen `unavailable`
+      # (hele open-plan af radionettet) ved vi ikke om noget står og lyser, og
+      # så skal vi ikke tænde mere (#9).
+      - name: "Koekken openplan kulsort"
+        unique_id: koekken_openplan_kulsort
+        icon: mdi:weather-night
+        availability: >-
+          {{ states('sensor.koekken_dagslys_lx') not in ['unknown', 'unavailable'] }}
+        state: >-
+          {% set t = states('input_number.koekken_lyskaede_foerste_lys_lux') | float(0) %}
+          {{ t > 0
+             and is_state('light.stue_all', 'off')
+             and (states('sensor.koekken_dagslys_lx') | float(1000)) < t }}
+
+      # 2026-09-23: kanalen er VINDUES-enden (sensor.spisestue_lux_reel), samme
+      # som kædens sluk-gate i automations/presence_koekken.yaml — de to SKAL
+      # læse samme kanal, ellers kæmper de (køkken 60 lx ≈ spisestue 202 lx
+      # målt, så et blandet par ville tænde og slukke i ring).
+      # Denne gate evalueres når kæden er SLUKKET, altså på en ren kanal; det er
+      # derfor den kan bruge et lavt tal (40) hvor sluk-gaten skal bruge 110.
+      - name: "Koekken lyskaede lux ok"
+        unique_id: koekken_lyskaede_lux_ok
+        icon: mdi:brightness-4
+        availability: >-
+          {{ states('sensor.spisestue_lux_reel') not in ['unknown', 'unavailable'] }}
+        # 2026-10-10 (user-spec: "sync så køkkenlyskæden ikke tænder uden spots
+        # pga en anden tærskel"): kæden må kun tænde for mørke når SPOTS' lux-
+        # gate også siger mørkt — samme kanal og samme tal som
+        # presence_koekken_cooking_spots_on (koekken_dagslys_lx mod
+        # koekken_spots_lux_gate_effektiv, inkl. aktivitets-bonus). Kun et
+        # ekstra krav på TÆND (gaten evalueres med kæden slukket = ren kanal);
+        # sluk-vejene er urørt. Er køkken-kanalen væk, gælder vinduet alene (#9:
+        # en død Apollo må ikke gøre køkkenet permanent "lyst").
+        state: >-
+          {% set t = states('input_number.koekken_lyskaede_lux_threshold') | float(0) %}
+          {% set dl = states('sensor.koekken_dagslys_lx') %}
+          {% set sg = states('sensor.koekken_spots_lux_gate_effektiv') %}
+          {% set spots_moerkt = not (dl | is_number and sg | is_number)
+                                or (dl | float < sg | float) %}
+          {{ t > 0 and (states('sensor.spisestue_lux_reel') | float(1000)) < t
+             and spots_moerkt }}
+        attributes:
+          maaler_mod: sensor.spisestue_lux_reel
+          vindue_lx: "{{ states('sensor.spisestue_lux_reel') }}"
+          spots_gate: "{{ states('sensor.koekken_spots_lux_gate_effektiv') }}"
+
+      # =====================================================================
+      # LÅNE-LÅSEN bor nu i ejerskabs-registret (2026-10-04, user-spec)
+      # =====================================================================
+      # binary_sensor.koekken_lyskaede_laant og sensor.koekken_lyskaede_ejer
+      # GENERERES fra ejerskab/koekken_lyskaede.yaml (packages/ejerskab_koekken_
+      # lyskaede.yaml). Registret er en RANGORDNET liste: højeste aktive krav ejer
+      # kæden, og hvert krav siger selv om enforceren skal male husets mål når det
+      # slipper. Ny låner = nyt krav i registret + `python3 scripts/ejerskab.py gen`
+      # — pre-commit afviser en skriver der ikke står dér. Historikken bag de
+      # enkelte lånere (dance rum-scopet, Sofa Zen, signal-kanalen uden for listen):
+      # `git log -S "LÅNE-LÅSEN" -- packages/koekken_lyskaede.yaml`.
+      #
+      # MANUEL SCENE (2026-10-04, user-bug: "køkkenlyskæden går væk fra scene:
+      # Sofa Zen efter få sekunder"): et scene-tryk (script.scene_toggle) tænder
+      # kæden i scenens look → enforcerens on_edge-gren maler den om til husets
+      # mål ~5 s efter. 3/10 20:35-20:46 trykkede user Zen fem gange i træk.
+      # Låner mens den valgte scene ejer kæden: kædens nuværende tænd-periode
+      # startede FØR eller SAMMEN MED scene-valget (≤ 30 s efter). Det er
+      # bevidst ikke bare `active_scene != none` — den er klistret (stod på
+      # 'zen' hele natten 3→4/10 efter at user slukkede kæden 21:39), så en
+      # bar test ville fratage enforceren kæden i dagevis. Tænder kæden senere
+      # (presence, Styrbar), er perioden yngre end valget → ingen låner.
+      # Slipper når kæden slukker, scenen skiftes til 'none', eller nogen laver
+      # mad (samme princip som Sofa Zen-auto: køkkenet i brug = normal auto).
+      # sofa_laesning og madlavning rører ikke kæden (script_pkg/scenes.yaml).
+      # Ingen now() — kun to faste tidsstempler → ingen minut-rækker (#24).
+      - name: "Koekken lyskaede scene laan"
+        unique_id: koekken_lyskaede_scene_laan
+        icon: mdi:palette
+        state: >-
+          {% set sc = states('input_select.active_scene') %}
+          {% set ch = states.light.koekken_lyskaede %}
+          {% set a = states.input_select.active_scene %}
+          {{ sc not in ['none', 'unknown', 'unavailable', '', 'sofa_laesning', 'madlavning']
+             and ch is not none and a is not none and ch.state == 'on'
+             and (ch.last_changed - a.last_changed).total_seconds() <= 30
+             and not is_state('binary_sensor.koekken_madlavningslys', 'on') }}
+
+
+  - sensor:
+      # 2026-07-08 (#9, user-spec): køkken-lys (spots + lyskæde) gates på KØKKEN-
+      # Apolloens lux, IKKE open_plan_lux. Rod: spisestue-Apolloen (nær vindue)
+      # trækker open_plan_lux kunstigt højt (målt 175 lx mens køkken-Apolloen
+      # læste 29 lx) → køkken-lyset tændte aldrig selvom køkkenet var mørkt.
+      # Denne effektiv-sensor = køkken-Apollo når tilgængelig, ellers open_plan_lux
+      # (så gates ikke kører på float-default hvis køkken-Apolloen falder ud).
+      - name: "Koekken lux effektiv"
+        unique_id: koekken_lux_effektiv
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state_class: measurement
+        state: >-
+          {# 2026-07-30: kompenseret kilde — køkken-Apolloens varsel-LED blindede
+             sin egen lux-sensor (packages/apollo_led_lux_kompensation.yaml). #}
+          {% set k = states('sensor.koekken_lux_reel') %}
+          {% if k not in ['unknown', 'unavailable', 'none', ''] %}
+            {{ k | float(0) | round(1) }}
+          {% else %}
+            {{ states('sensor.open_plan_lux') | float(50) }}
+          {% endif %}
+
+      # DAGSLYS alene — køkkenets eget lys trukket fra (2026-08-27).
+      # koekken_lux_effektiv er kompenseret for Apolloens egen varsel-LED, men
+      # IKKE for rummets lamper: lyskæden lyser direkte ind i LTR390'en og
+      # løfter målingen ~76 lx. Enhver gate der spørger "er der lyst NOK
+      # udefra?" mens vores eget lys er tændt, måler derfor sig selv.
+      # Signatur (målt 27/8 06:43-07:17): lyskæde on → lux 91-99 inden for 60 s
+      # → hård lux-sluk (65) fyrer 2 min senere → lyskæde off → lux 13-26 →
+      # bevægelse tænder igen. 4 cyklusser à 144-179 s mens user lavede kaffe.
+      # Fradraget er en UNDERVURDERING af dagslyset (bidraget er sat lidt for
+      # højt med vilje), så sensoren fejler mod "bliv tændt" — aldrig mod at
+      # rive lyset væk fra nogen der står i rummet.
+      # NB: den falder IKKE bagud når dagslyset stiger — modsat et "hold sidste
+      # rene måling"-design, der ville fryse hele formiddagen og genskabe
+      # 2026-08-05-fejlen (lyskæden brændte 06:40→08:55).
+      - name: "Koekken dagslys lx"
+        unique_id: koekken_dagslys_lx
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state_class: measurement
+        availability: >-
+          {{ states('sensor.koekken_lux_effektiv')
+             not in ['unknown', 'unavailable', 'none', ''] }}
+        # Fradraget SKALERER med kædens aktuelle styrke (user 2026-08-27: "eget
+        # lys-fradraget skal vel komme an på hvor bright den er i køkkenet?").
+        # Sliderens tal gælder brightness 254; begge morgen-målinger er taget
+        # der. Måling af den anden ende: under natturen 26/8 22:25→22:40 kørte
+        # kæden 2 % (bri ≈ 5) og lux stod FLADT på 0,0 i 15 min — altså et
+        # bidrag under sensorens opløsning. Lineært ville 78 × 5/254 = 1,5 lx,
+        # så bidraget falder HURTIGERE end styrken (γ > 1,7).
+        # Vi bliver alligevel lineære: den ene lav-måling er censureret ("< 0,1"),
+        # ikke et punkt man kan fitte en gamma på, og lineær over-vurderer
+        # bidraget ved lav styrke = over-fradrag = lyset bliver hængende. Det er
+        # den fejlretning husets regel foreskriver. Måler du en dag ved ~50 %,
+        # så indsæt en rigtig kurve her.
+        # Brightness mangler kun når lampen er OFF (anden gren), men | float(254)
+        # er alligevel det sikre default: fuldt fradrag.
+        #
+        # SLUK-FADEN (2026-08-27): kæden slukkes med transition (op til
+        # doed_fade_sekunder = 300 s), men HA sætter state til 'off' i SAMME
+        # sekund kaldet sendes — lampen lyser altså videre i op mod 5 minutter
+        # mens entity'en siger off. Uden denne gren holder fradraget op med det
+        # samme, og dagslyset over-læses med op til 78 lx præcis i det vindue
+        # hvor tænd-gaten (threshold 45) skal beslutte om der er mørkt nok.
+        # Signatur: lyset fader ud, user står stadig i køkkenet, og det kan ikke
+        # tænde igen fordi huset tror solen er stået op.
+        # Kurven er MÅLT 27/8 07:57:55→08:02:29 (fem samples): resterende
+        # bidrag 78/50/28/12/4 % ved t = 34/94/154/214/274 s. Det er ikke
+        # lineært — (1 - t/300)^2 rammer 89/47/24/8/1 %, altså inden for få
+        # point hele vejen (ESPHome/pæren fader perceptuelt, ikke i lumen).
+        # `off_with_transition` skelner en fade fra et instant-sluk; er den
+        # falsk, er lampen mørk med det samme og der er intet at trække fra.
+        # FARVE-ANDELEN (2026-08-28): fradraget skalerede kun med brightness, og
+        # det var 78× for stort hele hygge-dagen. Strippen er RGBW: i cooking
+        # (color_temp ~3050 K) bærer den HVIDE kanal alt lyset, i hygge (xy,
+        # hue 28 / sat 99) lyser kun de røde LED'er, som LTR390'en knap ser.
+        # Målt 28/8, alle på bri 254: hvid = +78 lx (07:29:31 14,3 → 86,8 og
+        # 27/8 08:10:05 29,0 → 107,0), orange = +1 lx (kæden slukkede 11:20:41
+        # og lux rørte sig IKKE: 25,8 → 25,4 → 26,1). Fælden var at hvert
+        # spots-skifte OGSÅ skifter kædens farve (spots on = cooking = hvid),
+        # så de 72-lx trin lignede spots og blev tilskrevet dem — derfor stod
+        # 'spots ≈ 0' side om side med et fradrag der aldrig gjaldt.
+        # (1 - sat/100) er den hvide kanals andel: sat 99 → 0,8 lx, målt ~1.
+        # Konsekvensen af fejlen var IKKE et selv-sluk men det modsatte: med
+        # 78 lx trukket fra en rå værdi på 28 stod sensoren klampet på 0,0 hele
+        # dagen, så 'bright' (50) og 'lux_haard' (65) krævede 128/143 lx ægte
+        # dagslys for at fyre. Begge dagslys-sluk var altså blinde mens kæden lyste.
+        # Ukendt color_mode → 1,0 = fuldt fradrag (uændret, konservativ). Fade-
+        # grenen nedenfor læser farven fra sidste tændte render (hvid_ved_sluk,
+        # 2026-09-29) — 1,0 der var en fantom-hvid der udløste en tænd/sluk-løkke.
+        # LOFT (2026-09-04f): fradraget kender KUN lyskæden — men køkken-Apolloen
+        # ser hele open-plannet. Målt 4/9 19:25: `light.stue_all` slukket trak
+        # køkkenets "dagslys" 65,3 → 34,6 (= 31 lx fra stuen alene), og med
+        # stue_all + spisestue_loft tændt stod sensoren på 213 lx kl. 19:30 mens
+        # entréen læste 1,0. Time-medianer 4/9 er inverterede: midt på dagen
+        # (lys slukket) 11-31 lx, om aftenen (lys tændt) 212,8 — sensoren måler
+        # husets eget lys, ikke dagslys. Konsekvens: kædens lux-gate (60) og
+        # spots-gaten (70) var begge lukkede hele aftenen, så madlavnings-
+        # sessionen kunne ikke starte.
+        # At bygge fradraget ud til også at kende stue + spisestue er præcis det
+        # multi-frihedsgrads-fradrag CLAUDE.md advarer imod. I stedet loftes
+        # resultatet af `sensor.open_plan_lux`, som pr. konstruktion kun bygges
+        # af kanaler vores eget lys ikke kan lyse ind i (rene samples + entré).
+        # `min` kan kun gøre køkkenet MØRKERE = fejle mod "bliv tændt", hvilket
+        # er den fejlretning denne sensor allerede er designet til (se ovenfor).
+        # Ingen cyklus: open_plan_lux læser *_dagslys_sample, aldrig denne.
+        state: >-
+          {% set raa = states('sensor.koekken_lux_effektiv') | float(0) %}
+          {% set fuld = states('input_number.koekken_lyskaede_eget_lys_lx') | float(0) %}
+          {% set cm = state_attr('light.koekken_lyskaede', 'color_mode') %}
+          {% set hs = state_attr('light.koekken_lyskaede', 'hs_color') %}
+          {% set sat = (hs[1] | float(0)) if (hs is not none and hs | count > 1) else 0 %}
+          {% set hvid = (1 - sat / 100) if cm in ['xy', 'hs', 'rgb', 'rgbw', 'rgbww'] else 1.0 %}
+          {% set ns = namespace(d = raa, klampet = false) %}
+          {% if is_state('light.koekken_lyskaede', 'on') %}
+            {% set bri = [state_attr('light.koekken_lyskaede', 'brightness') | float(254), 254] | min %}
+            {% set ns.d = [raa - (fuld * bri / 254 * hvid), 0] | max %}
+            {% set ns.klampet = (fuld * bri / 254 * hvid) >= raa %}
+          {# 2026-10-10: en HA-restart nulstiller kædens last_changed, og
+             off_with_transition står stadig True → fantom-fade (målt 11:55:28:
+             82,2 → 11,9 lx i 24 s, under spots' gate 37,5). Fade kun hvis DENNE
+             sensor selv så kæden tændt før flanken (sidst_taendt overlever ikke
+             en restart → tom = intet fradrag). #}
+          {% elif is_state('light.koekken_lyskaede', 'off')
+                  and state_attr('light.koekken_lyskaede', 'off_with_transition')
+                  and this is defined
+                  and (this.attributes.get('sidst_taendt') | float(0)) > 0
+                  and (this.attributes.get('sidst_taendt') | float(0))
+                      < as_timestamp(states.light.koekken_lyskaede.last_changed, 0) %}
+            {# 2026-09-29 (bug-hunt, målt 15/9 16:09-16:21 + 22/9 10:59): en
+               slukket lampe har ingen farve-attributter, så `hvid` ovenfor blev
+               ALTID 1,0 her — en ORANGE kæde (reelt ~1 lx) blev trukket fra som
+               hvid (~78 lx). I sluk-sekundet faldt sensoren 83,9 → 9,0, lux_ok
+               åbnede, presence tændte igen, og 'bright' slukkede igen: fire
+               cyklusser på 12 min. Nu: den hvide andel fra SIDSTE tændte render
+               (attributten hvid_ved_sluk). Og fade-længden var altid
+               max(doed 300, extended 60) = 300 s, også for de 60 s-sluk der er
+               de fleste → fantom-fradrag 4 min for længe. Nu: den transition
+               sluk-kaldet faktisk sendte (sensor.koekken_lyskaede_sluk_fade),
+               når stemplet hører til DENNE flanke (< 5 s); ellers som før. #}
+            {% set hvid = (this.attributes.get('hvid_ved_sluk') | float(1.0))
+                          if this is defined else 1.0 %}
+            {% set lc = as_timestamp(states.light.koekken_lyskaede.last_changed, 0) %}
+            {% set sf = states.sensor.koekken_lyskaede_sluk_fade %}
+            {% set fersk = sf is not none and sf.state | is_number
+                           and (sf.state | float(-1)) >= 0
+                           and ((as_timestamp(sf.attributes.get('kaldt'), 0) - lc) | abs) < 5 %}
+            {% set fade = (sf.state | float(0)) if fersk
+                          else [states('input_number.koekken_lyskaede_doed_fade_sekunder') | float(300),
+                                states('sensor.fade_extended_effective') | float(62)] | max %}
+            {% set t = now().timestamp() - lc %}
+            {% set bri = [state_attr('light.koekken_lyskaede', 'off_brightness') | float(254), 254] | min %}
+            {% if fade > 0 and t >= 0 and t < fade %}
+              {% set rest = (1 - (t / fade)) ** 2 %}
+              {% set ns.d = [raa - (fuld * bri / 254 * rest * hvid), 0] | max %}
+              {% set ns.klampet = (fuld * bri / 254 * rest * hvid) >= raa %}
+            {% endif %}
+          {% endif %}
+          {# KLAMPET FRADRAG (2026-09-20, user-bug "køkkenlyset har hængt i dag").
+             Et fradrag kan ikke være større end hele målingen — lampen kan ikke
+             bidrage med mere lys end sensoren ser. Sker det alligevel, er
+             modellen beviseligt for stor i de aktuelle forhold, og de 0,0 lx
+             `max`-clampen efterlader er ikke en måling men en PÅSTAND om
+             kulsort. Målt i dag 08:26: raa 76,4 mod et fradrag på 78,0 (hvid
+             kæde, bri 254, color_temp ⇒ hvid-andel 1,0) ⇒ sensoren stod på 0,0
+             mens solen var 12° over horisonten. Og fordi ENHVER "er der lyst
+             nok?"-gate læser denne sensor (kulsort, lux_ok, lux_haard_off),
+             var hele open-plannets dagslys-sluk blindt: kæden brændte fra
+             07:00 til over 08:30. `min`-loftet nedenfor kan kun gøre tallet
+             MØRKERE og kunne derfor ikke redde den.
+             Når fradraget klamper, dropper vi altså modellen og bruger husets
+             egen ukontaminerede open-plan-estimat i stedet. Det er strengt
+             mindre påstand end 0,0, og retningen er den sikre vej ud af
+             dødbåndet (fejlklasse 18b). NB: det gør os IKKE lyse-optimistiske
+             — `op` er selv loftet af rene samples + entré. #}
+          {# 2026-10-09 (user: "det er regn mørkt"): om EFTERMIDDAGEN er køkkenets
+             EGET rene sample fra i dag det bedre loft — open_plan_lux er snittet
+             med spisestue-enden ved vinduet, ~4× køkkenets skala. Målt 15:52:49:
+             kæden tændte, fradraget klampede, og sensoren sprang 11,5 → 34,0
+             (= open_plan_lux, samples 12,8 + 55,2) → open_plan_mork_indedag
+             (gate 14,8 på KØKKEN-skala) gik off 15:53:49 i regnmørke og blev
+             der til 16:40. Efter middag falder dagslyset, så samplet er et
+             loft — og open_plan_lux tæller stadig med når den er LAVERE (aften-
+             fremskrivningen under 11°). Morgenen (solen stiger) er uændret. #}
+          {% set ks = 'sensor.koekken_dagslys_sample' %}
+          {% set eget = states(ks) | float(-1)
+             if (state_attr('sun.sun', 'rising') == false
+                 and states(ks) | is_number
+                 and state_attr(ks, 'maalt_ts') | float(0) >= today_at('00:00').timestamp())
+             else -1 %}
+          {% set op = states('sensor.open_plan_lux') %}
+          {% if ns.klampet and eget >= 0 %}
+            {{ ([eget, raa] + ([op | float] if op | is_number else [])) | min | round(1) }}
+          {% elif op | is_number %}
+            {% if ns.klampet %}
+              {{ [op | float, raa] | min | round(1) }}
+            {% else %}
+              {{ [ns.d, op | float] | min | round(1) }}
+            {% endif %}
+          {% else %}
+            {{ ns.d | round(1) }}
+          {% endif %}
+        attributes:
+          # Kædens hvide andel mens den LYSER, båret gennem sluk-faden (den
+          # slukkede lampe har ingen farve). Samme formel som `hvid` i state.
+          # Kun en række når farven skifter; ingen now() (#24). Efter restart:
+          # tom → 1,0 = fuldt fradrag som før.
+          # Kædens seneste TÆND-flanke, set af denne sensor (ingen now(), #24).
+          # Tom efter restart → fade-grenen springes over (fantom-fade 10-10).
+          sidst_taendt: >-
+            {% if is_state('light.koekken_lyskaede', 'on') %}
+              {{ as_timestamp(states.light.koekken_lyskaede.last_changed, 0) }}
+            {% else %}
+              {{ (this.attributes.get('sidst_taendt') | float(0)) if this is defined else 0 }}
+            {% endif %}
+          hvid_ved_sluk: >-
+            {% if is_state('light.koekken_lyskaede', 'on') %}
+              {% set cm = state_attr('light.koekken_lyskaede', 'color_mode') %}
+              {% set hs = state_attr('light.koekken_lyskaede', 'hs_color') %}
+              {% set sat = (hs[1] | float(0)) if (hs is not none and hs | count > 1) else 0 %}
+              {{ ((1 - sat / 100) if cm in ['xy', 'hs', 'rgb', 'rgbw', 'rgbww'] else 1.0) | round(2) }}
+            {% else %}
+              {{ (this.attributes.get('hvid_ved_sluk') | float(1.0)) if this is defined else 1.0 }}
+            {% endif %}
+
+      # Den transition det SENESTE light.turn_off på kæden faktisk sendte
+      # (2026-09-29). Læses af koekken_dagslys_lx' fade-gren, der før gættede
+      # max(doed, extended) = 300 s for hvert sluk. Fanger alle direkte kald
+      # (presence 60/300 s, Styrbar 1 s, godnat …); et gruppe-sluk rammer ikke
+      # og efterlader et gammelt `kaldt` → forbrugeren falder tilbage på den
+      # gamle regel. -1 = kaldet sendte ingen transition (ukendt → gammel regel).
+      # Trigger-baseret: renderes kun ved sluk-kald, ingen minut-rækker (#24).
+  - trigger:
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: light
+          service: turn_off
+    sensor:
+      - name: "Koekken lyskaede sluk fade"
+        unique_id: koekken_lyskaede_sluk_fade
+        unit_of_measurement: "s"
+        icon: mdi:transition
+        state: >-
+          {% set sd = trigger.event.data.get('service_data') or {} %}
+          {% set e = sd.get('entity_id', []) %}
+          {% set e = [e] if e is string else e %}
+          {% if 'light.koekken_lyskaede' in e %}
+            {{ sd.get('transition', -1) | float(-1) }}
+          {% else %}
+            {{ this.state if this is defined else -1 }}
+          {% endif %}
+        attributes:
+          kaldt: >-
+            {% set sd = trigger.event.data.get('service_data') or {} %}
+            {% set e = sd.get('entity_id', []) %}
+            {% set e = [e] if e is string else e %}
+            {% if 'light.koekken_lyskaede' in e %}
+              {{ now().isoformat() }}
+            {% else %}
+              {{ this.attributes.get('kaldt') if this is defined else none }}
+            {% endif %}
+
+  - sensor:
+      # Én autoritet for lyskædens mål-styrke (bruges af BÅDE presence-on og
+      # enforceren — undgår at reglen kodes 2 steder og divergerer).
+      # elpris_dim_factor: 1.0 (billig/neutral) → 0.40 (dyreste time, slider 100).
+      # Cooking-session (spots on) = cooking-styrken RÅ, BEVIDST uden el-spare:
+      # arbejdslys til madlavning er kortvarigt og skal ikke dæmpes af spotpris.
+      - name: "Koekken lyskaede target brightness"
+        unique_id: koekken_lyskaede_target_brightness
+        unit_of_measurement: "%"
+        icon: mdi:brightness-percent
+        state: >-
+          {# 2026-08-05 (user-spec): DARK MODE vinder over alt andet. Spots er
+             hård-blokeret af cinema_active mens filmen kører, så lyskæden ER
+             køkkenlyset: helt nede når køkkenet er tomt, rampet op til et
+             meget lavt niveau når nogen faktisk står derude. #}
+          {% if is_state('binary_sensor.dark_mode_stue', 'on') %}
+            {# Runde 2: HOLD-vinduet bor her og ikke i triggeren, så alle veje
+               (tænd-grenen, tune-grenen, presence-on) ser SAMME svar på "er der
+               nogen i køkkenet lige nu" (fejlklasse #2). now() → re-render hvert
+               minut = holdet udløber af sig selv og ændrer sensoren, som
+               enforceren lytter på. #}
+            {% set o = states.binary_sensor.koekken_apollo_occupancy_filtered %}
+            {% set h = states('input_number.koekken_lyskaede_dark_hold_sekunder') | int(120) %}
+            {% set holdt = o is not none and o.state == 'off'
+                           and (now() - o.last_changed).total_seconds() < h %}
+            {% if is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'on') or holdt %}
+              {{ states('input_number.koekken_lyskaede_dark_session_pct') | int(40) }}
+            {% else %}
+              {{ states('input_number.koekken_lyskaede_dark_pct') | int(1) }}
+            {% endif %}
+          {# 2026-08-27b (user-valg): FILM vinder over cooking. Køkkenet er
+             open-plan med lærredet, så lyskæden er glare i billedet — også
+             mens der laves mad. Clampet (ikke sat) til predark-niveauet, så
+             en allerede lavere styrke ikke bliver LØFTET af filmen; samme
+             regel som pre-dark selv følger. Dark Mode ligger bevidst over
+             dette: det er en manuel, stærkere hensigt. #}
+          {% elif is_state('binary_sensor.filmmoerke_koekken', 'on') %}
+            {% set bri = states('input_number.koekken_lyskaede_brightness') | float(100) %}
+            {% set pf = states('sensor.elpris_dim_factor') | float(1.0) %}
+            {% set normal = [[(bri * pf) | round(0) | int, 100] | min, 1] | max %}
+            {{ [[normal, states('input_number.predark_dim_pct') | int(10)] | min, 1] | max }}
+          {% elif is_state('binary_sensor.koekken_madlavningslys', 'on')
+                  or is_state('binary_sensor.koekken_arbejdslys', 'on') %}
+            {# 2026-08-08: mørkt udenfor → egen, lavere cooking-styrke.
+               2026-09-25: morgenen er selv et arbejdslys (koekken_morgenlys). #}
+            {% if is_state('binary_sensor.natlys_sol_under_graense', 'on') %}
+              {{ states('input_number.koekken_lyskaede_cooking_moerk_brightness') | int(70) }}
+            {% else %}
+              {{ states('input_number.koekken_lyskaede_cooking_brightness') | int(100) }}
+            {% endif %}
+          {# 2026-09-28 (user-spec): måltidslys — rå %, uden el-spare (det er
+             et bevidst lavt niveau, ikke et forbrug der skal skæres i). #}
+          {% elif is_state('binary_sensor.koekken_maaltidslys', 'on') %}
+            {{ [[states('input_number.koekken_lyskaede_maaltid_pct') | int(40), 100] | min, 1] | max }}
+          {% else %}
+            {% set bri = states('input_number.koekken_lyskaede_brightness') | float(100) %}
+            {% set pf = states('sensor.elpris_dim_factor') | float(1.0) %}
+            {{ [[(bri * pf) | round(0) | int, 100] | min, 1] | max }}
+          {% endif %}
+
+      # --- Effektive fade-ind-tider (2026-08-08, gate omlagt 08-21) --------
+      # ÉN autoritet for "hvor langsomt ramper lyskæden op" — Dark Mode og
+      # godnat ganger begge segmenter med faktoren. ALLE kaldsteder (presence-tænd,
+      # enforcerens segment 2 + dens delay, dark-mode-tænd, tune-grenen) læser
+      # disse i stedet for de rå sliders, så delay og transition ikke kan
+      # divergere (fejlklasse #2). Clampet til [1, 6500] s: Zigbee-transition er
+      # uint16 i 0,1 s, så 120 s × 6 = 720 s er sikkert, men grænsen står her
+      # for den dag sliderens max hæves.
+      # 2026-10-08 (user-spec "dobbelt så langsomt" på mørke morgener): mens
+      # entré-velkomsten venter (packages/openplan_entre_velkomst.yaml) ganges
+      # BEGGE segmenter også med openplan_moerk_morgen_fade_faktor. Kun dér —
+      # ikke køkkenets egen morgen-tænding, hvor spottene venter på hele kurven.
+      - name: "Koekken lyskaede fade hurtig effektiv"
+        unique_id: koekken_lyskaede_fade_hurtig_effektiv
+        unit_of_measurement: "s"
+        icon: mdi:transition
+        state: >-
+          {% set f = states('input_number.koekken_lyskaede_moerk_fade_faktor') | float(2.0) %}
+          {% set m = f if (is_state('binary_sensor.dark_mode_stue', 'on')
+                           or is_state('binary_sensor.godnat_common_active', 'on')) else 1.0 %}
+          {% set mm = (states('input_number.openplan_moerk_morgen_fade_faktor') | float(2.0))
+                      if is_state('input_boolean.openplan_entre_velkomst_venter', 'on') else 1.0 %}
+          {{ [1, [6500, ((states('input_number.koekken_lyskaede_fade_ind_hurtig') | float(2)) * m * mm)
+                  | round(0) | int] | min] | max }}
+
+      - name: "Koekken lyskaede fade langsom effektiv"
+        unique_id: koekken_lyskaede_fade_langsom_effektiv
+        unit_of_measurement: "s"
+        icon: mdi:transition
+        state: >-
+          {% set f = states('input_number.koekken_lyskaede_moerk_fade_faktor') | float(2.0) %}
+          {% set m = f if (is_state('binary_sensor.dark_mode_stue', 'on')
+                           or is_state('binary_sensor.godnat_common_active', 'on')) else 1.0 %}
+          {% set mm = (states('input_number.openplan_moerk_morgen_fade_faktor') | float(2.0))
+                      if is_state('input_boolean.openplan_entre_velkomst_venter', 'on') else 1.0 %}
+          {{ [1, [6500, ((states('input_number.koekken_lyskaede_fade_ind_langsom') | float(15)) * m * mm)
+                  | round(0) | int] | min] | max }}
+
+      # 2026-09-25: HVORNÅR er tænd-kurven færdig? Alle tænd-veje følger samme
+      # kurve (segment 1 over hurtig, enforcerens on_edge venter hurtig og
+      # sender segment 2 over langsom), så slut = tænd-tidspunkt + hurtig +
+      # langsom + 2 s reaktionstid. Læses af enforcerens tune-gren (en omfarvning
+      # midt i kurven må ikke hoppe til målet på 1 s) og af spots-tænd (spots
+      # først når kæden er i mål). Ingen now() → ingen minut-rækker (#24).
+      # last_changed nulstilles ved restart (permanent faktum) = højst 27 s
+      # for lang ventetid lige efter en genstart.
+      - name: "Koekken lyskaede kurve slut"
+        unique_id: koekken_lyskaede_kurve_slut
+        device_class: timestamp
+        icon: mdi:timer-sand-complete
+        state: >-
+          {% set l = states.light.koekken_lyskaede %}
+          {% if l is not none and l.state == 'on' %}
+            {{ (l.last_changed
+                + timedelta(seconds=(states('sensor.koekken_lyskaede_fade_hurtig_effektiv') | int(2))
+                                    + (states('sensor.koekken_lyskaede_fade_langsom_effektiv') | int(15))
+                                    + 2)).isoformat() }}
+          {% else %}
+            {{ none }}
+          {% endif %}
+
+      # Runde 3a (2026-07-03): én autoritet for cooking-CCT — morgen (< 09:00,
+      # hardcodet) = morgen-varmen, ellers normal cooking-varme. Enforcerens
+      # BEGGE CCT-grene læser denne (fejlklasse #2: reglen bor ét sted).
+      # now() → re-render hvert minut → 09:00-krydsning trigger enforceren
+      # (den lytter på denne sensor) og omfarver en igangværende session.
+      - name: "Koekken lyskaede cooking kelvin effektiv"
+        unique_id: koekken_lyskaede_cooking_kelvin_effektiv
+        unit_of_measurement: "K"
+        icon: mdi:sun-thermometer
+        state: >-
+          {% if now().hour < 9 %}
+            {{ states('input_number.koekken_lyskaede_cooking_morgen_kelvin') | int(2700) }}
+          {% else %}
+            {{ states('input_number.koekken_lyskaede_cooking_kelvin') | int(3400) }}
+          {% endif %}
+
+script:
+  # ===========================================================================
+  # FARVE-PREVIEW: slut (2026-10-17, user-spec)
+  # ===========================================================================
+  # Giver kæden tilbage efter koekken_lyskaede_preview. Slukket før → sluk.
+  # Tændt før → slip kravet; ejer 'hus' i Auto maler enforcerens laant_slut
+  # husets mål (med de NYE slider-værdier). Ellers (din hånd, Manual, nattur,
+  # velkomst, morgenrampe) gendannes udseendet fra før previewet — der er intet
+  # hus-mål at spørge (#27: kun disse, aldrig over et højere krav der startede
+  # undervejs). sofa_zen har sin egen genoptag.
+  koekken_lyskaede_preview_slut:
+    alias: "Køkken-lyskæde: farve-preview slut"
+    mode: single
+    max_exceeded: silent
+    variables:
+      foer: "{{ states('input_text.koekken_lyskaede_preview') }}"
+    sequence:
+      - if:
+          - condition: template
+            value_template: "{{ foer == 'slukket' and is_state('sensor.koekken_lyskaede_ejer', 'farve_preview') }}"
+        then:
+          - service: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: light.koekken_lyskaede
+            data:
+              transition: 1
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.koekken_lyskaede_preview
+        data:
+          value: ""
+      - if:
+          - condition: template
+            value_template: "{{ foer == 'taendt' }}"
+        then:
+          # Ejer-sensoren gen-renderes på input_text-flanken.
+          - delay:
+              milliseconds: 500
+          - if:
+              - condition: template
+                value_template: >-
+                  {% set ejer = states('sensor.koekken_lyskaede_ejer') %}
+                  {{ is_state('light.koekken_lyskaede', 'on')
+                     and states.scene.koekken_lyskaede_preview_foer is not none
+                     and (ejer in ['haand', 'velkomst', 'morgenrampe', 'nattur']
+                          or (ejer == 'hus' and is_state('input_select.room_mode_koekken', 'Manual'))) }}
+            then:
+              - service: scene.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: scene.koekken_lyskaede_preview_foer
+                data:
+                  transition: 1
+
+  # ===========================================================================
+  # MALEREN — ét sted der ved hvordan lyskæden SKAL se ud
+  # ===========================================================================
+  # 2026-09-18e. Reglen "madlavning → cooking-kelvin, ellers hygge-sliders, og
+  # altid target_brightness" stod ordret FIRE steder: enforcerens tune-gren,
+  # dens cook_end-gren, dens dark_on-gren og gestus-annulleringens grønne
+  # aflevering i packages/koekken_gestus_timer.yaml. Den sidste bar endda en
+  # ⚠️-kommentar om at de to skulle ændres i takt — netop den slags aftale der
+  # ikke holder (fejlklasse #2). Målt 17/9: da hygge-halvdelen manglede i
+  # gestus-kopien, afleverede annulleringen kæden i orange MIDT i madlavningen,
+  # og fordi kæden blev stående `on` kom der ingen flanke der kunne rette den.
+  #
+  # Alle malere kalder nu dette script. Ændrer husets farveregel sig, ændres
+  # den ét sted.
+  #
+  # `andel` findes fordi tænd-kurven males i to segmenter (50 % hurtigt, så
+  # resten langsomt) — segmentet er en STYRKE-brøk, ikke en anden farveregel.
+  koekken_lyskaede_maal:
+    alias: "🍽️ Køkken-lyskæde: mal til husets mål nu"
+    icon: mdi:palette
+    mode: restart
+    fields:
+      transition:
+        description: "Fade-tid i sekunder. Default 1."
+        example: 1
+      andel:
+        description: >-
+          Brøkdel af mål-styrken der males til (tænd-kurvens segment 1 = 0.5).
+          Default 1.0 = hele målet.
+        example: 0.5
+      styrke_pct:
+        description: >-
+          Fast styrke i procent i stedet for husets mål. Bruges af lånere der
+          skal aflevere FARVEN til huset men beholde det NIVEAU de lånte kæden
+          på — fx en annulleret nedtælling, hvor brugeren selv kan have dæmpet
+          kæden undervejs og ikke skal have den sat op igen. 0 = brug målet.
+        example: 20
+    sequence:
+      # ⚠️ Et script-felt der ikke sendes med er UDEFINERET, og `| int(0)`
+      # redder det ikke — hele kalderens automation aborterer med
+      # UndefinedError. Derfor `| default(x)` FØR enhver konvertering.
+      - variables:
+          tr: "{{ transition | default(1) | int(1) }}"
+          fast: "{{ styrke_pct | default(0) | int(0) }}"
+          bri: >-
+            {% set fast = styrke_pct | default(0) | int(0) %}
+            {% if fast > 0 %}
+              {{ [ [ fast, 100 ] | min, 1 ] | max }}
+            {% else %}
+              {{ [ ((states('sensor.koekken_lyskaede_target_brightness') | int(40))
+                    * (andel | default(1.0) | float(1.0))) | round(0) | int, 1 ] | max }}
+            {% endif %}
+      # 2026-09-25: morgenen maler også arbejdslyset (binary_sensor.koekken_morgenlys).
+      - if:
+          - condition: template
+            value_template: >-
+              {{ is_state('binary_sensor.koekken_madlavningslys', 'on')
+                 or is_state('binary_sensor.koekken_arbejdslys', 'on') }}
+        then:
+          - action: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: light.koekken_lyskaede
+            data:
+              color_temp_kelvin: >-
+                {{ states('sensor.koekken_lyskaede_cooking_kelvin_effektiv') | int(3400) }}
+              brightness_pct: "{{ bri }}"
+              transition: "{{ tr }}"
+        # 2026-09-28: måltidslys = varm hvid (color_temp), ikke hygge-hs.
+        else:
+          - if:
+              - condition: state
+                entity_id: binary_sensor.koekken_maaltidslys
+                state: "on"
+            then:
+              - action: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data:
+                  color_temp_kelvin: >-
+                    {{ states('input_number.koekken_lyskaede_maaltid_kelvin') | int(2700) }}
+                  brightness_pct: "{{ bri }}"
+                  transition: "{{ tr }}"
+              - stop: "måltidslys malet"
+          - action: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: light.koekken_lyskaede
+            data:
+              hs_color:
+                - "{{ states('input_number.koekken_lyskaede_hue') | float(193) }}"
+                - "{{ states('input_number.koekken_lyskaede_saturation') | float(98) }}"
+              brightness_pct: "{{ bri }}"
+              transition: "{{ tr }}"
+
+  # ===========================================================================
+  # SIGNAL-KANALEN — ét blink ad gangen, aldrig to oven i hinanden
+  # ===========================================================================
+  # 2026-09-18e (user: "jeg oplever stadig rodede blink nu på lyskæden. der er
+  # mange ting som nu ligger oven i hinanden").
+  #
+  # Køkkenet fik tre uafhængige blink-kilder på kort tid: mikrofon-kvitteringen
+  # (voice_commands.yaml), nedtællingens burst og den grønne annullerings-
+  # kvittering. Hver var `mode: single` for SIG SELV, hvilket ikke betyder
+  # noget når de er tre forskellige scripts — de kunne køre samtidig, og gjorde
+  # det: målt i recorderen 19:38-19:39 lå der fire state-rækker inde i ét og
+  # samme sekund tre gange.
+  #
+  # KONSEKVENSEN VAR IKKE KUN ROD, MEN EN FORKERT SLUTTILSTAND. Hvert script
+  # aflæste kædens LEVENDE styrke som sin "base" og skrev den tilbage til
+  # sidst. Starter kvitteringen mens bursten står i sit dyk, er base = bunden,
+  # og kvitteringen efterlader kæden mørk resten af nedtællingen. Den fejl kan
+  # ikke fikses inde i det enkelte script — den kræver at der kun er ÉT script.
+  #
+  # Derfor: én kanal, `mode: queued`. Blink stiller sig i kø i stedet for at
+  # lægge sig oven i hinanden, hver kørsel aflæser base i et øjeblik hvor ingen
+  # anden rører kæden, og formerne kan ikke længere smelte sammen til noget
+  # ulæseligt.
+  #
+  # `max: 4` er en aflæselighedsgrænse, ikke en teknisk: står der mere end fire
+  # signaler i kø, er de holdt op med at betyde noget hver for sig, og et
+  # `max_exceeded: silent` er en pænere opførsel end en lyskæde der blinker et
+  # halvt minut i træk.
+  #
+  # FORMERNE skal kunne skelnes med øjnene alene (user-spec 2026-09-17):
+  #   vink  = OP, HELT NED, tilbage     — "jeg hørte dig" / "mikrofonen lytter"
+  #   burst = N hurtige slag OP         — et TAL (minutter tilbage)
+  #   groen = grønt, to dyk             — "stoppet"
+  # Kun `groen` rører farven; de to andre er rene niveau-kald, netop så de ikke
+  # kan forveksles med den røde alarm og ikke skal gætte hvilken color_mode
+  # kæden skal tilbage til.
+  koekken_lyskaede_signal:
+    alias: "✨ Køkken-lyskæde: ét signal ad gangen"
+    icon: mdi:flash
+    mode: queued
+    max: 4
+    max_exceeded: silent
+    fields:
+      moenster:
+        description: "vink | dobbeltvink | puls | burst | groen"
+        example: vink
+      antal:
+        description: "Antal slag i et burst. Default 1."
+        example: 5
+      udsving_pct:
+        description: "Burstets udsving i %-point omkring kædens niveau. Default 20."
+        example: 20
+      styrke_pct:
+        description: >-
+          Kun `groen`: fast styrke at aflevere på i stedet for husets mål.
+          Videresendes til script.koekken_lyskaede_maal. 0 = brug målet.
+        example: 20
+      aflever:
+        description: >-
+          Kun `groen`: mal kæden tilbage til husets udtryk bagefter. Default
+          true. Sæt false når kalderen alligevel SLUKKER kæden lige efter —
+          en aflevering dér ville være et synligt farve-spring lige inden et
+          sluk, altså zigbee-trafik der gør resultatet ringere.
+        example: false
+    sequence:
+      # Røgalarmens nødbelysning ligger over ALT (user-spec) — den ene ting
+      # ingen må låne lampen fra. Står den på, dør signalet her, og fordi
+      # gaten ligger FØR alt andet efterlader det intet at rydde op.
+      - condition: state
+        entity_id: input_boolean.roegalarm_blink_active
+        state: "off"
+
+      - variables:
+          m: "{{ moenster | default('vink') }}"
+          taendt: "{{ is_state('light.koekken_lyskaede', 'on') }}"
+          # Kædens styrke i det øjeblik VI får kanalen. Fordi scriptet er
+          # queued, er dette aldrig midt i et andet blink.
+          base: >-
+            {{ [ [ ((state_attr('light.koekken_lyskaede', 'brightness') | float(0)) / 2.54)
+                   | round(0) | int, 100 ] | min, 1 ] | max }}
+
+      - choose:
+          # -------------------------------------------------------------
+          # VINK — kæden er tændt: op, helt ned, tilbage.
+          # -------------------------------------------------------------
+          # DOBBELTVINK (2026-09-28) = to vink i ÉN kø-plads. Første udgave
+          # kaldte kanalen to gange fra kvitteringen, og timer-startens burst
+          # stillede sig i køen MELLEM dem: vink → burst → vink → blik-puls
+          # over 10 s, som ikke kunne læses som "dobbelt" (user: "buggy").
+          - conditions:
+              - condition: template
+                value_template: "{{ m in ['vink', 'dobbeltvink'] and taendt }}"
+            sequence:
+              - repeat:
+                  count: "{{ 2 if m == 'dobbeltvink' else 1 }}"
+                  sequence:
+                    - action: light.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: light.koekken_lyskaede
+                      data: {brightness_pct: 100, transition: 0}
+                    - delay: {milliseconds: 250}
+                    - action: light.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: light.koekken_lyskaede
+                      data: {brightness_pct: 1, transition: 0}
+                    - delay: {milliseconds: 250}
+                    - action: light.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: light.koekken_lyskaede
+                      data: {brightness_pct: "{{ base }}", transition: 0}
+                    # Pausen skiller de to vink; et enkelt vink får ingen hale.
+                    - delay:
+                        milliseconds: "{{ 350 if m == 'dobbeltvink' else 0 }}"
+
+          # -------------------------------------------------------------
+          # PULS (2026-09-23, user-spec: "gør tapo's KLAR signal meget mere
+          # subtilt, det forstyrrer helt vildt nu"). Vinket er et hårdt snap
+          # 100 % → 1 % → tilbage uden fade; målt 18-22/09 kørte det ved 47
+          # blik-armeringer, hvoraf 43 aldrig blev fulgt af tale. Pulsen er et
+          # lille åndedrag: +N procentpoint (slider) med fade op og ned — eller
+          # NED hvis kæden allerede står næsten i top. Samme farve, ingen snap.
+          # -------------------------------------------------------------
+          - conditions:
+              - condition: template
+                value_template: "{{ m == 'puls' and taendt }}"
+            sequence:
+              - variables:
+                  d: "{{ states('input_number.koekken_klar_puls_pct') | int(12) }}"
+                  top: "{{ (base + d) if base + d <= 100 else [base - d, 1] | max }}"
+              - action: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data: {brightness_pct: "{{ top }}", transition: 0.4}
+              - delay: {milliseconds: 700}
+              - action: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data: {brightness_pct: "{{ base }}", transition: 0.8}
+              - delay: {milliseconds: 900}
+          # PULS, slukket kæde: en svag glød i stedet for 40 %-glimtet. Tavs
+          # under godnat som vinket.
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ m == 'puls' and not taendt
+                     and is_state('binary_sensor.godnat_common_active', 'off') }}
+            sequence:
+              - action: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data:
+                  brightness_pct: "{{ [states('input_number.koekken_klar_puls_pct') | int(12) // 2, 2] | max }}"
+                  transition: 0.4
+              - delay: {milliseconds: 900}
+              - action: light.turn_off
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data: {transition: 0.8}
+              - delay: {milliseconds: 900}
+
+          # -------------------------------------------------------------
+          # VINK, slukket kæde — et kort glimt. Tavshed under godnat: et
+          # uventet blink i et mørkt køkken er værre end ingen kvittering.
+          # -------------------------------------------------------------
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ m in ['vink', 'dobbeltvink'] and not taendt
+                     and is_state('binary_sensor.godnat_common_active', 'off') }}
+            sequence:
+              - repeat:
+                  count: "{{ 2 if m == 'dobbeltvink' else 1 }}"
+                  sequence:
+                    - action: light.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: light.koekken_lyskaede
+                      data: {brightness_pct: 40, transition: 0}
+                    - delay: {milliseconds: 600}
+                    - action: light.turn_off
+                      continue_on_error: true
+                      target:
+                        entity_id: light.koekken_lyskaede
+                      data: {transition: 0}
+                    - delay:
+                        milliseconds: "{{ 400 if m == 'dobbeltvink' else 0 }}"
+
+          # -------------------------------------------------------------
+          # BURST — N hurtige slag OP og tilbage til det niveau kæden blev
+          # lånt på, med `udsving_pct` %-point amplitude (2026-09-24; før
+          # 100 %↔10 %). Gulv 1 %, aldrig 0: et sluk ville give en
+          # off→on-flanke pr. slag og vække enforceren.
+          # -------------------------------------------------------------
+          - conditions:
+              - condition: template
+                value_template: "{{ m == 'burst' }}"
+            sequence:
+              - repeat:
+                  count: "{{ [ [ antal | default(1) | int(1), 1 ] | max, 10 ] | min }}"
+                  sequence:
+                    # 2026-09-24: blødt udsving, ikke 100 %→10 % ("for
+                    # voldsomme", user). Top = base + udsving (loft 100),
+                    # bund = top − udsving (gulv 1) → står kæden lavt, går
+                    # slaget kun OP fra niveauet; står den højt, dykker det.
+                    - action: light.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: light.koekken_lyskaede
+                      data:
+                        brightness_pct: >-
+                          {{ [ base | int(40) + udsving_pct | default(20) | int(20), 100 ] | min }}
+                        transition: 0
+                    - delay: {milliseconds: 220}
+                    - action: light.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: light.koekken_lyskaede
+                      data:
+                        brightness_pct: >-
+                          {% set top = [ base | int(40) + udsving_pct | default(20) | int(20), 100 ] | min %}
+                          {{ [ top - udsving_pct | default(20) | int(20), 1 ] | max }}
+                        transition: 0
+                    - delay: {milliseconds: 220}
+              - action: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data: {brightness_pct: "{{ base }}", transition: 1}
+
+          # -------------------------------------------------------------
+          # GRØN — "stoppet". Farven sættes ÉN gang og dykkene er rene
+          # niveau-kald: et farvet turn_on er to zigbee-frames pr. pære, et
+          # niveau-kald ét. Bunden er 1 % og aldrig 0.
+          #
+          # Dette er det ENESTE mønster der rører farven, og derfor det
+          # eneste der skal aflevere: kæden ville ellers blive stående grøn
+          # uden nogen flanke til at hente den hjem. Afleveringen er et kald
+          # til maleren — ikke en kopi af husets farveregel (#2).
+          # -------------------------------------------------------------
+          - conditions:
+              - condition: template
+                value_template: "{{ m == 'groen' and taendt }}"
+            sequence:
+              - action: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data: {hs_color: [120, 100], brightness_pct: 100, transition: 0}
+              - delay: {milliseconds: 200}
+              - action: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data: {brightness_pct: 1, transition: 0}
+              - delay: {milliseconds: 200}
+              - action: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data: {brightness_pct: 100, transition: 0}
+              - delay: {milliseconds: 200}
+              - if:
+                  - condition: template
+                    value_template: "{{ aflever | default(true) | bool(true) }}"
+                then:
+                  - action: script.koekken_lyskaede_maal
+                    continue_on_error: true
+                    data:
+                      transition: 1
+                      styrke_pct: "{{ styrke_pct | default(0) | int(0) }}"
+
+automation:
+  # ===========================================================================
+  # FARVE-PREVIEW (2026-10-17, user-spec: "når jeg skruer på den vil jeg have
+  # køkkenstrip til midlertidigt at tage den farve så jeg kan se den")
+  # ===========================================================================
+  # Dit træk i farvetone/mætning/lysstyrke (user_id, #3) → kæden viser
+  # [hue, mætning] på lysstyrke-sliderens %, i koekken_lyskaede_preview_sekunder
+  # efter SIDSTE træk (mode: restart), og slut-scriptet giver den tilbage.
+  # Kravet `farve_preview` holder enforceren væk imens; røgalarm/nødlys/timer/
+  # vejrvarsel/dance/cirkus/legetøjsdag rangerer over og vinder (gaten nedenfor).
+  - id: koekken_lyskaede_preview
+    alias: "Køkken-lyskæde: farve-preview når du skruer på farven"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id:
+          - input_number.koekken_lyskaede_hue
+          - input_number.koekken_lyskaede_saturation
+          - input_number.koekken_lyskaede_brightness
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.to_state.context.user_id is not none
+             and trigger.from_state is not none
+             and trigger.from_state.state != trigger.to_state.state
+             and states('sensor.koekken_lyskaede_ejer') in
+                 ['hus', 'farve_preview', 'haand', 'velkomst', 'sofa_zen', 'morgenrampe', 'nattur', 'unknown'] }}
+    action:
+      - if:
+          - condition: template
+            value_template: "{{ states('input_text.koekken_lyskaede_preview') not in ['taendt', 'slukket'] }}"
+        then:
+          - service: scene.create
+            data:
+              scene_id: koekken_lyskaede_preview_foer
+              snapshot_entities:
+                - light.koekken_lyskaede
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.koekken_lyskaede_preview
+            data:
+              value: "{{ 'taendt' if is_state('light.koekken_lyskaede', 'on') else 'slukket' }}"
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.koekken_lyskaede
+        data:
+          hs_color:
+            - "{{ states('input_number.koekken_lyskaede_hue') | float(193) }}"
+            - "{{ states('input_number.koekken_lyskaede_saturation') | float(100) }}"
+          brightness_pct: "{{ states('input_number.koekken_lyskaede_brightness') | int(40) }}"
+          transition: 0.5
+      - delay:
+          seconds: "{{ states('input_number.koekken_lyskaede_preview_sekunder') | int(15) }}"
+      - service: script.koekken_lyskaede_preview_slut
+
+  # Backstop: en restart eller automation-reload dræber ventetiden ovenfor,
+  # og et hængende flag ville låne kæden ud for evigt (#4/#23).
+  - id: koekken_lyskaede_preview_backstop
+    alias: "Køkken-lyskæde: farve-preview backstop (restart/reload)"
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_text.koekken_lyskaede_preview') in ['taendt', 'slukket']
+             and (state_attr('automation.kokken_lyskaede_farve_preview_nar_du_skruer_pa_farven', 'current') | int(0)) == 0 }}
+    action:
+      - delay:
+          seconds: 30
+      - condition: template
+        value_template: "{{ (state_attr('automation.kokken_lyskaede_farve_preview_nar_du_skruer_pa_farven', 'current') | int(0)) == 0 }}"
+      - service: script.koekken_lyskaede_preview_slut
+
+  - id: koekken_lyskaede_enforce
+    alias: "Køkken-lyskæde: håndhæv egne farve/styrke-indstillinger"
+    description: >
+      Enhver tænding af lyskæden (gruppe-tænd, Styrbar, app, power-recovery,
+      presence) rettes til mål-lyset ~2 s efter: hygge-sliders normalt,
+      cooking-lys (kraftigt medium-varmt CCT) mens køkken-spots er tændt.
+      Spots-tænd i aften-vinduet tænder også selve lyskæden. Slider-ændring
+      mens den er tændt = live-preview. Direkte justering af selve lyskæden
+      mens den er tændt vinder (trigger fyrer kun på off/unavailable→on).
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: light.koekken_lyskaede
+        to: "on"
+        id: on_edge
+      # 2026-08-29 (user: "den virker lavt sat i brightness nu"): en HA-restart
+      # SLUGER on_edge-kanten. Kæden tændte 07:59:15 — 21 s efter en restart —
+      # og enforceren fyrede aldrig (last_triggered stod stadig 07:53:51), så
+      # kæden blev hængende på 54 % mens dens mål-sensor sagde 100 %. Det er
+      # fejlklasse #15: en automation der ikke lytter endnu modtager ingen
+      # triggers, og flanken er tabt for altid. Uden denne backstop står kæden
+      # på hvad end den tilfældigvis havde efter HVER eneste deploy.
+      - platform: homeassistant
+        event: start
+        id: boot
+      - platform: state
+        entity_id:
+          - input_number.koekken_lyskaede_brightness
+          - input_number.koekken_lyskaede_hue
+          - input_number.koekken_lyskaede_saturation
+          - input_number.koekken_lyskaede_cooking_brightness
+          # Runde 3a: effektiv-sensoren dækker BÅDE cooking-kelvin-sliderne
+          # (normal + morgen) OG 09:00-krydsningen — én trigger, tre kilder.
+          - sensor.koekken_lyskaede_cooking_kelvin_effektiv
+          - input_number.koekken_lyskaede_maaltid_pct
+          - input_number.koekken_lyskaede_maaltid_kelvin
+        id: tune
+      # 2026-09-28: måltidslyset skifter farve+styrke — langsomt (se `basis`),
+      # "abrupt" var netop klagen.
+      - platform: state
+        entity_id: binary_sensor.koekken_maaltidslys
+        from: "off"
+        to: "on"
+        id: maaltid
+      - platform: state
+        entity_id: binary_sensor.koekken_maaltidslys
+        from: "on"
+        to: "off"
+        id: maaltid
+      # 2026-08-05 (Dark Mode). Selve dark_mode-flanken retter niveauet OG farven
+      # (farve-grenen skifter selv når mål-styrken tilfældigvis er ens).
+      # 2026-09-02: gaten er nu RUM-SCOPET (dark_mode_stue) — køkkenet er open
+      # plan med sofastuen, ikke med soveværelset, så en knap-session i sengen
+      # må ikke dæmpe lyskæden. Eksplicit from/to i BEGGE retninger, fordi et
+      # `template.reload` ellers ville sende en Zigbee-kommando pr. deploy
+      # (unavailable → off er en gyldig state-flanke).
+      - platform: state
+        entity_id: binary_sensor.dark_mode_stue
+        from: "off"
+        to: "on"
+        id: tune
+      - platform: state
+        entity_id: binary_sensor.dark_mode_stue
+        from: "on"
+        to: "off"
+        id: tune
+      # 2026-08-27b: film-clampen i mål-sensoren lander kun på pæren hvis
+      # enforceren får en flanke — mål-sensoren har BEVIDST ingen generisk
+      # lytter (den følger elpris_dim_factor og ville sende en Zigbee-kommando
+      # pr. pris-tick, se noten nedenfor). Derfor en eksplicit trigger på
+      # selve film-gaten, begge veje: ind i filmen dæmpes der, ud af den
+      # rettes niveauet tilbage.
+      - platform: state
+        entity_id: binary_sensor.filmmoerke_koekken
+        id: tune
+      # 2026-09-25: morgen-vinduet ind/ud omfarver en TÆNDT kæde (godnat ryddes
+      # 06:00 med natturens 2 % orange på kæden; 09:00 tilbage til hygge).
+      # Eget id → tune-grenen fader over langsom i stedet for at springe.
+      # from/to begge veje: template.reload må ikke sende en Zigbee-kommando.
+      - platform: state
+        entity_id: binary_sensor.koekken_arbejdslys
+        from: "off"
+        to: "on"
+        id: morgenlys
+      - platform: state
+        entity_id: binary_sensor.koekken_arbejdslys
+        from: "on"
+        to: "off"
+        id: morgenlys
+      # Runde 2, NED-retningen: mål-sensoren ejer hold-vinduet og falder af sig
+      # selv til dark_pct når det udløber (now()-re-render), så vi lytter på
+      # SVARET i stedet for at gen-kode spørgsmålet her (fejlklasse #2) — og
+      # undgår samtidig et kapløb, hvor triggeren fyrer før sensoren har
+      # re-renderet og vi ville skrive 40 % tilbage. NB: vi kan ikke bare lytte
+      # på hele sensoren; den følger også elpris_dim_factor og skifter 3,2 gange
+      # i timen (målt), hvilket ville sende en Zigbee-kommando pr. pris-tick.
+      # Op mod 60 s forsinkelse er indbygget: sensoren re-renderer på minut-
+      # kanten, så det effektive hold er hold → hold + 60 s.
+      - platform: template
+        value_template: >-
+          {{ is_state('binary_sensor.dark_mode_stue', 'on')
+             and (states('sensor.koekken_lyskaede_target_brightness') | int(0))
+                 == (states('input_number.koekken_lyskaede_dark_pct') | int(1)) }}
+        id: tune
+      # 2026-09-17d (user: "låser på orange! kritisk"): SELVHELING mod hele
+      # klassen "en med-ejer malede kæden og slap den uden at efterlade en
+      # flanke". Den er nu ramt TRE gange (varsel_slut, ejer_slap, og
+      # gestus-annulleringen) — hver gang er svaret hidtil været en ny trigger
+      # pr. ejer, altså et roster der drifter (#16). Denne her spørger i stedet
+      # om RESULTATET: laver vi mad, og står kæden alligevel i en ikke-cooking
+      # farve? Så er der pr. definition en ejer der har sluppet.
+      # Attribut-ændringer på et lys trigger ingen state-trigger, men en
+      # template-trigger re-renderer på dem — derfor virker denne hvor en
+      # `platform: state` ikke gør.
+      # `for: 30s` gør den blind for alt hvad huset selv gør kortvarigt: det
+      # grønne kvitterings-blink (0,6 s), nedtællingens burst og varsel-blink.
+      # Dance/cirkus/Styrbar/alarm/røgalarm/velkomst er allerede gatet i
+      # `condition:` nedenfor og kan derfor ikke vækkes af den her.
+      # Lander i tune-grenens catch-all → 2 s delay → cooking-kelvin.
+      - platform: template
+        value_template: >-
+          {{ (is_state('binary_sensor.koekken_madlavningslys', 'on')
+              or is_state('binary_sensor.koekken_arbejdslys', 'on')
+              or is_state('binary_sensor.koekken_maaltidslys', 'on'))
+             and is_state('light.koekken_lyskaede', 'on')
+             and state_attr('light.koekken_lyskaede', 'color_mode') not in ['color_temp', none] }}
+        for:
+          seconds: 30
+        id: tune
+      # OP-retningen har sin EGEN id, fordi den som den eneste må TÆNDE et
+      # slukket lys — et slider-træk må ikke lyse køkkenet op midt i en film.
+      - platform: template
+        value_template: >-
+          {{ is_state('binary_sensor.dark_mode_stue', 'on')
+             and is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'on') }}
+        id: dark_on
+      # Cooking-mode ind/ud → arbejdslys / tilbage til hygge-sliders.
+      # to/from-par = fyrer ikke på unavailable-flap.
+      # 2026-09-03: ankeret er ikke længere spots-switchen, men
+      # binary_sensor.koekken_madlavningslys — sessionen sætter ramp-flaget
+      # FØR spots, så cook_start-rampen her når at nå fuld styrke inden
+      # spottene tændes. cook_end er uændret i praksis: ankeret falder når
+      # spots slukker (ramp-flaget er for længst ryddet).
+      - platform: state
+        entity_id: binary_sensor.koekken_madlavningslys
+        from: "off"
+        to: "on"
+        id: cook_start
+      - platform: state
+        entity_id: binary_sensor.koekken_madlavningslys
+        from: "on"
+        to: "off"
+        id: cook_end
+      # RE-ARM NÅR EN LÅNER SLIPPER (fejlklasse #15 + #12).
+      #
+      # En låner der slipper efterlader INGEN flanke: kæden stod `on` hele
+      # vejen, så kun attributter ændrede sig, og attribut-ændringer på et lys
+      # trigger ingen state-trigger. Huset har betalt for den indsigt tre
+      # gange med hver sin ejer:
+      #   12/9  aften-varslet ramte 2 s inde i en køkken-session og efterlod
+      #         kæden orange (hs 27,8/98 @ 100 %) i 16 min, mens mål-sensoren
+      #         sagde 3050 K. Enforcerens last_triggered stod FØR blinket.
+      #   17/9  "party time" → "auto mode" på 7 s gjorde alt rigtigt, men
+      #         kæden blev stående grøn (hs 98,2/77,6 @ bri 250) i 20+ min.
+      #         "Auto" betyder at husets logik ejer lyset igen, ikke at nogen
+      #         maler det.
+      #   17/9d gestus-annulleringen afleverede i hygge-orange midt i
+      #         madlavningen.
+      # Hver gang var svaret en ny trigger pr. ejer — altså tre rosters der
+      # drev fra hinanden (#16). Nu spørger vi låne-låsen i stedet: ÉN trigger
+      # dækker alle ni lånere, og en tiende får re-armeringen gratis ved at
+      # blive tilføjet i sensoren.
+      #
+      # Lander i tune-grenens catch-all (2 s delay → mål).
+      # 2026-10-04: lytter på den GENEREREDE ejer-sensor (ejerskab/koekken_
+      # lyskaede.yaml). Kun skiftet til 'hus' er en aflevering; kæden der går
+      # fra ét krav til et lavere er stadig lånt. Om afleveringen skal male,
+      # afgør kravet selv (`aflevering:` → attributten aflever_til_hus).
+      - platform: state
+        entity_id: sensor.koekken_lyskaede_ejer
+        to: "hus"
+        not_from: ["unknown", "unavailable"]
+        id: laant_slut
+    condition:
+      # 2026-09-03 (user-spec: "core features som openplan lys skal være de
+      # samme i airbnb mode og normal mode"): AirBnB-undtagelsen er FJERNET.
+      # Den var truffet 07-08 af æstetiske grunde (gæster fik varm hvid frem
+      # for familiens cyan), men den slog hele kædens adfærd fra: ingen kurvet
+      # fade, ingen cooking-styrke, og efter 09-03 heller ingen rampe — en
+      # køkkensession i AirBnB tændte spots først og lod kæden stå lavt.
+      #
+      # ER KÆDEN LÅNT UD? Ét spørgsmål dækker alle ni lånere — dance, cirkus,
+      # Styrbar-holdet, de tre varsels-blink, gestus-alarmen, røgalarmen og
+      # velkomst-ceremonien. De ejer hver især kædens udtryk mens de kører, og
+      # enforceren skal ikke slås med dem: den ville skyde cyan ind mellem
+      # blinkene, og røgalarmens flugtvejs-hvide kunne holdes væk i op til
+      # 10 s ad gangen (#21 — gaten fjerner kampen om lampen, den er ikke pynt
+      # oven i re-asserten).
+      #
+      # Definitionen og RANGEN står i ejerskab/koekken_lyskaede.yaml (sensoren
+      # genereres derfra). Ejer-sensoren re-armerer også enforceren når lånet
+      # slutter, så en ny låner tilføjes ét sted og får begge dele.
+      # Læser EJER-sensoren, ikke _laant: laant_slut-triggeren ER ejer-skiftet,
+      # og _laant (afledt af ejeren) gen-renderes i samme event i udefineret
+      # rækkefølge → en gate på _laant kunne se den gamle 'on' og sluge
+      # afleveringen. Samme betydning: ejer ∈ {hus, unknown, unavailable}.
+      - condition: template
+        value_template: >-
+          {{ states('sensor.koekken_lyskaede_ejer') in ['hus', 'unknown', 'unavailable', ''] }}
+      # Signal-kanalen (kvitterings-vink, nedtællings-burst, grøn kvittering)
+      # er bevidst IKKE en del af låne-låsen: den skriver kun NIVEAU og sætter
+      # selv styrken tilbage, så den skal ikke re-arme enforceren — et vink
+      # ville ellers male kæden op på husets mål og overskrive et bevidst
+      # håndsat niveau. Men mens den kører, skal enforceren stadig holde
+      # fingrene væk, så et kort glimt på en slukket kæde ikke besvares med
+      # en fuld tænd-kurve. Derfor: gate uden trigger.
+      - condition: template
+        value_template: >-
+          {{ (state_attr('script.koekken_lyskaede_signal', 'current') | int(0)) == 0 }}
+      # Godnat/nattur og morgenrampen (tidl. en stateless undtagelse her,
+      # 2026-08-26g/08-30/09-01b) er nu kravene `nattur` og `morgenrampe` i
+      # ejerskabs-registret: samme betingelse (godnat_COMMON / morgenrampe_aktiv,
+      # og madlavning bryder dem), men med en plads i rangen. `aflevering: ingen`
+      # = ingen maling når de slipper — som før. Historikken:
+      # `git log -S "MORGENRAMPEN er tilføjet som andet led" -- packages/koekken_lyskaede.yaml`.
+    action:
+      - choose:
+          # --- Køkken-session TÆNDER lyskæden i aften-vinduet (user-spec
+          # 2026-07-02: spots-tænd 17-22 → lyskæden på cooking-lys selv om
+          # dens egen lux-gate ikke er mødt).
+          # 2026-07-08 (curved fade): sender kun SEGMENT 1 (50 % af mål over
+          # hurtig-slideren) — off→on-kanten re-trigger'er enforceren
+          # (mode:restart) → on_edge-grenen fuldfører kurven (segment 2).
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.id == 'cook_start' }}"
+              - condition: state
+                entity_id: light.koekken_lyskaede
+                state: "off"
+              - condition: time
+                after: input_datetime.koekken_lyskaede_cooking_taend_start
+                before: input_datetime.koekken_lyskaede_cooking_taend_slut
+            sequence:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data:
+                  color_temp_kelvin: "{{ states('sensor.koekken_lyskaede_cooking_kelvin_effektiv') | int(3400) }}"
+                  brightness_pct: >-
+                    {{ [((states('sensor.koekken_lyskaede_target_brightness') | int(100)) * 0.5) | round(0) | int, 1] | max }}
+                  transition: "{{ states('sensor.koekken_lyskaede_fade_hurtig_effektiv') | int(2) }}"
+          # --- COOKING SLUT (2026-07-08, user-spec): spots on→off → LINEÆR fade
+          # NED til default-farven (hygge-sliders) over fade_ned-slideren.
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.id == 'cook_end' }}"
+              - condition: state
+                entity_id: light.koekken_lyskaede
+                state: "on"
+            sequence:
+              # 2026-09-25: via maleren, så en session der slutter om MORGENEN
+              # bliver i morgen-lyset i stedet for at falde til hygge-orange (#2).
+              - action: script.koekken_lyskaede_maal
+                continue_on_error: true
+                data:
+                  transition: "{{ states('input_number.koekken_lyskaede_fade_ned') | int(20) }}"
+          # --- TÆND-KANT (2026-07-08, curved fade): fuldfør kurven — SEGMENT 2.
+          # Tænd-kilden (presence/cook_start/app) har sendt segment 1 (50 % af
+          # mål over hurtig-slideren); vent til den er landet og fad langsomt
+          # videre mod 100 % (langsom-slideren). Erstatter det gamle faste
+          # 2 s-delay + transition 1 for on-kanter.
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.id in ['on_edge', 'boot'] }}"
+              - condition: state
+                entity_id: light.koekken_lyskaede
+                state: "on"
+            sequence:
+              # Boot-kanten deler denne gren med vilje (fejlklasse #2 — kurven må
+              # kun kodes ét sted), men skal vente længere: ved HA-start er
+              # switch.koekken_spots ofte stadig unavailable, og så ville
+              # cooking-grenen nedenfor tage fejl og male kæden cyan midt i
+              # madlavning. 30 s er samme settle som badets restart-recovery.
+              - delay:
+                  seconds: >-
+                    {{ 30 if trigger.id == 'boot'
+                       else (states('sensor.koekken_lyskaede_fade_hurtig_effektiv') | int(2)) }}
+              # 2026-09-29 (bug-hunt): låne-låsen og signal-kanalen blev kun
+              # spurgt i `condition:` — FØR delayet. En låner der starter i
+              # vinduet (varsels-blink, røgalarm, dance …) er ingen trigger
+              # (kun laant on → off er), så kørslen blev ikke afbrudt og malede
+              # husets mål midt i lånerens mønster. Signalet er kort og
+              # re-armerer IKKE → vent det ud (ellers står kurven på segment 1).
+              # Et lån afbryder; `laant_slut` fuldfører kurven når det slutter.
+              - wait_template: >-
+                  {{ (state_attr('script.koekken_lyskaede_signal', 'current') | int(0)) == 0 }}
+                timeout: 15
+              - condition: state
+                entity_id: light.koekken_lyskaede
+                state: "on"
+              # Re-tjek efter delay: hold/varsel kan være startet i vinduet.
+              - condition: state
+                entity_id: input_boolean.styrbar_lr_holding_stue
+                state: "off"
+              - condition: state
+                entity_id: binary_sensor.koekken_lyskaede_laant
+                state: "off"
+              # Madlavning vs. hygge afgøres inde i maleren — grenen her havde
+              # if/else med præcis den samme forgrening (#2).
+              - action: script.koekken_lyskaede_maal
+                continue_on_error: true
+                data:
+                  transition: >-
+                    {{ states('sensor.koekken_lyskaede_fade_langsom_effektiv') | int(15) }}
+          # --- DARK MODE: KØKKEN-SESSION TÆNDER LYSKÆDEN (2026-08-05 runde 2,
+          # user-spec: "ja køkken midt i film skal tænde 40 % (slider)").
+          # Hvorfor her og ikke i presence_koekken.yaml: dér er cinema_active en
+          # hård off-condition på HELE automationen (den ejer også spots, som
+          # bevidst skal forblive blokeret), så en undtagelse dér ville åbne for
+          # spots igen. Film-adfærden bor ét sted — sammen med niveau-logikken.
+          # Segment 1 af den kurvede fade (50 % af mål, hurtig-slideren);
+          # off→on-kanten re-trigger'er enforceren (mode: restart) → on_edge
+          # fuldfører til fuld styrke over langsom-slideren, så lyset RAMPER op
+          # i stedet for at springe i synsfeltet.
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.id == 'dark_on' }}"
+              - condition: state
+                entity_id: light.koekken_lyskaede
+                state: "off"
+              - condition: state
+                entity_id: binary_sensor.dark_mode_stue
+                state: "on"
+              - condition: template
+                value_template: "{{ not is_state('input_select.room_mode_koekken', 'Manual') }}"
+              # Samme manuel-sluk-grace som presence-tænd (fejlklasse #2):
+              # slukkede brugeren SELV kæden, må en køkkentur ikke gen-tænde den.
+              - condition: template
+                value_template: >-
+                  {% set g = states('input_number.koekken_manual_off_grace_minutes') | float(5) %}
+                  {{ g <= 0 or
+                     (now().timestamp() - (state_attr('input_datetime.koekken_lyskaede_manual_off_at', 'timestamp') | float(0))) > g * 60 }}
+              # Og samme lux-gate: er der dagslys nok, er der intet at lyse op —
+              # uden den ville sluk-grenen 'bright' slukke igen og vi ville
+              # cykle. 0 lx = auto-tænd slået fra, også her.
+              # 2026-08-29d: ét anker (#2) — samme sensor som presence-tænd.
+              - condition: state
+                entity_id: binary_sensor.koekken_lyskaede_lux_ok
+                state: "on"
+            sequence:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.koekken_lyskaede
+                data:
+                  hs_color:
+                    - "{{ states('input_number.koekken_lyskaede_hue') | float(193) }}"
+                    - "{{ states('input_number.koekken_lyskaede_saturation') | float(98) }}"
+                  brightness_pct: >-
+                    {{ [((states('sensor.koekken_lyskaede_target_brightness') | int(40)) * 0.5) | round(0) | int, 1] | max }}
+                  transition: "{{ states('sensor.koekken_lyskaede_fade_hurtig_effektiv') | int(2) }}"
+              - service: logbook.log
+                data:
+                  name: "Køkken-lyskæde"
+                  message: >-
+                    Tændt af køkken-session under Dark Mode (mål
+                    {{ states('sensor.koekken_lyskaede_target_brightness') }} %).
+          # --- SLIDER-TRÆK (tune): live-preview mens tændt — hurtig apply som før.
+          - conditions:
+              - condition: state
+                entity_id: light.koekken_lyskaede
+                state: "on"
+              # 2026-10-03e (B183.3): et lån der slutter FORDI brugeren selv
+              # greb kæden (køkkenet → Manual midt i Sofa Zen / et varsel) må
+              # ikke males over med husets mål — Manual = brugeren ejer lyset
+              # (#3). Aflevering til et køkken på Auto er uændret.
+              # 2026-10-04: og kun et krav med `aflevering: maal` i registret
+              # maler ved slip (nattur/morgenrampe slipper uden maling).
+              - condition: template
+                value_template: >-
+                  {{ not (trigger is defined and trigger.id == 'laant_slut'
+                          and (is_state('input_select.room_mode_koekken', 'Manual')
+                               or trigger.from_state.state not in
+                                  (state_attr('sensor.koekken_lyskaede_ejer', 'aflever_til_hus') or []))) }}
+            sequence:
+              # Kort delay: hurtige slider-træk kollapser til ét apply (mode:restart).
+              - delay:
+                  seconds: 2
+              # Samme re-tjek som on_edge-grenen (2026-09-29, #12).
+              - wait_template: >-
+                  {{ (state_attr('script.koekken_lyskaede_signal', 'current') | int(0)) == 0 }}
+                timeout: 15
+              - condition: state
+                entity_id: light.koekken_lyskaede
+                state: "on"
+              - condition: state
+                entity_id: input_boolean.styrbar_lr_holding_stue
+                state: "off"
+              - condition: state
+                entity_id: binary_sensor.koekken_lyskaede_laant
+                state: "off"
+              # Slider-træk skal ses med det samme (1 s), men Dark Mode-niveauet
+              # skal RAMPE — et spring i synsfeltet er præcis det mørklægningen
+              # skal undgå. Genbruger langsom-fade-slideren frem for en ny.
+              # 2026-09-25: morgen-vinduets flanke fader også langsomt (orange →
+              # hvid i hovedhøjde), og en omfarvning MIDT i tænd-kurven (fx
+              # madlavning opdaget 25 s efter presence) fuldfører kurven i
+              # stedet for at hoppe til målet på 1 s — ellers kommer spottene
+              # oven i et spring (user 25/9: "ikke midt i rampen").
+              - variables:
+                  langsom: "{{ states('sensor.koekken_lyskaede_fade_langsom_effektiv') | int(15) }}"
+                  basis: >-
+                    {{ langsom if (is_state('binary_sensor.dark_mode_stue', 'on')
+                                   or (trigger is defined
+                                       and trigger.id in ['morgenlys', 'maaltid']))
+                       else 1 }}
+                  rest: >-
+                    {% set k = as_timestamp(states('sensor.koekken_lyskaede_kurve_slut'), 0) %}
+                    {{ [(k - now().timestamp()) | round(0, 'ceil') | int, 0] | max }}
+                  tr: "{{ [basis | int(1), rest | int(0)] | max }}"
+              # Husets farveregel bor i script.koekken_lyskaede_maal — også
+              # for `laant_slut`, der lander her når en låner slipper (#2).
+              - action: script.koekken_lyskaede_maal
+                continue_on_error: true
+                data:
+                  transition: "{{ tr }}"
+
+  # Runde 2 (2026-07-03, user-valg): stempl MANUELT sluk af lyskæden.
+  # Manuel = context uden automation-parent (fejlklasse #3-mønsteret:
+  # app/UI-sluk har user_id, fysisk sluk har tom context — begge parent=none;
+  # automations-sluk (auto-off, godnat, entré-NED, varsler) har parent sat og
+  # stempler IKKE, så de må gen-tændes af presence som hidtil).
+  # Konsument: presence_light_koekken_on gren 2 (grace-gate) i
+  # automations/presence_koekken.yaml. NB: from on → off matcher IKKE
+  # unavailable-flap (on→unavailable→off), så Zigbee-drop stempler ikke.
+  # -------------------------------------------------------------------------
+  # FØRSTE LYS i et kulsort open plan (2026-09-13e, user-spec)
+  # -------------------------------------------------------------------------
+  # "så snart den ser movement (men selvfølgelig ikke ved ghost flaps) og så
+  # snart spisestue eller sofa stue ser movement, hvis de alle er slukket."
+  #
+  # Hvorfor en EGEN automation og ikke en gren i presence_light_koekken_on:
+  # den er betinget af KØKKEN-occupancy + KØKKEN-bevægelse på 250 cm-aksen, og
+  # de to krav er hele pointen dér (en sofa-liggende er et still-target i
+  # køkken-Apolloens 6 m felt, 2026-08-19g). Vi må ikke slække dem — vi mangler
+  # en ANDEN, smallere vej ind. Den her fyrer kun når open-plan er kulsort OG
+  # alt lys er slukket, altså præcis det scenarie hvor "for meget lys" ikke er
+  # en fejl man kan lave.
+  #
+  # 2026-10-16 (K1a, user-valg): DEN PRÆMIS HOLDT IKKE. "Kulsort" er
+  # koekken_dagslys_lx < 15, og under ~20 lx er LTR390'en sit sidste trin, ikke
+  # en måling — kulsort stod on i fuldt dagslys med vinduet på 42-116 lx.
+  # Målt 14 døgn: 15 af 32 tændinger skete ved sol 7-30° med lux_ok off, 9 af
+  # dem i perioder hvor brugerens 40 lx-tærskel aldrig tændte (~209 min dagslys-kæde).
+  # Nu kræves også binary_sensor.koekken_lyskaede_lux_ok — hovedvejens anker
+  # (#2). Alle 17 nat-/tusmørke-tændinger havde lux_ok on → uændrede. lux_ok
+  # var unavailable 14 s på 14 døgn (genstarter) → intet fallback, som hovedvejen.
+  # BEVIDST INGEN re-arm på lux_ok's off→on (foreslået, målt fra): 33 af 74
+  # flanker kom < 60 s efter at vores EGET lys slukkede (kæden lyser +56 lx ind
+  # i vindues-kanalen), og alle 8 hvor en re-arm kunne have fyret var kædens
+  # egen sluk 8-54 s før — den ville gen-tænde kæden i ring. Ægte tusmørke med
+  # nogen i et mørkt open plan forekom 0 gange; næste bevægelse er re-armen.
+  #
+  # GHOST-VÆRNET er ikke en ny tærskel, men de tre eksisterende, målte kanaler:
+  #   køkken    → koekken_bevaegelse_nylig (akkumuleret rå bevægelse, 09-04b)
+  #   stue      → stue_apollo_bevaegelse_frisk (moving_target, delay_off 20 s)
+  #   spisestue → spisestue_apollo_occupancy_filtered (gust-debounce 6/20 s;
+  #               rummet har ingen bevægelses-kanal, og gardin-flappet ER dens
+  #               spøgelse — filteret er bygget mod netop det)
+  # Replay af 14 døgn med HELE gate-pakken påført: 34 tændinger (2,4/døgn),
+  # fordelt på time 6-8, 11-19 og 23 — NUL mellem 01 og 05. Natte-spøgelserne
+  # (stue-kanalen alene: 34 flanker kl. 02, 64 kl. 23) lukkes altså allerede af
+  # godnat_common_active + house_state, ikke af noget nyt.
+  #
+  # Niveau/kurve: kun SEGMENT 0. transition 1 er ikke et magisk tal, det ER
+  # feature'en — "hurtigt lys" betyder at der ikke rampes. Enforcerens
+  # on_edge-gren fyrer på vores off→on-kant, venter fade-hurtig og løfter
+  # kæden videre til target_brightness over langsom-fadet; vi rører hverken
+  # farve-anker eller mål-niveau (#2).
+  - id: koekken_lyskaede_foerste_lys
+    alias: "Køkken-lyskæde: første lys (kulsort open plan + bevægelse)"
+    description: >
+      Kulsort open plan + alt open-plan-lys slukket + vinduet under lux-tærsklen
+      (lux_ok) + bevægelse i ÉT af de tre open-plan-rum → øjeblikkeligt lavt
+      orange lys på lyskæden. Enforceren
+      fuldfører kurven. Dækker hullet hvor man kommer ind i open-plan fra
+      putning og kun stue-/spisestue-Apolloen kan se én.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.koekken_bevaegelse_nylig
+        from: "off"
+        to: "on"
+        id: koekken
+      - platform: state
+        entity_id: binary_sensor.stue_apollo_bevaegelse_frisk
+        from: "off"
+        to: "on"
+        id: stue
+      - platform: state
+        entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+        from: "off"
+        to: "on"
+        id: spisestue
+    condition:
+      # Kulsort + alt slukket. Ankeret indeholder også 0-lx-afbryderen.
+      - condition: state
+        entity_id: binary_sensor.koekken_openplan_kulsort
+        state: "on"
+      - condition: state
+        entity_id: light.koekken_lyskaede
+        state: "off"
+      # 2026-10-16 (K1a): kulsort alene er ikke mørke — se kommentaren over.
+      - condition: state
+        entity_id: binary_sensor.koekken_lyskaede_lux_ok
+        state: "on"
+      # --- herunder: SAMME gate-pakke som presence_light_koekken_on (#2).
+      # Afviger den, har vi to tænd-veje med hver sin mening om hvornår
+      # køkkenet må lyse.
+      - condition: state
+        entity_id: binary_sensor.presence_sensors_available
+        state: "on"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      - condition: template
+        value_template: "{{ not is_state('input_select.room_mode_koekken', 'Manual') }}"
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+      - condition: state
+        entity_id: input_boolean.cinema_active
+        state: "off"
+      - condition: template
+        value_template: >-
+          {{ is_state('binary_sensor.godnat_common_active', 'off')
+             or is_state('binary_sensor.godnat_faelles_morgen_fri', 'on') }}
+      - condition: state
+        entity_id: binary_sensor.sleepover_openplan_moerkt
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.mood_pause_stue
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.entre_shutdown_grace
+        state: "off"
+      # Manuelt sluk vinder også her — ellers ville det fixede hul (2026-07-03)
+      # bare åbne igen fra en anden vej.
+      - condition: template
+        value_template: >-
+          {% set g = states('input_number.koekken_manual_off_grace_minutes') | float(5) %}
+          {{ g <= 0 or
+             (now().timestamp() - (state_attr('input_datetime.koekken_lyskaede_manual_off_at', 'timestamp') | float(0))) > g * 60 }}
+    action:
+      # 2026-09-26: i arbejdslys (morgen / hjemkomst i mørke) er første glimt
+      # ikke orange men kurvens første halvdel i hvidt, på 1 s — ellers blinker
+      # køkkenet orange før enforceren omfarver det (user: "hurtigt op til 50 %
+      # hvid og så langsomt hvidere derfra").
+      - if:
+          - condition: state
+            entity_id: binary_sensor.koekken_arbejdslys
+            state: "on"
+        then:
+          - action: script.koekken_lyskaede_maal
+            continue_on_error: true
+            data:
+              andel: 0.5
+              transition: 1
+        else:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: light.koekken_lyskaede
+            data:
+              hs_color:
+                - "{{ states('input_number.koekken_lyskaede_hue') | float(28) }}"
+                - "{{ states('input_number.koekken_lyskaede_saturation') | float(99) }}"
+              brightness_pct: >-
+                {{ [states('input_number.koekken_lyskaede_foerste_lys_pct') | int(8), 1] | max }}
+              transition: 1
+      - service: logbook.log
+        data:
+          name: "Køkken-lyskæde"
+          message: >-
+            Første lys ({{ states('input_number.koekken_lyskaede_foerste_lys_pct') | int(8) }} %)
+            {# 2026-09-17: `trigger` er UDEFINERET når automationen kaldes via
+               automation.trigger (openplan-hurtigvækningen gør det). Uden guard
+               aborterer HELE action'en med UndefinedError — lyset ville aldrig
+               tænde, og logbook-linjen er det eneste sted trigger.id bruges.
+               NB `| default()` duer IKKE her: attribut-opslaget trigger.id
+               kaster UndefinedError FØR filteret når at gribe det (verificeret
+               mod /api/template). Kun `trigger is defined` virker. #}
+            — bevægelse i {{ trigger.id if trigger is defined else 'ekstern' }}, open plan kulsort
+            ({{ states('sensor.koekken_dagslys_lx') }} lx, vindue
+            {{ states('sensor.spisestue_lux_reel') }} lx) og alt lys slukket.
+
+  - id: koekken_lyskaede_manual_off_track
+    alias: "Køkken-lyskæde: stempl manuelt sluk (grace)"
+    description: >
+      Brugeren slukkede selv lyskæden → stempl tidspunkt. Presence må ikke
+      gen-tænde i koekken_manual_off_grace_minutes (rod-årsag 2026-07-02:
+      manuelt app-sluk blev gen-tændt af gennemgangs-presence 2,8 min senere).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: light.koekken_lyskaede
+        from: "on"
+        to: "off"
+    condition:
+      # 2026-08-20: rettet fra `parent_id is none`. parent_id sættes KUN når
+      # automationen selv blev trigget af en anden context — en TIDS-trigget
+      # automation har parent_id = None præcis som en bruger. Bevist live: vejr-
+      # varslets 17:00-blink slukkede lyskæden 5 gange og stemplede hver gang
+      # "manuelt sluk" → presence var blokeret 30 min ind i aftensmaden (og igen
+      # efter 18:30-blinket). Samme fejl blev fundet og rettet for gardinerne
+      # 2026-07-30, se automations/gardin_manual_grace.yaml — men aldrig
+      # kopieret herover (#2/#12). Et ægte app/dashboard-sluk bærer user_id.
+      - condition: template
+        value_template: "{{ trigger.to_state.context.user_id is not none }}"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.koekken_lyskaede_manual_off_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ---------------------------------------------------------------------------
+  # DIN HÅND — kravet `haand` i ejerskab/koekken_lyskaede.yaml (2026-10-04)
+  # ---------------------------------------------------------------------------
+  # User-spec: din egen justering holder kæden fra husets mål til den slukkes;
+  # madlavning vinder altid (står i kravets `naar`, ikke her). To kilder:
+  #   • justering MENS den lyser (on → on) med user_id = app/dashboard/scene-
+  #     tryk fra UI (#3: user_id, aldrig parent_id). Et tænd-tryk (off → on)
+  #     er IKKE et valg af udseende — dér maler on_edge husets mål som før.
+  #   • sluppet Styrbar-farveloop: zha-events bærer intet user_id, så loopet
+  #     stemples her (før: farven blev malet over ~2 s efter slip, B-bug 2).
+  # NB: API-kald med et user-token stempler også (#11) — ryd efter tests.
+  - id: koekken_lyskaede_haand_stempel
+    alias: "Køkken-lyskæde: stempl din hånd (ejer-kravet haand)"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: light.koekken_lyskaede
+        id: justering
+      - platform: state
+        entity_id: input_boolean.styrbar_lr_holding_stue
+        from: "on"
+        to: "off"
+        id: farveloop
+    condition:
+      - condition: state
+        entity_id: light.koekken_lyskaede
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ trigger.id == 'farveloop'
+             or (trigger.from_state is not none
+                 and trigger.from_state.state == 'on'
+                 and trigger.to_state.state == 'on'
+                 and trigger.to_state.context.user_id is not none) }}
+    action:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.koekken_lyskaede_haand_ts
+        data:
+          value: "{{ now().timestamp() | int }}"

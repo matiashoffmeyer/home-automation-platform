@@ -1,0 +1,566 @@
+# =============================================================================
+# Room Modes — Holy Grail base architecture
+# =============================================================================
+#
+# Hvert rum har et room_mode-anker (input_select.room_mode_<rum>). I DRIFT
+# skrives kun Auto <-> Manual: et Styrbar-tryk (script.styrbar_stamp_press)
+# eller en app-justering (automations/manual_override.yaml) -> Manual,
+# automations/room_drift_back.yaml -> Auto. "Off" bruges kun i sove som
+# presence-blok. Dim/Bright + 31 %-tærsklen er slettet (2026-10-07, B198).
+# L/R-knapperne cykler FARVE, ikke mode (automations/styrbar_rooms.yaml).
+#
+# Drift-back: tomt rum i global_drift_back_empty_minutes (open plan og bad
+# har egne slidere) ELLER optaget-fallback efter room_manual_on_hold_hours
+# siden sidste tryk ELLER 24 t ikke-Auto (room_mode_<rum>_ikke_auto_siden);
+# tændte lys glider over hardkodet 600 s.
+# Den verificerede helhed: system_design.md §1-2 (2026-10-07).
+#
+# De 9 zoner (system_design.md §1):
+#   1. sovevaerelse
+#   2. stue          (KUN sofa-zonen, se 2026-09-03d nedenfor)
+#   3. spisestue     (open plan)
+#   4. koekken       (open plan)
+#   5. boernevaerelse
+#   6. terrasse
+#   7. depot         (vinduesløst)
+#   8. badevaerelse  (vinduesløst)
+#   9. entre
+#
+# 2026-09-03d (user-spec: "hvis jeg via app justerer lys i spisestuen, så skal
+# KUN spisestuen gå på manuel, ikke hele open plan — og så fremdeles for alle
+# tre rum som er del af openplan").
+# Open-plan var ÉT zone-anker (`room_mode_stue`) fordi det fysisk er ét rum
+# under Holy Grail. Prisen var at ENHVER app-justering af ét open-plan-lys
+# frøs presence i alle tre: et tryk på lyskæden slog sofa-zonens og
+# spisestuens auto-lys fra i op til 3 timer. Nu har hver af de tre sit eget
+# anker, og `room_mode_stue` betyder KUN sofa-zonen.
+#
+# Skellet der afgør hvilket anker en gate skal læse:
+#   • handler automationen på ÉT rums lamper  → dét rums eget room_mode
+#   • handler den på hele open-plan-sættet på én gang (morgenrampen,
+#     dagslys-sluk, velkomstlyset) → binary_sensor.open_plan_manual, som er
+#     sand hvis MINDST ét af de tre står Manual. Det bevarer nøjagtigt den
+#     gamle adfærd for netop de veje, der jo rører alle tre rum.
+# Fejlklasse #1: glemmer man et READ-sted, holder en manuel justering op med
+# at blokere; glemmer man et WRITE-sted (release-listerne nedenfor), kan et
+# rum hænge på Manual for evigt. Begge lister er gennemgået i samme commit.
+# =============================================================================
+
+input_select:
+  room_mode_sovevaerelse:
+    name: "Soveværelse mode"
+    icon: mdi:bed
+    # Dim/Bright fjernet 2026-10-07 (B198): kun ukaldte scripts skrev dem.
+    # "Off" bliver — sove bruger den som presence-blok.
+    options: &mode_options
+      - Auto
+      - Manual
+      - "Off"
+  # KUN sofa-zonen siden 2026-09-03d — se hovednoten øverst.
+  room_mode_stue:
+    name: "Stue mode"
+    icon: mdi:sofa
+    options: *mode_options
+  room_mode_spisestue:
+    name: "Spisestue mode"
+    icon: mdi:table-chair
+    options: *mode_options
+  room_mode_koekken:
+    name: "Køkken mode"
+    icon: mdi:countertop
+    options: *mode_options
+  room_mode_boernevaerelse:
+    name: "Børneværelse mode"
+    icon: mdi:teddy-bear
+    options: *mode_options
+  room_mode_terrasse:
+    name: "Terrasse mode"
+    icon: mdi:flower
+    options: *mode_options
+  room_mode_depot:
+    name: "Depot mode"
+    icon: mdi:package-variant
+    options: *mode_options
+  room_mode_badevaerelse:
+    name: "Badeværelse mode"
+    icon: mdi:shower
+    options: *mode_options
+  room_mode_entre:
+    name: "Entré mode"
+    icon: mdi:door
+    options: *mode_options
+
+input_datetime:
+  # Timestamp of the last physical Styrbar press per room. Drift-back læser
+  # dem til race-vinduet (ingen drift < 30 min efter et tryk) og til
+  # optaget-fallbacken (room_manual_on_hold_hours siden sidste tryk).
+  styrbar_last_press_sovevaerelse:
+    name: "Styrbar sidst trykket (soveværelse)"
+    has_date: true
+    has_time: true
+  styrbar_last_press_stue:
+    name: "Styrbar sidst trykket (stue)"
+    has_date: true
+    has_time: true
+  # 2026-09-03d: ingen fysisk Styrbar i køkken/spisestue, men BEGGE stemples af
+  # app-justeringer via script.styrbar_stamp_press, og room_drift_back læser
+  # {{ 'input_datetime.styrbar_last_press_' ~ room }} for hvert rum i sit
+  # presence_map. Mangler de, render stemplet 'unknown' → drift-backens
+  # race-beskyttelse falder tilbage på 9999 og rummet drifter for tidligt.
+  styrbar_last_press_spisestue:
+    name: "Styrbar sidst trykket (spisestue)"
+    has_date: true
+    has_time: true
+  styrbar_last_press_koekken:
+    name: "Styrbar sidst trykket (køkken)"
+    has_date: true
+    has_time: true
+  styrbar_last_press_boernevaerelse:
+    name: "Styrbar sidst trykket (børneværelse)"
+    has_date: true
+    has_time: true
+  # 2026-06-19: dedikeret ØJEBLIKKELIGT intent-stempel når en soveværelse-Styrbar
+  # trykkes (sat før al lys-logik af bedroom_styrbar_emergency_intent). Nat-låsen
+  # (bedroom_night_guard) bruger dette til race-frit at tillade nød-lys: styrbar_
+  # last_press stemples FØRST EFTER lyset (op til 2s ved hold→snap-full), så det
+  # alene var ikke pålideligt til at adskille nød-tryk fra automation.
+  bedroom_styrbar_intent_at:
+    name: "Soveværelse Styrbar nød-intent (tidspunkt)"
+    has_date: true
+    has_time: true
+  styrbar_last_press_terrasse:
+    name: "Styrbar sidst trykket (terrasse)"
+    has_date: true
+    has_time: true
+  styrbar_last_press_depot:
+    name: "Styrbar sidst trykket (depot)"
+    has_date: true
+    has_time: true
+  styrbar_last_press_badevaerelse:
+    name: "Styrbar sidst trykket (badeværelse)"
+    has_date: true
+    has_time: true
+  styrbar_last_press_entre:
+    name: "Styrbar sidst trykket (entré)"
+    has_date: true
+    has_time: true
+    # Stemples af entré-Styrbarens egen handler (automations/entre_somrig.yaml),
+    # ikke af styrbar_rooms.yaml::ieee_to_room. Læses af
+    # automations/room_drift_back.yaml::recent_press
+    # via {{ states('input_datetime.styrbar_last_press_' ~ room) }} hvor
+    # room='entre'. Sletning fjerner 30-min race-protection på entré drift.
+
+  entre_loft_manual_on_at:
+    name: "Entré loft manuelt tændt (wall-cycle)"
+    has_date: true
+    has_time: true
+    icon: mdi:gesture-tap-button
+    # Sprint 2026-05-23: stampes når entre_loft transitioner unavailable→on
+    # (= power restored after wall-switch flip = user MANUEL tænd).
+    # entre_motion_off gates på dette med 5-min threshold → manuel tænd
+    # respekteres som klart "hold lyset tændt" signal.
+
+  # 2026-10-07 (B198): hvornår forlod rummet Auto? Skrives af
+  # automations/room_drift_back.yaml::room_mode_ikke_auto_stempel og læses af
+  # drift-backens 24-t-fallback. room_mode's last_changed duer ikke (nulstilles
+  # ved restart). Ingen `initial:` → persisterer; urørt = dagens midnat =
+  # ugyldig. Runtime-stempler, ikke config → ikke i helpers_export-allowlisten.
+  room_mode_sovevaerelse_ikke_auto_siden:
+    name: "Soveværelse: ikke-Auto siden"
+    has_date: true
+    has_time: true
+    icon: mdi:timer-alert-outline
+  room_mode_stue_ikke_auto_siden:
+    name: "Stue: ikke-Auto siden"
+    has_date: true
+    has_time: true
+    icon: mdi:timer-alert-outline
+  room_mode_spisestue_ikke_auto_siden:
+    name: "Spisestue: ikke-Auto siden"
+    has_date: true
+    has_time: true
+    icon: mdi:timer-alert-outline
+  room_mode_koekken_ikke_auto_siden:
+    name: "Køkken: ikke-Auto siden"
+    has_date: true
+    has_time: true
+    icon: mdi:timer-alert-outline
+  room_mode_boernevaerelse_ikke_auto_siden:
+    name: "Børneværelse: ikke-Auto siden"
+    has_date: true
+    has_time: true
+    icon: mdi:timer-alert-outline
+  room_mode_terrasse_ikke_auto_siden:
+    name: "Terrasse: ikke-Auto siden"
+    has_date: true
+    has_time: true
+    icon: mdi:timer-alert-outline
+  room_mode_depot_ikke_auto_siden:
+    name: "Depot: ikke-Auto siden"
+    has_date: true
+    has_time: true
+    icon: mdi:timer-alert-outline
+  room_mode_badevaerelse_ikke_auto_siden:
+    name: "Badeværelse: ikke-Auto siden"
+    has_date: true
+    has_time: true
+    icon: mdi:timer-alert-outline
+  room_mode_entre_ikke_auto_siden:
+    name: "Entré: ikke-Auto siden"
+    has_date: true
+    has_time: true
+    icon: mdi:timer-alert-outline
+
+input_number:
+  # Drift-back parametre, eksponeret saa de kan tunes fra UI uden YAML-edits.
+  #
+  # (room_mode_drift_minutes slettet 2026-10-07, B198: ingen forbruger —
+  # drift-back-glidningen er hardkodet 600 s i script.room_drift_back.
+  # room_empty_drift_minutes + room_mode_hold_hours slettet 2026-07-25.)
+  # 2026-07-25 (user-spec, ny semantik): occupied-FALLBACK — bliver man i
+  # rummet efter et manuelt tryk, drifter rummet til Auto efter X timer.
+  # Tomt rum drifter ALTID efter global_drift_back_empty_minutes (denne
+  # slider gate'r ikke længere empty-drift som før 2026-07-25).
+  # Consumes: automations/room_drift_back.yaml (occupied_hold_h / ceiling_hit).
+  # Fresh-install-default: config_snapshots/ (siden P1 2026-10-04).
+  # 2026-10-01 (user-spec, B173 svar "a)": "Manual-låsen slipper, når rummet
+  # har været tomt i X min (kortere end i dag)"). EGEN slider for stue/spisestue/
+  # køkken frem for at sænke global_drift_back_empty_minutes: den globale rammer
+  # også soveværelset, hvis Apollo taber en sovende i 5-15 min (#26). Læses af
+  # automations/room_drift_back.yaml som BÅDE tom-tid og race-vindue (race =
+  # min(30, denne) — samme regel som badet). Målt 14 døgn (17/9-1/10): de 5
+  # gange user selv måtte tænde i et mørkt Manual-rum var ALLE blokeret af det
+  # faste 30-min race-vindue; 15 min redder 4 af 5 for 0,5 sluppet tændt
+  # Manual-indstilling/døgn (10 min: 4/5 for 0,9; 20 min: 2/5 for 0,4).
+  open_plan_drift_back_empty_minutes:
+    name: "Drift-back: tom open plan-tid før Auto"
+    icon: mdi:timer-sand
+    min: 5
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  room_manual_on_hold_hours:
+    name: "Manuel-hold for tændte lys (timer)"
+    min: 0.5
+    max: 12
+    step: 0.5
+    icon: mdi:hand-back-right
+  # 2026-06-24 (user-spec task 5): soveværelset har sin EGEN manuel-hold —
+  # 2026-07-25 ny semantik: occupied-fallback. Bliver man i sove efter et
+  # manuelt tryk (varme via L/R, brightness), drifter rummet til Auto efter
+  # denne tid (= presence overtager igen). Tomt sove drifter efter den
+  # globale empty-slider. Default 1.0 t. Overstyrer den globale
+  # room_manual_on_hold_hours KUN for sovevaerelse (jf. badets egen
+  # badevaerelse_manual_til_auto_minutes). Consumes: room_drift_back.yaml.
+  sovevaerelse_manual_on_hold_hours:
+    name: "Soveværelse: manuel-hold for tændte lys (timer)"
+    min: 0.5
+    max: 12
+    step: 0.5
+    icon: mdi:bed-clock
+
+  # 2026-08-19 (user-spec: "min manuelle tænding af spisestue lampen blev
+  # overrulet hurtigt i går. manuel (også fra app) skal persiste (3h timer)").
+  # EGEN slider og ikke room_manual_on_hold_hours: den styrer hvornår et rum
+  # drifter fra Manual tilbage til Auto, og står bevidst på 1,5 t. Her handler
+  # det om at et TÆNDT lys ikke må slukkes af presence/sluk-veje — et andet
+  # scope, og at hæve den fælles til 3 ville have flyttet drift-back i hele
+  # huset uden at nogen bad om det. Consumes: binary_sensor.stue_manuel_lys_hold.
+  manuel_lys_hold_timer:
+    name: "Manuel tænding: hold mod auto-sluk (timer)"
+    min: 0.5
+    max: 12
+    step: 0.5
+    icon: mdi:lightbulb-alert
+
+  # Per-room Styrbar L/R click cycle index (0-15) — 16-color palette.
+  # Defined per rum saa hvert rum cycler uafhaengigt.
+  styrbar_color_idx_sovevaerelse:
+    name: "Styrbar farve-index (sove)"
+    min: 0
+    max: 15
+    step: 1
+    initial: 0
+    icon: mdi:palette
+  styrbar_color_idx_stue:
+    name: "Styrbar farve-index (stue)"
+    min: 0
+    max: 15
+    step: 1
+    initial: 0
+    icon: mdi:palette
+  styrbar_color_idx_boernevaerelse:
+    name: "Styrbar farve-index (børn)"
+    min: 0
+    max: 15
+    step: 1
+    initial: 0
+    icon: mdi:palette
+  styrbar_color_idx_terrasse:
+    name: "Styrbar farve-index (terrasse)"
+    min: 0
+    max: 15
+    step: 1
+    initial: 0
+    icon: mdi:palette
+  styrbar_color_idx_depot:
+    name: "Styrbar farve-index (depot)"
+    min: 0
+    max: 15
+    step: 1
+    initial: 0
+    icon: mdi:palette
+  styrbar_color_idx_badevaerelse:
+    name: "Styrbar farve-index (bad)"
+    min: 0
+    max: 15
+    step: 1
+    initial: 0
+    icon: mdi:palette
+  styrbar_color_idx_entre:
+    name: "Styrbar farve-index (entré)"
+    min: 0
+    max: 15
+    step: 1
+    initial: 0
+    icon: mdi:palette
+
+  # Per-room Styrbar L/R HOLD palette80 cursor (0-79) — discrete 80-color
+  # curated sequence. Erstattede palette40 per user-request 2026-05-03 for
+  # seamless perception (~4.5° hue-steps = JND threshold = ingen synlige stops).
+  # 6 cursors (depot-cursoren er bevaret selvom depot-Styrbaren er frigjort).
+  # Loopet i
+  # styrbar_universal_lr_hold steper +1 (right) eller -1 (left) per 50ms,
+  # giver ~4 sek for fuld 80-cycle. Independent fra styrbar_color_idx_<rum>
+  # (16-palette short-press cursor) — short og long har egne sequences.
+  styrbar_palette80_idx_sovevaerelse:
+    name: "Styrbar 80-palette index (sove)"
+    min: 0
+    max: 79
+    step: 1
+    initial: 0
+    icon: mdi:palette-swatch-outline
+  styrbar_palette80_idx_stue:
+    name: "Styrbar 80-palette index (stue)"
+    min: 0
+    max: 79
+    step: 1
+    initial: 0
+    icon: mdi:palette-swatch-outline
+  styrbar_palette80_idx_boernevaerelse:
+    name: "Styrbar 80-palette index (børn)"
+    min: 0
+    max: 79
+    step: 1
+    initial: 0
+    icon: mdi:palette-swatch-outline
+  styrbar_palette80_idx_terrasse:
+    name: "Styrbar 80-palette index (terrasse)"
+    min: 0
+    max: 79
+    step: 1
+    initial: 0
+    icon: mdi:palette-swatch-outline
+  styrbar_palette80_idx_badevaerelse:
+    name: "Styrbar 80-palette index (bad)"
+    min: 0
+    max: 79
+    step: 1
+    initial: 0
+    icon: mdi:palette-swatch-outline
+  styrbar_palette80_idx_depot:
+    name: "Styrbar 80-palette index (depot)"
+    min: 0
+    max: 79
+    step: 1
+    initial: 0
+    icon: mdi:palette-swatch-outline
+
+  # Sove L/R warmth cursor (2026-06-22): aktuel kelvin-target for soveloftets
+  # varme-loop (styrbar_sove_warmth.yaml). Runtime-cursor (ikke i snapshot).
+  # initial 2700 = medium varm; faktisk startpunkt aflæses fra lyset /
+  # sensor.auto_color_temp_evening.
+  styrbar_ct_kelvin_sove:
+    name: "Sove Styrbar varme-cursor (K)"
+    min: 1798
+    max: 6535
+    step: 1
+    initial: 2700
+    icon: mdi:thermometer
+
+  entre_mode_idx:
+    name: "Entre Styrbar mode index (L/R cycle)"
+    min: 0
+    max: 3
+    step: 1
+    initial: 0
+    icon: mdi:palette-swatch
+    # Cursor for entre Styrbar L/R cycle. 4 modes: 0=auto, 1=zen,
+    # 2=all_bright, 3=all_off. Wraps via modulo i automation.
+
+  entre_brightness_cursor:
+    name: "Entré brightness cursor (Styrbar quick-tap)"
+    min: 0
+    max: 100
+    step: 1
+    icon: mdi:cursor-pointer
+    # Sprint 2026-05-25: fixer race condition i Styrbar entré quick-tap.
+    # Værdi reflekterer SENESTE step-target (ikke nuværende faktiske
+    # brightness). Quick-tap-automations læser cursor hvis fresh (<2s
+    # siden sidste set) — ellers re-sync fra bulb. Undgår at parallel
+    # invocations læser samme stale brightness fra HA's state-cache
+    # (bulb-reports lagger ~300ms efter transition).
+
+input_boolean:
+  # Per-rum grace window — blokerer UP-klik i 1.5 sek efter L/R release
+  # for at undgaa N2-quirkens spurious 'on' event efter hver L/R hold release.
+  styrbar_lr_grace_sovevaerelse:
+    name: "Styrbar L/R grace (sove)"
+    initial: false
+    icon: mdi:timer-sand
+  styrbar_lr_grace_stue:
+    name: "Styrbar L/R grace (stue)"
+    initial: false
+    icon: mdi:timer-sand
+  styrbar_lr_grace_boernevaerelse:
+    name: "Styrbar L/R grace (børn)"
+    initial: false
+    icon: mdi:timer-sand
+  styrbar_lr_grace_terrasse:
+    name: "Styrbar L/R grace (terrasse)"
+    initial: false
+    icon: mdi:timer-sand
+  styrbar_lr_grace_badevaerelse:
+    name: "Styrbar L/R grace (bad)"
+    initial: false
+    icon: mdi:timer-sand
+  styrbar_lr_grace_depot:
+    name: "Styrbar L/R grace (depot)"
+    initial: false
+    icon: mdi:timer-sand
+
+  # Per-rum OP hold tracking. Set ON ved move_with_on_off (start),
+  # set OFF ved stop_with_on_off (slip). Lader up_hold automation
+  # afgoere efter 2 sek delay om brugeren stadig holder.
+  styrbar_up_holding_sovevaerelse:
+    name: "Styrbar OP holding (sove)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+  styrbar_up_holding_stue:
+    name: "Styrbar OP holding (stue)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+  styrbar_up_holding_boernevaerelse:
+    name: "Styrbar OP holding (børn)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+  styrbar_up_holding_terrasse:
+    name: "Styrbar OP holding (terrasse)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+  styrbar_up_holding_badevaerelse:
+    name: "Styrbar OP holding (bad)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+  styrbar_up_holding_depot:
+    name: "Styrbar OP holding (depot)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+
+  # Per-rum L/R hold tracking (C2). Universal lr_hold_loop bruger denne flag
+  # som while-condition. Set ON ved 'hold' command, set OFF ved 'release'.
+  # Loop'en exit'er naturligt naar flag bliver off.
+  styrbar_lr_holding_sovevaerelse:
+    name: "Styrbar L/R holding (sove)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+  styrbar_lr_holding_stue:
+    name: "Styrbar L/R holding (stue)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+  styrbar_lr_holding_boernevaerelse:
+    name: "Styrbar L/R holding (børn)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+  styrbar_lr_holding_terrasse:
+    name: "Styrbar L/R holding (terrasse)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+  styrbar_lr_holding_badevaerelse:
+    name: "Styrbar L/R holding (bad)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+  styrbar_lr_holding_depot:
+    name: "Styrbar L/R holding (depot)"
+    initial: false
+    icon: mdi:gesture-tap-hold
+
+# =============================================================================
+# MANUEL LYS-HOLD (2026-08-19, user-spec: "manuel (også fra app) skal persiste")
+# =============================================================================
+# Incident 08-18: user tændte spisestue-loftet fra appen 21:05 og igen 21:11;
+# `presence_light_spisestue_off` slukkede det 21:10 og 21:15 via sin /5-backstop.
+# Den automation målte "tomt i 20 min" på spisebords-Apolloens last_changed —
+# der havde stået off hele tiden mens han rent faktisk sad der — og havde
+# hverken en Manual-gate eller et blik på hvor længe LYSET havde været tændt.
+#
+# Holdet er stempel-baseret, ikke mode-baseret: room_mode drifter tilbage til
+# Auto efter 20 min tomt rum, og det må ikke frigive et lys nogen lige har
+# tændt. Slipper når `manuel_lys_hold_timer` er gået — eller straks hvis
+# huset er tomt (GPS/anker er et vidne der ikke kan hænge, modsat radaren).
+# Stemplet dækker BÅDE Styrbar og app: manual_override.yaml skriver
+# `styrbar_last_press_stue` for begge veje (light.spisestue_loft → rum 'stue'),
+# dog kun når `nogen_hjemme` er ON — et fjern-tryk fra byen må ikke opfinde en
+# tilstedeværelse. Samme betingelse står derfor i sensoren.
+template:
+  - binary_sensor:
+      # 2026-09-03d: ét anker for "er MINDST ét open-plan-rum manuelt sat?".
+      # Læses af de veje der rører hele open-plan-sættet i ét kald (morgen-
+      # rampen, dagslys-sluk, velkomstlyset) — for dem er den gamle adfærd
+      # stadig den rigtige: har brugeren selv sat ét af lysene, skal en
+      # hus-bred handling på alle tre holde fingrene væk.
+      # Rum-SPECIFIKKE gates må IKKE læse denne — så var splittet ikke sket.
+      # Ingen availability-guard: `is_state` på en manglende entity er false,
+      # og fejl-retningen skal være "rør ikke lyset", ikke "rør det alligevel".
+      - name: "Open plan manual"
+        unique_id: open_plan_manual
+        icon: mdi:hand-back-right
+        state: >-
+          {{ is_state('input_select.room_mode_stue', 'Manual')
+             or is_state('input_select.room_mode_spisestue', 'Manual')
+             or is_state('input_select.room_mode_koekken', 'Manual') }}
+
+      - name: "Stue manuel lys-hold"
+        unique_id: stue_manuel_lys_hold
+        icon: mdi:hand-back-right
+        state: >-
+          {% set raw = states('input_datetime.styrbar_last_press_stue') %}
+          {% set sat = raw not in ['unknown','unavailable',''] and raw[11:] != '00:00:00' %}
+          {% set lp = state_attr('input_datetime.styrbar_last_press_stue', 'timestamp') | float(0) %}
+          {% set h = states('input_number.manuel_lys_hold_timer') | float(3) %}
+          {% set alder = as_timestamp(now()) - lp %}
+          {# 2026-09-23: et fuldt lys-hold (stue-Styrbar langt OP) der er SLUPPET
+             fordi open-plan var tom, frigiver også dette hold for samme tryk —
+             ellers stod sofa-zonen tændt i op til 3 t i et tomt rum "i Auto"
+             (packages/open_plan_fuldt_lys.yaml). Urørt stempel = midnat → ignorér. #}
+          {% set sl_raw = states('input_datetime.open_plan_fuldt_lys_sluppet') %}
+          {% set sl = state_attr('input_datetime.open_plan_fuldt_lys_sluppet', 'timestamp') | float(0)
+                      if sl_raw not in ['unknown','unavailable',''] and sl_raw[11:] != '00:00:00' else 0 %}
+          {# 2026-09-26 (user: "ved 1 person hjemme skal lys slukke mere
+             aggressivt ved tomt rum"): "nogen hjemme" er hus-bredt (#26) — er
+             den ENE person bekræftet uden for open plan i 5 min, sidder hun
+             ikke i stuen og holder lyset. packages/solo_hurtig_sluk.yaml. #}
+          {# 2026-10-03e: den automatiske Sofa Zen OVERTOG stuen efter trykket
+             (packages/sofa_zen_auto.yaml, user-spec "eget kortere hold") →
+             lysene er ikke længere brugerens, og sofa-sluk skal kunne tage dem
+             når Zen slipper. Samme mønster som fuldt lys-holdet ovenfor. #}
+          {% set zo_raw = states('input_datetime.sofa_zen_overtog') %}
+          {% set zo = state_attr('input_datetime.sofa_zen_overtog', 'timestamp') | float(0)
+                      if zo_raw not in ['unknown','unavailable',''] and zo_raw[11:] != '00:00:00' else 0 %}
+          {{ sat and lp > 0 and 0 <= alder < (h * 3600)
+             and not (sl > 0 and sl >= lp)
+             and not (zo > 0 and zo >= lp)
+             and is_state('binary_sensor.nogen_hjemme', 'on')
+             and not is_state('binary_sensor.solo_uden_for_open_plan', 'on') }}

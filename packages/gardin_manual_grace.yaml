@@ -1,0 +1,243 @@
+# =============================================================================
+# Gardin manuel-ned grace (2026-06-18, user-spec)
+# =============================================================================
+# "Hvis jeg manuelt har rullet et gardin ned, skal der gå en slider-bestemt tid
+#  (default 120 min) hvor det IKKE automatisk ruller op igen."
+#
+# Detektion af "manuel ned" (user-valg 2026-06-18: app OG RODRET tæller):
+#   - HA-app / dashboard: cover.close_cover kaldt direkte af en bruger → cover-
+#     state→closed UDEN parent-context (auto-luk fra automations/scener/forsvar
+#     har altid en parent). Se automations/gardin_manual_grace.yaml.
+#   - RODRET-knap (stue): går gennem vores somrig-handlers → de kalder
+#     script.gardin_mark_manual_down eksplicit (handlers har parent, så
+#     parent-none-detektoren fanger dem IKKE — derfor in-handler-stempel).
+#   - Den fysiske Somfy-fjernbetjening er RF-envejs og USYNLIG for HA → kan
+#     ikke starte grace. (Kendt begrænsning.)
+#
+# Auto-op-gate (user-valg: ALLE auto-op blokeres): hvert auto-open-kald
+# fjerner de gardiner der er i grace via sensor.gardiner_manual_hold's
+# 'held'-liste:  {{ ønske_liste | reject('in', held) | list }}.
+#
+# HVEM konsulterer 'held' (verificeret 2026-07-28 — de tre house_modes-veje
+# manglede det, fejlklasse #1/#3): Active-open ×2 + godnat_auto_clear +
+# weekend-09:00 (house_modes) · godmorgen · morning_curtains · sommer- og
+# vinter-forsvarets genåbning.
+# BEVIDSTE UNDTAGELSER (rører gardinet uanset 'held'):
+#   - Vækning (wakeup_adults / wakeup_alarm_driven): en stillet alarm ER
+#     brugerens intent — grace må ikke aflyse morgenens gardin-åbning.
+#   - Dark Mode / Pre-Dark restore: de stempler grace SELV ved luk og RYDDER
+#     stemplet ved genåbning; ville de læse 'held', kunne de aldrig restore.
+#     De har dog en EGEN putning-undtagelse (user-spec 2026-07-28): er
+#     putning_sove_active on, springer restore sove-gardinet over — men rydder
+#     stadig dets grace-stempel, så den senere auto-åbning ikke blokeres.
+#   - Al fysisk betjening (Somrig, RODRET, app) — manuel vinder altid.
+#
+# grace = 0 → feature slået fra (held er altid tom).
+#
+# ⏰ B67-fix (2026-07-28): alders-tjekket bruger `state_attr(dt, 'timestamp')`,
+# IKKE `as_timestamp(states(dt))` — sidstnævnte parser input_datetime'ens naive
+# streng som UTC og gav +2 t skew, dvs. grace holdt 2 t LÆNGERE end slideren
+# sagde (fanget live: stempel 09:29, grace 120 min, stadig 'held' kl. 12:01).
+#
+# SLEEP OVER-HOLD (2026-08-14, user-incident): mens
+# `binary_sensor.sleepover_openplan_moerkt` er on holdes de TRE open-plan-
+# gardiner (stue syd/vest + spisestue vest) altid i 'held'. Sleep Over-featuren
+# (13/8) gatede otte LYS-veje, men ingen gardin-vej — og motorlarmen + dagslyset
+# vækker en gæst på sofaen lige så effektivt som lyset. Målt 14/8 06:05:23-27:
+# `morning_curtains_open_on_activity` rullede alle tre op, fordi akkumulerings-
+# ankeret målte gæstens EGEN vending på sofaen som "familien er vågnet"
+# (fejlklasse #20 + #21: kill-switchen sad ikke på hver vej ind).
+# Placeret her frem for i hver enkelt åbner, så morning_curtains, house_modes'
+# to Active-open-veje og sommer-/vinter-forsvarets genåbning arver holdet gratis
+# (fejlklasse #1/#16). Manuel betjening (Somrig/RODRET/app) læser IKKE 'held' →
+# gæsten og familien kan altid selv trække gardinet op.
+#
+# MOSBILLEDE-HOLD (2026-09-23, user-spec): mens
+# `input_boolean.mosbillede_gardin_ned` er on holdes cover.gardin_spisestue_vest
+# i 'held'. Solbeskyttelsen af mosbilledet (packages/mosbillede_solbeskyttelse.yaml)
+# lukker gardinet når solen når længere ind i spisestuen end slideren tillader —
+# og ingen af de ni auto-åbnere må rive det op igen mens solen stadig står der.
+# Placeret HER frem for i hver åbner, af samme grund som de to hold nedenfor:
+# en ny auto-åbner arver forbuddet gratis (fejlklasse #1/#2/#16). Featurens EGEN
+# åbning rydder flaget FØR den bygger listen, så den ikke filtrerer sig selv væk.
+#
+# PUTNING-HOLD (2026-07-28): mens `input_boolean.putning_sove_active` er on
+# (barn puttet i forældresengen) holdes cover.gardin_sovevaerelse ALTID i 'held'
+# — uafhængigt af grace-slideren, også når grace = 0. Placeret her frem for i
+# hvert kaldested, så alle auto-op-veje (godnat_auto_clear, godmorgen, forsvar,
+# Dark Mode-restore, morning_curtains) arver holdet gratis.
+# =============================================================================
+
+input_number:
+  gardin_manual_grace_minutes:
+    name: "Gardin: manuel-ned grace (min)"
+    icon: mdi:timer-lock
+    min: 0
+    max: 480
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+# Per-gardin tidsstempel for sidste MANUELLE ned. Ingen `initial:` → persisterer
+# over restarts og starter tomt (= ingen grace) på fresh install.
+input_datetime:
+  gardin_manual_down_syd:
+    name: "Gardin manuel-ned: stue syd"
+    has_date: true
+    has_time: true
+  gardin_manual_down_vest_1:
+    name: "Gardin manuel-ned: stue vest 1"
+    has_date: true
+    has_time: true
+  gardin_manual_down_spisestue_vest:
+    name: "Gardin manuel-ned: spisestue vest"
+    has_date: true
+    has_time: true
+  gardin_manual_down_sove:
+    name: "Gardin manuel-ned: soveværelse"
+    has_date: true
+    has_time: true
+
+template:
+  - sensor:
+      # 'held' = liste over de gardiner der pt. er indenfor grace-vinduet efter
+      # et manuelt ned. Auto-open-kald subtraherer denne liste. now() → HA
+      # re-renderer ca. hvert minut (fint for et 120-min vindue).
+      #
+      # 2026-09-02b (user-spec: "gardiner der åbner af sig selv — det må de bare
+      # ikke, kun ved tryk på godmorgen-knap eller gardin-knap"): i AirBnB holdes
+      # ALLE FIRE gardiner permanent. Sove-gardinet havde allerede sin gate i
+      # tragten script.sove_gardin_op, men de tre open-plan-gardiner har ingen
+      # tragt — hver auto-åbner kalder cover.open_cover direkte, og reglen var
+      # derfor kodet i seks automations og manglede i tre (fejlklasse #2/#21).
+      # Ankeret er det rigtige sted: en NY auto-åbner arver forbuddet gratis,
+      # fordi den i forvejen skal subtrahere 'held'.
+      # Manuelle tryk (Somrig/RODRET → cover.* direkte) læser ikke 'held' og er
+      # derfor uberørte — det er præcis de to knapper user vil beholde.
+      # 2026-10-04 (B123): tæppet gælder KUN åbning — luk-vejene læser
+      # attributten `held_luk` (uden tæppet), se nederst.
+      - name: "Gardiner manual hold"
+        unique_id: gardiner_manual_hold
+        icon: mdi:curtains-closed
+        # state = ANTAL gardiner i grace. Beregnes UAFHÆNGIGT (ikke self-ref til
+        # egen 'held'-attr — det gav unavailable/deadlock 2026-06-18).
+        # 2026-08-14: state bygger nu SAMME liste som 'held' og tæller den, i
+        # stedet for at gentage reglerne i en parallel tæller (de to nåede at
+        # divergere ved putning-holdet). Stadig ingen self-ref til egen attribut.
+        state: >
+          {% set g = states('input_number.gardin_manual_grace_minutes') | float(120) %}
+          {% set m = {
+               'cover.gardin_stue_syd': 'input_datetime.gardin_manual_down_syd',
+               'cover.gardin_stue_vest_1': 'input_datetime.gardin_manual_down_vest_1',
+               'cover.gardin_spisestue_vest': 'input_datetime.gardin_manual_down_spisestue_vest',
+               'cover.gardin_sovevaerelse': 'input_datetime.gardin_manual_down_sove' } %}
+          {% set ns = namespace(l=[]) %}
+          {% if g > 0 %}
+            {% for cov, dt in m.items() %}
+              {% set t = state_attr(dt, 'timestamp') %}
+              {% if t is not none and (as_timestamp(now()) - (t | float(0))) < g * 60 %}
+                {% set ns.l = ns.l + [cov] %}
+              {% endif %}
+            {% endfor %}
+          {% endif %}
+          {% if is_state('input_boolean.putning_sove_active', 'on')
+                and 'cover.gardin_sovevaerelse' not in ns.l %}
+            {% set ns.l = ns.l + ['cover.gardin_sovevaerelse'] %}
+          {% endif %}
+          {% if is_state('binary_sensor.sleepover_openplan_moerkt', 'on') %}
+            {% from 'rosters.jinja' import open_plan_gardiner %}{% for cov in open_plan_gardiner
+                           %}
+              {% if cov not in ns.l %}{% set ns.l = ns.l + [cov] %}{% endif %}
+            {% endfor %}
+          {% endif %}
+          {% if is_state('input_select.house_mode', 'AirBnB') %}
+            {% for cov in m %}
+              {% if cov not in ns.l %}{% set ns.l = ns.l + [cov] %}{% endif %}
+            {% endfor %}
+          {% endif %}
+          {% if is_state('input_boolean.mosbillede_gardin_ned', 'on')
+                and 'cover.gardin_spisestue_vest' not in ns.l %}
+            {% set ns.l = ns.l + ['cover.gardin_spisestue_vest'] %}
+          {% endif %}
+          {{ ns.l | count }}
+        attributes:
+          held: >
+            {% set g = states('input_number.gardin_manual_grace_minutes') | float(120) %}
+            {% set m = {
+                 'cover.gardin_stue_syd': 'input_datetime.gardin_manual_down_syd',
+                 'cover.gardin_stue_vest_1': 'input_datetime.gardin_manual_down_vest_1',
+                 'cover.gardin_spisestue_vest': 'input_datetime.gardin_manual_down_spisestue_vest',
+                 'cover.gardin_sovevaerelse': 'input_datetime.gardin_manual_down_sove' } %}
+            {% set ns = namespace(l=[]) %}
+            {% if g > 0 %}
+              {% for cov, dt in m.items() %}
+                {% set t = state_attr(dt, 'timestamp') %}
+                {% if t is not none and (as_timestamp(now()) - (t | float(0))) < g * 60 %}
+                  {% set ns.l = ns.l + [cov] %}
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            {% if is_state('input_boolean.putning_sove_active', 'on')
+                  and 'cover.gardin_sovevaerelse' not in ns.l %}
+              {% set ns.l = ns.l + ['cover.gardin_sovevaerelse'] %}
+            {% endif %}
+            {% if is_state('binary_sensor.sleepover_openplan_moerkt', 'on') %}
+              {% from 'rosters.jinja' import open_plan_gardiner %}{% for cov in open_plan_gardiner
+                             %}
+                {% if cov not in ns.l %}{% set ns.l = ns.l + [cov] %}{% endif %}
+              {% endfor %}
+            {% endif %}
+            {% if is_state('input_select.house_mode', 'AirBnB') %}
+              {% for cov in m %}
+                {% if cov not in ns.l %}{% set ns.l = ns.l + [cov] %}{% endif %}
+              {% endfor %}
+            {% endif %}
+            {% if is_state('input_boolean.mosbillede_gardin_ned', 'on')
+                  and 'cover.gardin_spisestue_vest' not in ns.l %}
+              {% set ns.l = ns.l + ['cover.gardin_spisestue_vest'] %}
+            {% endif %}
+            {{ ns.l }}
+          # LUK-blokliste (B123, 2026-10-04). = `held` MINUS AirBnB-tæppet.
+          # AirBnB-forbuddet er et ÅBNE-forbud ("gardiner må ikke åbne af sig
+          # selv"); da luk-vejene læste `held`, kunne intet gardin lukke under et
+          # ophold (sept.: sove-gardinet 100 % oppe i 6½ nat, aftenluk sprunget
+          # over 7 aftener). Grace/putning/sleepover/mosbillede bliver med: de
+          # beskytter også mod motorlarm ved en sovende og mod at rive et bevidst
+          # valg op. ENHVER auto-LUK-vej læser denne, aldrig `held`; om en luk-
+          # vej skal køre i AirBnB er dens EGEN mode-gate (user 4/10: kun sove-
+          # aftenluk). TRE kopier af base-reglerne (state, held, held_luk) — ret
+          # alle tre i samme commit (#2).
+          held_luk: >
+            {% set g = states('input_number.gardin_manual_grace_minutes') | float(120) %}
+            {% set m = {
+                 'cover.gardin_stue_syd': 'input_datetime.gardin_manual_down_syd',
+                 'cover.gardin_stue_vest_1': 'input_datetime.gardin_manual_down_vest_1',
+                 'cover.gardin_spisestue_vest': 'input_datetime.gardin_manual_down_spisestue_vest',
+                 'cover.gardin_sovevaerelse': 'input_datetime.gardin_manual_down_sove' } %}
+            {% set ns = namespace(l=[]) %}
+            {% if g > 0 %}
+              {% for cov, dt in m.items() %}
+                {% set t = state_attr(dt, 'timestamp') %}
+                {% if t is not none and (as_timestamp(now()) - (t | float(0))) < g * 60 %}
+                  {% set ns.l = ns.l + [cov] %}
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            {% if is_state('input_boolean.putning_sove_active', 'on')
+                  and 'cover.gardin_sovevaerelse' not in ns.l %}
+              {% set ns.l = ns.l + ['cover.gardin_sovevaerelse'] %}
+            {% endif %}
+            {% if is_state('binary_sensor.sleepover_openplan_moerkt', 'on') %}
+              {% from 'rosters.jinja' import open_plan_gardiner %}{% for cov in open_plan_gardiner
+                             %}
+                {% if cov not in ns.l %}{% set ns.l = ns.l + [cov] %}{% endif %}
+              {% endfor %}
+            {% endif %}
+            {% if is_state('input_boolean.mosbillede_gardin_ned', 'on')
+                  and 'cover.gardin_spisestue_vest' not in ns.l %}
+              {% set ns.l = ns.l + ['cover.gardin_spisestue_vest'] %}
+            {% endif %}
+            {{ ns.l }}
+
+# script.gardin_mark_manual_down lever i script_pkg/house_routines.yaml
+# (repo-konvention: scripts samlet der). Kaldes af detektoren + RODRET-handlers.

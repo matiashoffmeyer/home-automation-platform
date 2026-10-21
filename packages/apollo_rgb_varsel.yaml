@@ -1,0 +1,242 @@
+# =============================================================================
+# Apollo RGB-varsel — ÉT anker + ÉN driver for husets tre RGB-varsler
+# =============================================================================
+# User-spec 2026-08-16h, i to skridt:
+#   1) "det skal være forbudt for rgb apollo lys at være full on. vi går over
+#      til blink for alle rgb varsler."
+#   2) "longer breaks between the blinks, giving the lux sensor a chance to se
+#      the real lux. and allo rgb warnings turn off with godnat button clicks."
+#
+# HVORFOR DET IKKE BLEV ESPHome'S EGEN "Slow Pulse"
+# -------------------------------------------------
+# Første forsøg brugte den indbyggede on-device-effekt (én write, nul chip-wear).
+# Målt live på køkken-Apolloen samme aften — og den duer ikke:
+#   80 % + Slow Pulse:  min 141 / mean 468 / max 888 lx
+#   25 % + Slow Pulse:  min 132 / mean 204 / max 326 lx   (HA melder bri=64)
+# Effekten IGNORERER den kommanderede brightness og ramper mod fuld styrke: ved
+# en indstilling hvis steady-værdi er 17 lx, er pulsens BUND alene 132 lx. Den
+# bryder altså krav 1 ("aldrig full on"), og den bunder aldrig i nul, så den
+# giver heller ikke lux-sensoren det mørke vindue krav 2 beder om. Til
+# sammenligning målte `open_plan_lux` 90,3 mens den pulsede — værre end de 1,9
+# der startede hele sagen. HA rapporterer desuden en STATISK brightness under
+# pulsen, så lux-kompensationen kan ikke engang modellere den væk (den kender
+# ikke fasen).
+#
+# LØSNINGEN: `flash: short`
+# -------------------------
+# `light.turn_on` med `flash: short` = ESP'en lyser 2 sek og slukker SELV igen.
+# Verificeret live 21:50:48 → on(bri 64, hue 216) 21:50:49-51 → off 21:50:52.
+# Det giver tre ting på én gang:
+#   * ÉN write pr. blink (ingen HA-side tænd/sluk-loop → ingen chip-wear,
+#     jf. docs/apollo_calibration.md og de 2 af 5 Apolloer der døde i maj),
+#   * ægte mørke mellem blinkene — LED'en er slukket 87-97 % af tiden, så
+#     Apolloens LTR390 måler rummet i stedet for sig selv,
+#   * og vigtigst: **en hængende, tændt LED er nu strukturelt umulig.** Dør HA
+#     midt i et blink, slukker ESP'en alligevel. Hele den gamle fejlklasse
+#     ("LED'en hænger blå natten over fordi sluk-flanken blev tabt") findes
+#     ikke længere, og dermed forsvandt også behovet for ejerskabs-tests på
+#     hue + brightness, /15-min sluk-backstops og de tre off-automationer.
+#
+# EJERSKAB (fejlklasse #1/#2)
+# ---------------------------
+# Før havde dug/regn/batteri hver sin _on- og _off-automation der skrev til de
+# SAMME LED'er og skelnede sig fra hinanden på hue + brightness, adskilt af
+# tidsvinduer. Da alle tre nu kører samme styrke fra samme slider, kan
+# brightness ikke længere skille dem ad — ejerskabs-testen var på vej til at
+# blive en løgn. Derfor er de seks automationer erstattet af:
+#   sensor.apollo_rgb_varsel   — hvem vinder lige nu? (Batteri > Regn > Dug)
+#   automation apollo_rgb_varsel_blink — renderer vinderen som blink
+# Prioriteten og gatesne bor ÉT sted. Skal du ændre hvornår et varsel vises,
+# er det sensorens state-template — ikke tre automationer der skal holdes i sync.
+# =============================================================================
+
+template:
+  - sensor:
+      # =======================================================================
+      # Hvem ejer Apollo-LED'en lige nu?
+      # =======================================================================
+      # Bevidst UDEN attributter: lys-listen og farven bor i driveren nedenfor.
+      # Grunden er fejlklasse #24 — en attribut der afhænger af now() (og alle
+      # tre varsler har tidsvinduer) skriver en DB-række i det øjeblik den
+      # ændrer sig, og `this.state` inde i en attribut-template peger på den
+      # FORRIGE state, så mappingen ville skulle beregne vinderen om igen =
+      # samme regel to steder (#2). Sensoren publicerer kun navnet.
+      #
+      # Gatesne pr. varsel er 1:1 dem de tre gamle automationer havde, med to
+      # tilføjelser der nu gælder ALLE tre (user-spec 2): godnat og AirBnB.
+      - name: "Apollo RGB varsel"
+        unique_id: apollo_rgb_varsel
+        icon: mdi:television-ambient-light
+        state: >-
+          {% set bad = ['unknown', 'unavailable', 'none', ''] %}
+          {% set godnat = is_state('binary_sensor.godnat_common_active', 'on') %}
+          {% set airbnb = is_state('input_select.house_mode', 'AirBnB') %}
+          {% set active = is_state('input_select.house_state', 'Active') %}
+
+          {% set ra = states('input_datetime.varsel_apollo_rgb_on') %}
+          {% set rb = states('input_datetime.varsel_apollo_rgb_off') %}
+          {% set regn = is_state('input_boolean.weather_warning_enabled', 'on')
+                        and state_attr('sensor.vejr_varsel_i_dag', 'is_rain') == true
+                        and ra not in bad and rb not in bad
+                        and today_at(ra) <= now() < today_at(rb) %}
+
+          {% set da = states('input_datetime.dug_apollo_rgb_on') %}
+          {% set db = states('input_datetime.dug_apollo_rgb_off') %}
+          {% set dug = (states('input_number.dug_varsel_sensitivitet') | float(0)) > 0
+                       and state_attr('sensor.dug_varsel_i_nat', 'is_dug') == true
+                       and da not in bad and db not in bad
+                       and today_at(da) <= now() < today_at(db) %}
+
+          {# Godnat og AirBnB slukker ALT — user-spec 2, og AirBnB-regel 5:
+             påtving aldrig familiens varsler på en gæst. Begge har en
+             automatisk udgang (flaget rydder sig selv om morgenen / ved
+             mode-skift), så varslet kommer af sig selv igen. #}
+          {% if godnat or airbnb %}Ingen
+          {% elif is_state('binary_sensor.battery_critical_any', 'on') %}Batteri
+          {% elif active and regn %}Regn
+          {% elif active and dug %}Dug
+          {% else %}Ingen{% endif %}
+
+automation:
+  # ===========================================================================
+  # DRIVEREN — ét burst pr. minut, resten af minuttet mørkt
+  # ===========================================================================
+  - id: apollo_rgb_varsel_blink
+    alias: "Apollo RGB-varsel: blink med lange mørke pauser"
+    description: >
+      Renderer vinderen fra sensor.apollo_rgb_varsel som et kort burst af
+      2-sekunders flash én gang i minuttet. Resten af minuttet er LED'en
+      slukket, så Apolloens egen lux-sensor kan måle rummet.
+      Perioden er bevidst fast (time_pattern /1 min) og kun burst-STØRRELSEN er
+      tunable: et sekund-baseret time_pattern ville koste 5760 tomme fires i
+      døgnet (fejlklasse #7), og en langtidskørende repeat-løkke ville dø tavst
+      ved HA-restart. Ét minuts tick er restart-immunt og selv-helbredende.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/1"
+      # Så det FØRSTE blink kommer med det samme når et varsel opstår, i stedet
+      # for at vente på næste minut-tick.
+      - platform: state
+        entity_id: sensor.apollo_rgb_varsel
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('sensor.apollo_rgb_varsel') in ['Batteri', 'Regn', 'Dug'] }}
+    action:
+      - variables:
+          v: "{{ states('sensor.apollo_rgb_varsel') }}"
+          # Dug bor i stue+køkken (aften, terrassen ses derfra); regn og batteri
+          # i sove+køkken (morgen-påklædning). Uændret fra de gamle automationer.
+          # Køkken-ringen er også gestus-timerens skærm (ravgul = hånd set,
+          # grøn = timer startet). Mens de kører, springes den over: ellers
+          # slukker værnet herunder kvitteringen midt i dens 2 s, eller et
+          # varsel-flash lægger sig oven i den (#1, delt udgang; 2026-10-11).
+          lys: >-
+            {% set l = ['light.stue_apollo_rgb_light', 'light.koekken_apollo_rgb_light']
+                 if v == 'Dug'
+                 else ['light.sovevaerelse_apollo_rgb_light', 'light.koekken_apollo_rgb_light'] %}
+            {% if is_state('script.koekken_gestus_set_signal', 'on')
+                  or state_attr('automation.kokken_gestus_start_timer_pa_n_minutter', 'current') | int(0) > 0 %}
+              {% set l = l | reject('eq', 'light.koekken_apollo_rgb_light') | list %}
+            {% endif %}
+            {{ l }}
+          # Batteri = rød (hue 0). Regn OG dug deler alert_regn_hue, præcis som
+          # før — "regn/våd = én farve i hele huset".
+          hue: >-
+            {{ 0 if v == 'Batteri'
+               else states('input_number.alert_regn_hue') | float(216) }}
+          bri: >-
+            {{ states('input_number.apollo_rgb_varsel_lysstyrke') | float(25) | round(0) | int }}
+      # Migrations-/anomali-værn: `flash` vender tilbage til lampens FORRIGE
+      # tilstand. Står LED'en (mod forventning) allerede steady-tændt — fx en
+      # rest fra den gamle kode henover en deploy — ville hvert flash altså
+      # efterlade den tændt igen. Ét sluk først, og kun når det faktisk gælder.
+      - if:
+          - condition: template
+            value_template: "{{ lys | select('is_state', 'on') | list | count > 0 }}"
+        then:
+          - service: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: "{{ lys }}"
+          - delay:
+              milliseconds: 400
+      - repeat:
+          count: >-
+            {{ states('input_number.apollo_rgb_varsel_blink') | float(2) | round(0) | int }}
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: "{{ lys }}"
+              data:
+                hs_color: ["{{ hue }}", 100]
+                brightness_pct: "{{ bri }}"
+                # 2 sek, hvorefter ESP'en selv slukker. ALDRIG steady on.
+                flash: short
+            # Kun MELLEM blinkene — ikke efter det sidste, ellers æder bursten
+            # unødigt af det mørke vindue. (repeat.index0 findes ikke i HA-Jinja,
+            # men repeat.last gør.)
+            - delay:
+                seconds: "{{ 0 if repeat.last else 3 }}"
+
+  # ===========================================================================
+  # GODNAT / AirBnB — sluk med det samme, vent ikke på at blinket klinger af
+  # ===========================================================================
+  - id: apollo_rgb_varsel_sluk
+    alias: "Apollo RGB-varsel: sluk ved godnat / AirBnB / HA-start"
+    description: >
+      user-spec: "allo rgb warnings turn off with godnat button clicks of
+      course!". Selve blinket stopper allerede af sig selv, fordi
+      sensor.apollo_rgb_varsel går til Ingen på godnat — men et flash der er i
+      luften kan nå at lyse op til 2 sek endnu, og en LED der (fra før denne
+      omlægning) står steady-tændt ville ellers blive stående. Denne rydder.
+      Ingen periodisk backstop med vilje: efter omlægningen findes der ikke
+      længere en vej der efterlader LED'en tændt, og et /15-tick ville i stedet
+      slukke andre ejeres brug af de samme LED'er (legetoejsdag,
+      sovevaerelse_morgen_beskyttelse) — fejlklasse #1 på en delt udgang.
+    mode: single
+    trigger:
+      # godnat_common_active = godnat_active OR voksne OR pending OR kalde.
+      # Børne-godnat er med vilje IKKE med: den rører kun børneværelset (hvis
+      # Apollo-LED godnat_night.yaml selv slukker), og de voksne er stadig oppe
+      # i de rum varslerne lyser i.
+      - platform: state
+        entity_id: binary_sensor.godnat_common_active
+        from: "off"
+        to: "on"
+      - platform: state
+        entity_id: input_select.house_mode
+        to: "AirBnB"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: template
+        value_template: >-
+          {{ ['light.stue_apollo_rgb_light', 'light.koekken_apollo_rgb_light',
+              'light.sovevaerelse_apollo_rgb_light']
+             | select('is_state', 'on') | list | count > 0 }}
+      # Ved HA-start må vi kun rydde hvis der IKKE er et aktivt varsel — ellers
+      # slukker vi et blink driveren lige har tændt. På godnat-/AirBnB-flanken
+      # skal vi slukke uanset hvad; det er hele pointen.
+      - condition: template
+        value_template: >-
+          {{ (trigger.platform | default('')) != 'homeassistant'
+             or states('sensor.apollo_rgb_varsel') not in ['Batteri', 'Regn', 'Dug'] }}
+    action:
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id:
+            - light.stue_apollo_rgb_light
+            - light.koekken_apollo_rgb_light
+            - light.sovevaerelse_apollo_rgb_light
+      - service: logbook.log
+        data:
+          name: "Apollo RGB-varsel"
+          message: >-
+            LED slukket — {{ 'godnat' if is_state('binary_sensor.godnat_common_active', 'on')
+                             else ('AirBnB' if is_state('input_select.house_mode', 'AirBnB')
+                                   else 'HA-start uden aktivt varsel') }}.

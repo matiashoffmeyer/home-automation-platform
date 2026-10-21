@@ -1,0 +1,147 @@
+# =============================================================================
+# FROSSEN-AFSTAND-FILTER — husets eneste maskine/menneske-diskriminator der er
+# uafhængig af afstand, rum og hvor Apolloen peger.
+#
+# Født 2026-08-20 som støddæmper under "xray mode": et eksperiment der åbnede
+# de pinnede gates på de tre open-plan-Apolloer for at teste user's hypotese om
+# at de ser ind i bad/børneværelse/soveværelse gennem gipsvægge.
+#
+# **EKSPERIMENTET ER AFSLUTTET OG RULLET TILBAGE 2026-08-22 — hypotesen holdt
+# ikke.** Køkken-g6 gav ingen sigtelinje ind i badet: Poisson-normaliseret
+# sammenfald mellem køkken-occupancy og `binary_sensor.badevaerelse_inde_occupancy`
+# faldt fra 2,15× FØR åbningen til 1,41× EFTER, mens køkkenets egen flap-rate
+# fordobledes (8,06 → 17,10 occupancy-flanker/time). Sammenfaldet er ADFÆRD —
+# folk går mellem nabo-rum — ikke gennemsyn. Gates over g5 og de nærfelts-gates
+# der flappede står på 100 igen. Fuld note: sprint 2026-08-22 i sprint_log.
+#
+# Filteret overlevede eksperimentet fordi diskriminatoren ikke er afstanden,
+# men om afstanden LEVER. Målt live:
+#   • statisk objekt: 241.0 · 241.0 · 241.0 … 90 samples i træk, identisk til
+#     decimalen, moving_distance 'unknown' hele vejen
+#   • menneske i køkkenet: 193 → 230 → 275 → 266 → 260 på fem sekunder;
+#     længste identiske ophold målt 4 s (64 samples)
+#   • fjern-detektion i stuen (~5,5 m): længste identiske ophold 22 s
+# Vejrtrækning og mikro-bevægelse flytter still-targetets range-bin; et møbel
+# gør ikke. Modsat køkkenets `< 75 cm`-gate (køleskabet) og stuens
+# varigheds-krav, som begge er rum-specifikke (CLAUDE.md 08-20d).
+#
+# GRÆNSE (B90): filteret fanger kun spøgelser hvor afstanden står HELT stille.
+# Et langt stue-spøgelse hvor tallet stadig jitrer kan det ikke skille fra en
+# person — dér er der ingen kendt diskriminator.
+#
+# KONSTRUKTION (fejlklasse #4/#20/08-20d):
+#   `*_afstand_jitter` er TRIGGER-baseret, ikke state-baseret: HA fyrer kun
+#   state-trigger når VÆRDIEN ændrer sig (identisk værdi = state_reported), så
+#   triggeren ER selve jitter-detektionen. `auto_off` holder vinduet uden et
+#   `now()` (fejlklasse #24: ingen minut-tick, ingen DB-række pr. minut).
+#   moving_target ligger i trigger-listen, ikke i ghost'ens betingelse: en
+#   flanke skal NULSTILLE vinduet, aldrig kunne slå masken fra og til — ellers
+#   flapper `filtered` på hver blink, præcis som B81 gjorde 08-20d.
+#
+# FAIL-OPEN OVERALT: jitter er `unknown` efter restart → `is_state(...,'off')`
+# er falsk → ingen maskering. Slider på 0 → filter helt fra. Forsvinder denne
+# pakke ved rollback, returnerer `is_state` på en ikke-eksisterende entity
+# False → de tre `occupancy_filtered` opfører sig som før.
+# -----------------------------------------------------------------------------
+
+input_number:
+  # Hvor længe afstanden skal stå BOMSTILLE (identisk til decimalen) før
+  # detektionen afvises som et møbel. Skal ligge langt over det et menneske
+  # kan producere (målt max 22 s) og under det et latchet spøgelse holder
+  # (timer). 0 = filter fra.
+  apollo_frossen_afstand_sekunder:
+    name: "Apollo: frossen afstand = spøgelse efter (s)"
+    icon: mdi:image-filter-center-focus-strong-outline
+    min: 0
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+
+template:
+  # --- jitter-detektorer: "afstanden har flyttet sig inden for vinduet" ------
+  - trigger:
+      - platform: state
+        entity_id:
+          - sensor.koekken_apollo_radar_still_distance
+          - sensor.koekken_apollo_radar_moving_distance
+          - binary_sensor.koekken_apollo_radar_moving_target
+    binary_sensor:
+      - name: "Koekken Apollo afstand jitter"
+        unique_id: koekken_apollo_afstand_jitter
+        icon: mdi:waveform
+        state: "true"
+        auto_off: >-
+          {{ [10, states('input_number.apollo_frossen_afstand_sekunder') | int(180)] | max }}
+
+  - trigger:
+      - platform: state
+        entity_id:
+          - sensor.spisestue_apollo_radar_still_distance
+          - sensor.spisestue_apollo_radar_moving_distance
+          - binary_sensor.spisestue_apollo_radar_moving_target
+    binary_sensor:
+      - name: "Spisestue Apollo afstand jitter"
+        unique_id: spisestue_apollo_afstand_jitter
+        icon: mdi:waveform
+        state: "true"
+        auto_off: >-
+          {{ [10, states('input_number.apollo_frossen_afstand_sekunder') | int(180)] | max }}
+
+  - trigger:
+      - platform: state
+        entity_id:
+          - sensor.stue_apollo_radar_still_distance
+          - sensor.stue_apollo_radar_moving_distance
+          - binary_sensor.stue_apollo_radar_moving_target
+    binary_sensor:
+      - name: "Stue Apollo afstand jitter"
+        unique_id: stue_apollo_afstand_jitter
+        icon: mdi:waveform
+        state: "true"
+        auto_off: >-
+          {{ [10, states('input_number.apollo_frossen_afstand_sekunder') | int(180)] | max }}
+
+  # --- spøgelset: occupancy holder, men afstanden er død --------------------
+  #
+  # delay_on: 30 er en RACE-GUARD, ikke en adfærds-knap. Trigger-baserede
+  # template-entities RESTORER deres state, så efter en reload/restart kan
+  # jitter komme tilbage som 'off' fra før nedlukningen. Uden guarden maskerer
+  # ghost'en da et LEVENDE rum indtil næste afstands-opdatering — målt live
+  # 20:58:44→20:59:11 = 27 s, og stuen fik dermed 3 skift på `filtered` ud af
+  # 0 skift på den rå sensor (08-20d's signatur: et filter der laver flanker i
+  # stedet for at fjerne dem).
+  # 30 s er valgt fordi det ligger over det LÆNGSTE ophold et menneske målt
+  # producerede mellem to afstands-opdateringer (22,5 s, 213 samples) — en
+  # levende krop rører altså tallet inden guarden udløber og nulstiller
+  # vinduet. Et møbel rører intet, så maskeringen kommer bare 30 s senere.
+  - binary_sensor:
+      - name: "Koekken Apollo frossen ghost"
+        unique_id: koekken_apollo_frossen_ghost
+        device_class: problem
+        icon: mdi:sofa-outline
+        delay_on: 30
+        state: >-
+          {{ (states('input_number.apollo_frossen_afstand_sekunder') | float(0)) > 0
+             and is_state('binary_sensor.koekken_apollo_occupancy', 'on')
+             and is_state('binary_sensor.koekken_apollo_afstand_jitter', 'off') }}
+
+      - name: "Spisestue Apollo frossen ghost"
+        unique_id: spisestue_apollo_frossen_ghost
+        device_class: problem
+        icon: mdi:sofa-outline
+        delay_on: 30
+        state: >-
+          {{ (states('input_number.apollo_frossen_afstand_sekunder') | float(0)) > 0
+             and is_state('binary_sensor.spisestue_apollo_occupancy', 'on')
+             and is_state('binary_sensor.spisestue_apollo_afstand_jitter', 'off') }}
+
+      - name: "Stue Apollo frossen ghost"
+        unique_id: stue_apollo_frossen_ghost
+        device_class: problem
+        icon: mdi:sofa-outline
+        delay_on: 30
+        state: >-
+          {{ (states('input_number.apollo_frossen_afstand_sekunder') | float(0)) > 0
+             and is_state('binary_sensor.stue_apollo_occupancy', 'on')
+             and is_state('binary_sensor.stue_apollo_afstand_jitter', 'off') }}

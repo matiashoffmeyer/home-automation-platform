@@ -1,0 +1,317 @@
+# =============================================================================
+# Manuel overstyring — app-justeringer markerer rummet Manual (opg 4, 2026-06-10)
+# =============================================================================
+# User-spec: "Hvis man sidder og manuelt ændrer lys og indstiller det som man
+# vil have det, skal auto-lys ved sensorbevægelse IKKE slå til. Der skal gå
+# 3 timer efter manuelt indstillede OG TÆNDTE lys, før de drifter tilbage
+# til Auto."
+#
+# Styrbar-tryk stamper allerede last_press + sætter Manual via
+# script.styrbar_stamp_press. Denne automation dækker justeringer i HA-APPEN.
+#
+# REWRITE 2026-06-11 (v2): fra state-triggers til call_service-event.
+# v1 (state-trigger på rum-grupperne) havde en fade-bug: en manuel SLUK med
+# transition holder gruppen i state 'on' mens medlemmerne fader → attribut-
+# ændringerne fyrede triggeren med user-context og to_state='on' → rummet
+# blev FEJLAGTIGT markeret Manual af en sluk-handling (observeret 2026-06-11:
+# bad → Manual efter light.turn_off med fade). v2 lytter i stedet på selve
+# servicekaldet:
+#   - light.turn_on OG light.turn_off (v3 2026-06-17, item 5 user-spec: "når
+#     jeg manuelt slukker for lys skal auto IKKE tænde lige efter"). Event-
+#     baseret → IKKE den gamle v1 fade-bug; vi reagerer på selve servicekaldet,
+#     ikke på gruppe-state-attributter under fade. Toggle ignoreres stadig.
+#   - KUN kald med context.user_id (ægte bruger via app/dashboard;
+#     automations/scripts har user_id=None → ingen loops)
+#   - Targets mappes til rum via entity-prefiks (grupper + enkelt-lys)
+#
+# v4 2026-08-01 (user-svar på "tre huller"-rapporten). Rum-mappet var en
+# håndskrevet allowlist, og en sammenligning mod /api/states afslørede tre
+# LIVE lys uden dækning:
+#   (a) KØKKENET — `light.koekken_room` + `light.koekken_lyskaede` + spottene
+#       (`switch.koekken_spots`, derfor de nye switch-triggers). De blev
+#       oprindeligt mappet til `stue`, fordi open-plan delte ét mode-anker.
+#       ⇒ OPHÆVET 2026-09-03d (user-spec: "hvis jeg via app justerer lys i
+#       spisestuen, så skal kun spisestuen gå på manuel, ikke hele open plan.
+#       og så fremdeles for alle tre rum som er del af openplan").
+#       Køkkenet har nu `room_mode_koekken`, spisestuen `room_mode_spisestue`,
+#       og `room_mode_stue` dækker KUN sofa-zonen. Prisen — at et tryk på
+#       lyskæden frøs sofa-zonens og spisestuens presence i op til 3 t — er
+#       dermed væk. Se hovednoten i packages/room_modes.yaml for hvilke gates
+#       der læser ét rums anker og hvilke der læser
+#       binary_sensor.open_plan_manual (mindst ét af de tre).
+#   (b) HUS-GRUPPERNE — `alle_lys` / `alle_indvendige` / `luksus_lys` markerede
+#       intet rum. Nu sætter de ALLE seks rum Manual. `light.festlys` er
+#       BEVIDST ikke med (2026-08-07) — se noten ved `hus_grupper` nedenfor.
+#   (c) TERRASSEN — forbliver bevidst udenfor (se note i `rooms` nedenfor).
+#
+# ⚠️ OG SÅ DEN STORE: `rooms` brugte `map('extract', m)` — og **`extract` er
+# ikke et Jinja/HA-filter**. Templaten kastede `TemplateRuntimeError: No filter
+# named 'extract'` ved HVER eneste fyring, så `variables:`-blokken fejlede og
+# scriptet blev afbrudt før første service-kald. Automationen har altså ALDRIG
+# markeret ét eneste rum Manual siden v2-rewriten 2026-06-11 — ~7 uger hvor
+# app-justeringer i praksis intet beskyttede, præcis som brugeren oplevede det
+# ("der er ikke grace period som på styrbar tryk?"). Bevis: `last_triggered`
+# opdateres FØRST når conditions er passeret og handlingerne starter, og den
+# var frisk (2026-08-01 07:05) — mens der ikke fandtes én eneste
+# "Manuel overstyring"-logbook-linje i recorderens 14 dage. Verificeret mod den
+# fulde HA-template-env (`slugify`/`iif` render fint, `extract` fejler).
+# Erstattet med en namespace-løkke (repoets normale mønster — Jinja her har
+# ingen list-comprehensions). Fejlklasse #6: den eksekverede sti blev aldrig
+# efterprøvet mod virkeligheden, kun mod læsning.
+# Action: script.styrbar_stamp_press → last_press-stamp + room_mode=Manual.
+# Drift-back (room_drift_back.yaml) slipper Manual når rummet har været tomt
+# (global_/open_plan_/bad-sliderne) eller efter room_manual_on_hold_hours i
+# et optaget rum (3 t i user-specen ovenfor var 2026-tallet; sliderne er
+# autoriteten, jf. system_design.md §2.1); presence-/LUX-tænd er gated på
+# mode != Manual.
+# =============================================================================
+- id: app_manual_adjust_marks_room_manual
+  alias: "Manuel overstyring: app-justering → Manual mode + 3h hold"
+  description: >
+    light.turn_on-servicekald med bruger-context på rum-lys stamper
+    last_press og sætter room_mode=Manual — samme adfærd som Styrbar-tryk.
+    Manuel SLUK markerer NU også Manual (v3 2026-06-17, item 5): så presence
+    ikke tænder lige efter en bevidst sluk; drift-back sender rummet
+    til Auto når det har stået tomt (empty + hold).
+  mode: queued
+  max: 10
+  trigger:
+    - platform: event
+      event_type: call_service
+      event_data:
+        domain: light
+        service: turn_on
+      id: "on"
+    # v3 2026-06-17 (item 5): manuel SLUK markerer også Manual.
+    - platform: event
+      event_type: call_service
+      event_data:
+        domain: light
+        service: turn_off
+      id: "off"
+    # v4 2026-08-01: køkken-spottene er en SWITCH (IKEA TRETAKT), ikke et light
+    # — uden disse to triggers ville køkkenets mest brugte lys være det eneste
+    # der ikke kunne overstyres fra appen. Der filtreres IKKE på entity her
+    # (service_data.entity_id kan være både streng og liste); rum-mappet
+    # nedenfor slipper kun switch.koekken_spots igennem, resten falder på
+    # `rooms | length > 0`.
+    - platform: event
+      event_type: call_service
+      event_data:
+        domain: switch
+        service: turn_on
+      id: "on"
+    - platform: event
+      event_type: call_service
+      event_data:
+        domain: switch
+        service: turn_off
+      id: "off"
+  condition:
+    # Ægte bruger-handling (app/dashboard). Automations har user_id=None.
+    - condition: template
+      value_template: "{{ trigger.event.context.user_id is not none }}"
+    # 2026-08-30: en snapshot-RESTORE er pr. definition "sæt det tilbage som det
+    # var" — aldrig en overstyring. Men et scene-apply arver den context der
+    # startede automationen, så køres varslet manuelt (dashboard-tap eller et
+    # API-kald under test), bærer HVER lampe i restoren brugerens user_id og
+    # ligner en app-justering. Målt 30/8 07:25:33: en test af morgen-vejrvarslet
+    # satte room_mode_stue = Manual i 3 t, og køkkenets madlavnings-spots var
+    # dermed hård-blokeret hele morgenen — 0 sessioner, mod 5-19 de foregående
+    # 8 dage med første start 06:10-07:36. Fejlklasse #11.
+    # Discriminatoren er eksakt og målt: scenens EGEN context.id er den context
+    # lys-kaldene bærer (ctx 7159CE0E stod på både scene.vejr_flash_restore og
+    # light.spisestue_loft i samme sekund).
+    # KUN snapshot-restore-scener står her. En håndlavet scene (snap_zen,
+    # full_bright) tappet med en finger ER en overstyring og skal stadig sætte
+    # Manual — derfor en allowlist og ikke `states.scene` bredt. Ny
+    # scene.create-restore et sted i huset → tilføj den her (#16).
+    - condition: template
+      value_template: >-
+        {% set restores = ['scene.vejr_flash_restore', 'scene.vejr_aften_flash_restore',
+                           'scene.predark_restore', 'scene.entre_somrig_undo_snapshot',
+                           'scene.legetoejsdag_restore'] %}
+        {% set ns = namespace(hit=false) %}
+        {% for s in restores %}
+          {% if states[s] is not none
+                and states[s].context.id == trigger.event.context.id %}
+            {% set ns.hit = true %}
+          {% endif %}
+        {% endfor %}
+        {{ not ns.hit }}
+  action:
+    - variables:
+        # Map target-entities → rum. Dækker rum-grupper OG enkelt-lys.
+        # spisestue_pendel er fysisk sove-loftet (flyttet 2026-06-05).
+        # Terrasse udeladt: plug-interceptoren (terrace_plug_control) ejer
+        # terrasse-flowet, og Manual-mode ville forstyrre den.
+        targets: >-
+          {% set t = trigger.event.data.service_data.get('entity_id', [])
+                     if trigger.event.data.service_data is defined else [] %}
+          {{ [t] if t is string else (t | list) }}
+        # Hus-grupperne sætter ALLE rum Manual (user-valg 2026-08-01: "ja, alle
+        # rum manual ved tryk"). Terrasse er ikke et room_mode-rum og indgår
+        # derfor ikke — plug-interceptoren ejer det flow, se note ovenfor.
+        # Rammer også script.sluk_alt / scene_full_bright / scene-toggle når de
+        # startes med et FINGERTRYK (scriptets kald arver brugerens user_id) —
+        # det er tilsigtet og er netop v3-princippet: har du selv slukket alt,
+        # må presence ikke tænde igen bagefter. Automation-/knap-drevne kald på
+        # de samme grupper (røgalarm, Dormant, AirBnB, entré-Somrig) har
+        # user_id = None og fanges derfor ikke.
+        alle_rum: >-
+          {{ ['stue', 'spisestue', 'koekken', 'sovevaerelse',
+              'boernevaerelse', 'badevaerelse', 'depot', 'entre'] }}
+        # `light.festlys` er BEVIDST ude (2026-08-07): den er ikke en almindelig
+        # lys-gruppe, men dance-modulets ENTRY POINT — et tap på tilen starter
+        # festen, og dance ejer selv sit room_mode-scope via
+        # dance_room_modes_claim/_release, som KUN tager de rum hvis
+        # dance_room_* er on (user-spec 2026-08-02). Stod festlys her, ville et
+        # tap sætte alle seks rum Manual, mens release kun giver de claimede
+        # tilbage → resten hang. Målt 08-07 06:54:57: et tap for en bad-ONLY
+        # fest efterlod stue/sove/børn/depot/entré låst på Manual, og depotets
+        # eget auto-sluk var dermed spærret. Fejlklasse #2 mod 08-02-scopet.
+        hus_grupper: >-
+          {{ ['light.alle_lys', 'light.alle_indvendige',
+              'light.luksus_lys'] }}
+        # Alder på "en fest/mood sluttede"-stemplet (packages/scene_state.yaml),
+        # sat af script.scene_toggle's exit-gren og dance_room_modes_release
+        # lige FØR de slukker. Et urørt input_datetime med has_date står på
+        # DAGENS midnat og ville ligne et friskt stempel kl. 02:00 → guard på
+        # tidsdelen. Skrevet stempel frem for last_changed (nulstilles ved
+        # restart, ville lyve om friskhed).
+        fest_slut_sek: >-
+          {% set raw = states('input_datetime.fest_slut_stempel') %}
+          {% if raw in ['unknown','unavailable','none',''] or raw[11:] == '00:00:00' %}999999
+          {% else %}{{ (now() - strptime(raw, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() }}{% endif %}
+        rooms: >-
+          {% set m = {
+            'light.stue_all': 'stue',
+            'light.stue_sofa_lampe': 'stue',
+            'light.stue_sofa_lampe_2': 'stue', 'light.stue_hjoernelampe': 'stue',
+            'light.stue_plug': 'stue', 'switch.stue_plug': 'stue',
+            'light.stue_laesehygge': 'stue',
+            'light.stue_room': 'stue',
+            'light.stue_spot_1': 'stue', 'light.stue_spot_2': 'stue',
+            'light.spisestue_loft': 'spisestue',
+            'light.sovevaerelse_all': 'sovevaerelse',
+            'light.spisestue_pendel': 'sovevaerelse',
+            'light.sove_lyskaede': 'sovevaerelse', 'switch.sove_lyskaede': 'sovevaerelse',
+            'light.boernevaerelse_all': 'boernevaerelse',
+            'light.boernevaerelse_loft': 'boernevaerelse',
+            'light.boernevaerelse_hygge_strip': 'boernevaerelse',
+            'light.boernevaerelse_hyggelys': 'boernevaerelse',
+            'light.badevaerelse_all': 'badevaerelse',
+            'light.badevaerelse_spot_1': 'badevaerelse',
+            'light.badevaerelse_spot_2': 'badevaerelse',
+            'light.badevaerelse_spot_3': 'badevaerelse',
+            'light.badevaerelse_spot_4': 'badevaerelse',
+            'light.badevaerelse_spot_5': 'badevaerelse',
+            'light.depot_all': 'depot', 'light.depot_loft': 'depot',
+            'light.depot_strip': 'depot', 'light.depot_loft_ikea': 'depot',
+            'light.depot_loft_hue_1': 'depot', 'light.depot_loft_hue_2': 'depot',
+            'light.entre_all': 'entre', 'light.entre_loft': 'entre',
+            'light.koekken_room': 'koekken', 'light.koekken_lyskaede': 'koekken',
+            'switch.koekken_spots': 'koekken'
+          } %}
+          {% set ns = namespace(r=[]) %}
+          {% for t in targets | map('string') | list %}
+            {% if t in m and m[t] not in ns.r %}{% set ns.r = ns.r + [m[t]] %}{% endif %}
+          {% endfor %}
+          {{ alle_rum
+             if targets | map('string') | select('in', hus_grupper)
+                | list | length > 0
+             else ns.r }}
+    - condition: template
+      value_template: "{{ rooms | length > 0 }}"
+    # === Hyggelampen alene er et FRAVALG/TILVALG, ikke en overstyring (2026-10-17) ===
+    # User: "det skal ikke sætte stuen i manuel tilstand at jeg slukker
+    # hyggelampen, men mit valg skal respekteres." Et app-SLUK af KUN
+    # hyggelampen sætter input_boolean.stue_hyggelampe_fravalgt (sofa-tænd-
+    # vejene lader den være) og rører ikke room_mode. Samme dag (user "ja"):
+    # et app-TÆND af kun den er heller ikke Manual — den er bare med igen
+    # (fravalget ryddes af stue_hyggelampe_fravalg_ryd på on-flanken). Kald
+    # der også rammer andre lys er uændret. Se packages/stue_plug.yaml.
+    - if:
+        - condition: template
+          value_template: >-
+            {{ targets | count > 0
+               and targets | map('string')
+                   | reject('in', ['light.stue_plug', 'switch.stue_plug'])
+                   | list | count == 0 }}
+      then:
+        - if:
+            - condition: template
+              value_template: "{{ trigger.id == 'off' }}"
+          then:
+            - service: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.stue_hyggelampe_fravalgt
+            - service: logbook.log
+              data:
+                name: "Hyggelampe-fravalg"
+                message: "slukket i appen → bliver slukket, stuen forbliver i sin tilstand"
+                entity_id: light.stue_plug
+        - stop: "Kun hyggelampen = fravalg/tilvalg, ikke Manual"
+    # === Fest-oprydning er IKKE en overstyring (2026-08-16d, user: "rod igen
+    # efter festlys! fuld auto mode for satan") ===
+    # At afslutte en fest og slukke lyset bagefter er en retur til normal.
+    # Fordi tilen/knappen blev trykket med en finger, arver kaldet brugerens
+    # user_id og ligner et manuelt "sluk alt" → uden dette hul låste festens
+    # afslutning hele huset på Manual i 3 t.
+    # Målt 08-16 14:51:44 → 14:52:46: festlys blev slukket, user trykkede
+    # alle-rum-Auto, og 34 s senere slukkede han lyset i huset → SEKS rum røg
+    # tilbage på Manual. Derfor 180 s: oprydningen sker i minutterne efter,
+    # ikke i sekunderne (den målte afstand var 62 s).
+    # SCOPET er bevidst snævert på to måder, så v3-princippet ("har du selv
+    # slukket, må presence ikke tænde igen") ellers står urørt:
+    #   - kun HUS-grupperne. Slukker du ét rums lys efter festen, er det stadig
+    #     en ægte overstyring af netop det rum.
+    #   - kun efter et stempel en fest-udgang selv har sat. script.sluk_alt og
+    #     scene_full_bright stempler ikke og rammes derfor ikke.
+    - condition: template
+      value_template: >-
+        {{ not (targets | map('string') | select('in', hus_grupper) | list | length > 0
+                and fest_slut_sek | float(999999) < 180) }}
+    - repeat:
+        for_each: "{{ rooms }}"
+        sequence:
+          - variables:
+              room: "{{ repeat.item }}"
+              last_ts: "{{ states('input_datetime.styrbar_last_press_' ~ room) }}"
+              since_last: >-
+                {% if last_ts in ['unknown','unavailable','none',''] %}9999
+                {% else %}{{ (now() - strptime(last_ts, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() }}{% endif %}
+          # Throttle: slider-drag fyrer mange kald — stamp max 1×/60s pr rum,
+          # MEDMINDRE rummet ikke allerede står i Manual. if/then (ikke bar
+          # condition) så ét throttlet rum ikke stopper resten af loopet.
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ since_last | float(9999) > 60
+                     or not is_state('input_select.room_mode_' ~ room, 'Manual') }}
+            then:
+              # `stamp` = "var det en finger i huset?" (2026-08-17).
+              # last_press fodrer sensor.last_physical_activity (3t Dormant-veto)
+              # og afvæbner wasp-udgangen — begge påstande om en KROP indendørs.
+              # Et app-kald har ingen sådan dimension: user_id propagerer ikke
+              # ned i input_datetime-skrivningen (verificeret live), så
+              # forbrugerne kan ikke selv skelne. Tror huset allerede at det er
+              # tomt (nogen_hjemme off), må et fjern-tryk derfor ikke opfinde en
+              # tilstedeværelse. Målt 08-17 08:21:32: user slukkede køkkenlyset
+              # fra appen i København → last_physical_activity sprang 3t frem og
+              # wasp_exit_armed blev afvæbnet, dvs. reaktionen på symptomet
+              # skubbede Dormant yderligere ud. Manual mode sættes stadig.
+              - service: script.styrbar_stamp_press
+                data:
+                  room: "{{ room }}"
+                  stamp: "{{ is_state('binary_sensor.nogen_hjemme', 'on') }}"
+              - service: logbook.log
+                data:
+                  name: "Manuel overstyring"
+                  message: >-
+                    {{ room }}: app-{{ 'sluk' if trigger.id == 'off' else
+                    'tænd/justering' }} → Manual mode (Auto igen efter {{
+                    states('input_number.global_drift_back_empty_minutes') | int(20)
+                    }} min tomt rum, eller {{
+                    states('input_number.room_manual_on_hold_hours') | float(3)
+                    }}h hvis man bliver).

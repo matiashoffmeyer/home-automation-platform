@@ -1,0 +1,186 @@
+# =============================================================================
+# Lampe-lys-måling i open plan — MIDLERTIDIGT MÅLEINSTRUMENT (2026-10-02, B178)
+# =============================================================================
+# USER: "ift køkkenet, gå med option a) og mål løs. mål meget!"
+#
+# Spørgsmålet der skal besvares: hvor meget lux lægger HVER af vores egne
+# lamper oven i køkken- og spisestue-Apolloens måling — pr. lampe, styrke og
+# FARVE? Først når det er målt, kan open_plan_lux få en nedre grænse
+# "rå − lampe-maks" der ser solen bryde igennem efter at lyset er tændt (2/10
+# 17:50: kanalen fremskrev 28 lx mens køkkenet målte 129 i sol, B178).
+# Hvorfor det ikke kan gættes: hvid lyskæde +78 lx, SAMME strip i mættet orange
+# +1 lx (2026-09-03b), spots ukendt — og rå-kanalerne er recorder-ekskluderede
+# (sensor.*_apollo_lux, *_lux_reel), så der fandtes INGEN historik at måle på.
+#
+# To lag:
+#  1. LØBENDE (recorder + LTS via state_class): køkken/spisestue-lux i hele
+#     lux + lampe-tilstanden med styrke og farve som attributter. Recorderen
+#     gemmer ingen lys-attributter (permanent faktum) → de ligger her.
+#  2. SPRING (ai_feedback/lux_lampe_feedback.jsonl, overlever purge): ved
+#     hvert tænd/sluk af en open-plan-lampe måles lux FØR og ved +10/+40/
+#     +80/+150 s. Apollo-lux rapporterer ca. hvert minut → før-værdien kan
+#     være op til ~60 s gammel, og først et sample med alder < (tid siden
+#     skiftet) er rent "efter". alder_s pr. sample afgør det i analysen.
+#     Andre lamper der skifter i vinduet ses i lamper_foer/lamper_efter.
+#
+# Fejlklasse #7: sluk/tænd af open-plan-lamper ≈ 20-60/dag → samme antal
+# shell-kald. Festlys/dance-effekter skifter brightness, ikke on/off → fanges
+# ikke (to:/from: on/off). Skrive-volumen lag 1: hel-lux skifter ~hvert
+# minut i dagtimerne (~1000 rækker/døgn pr. sensor) — accepteret mens vi måler.
+# FJERN pakken når B178 er kalibreret (≥ 1 uge mørke-data pr. lampe-kombi).
+# =============================================================================
+
+template:
+  - sensor:
+      - name: "Koekken lux maaling"
+        unique_id: koekken_lux_maaling
+        icon: mdi:flask-outline
+        unit_of_measurement: "lx"
+        state_class: measurement
+        state: "{{ states('sensor.koekken_lux_reel') | float(0) | round(0) }}"
+        availability: "{{ states('sensor.koekken_lux_reel') | is_number }}"
+        attributes:
+          led_fradrag: "{{ state_attr('sensor.koekken_lux_reel', 'led_fradrag') | float(0) | round(0) }}"
+
+      - name: "Spisestue lux maaling"
+        unique_id: spisestue_lux_maaling
+        icon: mdi:flask-outline
+        unit_of_measurement: "lx"
+        state_class: measurement
+        state: "{{ states('sensor.spisestue_lux_reel') | float(0) | round(0) }}"
+        availability: "{{ states('sensor.spisestue_lux_reel') | is_number }}"
+        attributes:
+          led_fradrag: "{{ state_attr('sensor.spisestue_lux_reel', 'led_fradrag') | float(0) | round(0) }}"
+
+      # State = antal tændte lamper (billig at plotte); attributterne bærer
+      # styrke + farve pr. lampe, så en lux-række kan parres med præcis det
+      # lys der lyste. Format pr. lampe: "off" | "<bri> <K>K" | "<bri> hs<h>/<s>".
+      - name: "Open plan lampe tilstand"
+        unique_id: open_plan_lampe_tilstand
+        icon: mdi:lightbulb-group-outline
+        state: >-
+          {{ (['light.koekken_lyskaede', 'switch.koekken_spots',
+               'light.spisestue_loft', 'light.stue_spot_1', 'light.stue_spot_2',
+               'light.stue_plug', 'light.stue_laesehygge', 'light.entre_loft',
+               'light.terrasse_paerelyskaede']
+              | select('is_state', 'on') | list | count) }}
+        attributes:
+          koekken_lyskaede: >-
+            {% set e = 'light.koekken_lyskaede' %}
+            {% if is_state(e, 'on') %}{% set k = state_attr(e, 'color_temp_kelvin') %}{% set hs = state_attr(e, 'hs_color') %}{{ state_attr(e, 'brightness') | int(0) }} {{ (k | string ~ 'K') if k else ('hs' ~ (hs[0] | round(0) | int) ~ '/' ~ (hs[1] | round(0) | int) if hs else '?') }}{% else %}{{ states(e) }}{% endif %}
+          koekken_spots: "{{ states('switch.koekken_spots') }}"
+          spisestue_loft: >-
+            {% set e = 'light.spisestue_loft' %}
+            {% if is_state(e, 'on') %}{% set k = state_attr(e, 'color_temp_kelvin') %}{% set hs = state_attr(e, 'hs_color') %}{{ state_attr(e, 'brightness') | int(0) }} {{ (k | string ~ 'K') if k else ('hs' ~ (hs[0] | round(0) | int) ~ '/' ~ (hs[1] | round(0) | int) if hs else '?') }}{% else %}{{ states(e) }}{% endif %}
+          stue: >-
+            {% set ns = namespace(o=[]) %}
+            {% for e in ['light.stue_spot_1', 'light.stue_spot_2', 'light.stue_plug', 'light.stue_laesehygge'] %}
+              {# B227: spottens styrke skifter hvert par sekunder under ilden → "ild" (fejlklasse #24). #}
+              {% if is_state(e, 'on') %}{% set ns.o = ns.o + [e.split('.')[1] ~ ':' ~ ('ild' if e in ['light.stue_spot_1', 'light.stue_spot_2'] and is_state('script.stue_spots_ild', 'on') else state_attr(e, 'brightness') | int(0))] %}{% endif %}
+            {% endfor %}
+            {{ ns.o | join(' ') if ns.o else 'off' }}
+          entre_loft: "{{ states('light.entre_loft') }}"
+          terrasse: "{{ states('light.terrasse_paerelyskaede') }}"
+
+automation:
+  - id: lux_lampe_spring_maaling
+    alias: "Måling: lux-spring ved lampe-skift i open plan"
+    description: >
+      Midlertidigt måleinstrument (B178). Logger køkken/spisestue-lux før og
+      efter hvert tænd/sluk af en open-plan-lampe til
+      ai_feedback/lux_lampe_feedback.jsonl. Slukker/tænder intet selv.
+    mode: parallel
+    max: 12
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: &lamper
+          - light.koekken_lyskaede
+          - switch.koekken_spots
+          - light.spisestue_loft
+          - light.stue_spot_1
+          - light.stue_spot_2
+          - light.stue_plug
+          - light.stue_laesehygge
+          - light.entre_loft
+          - light.terrasse_paerelyskaede
+        from: "off"
+        to: "on"
+      - platform: state
+        entity_id: *lamper
+        from: "on"
+        to: "off"
+    # AirBnB: JSONL'en committes til git og ville gemme gæstens tænd/sluk-
+    # mønster (privatliv, AirBnB-regel #3). Lag 1 er recorder og purges som
+    # resten af lys-historikken.
+    condition:
+      - condition: template
+        value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+    action:
+      - variables:
+          t0: "{{ now().timestamp() }}"
+          lampe: "{{ trigger.entity_id }}"
+          retning: "{{ trigger.to_state.state }}"
+          # Styrke/farve: fra den TÆNDTE side af skiftet (en slukket lampe har
+          # ingen farve — permanent faktum).
+          lys_attr: >-
+            {% set s = trigger.to_state if trigger.to_state.state == 'on' else trigger.from_state %}
+            {% set k = s.attributes.color_temp_kelvin | default(none) %}
+            {% set hs = s.attributes.hs_color | default(none) %}
+            {{ {'bri': s.attributes.brightness | default(none),
+                'mode': ('' ~ s.attributes.color_mode) if s.attributes.color_mode | default(none) else none,
+                'kelvin': k,
+                'hs': ([hs[0] | round(1), hs[1] | round(1)] if hs else none)} }}
+          kontekst: "{{ trigger.to_state.context.parent_id is not none }}"
+          foer: &sample >-
+            {% set ns = namespace(p=[]) %}
+            {% for e in ['sensor.koekken_apollo_lux', 'sensor.spisestue_apollo_lux',
+                         'sensor.koekken_lux_reel', 'sensor.spisestue_lux_reel'] %}
+              {% set st = states[e] %}
+              {% set ns.p = ns.p + [(e.split('.')[1], {
+                   'lx': (st.state | float(-1) | round(1)) if st else -1,
+                   'alder_s': ((now() - st.last_reported).total_seconds() | round(1)) if st else -1})] %}
+            {% endfor %}
+            {{ dict(ns.p) }}
+          # Kun lampe-nøglerne: icon/friendly_name har ENUM-nøgler i HA, og så
+          # kan resultatet ikke parses tilbage til en dict (blev en streng).
+          lamper_foer: &lamper_nu >-
+            {% set ns = namespace(p=[]) %}
+            {% for k in ['koekken_lyskaede', 'koekken_spots', 'spisestue_loft',
+                         'stue', 'entre_loft', 'terrasse'] %}
+              {% set ns.p = ns.p + [(k, state_attr('sensor.open_plan_lampe_tilstand', k))] %}
+            {% endfor %}
+            {{ dict(ns.p) }}
+      - delay: {seconds: 10}
+      - variables:
+          s10: *sample
+      - delay: {seconds: 30}
+      - variables:
+          s40: *sample
+      - delay: {seconds: 40}
+      - variables:
+          s80: *sample
+      - delay: {seconds: 70}
+      - variables:
+          s150: *sample
+          lamper_efter: *lamper_nu
+          payload_b64: >-
+            {{ {
+              'ts': t0 | timestamp_local,
+              'lampe': lampe,
+              'retning': retning,
+              'lys': lys_attr,
+              'automation': kontekst,
+              'sol_elev': state_attr('sun.sun', 'elevation'),
+              'sol_az': state_attr('sun.sun', 'azimuth'),
+              'skyer': state_attr('weather.forecast_home', 'cloud_coverage'),
+              'gardiner': {
+                'spisestue_vest': state_attr('cover.gardin_spisestue_vest', 'current_position'),
+                'stue_vest_1': state_attr('cover.gardin_stue_vest_1', 'current_position'),
+                'stue_syd': state_attr('cover.gardin_stue_syd', 'current_position')},
+              'foer': foer, 's10': s10, 's40': s40, 's80': s80, 's150': s150,
+              'lamper_foer': lamper_foer, 'lamper_efter': lamper_efter
+            } | to_json | base64_encode }}
+      - service: shell_command.ai_feedback_append
+        continue_on_error: true
+        data: {log_slug: lux_lampe, payload_b64: "{{ payload_b64 }}"}

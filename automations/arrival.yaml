@@ -1,0 +1,339 @@
+# =============================================================================
+# Arrival Automations (Hjemkomst)
+# =============================================================================
+# When someone comes home through the front door, create a welcoming
+# experience: lights in entré, stue, and køkken turn on adapted to
+# current ambient light level.
+#
+# Works in ALL modes: Normal, AirBnB, Home Vacation.
+#
+# FLOW:
+#   1. Hoveddør opens → entré light ON (LUX-aware brightness). Har OGSÅ en
+#      device_tracker-fallback, gatet på en ÆGTE afgang (se nederst).
+#   1a. If nobody was in open-plan when door opened → stue + køkken
+#       welcome light ON at LUX-adapted brightness. KUN døren — ingen GPS
+#       (user-spec 2026-08-07).
+#   2a. Entré light slukkes af entre_motion_off ~15s (slider-skaleret) efter
+#       valhorn-PIR clearer (kommentar rettet 2026-07-17c — "60 sek" var stale).
+#
+# This overrides the standard entre_motion automation's timing when
+# triggered by the front door (mode: restart on the off automation
+# ensures the longer timer takes effect).
+# =============================================================================
+
+# --- 1: Hoveddør åbner → entré lys tænd (LUX-tilpasset) ---
+# 2026-10-06 (user-bug "fesen velkomst — vi kommer hjem og det er mørkt"):
+# begge hjemkomst-regler gatede deres NAT-gren på godnat_any_active, som også
+# tæller børne-putningen. Natlys-bagkanten satte godnat_boern_active 20:30 i et
+# TOMT hus (Dormant), så hjemkomsten 21:09 fik entré 21 % / 2000 K, spisestue
+# ~30 % / 2000 K og INTET køkken. Fællesrum gater på godnat_common_active
+# (voksen-godnat/pending/kald, uden børnene). En sovende partner dæmper stadig.
+- id: arrival_entre_light
+  alias: "Hjemkomst: Entré lys ved hoveddør"
+  description: "Turn on entré light when front door opens, adapted to LUX"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parasoll_hoveddoer
+      to: "on"
+    # Sprint A.2 fix audit 2026-05-07: door sensor er i kasse pre-flyt →
+    # arrival never fires. Tilfojet device_tracker `to: home` som fallback
+    # trigger. Post-flyt: begge triggers redundant for robusthed.
+    # A91 fix audit-5 2026-05-12: `for: minutes: 2` debouncer phone-flap.
+    # Door-trigger forbliver instant (real event). Phone-trigger venter på
+    # 2 min stabil "home" før den fyrer welcome.
+    - platform: state
+      entity_id: device_tracker.phone_a
+      to: "home"
+      for:
+        minutes: 2
+    - platform: state
+      entity_id: device_tracker.phone_b
+      to: "home"
+      for:
+        minutes: 2
+  condition:
+    # 2026-09-27 (user-spec: "hvis en gæst sover i open plan skal hjemkomst og
+    # andre automations heller ikke tænde lys i openplan, terrasse og entré").
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    # M6 fix: gate paa presence_sensors_available — pre-flyt fyrer ikke
+    # fordi parasoll ikke paret, men belt-and-suspenders.
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    # Works in both Active and Dormant (door opening wakes house)
+    - condition: or
+      conditions:
+        - condition: state
+          entity_id: input_select.house_state
+          state: "Active"
+        - condition: state
+          entity_id: input_select.house_state
+          state: "Dormant"
+    # 2026-06-30 (user-spec): manuel justering vinder. Skrur user entré-lyset
+    # op (app/Styrbar) → room_mode_entre=Manual (holdes ~3h via room_drift_back,
+    # input_number.room_manual_on_hold_hours). Dør-triggeren må IKKE overskrive
+    # den manuelle styrke — samme gate som entre_motion_on. Bug: før dimmede en
+    # åben dør entré-lyset ned til lux-base efter manuel skru-op.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_entre', 'Manual') }}"
+    # 2026-08-06f: GPS-jitter må ikke tælle som hjemkomst — se ÆGTE-AFGANG
+    # nederst i filen. Gælder KUN tracker-triggerne; døren fyrer u-gatet.
+    - condition: template
+      value_template: >-
+        {% set p = trigger.entity_id | default('', true) if trigger is defined else '' %}
+        {% if p == 'device_tracker.phone_a' %}{% set f = 'input_boolean.parent_a_home' %}
+        {% elif p == 'device_tracker.phone_b' %}{% set f = 'input_boolean.parent_b_home' %}
+        {% else %}{% set f = '' %}{% endif %}
+        {% if f == '' %}true
+        {% else %}
+        {% set s = states[f] %}
+        {{ s is none or s.state == 'off'
+           or (now() - s.last_changed).total_seconds() < 60 }}
+        {% endif %}
+    # Only if there's a need for light (not bright daylight)
+    # Day-aware threshold (sprint 2026-05-07): halve threshold under sun_bracket=day.
+    # 2026-08-19: BEVIDST ikke flyttet til sensor.open_plan_haendelse_lux_gate.
+    # Denne tænder light.entre_loft, som ikke står i openplan_lights-rosteren →
+    # dagslys-sluk rører den aldrig, så der er intet at klampe imod. Kommer
+    # entréen nogensinde med i den roster, skal denne gate med samme dag (#2).
+    - condition: template
+      value_template: >-
+        {% set lux = states('sensor.open_plan_lux') | float(50) %}
+        {% set day = is_state('sensor.sun_bracket', 'day') %}
+        {% set f = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+        {{ lux < ((20 if day else 40) * f) }}
+  action:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.entre_loft
+      data:
+        # Light Aggressiveness factor (Phase 2 sprint 2026-05-07)
+        brightness_pct: >
+          {% if is_state('binary_sensor.godnat_common_active', 'on') %}{% set base = 8 %}
+          {% else %}
+            {% set lux = states('sensor.open_plan_lux') | float(50) %}
+            {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}{% set base = 100 %}
+            {% elif lux < (states('input_number.lux_trin_dunkelt') | float(20)) %}{% set base = 70 %}
+            {% else %}{% set base = 40 %}{% endif %}
+          {% endif %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+        # 2026-08-27b: entréens egen CT-slider uden for godnat (fejlklasse #2).
+        # Godnat beholder 2000 K — man skal ikke blændes på vej i seng.
+        color_temp_kelvin: >
+          {% if is_state('binary_sensor.godnat_common_active', 'on') %}2000
+          {% else %}{{ states('input_number.entre_kelvin') | int(3200) }}{% endif %}
+        # 2026-10-06 (user: "entré og open plan skal blødt åbne i dejligt
+        # velkommende lys"): blød fade fra husets fade-ind-autoritet, højst 3 s
+        # ved døren. F4-snappet (05-22) var for en TRADFRI WS-quirk — entre_loft
+        # er siden en KAJPLATS CWS, og depot_loft_ikea er husets eneste quirk-pære.
+        transition: "{{ [states('sensor.fade_ind_effektiv') | int(3), 3] | min }}"
+
+# --- 1a: Hoveddør åbner + ingen i stue → velkomstlys i stue+køkken ---
+- id: arrival_welcome_light
+  alias: "Hjemkomst: Velkomstlys stue+køkken"
+  description: "Turn on spisestue-loft + køkken-lyskæde when front door opens in the dark and nobody was inside (kitchen skipped under godnat)"
+  mode: single
+  trigger:
+    # 2026-08-07 (user-spec): "velkomstlys skal kun køre ved maindoor open,
+    # ikke ved gps". Døren er ENESTE trigger her — de to device_tracker-
+    # fallbacks er fjernet. De blev tilføjet 2026-05-07 fordi dørsensoren lå
+    # i en kasse pre-flyt; den virker nu, og GPS'en har vist sig at kunne
+    # opfinde en hjemkomst (se ÆGTE-AFGANG nederst i filen). Entré-lyset
+    # beholder bevidst tracker-fallbacken — dét lys er billigt at tage fejl
+    # med, mens velkomstlyset tænder stue/spisestue.
+    - platform: state
+      entity_id: binary_sensor.parasoll_hoveddoer
+      to: "on"
+  condition:
+    # Kill-switch (sprint 2026-05-17): toggle off hvis ikke ønsker auto-velkomst.
+    - condition: state
+      entity_id: input_boolean.arrival_welcome_enabled
+      state: "on"
+    # M6 fix: gate paa presence_sensors_available
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    # Works in both Active and Dormant (door opening wakes house)
+    - condition: or
+      conditions:
+        - condition: state
+          entity_id: input_select.house_state
+          state: "Active"
+        - condition: state
+          entity_id: input_select.house_state
+          state: "Dormant"
+    # Nobody was in the open-plan area (both sensors clear).
+    # C2 fix audit 2026-05-07: hvis Apollo unavailable (3 er unplugged
+    # pre-flyt), `state: "off"` fails → welcome silent skipped. Treat
+    # unavailable som "ingen detection" → tillad welcome. Template:
+    # ingen Apollo "on" = open-plan empty (uanset om det er off eller dødt).
+    - condition: template
+      value_template: >-
+        {{ states('binary_sensor.stue_apollo_occupancy_filtered') != 'on'
+           and states('binary_sensor.spisestue_apollo_occupancy_filtered') != 'on' }}
+    # Bug hunt 2026-07-17c (fejlklasse #12, spejler entré-gaten 2026-06-30):
+    # manuel justering vinder — er stuen i Manual (user har selv sat styrken,
+    # ~3t hold via room_drift_back), må velkomstlyset ikke overskrive
+    # spisestue/køkken med lux-basen.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.open_plan_manual', 'on') }}"
+    # 2026-08-13g (Sleep Over): en sen hjemkomst må ikke tænde 12 % over en gæst
+    # der sover i open-plan. Entré-lyset (egen automation) er urørt, så man kan
+    # stadig se at komme ind. Se packages/sleepover.yaml.
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    # Not during cinema/cirkus (mood scenes — user wants those preserved)
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_stue
+      state: "off"
+    # A22 fix sprint 2026-05-06 (USER DECISION): under godnat skal welcome
+    # STADIG fyre, men i meget dim mode. godnat_voksne_active beholdes ON
+    # (= godnat_any_active stadig on) så partner ikke vækkes af bright
+    # arrival. Sove + boern lights bliver IKKE rørt af denne automation
+    # (target er kun stue + koekken — dem behold vi mørke via simply
+    # ikke-targeting dem).
+    # Only if there's a need for light
+    # Day-aware threshold (sprint 2026-05-07): halve threshold under sun_bracket=day.
+    # 2026-08-19: gaten er nu sensor.open_plan_haendelse_lux_gate = den egne
+    # grænse KLAMPET til dagslys-sluk. Målt samme dag: hoveddøren åbnede
+    # 07:32:14 ved open_plan_lux 16 — under velkomstens egen 18-grænse, men
+    # OVER sensor.stue_dagslys_sluk_effektiv (13,5), så spisestue-loftet var
+    # dødsdømt i samme sekund det tændte og blev slukket 07:35:00. Et lys der
+    # tændes over den tærskel hvor et andet regelsæt slukker det, er en
+    # on/off-krig pr. konstruktion (#2) — og præcis den churn user afviste
+    # 2026-08-11 for netop spisestue_loft.
+    - condition: template
+      value_template: >-
+        {% set lux = states('sensor.open_plan_lux') | float(50) %}
+        {{ lux < (states('sensor.open_plan_haendelse_lux_gate') | float(18)) }}
+  action:
+    # B216 (user-spec 2026-10-11): morgen 04-12 efter en nat med børn tænder
+    # spisestue-loftet kun på spisestue-Apolloen — hoveddøren (også en voksen
+    # der GÅR) er ikke den. Køkken-kæden nedenfor er urørt. Søstre:
+    # godnat_adult_nightwalk, presence_light_stue_on (grep B216).
+    - if:
+        - condition: template
+          value_template: >-
+            {{ not (now().hour >= 4 and now().hour < 12
+                    and is_state('input_boolean.boern_sov_her_i_nat', 'on')) }}
+      then:
+        - service: light.turn_on
+          target:
+            entity_id:
+              - light.spisestue_loft
+          data:
+            # Light Aggressiveness factor (Phase 2 sprint 2026-05-07)
+            brightness_pct: >
+              {% if is_state('binary_sensor.godnat_common_active', 'on') %}{% set base = 12 %}
+              {% else %}
+                {% set lux = states('sensor.open_plan_lux') | float(50) %}
+                {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}{% set base = 70 %}
+                {% elif lux < (states('input_number.lux_trin_dunkelt') | float(20)) %}{% set base = 50 %}
+                {% else %}{% set base = 30 %}{% endif %}
+              {% endif %}
+              {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+              {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+            color_temp_kelvin: >
+              {# Under godnat: 2000K matcher nightwalk-warmth, beskytter
+                 mørketilpasset syn. #}
+              {% if is_state('binary_sensor.godnat_common_active', 'on') %}2000
+              {% else %}2700{% endif %}
+            # 2026-10-06: open plan "blomstrer" op i husets fade-ind-tid (6 s om
+            # aftenen) — før fast 3 s.
+            transition: "{{ states('sensor.fade_ind_effektiv') | int(3) }}"
+    # 2026-09-26 (user-spec: "da jeg lige kom hjem tændte køkkenet også for
+    # langsomt. ved mørk hjemkomst vil jeg gerne tages imod med lys i
+    # køkkenet medmindre godnat mode er på eller hvis gæster sover i stuen").
+    # Målt 19:36:51: binary_sensor.koekken_hjemkomstlys gik on med døren, men
+    # kæden tændte først +30 s — presence-tænd venter på køkken-occupancy +
+    # bevægelse på 250 cm-aksen, og første-lys-vejen var allerede spærret af
+    # spisestue-loftet (stue_all ikke længere slukket). Nu tænder velkomsten
+    # selv kæden: tænd-kurvens segment 1 via maleren (arbejdslys → hvidt;
+    # enforcerens on_edge fuldfører segment 2), samme som presence-tænd.
+    # Sleep Over er allerede en condition ovenfor. Godnat: velkomsten fyrer
+    # dæmpet under godnat (A22), men KØKKENET springes over (user-spec).
+    - if:
+        - condition: state
+          entity_id: binary_sensor.godnat_common_active
+          state: "off"
+        - condition: state
+          entity_id: light.koekken_lyskaede
+          state: "off"
+        - condition: template
+          value_template: "{{ not is_state('input_select.room_mode_koekken', 'Manual') }}"
+        - condition: template
+          value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
+        # Samme manuel-sluk-grace som presence-tænd (#2).
+        - condition: template
+          value_template: >-
+            {% set g = states('input_number.koekken_manual_off_grace_minutes') | float(5) %}
+            {{ g <= 0 or
+               (now().timestamp() - (state_attr('input_datetime.koekken_lyskaede_manual_off_at', 'timestamp') | float(0))) > g * 60 }}
+      then:
+        # hoveddoer_last_open stemples af security.yaml på SAMME dør-flanke →
+        # giv hjemkomst-ankeret et øjeblik, så kæden males hvid, ikke orange.
+        - wait_template: "{{ is_state('binary_sensor.koekken_arbejdslys', 'on') }}"
+          timeout: "00:00:02"
+          continue_on_timeout: true
+        - action: script.koekken_lyskaede_maal
+          continue_on_error: true
+          data:
+            andel: 0.5
+            transition: "{{ states('sensor.koekken_lyskaede_fade_hurtig_effektiv') | int(2) }}"
+
+# =============================================================================
+# ÆGTE-AFGANG-GATEN (2026-08-06f) — hvorfor entré-lysets tracker-trigger er
+# betinget
+# =============================================================================
+# NB 2026-08-07: gaten sidder nu KUN på `arrival_entre_light`. Velkomstlyset
+# har efter user-spec ("velkomstlys skal kun køre ved maindoor open, ikke ved
+# gps") ingen tracker-triggers længere og kan derfor slet ikke nås ad GPS-vejen.
+#
+# User 2026-08-06: "entre tændte lige under godnat wtf!". Facit fra history:
+# godnat blev sat 22:12:06, huset slukket 22:13:09 — og 22:18:03 tændte BÅDE
+# entre_loft og spisestue_loft igen. Ingen var i entréen (valhorn-occupancy
+# havde stået off siden 22:05:04), og telefonen lå og ladede på AC.
+#
+# Årsag: `sensor.phone_a_geocoded_location` hoppede rundt mellem adresser
+# (bl.a. "Center Boulevard") og trak person/tracker til not_home 22:15:36 →
+# home 22:16:03 = **27 sekunder**. Præcis 2 min stabil "home" senere fyrede
+# `for: minutes: 2`-triggeren. Debouncen kan pr. konstruktion ikke fange
+# dette: ANKOMST-flanken VAR stabil — det var AFGANGEN der var falsk.
+#
+# 💡 Diskriminatoren er `input_boolean.<person>_home`, ikke en ny tærskel:
+# `presence_*_leave` venter 5 min grace og re-tjekker `not_home` før den
+# slukker flaget, så en jitter-afgang under 5 min efterlader flaget ON hele
+# vejen igennem. En ÆGTE hjemkomst har derfor altid enten (a) flaget stadig
+# off (vi kom først), eller (b) flaget lige tændt af `presence_*_arrive`
+# (den kom først) — begge dækket, så gaten er RACE-FRI, uanset om
+# `presence_*_arrive` når at sætte flaget før eller efter os på samme trigger.
+#
+# Kalibrering (14 dages person.*-historik, begge voksne): jitter-klyngen er
+# 0,1-0,9 min (15 forekomster), ægte ture ≥ 11,1 min. De få 3-5 min "ture"
+# ligger kl. 03 om natten og er også jitter. Vi vælger IKKE et minuttal her —
+# vi arver husets egen definition af "en rigtig afgang" (leave-graceen), så
+# der kun er ét sted at justere.
+#
+# Falske negativer er billige: døren fyrer u-gatet, og entre_motion tænder
+# alligevel på VALLHORN-PIR når man går ind. Tracker-triggeren er kun den
+# fallback der blev tilføjet pre-flyt da dørsensoren lå i en kasse.
+#
+# NB: gaten rører IKKE godnat-adfærden. At entré/velkomst fyrer dæmpet (8 %
+# / 12 % @ 2000 K) under godnat er en bevidst user-beslutning (A22, sprint
+# 2026-05-06) og gælder stadig for ÆGTE hjemkomster.
+# =============================================================================
+
+# --- 2a: Entré-sluk ejes af entre_motion_off ---
+# Stale kommentar rettet 2026-07-17c (fejlklasse #3): den gamle tekst påstod
+# "60s-timer" — entre_motion_off kører reelt ~15s × global_absence_wait_factor
+# (2026-05-07 fix #5) + /2-min fallback for orphan-lys. Ingen arrival-specifik
+# timer findes; entre_motion.yaml er eneste sluk-ejer.

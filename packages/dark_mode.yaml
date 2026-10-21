@@ -1,0 +1,1229 @@
+# =============================================================================
+# Dark Mode — projektor-mørklægning (2026-07-27, user-spec)
+# =============================================================================
+# "Mørklæg børneværelset, voksensoveværelset og sofastuen så vi kan se tv på
+#  projektor." Aktiveres via:
+#   - Dark Mode-RODRET (58:55:f0): op/hold-op = ON, ned/hold-ned = OFF
+#     (ligger fysisk i børneværelset, men styrer INTET gardin — hed derfor
+#      "Børne-RODRET" indtil 2026-08-02; se automations/somrig_buttons.yaml)
+#   - script.dark_mode_toggle → telefon-widget (companion-app script-widget)
+#   - tile på Scener-siden (Status-sektionen)
+#
+# LYSET HOLDES SLUKKET (ikke bare slukket én gang) — user-spec 2026-07-27:
+# projektor-mørklægning kræver at rummene FORBLIVER mørke. To lag:
+#   (a) auto-tænd-gates på dark_mode i presence/LUX/early-detect (source-luk,
+#       ingen flicker), OG
+#   (b) dark_mode_lights_enforce (backstop): tænder AUTO noget af de 3 grupper
+#       mens dark_mode er on → sluk det igen. MEN lad manuel vinde (user-spec
+#       2026-07-27): app-tryk (context.user_id) el. Styrbar (room_mode=Manual)
+#       får lov at blive tændt. 2 s delay før tjek pga. Styrbar turn_on-før-
+#       stempel-race. Fanger enhver u-gatet AUTO-sti. Escape = sluk Dark Mode
+#       (ned på Dark Mode-RODRET). Selv-heal: efterlades dark_mode on rydder
+#       mood_flag_safety cinema_active efter 4t → cinema_off-grenen her
+#       slukker dark_mode med.
+# NB (2026-07-28): børneværelset har INGEN gardin-motor (droppet) → mørklægning
+#     dér kommer udelukkende fra at lyset holdes slukket. Sove-gardinet er
+#     kalibreret og kører med.
+#
+# RUM-SCOPE (omskrevet 2026-08-02 — user-spec: "dark mode skal gælde i
+#   soveværelset som udgangspunkt (KUN), hvis der er meget nylig aktivitet
+#   derinde, ellers børneværelset hvis der er meget nylig aktivitet derinde,
+#   ellers sofastuen hvis der er meget nylig aktivitet derinde").
+#   Tre lag — MEN kun når projektoren kører (se (0)):
+#   (0) KNAP-SESSION (2026-09-02, user-spec: "hvis dark mode trykkes via knappen
+#       (rodret/somrig) og ikke aktiveres via projektoren, så skal den kun gælde
+#       i soveværelset. ikke i open plan"). Er binary_sensor.projektor_aktiv
+#       IKKE on når dark_mode tændes, sættes input_boolean.dark_mode_kun_sove,
+#       og så gælder: scope = HÅRDT 'sove' (stigen springes over),
+#       cinema_active sættes IKKE (= husets open-plan-suppression rører hverken
+#       køkken, spisestue, stue, terrasse eller entré), og dark_mode_room_joins
+#       må kun tilføje 'sove'. Køkken-lyskædens egne dark_mode-gates er samtidig
+#       flyttet til binary_sensor.dark_mode_stue (packages/koekken_lyskaede.yaml),
+#       så open plan følger SOFASTUEN og ikke soveværelset.
+#       Udvejen er uændret: dobbelttryk = alle tre rum (og dét tænder
+#       cinema_active + rydder kun_sove igen).
+#   (1) START-SCOPE = en PRIORITETS-STIGE, ikke en rangering: sove → boern →
+#       stue, og den FØRSTE der har aktivitet indenfor
+#       dark_mode_meget_nylig_sekunder vinder. ÉT rum, ikke flere.
+#       Stigen bor i sensor.moerklaegning_scope_rum og deles med PRE-DARK
+#       (2026-08-12, user-spec — pre-dark tog før hele kandidat-listen).
+#       ⚠️ Ændrer du stigen, ændrer du BEGGE mørklægninger.
+#       Hvorfor en stige og ikke "det friskeste rum": to rum står tit på alder 0
+#       samtidig (målt: ved ALLE fire ægte Dark Mode-tændinger 07-27→08-02 var
+#       både stue og sove på 0 i tre af dem), og recency kan derfor ikke skelne
+#       "jeg gik forbi sofaen på vej ind" fra "vi ser film her". Sengen kan.
+#       Den forrige model (recency + samtidigheds-vindue) mørklagde BEGGE rum i
+#       de situationer — 07-28-rapporten "dark mode troede vi var i sofastuen,
+#       men Parent B lå stille i soveværelset hvor vi skulle se film".
+#       Grænsen er bevidst kort (default 90 s, user-valg 2026-08-12; var 120):
+#       den skal bygge bro over
+#       radar-huller om en stilleliggende film-seer (målt 83-106 s i sove) uden
+#       at et forbipasserende glimt kan kapre valget (boern-ghost-flappet 07-28
+#       var 168 s gammelt). Hæves den, vinder soveværelset oftere på gamle spor:
+#       ved 120 s har sove aktivitet i 35,5 % af de aften-minutter hvor stuen
+#       ER i brug, ved 600 s er det 45,2 % (14 dages historik, 18-24). 90 s
+#       ligger stadig over det målte radar-hul (83-106 s) i sin nedre ende, så
+#       en stilleliggende seer i sengen kan fortsat vinde stigen.
+#       Har INTET rum meget nylig aktivitet, mørklægges ingen rum (kun
+#       open-plan-suppression) — dobbelttrykket nedenfor er udvejen.
+#   (1b) DOBBELTTRYK = to op-tryk på Dark Mode-RODRET'en indenfor
+#       dark_mode_dobbelttryk_sekunder (120) → ALLE TRE rum mørklægges, og
+#       fritagelses-listen ryddes så "alle tre" faktisk betyder alle tre
+#       (user-spec 2026-08-02). Det er samtidig eneste vej til mørklægning når
+#       stigen ikke fandt et rum: tryk igen, så tager den det hele.
+#   (2) SESSIONEN = input_text.dark_mode_rooms — de rum mørklægningen FAKTISK
+#       ejer. Sat ved ON, udvidet af dark_mode_room_joins, og STICKY derefter:
+#       radaren må ikke afmelde et rum midt i filmen fordi seeren ligger stille
+#       (live-målt 07-28: sove-radaren tabte Parent B i 83-106 s ad gangen).
+#       Rum-sensorerne (binary_sensor.dark_mode_*) læser DENNE liste.
+#       Stigen vælger kun UDGANGSPUNKTET: får et andet rum meget nylig aktivitet
+#       MENS filmen kører (nogen går i seng), kommer det med via
+#       dark_mode_room_joins — ellers ville dets lys og gardin spilde ind i
+#       biografen. Sessionen krymper aldrig af sig selv.
+#   (3) FRITAGELSE = input_text.dark_mode_exempt — op-tryk på rummets Styrbar/
+#       RODRET tager rummet UD af sessionen resten af filmen (se
+#       dark_mode_room_exempt_button). Ryddes ved ON og OFF.
+#
+# TV I BØRNEVÆRELSET HÅNDTERES **IKKE** HER (user-valg 2026-08-07, "frigiv
+#   stuen"): et tv-kig i børneværelset skal kun slukke DET rum, mens stue/
+#   køkken/spisestue kører videre med helt normalt auto-lys. Dark Mode kan pr.
+#   konstruktion ikke levere det — den tænder cinema_active, som ~10
+#   automations læser som HUSDÆKKENDE suppression, og dens gardin-scope for
+#   stue er tre motorer. Den vej ligger derfor rum-lokalt i
+#   packages/boernevaerelse_manual_off_lock.yaml (ARM 2): tv on → sluk
+#   børneværelset + arm låsen; Styrbar børn OP er udgangen (låsens CLEAR 1) og
+#   starter en ny putte-session via Trigger D. Et første udkast her (seed-felt
+#   + tv-markør + særlig afslutning) er rullet helt tilbage samme dag.
+#
+# ON:  (1) snapshot af hvilke af rummets gardiner der er ÅBNE (til genåbning),
+#      (2) cinema_active ON — genbruger den eksisterende hold-alive-suppression
+#          som ALLE open-plan presence/LUX-fald/watchdog-automations gater på,
+#      (3) sluk lys: boernevaerelse_all + sovevaerelse_all + stue_room (sofa-
+#          lamperne; køkken/spisestue røres ikke men deres auto-tænd er
+#          cinema-suppresset),
+#      (4) manuel-ned-grace-stempel på gardinerne (blokerer auto-genåbning:
+#          morgen-gardiner, vinter sol-opvarmning, Active-open — jf.
+#          packages/gardin_manual_grace.yaml),
+#      (5) luk gardiner via script.gardin_film_luk: stue syd + stue vest +
+#          spisestue vest + sove — ALLE i scope, uanset hvad HA tror de står på
+#          (vest får desuden 1 s ekstra ned efter 85 %-stoppet, user 2026-08-08)
+#          (2026-07-29: RTS-state er et gæt, og et forkert 'closed' sprang vest
+#          over = user-rapporteret bug). Scriptet ejer fysikken pr. cover: vest
+#          re-homes (OP → fuld køretid → close) så 85 %-stoppet altid rammes fra
+#          toppen og bunden aldrig nås; syd + spisestue-vest lukkes idempotent;
+#          Zigbee-sove springes over hvis dens MÅLTE position allerede er nede.
+#          SIDST i kæden — template-coverne BLOKERER op til ~35 s.
+# OFF: cinema_active OFF; gardiner der var åbne ved ON genåbnes KUN når solen
+#      er oppe (efter mørkefald er lukket = naturlig aften-tilstand; godnat/
+#      morgen-automatikken ejer dem derfra) + ryd deres grace-stempel (tilbage
+#      til normal auto-styring). UNDTAGELSE (user-spec 2026-07-28): puttes der
+#      barn i forældresengen (putning_sove_active), genåbnes sove-gardinet IKKE
+#      — kun brugeren selv eller en senere auto-rutine åbner det. Stemplet
+#      ryddes alligevel, så den senere auto-åbning ikke blokeres.
+#      Lys genoptages af presence-automatikken (enforce + cinema-gaten slipper).
+# SYNC: slukkes cinema_active eksternt (entré "vi går"-knap, mood_flag_safety's
+#      stuck-clear >4t) mens dark_mode er on → dark_mode slukkes med og kører
+#      fuld OFF-oprydning via re-trigger (én eksekverings-sti, mode: queued).
+# NAT-CUTOVER (dark_mode_night_cutover, user-spec 2026-07-28): er Dark Mode stadig
+#      tændt kl. dark_mode_godnat_cutover (default 03:00) = man faldt i søvn under
+#      filmen uden godnat-tryk → script.godnat kaldes = huset går til godnat (og
+#      videre til godmorgen via den normale morgen-automatik). Cinema-off-syncen
+#      ovenfor slukker Dark Mode med. INTET tænder ved overgangen (lys allerede
+#      slukket + godnat-flag sat FØR cinema slippes → presence gated af godnat).
+# Sove/børn auto-tænd (presence + LUX-fald + early-detect + adult-vækning)
+# gater direkte på dark_mode (cinema-gaten dækker kun open-plan) — se
+# presence_sovevaerelse / presence_boernevaerelse / presence_lights.
+# =============================================================================
+
+input_boolean:
+  dark_mode:
+    name: "Dark Mode (projektor)"
+    icon: mdi:projector
+  # Sessionens NATUR (runtime, sat af dark_mode_apply's ON-gren): blev Dark Mode
+  # tændt UDEN at projektoren kørte, er det et knap-tryk på RODRET/Somrig — og
+  # så gælder mørklægningen KUN soveværelset, aldrig open plan (user-spec
+  # 2026-09-02). Ingen `initial:` — den skal overleve en HA-restart midt i en
+  # session (CLAUDE.md: initial PÅTVINGER, restorer ikke).
+  # 2026-09-23 (user-bug 21/09: "Dark Mode blev ikke aktiveret af projektoren
+  # … projektoren var slukket og skulle ha stoppet dark mode"). Til/fra-knap:
+  # projektoren tænder fuld Dark Mode (i familie-modes; AirBnB beholder den
+  # blide pre-dark) og slukker den igen når projektoren slukkes.
+  dark_mode_ved_projektor:
+    name: "Dark Mode: start/stop med projektoren"
+    icon: mdi:projector
+  # Runtime: sessionen blev startet MENS projektoren kørte → projektor-sluk
+  # afslutter den. En ren knap-session (projektor slukket) røres ikke.
+  dark_mode_projektor_session:
+    name: "Dark Mode: projektor-session"
+    icon: mdi:movie-roll
+
+  dark_mode_kun_sove:
+    name: "Dark Mode: knap-session (kun soveværelset)"
+    icon: mdi:bed-outline
+
+input_text:
+  dark_mode_curtains_prev:
+    name: "Dark Mode: gardiner åbne før ON"
+    max: 100
+    icon: mdi:window-shutter-cog
+  # Sessionens FAKTISKE rum (sticky — se RUM-SCOPE i headeren). Mellemrums-
+  # separeret delmængde af "stue sove boern".
+  dark_mode_rooms:
+    name: "Dark Mode: rum i sessionen"
+    max: 30
+    icon: mdi:theater
+  # Rum brugeren har fritaget med et op-tryk. De kommer IKKE med igen i denne
+  # session (heller ikke via dark_mode_room_joins).
+  dark_mode_exempt:
+    name: "Dark Mode: fritagne rum"
+    max: 30
+    icon: mdi:lightbulb-on-outline
+
+input_datetime:
+  # Nat-cutover: er Dark Mode stadig tændt på dette klokkeslæt (typisk fordi man
+  # faldt i søvn under en film uden at trykke godnat) → overgang til godnat.
+  # Default 03:00 (user-spec 2026-07-28). Justerbar (Scener-siden).
+  dark_mode_godnat_cutover:
+    name: "Dark Mode: nat-cutover til godnat"
+    icon: mdi:weather-night
+    has_date: false
+    has_time: true
+
+  # RUNTIME (ikke en indstilling): tidspunktet for sidste op-tryk på Dark
+  # Mode-knappen — grundlaget for dobbelttryks-detektionen. Sættes med
+  # timestamp (en SAT værdi læses korrekt af 'timestamp'-attributten; en urørt
+  # helper står på dagens midnat, hvilket er langt uden for vinduet = enkelt
+  # tryk, altså fejler den ÅBENT mod den normale stige).
+  dark_mode_op_tryk_at:
+    name: "Dark Mode: sidste op-tryk (runtime)"
+    icon: mdi:gesture-tap
+    has_date: true
+    has_time: true
+
+input_number:
+  # "Meget nylig aktivitet" — hvor frisk et rums presence skal være for at
+  # kunne vinde prioritets-stigen (user-spec 2026-08-02). Kalibreret mod 14
+  # dages historik: skal bygge bro over radar-huller om en stilleliggende
+  # film-seer (sove: 83-106 s, målt 07-28) men holde et forbipasserende glimt
+  # ude (børneværelsets ghost-flap samme aften: 168 s). Hæves den, kaprer
+  # soveværelset oftere en aften i stuen (35,5 % af de aften-minutter hvor
+  # stuen er i brug ved 120 s → 45,2 % ved 600 s).
+  # 2026-08-12 (user-spec): default 120 → 90 s. Gælder nu BÅDE Dark Mode og
+  # pre-dark (samme stige, sensor.moerklaegning_scope_rum).
+  dark_mode_meget_nylig_sekunder:
+    name: "Dark Mode: meget nylig aktivitet"
+    min: 30
+    max: 600
+    step: 30
+    unit_of_measurement: "s"
+    icon: mdi:motion-sensor
+
+  # Hvor lang tid der må gå mellem to op-tryk på Dark Mode-knappen for at det
+  # tæller som ét dobbelttryk = mørklæg ALLE TRE rum (user-spec 2026-08-02:
+  # "trykkes to gange på dark mode knappens op knap indenfor 2 min").
+  dark_mode_dobbelttryk_sekunder:
+    name: "Dark Mode: dobbelttryk-vindue"
+    min: 30
+    max: 300
+    step: 10
+    unit_of_measurement: "s"
+    icon: mdi:gesture-double-tap
+
+template:
+  - sensor:
+      # KANDIDAT-rum for Dark Mode + Pre-Dark: de af de tre rum der har MEGET
+      # NYLIG aktivitet — alder (0 s = presence lige nu) under
+      # dark_mode_meget_nylig_sekunder. Omskrevet 2026-08-02: den gamle
+      # recency-rangering (friskeste rum + alle indenfor et samtidigheds-vindue)
+      # er væk, fordi to rum konstant står på alder 0 samtidig og recency derfor
+      # ikke kan skelne gennemgang fra ophold. Dark Modes valg er i stedet en
+      # PRIORITETS-STIGE over denne liste (sove → boern → stue) — se
+      # dark_mode_apply's ON-gren og RUM-SCOPE i headeren.
+      # Listen emitteres i stige-orden, men INGEN forbruger må afhænge af det:
+      # stigen er skrevet eksplicit dér hvor den bruges.
+      # Bevidst kun stue/sove/boern — køkken/spisestue/bad er aldrig i scope.
+      # unavailable/unknown → alder 0 = rummet TÆLLER MED (fejlklasse #9: en død
+      # radar må ikke stille og roligt afmelde et rum fra mørklægningen).
+      # NB: dette er KANDIDATERNE. Hvad mørklægningen faktisk ejer står i
+      # input_text.dark_mode_rooms (sticky) — se RUM-SCOPE i headeren.
+      - name: "Rum med nylig presence"
+        unique_id: rum_med_nylig_presence
+        icon: mdi:home-search
+        state: >-
+          {% set lim = states('input_number.dark_mode_meget_nylig_sekunder')
+                       | float(120) %}
+          {% set ns = namespace(l=[]) %}
+          {% for k, e in [('sove', 'binary_sensor.sovevaerelse_apollo_occupancy'),
+                          ('boern', 'binary_sensor.boernevaerelse_apollo_occupancy'),
+                          ('stue', 'binary_sensor.stue_apollo_occupancy_filtered')] %}
+          {% if states(e) in ['on', 'unavailable', 'unknown'] or states[e] is none %}
+          {% set ns.l = ns.l + [k] %}
+          {% elif (now() - states[e].last_changed).total_seconds() < lim %}
+          {% set ns.l = ns.l + [k] %}
+          {% endif %}
+          {% endfor %}
+          {{ ns.l | join(' ') }}
+        attributes:
+          antal: >-
+            {{ states('sensor.rum_med_nylig_presence').split() | count }}
+          # Diagnostik: alder pr. rum i sekunder (0 = presence lige nu). Gør det
+          # muligt at se HVORFOR et rum ikke talte som "meget nylig".
+          aldre: >-
+            {% set ns = namespace(l=[]) %}
+            {% for k, e in [('sove', 'binary_sensor.sovevaerelse_apollo_occupancy'),
+                            ('boern', 'binary_sensor.boernevaerelse_apollo_occupancy'),
+                            ('stue', 'binary_sensor.stue_apollo_occupancy_filtered')] %}
+            {% if states(e) in ['on', 'unavailable', 'unknown'] or states[e] is none %}
+            {% set ns.l = ns.l + [k ~ '=0'] %}
+            {% else %}
+            {% set ns.l = ns.l + [k ~ '=' ~ ((now() - states[e].last_changed).total_seconds() | int)] %}
+            {% endif %}
+            {% endfor %}
+            {{ ns.l | join(' ') }}
+
+      # PRIORITETS-STIGEN som ÉT anker (2026-08-12, user-spec: "dark mode og
+      # pre dark mode skal applies kun i soveværelset hvis der har været
+      # aktivitet i soveværelset … dernæst den samme regel for børneværelset.
+      # og ellers … i sofa stuen"). Før i dag stod stigen kun i dark_mode_apply,
+      # og pre-dark brugte hele kandidat-listen = evt. flere rum. Nu læser BEGGE
+      # denne sensor, så reglen ikke kan drifte i to kopier (fejlklasse #2).
+      # Tom streng = intet rum havde meget nylig aktivitet (Dark Mode falder da
+      # tilbage på open-plan-suppression + dobbelttryk; pre-dark gør ingenting).
+      - name: "Moerklaegning scope rum"
+        unique_id: moerklaegning_scope_rum
+        icon: mdi:ladder
+        state: >-
+          {% set kand = states('sensor.rum_med_nylig_presence').split() %}
+          {% set ns = namespace(v='') %}
+          {% for k in ['sove', 'boern', 'stue'] %}
+          {% if ns.v == '' and k in kand %}
+          {% set ns.v = k %}
+          {% endif %}
+          {% endfor %}
+          {{ ns.v }}
+        attributes:
+          kandidater: "{{ states('sensor.rum_med_nylig_presence') }}"
+          aldre: "{{ state_attr('sensor.rum_med_nylig_presence', 'aldre') }}"
+          graense_sekunder: >-
+            {{ states('input_number.dark_mode_meget_nylig_sekunder') | int(90) }}
+
+  - binary_sensor:
+      # Pr.-rum "Dark Mode gælder HER". Presence-gates i presence_lights /
+      # presence_sovevaerelse / presence_boernevaerelse hænger på DISSE i stedet
+      # for på input_boolean.dark_mode direkte — så et rum uden nylig presence
+      # (eller et FRITAGET rum) beholder sin normale auto-lys-styring under filmen.
+      # Kilden er sessionen (input_text.dark_mode_rooms), IKKE kandidat-sensoren:
+      # scopet må ikke flimre når radaren taber en stilleliggende film-seer,
+      # og en fritagelse skal slå igennem med det samme (2026-07-28).
+      - name: "Dark Mode stue"
+        unique_id: dark_mode_stue
+        icon: mdi:sofa
+        state: >-
+          {{ is_state('input_boolean.dark_mode', 'on')
+             and 'stue' in states('input_text.dark_mode_rooms').split() }}
+      - name: "Dark Mode sove"
+        unique_id: dark_mode_sove
+        icon: mdi:bed
+        state: >-
+          {{ is_state('input_boolean.dark_mode', 'on')
+             and 'sove' in states('input_text.dark_mode_rooms').split() }}
+      - name: "Dark Mode boern"
+        unique_id: dark_mode_boern
+        icon: mdi:teddy-bear
+        state: >-
+          {{ is_state('input_boolean.dark_mode', 'on')
+             and 'boern' in states('input_text.dark_mode_rooms').split() }}
+
+script:
+  dark_mode_toggle:
+    alias: "🎬 Dark Mode til/fra"
+    icon: mdi:projector
+    mode: single
+    sequence:
+      - service: input_boolean.toggle
+        target:
+          entity_id: input_boolean.dark_mode
+
+  # Op-tryk på Dark Mode-RODRET'en (klik ELLER hold — se
+  # automations/somrig_buttons.yaml, som ikke gør andet end at kalde herind).
+  # Ét tryk = tænd Dark Mode (prioritets-stigen vælger rummet).
+  # TO tryk indenfor dark_mode_dobbelttryk_sekunder = mørklæg ALLE TRE rum
+  # (user-spec 2026-08-02). Logikken ligger HER og ikke i knap-filen, fordi
+  # dobbelttrykket skal kunne kaldes fra en fremtidig widget/tile med samme
+  # semantik — og fordi stemplet ellers ville have to skrivere (fejlklasse #1).
+  dark_mode_button_up:
+    alias: "Dark Mode: op-tryk (2. tryk = alle rum)"
+    icon: mdi:gesture-double-tap
+    mode: single
+    sequence:
+      - variables:
+          sidst: >-
+            {{ state_attr('input_datetime.dark_mode_op_tryk_at', 'timestamp') | float(0) }}
+          vindue: >-
+            {{ states('input_number.dark_mode_dobbelttryk_sekunder') | float(120) }}
+          # Et URØRT input_datetime står på dagens midnat, og dets timestamp-attribut
+          # læses 2 t forskudt — så mellem 02:00 og 02:02 ville "aldrig trykket" ligne
+          # et dobbelttryk. Midnat er derfor sentinel for "ikke sat"; et ægte tryk på
+          # præcis 00:00:00 fejler dermed ÅBENT (= ét rum), som er den billige vej.
+          urort: >-
+            {{ states('input_datetime.dark_mode_op_tryk_at')[11:] == '00:00:00' }}
+          dobbelt: >-
+            {{ sidst > 0 and not urort and (now().timestamp() - sidst) < vindue }}
+      # Stemplet sættes FØR handlingen: mørklægningen kan blokere op mod 35 s på
+      # gardinerne, og et tryk nr. 3 midt i den kørsel skal måles fra tryk nr. 2.
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.dark_mode_op_tryk_at
+        data:
+          timestamp: "{{ now().timestamp() }}"
+      - if:
+          - condition: template
+            value_template: "{{ dobbelt }}"
+        then:
+          # Var Dark Mode slukket, skal ON-grenen have lov at nulstille session +
+          # fritagelser FØR vi lægger alle tre rum ind — ellers tørrer den vores
+          # liste af igen. Synkroniserings-punktet er "ON-grenen har afsat sit
+          # spor": enten cinema_active (filmsession) eller rum-listen (knap-
+          # session, som altid lander på mindst 'sove'). 2026-09-02: cinema_active
+          # alene duer ikke længere, da en knap-session bevidst ikke sætter den.
+          - if:
+              - condition: state
+                entity_id: input_boolean.dark_mode
+                state: "off"
+            then:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.dark_mode
+              - wait_template: >-
+                  {{ is_state('input_boolean.cinema_active', 'on')
+                     or states('input_text.dark_mode_rooms') != '' }}
+                timeout: "00:00:10"
+          # "Alle tre" skal betyde alle tre: et rum brugeren fritog tidligere i
+          # sessionen kommer med igen (dark_mode_apply_rooms filtrerer ellers
+          # fritagne rum fra).
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.dark_mode_exempt
+            data:
+              value: ""
+          # Dobbelttrykket tager sofastuen med = open plan ER i scope igen, så
+          # husets open-plan-suppression skal tændes og knap-session-mærket falde
+          # (ellers ville dark_mode_room_joins stadig afvise stue/boern).
+          - service: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.dark_mode_kun_sove
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.cinema_active
+          - service: logbook.log
+            data:
+              name: "Dark Mode"
+              message: >-
+                Dobbelttryk på op-knappen → mørklægger ALLE tre rum
+                (sofastue + soveværelse + børneværelse).
+              entity_id: input_boolean.dark_mode
+          - service: script.dark_mode_apply_rooms
+            data:
+              rooms: "sove boern stue"
+        else:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.dark_mode
+
+  # Mørklæg ét eller flere af de tre rum. Delt af ON-grenen og af
+  # dark_mode_room_joins (rum der får presence MENS filmen kører).
+  # 'rooms' = mellemrums-separeret delmængde af "stue sove boern".
+  # ÉT choke point (fejlklasse #1): fritagelses-filter, sessions-bogføring og
+  # gardin-snapshot ligger HER, så begge veje ind i mørklægningen opfører sig ens.
+  dark_mode_apply_rooms:
+    alias: "Dark Mode: mørklæg rum"
+    icon: mdi:theater
+    mode: queued
+    max: 4
+    fields:
+      rooms:
+        description: "Mellemrums-separeret: stue sove boern"
+        example: "stue sove"
+    sequence:
+      - variables:
+          # Fritagne rum (op-tryk) filtreres fra uanset hvem der kalder.
+          r: >-
+            {% set ex = states('input_text.dark_mode_exempt').split() %}
+            {{ (rooms | default('') | string).split() | reject('in', ex) | join(' ') }}
+      - condition: template
+        value_template: "{{ r != '' }}"
+      - variables:
+          lights: >-
+            {% set ns = namespace(l=[]) %}
+            {% for k, g in [('stue', 'light.stue_room'),
+                            ('sove', 'light.sovevaerelse_all'),
+                            ('boern', 'light.boernevaerelse_all')] %}
+            {% if k in r.split() %}
+            {% set ns.l = ns.l + [g] %}
+            {% endif %}
+            {% endfor %}
+            {{ ns.l | join(',') }}
+          # ALLE gardiner i de rum vi mørklægger — uanset hvad HA TROR de står
+          # på. Vest_1's close = NED-RF + gardin_vest_ned_sekunder + My-STOP ved
+          # 85 % (user-spec 2026-07-28: "vest gardin sofa stue kun går ned til
+          # tærsklen"), og en ANDEN close fra 85 % kører videre og rammer bunden
+          # — derfor filtrerede vi før på state. Men RTS er ENVEJS: state er et
+          # GÆT. Stod gættet forkert på 'closed' blev gardinet sprunget over
+          # (user 2026-07-29: "dark mode glemte vest gardin stue"). Nu ejer
+          # script.gardin_film_luk fysikken: vest re-homes (OP → fuld køretid →
+          # close) så 85 % altid rammes fra toppen, syd/spisestue-vest lukkes
+          # idempotent, og Zigbee-sove filtreres på sin ÆGTE position.
+          # Spisestue-vest tilføjet 2026-07-29 (manglede i begge mørklægninger,
+          # fejlklasse #16). 2026-08-08: efter 85 %-stoppet giver film-luk vest
+          # et ekstra kort NED (gardin_vest_moerklaeg_ekstra_sekunder, 1 s) —
+          # kun ved mørklægning.
+          covers: >-
+            {% set ns = namespace(l=[]) %}
+            {% for k, c in [('stue', 'cover.gardin_stue_syd'),
+                            ('stue', 'cover.gardin_stue_vest_1'),
+                            ('stue', 'cover.gardin_spisestue_vest'),
+                            ('sove', 'cover.gardin_sovevaerelse')] %}
+            {% if k in r.split() %}
+            {% set ns.l = ns.l + [c] %}
+            {% endif %}
+            {% endfor %}
+            {{ ns.l | join(',') }}
+      # Sessionen udvides FØR lyset slukkes: binary_sensor.dark_mode_* læser
+      # denne liste, og enforce/presence-gates skal være live i samme øjeblik
+      # lyset går ud (ellers kunne en auto-tænd smutte ind i hullet).
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.dark_mode_rooms
+        data:
+          value: >-
+            {% set cur = states('input_text.dark_mode_rooms').split() %}
+            {{ (cur + (r.split() | reject('in', cur) | list)) | join(' ') }}
+      - if:
+          - condition: template
+            value_template: "{{ lights != '' }}"
+        then:
+          - service: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: "{{ lights.split(',') }}"
+      # Genåbnings-snapshot: TILFØJ de gardiner vi rent faktisk lukker (og som
+      # stod åbne). Skrives her — ikke i ON-grenen — så BEGGE veje ind i
+      # mørklægningen (ON + rum-der-slutter-sig-til) registrerer deres gardiner
+      # ét sted (fejlklasse #1: ellers ville join-vejens gardiner aldrig blive
+      # genåbnet ved OFF).
+      - variables:
+          nye: >-
+            {% set prev = states('input_text.dark_mode_curtains_prev').split() %}
+            {% set ns = namespace(l=[]) %}
+            {% for k, c in [('syd', 'cover.gardin_stue_syd'),
+                            ('vest', 'cover.gardin_stue_vest_1'),
+                            ('spv', 'cover.gardin_spisestue_vest'),
+                            ('sove', 'cover.gardin_sovevaerelse')] %}
+            {#- Vi LUKKER alt i scope, men bogfører kun det der stod ÅBENT: var
+                gardinet allerede nede (sommerforsvar/godnat/manuelt), er det
+                ikke vores at åbne igen ved OFF. 'unknown' tæller som åben —
+                RTS-coverne står unknown til første kommando efter genstart. -#}
+            {% if c in covers.split(',') and k not in prev
+                  and states(c) in ['open', 'opening', 'unknown'] %}
+            {% set ns.l = ns.l + [k] %}
+            {% endif %}
+            {% endfor %}
+            {{ (prev + ns.l) | join(' ') }}
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.dark_mode_curtains_prev
+        data:
+          value: "{{ nye }}"
+      - if:
+          - condition: template
+            value_template: "{{ covers != '' }}"
+        then:
+          # Manuel-ned-grace FØR luk (blokerer auto-genåbning: morgen-gardiner,
+          # vinter sol-opvarmning, Active-open — jf. packages/gardin_manual_grace.yaml)
+          - repeat:
+              for_each: "{{ covers.split(',') }}"
+              sequence:
+                - service: script.gardin_mark_manual_down
+                  data:
+                    cover: "{{ repeat.item }}"
+          # Covers SIDST — template-covers blokerer (op til ~30 s).
+          - service: script.gardin_film_luk
+            data:
+              covers: "{{ covers }}"
+
+  # Fritag ét rum for resten af sessionen (op-tryk på rummets Styrbar/RODRET —
+  # user-spec 2026-07-28: "trykkes styrbar-op eller rodret/somrig-op i et rum,
+  # så er det rum undtaget fra dark mode-sessionen").
+  dark_mode_room_exempt:
+    alias: "Dark Mode: fritag rum"
+    icon: mdi:lightbulb-on-outline
+    mode: queued
+    max: 5
+    fields:
+      room:
+        description: "stue | sove | boern"
+        example: "stue"
+    sequence:
+      - condition: state
+        entity_id: input_boolean.dark_mode
+        state: "on"
+      - variables:
+          k: "{{ room | default('') | string }}"
+      # Idempotent: gentagne op-tryk (brightness-stigen) må ikke spamme logbogen.
+      - condition: template
+        value_template: >-
+          {{ k in ['stue', 'sove', 'boern']
+             and k not in states('input_text.dark_mode_exempt').split() }}
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.dark_mode_exempt
+        data:
+          value: >-
+            {{ (states('input_text.dark_mode_exempt').split() + [k]) | join(' ') }}
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.dark_mode_rooms
+        data:
+          value: >-
+            {{ states('input_text.dark_mode_rooms').split()
+               | reject('eq', k) | join(' ') }}
+      - service: logbook.log
+        data:
+          name: "Dark Mode"
+          message: >-
+            {{ k }}: op-tryk på fjernbetjeningen → rummet er FRITAGET resten af
+            sessionen (normal auto-lys igen). Gardinet bliver liggende — det
+            genåbnes af OFF-grenen i dagslys som altid.
+          entity_id: input_boolean.dark_mode
+
+automation:
+  - id: dark_mode_apply
+    alias: "Dark Mode: mørklæg / genopret (børn + sove + sofastue)"
+    mode: queued
+    max: 4
+    trigger:
+      - platform: state
+        entity_id: input_boolean.dark_mode
+        to: "on"
+        id: dm_on
+      - platform: state
+        entity_id: input_boolean.dark_mode
+        to: "off"
+        id: dm_off
+      - platform: state
+        entity_id: input_boolean.cinema_active
+        to: "off"
+        id: cinema_off
+    action:
+      - choose:
+          # ------------------- ON: mørklæg -------------------
+          - conditions:
+              - condition: trigger
+                id: dm_on
+            sequence:
+              # Scope (user-spec 2026-08-02): PRIORITETS-STIGE — soveværelset
+              # hvis der er meget nylig aktivitet derinde, ellers børneværelset,
+              # ellers sofastuen. ÉT rum. Stigen selv bor i
+              # sensor.moerklaegning_scope_rum (2026-08-12), som pre-dark også
+              # læser — ét anker frem for to kopier af reglen.
+              # Snapshottet indeholder derfor KUN det scopede rums gardiner — så
+              # OFF ikke genåbner et gardin vi aldrig rørte.
+              #
+              # 2026-09-02 (user-spec): stigen gælder KUN når det er en ægte
+              # filmsession, dvs. når projektoren kører. Trykkes Dark Mode-
+              # knappen (RODRET/Somrig) uden projektor, er hensigten "mørkt her
+              # hvor jeg er på vej i seng" — ikke "huset ser film". Så er scopet
+              # HÅRDT soveværelset, og open plan røres slet ikke: cinema_active
+              # (husets open-plan-suppression, ~40 forbrugere) sættes ikke, og
+              # køkken-lyskæden gater på binary_sensor.dark_mode_stue.
+              # `not is_state(... 'on')` frem for `is_state(... 'off')`: en
+              # unavailable projektor-sensor skal falde til den SMALLE adfærd.
+              # Dobbelttrykket (script.dark_mode_button_up) er stadig udvejen
+              # til alle tre rum og tænder selv cinema_active.
+              - variables:
+                  knap_session: >-
+                    {{ not is_state('binary_sensor.projektor_aktiv', 'on') }}
+                  scope: >-
+                    {{ 'sove' if knap_session
+                       else states('sensor.moerklaegning_scope_rum') }}
+              # 2026-09-23 (user-bug 21/09): en projektor-session hvis stige
+              # landede på SOVEVÆRELSET er også en "kun sove"-session. Filmen
+              # 21/09 kørte i sengen (sove optaget 100 % af alle 6 projektor-
+              # sessioner 14-22/09, stuen 0 %) — men cinema_active lagde husets
+              # open-plan-suppression over stuen, så sofalyset brændte en time i
+              # et tomt rum, og en tur ud i stuen efter filmen trak alle tre
+              # open-plan-gardiner ned via dark_mode_room_joins (fejlklasse #26).
+              # 2026-09-25 (user-spec: "på samme måde som at soveværelse film
+              # ikke forhindrer hvidt lys i køkkenet skal film i børne
+              # soveværelset heller ikke blokere for det hvide lys"): en
+              # projektor-session hvis stige landede i BØRNEVÆRELSET ejer
+              # heller ikke open plan → samme "kun soverum"-session, ingen
+              # cinema_active (den blokerede køkkenets presence-tænd helt).
+              # Flaget hedder stadig kun_sove; joins er stadig kun 'sove'
+              # (se dark_mode_room_joins) — stuen kommer kun med via
+              # dobbelttrykket. Pris: vælger stigen 'boern' under en stue-film
+              # (27/8-sagen), er open plan ikke undertrykt før dobbelttrykket.
+              - variables:
+                  kun_sove: "{{ knap_session or scope | trim in ['sove', 'boern'] }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ kun_sove }}"
+                then:
+                  - service: input_boolean.turn_on
+                    target:
+                      entity_id: input_boolean.dark_mode_kun_sove
+                else:
+                  - service: input_boolean.turn_off
+                    target:
+                      entity_id: input_boolean.dark_mode_kun_sove
+              - service: "input_boolean.turn_{{ 'off' if knap_session else 'on' }}"
+                target:
+                  entity_id: input_boolean.dark_mode_projektor_session
+              # Nulstil genåbnings-snapshottet — script.dark_mode_apply_rooms
+              # fylder det selv med de gardiner den faktisk lukker.
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.dark_mode_curtains_prev
+                data:
+                  value: ""
+              # Ny session: rum-listen bygges forfra, og forrige sessions
+              # fritagelser må IKKE arves (2026-07-28).
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.dark_mode_rooms
+                data:
+                  value: ""
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.dark_mode_exempt
+                data:
+                  value: ""
+              # Open-plan-suppressionen hører til en FILMSESSION. En knap-session
+              # må ikke slukke presence-lyset i køkken/spisestue/stue/terrasse/
+              # entré for resten af familien.
+              - if:
+                  - condition: template
+                    value_template: "{{ not kun_sove }}"
+                then:
+                  - service: input_boolean.turn_on
+                    target:
+                      entity_id: input_boolean.cinema_active
+              - service: logbook.log
+                data:
+                  name: "Dark Mode"
+                  message: >-
+                    {% if knap_session %}
+                    Knap-session (projektor slukket) → mørklægger KUN soveværelset;
+                    open plan røres ikke. Tryk op igen indenfor
+                    {{ states('input_number.dark_mode_dobbelttryk_sekunder') | int(120) }}
+                    s for at tage alle tre rum.
+                    {% else %}
+                    Mørklægger {{ scope if scope != ''
+                    else '(intet rum med meget nylig aktivitet — kun open-plan-suppression; tryk op igen indenfor '
+                         ~ (states('input_number.dark_mode_dobbelttryk_sekunder') | int(120))
+                         ~ ' s for at tage alle tre rum)' }}.
+                    {% endif %}
+                  entity_id: input_boolean.dark_mode
+              - service: script.dark_mode_apply_rooms
+                data:
+                  rooms: "{{ scope }}"
+          # -------- eksternt cinema-off → sluk dark_mode (OFF-grenen rydder op) --------
+          - conditions:
+              - condition: trigger
+                id: cinema_off
+              - condition: state
+                entity_id: input_boolean.dark_mode
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.dark_mode
+          # ------------------- OFF: genopret -------------------
+          - conditions:
+              - condition: trigger
+                id: dm_off
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id:
+                    - input_boolean.cinema_active
+                    - input_boolean.dark_mode_kun_sove
+                    - input_boolean.dark_mode_projektor_session
+              # Session slut: ryd rum-liste + fritagelser, og giv rummene deres
+              # NORMALE AUTO tilbage (user-spec 2026-07-28 om ned-trykket på Dark
+              # Mode-RODRET: "skal slukke for dark mode i alle rum og så skal de
+              # rum tilbage til deres normale auto").
+              # Kun Manual → Auto: Manual er præcis det stempel et Styrbar-tryk
+              # under filmen efterlader, mens et bevidst Off valgt på
+              # dashboardet ikke må overskrives. INTET lys tændes/ændres her —
+              # room_mode-skiftet slipper blot presence-automatikken løs igen
+              # (jf. "lights-tændt-spontant"-mønstret i CLAUDE.md).
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.dark_mode_rooms
+                data:
+                  value: ""
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.dark_mode_exempt
+                data:
+                  value: ""
+              - repeat:
+                  for_each:
+                    - input_select.room_mode_stue
+                    - input_select.room_mode_sovevaerelse
+                    - input_select.room_mode_boernevaerelse
+                  sequence:
+                    - if:
+                        - condition: template
+                          value_template: "{{ is_state(repeat.item, 'Manual') }}"
+                      then:
+                        - service: input_select.select_option
+                          target:
+                            entity_id: "{{ repeat.item }}"
+                          data:
+                            option: "Auto"
+              - variables:
+                  # Alt vi lukkede ved ON (snapshottet).
+                  prev_covers: >-
+                    {% set prev = states('input_text.dark_mode_curtains_prev').split() %}
+                    {% set ns = namespace(l=[]) %}
+                    {% for k, e in [('syd', 'cover.gardin_stue_syd'),
+                                    ('vest', 'cover.gardin_stue_vest_1'),
+                                    ('spv', 'cover.gardin_spisestue_vest'),
+                                    ('sove', 'cover.gardin_sovevaerelse')] %}
+                    {% if k in prev %}{% set ns.l = ns.l + [e] %}{% endif %}
+                    {% endfor %}
+                    {{ ns.l | join(', ') }}
+                  # 2026-07-28 (user-spec): sover et barn i forældresengen
+                  # (putning_sove_active), skal sove-gardinet BLIVE nede når
+                  # Dark Mode slukkes — det åbnes først når brugeren selv gør
+                  # det, eller når en senere auto-rutine gør det (godmorgen,
+                  # weekend 09:00, Active) efter putningen er clearet.
+                  # NB: restore læser bevidst IKKE sensor.gardiner_manual_hold
+                  # generelt — dens eget ON-stempel ligger i 'held', så det
+                  # ville gøre enhver genåbning umulig. Kun putningen undtages.
+                  # 2026-09-29 (B170): spisestue-vest bliver også NEDE mens
+                  # mosbillede eller putte-glare holder det — de ejer det og
+                  # åbner selv (frigiv / morning_curtains).
+                  reopen: >-
+                    {{ (prev_covers.split(', ') if prev_covers != '' else [])
+                       | reject('in', (['cover.gardin_sovevaerelse']
+                                       if is_state('input_boolean.putning_sove_active', 'on')
+                                       else [])
+                                  + (['cover.gardin_spisestue_vest']
+                                     if is_state('input_boolean.mosbillede_gardin_ned', 'on')
+                                        or is_state('input_boolean.putte_glare_spisestue_vest_ned', 'on')
+                                     else []))
+                       | join(', ') }}
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.dark_mode_curtains_prev
+                data:
+                  value: ""
+              # Genåbn kun i dagslys — efter mørkefald er lukket nat-normalen.
+              - if:
+                  - condition: template
+                    value_template: "{{ prev_covers != '' and is_state('sun.sun', 'above_horizon') }}"
+                then:
+                  - if:
+                      - condition: template
+                        value_template: "{{ reopen != '' }}"
+                    then:
+                      - service: cover.open_cover
+                        continue_on_error: true
+                        target:
+                          entity_id: "{{ reopen }}"
+                  - if:
+                      - condition: template
+                        value_template: "{{ 'cover.gardin_sovevaerelse' in prev_covers
+                                            and 'cover.gardin_sovevaerelse' not in reopen }}"
+                    then:
+                      - service: logbook.log
+                        data:
+                          name: "Dark Mode"
+                          message: >-
+                            Sove-gardinet blev IKKE genåbnet — barn puttet i
+                            forældresengen. Det åbnes manuelt eller af næste
+                            auto-rutine efter putningen er slut.
+                          entity_id: cover.gardin_sovevaerelse
+                  # Ryd manuel-ned-grace på ALLE gardiner fra snapshottet — også
+                  # det putning-holdte sove: ON-stemplet må ikke blokere den
+                  # SENERE auto-åbning (godmorgen/Active) i op til 2 t. Mens
+                  # putningen kører holder sensor.gardiner_manual_hold det nede
+                  # alligevel, så et ryddet stempel åbner ikke noget nu.
+                  # Spejler Styrbar-open-mønstret i script_pkg/house_routines.yaml.
+                  - repeat:
+                      for_each: "{{ prev_covers.split(', ') }}"
+                      sequence:
+                        - variables:
+                            dt: >-
+                              {% set m = {
+                                   'cover.gardin_stue_syd': 'input_datetime.gardin_manual_down_syd',
+                                   'cover.gardin_stue_vest_1': 'input_datetime.gardin_manual_down_vest_1',
+                                   'cover.gardin_spisestue_vest': 'input_datetime.gardin_manual_down_spisestue_vest',
+                                   'cover.gardin_sovevaerelse': 'input_datetime.gardin_manual_down_sove' } %}
+                              {{ m.get(repeat.item, '') }}
+                        - if:
+                            - condition: template
+                              value_template: "{{ dt != '' }}"
+                          then:
+                            - service: input_datetime.set_datetime
+                              target:
+                                entity_id: "{{ dt }}"
+                              data:
+                                datetime: "1970-01-01 00:00:00"
+
+  - id: dark_mode_lights_enforce
+    alias: "Dark Mode: hold lys slukket (re-assert)"
+    description: >
+      Backstop for "lys skal HOLDES slukket" — MEN lad manuel vinde
+      (user-spec 2026-07-27): tænder AUTO (presence/LUX/watchdog) noget af
+      de tre mørklagte grupper (børn + sove + sofastue) mens Dark Mode er
+      on, slukkes det straks igen. Manuel tænd (app/dashboard-tryk =
+      context.user_id sat; ELLER Styrbar = room_mode_<rum> == Manual) får
+      LOV at blive. Fanger enhver auto-tænd-sti der ikke er dark_mode-gatet
+      ved kilden. Escape = sluk Dark Mode.
+      NB: 2 s delay før tjek — Styrbar-handleren kalder light.turn_on FØR
+      den stempler room_mode=Manual (styrbar_helpers race), så et øjeblikkeligt
+      tjek ville se Auto og fejlagtigt slukke brugerens manuelle tænd.
+    mode: queued
+    max: 6
+    trigger:
+      - platform: state
+        entity_id:
+          - light.boernevaerelse_all
+          - light.sovevaerelse_all
+          - light.stue_room
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.dark_mode
+        state: "on"
+    action:
+      - delay: "00:00:02"
+      - variables:
+          room: >-
+            {{ {'light.boernevaerelse_all': 'boernevaerelse',
+                'light.sovevaerelse_all': 'sovevaerelse',
+                'light.stue_room': 'stue'}.get(trigger.entity_id, '') }}
+          # Scope-sensor for netop dette rum (user-spec 2026-07-28): er rummet
+          # IKKE mørklagt — ingen nylig presence, ELLER brugeren har fritaget det
+          # med et op-tryk — skal dets normale auto-lys have lov at virke, så
+          # enforce holder fingrene væk.
+          scope_sensor: >-
+            {{ {'light.boernevaerelse_all': 'binary_sensor.dark_mode_boern',
+                'light.sovevaerelse_all': 'binary_sensor.dark_mode_sove',
+                'light.stue_room': 'binary_sensor.dark_mode_stue'}.get(trigger.entity_id, '') }}
+          # 2026-08-29 (user-spec: "hvis jeg trykker på lys vil jeg selvfølgelig
+          # ha lys, det skal du ikke beskytte mig mod"). De to gamle tests kunne
+          # BEGGE fejle for et fysisk knap-tryk: zha_event bærer intet
+          # context.user_id (fejlklasse #3), og de knapper der bevidst sætter
+          # room_mode=Auto (sove-RODRET) i stedet for Manual faldt derfor
+          # igennem. Målt 28/8 21:21-22:01: Dark Mode kørte 40 min, og fire
+          # RODRET-tryk + to sengetids-tænd blev snappet slukket 2 s efter hver
+          # gang; brugeren måtte slukke Dark Mode for at få lys.
+          # Tredje test = husets kanoniske finger-vidne. Rum-slug'en er den
+          # samme i begge entity-navne, så alle tre mørklagte rum dækkes.
+          press_alder: >-
+            {% set p = state_attr('input_datetime.styrbar_last_press_' ~ room,
+                                  'timestamp') | float(0) %}
+            {{ 99999 if p <= 0 else (as_timestamp(now()) - p) }}
+          # 20 s = samme vindue som aften-låsen (packages/aften_manual_off_lock.yaml):
+          # dækker knap → stempel → lysets 2 s debounce. Holdt bevidst identisk,
+          # så de to finger-tests ikke kan divergere (fejlklasse #2).
+          is_manual: >-
+            {{ trigger.to_state.context.user_id is not none
+               or states('input_select.room_mode_' ~ room) == 'Manual'
+               or (press_alder | float(99999)) < 20 }}
+      - if:
+          # stadig on efter delay + Dark Mode stadig on + rummet i scope + IKKE
+          # manuel → auto-tænd i et mørklagt rum → sluk igen
+          - condition: state
+            entity_id: input_boolean.dark_mode
+            state: "on"
+          - condition: template
+            value_template: "{{ scope_sensor != '' and is_state(scope_sensor, 'on') }}"
+          - condition: template
+            value_template: "{{ is_state(trigger.entity_id, 'on') and not is_manual }}"
+        then:
+          - service: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: "{{ trigger.entity_id }}"
+            data:
+              transition: 2
+
+  # ---------------------------------------------------------------------------
+  # 2026-09-23: projektoren styrer Dark Mode (user-bug 21/09). Pre-dark dæmper
+  # kun allerede-tændte pærer — soveloftet brændte 20:37→21:20 under filmen,
+  # indtil user selv trykkede Dark Mode. ON-grenen vælger scope via stigen som
+  # ved et knaptryk med projektoren tændt. OFF: projektor-sluk afslutter en
+  # projektor-session (dm_off-grenen rydder op og giver rummene Auto igen).
+  # AirBnB beholder pre-dark (blid og selv-reverserende for gæsten).
+  # ---------------------------------------------------------------------------
+  - id: dark_mode_projektor_styrer
+    alias: "Dark Mode: start/stop med projektoren"
+    mode: queued
+    max: 3
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.projektor_aktiv
+        from: "off"
+        to: "on"
+        id: "on"
+      - platform: state
+        entity_id: binary_sensor.projektor_aktiv
+        from: "on"
+        to: "off"
+        id: "off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.dark_mode_ved_projektor
+        state: "on"
+    action:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: "on"
+              - condition: template
+                value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+              - condition: state
+                entity_id: input_boolean.dark_mode
+                state: "off"
+              # Godnat ejer allerede mørket; en film i sengen efter godnat
+              # skal ikke vække Dark Mode-maskineriet (gardiner er nede).
+              - condition: state
+                entity_id: input_boolean.godnat_active
+                state: "off"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.dark_mode
+          - conditions:
+              - condition: trigger
+                id: "off"
+              - condition: state
+                entity_id: input_boolean.dark_mode
+                state: "on"
+              - condition: state
+                entity_id: input_boolean.dark_mode_projektor_session
+                state: "on"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Dark Mode"
+                  message: "Projektoren slukket → Dark Mode afsluttet."
+                  entity_id: input_boolean.dark_mode
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.dark_mode
+
+  - id: dark_mode_room_joins
+    alias: "Dark Mode: mørklæg rum der får presence undervejs"
+    description: >
+      Scope-udvidelse (user-spec 2026-07-28): går nogen i seng midt i filmen,
+      kommer soveværelset med — ellers ville dets gardin stå åbent og dets
+      presence-lys tænde, hvilket er præcis det lys-spild ind i biografen
+      mørklægningen skal forhindre. Kun ÉN vej: sessionen udvides, aldrig
+      trækkes tilbage (stickiness — se RUM-SCOPE i headeren). Undtagelsen er
+      brugerens eget op-tryk (dark_mode_room_exempt), og et fritaget rum kommer
+      IKKE med igen her.
+      Trigger er KANDIDAT-sensoren (ikke rum-sensorerne, som nu læser sessionen
+      og derfor ikke kan tænde af sig selv).
+      2026-08-02: kun rum der lige er KOMMET IND i kandidat-listen (ikke i
+      from_state) tæller som "sluttede sig til". Uden det ville prioritets-
+      stigens ene rum blive ædt op med det samme: stod stuen også på listen da
+      filmen startede (den gør den næsten altid — man trykker på knappen et
+      sted), ville den blive lagt til ved den FØRSTE bedste ændring af
+      sensoren. Et rum man reelt går ind i under filmen falder ud af listen
+      først og kommer ind igen = ægte join.
+    mode: queued
+    max: 3
+    trigger:
+      - platform: state
+        entity_id: sensor.rum_med_nylig_presence
+    condition:
+      # Kun MENS Dark Mode kører. 5 s karens efter ON: ON-grenen har lige
+      # mørklagt de samme rum, og en kandidat-ændring i det vindue ville ellers
+      # kapløbe med den.
+      - condition: state
+        entity_id: input_boolean.dark_mode
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ (now() - states.input_boolean.dark_mode.last_changed).total_seconds() > 5 }}
+      # 2026-09-23: en projektor-session tager kun nye rum ind MENS der vises
+      # film. 21/09 21:42 blev stuen trukket ind (tre gardiner ned) 7 min efter
+      # at projektoren var slukket — et rum kan ikke slutte sig til en film der
+      # er slut.
+      - condition: template
+        value_template: >-
+          {{ not is_state('input_boolean.dark_mode_projektor_session', 'on')
+             or is_state('binary_sensor.projektor_aktiv', 'on') }}
+    action:
+      - variables:
+          nye: >-
+            {% set cur = states('input_text.dark_mode_rooms').split() %}
+            {% set ex = states('input_text.dark_mode_exempt').split() %}
+            {% set fra = trigger.from_state.state.split() if trigger.from_state else [] %}
+            {#- 2026-09-02: en knap-session ejer KUN soveværelset. Uden dette
+                filter ville en tur ud i køkkenet/sofaen midt i en sove-
+                mørklægning trække stuen (og dermed open plan + tre gardiner)
+                ind ad bagdøren — præcis det scopet skulle forhindre. -#}
+            {% set tilladt = ['sove'] if is_state('input_boolean.dark_mode_kun_sove', 'on')
+                             else ['sove', 'boern', 'stue'] %}
+            {{ trigger.to_state.state.split() | select('in', tilladt)
+               | reject('in', fra) | reject('in', cur)
+               | reject('in', ex) | join(' ') }}
+      - condition: template
+        value_template: "{{ nye != '' }}"
+      - service: logbook.log
+        data:
+          name: "Dark Mode"
+          message: >-
+            {{ nye }} fik presence under filmen → mørklægges med.
+          entity_id: input_boolean.dark_mode
+      - service: script.dark_mode_apply_rooms
+        data:
+          rooms: "{{ nye }}"
+
+  - id: dark_mode_room_exempt_button
+    alias: "Dark Mode: op-tryk fritager rummet"
+    description: >
+      user-spec 2026-07-28: "hvis dark mode er tændt og der trykkes styrbar-op
+      eller rodret/somrig-op i et rum, så skal det rum undtages fra dark
+      mode-sessionen." Op = "jeg vil have lys HER" → rummet forlader
+      mørklægningen med det samme: dark_mode_lights_enforce holder op med at
+      slukke det, og presence-gaterne (der hænger på binary_sensor.dark_mode_*)
+      slipper, så rummets normale auto-styring virker igen.
+      Både klik (on) og hold (move_with_on_off) på øverste knap tæller — begge
+      er "op" på både Styrbar N2 og RODRET/Somrig.
+      Dark Mode-RODRET (58:55:f0) er BEVIDST ikke med: dens op-knap ER Dark Mode-tænd
+      (automations/somrig_buttons.yaml). Terrasse/bad-Stybar er ikke Dark
+      Mode-rum og rammer derfor ingenting.
+      Gardinet bliver liggende (mørklagt vindue generer ikke, og RTS-motorerne
+      skal ikke køre op/ned ved hvert lys-tryk) — OFF-grenen genåbner det i
+      dagslys som altid.
+    mode: queued
+    max: 5
+    trigger:
+      - platform: event
+        event_type: zha_event
+        event_data:
+          command: "on"
+      - platform: event
+        event_type: zha_event
+        event_data:
+          command: "move_with_on_off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.dark_mode
+        state: "on"
+      # 2026-10-05 (B193): et radio-tryk på Styrbar stue er volumen, ikke "lys her".
+      - condition: template
+        value_template: >-
+          {{ not (trigger.event.data.device_ieee == '7e:44:f6:62:8e:f4:b1:23'
+               and is_state('binary_sensor.styrbar_stue_radio', 'on')) }}
+    action:
+      - variables:
+          # IEEE → Dark Mode-rum. Kilder: ieee_to_room i
+          # automations/styrbar_rooms.yaml + device-mappet i
+          # automations/somrig_buttons.yaml (fejlklasse #16: opdatér BEGGE
+          # steder hvis en fjernbetjening flytter rum).
+          ieee_to_room:
+            "7e:44:f6:62:8e:f4:b1:23": stue    # Styrbar stue
+            "c3:db:c9:b4:05:ef:1d:63": sove    # Styrbar soveværelse
+            "66:19:44:cc:2c:41:57:fe": boern   # Styrbar børneværelse
+            "99:09:1d:84:7d:4e:c6:17": stue    # RODRET stue-gardiner
+            "39:ed:51:54:13:58:b3:9d": sove    # RODRET sove-gardin
+          k: >-
+            {{ ieee_to_room.get(trigger.event.data.device_ieee, '') }}
+      - condition: template
+        value_template: "{{ k != '' }}"
+      - service: script.dark_mode_room_exempt
+        data:
+          room: "{{ k }}"
+
+  - id: dark_mode_night_cutover
+    alias: "Dark Mode: nat-cutover til godnat (glemt tændt)"
+    description: >
+      Sikkerheds-cutover (user-spec 2026-07-28): er Dark Mode STADIG tændt ved
+      cutover-tiden (input_datetime.dark_mode_godnat_cutover, default 03:00) —
+      typisk fordi man faldt i søvn under en film uden at trykke godnat — så
+      overgår huset til godnat via script.godnat. Derfra kører den normale
+      godnat→godmorgen-automatik videre (06:00 godnat_auto_clear + morgen-vækning).
+      INTET TÆNDER ved overgangen:
+        - alle indendørs lys er allerede holdt slukket af Dark Mode (enforce),
+        - script.godnat sætter godnat_active/voksne FØR den slipper cinema_active
+          (som via dark_mode_apply's cinema_off-sync slukker Dark Mode) → i det
+          øjeblik Dark Mode-gaten slipper, er open-plan + sove/børn gated af
+          godnat-flagene i stedet (presence_stue/_lights gater på godnat-unionen,
+          ikke kun cinema). Ingen ugated auto-tænd-sti findes derfor.
+      AirBnB (2026-07-28, AirBnB-review): vi tvinger ALDRIG godnat på en gæst —
+      men mørklægningen må heller ikke hænge, for dark_mode_lights_enforce er
+      IKKE mode-gatet og ville så slå gæstens presence-lys ihjel resten af
+      opholdet (AirBnB-natmode sætter godnat-flag DIREKTE og rører aldrig
+      cinema_active, så den rydder ikke Dark Mode). Derfor: AirBnB-grenen
+      SLIPPER kun mørklægningen (dark_mode off) — intet tændes (OFF-grenen
+      tænder aldrig lys, og gardin-genåbning kræver dagslys). Undtagen hvis
+      gæsten er OPPE lige nu (fælles-arealet aktivt): så er mørklægningen i
+      brug, og et release ville gøre presence-lyset live midt i filmen.
+      Backstop hvis vi holder igen: mood_flag_safety_cinema (4t stuck + tom stue).
+    mode: single
+    trigger:
+      - platform: time
+        at: input_datetime.dark_mode_godnat_cutover
+    condition:
+      - condition: state
+        entity_id: input_boolean.dark_mode
+        state: "on"
+    action:
+      - choose:
+          # ---------- Familie-modes: fuld overgang til godnat ----------
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Dark Mode cutover"
+                  message: >-
+                    Dark Mode stadig tændt kl {{ now().strftime('%H:%M') }} → overgang til
+                    godnat (glemt godnat-tryk). Intet tændt; morgen-automatik overtager.
+                  entity_id: input_boolean.dark_mode
+              # script.godnat sætter godnat-flag + slukker cinema_active → dark_mode_apply's
+              # cinema_off-sync slukker Dark Mode og kører fuld OFF-oprydning. Én sti.
+              - service: script.godnat
+          # ---------- AirBnB: slip kun mørklægningen (ingen påtvunget godnat) ----------
+          - conditions:
+              - condition: state
+                entity_id: input_select.house_mode
+                state: "AirBnB"
+              # Er gæsten oppe lige nu → mørklægningen er i BRUG; slip den ikke.
+              # LIVE signal (samme sensor som natmode's ro-detektion bruger).
+              - condition: state
+                entity_id: binary_sensor.faelles_areal_aktiv
+                state: "off"
+              # Medie-tjek BEVIDST kun sekundært. Projektoren var 'unavailable' i
+              # døgn (også natten 07-27 hvor der REELT blev set film) fordi Cast-
+              # discovery via mDNS er brudt af HA-hostens to default-routes;
+              # genoprettet 2026-07-28 via known_hosts=192.0.2.97. Den kan
+              # stadig ikke bære gaten alene: HDMI-/app-afspilning uden Cast giver
+              # ikke 'playing' (fejlklasse #9 — unavailable er hverken on/off).
+              - condition: template
+                value_template: >-
+                  {{ states('media_player.projector') != 'playing' }}
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Dark Mode cutover"
+                  message: >-
+                    AirBnB: Dark Mode stadig tændt kl {{ now().strftime('%H:%M') }} og
+                    ingen afspilning → mørklægning sluppet (ingen godnat påtvunget).
+                    Intet tændt; gardiner forbliver lukkede til dagslys.
+                  entity_id: input_boolean.dark_mode
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.dark_mode

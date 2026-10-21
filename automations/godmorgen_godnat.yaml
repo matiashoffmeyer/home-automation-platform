@@ -1,0 +1,1587 @@
+# =============================================================================
+# GODMORGEN/GODNAT — Separated Kids + Adults Bedtime Cycles
+# =============================================================================
+#
+# SPRINT 2026-05-22 — SOVE-KNAP REDESIGN
+# Knappen blev simplificeret. Den er nu KUN sove-lokal på op-knapperne og
+# kun "lille sluk" på kort-ned (ikke whole-house godnat). Lang-ned bevarer
+# whole-house godnat-rollen.
+#
+# 1. BØRNE-GODNAT (somrig_4 button in børneværelse):
+#    Press → activates godnat_boern_active. Kids' room dims to bedtime
+#    scene (15% warm), curtain closes. Stue+køkken stay NORMAL for adults.
+#    Press again → cancels børne-godnat, restores kids' room to presence mode.
+#
+# 2. SOVE-KNAP KORT NED (somrig_6 endpoint=2 short_release):
+#    Sove fader off over 6s + sove-gardin lukker + room_mode_sovevaerelse=Off
+#    (presence-block indtil drift_back returnerer til Auto efter ~20 min tom).
+#    INGEN godnat-flags, ingen action i andre rum. "Lille sluk".
+#
+# 3. SOVE-KNAP LANG NED (somrig_6 endpoint=2 long_press):
+#    Whole-house godnat. Skip ventetid. Instant: flags + ALT lys off over 6s
+#    + ALLE gardiner lukket. "Force godnat NU".
+#
+# 4. FULL GODNAT (automatic):
+#    When BOTH godnat_boern_active AND godnat_voksne_active are on,
+#    godnat_active turns on. This is the "whole house asleep" flag that
+#    the night-light system (godnat_night.yaml) watches.
+#
+# 5. SOVE-KNAP KORT OP (somrig_6 endpoint=1 short_release):
+#    Tidsbestemt sove turn_on. Aften 18-04: +5%/klik (uden cap). Morgen+dag
+#    04-18: 30% + GARDIN-STIGE (2026-07-29: 1. tryk = privacy-niveau, 2. tryk =
+#    helt op). Cancel'er godnat-flags hvis aktive. Aften-grenen rører ikke gardinet.
+#
+# 6. SOVE-KNAP LANG OP (somrig_6 endpoint=1 long_press):
+#    Sove til 80% uanset tid. Sove-only, ingen gardin, ingen fælles-rum.
+#    Cancel'er godnat-flags hvis aktive.
+#
+# 7. AUTO-GODMORGEN DETECT (audit-runde 20, 2026-05-05):
+#    Hvis godnat_active=on + time > 06:00 + non-bedroom presence detekteret
+#    → kør instant godmorgen automatisk. Safety-net for hvis bruger glemmer
+#    at klikke godmorgen / vågner uden alarm. Hard limit 06:00 (ikke før).
+#
+# HARDWARE:
+#   somrig_6 (soveværelse)   — IKEA Somrig E2213 button, sove-knap.
+#                               KORT NED  = hus-godnat (60s fade) — MEN 04–12 =
+#                                           SNOOZE "sov videre" (kun soveværelset)
+#                               LANG NED  = whole-house godnat instant (5s), altid
+#                                           (putte-grenen fjernet 2026-09-30)
+#                               KORT OP   = sove tidsbestemt (aften +5%, morgen/dag 30%
+#                                           + gardin-stige privacy→helt op) + snooze-clear
+#                               LANG OP   = sove 80% + gardin helt op (uanset tid)
+#                               IEEE: b3:47:dd:fa:8c:68:31:05 (paret 2026-05-04
+#                               — flyttet fra entré rolle hvor den var pre-flyt
+#                               temporarily; entré Somrig er ikke paret endnu).
+#   somrig_4 (børneværelse)  — IKEA Somrig button (see somrig_buttons.yaml)
+# =============================================================================
+
+# =============================================================================
+# SOVE-KNAP KORT NED: hus-godnat — MEN morgen (04–12) = SNOOZE "sov videre"
+# =============================================================================
+# To grene, i den rækkefølge de prøves:
+#   1. MORGEN 04–12 (2026-07-29 user-spec) → script.sove_snooze_start:
+#      soveværelset mørklægges helt og vækning/auto-tænd/auto-gardin er
+#      suppress'et i sove_snooze_timer timer (default 4) eller indtil
+#      godmorgen-knappen trykkes derinde. KUN soveværelset — resten af
+#      familien er ved at stå op. Se packages/sovevaerelse_morgen_beskyttelse.yaml.
+#      2026-08-25 (user-spec): trykket SPRINGER desuden dagens vækning helt
+#      over — alle tre alarm-kanaler (Parent A's telefon, Parent B's genvej,
+#      reserve-alarmen) via input_datetime.wakeup_skip_dato, som gater
+#      ankeret sensor.wakeup_alarm_next. Før var det KUN en snooze, og
+#      vækningen fyrede så på snoozens egen udløbs-flanke ~4 t senere
+#      (fejlklasse #19). Godmorgen-knappen (kort/lang OP) fortryder begge dele.
+#   2. Ellers → fuld hus-godnat via script.godnat_fuld.
+# LANG NED (godnat_force): altid instant fuld hus-godnat (også i morgenvinduet
+# — kant-tilfældet "kom hjem kl 04:30").
+# 2026-09-30 (user): putte-grenen (første tryk 16:00-21:00 = putning i
+# voksensengen, 2026-07-22/08-06) er FJERNET fra begge gestusser: "det er jo
+# styrbar børneværelse den regel gælder for! ikke godnat knappen som er i
+# voksen værelset!" Putning i voksen-værelset tændes kun via tilen.
+# =============================================================================
+- id: godnat_voksen_start
+  alias: "Sove-knap: kort ned (godnat hele huset, 60s fade)"
+  description: >
+    Somrig short release endpoint=2 (kort ned) i soveværelse.
+    2026-07-29 (user-spec): I MORGENVINDUET 04–12 er trykket en SNOOZE —
+    "sov videre" — der kun rører soveværelset (lys af, gardin ned, vækning
+    suppress'et i 4 t / til godmorgen-knappen). 2026-08-25 (user-spec): det
+    springer samtidig DAGENS vækning helt over på alle tre alarm-kanaler —
+    ikke bare udskyder den. Uden for vinduet: fuld hel-hus
+    godnat over 60s fade via script.godnat_fuld. Sætter godnat-flags, slukker
+    ALT lys (inkl. terrasse) undtagen børne-strippen (1% natlys), lukker alle
+    gardiner. User-spec 2026-06-07: kort tryk = langsom godnat; langt tryk
+    (godnat_force) = instant 6s. Erstatter tidligere "lille godnat" (sove+entre).
+    2026-07-15: I AirBnB gør kort = langt (begge instant 6s) — gæster forventer
+    øjeblikkelig sluk; Normal-mode beholder den bløde 60s-fade.
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "b3:47:dd:fa:8c:68:31:05"
+        endpoint_id: 2
+        command: "short_release"
+  action:
+    # 2026-10-02: et nyt tryk afbryder godmorgen-fadet (knapper skal stoppe det der kører NU).
+    - service: script.turn_off
+      target:
+        entity_id: script.sove_godmorgen_fade
+    - choose:
+        # ---- MORGEN 04–12: SNOOZE i stedet for hus-godnat (2026-07-29) --------
+        # User-spec: "hvis en alarm er sat vækkes vi, sådan er det. hvis en så
+        # vil sove videre skal de bare kunne trykke på godnat knappen som
+        # udskyder vækning i voksensoveværelset 4 timer eller indtil der trykkes
+        # på godmorgen knappen derinde."
+        # Kort-ned om morgenen = "sov videre", IKKE "sluk hele huset" — resten
+        # af familien er ved at stå op. Scope er derfor soveværelset alene.
+        # ESCAPE: LANG ned (godnat_force) er urørt = altid fuld hus-godnat, også
+        # i morgenvinduet. Det dækker kant-tilfældet "kom hjem kl 04:30".
+        # Kun familie-modes (AirBnB-gæster skal have almindelig godnat) og kun
+        # når kill-switchen er on.
+        - conditions:
+            - condition: template
+              value_template: "{{ 4 <= now().hour < 12 }}"
+            - condition: template
+              value_template: >-
+                {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+            - condition: state
+              entity_id: input_boolean.sovevaerelse_morgen_beskyttelse_enabled
+              state: "on"
+          sequence:
+            - service: script.sove_snooze_start
+      # 2026-07-08 (#4d): fade-tid slider-styret (default 60). Langt-ned = instant 6s.
+      # 2026-07-15 (user): I AirBnB skal kort-ned være lige så hurtigt som langt-ned
+      # (= instant 6s) → kort + langt godnat gør DET SAMME for gæster. Baggrund: en
+      # gæst trykkede kort-godnat 9× i nat fordi 60s-faden føltes som "virker ikke"
+      # (de forventer øjeblikkelig sluk som en almindelig kontakt). Normal-mode
+      # uændret — familien beholder den bløde 60s-fade via slideren. 5 matcher
+      # godnat_force's hardcodede fade (hold dem i sync hvis den ændres).
+      # 2026-09-04 (user-spec): 6 → 5 s — "slukker alt lys indenfor 5 sek".
+      default:
+        - service: script.godnat_fuld
+          data:
+            fade: >-
+              {{ 5 if is_state('input_select.house_mode', 'AirBnB')
+                 else states('input_number.godnat_fade_seconds') | int(60) }}
+
+# =============================================================================
+# SOVE-KNAP KORT OP: tidsbestemt sove-lys (sove-only, ingen gardin)
+# =============================================================================
+# User-spec 2026-05-22:
+#   - Aften (18:00–04:00): +5% per klik. Hvis off → tænd på 5%. Ingen cap
+#     (kan akkumulere til 100% med spam-klik).
+#   - Morgen+dag (04:00–18:00): tænd sove "lidt" = 30% + gardin-stige
+#     (2026-07-29 user-spec: 1. tryk → privacy-niveau, 2. tryk → helt op).
+#     Mørkt ude → gardinet røres ikke (2026-10-05 user-spec), lyset tænder stadig.
+# Ingen fælles-rum. Cancel'er godnat-flags hvis de er aktive (= virker også
+# som "lille godmorgen"). Aften-grenen (18–04) rører IKKE gardinet.
+# Room_mode_sovevaerelse sættes til AUTO (2026-08-18, user-spec) — knappen
+# frigør kort-ned's Off-block, men flytter IKKE rummet ud af Auto. Den gamle
+# tekst her påstod at Bright holdt presence væk; det gjorde den aldrig
+# (presence_sovevaerelse gater kun på Manual/Off), så påstanden var en #3.
+# =============================================================================
+- id: godmorgen_forced
+  alias: "Sove-knap: kort op (aften=toggle hygge / dag=godmorgen)"
+  description: >
+    Somrig short release endpoint=1 (kort op) i soveværelse.
+    2026-07-08 (#4a/b/c, user-spec): AFTEN 18–04 = TOGGLE soveloftet on/off på
+    hyggeligt lys (10% @ cozy-farve) + Manual-hold (INGEN drift mod Auto resten af
+    aftenen/natten, frigives kl 04:00). DAG 04–18 = godmorgen (tænd sove 30% +
+    cancel godnat-flags) + gardin-stige: 1. tryk kører sove-gardinet til privacy-
+    niveau, 2. tryk ruller det helt op (2026-07-29 user-spec). Aften rører ikke gardinet.
+    Mørkt ude (sol under input_number.sove_gardin_privacy_min_sol_elevation) rører
+    heller ikke gardinet (2026-10-05 user-spec: "det larmer bare").
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "b3:47:dd:fa:8c:68:31:05"
+        endpoint_id: 1
+        command: "short_release"
+  action:
+    # 2026-07-29 (user-spec): godmorgen-knappen ophæver en aktiv sove-snooze —
+    # "…eller indtil der trykkes på godmorgen knappen derinde". Scriptet er en
+    # no-op hvis der ikke er snoozet, så det må stå før begge grene.
+    - service: script.sove_snooze_clear
+    - choose:
+        # ---- AFTEN (18–04): TOGGLE sove-hygge on/off + Manual-hold til 04:00 ----
+        # 2026-07-08 (#4a/b/c): kort-OP bruges IKKE til godmorgen om aftenen, men
+        # til at toggle soveloftet on/off på hyggeligt lys (10% @ cozy-farve).
+        # Sætter Manual + sove_evening_hold → INGEN drift mod Auto resten af
+        # aftenen/natten (frigives kl 04:00 af sove_evening_hold_release).
+        - conditions:
+            - condition: template
+              value_template: "{{ now().hour >= 18 or now().hour < 4 }}"
+          sequence:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.house_state
+              data:
+                option: "Active"
+            # Manual + hold-flag → presence/adaptive/drift rører ikke sove før 04:00.
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.room_mode_sovevaerelse
+              data:
+                option: "Manual"
+            - service: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.sove_evening_hold
+            - service: input_datetime.set_datetime
+              target:
+                entity_id: input_datetime.styrbar_last_press_sovevaerelse
+              data:
+                datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+            # Toggle: er lyset slukket → tænd hygge; ellers → sluk.
+            - if:
+                - condition: state
+                  entity_id: light.spisestue_pendel
+                  state: "off"
+              then:
+                # 2026-07-08 (user-fund): ryd VOKSEN-godnat FØR tændingen — ellers
+                # dræber bedroom_night_guard (godnat-gated, 8%-tærskel) hygge-lyset
+                # (10%) øjeblikkeligt. Kort-OP om aftenen = "jeg er stadig oppe" →
+                # master/voksne/pending/kalde ryddes. BØRNE-godnat røres IKKE
+                # (børnene sover videre). Kun toggle-ON — toggle-OFF (sluk) er
+                # "på vej i seng" og rører ingen flags.
+                - service: input_boolean.turn_off
+                  target:
+                    entity_id:
+                      - input_boolean.godnat_active
+                      - input_boolean.godnat_voksne_active
+                      - input_boolean.godnat_pending
+                      - input_boolean.kalde_active
+                # Ryd også winddown/force-stempler (entré tilbage til normal nattur).
+                - service: input_datetime.set_datetime
+                  target:
+                    entity_id:
+                      - input_datetime.sove_winddown_at
+                      - input_datetime.godnat_force_at
+                  data:
+                    datetime: "1970-01-01 00:00:00"
+                # 2026-07-09: slider (var hardcodet 10%) på cozy-farven (genbrugt).
+                - service: light.turn_on
+                  target:
+                    entity_id: light.spisestue_pendel
+                  data:
+                    brightness_pct: "{{ states('input_number.sove_hygge_brightness') | int(10) }}"
+                    color_temp_kelvin: "{{ states('input_number.sovevaerelse_cozy_warmth_k') | int(2000) }}"
+                    transition: 2
+              else:
+                - service: light.turn_off
+                  target:
+                    entity_id: light.spisestue_pendel
+                  data:
+                    transition: 2
+        # ---- DAG/MORGEN (04–18): godmorgen som hidtil ----
+        - conditions: []
+          sequence:
+            # Auto-aktiver house (knap-tryk = nogen er hjemme + står op)
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.house_state
+              data:
+                option: "Active"
+            # Cancel godnat-flags hvis aktive (knap = "jeg er vågen / jeg vil have lys")
+            - service: input_boolean.turn_off
+              target:
+                entity_id: !include ../rosters/godnat_flag.yaml
+            # Ryd aften-hold hvis man er gået i gang om morgenen (dag short-op = vågen).
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.sove_evening_hold
+            # Clear winddown + force timestamps (= entre tilbage til normal 10% nattur)
+            - service: input_datetime.set_datetime
+              target:
+                entity_id:
+                  - input_datetime.sove_winddown_at
+                  - input_datetime.godnat_force_at
+              data:
+                datetime: "1970-01-01 00:00:00"
+            # Frigør presence-block hvis kort-ned havde sat room_mode=Off.
+            # 2026-08-18 (user-spec): AUTO, ikke Bright. "Det er en del af auto
+            # mode at godnat- og godmorgen-knapperne bruges" — lyset skal tænde,
+            # men rummet må ikke forlade Auto. RODRET-knappen gjorde det allerede
+            # rigtigt (sove_rodret_button.yaml) → dette var en #2-divergens.
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.room_mode_sovevaerelse
+              data:
+                option: "Auto"
+            - service: input_datetime.set_datetime
+              target:
+                entity_id: input_datetime.styrbar_last_press_sovevaerelse
+              data:
+                datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+            # Tænd sove 30% varm hvid (dag-niveau) — 2026-10-02 (user: "fade lyset
+            # ind over 10sek og slutte med plug-lyskæden … det er meget pludseligt"):
+            # var transition 2 + kæden 0,13 s efter. Fadet ejes af
+            # script.sove_godmorgen_fade (packages/sove_lyskaede.yaml); turn_on
+            # venter IKKE på det, så gardin-stigen nedenfor reagerer straks.
+            - service: script.turn_on
+              target:
+                entity_id: script.sove_godmorgen_fade
+            # ---- GARDIN-STIGE (2026-07-29, user-spec) ----------------------
+            # "Første tryk på godmorgen skal åbne gardinet til privacy-niveau.
+            #  Andet tryk skal rulle det helt op."
+            # POSITIONS-baseret, ikke tælle-baseret: stigen aflæses af gardinets
+            # egen position, så den er selv-korrigerende (ingen tæller der kan
+            # gå ud af sync med virkeligheden, og et 3. tryk gør ingenting).
+            #   position < privacy − 5  → trin 1: kør til privacy
+            #   ellers                  → trin 2: helt op
+            # Privacy-niveauet er SAMME slider som vækningen bruger
+            # (global_wakeup_curtain_privacy_pct, % DÆKKET → position = 100 − pct)
+            # = ét anker, så knap og alarm ikke kan divergere (fejlklasse #2).
+            # Ukendt position (unavailable) → trin 1 (delvist er den skånsomme
+            # gæt; helt op i blinde kan blænde en sovende partner).
+            # Manuel betjening vinder altid over gardin-grace (jf. header i
+            # packages/gardin_manual_grace.yaml) → 'held' konsulteres IKKE her,
+            # men manuel-ned-stemplet ryddes ved fuld åbning, så senere auto-op
+            # ikke blokeres af et stempel brugeren netop har annulleret.
+            # MØRKE-GATE (2026-10-05, user-spec): "ingen grund til at køre gardinet
+            # op hvis der er mørkt udenfor. det larmer bare." → under mørke-
+            # grænsen rører kort op slet ikke gardinet (heller ikke trin 2).
+            # SAMME slider som vækningens privacy-trin
+            # (packages/sove_gardin_privacy_moerke.yaml: under ~−4° gav trinnet
+            # målt 0 lx) = ét anker for "mørkt ude" på sove-gardinet (#2).
+            # Ukendt solhøjde → float(90) = lyst = adfærd som før. Langt op er
+            # bevidst UDEN gaten: "giv mig alt nu" vinder, også i mørke.
+            - variables:
+                sove_pos: >-
+                  {% set p = state_attr('cover.gardin_sovevaerelse', 'current_position') %}
+                  {{ p | int(-1) if p is not none else -1 }}
+                sove_privacy_pos: >-
+                  {{ 100 - (states('input_number.global_wakeup_curtain_privacy_pct') | int(70)) }}
+                sol_elev: "{{ state_attr('sun.sun', 'elevation') | float(90) }}"
+                moerke_graense: "{{ states('input_number.sove_gardin_privacy_min_sol_elevation') | float(-3) }}"
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ sol_elev | float(90) < moerke_graense | float(-3) }}"
+                  sequence:
+                    - service: logbook.log
+                      data:
+                        name: "Godmorgen gardin"
+                        message: >-
+                          Gardinet bliver nede — mørkt ude (sol {{ sol_elev | float(90) | round(1) }}°
+                          < {{ moerke_graense }}°), motoren ville kun larme. Langt OP kører det alligevel.
+                        entity_id: cover.gardin_sovevaerelse
+                - conditions:
+                    - condition: template
+                      value_template: >-
+                        {{ sove_pos | int(-1) < 0
+                           or sove_pos | int(-1) < (sove_privacy_pos | int(30)) - 5 }}
+                  sequence:
+                    - service: cover.set_cover_position
+                      continue_on_error: true
+                      target:
+                        entity_id: cover.gardin_sovevaerelse
+                      data:
+                        position: "{{ sove_privacy_pos | int(30) }}"
+                    - service: logbook.log
+                      data:
+                        name: "Godmorgen gardin"
+                        message: >-
+                          Tryk 1 → privacy-niveau ({{ states('input_number.global_wakeup_curtain_privacy_pct') | int(70) }} % dækket,
+                          position {{ sove_privacy_pos }}). Næste tryk ruller helt op.
+                        entity_id: cover.gardin_sovevaerelse
+              default:
+                - service: cover.open_cover
+                  continue_on_error: true
+                  target:
+                    entity_id: cover.gardin_sovevaerelse
+                # Brugeren ruller selv op → annullér manuel-ned-graceen, ellers
+                # springer dagens øvrige auto-op-veje gardinet over.
+                - service: input_datetime.set_datetime
+                  target:
+                    entity_id: input_datetime.gardin_manual_down_sove
+                  data:
+                    datetime: "1970-01-01 00:00:00"
+                - service: logbook.log
+                  data:
+                    name: "Godmorgen gardin"
+                    message: "Tryk 2 (position {{ sove_pos }} ≥ privacy) → gardinet ruller helt op."
+                    entity_id: cover.gardin_sovevaerelse
+
+# =============================================================================
+# SOVE AFTEN-HYGGE HOLD RELEASE (2026-07-08, #4c user-spec)
+# =============================================================================
+# Frigiver aften-toggle-holdet KL 04:00 (fast, user-valg): sove_evening_hold →
+# off + room_mode_sovevaerelse Manual→Auto, så presence/adaptive igen må styre
+# soveværelset (godmorgen/dag). Kun hvis holdet faktisk er on OG rummet stadig
+# står Manual (rør ikke hvis brugeren har sat en anden mode i mellemtiden).
+# Rører ikke lyset — er hygge-lyset stadig tændt kl 04 lades det (presence-on er
+# gated før 06:00, så Auto tænder ikke midt om natten).
+# =============================================================================
+- id: sove_evening_hold_release
+  alias: "Sove: frigiv aften-hygge hold kl 04:00 (Manual→Auto)"
+  mode: single
+  trigger:
+    - platform: time
+      at: "04:00:00"
+  condition:
+    - condition: state
+      entity_id: input_boolean.sove_evening_hold
+      state: "on"
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.sove_evening_hold
+    - if:
+        - condition: state
+          entity_id: input_select.room_mode_sovevaerelse
+          state: "Manual"
+      then:
+        - service: input_select.select_option
+          target:
+            entity_id: input_select.room_mode_sovevaerelse
+          data:
+            option: "Auto"
+    - service: logbook.log
+      data:
+        name: "Sove aften-hygge"
+        message: "Aften-hold frigivet kl 04:00 → drift mod Auto tilladt igen."
+
+# =============================================================================
+# SOVE-KNAP LANG OP: sove 80% + gardin HELT op (uanset tid)
+# =============================================================================
+# User-spec 2026-05-22: lang op = "tænd lys i sove meget" uanset tidspunkt.
+# User-spec 2026-07-29: lang op ruller OGSÅ gardinet HELT op — ingen stige,
+# ingen bad-gate, ingen tids-gren. Lang op er husets "giv mig alt nu"-tryk;
+# kort op er den nænsomme stige (privacy → helt op).
+# =============================================================================
+- id: godmorgen_fast
+  alias: "Sove-knap: lang op (sove 80% + gardin helt op)"
+  description: >
+    Somrig long_press endpoint=1 (long op) i soveværelse. Sove til 80%
+    instant + gardinet helt op (uanset tid). Ingen fælles-rum.
+    Cancel'er godnat-flags og sove-snooze hvis aktive.
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "b3:47:dd:fa:8c:68:31:05"
+        endpoint_id: 1
+        command: "long_press"
+  action:
+    # 2026-10-02: langt op vinder over et igangværende godmorgen-fade (kort op).
+    - service: script.turn_off
+      target:
+        entity_id: script.sove_godmorgen_fade
+    # 2026-07-29 (user-spec): godmorgen ophæver sove-snoozen (no-op uden snooze).
+    - service: script.sove_snooze_clear
+    # Auto-aktiver house (knap-tryk = nogen er hjemme)
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_state
+      data:
+        option: "Active"
+    # Cancel godnat-flags hvis aktive (knap = "tænd sove højt nu", ikke godnat)
+    - service: input_boolean.turn_off
+      target:
+        entity_id: !include ../rosters/godnat_flag.yaml
+    # Clear winddown + force timestamps (= entre tilbage til normal 10% nattur)
+    - service: input_datetime.set_datetime
+      target:
+        entity_id:
+          - input_datetime.sove_winddown_at
+          - input_datetime.godnat_force_at
+      data:
+        datetime: "1970-01-01 00:00:00"
+    # Frigør presence-block hvis kort-ned havde sat room_mode=Off.
+    # 2026-08-18 (user-spec): AUTO, ikke Bright — se kort-op-grenen ovenfor.
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.room_mode_sovevaerelse
+      data:
+        option: "Auto"
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.styrbar_last_press_sovevaerelse
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    # Sove til vækning-target % varm hvid. Sove-only, ingen gardin, ingen
+    # fælles-rum. 2026-06-28: deler nu global_wakeup_brightness_pct med det
+    # alarm-drevne vækkelys (default 80) i st.f. hardcodet 80.
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        brightness_pct: "{{ states('input_number.global_wakeup_brightness_pct') | int(80) }}"
+        color_temp_kelvin: 2700
+        transition: 3
+    # ---- GARDIN HELT OP (2026-07-29, user-spec) --------------------------
+    # "Det lange tryk skal også åbne, helt." Ingen stige (det er kort op's
+    # job) og ingen bad-tomt-gate: gaten gælder kun AUTO-oprulning — et
+    # bevidst langt tryk er brugerens egen beslutning og vinder altid.
+    # Manuel-ned-graceen ryddes, ellers springer dagens auto-veje gardinet
+    # over pga. et stempel brugeren netop har annulleret.
+    - service: cover.open_cover
+      continue_on_error: true
+      target:
+        entity_id: cover.gardin_sovevaerelse
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.gardin_manual_down_sove
+      data:
+        datetime: "1970-01-01 00:00:00"
+
+# =============================================================================
+# GODNAT FORCE (long ned): instant godnat — skip 1-min fade + skip wait
+# =============================================================================
+- id: godnat_force
+  alias: "Godnat: Force instant (Somrig long ned)"
+  description: >
+    Somrig long_press endpoint=2 (long ned) i soveværelse. Skip godnat_voksen_start's
+    gradual flow — instant: flags + ALT lys i lejligheden off + ALLE gardiner
+    lukket. Bruges hvis du vil i seng NU uden vente på fælles-rum.
+    User-spec 2026-05-04: ALT lys (light.alle_lys group) + ALLE gardiner inkl.
+    boern.
+  mode: restart
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "b3:47:dd:fa:8c:68:31:05"
+        endpoint_id: 2
+        command: "long_press"
+  # 2026-09-30 (user): "det er jo styrbar børneværelse den regel gælder for!
+  # ikke godnat knappen som er i voksen værelset!" → putte-grenen (første tryk
+  # 16:00-21:00 = putning i voksensengen, 2026-08-06) er fjernet. Lang ned er
+  # igen altid instant hel-hus-godnat. Putte-reglen bor på børneværelsets
+  # Styrbar (puttelys_styrbar_start i putning_auto_detect.yaml).
+  # 2026-09-04 (user-spec): 6 → 5 s. Skal matche AirBnB-grenen i
+  # godnat_voksen_start ovenfor (fejlklasse #2 — hold de to i sync).
+  action:
+    - service: script.turn_off
+      target:
+        entity_id: script.sove_godmorgen_fade
+    - service: script.godnat_fuld
+      data:
+        fade: 5
+
+# =============================================================================
+# AUTO-GODMORGEN DETECT (audit-runde 20, 2026-05-05)
+# =============================================================================
+# Safety-net: hvis bruger glemmer at klikke godmorgen, system detekterer
+# vågnen automatisk når non-bedroom presence registreres efter 06:00.
+#
+# Trigger: presence ON i et af de 4 fælles-rum (stue/spisestue/koek/entre).
+# Kører instant godmorgen (clear flags + raise lys + open gardiner).
+#
+# Hard limits:
+#   - Time after 06:00 (skip nattur-toilet-besøg)
+#   - godnat_active = on (skip hvis allerede vågen)
+#   - house_mode = Normal (skip AirBnB)
+#   - presence_sensors_available = on (Apollo/Vallhorn online)
+#
+# Manual override bevares: kort/long op + ned på Somrig fyrer altid uanset tid.
+# Wakeup_alarm_driven (alarm-baseret) clearer godnat 28 min før alarm —
+# denne auto-detect er for "vågner uden alarm" eller "alarm fejlede".
+# =============================================================================
+- id: godmorgen_auto_detect
+  alias: "Godmorgen: Auto-detect ved fælles-rum presence efter 06:00"
+  description: >
+    Hvis bruger walker ind i fælles-rum efter 06:00 mens godnat_active=on,
+    kør instant godmorgen flow. Safety-net for forgotten Somrig op-tryk.
+  mode: single
+  trigger:
+    # C2 fix sprint 2026-05-07 (audit-finding): tidligere triggers
+    # stue/spisestue/køkken Apollos + entre Valhorn. Entré-only er OK som
+    # single-point safety-net fordi user FYSISK skal passere entré for
+    # at forlade soveværelset → Myggspray fanger den. NB: sove/boern apollo
+    # IKKE tilføjet som triggers — bedrooms er IKKE "user is up" signal
+    # (sove on = user i seng, vil fyre godmorgen midt om natten).
+    # B14-BESLUTNING 2026-07-14 (AskUserQuestion): Apolloerne er live igen,
+    # men user valgte BEVIDST at beholde entré-only — stue-Apolloen spøgelses-
+    # flapper (16-48 skift/t) og et flap 06-12 ville fyre godmorgen mens
+    # familien sover. Gen-overvej fælles-rum-Apollo-triggers når flappet er
+    # løst (B49-note). (badevaerelse-Apollo findes ikke længere — den blev
+    # køkken-Apolloen 2026-06-15.)
+    - platform: state
+      entity_id:
+        - binary_sensor.entre_valhorn_occupancy
+      to: "on"
+  condition:
+    # 🔥 ROOT CAUSE FIX 2026-05-07: tilfojet 'before' constraint!
+    # Tidligere `after: 06:00:00` UDEN `before:` matcher fra 06:00 indtil
+    # midnight = HELE DAGEN. Resultat: aften-motion (eg. 20:00) trigede
+    # godmorgen_auto_detect → clearede godnat flags 2 min efter user pressed
+    # godnat. Real-life test 2026-05-06 viste dette skete præcis.
+    # FIX: morning window 06:00-12:00 only.
+    - condition: time
+      after: "06:00:00"
+      before: "12:00:00"
+    # 🔥 CRITICAL FIX 2026-05-23: WORKDAY-only gate. Lørdag 2026-05-23 08:08
+    # vågnede partner pga at Parent B gik gennem entré → auto-detect fyrede
+    # → sove_loft @ 60% midt i partner's sleep-in. På weekend findes ingen
+    # alarm-context der gør auto-detect meningsfuldt — kropssignal er typisk
+    # en tur til badeværelse, ikke "vi vil i gang". Manuelt Somrig op-tryk
+    # er stadig tilgængeligt for genuine wake-up.
+    - condition: state
+      entity_id: binary_sensor.workday_sensor
+      state: "on"
+    # 🔥 CRITICAL FIX 2026-05-23: partner-i-seng gate. Sove Apollo
+    # still_target=on → en person ligger stadig i sengen. Skip auto-godmorgen
+    # som ville tænde sove_loft 60% og vække dem. Manuel Somrig op virker
+    # stadig hvis person 1 vil vække person 2 bevidst.
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_apollo_radar_still_target
+      state: "off"
+    # 2026-08-11 (user-bug: "spisestuelyset tændte igen, jeg gik ikke derind"):
+    # dark-room-fallbacken er FJERNET. Triggeren er entré-VALLHORN — altså
+    # gennemgang, ikke tilstedeværelse i spisestuen — og fallbacken krævede kun
+    # "spisestue_loft off + mørkt", som er SAND hver gang lyset lige er slukket.
+    # Resultat i morges: godmorgen fyrede fire gange EFTER at godnat var ryddet
+    # 06:07, og sloges med gradvis-sluk om loftet: on 06:24:11 → off 06:25 →
+    # on 06:31:16 → off 06:35 → on 06:35:17 → off 06:40 → on 06:43:39 → off 06:45.
+    # Uden et godnat-flag at rydde har godmorgen ingen opgave; den tænder bare
+    # lys på en forbipasserende. Morgenlys i spisestuen er nu presence-styret,
+    # som user beder om. (A32-hullet den dækkede — weekend_early_clear rydder
+    # flagene før 06:00 — er weekend-only, og auto-detect er workday-gated.)
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "on"
+    # House mode normal (skip AirBnB)
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "Normal"
+    # Sensor-gate
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+  action:
+    # Auto-aktiver house
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_state
+      data:
+        option: "Active"
+    # Cancel ALL godnat flags (presence = bruger vågen)
+    - service: input_boolean.turn_off
+      target:
+        entity_id: !include ../rosters/godnat_flag.yaml
+    # Clear winddown + force timestamps (= entre tilbage til normal 10% nattur)
+    - service: input_datetime.set_datetime
+      target:
+        entity_id:
+          - input_datetime.sove_winddown_at
+          - input_datetime.godnat_force_at
+      data:
+        datetime: "1970-01-01 00:00:00"
+    # Sove til 60% (mellem-værdi — ikke 100% fordi du allerede er ude af sengen)
+    # Light Aggressiveness factor (Phase 2 sprint 2026-05-07)
+    # 🌙 MORGEN-BESKYTTELSE (sprint 2026-07-04): under beskyttelses-vinduet
+    # (partneren sover stadig) holdes voksen-soveværelset MØRKT — godnat ryddes
+    # + fælles-rum tændes stadig (user: "godnat clearer... det er fint"), men
+    # sove-lyset springes over. Manuel Somrig op virker (rører ikke denne gren).
+    - if:
+        - condition: state
+          entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+          state: "off"
+      then:
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: light.spisestue_pendel
+          data:
+            brightness_pct: "{{ [[(60 * (states('sensor.global_brightness_factor') | float(1.0))) | round(0) | int, 100] | min, 2] | max }}"
+            color_temp_kelvin: 2700
+            transition: 3
+    # 2026-08-11 (user-spec): godmorgen tænder IKKE længere spisestue_loft.
+    # Triggeren er entré-VALLHORN = en der GÅR FORBI, ikke en der står i
+    # spisestuen — og lyset tændte derfor på morgener hvor user aldrig gik
+    # derind. Morgenlys i fælles-rummet ejes nu udelukkende af presence
+    # (presence_lights), som ser den rigtige ting. Godmorgen beholder sine
+    # ægte opgaver: rydde godnat-flagene, sove-lyset og gardinerne.
+    # Åbn KUN sove-gardinet instant — du er stået op.
+    # 2026-06-19 (user-spec): OPEN-PLAN-gardinerne (syd/vest/spisestue) åbnes
+    # IKKE her på instant-bevægelse. De åbnes af morning_curtains_open_on_activity
+    # når der har været AKKUMULERET open-plan-bevægelse (slider
+    # morning_curtain_accum_minutes, default 10 min). Et enkelt morgen-kig ind i
+    # stuen skal ikke rive alle gardiner op (rev. efter 2026-06-19 instant-open).
+    # 2026-07-29 (user-spec): AUTO-op går gennem det bad-gatede script, som selv
+    # holder de tre vetoer (snooze, manuel-ned-grace/putning, bad i brug) og
+    # fuldfører oprulningen når badet er tomt længe nok.
+    - service: script.sove_gardin_op
+    # Notification (ikke kritisk, mest til debug-trail)
+    - service: persistent_notification.create
+      data:
+        notification_id: godmorgen_auto
+        title: "Godmorgen auto-detected"
+        message: >
+          Detekteret presence i fælles-rum efter 06:00. Godnat ryddet,
+          lys op til 60%, gardiner åbnet. Hvis dette er fejl: tap
+          Somrig kort/long ned for at gå tilbage til godnat.
+
+# =============================================================================
+# GODMORGEN AUTO-CLEAR — lightweight activity-triggered godnat-clear
+# =============================================================================
+# Sibling til godmorgen_auto_detect (entré-presence → fuld godmorgen ramp).
+# Denne lytter til broader activity signals:
+#   1. Apollo moving target (sove + boern live pre-flyt — IKKE still target
+#      som = sovende krop i seng)
+#   2. Wall-switch flip på bath/sove/boern bulbs (firmware-wake brightness=76)
+#   3. Hvilken som helst ZHA button press (Styrbar, RODRET, Somrig, kalde)
+#
+# Action: kun clear af godnat flags. Ingen lys/gardin-actions — lader normal
+# presence-system + Styrbar overtage. godmorgen_auto_detect (entré) bevarer
+# rollen som "fuld ramp" når user faktisk forlader soveværelset.
+#
+# mode: single + godnat_any_active=on condition → fyrer max én gang per
+# godnat-cyklus uanset hvor mange zha_events der kommer ind.
+# =============================================================================
+- id: godmorgen_auto_clear_on_activity
+  alias: "Godmorgen: Clear godnat ved aktivitet efter 06:00"
+  description: >
+    Lightweight godnat-clear på aktivitetssignaler (moving target, wall-switch,
+    button press) efter 06:00. Sibling til godmorgen_auto_detect — denne kun
+    clearer flags, ingen ramp eller curtain-actions.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # Moving target på live Apollos (sove + boern). Still target er ekskluderet
+    # bevidst — det fanger sovende krop i seng, ville falsely clear godnat.
+    - platform: state
+      id: passiv_radar
+      entity_id:
+        - binary_sensor.sovevaerelse_apollo_radar_moving_target
+        - binary_sensor.boernevaerelse_apollo_radar_moving_target
+      to: "on"
+    # Wall-switch flip: firmware-default brightness signature (76 = 30%).
+    # Mirror af light_power_recovery's trigger pattern. Bath + sove + boern
+    # er wall-switch-wired pre-flyt. Spisestue/koek bulbs ikke paret endnu.
+    - platform: numeric_state
+      entity_id:
+        - light.badevaerelse_spot_1
+        - light.badevaerelse_spot_2
+        - light.badevaerelse_spot_3
+        - light.badevaerelse_spot_4
+        - light.badevaerelse_spot_5
+        - light.spisestue_pendel
+        - light.boernevaerelse_loft
+      attribute: brightness
+      above: 72
+      below: 80
+    # Any ZHA button press — Styrbars, RODRETs, Somrigs, kalde-knappen.
+    # Bred trigger; conditions gater til relevant tidsvindue + godnat=on.
+    - platform: event
+      event_type: zha_event
+    # 2026-09-05 (user-bug: "burde køkkenlys være tændt nu? har gået 10 min i
+    # køkkenet"): UAFBRUDT ophold i ét open-plan-rum. Husets tre clear-veje var
+    # alle ankret et andet sted end beviset, så en lørdag morgen hvor begge var
+    # tydeligt oppe holdt godnat i 14 min efter første bevis — og natturens
+    # 2 %-klamp holdt køkkenet mørkt imens. Målt den morgen:
+    #   • DENNE vej (passiv_radar): weekend-grenen åbner først 07:30 (B40), og
+    #     køkkenet er slet ikke blandt triggerne. Kunne ikke fyre kl. 06:5x.
+    #   • morgenrampe_arm: kræver 2 min UAFBRUDT i STUEN. Stuens længste
+    #     ubrudte ophold var 53 s (open plan blinker når man går rundt), mens
+    #     KØKKENET stod on i 6 min 35 s. Beviset var 3× kravet — i det forkerte
+    #     rum.
+    #   • godnat_auto_off_aktivitet: kræver soveværelset TOMT i 5 min. Sove-
+    #     Apolloen slap først kl. 07:04:41 → clear 07:09:41 (præcis +5 min).
+    # Ophold er ikke et blip, og B40-værnet er eksplicit bygget mod "et enkelt
+    # knaptryk/bevægelses-blip" — derfor får denne gren sit eget tidsvindue
+    # nedenfor og venter ikke til 07:30 i weekenden. `for:` bor i triggeren her
+    # (ikke et /1-tick): de tre øvrige veje er backstop nok, og et minut-tick
+    # ville koste 1440 fires/døgn på en automation der i forvejen fyrer på hver
+    # eneste zha_event (#7).
+    - platform: state
+      id: openplan_ophold
+      entity_id: !include ../rosters/open_plan_occupancy.yaml
+      from: "off"
+      to: "on"
+      for:
+        minutes: >-
+          {{ states('input_number.godmorgen_openplan_oppe_minutter') | int(3) }}
+    # 2026-09-13 (user-bug: "og nu står jeg igen i mørke i køkkenet"): ophold-
+    # grenen ovenfor kræver UAFBRUDT occupancy i ÉT rum, og en voksen der lige er
+    # stået op går RUNDT. Målt den morgen: 5 entré-passager 2e:fd:95-ab:96:51,
+    # bad, køkken — men intet rum holdt 3 min ubrudt før 07:21. godnat ryddedes
+    # først 07:24:04, og natturens 2 %-klamp slukkede køkkenet 07:05:00 og
+    # 07:10:00 imens. Passager er det omvendte bevis af ophold: BEVÆGELSE mellem
+    # rum. Tærskel + 06:00-vindue bor i binary_sensor.entre_morgen_passager_nok
+    # (dér af re-arm-grunde, se sensorens kommentar) — derfor INGEN time-
+    # condition på denne gren nedenfor. Eksplicit `from: "off"` er obligatorisk:
+    # det er en template-sensor, og `template.reload` sender den gennem
+    # `unavailable` (B103).
+    - platform: state
+      id: entre_passager
+      entity_id: binary_sensor.entre_morgen_passager_nok
+      from: "off"
+      to: "on"
+    # 2026-09-13 (user-mekanisme): aktivitet uden for soveværelset efter en
+    # retningsbestemt voksen-afgang der IKKE blev fulgt af en retur til sengen.
+    # Den fyrer tidligere end passage-grenen, fordi den ikke skal vente på 3
+    # passager — afgangen er allerede halvdelen af beviset.
+    # Målt 13/9 (sensor.sove_doerzone_stempel, som ER i recorderen): første
+    # dørzone-krydsning 07:03:05, første entré-flanke 07:03:14 — altså 9
+    # SEKUNDER imellem, ikke de 8 min jeg først rekonstruerede ud fra sove-
+    # Apolloens occupancy-fald kl. 06:55 (det var Parent B's sovende krop der
+    # tabte occupancy, ikke en afgang). Med alders-kravet nedenfor ville grenen
+    # have ryddet godnat 07:06:05 i stedet for 07:24:04 = 18,0 min tidligere.
+    # Retnings-beviset skrives af sove_voksen_afgang_sweep nederst i filen.
+    - platform: state
+      id: voksen_op
+      entity_id:
+        - binary_sensor.entre_valhorn_occupancy
+        - binary_sensor.stue_apollo_occupancy_filtered
+        - binary_sensor.koekken_apollo_occupancy_filtered
+        - binary_sensor.spisestue_apollo_occupancy_filtered
+      from: "off"
+      to: "on"
+    # 2026-10-16 (user-bug: "giv mig morgenlys i open plan? jeg er jo oppe og
+    # har været i bad … stue og køkken skal jo velkomme mig"): oppe 05:16, bad
+    # 05:17-05:35 (session armeret 05:20:31), ind i open plan 05:35 — mørkt,
+    # fordi ALLE clear-veje først åbner 06:00. Samme mønster 10-09: køkken
+    # 05:43-05:48, godnat holdt til 06:00:00.
+    # Et brusebad er ikke en nat-tur. MÅLT 30 døgn (09-16→10-16): 15 morgen-
+    # sessioner før 08:00, tidligst 05:20 (i dag) og 05:49 (10-11) — NUL
+    # sessioner mellem 00:00 og 05:20. Derfor eget vindue fra 05:00, så entré-
+    # velkomsten tager imod når man går fra badet til open plan.
+    # SOVEVÆRELSERNE FORBLIVER MØRKE (user: "alle sover undtagen mig"): alle
+    # auto-tænd-veje i sove/børn kræver selv 06:00 — undtagen sove-pre-lyset
+    # (gang-early-detect), som kun sove_morgen_moerklagt spærrede, og den
+    # gælder først fra 05 og kun med gardinet nede. Derfor 05:00 (ikke 04 som
+    # velkomstens morgen-definition) OG en 06:00-spærre på pre-lyset selv
+    # (presence_sovevaerelse.yaml).
+    # `from: "off"` (#B103-reflekset; input_boolean, men billigt).
+    - platform: state
+      id: brusebad
+      entity_id: input_boolean.badevaerelse_brusebad_session
+      from: "off"
+      to: "on"
+  condition:
+    # 2026-06-23 (B40): weekend-morgener beskyttes. Hverdag clearer godnat fra
+    # 06:00; weekend/helligdag (binary_sensor.workday_sensor=off) først fra 07:30,
+    # så et barn der vågner 06:30 lørdag ikke afbryder forældrenes sovemorgen via
+    # et enkelt knaptryk/bevægelses-blip. (Søster godnat_auto_off_aktivitet kræver
+    # i forvejen akkumuleret aktivitet — denne var den bredt-følsomme.)
+    - condition: or
+      conditions:
+        - condition: and
+          conditions:
+            - condition: state
+              entity_id: binary_sensor.workday_sensor
+              state: "on"
+            - condition: time
+              after: "06:00:00"
+              before: "12:00:00"
+        - condition: and
+          conditions:
+            - condition: state
+              entity_id: binary_sensor.workday_sensor
+              state: "off"
+            - condition: time
+              after: "07:30:00"
+              before: "12:00:00"
+        # 2026-09-05: ophold-grenen har sit EGET vindue — 06:00 uanset ugedag.
+        # B40's 07:30 værner mod "et enkelt knaptryk/bevægelses-blip" i weekenden;
+        # et ubrudt ophold på flere minutter i open plan er pr. definition ikke et
+        # blip, og at lade det vente til 07:30 er præcis den fejl der kostede
+        # 14 minutters mørkt køkken 2026-09-05.
+        - condition: and
+          conditions:
+            - condition: template
+              value_template: "{{ trigger.id | default('') == 'openplan_ophold' }}"
+            - condition: time
+              after: "06:00:00"
+              before: "12:00:00"
+        # 2026-09-13: passage-grenen bærer sit eget vindue INDE i sensoren
+        # (binary_sensor.entre_morgen_passager_nok er kun 'on' 06:00-12:00), så
+        # den får ingen time-condition her. Samme begrundelse som ophold-grenen:
+        # B40's 07:30 værner mod ét blip, og 3 passager på 5 min er ikke et blip.
+        - condition: template
+          value_template: "{{ trigger.id | default('') == 'entre_passager' }}"
+        # 2026-10-16: brusebad-grenen — eget 05:00-vindue (se triggeren).
+        - condition: and
+          conditions:
+            - condition: template
+              value_template: "{{ trigger.id | default('') == 'brusebad' }}"
+            - condition: time
+              after: "05:00:00"
+              before: "12:00:00"
+        # 2026-09-13: voksen_op-grenen. Stemplet er halvdelen af beviset, så
+        # denne gren har BÅDE sit eget 06:00-vindue (en afgang kl. 02 er en
+        # nat-tur, ikke en morgen) OG et alders-VINDUE. Sentinel testes
+        # eksplicit: et urørt input_text står på 'unknown', som er TRUTHY.
+        - condition: and
+          conditions:
+            - condition: template
+              value_template: "{{ trigger.id | default('') == 'voksen_op' }}"
+            # Stemplets alder skal ligge i et VINDUE, ikke bare være frisk.
+            #
+            # MAKS (godmorgen_sove_afgang_vindue_min, 30 min): en afgang for
+            # længe siden beviser intet om lige nu.
+            #
+            # MIN (godmorgen_openplan_oppe_minutter, 3 min) — tilføjet samme dag,
+            # 2026-09-13, FØR grenens første morgen i drift: uden den genåbnede
+            # den hullet fra 2026-08-01 ("katastrofe"). En NAT-TUR producerer
+            # BEGGE halvdele af beviset helt af sig selv — man krydser dørzonen
+            # på vej ud (afgangs-stempel), og entréen ligger på vejen til badet
+            # (voksen_op-flanke) — så et toiletbesøg kl. 06:10 en lørdag ville
+            # have ryddet godnat og dermed dræbt weekendens sovemorgen (sove-
+            # pendel via gang-early-detect, børnenes natlys slukket). Ingen
+            # tærskel på ÉN flanke kan skille en nat-tur fra en morgen; det
+            # eneste der skiller dem er at nat-turen VENDER TILBAGE. Derfor skal
+            # stemplet have OVERLEVET N minutter: sweepet rydder det i det sekund
+            # radaren ser en retur til sengen, så "stempel stadig sat OG N min
+            # gammelt" = gik ud og kom IKKE tilbage. Det er præcis user's egen
+            # mekanisme ("you can tell that i didnt go back to bed by apollo
+            # sove").
+            #
+            # N deles bevidst med openplan_ophold-grenen: det er det samme
+            # spørgsmål ("hvor længe skal nogen være oppe før det er morgen"), og
+            # to slidere for ét begreb divergerer (#2). Grenen fyrer alligevel
+            # tidligere end ophold-grenen, fordi ophold kræver N min UAFBRUDT i
+            # ÉT rum, mens denne kun kræver at N min er GÅET uden en retur — man
+            # må gerne gå rundt. Målt 13/9: clear 07:06:05 i stedet for 07:24:04
+            # (18,0 min tidligere). Misser den — fx fordi en ny dørzone-krydsning
+            # nulstiller alderen — er passage-grenen, ophold-grenen og
+            # godnat_auto_off_aktivitet backstop.
+            - condition: template
+              value_template: >-
+                {% set s = states('input_text.sove_voksen_afgang') %}
+                {% set maks = states('input_number.godmorgen_sove_afgang_vindue_min') | float(30) %}
+                {% set minut = states('input_number.godmorgen_openplan_oppe_minutter') | float(3) %}
+                {% set alder = now().timestamp() - (s | float(0)) %}
+                {{ s not in ['unknown', 'unavailable', 'none', '']
+                   and (s | float(0)) > 0
+                   and alder >= minut * 60
+                   and alder < maks * 60 }}
+            - condition: time
+              after: "06:00:00"
+              before: "12:00:00"
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "on"
+    # 2026-07-12: også AirBnB — flags-only clear er gæste-sikker (ingen lys/
+    # gardin-sideeffekter; presence-lys overtager). Del af airbnb_natmode.
+    - condition: state
+      entity_id: input_select.house_mode
+      state: ["Normal", "AirBnB"]
+    # PRE-ALARM-VÆRN (2026-07-29): i vinduet lige før en stillet alarm er
+    # radar-bevægelse IKKE bevis på at nogen er stået op — man vender sig i
+    # sengen. Ryddes godnat dér, dør den alarm-drevne vækning tavst (dens
+    # condition er godnat_active = on) → hverken solopgangs-ramp eller gardin.
+    # Det skete 2026-07-29: moving-target 06:01:25 mod alarm 06:15.
+    # Kun de PASSIVE triggers værnes; vægkontakt-flip og knaptryk er bevidste
+    # "jeg er oppe"-signaler og rydder fortsat godnat med det samme.
+    # 2026-09-05: ophold-grenen værnes OGSÅ. Den beviser at ÉN er oppe — ikke at
+    # den anden ikke skal vækkes. Ryddes godnat mens en alarm er nært
+    # forestående, dør partnerens vækning tavst, og en vække-gate skal fejle
+    # ÅBENT (unødig solopgang > misset vækning).
+    # 2026-09-13: passage-grenen værnes OGSÅ — og det koster målbart. På
+    # 2026-09-05 stod wakeup_alarm_imminent 'on' fra 05:45 til 06:29, så 3.
+    # passage kl. 06:10 ville være blevet BLOKERET; grenen ville altså ikke have
+    # hjulpet den morgen (den 13/9 var sensoren 'off' kl. 07:05 → clear 19 min
+    # tidligere end de faktiske 07:24). Valget er bevidst: rydder vi godnat mens
+    # en alarm er nært forestående, dør partnerens alarm-drevne vækning TAVST
+    # (dens condition er godnat_active = on), og en vække-gate skal fejle ÅBENT —
+    # unødig solopgang > misset vækning. Det mørke køkken løses ved kilden
+    # (natturens vidne-sæt + sol-gate i godnat_night.yaml), ikke ved at gøre
+    # vækningen utilregnelig.
+    - condition: template
+      value_template: >-
+        {{ trigger.id | default('') not in
+             ['passiv_radar', 'openplan_ophold', 'entre_passager', 'voksen_op',
+              'brusebad']
+           or is_state('binary_sensor.wakeup_alarm_imminent', 'off') }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Godmorgen auto-clear"
+        message: >
+          Activity-triggered clear. Trigger: {{ trigger.platform }}{% if trigger.entity_id is defined %} ({{ trigger.entity_id }}){% elif trigger.event is defined %} (zha_event device={{ trigger.event.data.device_ieee | default('?') }} cmd={{ trigger.event.data.command | default('?') }}){% endif %}
+    - service: input_boolean.turn_off
+      target:
+        entity_id: !include ../rosters/godnat_flag.yaml
+    # Clear winddown + force timestamps (= entre tilbage til normal 10% nattur)
+    - service: input_datetime.set_datetime
+      target:
+        entity_id:
+          - input_datetime.sove_winddown_at
+          - input_datetime.godnat_force_at
+      data:
+        datetime: "1970-01-01 00:00:00"
+
+# =============================================================================
+# GODNAT AUTO-OFF — akkumuleret fælles-aktivitet + voksen-soveværelse tomt
+# =============================================================================
+# User-spec 2026-06-14. Tredje clear-vej (se packages/godnat_autooff.yaml for
+# sensorer + sliders + fuld rationale). SUSTAINED akkumuleret bevægelse i
+# fælles-rum (sensor.faelles_aktivitet_30min over slider-threshold) MENS
+# voksen-soveværelset er tomt → husstanden er reelt oppe → clear godnat.
+# Flags-only (som godmorgen_auto_clear_on_activity-sibling'en; normal presence
+# + Styrbar overtager lys/gardin). IKKE workday-gated — det er pointen: fanger
+# weekend-morgener hvor entré-auto_detect er blokeret. Time-vindue 05:00-12:00
+# guard'er mod nat-toilet (02:00) og deep-night insomni-false-clears.
+#
+# Hele "oppe"-tilstanden skal holde i godnat_autooff_bedroom_empty_min via
+# trigger-for'en → kortvarige blip clearer ikke godnat.
+# 2026-06-17 (item 4): "soveværelse tomt" via binary_sensor.sovevaerelse_empty_
+# effective — real occupancy når sove-Apollo online, antag tomt efter 06:15 mens
+# den er offline (user-spec). Før: krævede rå occupancy == 'off' → dormant mens
+# Apollo unavailable. Time-vinduet 05:00-12:00 + 06:15-antagelsen guard'er nat.
+# =============================================================================
+- id: godnat_auto_off_aktivitet
+  alias: "Godmorgen: Auto-off ved akkumuleret aktivitet + soveværelse tomt"
+  description: >
+    Sustained fælles-rum-aktivitet over slider-threshold MENS voksen-
+    soveværelset er tomt (effective-sensor) → clear godnat (flags-only). Mens
+    sove-Apollo er offline antages tomt efter 06:15. Fanger weekender hvor
+    entré-vejen er workday-gated.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: template
+      value_template: >-
+        {{ is_state('input_boolean.godnat_active', 'on')
+           and is_state('binary_sensor.sovevaerelse_empty_effective', 'on')
+           and (states('sensor.faelles_aktivitet_30min') | float(0)) * 60
+               >= (states('input_number.godnat_autooff_activity_min') | float(4)) }}
+      for:
+        minutes: "{{ states('input_number.godnat_autooff_bedroom_empty_min') | int(5) }}"
+  condition:
+    - condition: state
+      entity_id: input_boolean.godnat_autooff_enabled
+      state: "on"
+    # 2026-08-01: nedre grænse flyttet fra hardcodet 05:00 til slideren
+    # `godnat_autooff_tidligst` (default 06:00). En nat-tur producerer SELV både
+    # "fælles-aktivitet" (entré + bad er med i rosteret) og "soveværelse tomt",
+    # så uret er det eneste der skiller nat fra morgen her — se INCIDENT-afsnittet
+    # i packages/godnat_autooff.yaml. Fail-LUKKET: kan tiden ikke læses, bruges
+    # 06:00, så en død helper ikke gen-åbner hullet.
+    - condition: template
+      value_template: >-
+        {{ now() >= today_at(states('input_datetime.godnat_autooff_tidligst')
+                             if states('input_datetime.godnat_autooff_tidligst')
+                                | regex_match('^\d{2}:\d{2}')
+                             else '06:00') }}
+    - condition: time
+      before: "12:00:00"
+    - condition: state
+      entity_id: input_boolean.godnat_active
+      state: "on"
+    # 2026-07-12: også AirBnB — flags-only clear er gæste-sikker (ingen lys/
+    # gardin-sideeffekter; presence-lys overtager). Del af airbnb_natmode.
+    - condition: state
+      entity_id: input_select.house_mode
+      state: ["Normal", "AirBnB"]
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    # 2026-06-17 (item 4): soveværelse-tomt via effective-sensor (real occupancy
+    # når sove-Apollo online; antag tomt efter 06:15 mens den er offline).
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_empty_effective
+      state: "on"
+  action:
+    - service: logbook.log
+      data:
+        name: "Godnat auto-off"
+        message: >
+          Akkumuleret fælles-aktivitet
+          ({{ ((states('sensor.faelles_aktivitet_30min') | float(0)) * 60) | round(1) }} min/30min)
+          + voksen-soveværelse tomt → godnat ryddet.
+    - service: input_boolean.turn_off
+      target:
+        entity_id: !include ../rosters/godnat_flag.yaml
+    # Clear winddown + force timestamps (= entre tilbage til normal nattur).
+    - service: input_datetime.set_datetime
+      target:
+        entity_id:
+          - input_datetime.sove_winddown_at
+          - input_datetime.godnat_force_at
+      data:
+        datetime: "1970-01-01 00:00:00"
+
+# =============================================================================
+# FULL GODNAT: activates when both kids AND adults are in bed
+# =============================================================================
+- id: godnat_full_activate
+  alias: "Godnat: Fuld godnat (begge cyklusser aktive)"
+  description: >
+    When both godnat_boern_active and godnat_voksne_active are on AND
+    godnat_pending is off (adults have fully settled), activate godnat_active.
+    This is the master flag for the night-light system.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_boolean.godnat_voksne_active
+      to: "on"
+    - platform: state
+      entity_id: input_boolean.godnat_boern_active
+      to: "on"
+    - platform: state
+      entity_id: input_boolean.godnat_pending
+      to: "off"
+  condition:
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.godnat_voksne_active
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.godnat_pending
+      state: "off"
+    # Sprint 2026-05-10 fix: Dormant gate. Master flag skal IKKE sættes hvis
+    # huset er Dormant (= ingen hjemme). Forhindrer false-positive cascade
+    # fra stuck flags mens family er væk.
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.godnat_active
+
+# =============================================================================
+# GODNAT PENDING: ingen proaktiv stue-dim
+# =============================================================================
+# Tidligere: godnat_pending_windown_dim dimmede stue+koekken til 20% straks
+# naar voksen-godnat blev trykket. Det braekker familielivet — hvis voksne
+# stadig spiser faerdig efter at have puttet boernene, bliver det for moerkt
+# midt i et maaltid. Fjernet 2026-04-28.
+#
+# Nu styres godnat-stue rent af godnat_voksen_start: vi ventet pa at stue
+# bliver tom (max 30 min wait_template), og DEREFTER slukker vi lys med
+# 10 sek transition. Sa laenge nogen er i stue er der INGEN lyseaendring.
+
+# =============================================================================
+# WEEKEND MORGEN: Dim stuelys når børnene er oppe men forældre sover
+# =============================================================================
+# Kids enter the stue on a weekend morning before parents wake up.
+# godnat_active is still on so presence_light_stue_on doesn't fire.
+# This fills the gap: dim warm light for kids without waking parents.
+# Triggers when stue becomes occupied while godnat is still active.
+# Parents' soveværelse curtain stays closed (godnat_auto_clear handles that).
+#
+# When godnat_auto_clear eventually fires (08:00 or parents get up),
+# a companion automation (godnat_clear_stue_restore) upgrades the stue
+# to normal presence brightness.
+# =============================================================================
+- id: godnat_kids_morning_stue
+  alias: "Godnat: Børn oppe i stuen (forældre sover stadig)"
+  description: >
+    Weekend mornings: kids enter stue while godnat is still active.
+    Turn on dim warm light so they're not in the dark.
+    Much softer than normal presence brightness — parents still asleep.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.stue_apollo_occupancy_filtered
+      from: "off"
+      to: "on"
+    - platform: state
+      entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
+      from: "off"
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: input_boolean.godnat_active
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Parents still in sovevaerelse — don't blast the house bright
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+      state: "on"
+    # 2026-08-13g (Sleep Over): dette er nøjagtig det vindue (06-09) hvor en
+    # gæst i open-plan stadig sover — børnenes morgenlys ville tænde i hendes
+    # "soveværelse". Mørket slipper ved input_datetime.sleepover_morgen_slut,
+    # og derefter tænder denne igen som normalt.
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    - condition: time
+      after: "06:00:00"
+      before: "09:00:00"
+    # Weekend or Home Vacation only — weekday wakeup handles workdays
+    - condition: template
+      value_template: >
+        {{ now().isoweekday() > 5
+           or is_state('input_select.house_mode', 'Home Vacation') }}
+    # 2026-06-27 fix (user-rapport: spisestue+køkken loft brændte 100% kl 06:18
+    # i 220-lux dagslys). Denne regel havde INGEN lux-gate → den tændte loftet
+    # i fuldt dagslys. Mirror companion-reglens dag-aware lux-gate: tænd kun når
+    # rummet faktisk er mørkt (sommer-morgen = lyst kl 06 → skip helt).
+    # 2026-08-19: gaten er nu sensor.open_plan_haendelse_lux_gate — samme
+    # grænse, men klampet til dagslys-sluk, så vi ikke tænder et lys som
+    # presence_lux_stue_off slukker igen 5 min senere (#2).
+    - condition: template
+      value_template: >-
+        {% set lux = states('sensor.open_plan_lux') | float(50) %}
+        {{ lux < (states('sensor.open_plan_haendelse_lux_gate') | float(18)) }}
+  action:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        # Light Aggressiveness factor (Phase 2 sprint 2026-05-07)
+        brightness_pct: "{{ [[(20 * (states('sensor.global_brightness_factor') | float(1.0))) | round(0) | int, 100] | min, 2] | max }}"
+        color_temp_kelvin: 2200
+    # 2026-06-27 fix: re-assert level ~2 s senere. spisestue_loft er en
+    # color_temp+xy-pære der TABER level-kommandoen under morgen-mesh-trængsel
+    # → power-on på off_brightness:254 (= 100%). En enkelt turn_on (især med
+    # transition, som selv er en level-ramp der droppes) landede ikke pålideligt.
+    # Direkte set + gentaget kommando slår dropped-command-racet. transition
+    # fjernet bevidst (ramp-kommando = mere skrøbelig end direkte set).
+    - delay:
+        seconds: 2
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        brightness_pct: "{{ [[(20 * (states('sensor.global_brightness_factor') | float(1.0))) | round(0) | int, 100] | min, 2] | max }}"
+        color_temp_kelvin: 2200
+
+# --- Restore stue to full presence brightness once godnat clears ---
+- id: godnat_clear_stue_restore
+  alias: "Godnat: Gendan stuelys ved godnat-slut (stue allerede beboet)"
+  description: >
+    When godnat_active clears (parents got up, godnat_auto_clear fired, or
+    forced godmorgen), upgrade stue+køkken from the dim kids-morning level
+    to normal presence brightness if someone is still in the stue.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_boolean.godnat_active
+      to: "off"
+  condition:
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-06-15 fix (user-rapport: spisestuelys tændt hver morgen kl 06:00):
+    # Det gamle `!= 'off'` betød at en `unavailable` Apollo (spisestue-Apollo'en
+    # er kronisk unavailable = hardware) talte som "måske nogen der", så lyset
+    # tændte HVER morgen ved godnat-clear uanset reel presence. Nu kræves
+    # eksplicit `on` (ægte detektion) — unavailable tæller IKKE som presence.
+    # (Decisive guard er upgrade-only længere nede; denne strammer presence.)
+    - condition: template
+      value_template: >-
+        {{ is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on')
+           or is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'on') }}
+    # Day-aware threshold (sprint 2026-05-07): halve under sun_bracket=day.
+    # 2026-08-19: flyttet til sensor.open_plan_haendelse_lux_gate (klampet til
+    # dagslys-sluk, så gendannelsen ikke tænder et lys der straks slukkes, #2).
+    - condition: template
+      value_template: >-
+        {% set lux = states('sensor.open_plan_lux') | float(50) %}
+        {{ lux < (states('sensor.open_plan_haendelse_lux_gate') | float(18)) }}
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_stue
+      state: "off"
+    # 2026-06-15 fix (decisive): UPGRADE-ONLY. Denne automation er companion til
+    # godnat_kids_morning_stue og skal kun løfte den dim kids-morning-scene til
+    # fuld styrke — ALDRIG tænde lys i et tomt, mørkt rum. Kræv derfor at mindst
+    # ét mållys allerede ER tændt (= der findes en scene at opgradere). Dette er
+    # robust mod defekte Apollo'er (stue stuck-on, spisestue unavailable): hvis
+    # rummet er mørkt/tomt når godnat clearer kl 06:00, er lysene slukket → no-op.
+    - condition: template
+      value_template: >-
+        {{ is_state('light.spisestue_loft', 'on') }}
+  action:
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        # Light Aggressiveness factor (Phase 2 sprint 2026-05-07)
+        brightness_pct: >
+          {% set lux = states('sensor.open_plan_lux') | float(50) %}
+          {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}{% set base = 70 %}
+          {% elif lux < (states('input_number.lux_trin_dunkelt') | float(20)) %}{% set base = 50 %}
+          {% else %}{% set base = 35 %}{% endif %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+        color_temp_kelvin: 2700
+        transition: 10
+
+# =============================================================================
+# SOVEVÆRELSE SENGELYS (user-spec 2026-06-25)
+# =============================================================================
+# Når en voksen går i seng om AFTENEN (sove-Apollo ser bevægelse) tændes sove-
+# loftet (light.spisestue_pendel) MEGET svagt + varmt, så rummet ikke er bælg-
+# mørkt mens man lægger sig. Slukkes derefter med godnat-knappen (kort/lang ned
+# → script.godnat_fuld slukker light.alle_lys inkl. pendlen).
+#
+# NAT-SIKKERHED (vigtigt — må ALDRIG tænde mens nogen sover):
+#   • Gated på aften-låsen (2026-10-04): er loftet slukket i aften-vinduet —
+#     af dig ELLER en automatik — tænder sengelyset ikke igen.
+#   • Gated på godnat_any_active = OFF → efter godnat-tryk er der mørkt; en
+#     nattur (godnat aktiv) tænder IKKE dette lys.
+#   • Aften-vindue: input_datetime.sove_aften_graense→23:59 (2026-07-09, var
+#     hardcodet 22:00) → 06→grænsen ejes af presence-on's START-niveau; sengelys
+#     = gentle dim entry grænsen→24. Holder det UDE af morgen-soveni (06–12) og
+#     dag-lure, hvor occupancy også fyrer.
+#   • sun below_horizon → tænder ikke i sommer-aften-lys.
+#   • light off-gate → overskriver ikke et lys du selv har sat — MEN et aktivt
+#     gang-early-detect-pre-lys (sove_approach_lit) OPGRADERES til sengelys-
+#     niveau (2026-07-09-fix: pre-lyset latchede ellers på 5% efter grænsen,
+#     fordi presence-on's upgrade er gated ude om aftenen).
+#   • 5% (slider) ligger UNDER bedroom_night_guard's 8%-tærskel, og kører kun
+#     PRE-godnat → guarden rører det aldrig.
+# Brightness er RÅ slider-% (ikke factor-skaleret) så "5%" forbliver 5%.
+# =============================================================================
+- id: sove_sengelys_ved_sengetid
+  alias: "Soveværelse: sengelys ved sengetid (dim, før godnat)"
+  description: >
+    Tænder soveloftet svagt+varmt når en voksen går i seng om aftenen (før
+    godnat). Slukkes med godnat-knappen. Gated til aften + godnat OFF + mørke,
+    så det aldrig tænder midt om natten eller ved morgen-soveni.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+      to: "on"
+    - platform: state
+      entity_id: binary_sensor.sovevaerelse_apollo_radar_still_target
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Godnat IKKE aktiv — har man sagt godnat skal der være mørkt (godnat slukkede
+    # selv pendlen). Dette er PRE-godnat sengelys.
+    # 2026-07-02 KRITISK: any → COMMON. Vinduet er 22–24, og børne-godnat er ON
+    # stort set hver aften fra ~19:30 → med any-unionen kunne sengelyset ALDRIG
+    # fyre. Voksen/fuld godnat + pending + kalde blokerer fortsat.
+    - condition: state
+      entity_id: binary_sensor.godnat_common_active
+      state: "off"
+    # 2026-07-22: børn puttes/sover i voksen-værelset → intet auto-tænd i sove
+    # (packages/putning_sove.yaml).
+    - condition: state
+      entity_id: input_boolean.putning_sove_active
+      state: "off"
+    # 2026-09-23 (user-bug 21/09 "ved bevægelse blinkede lyset op og ned mange
+    # gange mens vi så film"): søskende-vejene (presence-on, early-detect)
+    # gater på filmmørket ved kilden — denne manglede (fejlklasse #12), så
+    # hvert still_target-udslag tændte soveloftet og enforceren slukkede det
+    # 2 s senere: 21:26:29/:34/:50 + 21:44:03.
+    - condition: state
+      entity_id: binary_sensor.filmmoerke_sove
+      state: "off"
+    # 2026-10-04 KRITISK (user: "igår aftes tændte lys mens jeg sov fordi jeg
+    # ikke trykkede godnat"): denne vej var den ENESTE aften-tænd-vej uden
+    # aften-låsen (fejlklasse #21). 3/10 23:14:13 tændte den loftet på et
+    # still-target-blip, efter at Dark Mode havde slukket det 21:23 og en
+    # HA-genstart 22:46 havde nulstillet filmmørket. Låsen armeres nu af enhver
+    # sluk i aften-vinduet (packages/aften_manual_off_lock.yaml) og overlever
+    # en genstart (intet initial:).
+    - condition: state
+      entity_id: input_boolean.sovevaerelse_manual_off_lock
+      state: "off"
+    # Manual mode = bruger har selv sat lyset → rør ikke.
+    - condition: template
+      value_template: "{{ not is_state('input_select.room_mode_sovevaerelse', 'Manual') }}"
+    # Kun når pendlen er slukket — overskriv ikke et lys du selv har sat.
+    # 2026-07-09 (user-bug: "kommer kun på 5%, ikke mine 20%"): ELLER hvis det
+    # tændte lys er gang-early-detect-pre-lyset (sove_approach_lit on). Efter
+    # aften-grænsen er presence-on gated ude → INGEN løftede pre-lyset, så det
+    # latchede på early_brightness (5%) og sengelys-slideren "virkede ikke".
+    # Nu opgraderer sengelyset selv pre-lyset (spejler presence-on's mønster).
+    - condition: template
+      value_template: >-
+        {{ is_state('light.spisestue_pendel', 'off')
+           or is_state('input_boolean.sove_approach_lit', 'on') }}
+    # 2026-07-01: vindue flyttet 19→22 så sengelyset IKKE racer med presence-on's
+    # nye START-niveau (opg 4). Presence-on ejer 06→grænsen (START "find ting i
+    # skuffer", dæmper til hygge når du ligger); sengelys ejer grænsen→23:59 =
+    # gentle dim entry sent om aftenen (respekterer partner der gik tidligt i
+    # seng). Holder også funktionen UDE af morgen-soveni (06–12) og dag-lure.
+    # 2026-07-09: grænsen (var hardcodet 22:00) er nu slider-styret — SAMME
+    # input_datetime som presence-on's `before:` → ingen hul/overlap.
+    - condition: time
+      after: input_datetime.sove_aften_graense
+      before: "23:59:00"
+    # Kun i mørke — om sommeren kl. 21 kan der være lyst nok.
+    - condition: state
+      entity_id: sun.sun
+      state: "below_horizon"
+  action:
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        brightness_pct: "{{ states('input_number.sove_sengelys_brightness') | int(5) }}"
+        color_temp_kelvin: 2000
+        transition: 2
+    # 2026-07-09: ryd early-detect-flaget hvis det var et pre-lys vi opgraderede
+    # (samme oprydning som presence-on) — ellers kan fast-clear slukke sengelyset.
+    - if:
+        - condition: state
+          entity_id: input_boolean.sove_approach_lit
+          state: "on"
+      then:
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.sove_approach_lit
+
+# =============================================================================
+# SOVEVÆRELSE: RETNINGSBESTEMT VOKSEN-AFGANG (user-mekanisme 2026-09-13)
+# =============================================================================
+# User: "you can tell that i didnt go back to bed by apollo sove. it would have
+# shown a moving target close to the apollo then further until bed distance."
+#
+# Han har ret i fysikken, og CLAUDE.md siger det samme: sove-Apolloen sidder LIGE
+# VED DØREN, så `moving_distance` er husets ENESTE retnings-signal (ud = falder,
+# ind = stiger; sengen 229-240 cm). Det løser det hul ingen anden clear-vej kan
+# nå: når ÉN voksen står op mens den anden sover videre, er soveværelset stadig
+# optaget, så alle "soveværelset tomt"-veje (godnat_auto_off_aktivitet,
+# sovevaerelse_empty_effective) er blinde. 13/9 kl. 07:03 var præcis det.
+#
+# HVORDAN RETNINGEN UDLEDES — og hvorfor en bar tærskel IKKE duer:
+# Målt live 13/9 07:58 hviler kanalen på `unknown` uden mål (ikke 0, ikke en
+# afstand). Det er selve diskriminatoren:
+#   • UD (han går fra sengen mod døren): readings falder 230 → 180 → 90. En
+#     `below: <dørzone>`-crossing fyrer med trigger.from_state = et TAL OVER
+#     dørzonen. ⇒ ægte afgangs-sweep.
+#   • IND (et barn kommer til døren udefra): målet opstår FØRST ved døren, så
+#     flanken er `unknown → 50`. `below:`-crossingen fyrer også her (HA regner
+#     `unknown` som "ikke i intervallet"), men from_state er IKKE et tal over
+#     dørzonen → afvist.
+# Derfor er kravet "from_state er et TAL og over dørzonen" både nødvendigt og
+# tilstrækkeligt. En bar `below 140` ville fange barnet der kommer ind — præcis
+# B40's bekymring.
+#
+# KALIBRERET MOD HISTORIK — via en PROXY, ikke via rå-kanalen. Rå
+# `sensor.*_apollo_radar_moving_distance` og `binary_sensor.*_apollo_radar_
+# moving_target` er ekskluderet i recorderen (configuration.yaml, ~1 række/sek ×
+# 5 Apollos). MEN packages/nattur_retur.yaml's afledte
+# `sensor.sove_doerzone_stempel` (1477 rækker) og
+# `binary_sensor.sove_retur_til_seng` (1755 rækker) ER gemt, 30/8 → 13/9, og de
+# opdateres netop når moving_distance krydser dørzonen. Målt på dem, 8 morgener
+# med en dørzone-krydsning 06:00-09:00: hullet fra første krydsning til første
+# aktivitet uden for soveværelset har median 3 s (maks 1640 s, kun 30/8). Gevinst
+# mod den FAKTISKE godnat-clear: 5/9 +62,1 min, 13/9 +20,8 min; på hverdage
+# negativ (-7,1 til -26,3 min), men der er grenen i forvejen forbi — `godnat_any
+# _active` står off når de eksisterende veje allerede har ryddet.
+# NB 06:00-08:00-vinduet er TOMT 6/9-10/9 (gæsteperiode: Apolloen var uden strøm,
+# 2 rækker/dag) — det er ikke fravær af afgange, det er en blind kanal.
+#
+# Blast radius er bevidst lille: stemplet HANDLER ikke selv. Det bevæbner kun en
+# hurtigere godnat-clear når der kommer aktivitet uden for soveværelset, og den
+# gren er med i pre-alarm-værnet — så en falsk sweep kan ikke dræbe partnerens
+# vækning, kun rydde godnat lidt tidligere end ellers.
+- id: sove_voksen_afgang_sweep
+  alias: "Soveværelse: voksen-afgang sweep (retning)"
+  description: >
+    Skriver input_text.sove_voksen_afgang når sove-Apolloens moving_distance
+    krydser UD over dørzonen, og rydder det igen når husets eksisterende
+    dør→seng-detektor (binary_sensor.sove_retur_til_seng) ser en retur.
+    Stemplet bevæbner godmorgen_auto_clear_on_activity's voksen_op-gren — men
+    først når det har overlevet godmorgen_openplan_oppe_minutter, så en nat-tur
+    ikke kan rydde godnat.
+  mode: queued
+  max: 5
+  trigger:
+    # Dørzone-tærsklen DELES bevidst med to-oppe-detektionen
+    # (input_number.sove_morgen_2p_doerzone_cm, live 140 cm) — det er det samme
+    # fysiske spørgsmål, og to slidere for én dørzone ville divergere (#2).
+    # Ændrer du den, ændrer du BEGGE features. Entity-baseret above/below, så
+    # slideren er autoriteten. Samme slider bruges af nattur_retur.yaml's
+    # dørzone-stempel, så den har nu TRE med-ejere (#1).
+    - platform: numeric_state
+      id: afgang
+      entity_id: sensor.sovevaerelse_apollo_radar_moving_distance
+      below: input_number.sove_morgen_2p_doerzone_cm
+    # RETUR genbruger husets EKSISTERENDE dør→seng-detektor fra
+    # packages/nattur_retur.yaml (dørzone-stempel + ≥ input_number.
+    # sove_retur_seng_cm inden for sove_retur_vindue_sekunder). Den var her før
+    # denne automation, måler præcis samme fysik, og en spejlet "above dørzonen"
+    # ville være fejlklasse #2 med en SVAGERE tærskel: 140 cm er midt i rummet,
+    # ikke i sengen (sengen ligger 229-240 cm).
+    # Bevidst UDEN `from: "off"` — samme begrundelse som nattur_retur_seng_sluk:
+    # sensoren er trigger-baseret og står `unknown` til sit første sample, så et
+    # from-krav ville sluge den allerførste ægte retur (#4). `auto_off: 30 s`
+    # sikrer at flanken kan komme igen.
+    - platform: state
+      id: retur
+      entity_id: binary_sensor.sove_retur_til_seng
+      to: "on"
+    # LANGSOM RESERVE: sove_retur_til_seng kræver at sengen nås inden for 45 s
+    # efter dørzonen. Står man og fumler et minut ved døren først, udløber
+    # vinduet, og stemplet ville blive stående selvom man lagde sig. Derfor også
+    # en bar "der er et bevægende mål i seng-afstand" — uden tidsvindue, men med
+    # samme slider som ovenfor, så der kun findes ÉN seng-tærskel i huset.
+    # Den fyrer også når PARTNEREN vender sig, og det er bevidst: at rydde
+    # stemplet er den SIKRE retning (mister vi det, rydder passage-/ophold-
+    # grenen godnat et par minutter senere — holder vi det fejlagtigt, ryddes
+    # godnat under en nat-tur, og det er 2026-08-01-katastrofen).
+    - platform: numeric_state
+      id: retur
+      entity_id: sensor.sovevaerelse_apollo_radar_moving_distance
+      above: input_number.sove_retur_seng_cm
+    # Ryd stemplet når godnat i forvejen ER ryddet. Ellers kan et stempel fra
+    # 06:55 rydde en godnat der blev sat PÅ IGEN kl. 07:10 (han gik tilbage i
+    # seng) i samme sekund entréen rører sig — vinduet alene ville ikke nå det.
+    # ÉT sted: de fire clear-veje (godmorgen_fast, _auto_detect,
+    # _auto_clear_on_activity, godnat_auto_off_aktivitet) deler denne flanke, og
+    # en kopi i hver ville være fejlklasse #12/#16 i støbeskeen.
+    - platform: state
+      id: godnat_ryddet
+      entity_id: input_boolean.godnat_active
+      from: "on"
+      to: "off"
+  action:
+    - variables:
+        zone: "{{ states('input_number.sove_morgen_2p_doerzone_cm') | float(140) }}"
+        # from_state kan være 'unknown' (intet mål før nu) — `| float(-1)` gør
+        # det til -1, der hverken er over eller under en positiv dørzone, så
+        # BEGGE grene afviser det. Det er med vilje: en flanke fra 'unknown'
+        # bærer ingen retning.
+        fra: "{{ trigger.from_state.state | default('unknown') | float(-1) }}"
+        til: "{{ trigger.to_state.state | default('unknown') | float(-1) }}"
+        # Læses FØR retur-grenen rydder stemplet — bagefter er det '' og alderen
+        # ville blive hele epoken.
+        afgang_alder: >-
+          {% set s = states('input_text.sove_voksen_afgang') | float(0) %}
+          {{ (now().timestamp() - s) | round(0) if s > 0 else -1 }}
+    - choose:
+        # UD: var dybere i rummet (mod sengen), er nu i dørzonen.
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.id == 'afgang' and fra > zone }}"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.sove_voksen_afgang
+              data:
+                value: "{{ now().timestamp() | int }}"
+            - service: logbook.log
+              data:
+                name: "Sove afgang"
+                message: >-
+                  Afgangs-sweep: {{ fra | round(0) }} → {{ til | round(0) }} cm
+                  (dørzone {{ zone | round(0) }}). Stempel sat — aktivitet uden
+                  for soveværelset rydder godnat når stemplet har overlevet
+                  {{ states('input_number.godmorgen_openplan_oppe_minutter') | int(3) }} min.
+        # IND: radaren har set en krop i seng-afstand. Ingen retnings-test her —
+        # begge retur-triggers bærer den selv (dør→seng-sweepet i sensoren,
+        # seng-afstanden i reserven). Kun "er der et stempel at rydde?", så
+        # partnerens vendinger ikke skriver input_text 100 gange pr. nat (#24).
+        - conditions:
+            - condition: template
+              value_template: >-
+                {% set s = states('input_text.sove_voksen_afgang') %}
+                {{ trigger.id == 'retur'
+                   and s not in ['unknown', 'unavailable', 'none', '']
+                   and (s | float(0)) > 0 }}
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.sove_voksen_afgang
+              data:
+                value: ""
+            - service: logbook.log
+              data:
+                name: "Sove afgang"
+                message: >-
+                  Retur til seng ({{ trigger.entity_id }}) — afgangs-stempel
+                  ryddet efter {{ afgang_alder }} s. Godnat ryddes ikke af
+                  denne afgang.
+        # godnat er ryddet af en anden vej → stemplet har ingen opgave mere.
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.id == 'godnat_ryddet' }}"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.sove_voksen_afgang
+              data:
+                value: ""

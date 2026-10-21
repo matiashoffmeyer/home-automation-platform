@@ -1,0 +1,247 @@
+# =============================================================================
+# BØRNESTRIP: manuelt sat om aftenen → står til solopgang (2026-09-12, user-spec)
+# =============================================================================
+# User: "når jeg manuelt sætter børnestrip lyskæde om aftenen så holder den på
+# det niveau indtil solopgang. som jeg lige har gjort."
+#
+# MÅLT ÅRSAG (recorder, context_id-opslag, 12-09)
+# -----------------------------------------------
+#   21:00:00  automation.lysnet_bornevaerelse_gradvis_sluk slukkede strippen
+#   21:18:42  user tændte den igen (app-kontekst + Styrbar-stempel 21:18:49)
+#   21:20:00  SAMME automation slukkede den igen — 78 sekunder senere
+#
+# Gradvis-sluk har en `/5`-time_pattern-backstop, og dens krav er "occupancy off
+# i ≥ 5 min". **Et sovende barn giver ingen occupancy**, så kravet er opfyldt
+# HELE natten, og det næste tick vinder altid. Det er ikke et uheld der kan
+# times væk — brugeren kan pr. konstruktion ikke vinde det kapløb. Nøjagtig
+# samme mekanisme dræbte morgenvækningen 02-09 (se packages/vaekning_boern_hold.yaml,
+# der kommenterer netop denne automation). Fejlklasse #3: en backstop
+# RE-ASSERTER sin tilstand, så "manuel betjening vinder" er falsk uden et hold.
+#
+# HVORFOR ET HOLD OG IKKE EN ENFORCER
+# ------------------------------------
+# Strippen har 19 sluk-med-ejere. Men over 14 døgn er der i aften-/nat-vinduet
+# (17-06) **kun ÉN** automatisk sluk-årsag: gradvis-sluk, 13 gange. De øvrige 18
+# er dagtimer (dance_mode) eller morgen (morgen_boern_*), og de rammer aldrig
+# det vindue user taler om. Derfor er dette et VETO tre præcise steder — ikke en
+# re-assert-løkke og ikke 19 gates (fejlklasse #2/#16).
+#
+# **Vetoet gemmer ALDRIG niveauet.** Det er med vilje: recorderen gemmer ingen
+# lys-attributter (permanent faktum), så et gemt niveau kunne hverken verificeres
+# eller genskabes efter en restart. Når intet skriver til strippen, BLIVER den
+# stående på det niveau user satte — det er stærkere end at skrive det tilbage,
+# og det koster nul radiotid.
+#
+# HVORFOR `input_text` OG IKKE EN TEMPLATE-SENSOR
+# -----------------------------------------------
+# Familien SOV da dette blev bygget. En ny `template:`-blok eller et nyt
+# `input_boolean` kræver `template.reload` (husets farligste reload — sender
+# hver template-entity gennem `unavailable`, B103) eller `input_boolean.reload`
+# (gen-påtvinger ALLE `initial:` i huset). `input_text.reload` er husets ENESTE
+# gratis helper-reload, så tilstanden er kodet som en streng:
+#     `off`  |  `hold:<epoch>`
+# Læs den ALTID som `.startswith('hold')` — ét anker, tre læsere, ingen kopi af
+# reglen (fejlklasse #2).
+#
+# TRE UDGANGE, alle automatiske — holdet kan ikke hænge (🏡 #2)
+# -------------------------------------------------------------
+#   1. SOLOPGANG. Det user bad om. Kant + /5-backstop, fordi en HA-restart
+#      dræber en sol-flanke der sker mens vi er nede (permanent faktum).
+#   2. USER TAGER OVER IGEN: et manuelt sluk med finger-bevis slipper holdet.
+#   3. STRIPPEN ER SLUKKET ALLIGEVEL i ≥ 10 min (dormant, husmode, strømtab,
+#      radio-drop). Holdet tænder aldrig noget selv, så et hold over en slukket
+#      strip er ren gæld — det ryddes.
+#
+# ARBEJDSDELING MED DE TO EKSISTERENDE HOLD I SAMME RUM:
+#   - `boernevaerelse_vaekning_hold` (morgen) freder lyset MENS rampen kører.
+#   - `boernevaerelse_manual_off_lock` (aften) holder lyset SLUKKET efter et
+#     manuelt sluk. Dette er dens spejlbillede: holder lyset TÆNDT efter et
+#     manuelt tænd. At det ene fandtes og det andet ikke, er fejlklasse #12
+#     (beskyttelse tilføjet asymmetrisk på søster-adfærd).
+#
+# BEVIDST IKKE VETOET: dormant/afrejse/husmode-sluk. Falder hele huset i
+# dvale eller kører alle hjemmefra, skal strippen slukke — et hold må aldrig
+# kunne efterlade lys tændt i et tomt hus. Målingen viser da også at ingen af
+# dem har rørt strippen om aftenen i 14 døgn.
+# =============================================================================
+
+input_text:
+  # `off` | `hold:<epoch>`. Se header for hvorfor det ikke er et input_boolean.
+  boern_aften_niveau_hold:
+    name: "Børn aften: niveau-hold"
+    icon: mdi:lock-clock
+    max: 40
+
+automation:
+  # ---------------------------------------------------------------------------
+  # ARM — user satte strippen med en finger, i aften-vinduet.
+  # ---------------------------------------------------------------------------
+  - id: boern_aften_niveau_hold_arm
+    alias: "Børn aften: arm niveau-hold ved manuelt sat strip"
+    description: >
+      Triggeren har bevidst hverken `to:` eller `from:`: et niveau-skift på en
+      allerede tændt strip ændrer KUN attributter, og en `to: "on"`-trigger
+      fyrer ikke på det. Vi fanger altså både "tændt" og "skruet op/ned", og
+      lader condition'en om at kræve `on`. Derfor er automationen også immun
+      over for B103's `unavailable → on`-problem: `unavailable` er ikke `on`.
+    mode: restart
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: light.boernevaerelse_hygge_strip
+    condition:
+      # Kun ét hold pr. aften. En slider-træk sender 3-4 skrivninger på få
+      # sekunder, og holdet varer til solopgang uanset hvad — der er intet at
+      # genopfriske, så vi undgår 4 DB-rækker for samme intention.
+      - condition: template
+        value_template: >-
+          {{ not states('input_text.boern_aften_niveau_hold').startswith('hold') }}
+      - condition: template
+        value_template: "{{ trigger.to_state is not none and trigger.to_state.state == 'on' }}"
+      # Aften-vinduet (18:30 → 05:00) deles med boernevaerelse_manual_off_lock,
+      # så de to spejlvendte låse ikke kan komme til at gælde i hver sit vindue.
+      - condition: state
+        entity_id: binary_sensor.boern_aften_laasevindue
+        state: "on"
+      # HÅRDT FINGER-BEVIS (fejlklasse #3: manuel = user_id, ALDRIG parent_id is
+      # none). App/dashboard bærer context.user_id; et Styrbar-tryk gør IKKE, og
+      # stemples derfor i handleren — begge veje skal tælle, ellers er husets
+      # fysiske knap den eneste der ikke virker.
+      - condition: template
+        value_template: >-
+          {% set st = state_attr('input_datetime.styrbar_last_press_boernevaerelse', 'timestamp') | float(0) %}
+          {{ trigger.to_state.context.user_id is not none
+             or (st > 0 and (as_timestamp(now()) - st) < 15) }}
+      # Måne/sol-trapperne (og Styrbar NED i putte-kontekst) bærer finger-
+      # beviset, men er TRIN mod natlyset — ikke "hold dette niveau". Et hold
+      # her ville vetoe trappens egen bund (natlys via boern_natlys_set).
+      # Strippen er fredet mod gradvis-sluk af phase1_fired/godnat i stedet.
+      # 10 s dækker transition + rapport.
+      - condition: template
+        value_template: >-
+          {% set ns = namespace(frisk=false) %}
+          {% for s in ['script.putning_trappe_ned', 'script.putning_trappe_op'] %}
+            {% set lt = state_attr(s, 'last_triggered') %}
+            {% if lt is not none and (now() - lt).total_seconds() < 10 %}
+              {% set ns.frisk = true %}
+            {% endif %}
+          {% endfor %}
+          {{ not ns.frisk }}
+      # 🏡 AirBnB: en gæst skal ikke kunne arme en familie-lås, og flaget ryddes
+      # desuden ved entry+exit i automations/airbnb_mode.yaml.
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+      # Festlys skriver konstant til strippen med sin egen kontekst; et hold
+      # armeret midt i en dance-sekvens ville fryse festen. 2026-09-23: gater på
+      # at festen KØRER i børneværelset, ikke bare at rummet er VALGT — rum-valget
+      # overlever nu en HA-start (user-valg), så et glemt flueben ville ellers
+      # spærre holdet for evigt.
+      - condition: template
+        value_template: >-
+          {{ not (is_state('binary_sensor.festlys_aktiv', 'on')
+                  and is_state('input_boolean.dance_room_boern', 'on')) }}
+    action:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.boern_aften_niveau_hold
+        data:
+          value: "hold:{{ now().timestamp() | int }}"
+      - service: logbook.log
+        data:
+          name: "Børn aften-hold"
+          message: >-
+            ARMERET — strippen er sat manuelt
+            ({{ 'app/dashboard' if trigger.to_state.context.user_id is not none else 'Styrbar' }}).
+            Niveauet står urørt til solopgang; gradvis-sluk og natlys-scriptet
+            springer strippen over indtil da.
+          entity_id: input_text.boern_aften_niveau_hold
+
+  # ---------------------------------------------------------------------------
+  # UDGANG 1 + 3: solopgang, eller et hold der er blevet til gæld.
+  # ---------------------------------------------------------------------------
+  - id: boern_aften_niveau_hold_slip
+    alias: "Børn aften: slip niveau-hold ved solopgang"
+    description: >
+      Kant OG /5-tick. Kanten alene duer ikke: en HA-restart dræber en
+      sol-flanke der sker mens vi er nede, og så ville holdet overleve hele
+      dagen. Ticket måler i stedet tilstanden med et condition-template og
+      svarer derfor rigtigt uanset hvornår vi kom op.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      # Eksplicit `from:` (B103): uden den er `unknown → above_horizon` efter en
+      # restart en gyldig flanke.
+      - platform: state
+        entity_id: sun.sun
+        from: "below_horizon"
+        to: "above_horizon"
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_text.boern_aften_niveau_hold').startswith('hold') }}
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: sun.sun
+            state: "above_horizon"
+          # Holdet tænder aldrig noget selv. Er strippen slukket alligevel
+          # (dormant, husmode, strømtab, radio-drop), er holdet ren gæld.
+          # 10 min er valgt så et Innr-radio-drop midt i natten ikke slipper
+          # holdet — en ZHA-flap er sekunder, ikke minutter.
+          - condition: template
+            value_template: >-
+              {% set lc = states.light.boernevaerelse_hygge_strip.last_changed %}
+              {{ not is_state('light.boernevaerelse_hygge_strip', 'on')
+                 and lc is not none and (now() - lc).total_seconds() >= 600 }}
+    action:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.boern_aften_niveau_hold
+        data:
+          value: "off"
+      - service: logbook.log
+        data:
+          name: "Børn aften-hold"
+          message: >-
+            SLUPPET — {{ 'solen er stået op' if is_state('sun.sun', 'above_horizon')
+            else 'strippen har været slukket i over 10 min' }}. Rummets normale
+            presence-logik har styringen igen.
+          entity_id: input_text.boern_aften_niveau_hold
+
+  # ---------------------------------------------------------------------------
+  # UDGANG 2: user tager over igen. Et fysisk sluk må aldrig blive en no-op.
+  # ---------------------------------------------------------------------------
+  - id: boern_aften_niveau_hold_slip_manuel
+    alias: "Børn aften: slip niveau-hold ved manuelt sluk"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: light.boernevaerelse_hygge_strip
+        from: "on"
+        to: "off"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_text.boern_aften_niveau_hold').startswith('hold') }}
+      - condition: template
+        value_template: >-
+          {% set st = state_attr('input_datetime.styrbar_last_press_boernevaerelse', 'timestamp') | float(0) %}
+          {{ trigger.to_state.context.user_id is not none
+             or (st > 0 and (as_timestamp(now()) - st) < 15) }}
+    action:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.boern_aften_niveau_hold
+        data:
+          value: "off"
+      - service: logbook.log
+        data:
+          name: "Børn aften-hold"
+          message: "SLUPPET — brugeren slukkede strippen selv."
+          entity_id: input_text.boern_aften_niveau_hold

@@ -1,0 +1,142 @@
+# =============================================================================
+# Sove-gardin: automatisk aftenluk (2026-09-03, user-spec)
+# =============================================================================
+# USER: "sovegardinet må gerne gå ned automatisk hvis det ikke allerede er,
+#  N minutter efter solnedgang, N = 30 per default."
+#
+# HULLET: sove-gardinet havde ingen aften-luk-vej. Det lukkes i dag KUN af
+# putning_sove, sommer-forsvarets sol-blast, vinter-forsvarets mørkt+koldt (kun
+# fyrings-sæson, ude < 12 °C) og Dark Mode/projektor — ellers af et menneske.
+# Målt 08-31 → 09-03: lukket 21:06, 19:39, 19:08 og 20:54 med solnedgang ~19:56,
+# dvs. to af fire aftener stod det åbent 30-70 min efter den nye regels tidspunkt,
+# og tidspunktet svingede 2 timer.
+#
+# HVORFOR ET VINDUE-FLAG OG IKKE EN TIDS-TRIGGER:
+#   - `platform: sun` + `offset` kan ikke templates → offsettet kan ikke være
+#     en slider.
+#   - Et timestamp-sensor med `next_setting + offset` + `platform: time` fyrer
+#     ALDRIG: i samme sekund solen går ned, hopper `next_setting` til I MORGEN,
+#     så den armerede tid rykkes en dag frem hver dag, før den nås.
+#
+# DAGENS SOLNEDGANG UDEN EN "last_setting"-ATTRIBUT: er næste solnedgang mere
+# end 12 t væk, er dagens passeret — og den lå ~24 t før den næste. Fejlen er
+# dermed ét døgns ændring i solnedgangstid (maks ~3,5 min i DK ved jævndøgn,
+# ~0 ved solhverv), usynlig i et 30-min offset. `now().hour >= 12` holder
+# vinduet ude af morgentimerne, hvor 12-t-testen også er sand (en solnedgang
+# 21:57 ligger 12,9 t fra kl. 09).
+#
+# ARVEDE VETOER (fejlklasse #1/#16 — samme reject-mønster som sommer-/vinter-
+# forsvarets luk): `sensor.gardiner_manual_hold`s LUK-liste `held_luk` bærer
+# manuel-ned-grace og putning_sove — IKKE AirBnB-tæppet (det er et åbne-forbud,
+# B123) — og `gardin_dormant_pause_active` er batterisparet under lang dvale.
+#
+# MED-EJEREN ER LUKKET (user-valg 09-03h): house_modes' Active-open (hjemkomst)
+# kørte sove-gardinet OP via script.sove_gardin_op indtil kl. 19:00, og fra ca.
+# 5. oktober til marts ligger solnedgang+30 før den grænse — en hjemkomst kl. 17
+# i december ville have annulleret aftenluk hver hverdag. Gaten sidder i tragten
+# (`sove_gardin_bad_gate.yaml`, trin 0c: vindue on ⇒ ingen auto-op, ingen gæld),
+# så alle ni auto-åbnere arver den. Manuelle veje går uden om tragten og virker
+# uændret. Vinduet lukker efter midnat, så morgenens åbnere er urørte.
+# =============================================================================
+
+input_boolean:
+  # Kill-switch. Skal være en condition på BEGGE veje ind (fejlklasse #21):
+  # vindue-flanken og boot-backstoppet.
+  sove_gardin_aftenluk_enabled:
+    name: "Sove-gardin: aftenluk efter solnedgang"
+    icon: mdi:window-shutter-auto
+
+input_number:
+  # 0 = luk præcis ved solnedgang. Der er ingen "fra"-værdi her — brug
+  # kill-switchen, ellers ville 0 have to betydninger.
+  sove_gardin_aftenluk_offset_min:
+    name: "Sove-gardin: aftenluk efter solnedgang (min)"
+    icon: mdi:weather-sunset-down
+    min: 0
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+template:
+  - binary_sensor:
+      # on = vi er i aften-vinduet: dagens solnedgang er passeret med mindst
+      # offset-slideren, og klokken er endnu ikke rullet over midnat.
+      # Ingen attributter med now() her — de ville skrive en DB-række i minuttet
+      # (fejlklasse #24).
+      - name: "Sove gardin aftenluk vindue"
+        unique_id: sove_gardin_aftenluk_vindue
+        icon: mdi:weather-night
+        state: >-
+          {% set off = states('input_number.sove_gardin_aftenluk_offset_min') | int(30) %}
+          {% set ns = state_attr('sun.sun', 'next_setting') | as_datetime %}
+          {{ ns is not none
+             and now().hour >= 12
+             and (ns - now()).total_seconds() > 43200
+             and (now() - (ns - timedelta(days=1))).total_seconds() >= off * 60 }}
+
+automation:
+  - id: sove_gardin_aftenluk
+    alias: "Sove-gardin: luk automatisk efter solnedgang"
+    description: >
+      N minutter efter solnedgang (slider, default 30) lukkes sove-gardinet hvis
+      det ikke allerede er nede. Alle house_modes (også AirBnB, B123);
+      manuelt-holdte gardiner og dvale-pausen respekteres.
+    mode: single
+    trigger:
+      # Normal-vejen: vinduet åbner. `from: "off"` er obligatorisk — uden den
+      # ville enhver template.reload/restart (unavailable → on) fyre luk.
+      - platform: state
+        entity_id: binary_sensor.sove_gardin_aftenluk_vindue
+        from: "off"
+        to: "on"
+        id: vindue
+      # Restart-hullet: en HA-restart hen over solnedgang+N efterlader ingen
+      # flanke at fyre på (permanent faktum). Samme gren, ekstra id.
+      - platform: homeassistant
+        event: start
+        id: boot
+    action:
+      # Efter boot er cover- og sun-tilstand endnu ikke rapporteret; conditions
+      # står derfor i action'en, så de evalueres EFTER settle — ikke før.
+      - if:
+          - condition: trigger
+            id: boot
+        then:
+          - delay: {seconds: 45}
+      - condition: state
+        entity_id: input_boolean.sove_gardin_aftenluk_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.sove_gardin_aftenluk_vindue
+        state: "on"
+      # 2026-10-04 (B123, user-valg): kører OGSÅ i AirBnB. Her stod en
+      # Normal/Home Vacation-gate ("gæsten styrer selv") — men user-spec 02/9b er
+      # "auto-NED er stadig tilladt", og gæsten i september sov 6½ nat med
+      # gardinet 100 % oppe. Edge-triggeret = én gang pr. aften, så en gæst der
+      # åbner igen bagefter får lov (🏡 #2: udgangen er hans eget tryk).
+      - condition: state
+        entity_id: input_boolean.gardin_dormant_pause_active
+        state: "off"
+      # "hvis det ikke allerede er nede": position 30 (privacy) tæller som åbent.
+      # `open` er samtidig guarden mod unavailable/unknown (fejlklasse #9) —
+      # sove-gardinet har ægte positions-feedback, så state er pålidelig.
+      - condition: state
+        entity_id: cover.gardin_sovevaerelse
+        state: "open"
+      - condition: template
+        value_template: >-
+          {{ 'cover.gardin_sovevaerelse' not in
+             (state_attr('sensor.gardiner_manual_hold', 'held_luk') | default([])) }}
+      - service: cover.close_cover
+        continue_on_error: true
+        target: {entity_id: cover.gardin_sovevaerelse}
+      - service: logbook.log
+        data:
+          name: "Sove-gardin aftenluk"
+          message: >-
+            Lukket {{ states('input_number.sove_gardin_aftenluk_offset_min') | int(30) }} min
+            efter solnedgang (stod på position
+            {{ state_attr('cover.gardin_sovevaerelse', 'current_position') | int(-1) }}{{
+            ', boot-backstop' if trigger.id == 'boot' else '' }}).
+          entity_id: cover.gardin_sovevaerelse

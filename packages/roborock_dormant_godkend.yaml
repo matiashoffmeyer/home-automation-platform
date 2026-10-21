@@ -1,0 +1,341 @@
+# =============================================================================
+# Roborock: Dormant-kørsler kræver godkendelse fra telefonen (2026-09-20)
+# =============================================================================
+# User-spec 2026-09-20: "roborock kørte i går uden at jeg blev advaret mens
+# huset var dormant. bug. jeg skal fra min tlf godkende alle roborock dormant
+# kørsler."
+#
+# HVAD DER FAKTISK VAR I STYKKER (målt, ikke gættet):
+# Varslet FANDTES — `roborock_plan_morgenvarsel` i roborock_varsler.yaml pusher
+# kl. 06:30 "robotten støvsuger i dag". Men den har `last_triggered`
+# 2026-09-03, altså ÉN gang i de 17 døgn op til klagen, mens robotten har kørt
+# gentagne gange. Årsagen er strukturel, ikke en tastefejl: varslet gates på
+# `maa_starte`, som er SANDT først når de vægtede aktiv-timer HAR passeret
+# intervallet. Kl. 06:30 på netop den dag hvor tælleren krydser tærsklen
+# undervejs, står den stadig UNDER — så varslet tier, og dormant-starten fyrer
+# samme aften. Varslet kan med andre ord kun forudsige de dage hvor kørslen
+# ALLEREDE var forfalden ved daggry, dvs. dem hvor robotten af en anden grund
+# ikke kørte i går. Det er fejlklasse #20's slægtning: gaten blev evalueret på
+# et andet tidspunkt end den handling den skulle forudsige.
+#
+# DERFOR ER SVARET IKKE EN BEDRE FORUDSIGELSE, MEN ET SPØRGSMÅL PÅ DAGEN.
+# I stedet for at gætte om morgenen spørger huset i det sekund kørslen vil
+# starte. Det fjerner hele forudsigelses-problemet: der er ingen prognose at
+# ramme forbi, og user's formulering ("godkende ALLE dormant kørsler") er
+# opfyldt ordret.
+#
+# FEJLER LUKKET. Uden et JA kører robotten ikke. Det er den rigtige retning her
+# — en uventet robot-kørsel i et tomt hus er værre end en udskudt rengøring —
+# men det betyder også at kanalen er blevet load-bearing: slukkes
+# `notif_roborock_enabled`, kommer der ingen forespørgsel, og så kører
+# auto-rengøringen aldrig mere. Derfor `kritisk: true` på pushen, og derfor
+# kill-switchen `roborock_godkendelse_enabled`: slå den FRA og huset opfører sig
+# præcis som før 2026-09-20 (fejlklasse #21 — en gate skal kunne slås af ét
+# sted, ikke omgås fem).
+#
+# HVORFOR ET STEMPEL OG IKKE BARE EN BOOLEAN:
+# `roborock_dormant_start` har en `/15`-backstop der fyrer 4×/time så længe
+# huset er Dormant. Uden hukommelse ville den sende en ny forespørgsel hvert
+# kvarter i timevis. `roborock_godkend_pending` er derfor BÅDE "der er spurgt"
+# og "hvad der blev spurgt om": den bærer det valgte script med, så et JA
+# udfører den plan der stod i beskeden — ikke en plan der er regnet forfra og
+# kan have ændret sig imellem (fejlklasse #2 + #27).
+#
+# ET JA GENBRUGER IKKE SIN EGEN PRÆMIS (fejlklasse #23). Beskeden kan ligge
+# ulæst i timer. Derfor tjekker godkendelses-handleren HELE sikkerhedssættet om
+# igen på svar-tidspunktet — huset skal stadig være Dormant, ingen må være
+# hjemme, robotten skal stadig være klar, og klokken skal stadig være inden for
+# 08-21. Er noget faldet væk, afvises godkendelsen med en forklaring i stedet
+# for at køre på et forældet ja.
+#
+# OCCUPANCY-BLOKKEN ER FLYTTET TIL ÉN SENSOR. `roborock_dormant_start` bar et
+# 25-linjers inline-template over otte occupancy-kanaler + to GPS-flag. Den
+# skulle nu læses fra to steder, og to kopier af den slags divergerer
+# (fejlklasse #2) → `binary_sensor.roborock_ingen_hjemme` er nu det fælles
+# anker. Templaten er uændret ord for ord; er sensoren væk efter en
+# `template.reload`, læses den som ikke-'on' og begge forbrugere fejler LUKKET
+# (fejlklasse #9).
+# =============================================================================
+
+input_boolean:
+  # 🎛️ Kill-switch. ON = auto-kørsler skal godkendes fra telefonen (default og
+  # user-spec). OFF = adfærd som før 2026-09-20: robotten starter selv.
+  # Bevidst UDEN `initial:` — `initial:` PÅTVINGER ved hver HA-start og ville
+  # rulle user's eget valg tilbage ved hver genstart.
+  # Navnet SKAL ende på `_enabled`: scripts/helpers_export.py snapshotter kun
+  # input_booleans med det suffiks (eller `notif_`-prefiks), og en helper uden
+  # for den allowliste springes TAVST over → gaten ville komme tilbage OFF
+  # efter et .storage-tab, dvs. en robot der starter uspurgt.
+  roborock_godkendelse_enabled:
+    name: "Roborock: kræv godkendelse af Dormant-kørsler"
+    icon: mdi:shield-check-outline
+
+input_text:
+  # Den åbne forespørgsel: "<epoch>|<start_script>|<menneskelig plan-tekst>",
+  # eller 'off' når der ikke er spurgt. input_text frem for input_datetime +
+  # input_boolean af to grunde: det er husets ENESTE gratis helper-reload, og
+  # et urørt input_datetime står på dagens midnat (en fælde vi så slipper for).
+  roborock_godkend_pending:
+    name: "Roborock: afventende godkendelse"
+    max: 255
+    icon: mdi:comment-question-outline
+  # Epoch for sidste AFVISNING. Sammenlignes med house_state.last_changed på
+  # præcis samme måde som husets øvrige "max 1 pr. Dormant-session"-gates, så
+  # et nej gælder DENNE session — ikke for evigt, og ikke kun til næste kvarter.
+  roborock_godkend_afvist_at:
+    name: "Roborock: sidste afvisning (epoch)"
+    max: 20
+    icon: mdi:close-circle-outline
+
+template:
+  - binary_sensor:
+      # Ord for ord den occupancy+GPS-template der stod inline i
+      # roborock_dormant_start. 24-timers friskhedskravet på last_changed er
+      # bevaret: en kanal der har hængt 'on' i over et døgn er en død kanal,
+      # ikke en person (fejlklasse #9 — `unavailable` læses som off, så en
+      # blind kanal ville ellers svare "her er tomt" med fuld selvsikkerhed).
+      - name: "Roborock ingen hjemme"
+        unique_id: roborock_ingen_hjemme
+        icon: mdi:home-export-outline
+        state: >-
+          {% from 'rosters.jinja' import husets_occupancy %}{% set occ = husets_occupancy
+          %}
+          {% set ns = namespace(present=false) %}
+          {% for s in occ %}
+            {% if is_state(s, 'on') %}
+              {% set lc = states[s].last_changed %}
+              {% if lc is not none and (now() - lc).total_seconds() < 86400 %}
+                {% set ns.present = true %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ not ns.present
+             and is_state('input_boolean.parent_a_home', 'off')
+             and is_state('input_boolean.parent_b_home', 'off') }}
+
+  - sensor:
+      # Dashboard-læsbar status. Ingen `now()` i en attribut (fejlklasse #24) —
+      # staten skifter kun når selve forespørgslen skifter.
+      - name: "Roborock godkendelse status"
+        unique_id: roborock_godkendelse_status
+        icon: mdi:shield-check-outline
+        state: >-
+          {% set p = states('input_text.roborock_godkend_pending') %}
+          {% if is_state('input_boolean.roborock_godkendelse_enabled', 'off') %}
+            slået fra — robotten starter selv
+          {% elif p not in ['off', 'unknown', 'unavailable', ''] %}
+            afventer svar
+          {% else %}
+            ingen forespørgsel
+          {% endif %}
+        attributes:
+          plan: >-
+            {% set p = states('input_text.roborock_godkend_pending') %}
+            {{ p.split('|')[2] if p not in ['off','unknown','unavailable','']
+                                  and '|' in p else '—' }}
+
+script:
+  # ---------------------------------------------------------------------------
+  # Spørg om lov. Kaldes KUN fra roborock_dormant_start, som har verificeret
+  # hele sikkerhedssættet i samme sekund.
+  # ---------------------------------------------------------------------------
+  roborock_godkend_spoerg:
+    alias: "Roborock: spørg om lov til Dormant-kørsel"
+    icon: mdi:comment-question-outline
+    mode: single
+    fields:
+      start_script:
+        description: "Scriptet der skal køres hvis user siger ja"
+        example: script.roborock_start_full
+      plan:
+        description: "Menneskelig beskrivelse af planen (står i pushen)"
+        example: "Hele huset — støvsug + mop"
+    sequence:
+      # Stemplet FØRST. Pushen kan fejle (FCM, netværk), og en tavs
+      # forespørgsel uden stempel ville få /15-backstoppen til at spørge igen
+      # om et kvarter — og igen, og igen.
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.roborock_godkend_pending
+        data:
+          value: >-
+            {{ now().timestamp() | int }}|{{ start_script }}|{{ plan[:180] }}
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: roborock
+          # Kanalen er load-bearing nu: uden denne push kører robotten aldrig.
+          # `kritisk` springer AirBnB-gaten over — relevant hvis en fremtidig
+          # ændring lader auto-start køre i AirBnB (i dag er den vetoet dér).
+          kritisk: true
+          title: "🧹 Må robotten køre nu?"
+          message: >-
+            {{ plan }}. Huset er tomt
+            ({{ states('sensor.roborock_aktive_timer_siden_rengoring') }}
+            vægtede aktiv-timer siden sidst). Den kører IKKE uden dit ja.
+          payload:
+            tag: roborock_godkend
+            # Samme tag som en evt. tidligere forespørgsel → telefonen
+            # erstatter den gamle boble i stedet for at stakke dem.
+            actions:
+              - action: ROBOROCK_GODKEND
+                title: "Kør nu"
+              - action: ROBOROCK_AFVIS
+                title: "Ikke i dag"
+      - service: logbook.log
+        data:
+          name: "Roborock-godkendelse"
+          message: "Spurgte om lov: {{ plan }} → {{ start_script }}."
+
+automation:
+  # ---------------------------------------------------------------------------
+  # JA. Re-verificerer HELE præmissen — beskeden kan være timer gammel.
+  # ---------------------------------------------------------------------------
+  - id: roborock_godkend_ja
+    alias: "Roborock-knap: godkend Dormant-kørsel"
+    description: >
+      Fejlklasse #23: et ja er et svar på et spørgsmål der blev stillet
+      tidligere, og må ikke bevise sin egen præmis. Alle sikkerhedsgates
+      tjekkes derfor om igen HER. Er huset vågnet, er nogen kommet hjem, er
+      klokken blevet 21, eller står robotten med en fejl, afvises godkendelsen
+      med en forklaring — et forældet ja må ikke kunne sende robotten ud.
+    mode: single
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: ROBOROCK_GODKEND
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_text.roborock_godkend_pending')
+             not in ['off', 'unknown', 'unavailable', ''] }}
+    action:
+      - variables:
+          pending: "{{ states('input_text.roborock_godkend_pending') }}"
+          start_script: "{{ pending.split('|')[1] }}"
+          plan: "{{ pending.split('|')[2] if pending.split('|') | count > 2 else 'kørsel' }}"
+          # Hele sikkerhedssættet, læst NU. Ét udtryk pr. variabel, aldrig en
+          # {% if %}-blok (den ville give strengen "False", som er truthy).
+          stadig_tomt: >-
+            {{ is_state('input_select.house_state', 'Dormant')
+               and is_state('binary_sensor.roborock_ingen_hjemme', 'on') }}
+          robot_klar: >-
+            {{ states('vacuum.s8_maxv_ultra') in ['docked', 'idle']
+               and states('sensor.s8_maxv_ultra_vacuum_error') in ['none', 'ok']
+               and states('sensor.s8_maxv_ultra_battery') | int(0) >= 30 }}
+          tid_ok: >-
+            {{ 8 <= now().hour < 21 }}
+          fri: >-
+            {{ is_state('input_boolean.roborock_session_active', 'off')
+               and is_state('input_boolean.roborock_auto_paused', 'off')
+               and not is_state('input_select.house_mode', 'AirBnB') }}
+      # Forespørgslen er brugt uanset udfaldet — ellers kan samme ja køre to
+      # gange, og /15-backstoppen ville se en åben forespørgsel for evigt.
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.roborock_godkend_pending
+        data:
+          value: "off"
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ stadig_tomt and robot_klar and tid_ok and fri }}"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Roborock-godkendelse"
+                  message: "Godkendt fra telefonen → {{ start_script }} ({{ plan }})."
+              - service: "{{ start_script }}"
+        default:
+          # Fortæl HVORFOR. Et tavst "der skete ingenting" efter et tryk er
+          # den slags der får user til at trykke igen og igen.
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: roborock
+              kritisk: true
+              title: "🧹 For sent — robotten kører ikke"
+              message: >-
+                {{ 'Huset er ikke tomt længere.' if not stadig_tomt
+                   else ('Robotten er ikke klar (' ~ states('vacuum.s8_maxv_ultra')
+                         ~ ', batteri ' ~ states('sensor.s8_maxv_ultra_battery')
+                         ~ '%).' if not robot_klar
+                   else ('Uden for 08-21.' if not tid_ok
+                   else 'En kørsel er allerede i gang, eller auto er sat på pause.')) }}
+                Forespørgslen er lukket — huset spørger igen næste gang det bliver tomt.
+              payload:
+                tag: roborock_godkend
+          - service: logbook.log
+            data:
+              name: "Roborock-godkendelse"
+              message: >-
+                Ja afvist af huset (tomt={{ stadig_tomt }},
+                robot={{ robot_klar }}, tid={{ tid_ok }}, fri={{ fri }}).
+
+  # ---------------------------------------------------------------------------
+  # NEJ. Gælder denne Dormant-session, ikke for evigt.
+  # ---------------------------------------------------------------------------
+  - id: roborock_godkend_nej
+    alias: "Roborock-knap: afvis Dormant-kørsel"
+    description: >
+      Et nej skal holde længere end til næste /15-backstop, men ikke længere
+      end til huset har været beboet igen. Stemplet sammenlignes derfor med
+      house_state.last_changed — samme mønster som husets øvrige "max 1 pr.
+      Dormant-session"-gates.
+    mode: single
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: ROBOROCK_AFVIS
+    action:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.roborock_godkend_afvist_at
+        data:
+          value: "{{ now().timestamp() | int }}"
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.roborock_godkend_pending
+        data:
+          value: "off"
+      - service: logbook.log
+        data:
+          name: "Roborock-godkendelse"
+          message: "Afvist fra telefonen — ingen auto-kørsel i denne Dormant-session."
+
+  # ---------------------------------------------------------------------------
+  # Huset vågnede med en ubesvaret forespørgsel → den er ikke aktuel længere.
+  # ---------------------------------------------------------------------------
+  - id: roborock_godkend_ryd_ved_vaagen
+    alias: "Roborock: ryd ubesvaret godkendelse når huset vågner"
+    description: >
+      Uden denne ville en ubesvaret forespørgsel blokere NÆSTE Dormant-session:
+      `roborock_dormant_start` spørger ikke igen så længe der står en åben
+      forespørgsel, så et ulæst spørgsmål fra i går ville tie robotten for
+      altid. Eksplicit `from:` på triggeren, fordi et `template.reload` sender
+      hver template-entity gennem `unavailable` og et bart `to:` ville fyre på
+      vejen tilbage.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.house_state
+        from: "Dormant"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('input_text.roborock_godkend_pending')
+             not in ['off', 'unknown', 'unavailable', ''] }}
+      - condition: template
+        value_template: "{{ not is_state('input_select.house_state', 'Dormant') }}"
+    action:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.roborock_godkend_pending
+        data:
+          value: "off"
+      - service: logbook.log
+        data:
+          name: "Roborock-godkendelse"
+          message: "Huset vågnede — ubesvaret forespørgsel lukket."

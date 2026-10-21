@@ -1,0 +1,118 @@
+# =============================================================================
+# Badeværelse lys — forbrugs-metrics + bug-detektor (2026-06-18, user-spec)
+# =============================================================================
+# Født ud af wasp-in-a-box-fejlen der brændte bad-lyset 10-12 t/dag. Giver:
+#
+#   1. sensor.badevaerelse_lys_on_24h   — timer tændt de seneste 24 t (rullende).
+#      Tile på indstillinger-siden ("hvor meget har bad-lyset været tændt").
+#   2. sensor.badevaerelse_lys_on_idag  — timer tændt siden midnat (nulstiller
+#      00:00). Recorder long-term statistics → statistics-graph kan vise hver
+#      dag de seneste 7 dage som søjler (akkumuleret tændt-tid pr. dag).
+#
+#   Begge tæller light.badevaerelse_all = 'on', dvs. BÅDE fuld styrke og dim
+#   (gruppen er 'on' hvis bare ét medlem lyser).
+#
+#   3. Bug-notifikation: lyset tændt UAFBRUDT > (max besøgs-tid + 5 min) =
+#      selv max-on watchdog'en svigtede → næsten altid en reel fejl (fx en
+#      KAJPLATS-spot der hænger 'on', eller en uventet veto). Push + persistent.
+#
+# LTS-grafen bygger fremad fra i dag (long-term statistics findes først fra
+# sensoren oprettes). Historik før 2026-06-18 er ikke i grafen.
+# =============================================================================
+
+sensor:
+  # Rullende 24 t — til tile'en "tændt de sidste 24 timer".
+  - platform: history_stats
+    name: "Badevaerelse lys on 24h"
+    unique_id: badevaerelse_lys_on_24h
+    entity_id: light.badevaerelse_all
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      hours: 24
+
+  # Siden midnat — kilde til 7-dages dag-for-dag søjlegraf via LTS.
+  # 2026-08-13: måler på ..._lys_on_effektiv (packages/lys_kpi.yaml) = gruppen
+  # ELLER et spøgelses-spot (lyser videre uden radio). Stuck-alarmen nedenfor
+  # bliver bevidst på den rå gruppe — den skal slukke lys, og et spøgelse kan
+  # pr. definition ikke slukkes; Thread-vagten ejer den sag.
+  - platform: history_stats
+    name: "Badevaerelse lys on idag"
+    unique_id: badevaerelse_lys_on_idag
+    entity_id: binary_sensor.badevaerelse_lys_on_effektiv
+    state: "on"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+
+automation:
+  # ===========================================================================
+  # Bug-detektor — bad-lys hængt urealistisk længe (user-spec 2026-06-18)
+  # ===========================================================================
+  # Tærskel = max besøgs-tid + 5 min. Da watchdog'en slukker ved max besøgs-tid,
+  # betyder uafbrudt-tændt udover det at watchdog'en IKKE virkede → reel bug.
+  # Et normalt bad (≤30 min) eller en hængende wasp (ryddes ved max_on) når
+  # aldrig hertil. Mute i guest_mode (gæster bruger badet anderledes).
+  - id: badevaerelse_lys_stuck_alert
+    alias: "Bad: lys hængt urealistisk længe (bug-detektor)"
+    description: >
+      Bad-lyset tændt uafbrudt > max besøgs-tid + 5 min = selv watchdog'en
+      svigtede. Push + persistent notifikation så fejlen kan undersøges.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: light.badevaerelse_all
+        to: "on"
+        for:
+          seconds: >-
+            {{ (((states('input_number.badevaerelse_max_on_minutes') | float(40))
+                 + 5) * 60) | int }}
+    condition:
+      - condition: state
+        entity_id: light.badevaerelse_all
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.guest_mode
+        state: "off"
+    action:
+      - service: persistent_notification.create
+        data:
+          notification_id: badevaerelse_lys_stuck
+          title: "🐝 Bad-lys hænger"
+          message: >-
+            Badeværelses-lyset har været tændt uafbrudt i over
+            {{ ((states('input_number.badevaerelse_max_on_minutes') | float(40)) + 5) | int }}
+            min — watchdog'en burde have slukket det. Sandsynlig bug (hængende
+            wasp-lås eller en spot der ikke slukkede). Tjek
+            input_boolean.badevaerelse_wasp_active + de 5 spots.
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: bad_lys
+          title: "🐝 Bad-lys hænger"
+          message: >-
+            Bad-lyset har hængt > {{ ((states('input_number.badevaerelse_max_on_minutes')
+            | float(40)) + 5) | int }} min uafbrudt (watchdog svigtede). Tjek for bug.
+          payload:
+            tag: badevaerelse_lys_stuck
+      - service: logbook.log
+        data:
+          name: "Bad lys bug-detektor"
+          message: "Lys hængt > max besøgs-tid + 5 min — notifikation sendt"
+          entity_id: light.badevaerelse_all
+
+  # Ryd persistent-notifikationen når lyset endelig slukker igen.
+  - id: badevaerelse_lys_stuck_clear
+    alias: "Bad: ryd 'lys hænger'-notifikation når slukket"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: light.badevaerelse_all
+        to: "off"
+        for:
+          seconds: 5
+    action:
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: badevaerelse_lys_stuck

@@ -1,0 +1,67 @@
+# =============================================================================
+# OTBR (Thread) self-heal daemon — HA-side hooks (2026-07-24, user-spec;
+# integreret m. thread_otbr_watchdog 2026-07-24 review)
+# =============================================================================
+# User: "sikre dig at det self healer i fremtiden med et script." Baggrund
+# (2026-07-24-incident): OpenThread Border Router-addon'et crashede fordi
+# Sonoff ZBDongle-E's OpenThread-RCP hard-hang (spinel TimeoutError) → HELE
+# Thread-nettet dødt. En wedged chip kræver FYSISK RTS/DTR reset-pin-puls
+# + bootloader "launch app" (universal-silabs-flasher) — soft spinel-reset
+# og ren pin-puls er ikke nok.
+#
+# Selve helbredelsen kan IKKE være ren-HA: den kræver /dev/ttyUSB0-adgang +
+# flasher-venv, som kun findes i SSH-addon'et. Logikken lever derfor i
+# scripts/otbr_selfheal.sh (daemon i SSH-addon'et, startet via addon'ets
+# init_commands; poller OTBR-addon-state hvert 2. min, resetter ved 'error';
+# 10-min cooldown, 60-min backoff ved vedvarende fejl). Daemonen er den
+# ENESTE ejer af det fysiske chip-reset (fejlklasse #1: single-owner).
+#
+# ARBEJDSDELING m. packages/thread_otbr_watchdog.yaml (den HA-side vagt):
+#   - Daemonen ser addon-state 'error' (hård crash) → hurtig kur (~2-5 min).
+#   - HA-vagten ser OTBR'ens eget routerCount + enhederne (fanger OGSÅ den
+#     ensomme partition hvor addon'et kører men er afskåret — usynligt for
+#     daemonen) → stigen i thread_otbr_watchdog.yaml DELEGERER chip-reset
+#     (otbr_selfheal_request) og TX-boost (otbr_selfheal_txboost) hertil.
+#     Delegerede kure pusher IKKE "succes" herfra — kun HA-vagten ved om
+#     mesh'et faktisk samlede sig (08/10: falsk ✅ 9 t før nettet var oppe).
+#     shell_command.otbr_rcp_reset = kun legacy-fallback når daemonen er død.
+#   - FÆLLES killswitch: input_boolean.thread_watchdog_enabled (én kontakt
+#     dræber AL automatisk Thread-healing — også praktisk under dongle-flash).
+#   - Pushes går via script.push_notify nid `thread` (🔔-fanens toggles).
+#
+# Flasher-venv + logs i /data/otbr_selfheal/ (addon-persistent, ikke git).
+# =============================================================================
+input_boolean:
+  # Delegations-flag: HA-vagtens recovery-script tænder den ved hård hang;
+  # daemonen forbruger den (sluk + recover) indenfor sin 2-min poll. Selv-
+  # ryddende: en daemon der starter senere forbruger et efterladt flag.
+  otbr_selfheal_request:
+    name: "🧵 Self-heal: anmod daemon om chip-reset"
+    icon: mdi:restart-alert
+
+  # 2026-10-09: TX-boost-flag. script.thread_otbr_eskaler tænder den; daemonen
+  # forbruger den (sluk + `ot-ctl txpower 17`) i sin næste poll. Addon'et tvinger
+  # 6 dBm ved HVER start, så boostet gentages efter hver chip-kur.
+  otbr_selfheal_txboost:
+    name: "🧵 Self-heal: anmod daemon om TX-boost"
+    icon: mdi:signal-variant
+
+input_text:
+  # Epoch-sekunder skrevet af daemonen hver time. Epoch (ikke datetime-streng)
+  # = ingen tidszone-parsing (fejlklasse B67: naive strenge parses som UTC).
+  otbr_selfheal_heartbeat:
+    name: "🧵 Self-heal daemon heartbeat (epoch)"
+    icon: mdi:heart-pulse
+    max: 20
+
+template:
+  - binary_sensor:
+      # on = daemonen har heartbeatet indenfor 2,5 t (daemon-interval 1 t +
+      # margin for HA-genstart/API-hikke). off = daemon død → HA-vagten
+      # falder tilbage til sin legacy pin-puls, og tilen på Indstillinger
+      # viser rødt. now()-template ratelimites til 1/min af HA.
+      - name: "otbr_selfheal_daemon_ok"
+        unique_id: otbr_selfheal_daemon_ok
+        icon: mdi:lan-connect
+        state: >-
+          {{ (now().timestamp() - states('input_text.otbr_selfheal_heartbeat') | float(0)) < 9000 }}

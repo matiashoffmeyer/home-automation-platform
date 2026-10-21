@@ -1,0 +1,364 @@
+# =============================================================================
+# Mad-planlægning — daglige ret-afstemninger + samlet indkøbsliste (2026-07-29)
+# =============================================================================
+# Ret-katalog + stemmer bor i Google Sheets (Gemini fylder retter på løbende).
+# scripts/mad_planner.py læser/skriver via en Apps Script web-app
+# (scripts/mad_sheet_api.gs) og sender actionable notifikationer til begge
+# telefoner: JA! / SUPERJA! / NIX!  ("Måske" er 2026-08-29 blevet en TIMEOUT
+# i stedet for en knap — se mad_svar_timeout_dage nedenfor.)
+#
+# GODKENDT ret = begge har svaret + ingen NIX + mindst ét JA (user-valg) —
+# ELLER et aktivt SUPERJA, der godkender alene og tvinger retten med på den
+# førstkommende indkøbsliste (kvote: mad_superja_dage).
+# En ret med NIX kommer aldrig i puljen; en ret uden svar fra begge heller ikke.
+#
+# NOTIFIKATIONER (2 nids i packages/notifikationer.yaml + tiles på 🔔-fanen):
+#   mad_indkoeb      → sendes gennem script.push_notify (samme payload til alle
+#                      = central dispatch, hjemkomst-kø virker).
+#   mad_spoergsmaal  → sendes DIREKTE af scriptet, fordi hver telefon skal have
+#                      sine EGNE svar-knapper (personen er kodet ind i action-
+#                      id'et: MAD_<person>_<svar>_<ret-id>). scripts/mad_planner.py
+#                      ::gate_ok SPEJLER derfor push_notify's gate — ret BEGGE
+#                      steder hvis gaten ændres (fejlklasse #2, som plant_notify).
+#   Begge nids' tidsvinduer står 00:00/00:00 = ALTID: tidspunktet ejes af
+#   sliderne herunder, så der ikke er to konkurrerende tids-autoriteter.
+#
+# PÅMINDELSER — tabte svar-tryk (2026-08-06, user-rapport):
+#   Et svar-tryk er et HTTP-kald TILBAGE til HA (mobile_app-webhook) og virker
+#   derfor KUN på hjemme-wifi eller med Tailscale. Er man på mobildata uden VPN,
+#   når svaret aldrig frem — men appen rydder notifikationen ved tryk uanset
+#   (autoCancel), og kvitteringen udebliver, så stemmen er tabt i stilhed og
+#   familien tror de har stemt. Målt facit samme dag: 25 retter spurgt, Parent A
+#   22 stemmer, Parent B 4.
+#   `sticky: true` er IKKE udvejen — prøvet 2026-07-30b, det slog appens
+#   oprydning fra og gjorde det umuligt at svare overhovedet (rullet tilbage).
+#   Løsningen er `--paamind`: gensend spørgsmålet til den der mangler, helst
+#   mens telefonens tracker siger `home` (= svar-vejen virker med sikkerhed),
+#   med en tekst der forklarer hvorfor det kommer igen. Sensorens attributter
+#   `mangler_parent_a`/`mangler_parent_b` gør skævheden synlig på Mad-siden.
+#
+# WIRING:
+#   shell_command.mad_spoergsmaal   → dagens ret-spørgsmål (gated på slider)
+#   shell_command.mad_paamind       → gensend ubesvarede spørgsmål (svar-vagt)
+#   shell_command.mad_indkoeb       → indkøbsliste (gater selv på ugedag+interval)
+#   shell_command.mad_indkoeb_morgen → morgenspørgsmål på indkøbsdage (Ja/Nej/Udskyd)
+#   shell_command.mad_indkoeb_svar  → svar på morgenspørgsmålet (action-handler)
+#   shell_command.mad_refresh       → publicér sensorer (ingen notifikationer)
+#   shell_command.mad_fjern_ret     → fjern valgt ret fra listen + genberegn varer
+#   shell_command.mad_udskift_ret   → udskift valgt ret med en anden godkendt ret
+#   shell_command.mad_vote          → skriv én stemme (kaldes af action-handler)
+#   shell_command.mad_stem_slot     → stem fra Mad-sidens knapper (slot-nummer)
+#   automations/mad_planlaegning.yaml
+#   dashboards/mad.yaml ("Mad"-siden — kontrolpanelet) + dashboards/settings.yaml,
+#   fanen 🥘 Mad (alle sliders bor der, 2026-09-30)
+#
+# SENSORER (publiceres af scriptet via REST → forsvinder ved restart, derfor
+# refresh-automation på homeassistant:start):
+#   sensor.mad_status              status + balance-fordeling + afventende svar
+#   sensor.mad_seneste_spoergsmaal dagens ret(ter)
+#   sensor.mad_indkoebsliste       seneste liste (retter + summerede varer)
+#   sensor.mad_naeste_indkoeb      næste indkøbsdato (afledt af sliderne)
+#
+# SETUP-KRAV (secrets.yaml er .gitignored):
+#   /config/secrets.yaml:
+#     mad_sheet_url: https://script.google.com/macros/s/…/exec
+#     mad_sheet_token: <samme streng som TOKEN i scripts/mad_sheet_api.gs>
+#     mad_sheet_id: <arkets id — til CSV-fallback'en>
+#   Uden url/token falder scriptet tilbage til offentlig CSV-eksport = LÆS-ONLY
+#   (stemmer kan så kun gemmes lokalt i /config/.mad_planner_state.json).
+#
+# Test:  python3 /config/scripts/mad_planner.py --refresh --dry-run
+# =============================================================================
+
+input_boolean:
+  mad_spoergsmaal_enabled:
+    name: "Mad — daglige spørgsmål"
+    icon: mdi:comment-question-outline
+  mad_indkoeb_enabled:
+    name: "Mad — indkøbsliste"
+    icon: mdi:cart-outline
+  mad_basisvarer_filter_enabled:
+    name: "Mad — spring basisvarer over"
+    icon: mdi:shaker-outline
+  # 2026-08-06: svar-vagten (se PÅMINDELSER i headeren).
+  mad_paamind_enabled:
+    name: "Mad — påmind om ubesvarede retter"
+    icon: mdi:bell-ring-outline
+
+input_number:
+  mad_spoergsmaal_antal:
+    name: "Mad — retter pr. spørgsmål"
+    min: 1
+    max: 5
+    step: 1
+    mode: box
+    icon: mdi:numeric
+  mad_genspoerg_dage:
+    name: "Mad — genspørg efter (dage)"
+    min: 0
+    max: 60
+    step: 1
+    mode: box
+    icon: mdi:calendar-refresh
+  # 2026-08-29 (user-spec): "Måske" er ikke længere en knap — den er blevet en
+  # frist. Har man ikke svaret så mange dage efter at retten FØRST blev spurgt
+  # om, tæller det som et Måske, og retten er færdigbehandlet (ingen flere
+  # påmindelser, ingen genspørgsel). 0 = slået fra = retter kan afvente evigt.
+  # Fristen måles fra første spørgsmål, ikke seneste — ellers ville en
+  # genspørgsel forlænge den (mad_planner.py::svar_udloebet).
+  mad_svar_timeout_dage:
+    name: "Mad — ubesvaret = Måske efter (dage)"
+    min: 0
+    max: 60
+    step: 1
+    mode: box
+    icon: mdi:timer-alert-outline
+  # 2026-08-29 (user-spec): SUPERJA sikrer retten en plads på den FØRSTKOMMENDE
+  # indkøbsliste uanset hvad den anden svarer. Kvoten er én pr. person pr. N
+  # dage; bruges den oftere, bliver den et almindeligt JA (og man får det at
+  # vide). 0 = ingen kvote (SUPERJA hver gang).
+  mad_superja_dage:
+    name: "Mad — én SUPERJA pr. person hver (dage)"
+    min: 0
+    max: 60
+    step: 1
+    mode: box
+    icon: mdi:star-circle-outline
+  mad_indkoeb_interval_uger:
+    name: "Mad — indkøb hver N. uge"
+    min: 1
+    max: 6
+    step: 1
+    mode: box
+    icon: mdi:calendar-sync
+  mad_retter_min:
+    name: "Mad — min. retter pr. indkøb"
+    min: 1
+    max: 10
+    step: 1
+    mode: box
+    icon: mdi:numeric-3-box-outline
+  mad_retter_max:
+    name: "Mad — max. retter pr. indkøb"
+    min: 1
+    max: 12
+    step: 1
+    mode: box
+    icon: mdi:numeric-4-box-outline
+  mad_boernevenlig_pct:
+    name: "Mad — andel børnevenlige (%)"
+    min: 0
+    max: 100
+    step: 5
+    mode: slider
+    unit_of_measurement: "%"
+    icon: mdi:baby-face-outline
+  # 2026-08-05 (item 1c): hver N'te plads på indkøbslisten OG hvert N'te
+  # ret-spørgsmål er en salat. 0 = slået fra. Salat-tælleren for spørgsmål
+  # lever i .mad_planner_state.json ("ask_nr") og tælles PR. SPURGT RET på
+  # tværs af dage — `mad_spoergsmaal_antal` bestemmer hvor mange retter vi
+  # spørger om pr. dag (2 pt.), så en tæller der kun levede inde i én kørsel
+  # ville ikke være retvisende. Med antal=2 og hver=4 falder salat-spørgsmålet
+  # altså hver anden dag, ikke hver fjerde.
+  mad_salat_hver:
+    name: "Mad — salat på hver N'te plads"
+    min: 0
+    max: 10
+    step: 1
+    mode: box
+    icon: mdi:leaf
+  # 2026-08-05 (item 1a): arkets kolonne M, 1-10 (10 = ekstremt sundt). Målet
+  # er listens GENNEMSNIT, ikke en minimumsgrænse — en enkelt usund yndlingsret
+  # må gerne med, hvis resten trækker op.
+  mad_sundhed_maal:
+    name: "Mad — sundheds-mål (gennemsnit 1-10)"
+    min: 1
+    max: 10
+    step: 0.5
+    mode: slider
+    icon: mdi:heart-pulse
+  # 2026-08-06 (svar-vagt): tre tal styrer hvor påtrængende den er.
+  # `efter_timer` er BÅDE modningstid og afstand mellem påmindelser.
+  mad_paamind_efter_timer:
+    name: "Mad — påmind tidligst efter (timer)"
+    min: 1
+    max: 72
+    step: 1
+    mode: box
+    icon: mdi:timer-sand
+  mad_paamind_maks:
+    name: "Mad — max påmindelser pr. ret"
+    min: 1
+    max: 5
+    step: 1
+    mode: box
+    icon: mdi:repeat
+  # 0 = påmind ALDRIG mens telefonen er ude (svaret ville alligevel gå tabt
+  # uden Tailscale). Ellers: send alligevel når spørgsmålet er så gammelt.
+  # KØRER PÅ 0 (user-valg 2026-08-06): en påmindelse man ikke kan svare på er
+  # selve fejlen vi bygger imod — så hellere vente til telefonen er hjemme.
+  # Derfor står den heller ikke i init_user_preferences (0 er også minimum,
+  # så en fresh-min-sentinel ville overskrive valget ved hver restart, #5).
+  mad_paamind_ude_timer:
+    name: "Mad — påmind alligevel når man er ude efter (timer)"
+    min: 0
+    max: 168
+    step: 1
+    mode: box
+    icon: mdi:home-alert
+  # 2026-10-20: samlet Mad-side-påmindelse for personer med paamind: "side"
+  # (Parent B) — erstatter hendes påmindelse pr. ret. Defaults målt på hendes
+  # stem-sessioner, se E_SIDE_* i scripts/mad_planner.py.
+  mad_side_paamind_dage:
+    name: "Mad — Mad-side-påmindelse højst hver (dage)"
+    min: 1
+    max: 14
+    step: 1
+    mode: box
+    icon: mdi:calendar-refresh
+  mad_side_paamind_min:
+    name: "Mad — Mad-side-påmindelse ved mindst (retter)"
+    min: 1
+    max: 20
+    step: 1
+    mode: box
+    icon: mdi:format-list-numbered
+
+input_datetime:
+  mad_spoergsmaal_tid:
+    name: "Mad — tidspunkt for dagens spørgsmål"
+    has_date: false
+    has_time: true
+    icon: mdi:clock-outline
+  mad_indkoeb_tid:
+    name: "Mad — tidspunkt for indkøbsliste"
+    has_date: false
+    has_time: true
+    icon: mdi:clock-check-outline
+  mad_side_paamind_tid:
+    name: "Mad — Mad-side-påmindelse fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-outline
+  mad_indkoeb_anker:
+    name: "Mad — indkøbs-anker (tæller uger fra denne dato)"
+    has_date: true
+    has_time: false
+    icon: mdi:calendar-start
+
+  # --- Morgen-spørgsmålet på indkøbsdage (2026-08-26, user-spec) -------------
+  # "på indkøbsdage skal jeg om morgenen spørges om vi senere vil ha genereret
+  #  en liste eller om køleskabet er fyldt stadig."
+  mad_indkoeb_morgen_tid:
+    name: "Mad — morgenspørgsmål på indkøbsdage"
+    has_date: false
+    has_time: true
+    icon: mdi:fridge-alert-outline
+  # Sat til dagens dato når der svares "Nej, køleskabet er fyldt". Springer KUN
+  # dagens liste over — kadencen er urørt, så næste indkøbsdag falder som normalt.
+  # (Snooze flytter i stedet ankeret; se mad_planner.py::mode_indkoeb_svar.)
+  #
+  # ⚠️ has_time: true er IKKE pynt. Et urørt input_datetime med has_date står på
+  # DAGENS midnat — ikke 1970 — så en ren dato-helper ville læse som "sprunget
+  # over i dag" hver eneste dag, og indkøbslisten ville aldrig blive lavet igen.
+  # Tidsdelen er husets sentinel: `[11:] == '00:00:00'` = aldrig sat.
+  mad_indkoeb_sprunget_dato:
+    name: "Mad — indkøbsdag sprunget over (dato)"
+    has_date: true
+    has_time: true
+    icon: mdi:calendar-remove
+
+input_select:
+  mad_indkoeb_ugedag:
+    name: "Mad — indkøbs-ugedag"
+    icon: mdi:calendar-week
+    options:
+      - Mandag
+      - Tirsdag
+      - Onsdag
+      - Torsdag
+      - Fredag
+      - Lørdag
+      - Søndag
+
+  # Fyldes af mad_planner.py med den aktuelle indkøbslistes retter (+ "—").
+  # Bruges af BEGGE knapper på Mad-siden: fjern og udskift (2026-08-12).
+  mad_fjern_ret:
+    name: "Mad — vælg ret (fjern / udskift)"
+    icon: mdi:delete-outline
+    options:
+      - "—"
+
+shell_command:
+  mad_spoergsmaal: "python3 /config/scripts/mad_planner.py --detach --ask"
+  mad_indkoeb: "python3 /config/scripts/mad_planner.py --detach --indkoeb"
+  # Manuel knap på Mad-siden: ignorér ugedag/interval (men ikke min-antal).
+  mad_indkoeb_nu: "python3 /config/scripts/mad_planner.py --detach --indkoeb --force"
+  mad_refresh: "python3 /config/scripts/mad_planner.py --detach --refresh"
+  # Morgen-spørgsmålet på indkøbsdage (gater selv på ugedag/interval/sprunget).
+  mad_indkoeb_morgen: "python3 /config/scripts/mad_planner.py --detach --indkoeb-morgen"
+  # Svaret er en fast enum — regex-gatet i action-handleren, aldrig fri tekst.
+  mad_indkoeb_svar: "python3 /config/scripts/mad_planner.py --detach --indkoeb-svar {{ svar }}"
+  # Svar-vagt: gensender ubesvarede spørgsmål (gater selv på timer/max/hjemme).
+  mad_paamind: "python3 /config/scripts/mad_planner.py --detach --paamind"
+  # Sletter den valgte ret og genberegner varerne (læser selv input_select'en).
+  mad_fjern_ret: "python3 /config/scripts/mad_planner.py --detach --fjern-valgt"
+  # Sletter den valgte ret OG sætter en anden godkendt ret ind i stedet.
+  mad_udskift_ret: "python3 /config/scripts/mad_planner.py --detach --udskift-valgt"
+  # 2026-09-23 (user-bug: "kan ikke fjerne to retter … knapperne burde være ud
+  # for hver ret i stedet for en dropdown"): knappen ud for retten bærer sit
+  # slot-nummer (1 = første ret på listen). `| int(0)` = kun et tal når shellen.
+  mad_fjern_slot: "python3 /config/scripts/mad_planner.py --detach --fjern-valgt --slot {{ slot | int(0) }}"
+  mad_udskift_slot: "python3 /config/scripts/mad_planner.py --detach --udskift-valgt --slot {{ slot | int(0) }}"
+  # ↩️ Byt den aktuelle indkøbsliste med den der blev overskrevet (og tilbage).
+  mad_fortryd_liste: "python3 /config/scripts/mad_planner.py --detach --fortryd-liste"
+  # Værdierne er validerede enums/cifre (regex-gate i action-handleren).
+  mad_vote: "python3 /config/scripts/mad_planner.py --detach --vote --id {{ ret_id }} --person {{ person }} --svar {{ svar }}"
+  # Stem fra Mad-siden: knappen bærer kun sit slot-nummer + to faste enums.
+  # Retten slås op i sensor.mad_afventer (samme kilde som kortet tegner efter),
+  # og scriptet afviser alt andet end parent_a/parent_b × JA/SUPERJA/NIX/MAASKE.
+  mad_stem_slot: "python3 /config/scripts/mad_planner.py --detach --stem-slot --slot {{ slot }} --person {{ person }} --svar {{ svar }}"
+
+script:
+  # Knap på Mad → 🛒 Indkøb: kopiér varerne over i HA's egen indkøbsliste, så de
+  # kan krydses af i butikken. Tilføjer KUN varer der ikke allerede står der —
+  # listen ejes af mennesker, så hverken deres egne linjer eller afkrydsninger
+  # må ryge ved et tryk (derfor get_items først, aldrig remove/clear).
+  mad_indkoeb_til_liste:
+    alias: "Mad — send indkøbslisten til HA's indkøbsliste"
+    icon: mdi:playlist-plus
+    mode: single
+    sequence:
+      - action: todo.get_items
+        target:
+          entity_id: todo.shopping_list
+        data:
+          status:
+            - needs_action
+        response_variable: liste
+      - variables:
+          allerede: >-
+            {{ (liste['todo.shopping_list']['items'] | default([]))
+               | map(attribute='summary') | list }}
+          nye: >-
+            {{ (state_attr('sensor.mad_indkoebsliste','varer') or [])
+               | reject('in', allerede) | list }}
+      - repeat:
+          for_each: "{{ nye }}"
+          sequence:
+            - action: todo.add_item
+              target:
+                entity_id: todo.shopping_list
+              data:
+                item: "{{ repeat.item }}"
+
+template:
+  - sensor:
+      # Antal retter på den aktuelle liste — tal-state til dashboardets
+      # numeric_state-visibility (Lovelace har ingen template-betingelse).
+      # sensor.mad_indkoebsliste er selv POST-skabt og fraværende efter en
+      # restart indtil mad_refresh → 0 = ingen rækker vist (sikker retning).
+      - name: "Mad indkoeb antal retter"
+        unique_id: mad_indkoeb_antal_retter
+        icon: mdi:counter
+        state: "{{ (state_attr('sensor.mad_indkoebsliste', 'retter') or []) | count }}"

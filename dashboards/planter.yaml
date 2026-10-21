@@ -1,0 +1,156 @@
+# =============================================================================
+# Planter — dedikeret dashboard (2026-06-15)
+# =============================================================================
+# Viser "upcoming varsler" for planterne: kommende vanding + gødning + vejr.
+# Data kommer fra sensor.plant_overview, som scripts/plant_notify.py publicerer
+# ved hver daglig kørsel (08:00) + ved HA-start. Markdown-kort templater
+# attributterne (vanding[], goedning[], regn_3d_mm, varme_dage ...).
+# Selve notifikationerne sendes af samme script til notify.mobile_app_phone_a.
+# Lovelace mode: yaml — registreret i configuration.yaml (planter-dash).
+# =============================================================================
+title: Planter
+icon: mdi:sprout
+views:
+  - title: Planter
+    path: planter
+    type: sections
+    max_columns: 3
+    sections:
+      # =====================================================================
+      # Status + kontrol
+      # =====================================================================
+      - type: grid
+        cards:
+          - type: heading
+            heading: 🌱 Plante-oversigt
+            heading_style: title
+          - type: markdown
+            content: >
+              {% set o = 'sensor.plant_overview' %}
+              {% if states(o) in ['unknown','unavailable','None'] %}
+              _Afventer første kørsel af plante-scriptet (kører kl 08:00 + ved
+              HA-start). Tryk "Tjek planter nu" for at hente med det samme._
+              {% else %}
+              **{{ state_attr(o,'antal_planter') }} planter** · opdateret {{ state_attr(o,'updated') }}<br>
+              💧 {{ state_attr(o,'forfaldne_vanding') }} vanding + 🌿 {{ state_attr(o,'forfaldne_goedning') }} gødning forfaldne i dag
+              {% endif %}
+          - type: tile
+            entity: sensor.plant_overview
+            name: Forfaldne i dag
+            icon: mdi:sprout
+          - type: button
+            name: Tjek planter nu
+            icon: mdi:refresh
+            tap_action:
+              action: perform-action
+              perform_action: shell_command.plant_notify_scan
+
+      # =====================================================================
+      # Sidste gødnings-påmindelse — SAMME liste som pushen (2026-10-05)
+      # =====================================================================
+      # User-spec 2026-10-05: "på plantesiden skal jeg kunne se hvilke planter
+      # der blev bedt om at blive gødet sidste gang, in case jeg glemmer det".
+      # Attributten sidste_goedning er den seneste push' batch (_fert_last i
+      # plant_notify.py) og bliver stående EFTER kvitteringen — den afløser
+      # 08-13's goedes_i_dag, der kun levede samme dag. status_tekst bygges i
+      # Python (testet i scripts/tests/test_plant_notify.py), ikke her.
+      # Knapperne kalder samme script som push-knapperne (fejlklasse #2) og er
+      # nødvejen når telefonens knapsvar ikke når hjem (intet netværk til HA).
+      # Et tryk på en batch der blev lukket en tidligere dag ignoreres af
+      # scriptet — Lovelace kan ikke skjule kortet på en attribut.
+      - type: grid
+        cards:
+          - type: heading
+            heading: 🌿 Sidste gødnings-påmindelse
+            heading_style: title
+          - type: markdown
+            content: >
+              {% set s = state_attr('sensor.plant_overview','sidste_goedning') %}
+              {% if not s or not s.planter %}
+              _Ingen gødnings-påmindelse endnu._
+              {% else %}
+              **{{ s.status_tekst }}**<br>
+              {% for plac, gr in s.planter | groupby('plac') %}
+              **{{ plac if plac else 'Uden placering' }}:**
+              {% for p in gr %}#{{ p.id }} {{ p.navn }}{% if not loop.last %}, {% endif %}{% endfor %}<br>
+              {% endfor %}
+              _Knapperne gælder alle planter på listen._
+              {% endif %}
+          - type: button
+            name: Gødet
+            icon: mdi:check-circle-outline
+            tap_action:
+              action: perform-action
+              perform_action: script.planter_goedning_kvitter
+              data:
+                act: done
+              confirmation:
+                text: Markér alle planter i den seneste påmindelse som gødet i dag?
+          - type: button
+            name: +1 uge
+            icon: mdi:calendar-arrow-right
+            tap_action:
+              action: perform-action
+              perform_action: script.planter_goedning_kvitter
+              data:
+                act: snooze7
+              confirmation:
+                text: Udskyd hele påmindelsen en uge?
+
+      # =====================================================================
+      # Vejr-varsler (forecast-baseret)
+      # =====================================================================
+      - type: grid
+        cards:
+          - type: heading
+            heading: ☀️ Vejr-varsler
+            heading_style: title
+          - type: markdown
+            content: >
+              {% set o = 'sensor.plant_overview' %}
+              {% set rain = state_attr(o,'regn_3d_mm') %}
+              {% set hot = state_attr(o,'varme_dage') %}
+              {% set maxt = state_attr(o,'varme_maxtemp') %}
+
+              🌧️ **Regn (næste 3 dage):** {{ rain if rain is not none else '–' }} mm{% if rain is not none and rain >= 20 %} — ⚠️ meget regn, overvej at flytte krukke-planter i ly{% endif %}
+
+              ☀️ **Varme + solrige dage forude:** {{ hot if hot is not none else '–' }}{% if maxt %} (op til {{ maxt | round(0) }}°C){% endif %}{% if hot and hot >= 2 %} — ⚠️ vand ekstra og skyg følsomme planter{% endif %}
+
+      # =====================================================================
+      # Kommende vanding (næste ~3 uger) — VISNING ONLY, ingen pushes
+      # (user-spec 2026-07-29: "vanding skal jeg nok selv gøre")
+      # =====================================================================
+      - type: grid
+        cards:
+          - type: heading
+            heading: 💧 Kommende vanding (kun visning — ingen varsler)
+            heading_style: title
+          - type: markdown
+            content: >
+              {% set items = state_attr('sensor.plant_overview','vanding') or [] %}
+              {% set ns = namespace(any=false) %}
+              {% for w in items if 0 <= w.dage <= 21 %}
+              {% set ns.any = true %}
+              {% if w.dage == 0 %}🟠{% else %}🟢{% endif %} **#{{ w.id }} {{ w.navn }}** ({{ w.plac }}) · {{ w.dato }} ({% if w.dage == 0 %}i dag{% else %}om {{ w.dage }} d{% endif %}) — _{{ w.besked }}_<br>
+              {% endfor %}
+              {% if not ns.any %}_Ingen planlagte vandinger de næste 3 uger._{% endif %}
+
+      # =====================================================================
+      # Kommende gødning (sæson-frekvens; ukvitterede står som "i dag" til ✅)
+      # =====================================================================
+      - type: grid
+        cards:
+          - type: heading
+            heading: 🌿 Kommende gødning
+            heading_style: title
+          - type: markdown
+            content: >
+              {% set items = state_attr('sensor.plant_overview','goedning') or [] %}
+              {% set ns = namespace(any=false) %}
+              {% for f in items if 0 <= f.dage <= 21 %}
+              {% set ns.any = true %}
+              {% if f.dage <= 3 %}🟠{% else %}🟢{% endif %} **#{{ f.id }} {{ f.navn }}** ({{ f.plac }}) · {{ f.dato }} ({% if f.dage == 0 %}i dag{% else %}om {{ f.dage }} d{% endif %})<br>
+              {% endfor %}
+              {% if not ns.any %}_Ingen gødning planlagt de næste 3 uger._{% endif %}
+
+              _Én samlet push kl. 08 — den kommer igen hver dag til du trykker ✅ Gødet._

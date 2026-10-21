@@ -1,0 +1,280 @@
+# =============================================================================
+# Terrasse Plug — helpers (power-controller støtte + pærelyskæde-rytme)
+# =============================================================================
+# switch.terrasse_plug = udeområdets ENESTE strøm-udtag (pærelyskæde + luftpumpe
+# + andre terrasse-redskaber). Pærelyskæden (light.terrasse_paerelyskaede) får
+# strøm GENNEM pluggen → bliver "unavailable" hvis pluggen er off.
+#
+# MODEL (user-spec 2026-06-22):
+#   - Pluggen er ALTID ON som udgangspunkt (powerer luftpumpe m.m.).
+#   - Eneste OFF: huset Dormant ELLER det regner NU (sikkerhed for redskaberne)
+#     ELLER vinter-kill-switch (input_boolean.terrace_presence_enabled off).
+#   - Regn = KUN aktuelt vejr (weather.forecast_home vådt), IKKE forecast (user).
+#   - Styrbar OP/NED styrer KUN pærelyskæden (plug ejes af controlleren).
+#   Controller + Styrbar-logik: automations/terrace_plug_control.yaml.
+#
+# Denne fil leverer: debounce-stempel, regn-sensor, sol-elevation-slider og
+# scriptet der tænder pærelyskæden på sol-tilpasset styrke (delt af Styrbar +
+# dusk-auto-on).
+#
+# 2026-06-22: manuel-override-input_boolean + template-light.terrasse_plug
+# FJERNET — pluggen er nu rent controller-styret (ingen override at forene med),
+# og dashboardet viser switch.terrasse_plug direkte (altid available).
+# =============================================================================
+
+# Debounce-stempel for terrasse-Styrbar kommandoer. Bruges til at droppe
+# machine-gun-repeats fra en defekt/fugtig udendørs-Styrbar (se automation).
+input_datetime:
+  # Nat-auto-sluk (2026-07-14): fra dette klokkeslæt slukkes pærelyskæden når
+  # der ikke er dør-aktivitet (se automation G). Baggrund: i AirBnB fyrer
+  # godnat aldrig → zen-lyset brændte til super-watchdoggen (03:30). Vinduet
+  # løber sluk-tid → 06:00 (hardcodet morgen-ende; dusk-tænd kan ikke fyre
+  # før da). Fresh-install-default 23:30 via init.
+  terrasse_lys_nat_sluk_tid:
+    name: "Terrasse lys: nat-sluk fra kl."
+    icon: mdi:weather-night
+    has_date: false
+    has_time: true
+  terrasse_styrbar_last_cmd:
+    name: "Terrasse Styrbar sidste kommando"
+    icon: mdi:gesture-tap-button
+    has_date: true
+    has_time: true
+  # Hvornår blev den manuelle sluk-hold sat (→ max-cap måles herfra).
+  terrasse_plug_manual_off_since:
+    name: "Terrasse plug: manuel sluk siden"
+    has_date: true
+    has_time: true
+  # Hvornår blev det sidst tørt (regn_aktiv on→off) → tør-streak måles herfra.
+  terrasse_regn_dry_since:
+    name: "Terrasse regn: tørt siden"
+    has_date: true
+    has_time: true
+  # Styrbar-OP = "tænd lige meget hvad" (user-spec 2026-08-23). Stemplet sættes
+  # til nu + 3 t og får controlleren (A) til at LADE VÆRE med at slukke pluggen
+  # mens det løber — ellers ville regn/Dormant/kill-switch rulle trykket tilbage
+  # ved næste /15-tick. Uden stempel (midnat-sentinel) = ingen force.
+  terrasse_force_on_until:
+    name: "Terrasse: force-on gælder til"
+    icon: mdi:power-plug-outline
+    has_date: true
+    has_time: true
+
+# Sol-elevation-grænse: pærelyskæden tænder KUN (auto/Styrbar-første-tryk) når
+# solens elevation er UNDER denne værdi. Default 0° = "kun når solen er gået
+# ned" (man kan ikke se kæden når solen er oppe, user-spec). Tunable.
+input_number:
+  # Skumrings-grænsen (2026-10-10): pærelyskæden auto-tænder når solen falder
+  # under denne højde, og fest-holdet løfter den til fuld under samme grænse.
+  # Var hårdt -4° seks steder (terrace_plug_control.yaml + fest_ankomst.yaml).
+  terrasse_skumring_elevation:
+    name: "Terrasse: skumrings-tænd under sol"
+    icon: mdi:weather-sunset-down
+    min: -12
+    max: 5
+    step: 1
+    unit_of_measurement: "°"
+    mode: slider
+
+  # Regn-tærskel (DMI near-term): hvor meget regn DMI skal forvente i de næste
+  # ~3 timer (sensor.dmi_regn_forecast attr mm_next3h) før pluggen auto-slukker.
+  # Lavere = mere følsom (slukker tidligere/på lettere byger). Default 0.3 mm.
+  # 2026-06-27: tilføjet fordi met.no missede en regnbyge helt (sagde
+  # partlycloudy/0mm) mens DMI så den → met.no alene = upålidelig auto-sluk.
+  terrasse_regn_dmi_threshold_mm:
+    name: "Terrasse regn: DMI-tærskel (næste 3t)"
+    min: 0.1
+    max: 3.0
+    step: 0.1
+    unit_of_measurement: "mm"
+    icon: mdi:weather-pouring
+    mode: slider
+
+  # Hold-release (tørt-streak): hvor længe regn-signalet skal være VÆK uafbrudt
+  # før en manuel sluk frigives og pluggen må tænde igen ("regnen helt sikkert
+  # forbi"). Default 2 timer. Manuel TÆND vinder altid med det samme.
+  terrasse_regn_dry_release_hours:
+    name: "Terrasse regn: tør-streak før release"
+    min: 0.5
+    max: 12
+    step: 0.5
+    unit_of_measurement: "t"
+    icon: mdi:weather-sunny
+    mode: slider
+
+  # Max-cap (safety): tving release af manuel sluk-hold senest efter så mange
+  # timer, så pluggen aldrig hænger slukket for evigt hvis et regn-signal sidder
+  # fast. Default 12 timer. (Begge-strategi: primær = tør-streak; cap = backstop.)
+  terrasse_regn_hold_max_hours:
+    name: "Terrasse regn: hold max-cap"
+    min: 1
+    max: 48
+    step: 1
+    unit_of_measurement: "t"
+    icon: mdi:timer-lock-outline
+    mode: slider
+
+  # Nat-auto-sluk ro-krav: OPEN-PLAN (stue+spisestue+køkken Apollo-occupancy)
+  # skal have været i ro — alle 'off' og uændrede — i N minutter før nat-slukket
+  # fyrer, så vi ikke slukker for næsen af folk der stadig er oppe. 2026-07-14
+  # user-fix: var dør-ro, men terrassedøren holdes ofte åben (sommer) → dør-state
+  # er et dårligt aktivitetssignal; er nogen oppe/på terrassen, ses de i
+  # open-plan på vej ud/ind. 0 = sluk hårdt ved sluk-tid uanset aktivitet.
+  # Entity_id beholder navnet (snapshot/live-værdi bevaret). Fresh-install
+  # lander på min (0) = hård sluk — live-default 20 sættes via API (samme
+  # mønster som roborock_elpris_aggressivitet; 0 er en gyldig user-værdi, så
+  # init-sentinel kan ikke skelne).
+  terrasse_lys_nat_ro_minutter:
+    name: "Terrasse nat-sluk: open-plan-ro krav"
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:sofa-outline
+    mode: slider
+
+# Manuel sluk-hold: når brugeren SELV slukker switch.terrasse_plug (fx under
+# regn met.no missede) sættes dette flag → controlleren tænder IKKE pluggen
+# igen før regnen er sikkert forbi (tør-streak) eller max-cap nås. Manuel TÆND
+# rydder flaget med det samme. Auto-sluk (regn/Dormant) sætter IKKE flaget.
+input_boolean:
+  terrasse_plug_manual_off_hold:
+    name: "Terrasse plug: manuel sluk-hold"
+    icon: mdi:hand-back-left
+
+  # Nat-manuel-hold: tænder nogen SELV pærelyskæden INDE i nat-vinduet (app/
+  # fysisk = parent_id none, eller terrasse-Styrbar), er det et bevidst nat-
+  # valg → nat-auto-slukket holder fingrene væk resten af natten. Ryddes fast
+  # kl 06:00:30 (lige efter vinduet lukker). Runtime-flag — snapshottes ikke.
+  terrasse_nat_manuel_hold:
+    name: "Terrasse nat: manuel tænd-hold"
+    icon: mdi:weather-night-partly-cloudy
+
+template:
+  - binary_sensor:
+      # Regner det / regner det SNART? TRE kilder — én måling, to prognoser:
+      #   1) MÅLT: binary_sensor.regn_nu_observeret (DMI metObs, 10-min-buckets
+      #      fra station 06180, packages/regn_nu.yaml), ELLER
+      #   2) met.no aktuelt vejr-symbol vådt NU, ELLER
+      #   3) DMI HARMONIE forventer regn i de næste ~3 timer over en tærskel-
+      #      slider (mm_next3h ≥ terrasse_regn_dmi_threshold_mm).
+      # Baggrund: met.no missede en reel regnbyge HELT (partlycloudy/0mm) mens
+      # DMI så den → met.no alene var upålidelig auto-sluk. DMI fanger de korte
+      # danske byger met.no's grovere model overser (samme grund som B34).
+      # 2026-08-28: begge PROGNOSER missede samtidig (met.no 'cloudy' hele bygen,
+      # HARMONIE frosset på et 429'et fetch) og pluggen stod tændt gennem 1,9 mm
+      # regn. To modeller er ikke to uafhængige kilder — derfor kilde 1, den
+      # eneste der måler i stedet for at gætte. Den står FØRST fordi den er både
+      # hurtigst (~0-2 min efter bucket-luk) og den eneste der ikke kan tage fejl
+      # af om det regnede.
+      # Bruges af plug-controlleren til at slukke strømmen som sikkerhed for
+      # luftpumpe/redskaber. Fail-safe: alle kilder unknown ⇒ off ⇒ pluggen
+      # bliver PÅ (regn er undtagelsen, ikke reglen).
+      - name: "Terrasse regn aktiv"
+        unique_id: terrasse_regn_aktiv
+        icon: mdi:weather-pouring
+        state: >-
+          {% set obs_wet = is_state('binary_sensor.regn_nu_observeret', 'on') %}
+          {% set wet_now = states('weather.forecast_home') in
+             ['rainy', 'pouring', 'lightning', 'lightning-rainy',
+              'snowy', 'snowy-rainy', 'hail'] %}
+          {% set dmi3 = state_attr('sensor.dmi_regn_forecast', 'mm_next3h') %}
+          {% set thr = states('input_number.terrasse_regn_dmi_threshold_mm') | float(0.3) %}
+          {# mm_next3h BESKRIVER et vindue der starter ved fetch-tidspunktet, så
+             den udløber af sig selv 3 t efter. Sensoren bærer sin sidste gode
+             værdi videre ved 429 (og endpointet 429'er ofte i timevis), så uden
+             denne alders-guard læses et forlængst udløbet vindue som nowcast —
+             det var halvdelen af 28/8-incidentet. #}
+          {% set f = state_attr('sensor.dmi_regn_forecast', 'fetched_at') %}
+          {% set f_alder = (as_timestamp(now()) - as_timestamp(f | as_datetime, 0)) / 3600
+                           if f not in [none, 'none', 'unknown', 'unavailable', ''] else 99 %}
+          {% set dmi_wet = dmi3 not in [none, 'none', 'unknown', 'unavailable']
+                           and (dmi3 | float(0)) >= thr
+                           and f_alder <= 3 %}
+          {{ obs_wet or wet_now or dmi_wet }}
+
+      # Nat-sluk-vinduet: ÉN autoritet (fejlklasse #2 — bruges af automation G,
+      # H og Styrbar-hold i terrace_plug_control.yaml). ON fra sluk-tid-slideren
+      # til 06:00 (hardcodet morgen-ende). Håndterer midnats-kryds begge veje
+      # (sluk-tid før/efter midnat). now() → re-render pr. minut. Fallback
+      # 23:30 hvis slideren er unavailable (fail mod sluk, ikke mod nat-burn).
+      - name: "Terrasse nat-sluk vindue"
+        unique_id: terrasse_nat_sluk_vindue
+        icon: mdi:weather-night
+        state: >-
+          {% set sluk = states('input_datetime.terrasse_lys_nat_sluk_tid') %}
+          {% if sluk in ['unknown', 'unavailable', 'none', ''] %}
+            {% set sluk = '23:30:00' %}
+          {% endif %}
+          {% set t = now().strftime('%H:%M:%S') %}
+          {% if sluk >= '06:00:00' %}
+            {{ t >= sluk or t < '06:00:00' }}
+          {% else %}
+            {{ sluk <= t < '06:00:00' }}
+          {% endif %}
+
+script:
+  # Styrbar-OP-tragten (user-spec 2026-08-23: "skal tænde både plug og
+  # terasselys lige meget hvad"). Slipper de bløde hold, sætter force-on-
+  # stemplet så controlleren ikke slukker igen, tænder pluggen og venter på at
+  # Zigbee-pæren melder sig FØR lys-kaldet (uden ventetiden rammer turn_on en
+  # unavailable pære og forsvinder tavst).
+  terrasse_force_on:
+    alias: "Terrasse: tænd plug + pærelyskæde (lige meget hvad)"
+    mode: restart
+    fields:
+      pct:
+        description: "Fast lysstyrke i % (udelades = sol-tilpasset styrke)"
+        example: 100
+    sequence:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.terrasse_plug_manual_off_hold
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.terrasse_force_on_until
+        data:
+          datetime: "{{ (now() + timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: switch.turn_on
+        target:
+          entity_id: switch.terrasse_plug
+      - wait_template: >-
+          {{ states('light.terrasse_paerelyskaede') not in ['unavailable', 'unknown'] }}
+        timeout: "00:00:20"
+        continue_on_timeout: true
+      - choose:
+          - conditions: "{{ pct is defined }}"
+            sequence:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.terrasse_paerelyskaede
+                data:
+                  brightness_pct: "{{ pct | int(100) }}"
+                  transition: 0.5
+        default:
+          - service: script.terrasse_paerelys_til
+
+  # Tænd pærelyskæden på en styrke der passer til hvor mørkt der er (sol-
+  # elevation). Mørkere himmel → kraftigere kæde (decorative, skal kunne ses).
+  # Skaleres af den globale Light Aggressiveness-faktor (som alle andre rum).
+  # Kaldes af Styrbar-OP (første tryk) + dusk-auto-on. GATER IKKE selv på sol —
+  # det gør kalderen (Styrbar tjekker sol-grænsen, dusk fyrer først ved -4°).
+  terrasse_paerelys_til:
+    alias: "Terrasse: tænd pærelyskæde på sol-tilpasset styrke"
+    mode: restart
+    variables:
+      elev: "{{ state_attr('sun.sun', 'elevation') | float(0) }}"
+      f: "{{ states('sensor.global_brightness_factor') | float(1.0) }}"
+      base: >-
+        {% if elev >= -6 %}40
+        {% elif elev >= -12 %}65
+        {% else %}90{% endif %}
+      pct: "{{ [[(base | float(40) * f) | round(0) | int, 100] | min, 5] | max }}"
+    sequence:
+      - service: light.turn_on
+        target:
+          entity_id: light.terrasse_paerelyskaede
+        data:
+          brightness_pct: "{{ pct }}"
+          transition: 3

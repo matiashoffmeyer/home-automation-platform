@@ -1,0 +1,466 @@
+# =============================================================================
+# Soveværelsets pærelyskæde på smart plug (Innr SP 240, Zigbee, fra 15/10)
+# =============================================================================
+# Pluggen: fra 2026-09-23 en GRILLPLATS Thread-plug (Matter node 0x1F3); 15/10
+# flyttet til køkkenet som altid-tændt Thread-router (switch.thread_router_koekken)
+# og erstattet her af den Innr SP 240 der før drev stue-hyggelampen (senest
+# switch.depot_plug). Entity-id'erne blev omdøbt i registret, så switch.sove_lyskaede
+# / sensor.sove_lyskaede_power er de samme navne. Historikken fulgte ENHEDERNE:
+# sove_lyskaede_* før 15/10 er hyggelampen i stuen; kædens egne målinger før
+# 15/10 ligger på thread_router_koekken_*.
+#
+# User-spec 2026-09-23: "der kommer også et thread smart plug ind i soveværelset
+# som styrer en gammeldags pærelyskæde. vi skal ha visibility på dens
+# strømforbrug hvis muligt. den skal tænde on efter N akkumuleret presence
+# (still eller move) i soveværelset, default 3min, og slukke når loft lyset i
+# soveværelset slukker. den skal også slukkes under darkmode (og pre dark mode
+# og projektor). om morgenen skal den være en del af morgenvækning i
+# soveværelset. de knapper der skruer lyset op i soveværelset (manuelle
+# fysiske) skal også tænde/slukke den."
+#
+# DESIGN
+# - light.sove_lyskaede = template-light over switchen (samme mønster som
+#   light.stue_plug) → indgår i light.alle_indvendige/alle_lys, så godnat,
+#   sluk-alt, entré-NED og snapshots dækker den GRATIS (fejlklasse #1/#16).
+#   BEVIDST IKKE i light.sovevaerelse_all: room_mode_apply tænder den gruppe,
+#   og så ville kæden springe 3-min-reglen over hver gang loftet tændes.
+# - TÆND: loftet (light.spisestue_pendel = sove-loft) er tændt OG rummet har
+#   haft ≥ N min presence SIDEN loftet tændte (history_stats over
+#   sovevaerelse_apollo_occupancy = still ELLER move). Kæden er loftets hygge-
+#   tilføjelse, derfor koblet til loftet — også i sluk-retningen.
+# - AFTEN-GENVEJ (user-spec 2026-09-23: "soveværelset ved move aktivitet om
+#   aftenen er for mørkt og bør have plug lyskæden med"): efter solnedgang
+#   (kl. 12-24) tænder kæden STRAKS når radaren ser BEVÆGELSE i rummet mens
+#   loftet lyser på sit rigtige niveau — ikke på gang-early-detect-pre-lyset
+#   (sove_approach_lit on = et gæt ud fra entréen, ikke bevis for at nogen er
+#   herinde). 3-min-reglen gælder fortsat om dagen og for stille presence.
+# - SLUK: loftet slukker · filmmørke i sove (Dark Mode / Pre-Dark / projektor
+#   = binary_sensor.filmmoerke_sove, ét anker) · godnat.
+# - APP (2026-09-23, user-spec "respektér mit valg"): app-sluk af kæden =
+#   manuel-sluk-flaget (som NED); app-sluk af LOFTET tager ikke kæden med; en
+#   app-ændring på kæden sætter soveværelset Manual (manual_override.yaml), så
+#   presence ikke tænder loftet oveni dit valg.
+# - MØRKT RUM: første klik-OP tænder KUN kæden, næste klik/langt OP tager
+#   loftet med (styrbar_universal_instant ejer klik-OP).
+# - KNAPPER: Styrbar sove OP (klik/hold) = kæden tænder med det samme; NED
+#   (klik/hold) = kæden slukker og bliver slukket (manuel-sluk-flag) til loftet
+#   har været slukket — ellers ville 3-min-reglen tænde den igen lige efter.
+# - GODMORGEN (Somrig kort op 04–18, 2026-10-02): loftet fader op og kæden
+#   tænder til SIDST (script.sove_godmorgen_fade nederst); tænd-reglen holder
+#   sig væk mens fadet kører.
+# - VÆKNING: tændes i vækningens fase 2 (wakeup_alarm_driven), slukker med
+#   loftet som alt andet.
+# - AirBnB: kæden følger loftet også for gæsten (blid, selv-slukkende, ingen
+#   ny tilstand at slippe ud af). Ingen push.
+# =============================================================================
+
+input_boolean:
+  sove_lyskaede_enabled:
+    name: "Sove-lyskæde: automatik aktiv"
+    icon: mdi:string-lights
+  # Runtime: slukket med knappen mens loftet var tændt → ingen auto-tænd før
+  # loftet har været slukket.
+  sove_lyskaede_manuel_slukket:
+    name: "Sove-lyskæde: slukket manuelt"
+    icon: mdi:string-lights-off
+
+input_number:
+  sove_lyskaede_presence_minutter:
+    name: "Sove-lyskæde: tænd efter presence (min)"
+    icon: mdi:timer-sand
+    min: 0
+    max: 30
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: slider
+  # 2026-10-04 (user-spec: "plug lyskæden ... skal først med når loft har nået
+  # et højt niveau"): kæden er en plug — den springer fra 0 til fuld — så den
+  # tænder kun når loftet står på mindst dette niveau OG har været tændt længe
+  # nok til at et blødt op-fade er færdigt. Under niveauet (hygge 10 %, cozy
+  # 9 %) bliver kæden slukket.
+  sove_lyskaede_min_loft_pct:
+    name: "Sove-lyskæde: kun når loftet er mindst (%)"
+    icon: mdi:brightness-6
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+  # Godmorgen-knappens (Somrig kort op, 04–18) fade-tid for loftet; kæden tænder
+  # når fadet er færdigt. 0 = gammel opførsel (2 s, kæden straks).
+  sove_godmorgen_fade_sekunder:
+    name: "Sove: godmorgen fade-tid (kort op)"
+    icon: mdi:weather-sunset-up
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+template:
+  - light:
+      - name: "Sove lyskæde"
+        unique_id: sove_lyskaede_light
+        icon: mdi:string-lights
+        # availability: kæden er 'unavailable' indtil pluggen er parret —
+        # HA springer den så selv over i gruppe-kald (permanent faktum).
+        availability: "{{ states('switch.sove_lyskaede') not in ['unavailable', 'unknown'] }}"
+        state: "{{ is_state('switch.sove_lyskaede', 'on') }}"
+        turn_on:
+          - action: switch.turn_on
+            continue_on_error: true
+            target:
+              entity_id: switch.sove_lyskaede
+        turn_off:
+          - action: switch.turn_off
+            continue_on_error: true
+            target:
+              entity_id: switch.sove_lyskaede
+
+sensor:
+  # Minutter med presence i soveværelset SIDEN loftet sidst skiftede tilstand
+  # (= siden det tændte, når det er tændt). last_changed nulstilles ved restart
+  # → tælleren starter forfra = kæden tænder senere, aldrig tidligere.
+  - platform: history_stats
+    name: "Sove lyskæde presence siden loft"
+    unique_id: sove_lyskaede_presence_siden_loft
+    entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+    state: "on"
+    type: time
+    start: "{{ states.light.spisestue_pendel.last_changed if states.light.spisestue_pendel else now() }}"
+    end: "{{ now() }}"
+
+automation:
+  - id: sove_lyskaede_taend
+    alias: "Sove-lyskæde: tænd efter presence mens loftet lyser"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: sensor.sove_lyskaede_presence_siden_loft
+      - platform: state
+        entity_id: light.spisestue_pendel
+        from: "off"
+        to: "on"
+      # Aften-genvej: bevægelse, eller pre-lyset opgraderes til START (flaget
+      # ryddes ~0,5 s efter at presence-tænd har løftet loftet).
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_apollo_radar_moving_target
+        to: "on"
+      # Flaget ryddes KUN af en Apollo-bekræftet opgradering (presence-tænd /
+      # sengelys) eller når loftet slukker — med loftet tændt er det bevis.
+      - platform: state
+        entity_id: input_boolean.sove_approach_lit
+        from: "on"
+        to: "off"
+        id: opgraderet
+      # Re-arm (#4): blokering der slipper mens loftet stadig lyser.
+      - platform: state
+        entity_id: binary_sensor.filmmoerke_sove
+        from: "on"
+        to: "off"
+      # 2026-10-04: kæden venter til loftet er OPPE (niveau + fade færdig).
+      # Disse to re-evaluerer når ventetiden er gået, eller når loftet senere
+      # skrues op over niveauet (RODRET lang-op, Styrbar, app). 15 s ≥ den
+      # længste op-fade vi selv sender (passage-fade 8 s + margin); den
+      # præcise ventetid står i conditionen nedenfor.
+      - platform: state
+        entity_id: light.spisestue_pendel
+        to: "on"
+        for:
+          seconds: 15
+      - platform: state
+        entity_id: light.spisestue_pendel
+        attribute: brightness
+        for:
+          seconds: 15
+    condition:
+      - condition: state
+        entity_id: input_boolean.sove_lyskaede_enabled
+        state: "on"
+      - condition: state
+        entity_id: light.spisestue_pendel
+        state: "on"
+      - condition: state
+        entity_id: light.sove_lyskaede
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.sove_lyskaede_manuel_slukket
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.filmmoerke_sove
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.godnat_active
+        state: "off"
+      # Godmorgen-fadet ejer kæden mens det kører og tænder den selv til sidst.
+      - condition: state
+        entity_id: script.sove_godmorgen_fade
+        state: "off"
+      # 2026-10-04 (user-spec): kun når loftet har nået et HØJT niveau og
+      # op-fadet er færdigt. 3/10 21:01:19 tændte kæden i SAMME sekund som
+      # RODRET-trykket (aften-genvejen), mens loftet stadig fadede op.
+      # Ventetiden = passage-fade + 2 s (RODRET-aftentænd bruger passage-fade;
+      # presence 3 s, sengelys 2 s). last_changed nulstilles ved genstart →
+      # venter længere, aldrig kortere.
+      - condition: template
+        value_template: >-
+          {% set loft = states.light.spisestue_pendel %}
+          {% set min_pct = states('input_number.sove_lyskaede_min_loft_pct') | float(60) %}
+          {% set bri_pct = (state_attr('light.spisestue_pendel', 'brightness') | float(0)) / 2.55 %}
+          {% set vent = (states('sensor.fade_passage_effective') | float(8)) + 2 %}
+          {{ loft is not none
+             and bri_pct >= min_pct - 0.5
+             and (now() - loft.last_changed).total_seconds() >= vent }}
+      # history_stats svarer i TIMER. ELLER aften-genvejen (se header).
+      # 2026-10-02: history_stats genberegnes først ved næste minut-tick — i
+      # sekundet loftet tænder står den stadig på presence fra loftets SLUKKEDE
+      # periode (05:53:38: 6,01 t nattesøvn → kæden 0,13 s efter loftet; 20 af 45
+      # tændinger 23/9-2/10 kom < 5 s efter loftet). Presence siden loftet kan
+      # aldrig overstige tiden siden loftet → det loft på tallet fjerner staleness.
+      - condition: template
+        value_template: >-
+          {% set n_min = states('input_number.sove_lyskaede_presence_minutter') | float(3) %}
+          {% set loft = states.light.spisestue_pendel %}
+          {% set loft_s = (now() - loft.last_changed).total_seconds() if loft else 0 %}
+          {% set min_ok = (states('sensor.sove_lyskaede_presence_siden_loft') | float(0)) * 60 >= n_min
+             and loft_s >= n_min * 60 %}
+          {% set aften = is_state('sun.sun', 'below_horizon') and now().hour >= 12 %}
+          {% set bevaegelse = ((trigger.id if trigger is defined else '') == 'opgraderet')
+                              or (is_state('binary_sensor.sovevaerelse_apollo_radar_moving_target', 'on')
+                                  and is_state('input_boolean.sove_approach_lit', 'off')) %}
+          {{ min_ok or (aften and bevaegelse) }}
+    action:
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.sove_lyskaede
+
+  - id: sove_lyskaede_sluk
+    alias: "Sove-lyskæde: sluk med loftet / filmmørke / godnat"
+    mode: queued
+    max: 4
+    trigger:
+      # 2026-09-23 (user: "når jeg slukker og tænder i ha appen så skal du
+      # altså respektere mit valg"): kun et AUTOMATISK loft-sluk tager kæden
+      # med. Slukker du loftet i appen (context.user_id), bliver kæden stående.
+      # Knapper bærer ikke user_id — Styrbar NED slukker kæden selv nedenfor.
+      - platform: state
+        entity_id: light.spisestue_pendel
+        from: "on"
+        to: "off"
+        id: loft_off
+      - platform: state
+        entity_id: binary_sensor.filmmoerke_sove
+        from: "off"
+        to: "on"
+      - platform: state
+        entity_id: input_boolean.godnat_active
+        from: "off"
+        to: "on"
+    action:
+      - if:
+          - condition: trigger
+            id: loft_off
+        then:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.sove_lyskaede_manuel_slukket
+      - condition: template
+        value_template: >-
+          {{ not (trigger.id == 'loft_off'
+                  and trigger.to_state.context.user_id is not none) }}
+      - condition: state
+        entity_id: light.sove_lyskaede
+        state: "on"
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.sove_lyskaede
+
+  # Styrbar soveværelse: OP (klik/hold) = kæden med; NED (klik/hold) = kæden fra.
+  # Samme event-former som styrbar_rooms.yaml (on / move_with_on_off / off / move).
+  - id: sove_lyskaede_knap
+    alias: "Sove-lyskæde: Styrbar sove op/ned"
+    mode: queued
+    max: 4
+    trigger:
+      # Klik-OP ('on') ejes af styrbar_universal_instant (2026-09-23): dér
+      # afgøres "mørkt rum → kun kæden" samme sted som loft-trappen.
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+          command: "move_with_on_off"
+        id: op
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+          command: "off"
+        id: ned
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "c3:db:c9:b4:05:ef:1d:63"
+          command: "move"
+        id: ned
+    condition:
+      - condition: state
+        entity_id: input_boolean.sove_lyskaede_enabled
+        state: "on"
+    action:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: op
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.sove_lyskaede_manuel_slukket
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.sove_lyskaede
+          - conditions:
+              - condition: trigger
+                id: ned
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.sove_lyskaede_manuel_slukket
+              - service: light.turn_off
+                continue_on_error: true
+                target:
+                  entity_id: light.sove_lyskaede
+
+  # 2026-09-23 (user-spec): slukker du kæden i APPEN, er det samme valg som
+  # Styrbar NED → manuel-sluk-flaget, så 3-min-reglen / aften-genvejen ikke
+  # tænder den igen (målt 21:18:04 app-sluk → 21:18:07 auto-tænd). Flaget
+  # ryddes som altid når loftet slukker, eller ved OP-tryk.
+  # call_service (ikke state-trigger): kun kaldets egen context bærer
+  # user_id med sikkerhed — en automation der reagerer på dit tryk gør ikke.
+  - id: sove_lyskaede_app_sluk
+    alias: "Sove-lyskæde: app-sluk = slukket manuelt"
+    mode: queued
+    max: 4
+    trigger:
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: light
+          service: turn_off
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: switch
+          service: turn_off
+    condition:
+      - condition: template
+        value_template: >-
+          {% set t = trigger.event.data.service_data.entity_id | default([]) %}
+          {% set t = [t] if t is string else t | list %}
+          {{ trigger.event.context.user_id is not none
+             and ('light.sove_lyskaede' in t or 'switch.sove_lyskaede' in t) }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.sove_lyskaede_manuel_slukket
+
+script:
+  # Godmorgen-knappens fade (2026-10-02, user: "når man trykker godmorgen
+  # knappen … fade lyset ind over 10sek og slutte med plug-lyskæden? det er
+  # meget pludseligt"). Før: loftet 30 % på transition 2, og kæden sprang på
+  # 0,13 s efter (sove_lyskaede_taend læste en forældet presence-tæller).
+  # HA driver rampen GEOMETRISK (samme grund som godnat_fuld 2026-09-05: innr
+  # RF 271 T kvantiserer en lang firmware-transition groft, og et lineært fade
+  # fra mørke er et stort opfattet spring i starten). Fra slukket snappes der
+  # først til 1 % @ 2700 K uden transition (usynligt), så farven er sat før
+  # rampen. Kæden (on/off-plug) tænder til sidst — kun hvis ingen andre har
+  # taget loftet undervejs: slukket, godnat, rum ikke længere Auto (Styrbar/
+  # app sætter Manual), eller lysere end vi selv har sendt (langt op). ZHA
+  # skriver den sendte brightness optimistisk, så sammenligningen er direkte.
+  # mode: restart → et 2. kort tryk (gardin-stigen) fortsætter fra nuværende
+  # niveau i stedet for at starte forfra. Somrig-knappens øvrige tryk kalder
+  # script.turn_off (automations/godmorgen_godnat.yaml).
+  sove_godmorgen_fade:
+    alias: "Sove: godmorgen-fade (loft op, pærelyskæden til sidst)"
+    mode: restart
+    sequence:
+      - variables:
+          fade_s: "{{ states('input_number.sove_godmorgen_fade_sekunder') | float(10) }}"
+          maal: 77
+          fra_slukket: "{{ not is_state('light.spisestue_pendel', 'on') }}"
+          start: >-
+            {{ 3 if fra_slukket
+               else [state_attr('light.spisestue_pendel', 'brightness') | int(3), 3] | max }}
+          trin: >-
+            {{ 0 if fade_s < 1 or (start - maal) | abs <= 3
+               else [[(fade_s / 1.25) | round(0) | int, 4] | max, 20] | min }}
+          interval: "{{ fade_s / trin if trin > 0 else 0 }}"
+      - if:
+          - condition: template
+            value_template: "{{ trin == 0 }}"
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: light.spisestue_pendel
+            data:
+              brightness: "{{ maal }}"
+              color_temp_kelvin: 2700
+              transition: 2
+        else:
+          - if:
+              - condition: template
+                value_template: "{{ fra_slukket }}"
+            then:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: light.spisestue_pendel
+                data:
+                  brightness: "{{ start }}"
+                  color_temp_kelvin: 2700
+          # Hvert trin: tjek at loftet stadig er vores (sidst sendte niveau =
+          # trin index-1), send så næste geometriske niveau. transition ×1,2 af
+          # intervallet, så pæren stadig er i bevægelse når næste trin overtager.
+          - repeat:
+              while:
+                - condition: template
+                  value_template: >-
+                    {% set forrige = start * (maal / start) ** ((repeat.index - 1) / trin) %}
+                    {{ repeat.index <= trin
+                       and is_state('light.spisestue_pendel', 'on')
+                       and is_state('binary_sensor.godnat_any_active', 'off')
+                       and is_state('input_select.room_mode_sovevaerelse', 'Auto')
+                       and state_attr('light.spisestue_pendel', 'brightness') | int(0)
+                           <= forrige + [8, forrige * 0.25] | max }}
+              sequence:
+                - service: light.turn_on
+                  continue_on_error: true
+                  target:
+                    entity_id: light.spisestue_pendel
+                  data:
+                    brightness: "{{ (start * (maal / start) ** (repeat.index / trin)) | round(0) | int }}"
+                    color_temp_kelvin: 2700
+                    transition: "{{ (interval * 1.2) | round(1) }}"
+                - delay:
+                    milliseconds: "{{ (interval * 1000) | round(0) | int }}"
+      # Nåede rampen sit mål uden at nogen tog over? Ellers ingen kæde.
+      - condition: template
+        value_template: >-
+          {{ is_state('light.spisestue_pendel', 'on')
+             and is_state('binary_sensor.godnat_any_active', 'off')
+             and is_state('input_select.room_mode_sovevaerelse', 'Auto')
+             and state_attr('light.spisestue_pendel', 'brightness') | int(0) <= maal + 19 }}
+      - condition: state
+        entity_id: input_boolean.sove_lyskaede_enabled
+        state: "on"
+      # Fysisk "mere lys"-knap = samme ret som Styrbar OP: rydder manuel-sluk.
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.sove_lyskaede_manuel_slukket
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.sove_lyskaede

@@ -1,0 +1,521 @@
+# =============================================================================
+# Wake-up Automation - Børneværelse
+# =============================================================================
+# Blød solopgang i børneværelset på skoledage. Lyset fader op over ~15 min
+# (slider-tunable) så pigerne vågner gradvist.
+#
+# Kører IKKE i: AirBnB, Home Vacation, weekender eller Dormant state.
+#
+# WEEKEND-VARIANT: blød 07:30-solopgang på weekender + Home Vacation. Blødere
+# (~83 % af target mod 100 %) og fyrer kun mens godnat stadig er aktiv (= rummet
+# er mørkt), så en doven morgen ikke bliver mere krævende end nødvendigt.
+#
+# -----------------------------------------------------------------------------
+# TIDSPUNKT (2026-08-05, user-spec: "slider til at bestemme hvor lang tid efter
+# voksenalarmen går af at børnevækning skal køre, default 15min")
+# -----------------------------------------------------------------------------
+# Vækningen var låst til 06:05. Flyttede de voksne deres alarm, fulgte børnene
+# ikke med — enten blev pigerne vækket før forældrene var oppe, eller de lå og
+# ventede. Målet beregnes nu i ÉT anker, `sensor.wakeup_kids_maal`
+# (packages/global_tuning.yaml), som både trigger og condition læser
+# (fejlklasse #2). Ankeret har tre kilder, i prioriteret orden:
+#
+#   1. "alarm gik af"   — `input_datetime.wakeup_alarm_gaaet_af_at` er stemplet
+#                          i dag → mål = stempel + slider.
+#   2. "alarm forventet" — `sensor.wakeup_alarm_next` peger på et tidspunkt i dag
+#                          mellem 04:00 og 10:00 → mål = alarmtid + slider.
+#                          (Ankeret ruller videre i ringe-øjeblikket, derfor er
+#                          stemplet i punkt 1 det der holder bagefter.)
+#   3. "fast 06:05"      — ingen voksenalarm i spil → uændret gammel adfærd.
+#                          Bevidst fail-open: har ingen sat en alarm, skal
+#                          skoledagen stadig starte til tiden.
+#
+# Slider: input_number.global_kids_wakeup_after_alarm_minutes (0-120, default 15).
+#
+# TRIGGERS: template-triggeren giver minut-præcision (`now()` re-renderer den
+# selv), /5-backstoppen dækker en HA-restart hen over måltidspunktet
+# (fejlklasse #4), og godnat-flanken giver øjeblikkelig indhentning når
+# "sov videre" slippes. Alle tre går gennem SAMME conditions, og
+# `last_triggered` sikrer én kørsel pr. døgn (målt fra 04:00, husets
+# standard-nulpunkt) — ellers ville backstoppen re-fyre hvert 5. minut.
+#
+# TIDS-LOFT: alle veje er gated til 04:00-09:00. Uden det ville en snooze der
+# slippes kl. 10:30 udløse en solopgang midt på formiddagen — fejlklasse #19:
+# en blokeret automation fyrer i SAMME sekund blokeringen ophæves.
+#
+# GRACE: oveni må rampen højst starte `maal_grace_minutter` (25) efter sit mål.
+# Det er user-valget fra 2026-07-17 (indhentning 06:05 → 06:30) gjort relativt
+# til det nu bevægelige mål. Gælder ALLE tre triggers: en /5-backstop efter en
+# restart kl. 08:30 er lige så forkert som en sen godnat-clear.
+#
+# -----------------------------------------------------------------------------
+# HVILKE LAMPER (2026-08-05, user-spec: "børnestrip skal også være med til at
+# vække dem, samt deres hyggelys. alt lys derinde. loftet er tit slukket på
+# væggen.")
+# -----------------------------------------------------------------------------
+# Rampen kørte KUN `light.boernevaerelse_loft`. Er vægkontakten slået fra, er
+# loftet `unavailable` og hele vækningen var reelt et no-op — målt: loftet var
+# nede 07-31 17:40→08-01 19:24 og igen fra 08-04 15:52 (stadig nede nu, 30 t).
+# Loft og strip falder af i SAMME sekund (samme vægkontakt), så plug-lampen er
+# den eneste der overlever et slukket rum.
+#
+#   DIMBARE (rampes 5 % → 50 % → target):
+#     light.boernevaerelse_loft         — vægkontakt-afhængig
+#     light.boernevaerelse_hygge_strip  — samme kontakt som loftet
+#     light.boernevaerelse_lampe        — har været unavailable siden 07-22
+#                                         (fjernet fra boernevaerelse_all
+#                                         2026-06-04). Med her alligevel, så den
+#                                         bare virker hvis den kommer tilbage;
+#                                         `continue_on_error` bærer den døde sag.
+#   NON-DIMBAR:
+#     light.boernevaerelse_hyggelys     — plug-lampe (switch.sove_plug), tænder
+#                                         altid FULDT.
+#
+# Plug-lampen kan ikke dæmpes og må derfor ikke blæse fuld styrke ind i Phase 1
+# ("deep sleep"-fasen). Den kommer på:
+#   • i Phase 2 KUN som nødlys, hvis ingen dimbar lampe er tændt (= rummet er
+#     mørkt fordi vægkontakten er slået fra — præcis brugerens klage);
+#   • i Phase 3 altid ("alt lys derinde").
+# NB med-ejer (fejlklasse #1): `boernevaerelse_hyggelys_mirror` tænder allerede
+# selv pluggen ~2 s efter strippen passerer 26 raw (~10 %), dvs. ved Phase 2.
+# Kaldene her er idempotente og dækker det tilfælde hvor strippen er død.
+#
+# ABORT MIDT I RAMPEN: de gamle mellem-fase-tjek krævede at LOFTET var tændt —
+# med et slukket loft ville rampen aborte efter Phase 1 hver gang. Nu aborteres
+# kun når der ER en dimbar lampe indenfor rækkevidde OG alt er slukket (= nogen
+# har trykket Styrbar NED / vægkontakten ud undervejs). Er ingen dimbar lampe
+# tilgængelig, fortsætter rampen — den skal netop nå frem til plug-lampen.
+# =============================================================================
+
+- id: wakeup_kids_weekday
+  alias: "Vækning: Pigerne (N min efter voksenalarmen, ellers 06:05)"
+  description: >
+    Blød solopgang i børneværelset på skoledage, tidsfæstet efter
+    voksenalarmen (sensor.wakeup_kids_maal).
+    User-spec 2026-05-08: GATES STRENGT — kun fyr hvis (a) systemet tror
+    kids er hjemme ELLER (b) user manuelt har sagt det i appen, OG (c) der
+    har været motion i boern rum natten igennem (= kids har faktisk sovet
+    her). Har kids sovet et andet sted, skip wakeup helt.
+    2026-08-05: rampen tager ALLE lamper i rummet (loftet er tit slukket på
+    væggen), og tidspunktet følger voksenalarmen.
+  mode: single
+  variables:
+    # ÉN kilde til lampe-listen (bruges af alle tre faser + abort-tjekket).
+    boern_dim: !include ../rosters/boern_morgenlys.yaml
+    boern_plug: light.boernevaerelse_hyggelys
+    # Hvor sent må rampen stadig starte efter sit mål? User-valg 2026-07-17 var
+    # 06:05 → 06:30 = 25 min; grænsen følger nu det dynamiske mål i stedet for
+    # et fast klokkeslæt. En vækning en time for sent er ikke en vækning.
+    maal_grace_minutter: 25
+  trigger:
+    # (A) Minut-præcist: målet er nået. `now()` i templaten tvinger re-render
+    #     hvert minut, så den slår til af sig selv uden tick.
+    - platform: template
+      value_template: >
+        {% set m = states('sensor.wakeup_kids_maal') | float(0) %}
+        {{ m > 0 and as_timestamp(now()) >= m }}
+      id: maal
+    # (B) Backstop (fejlklasse #4): en HA-restart hen over måltidspunktet
+    #     efterlader template-triggeren "allerede sand" og den fyrer aldrig.
+    - platform: time_pattern
+      minutes: "/5"
+      id: backstop
+    # (C) Indhentning: godnat clearer først SENERE (forælder i bad/køkken →
+    #     sofa-clear, eller snooze der slippes). Uden denne skulle vi vente på
+    #     næste /5-tick.
+    - platform: state
+      entity_id: input_boolean.godnat_active
+      from: "on"
+      to: "off"
+      id: catchup
+  condition:
+    # Tids-loft for ALLE tre triggers (se TIDS-LOFT i headeren).
+    - condition: time
+      after: "04:00:00"
+      before: "09:00:00"
+    # Er måltidspunktet nået — og ikke for længe siden? Samme anker som trigger
+    # (A), så trigger og condition ikke kan divergere (fejlklasse #2).
+    # Grace-vinduet gælder ALLE tre triggers med vilje: en /5-backstop efter en
+    # restart kl. 08:30 skal lige så lidt som en sen godnat-clear udløse en
+    # solopgang der er en time forsinket.
+    - condition: template
+      value_template: >
+        {% set m = states('sensor.wakeup_kids_maal') | float(0) %}
+        {% set naa = as_timestamp(now()) %}
+        {{ m > 0 and m <= naa < m + maal_grace_minutter * 60 }}
+    # Én kørsel pr. døgn. Uden denne ville /5-backstoppen re-fyre hele morgenen.
+    # 04:00 er husets standard-nulpunkt for "i dag". `last_triggered` sættes
+    # først NÅR conditions er passeret, så den holder stadig forrige kørsel her.
+    - condition: template
+      value_template: >
+        {% set lt = state_attr(this.entity_id, 'last_triggered') %}
+        {{ lt is none or as_timestamp(lt, 0) < today_at('04:00').timestamp() }}
+    # Kill-switch (sprint 2026-05-17): toggle off ved ferie / skiftedage.
+    - condition: state
+      entity_id: input_boolean.wakeup_kids_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.arbejdsdag
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # ===== USER GATE 1 2026-05-08: kids must be home =====
+    # binary_sensor.kids_home returns true if:
+    #   - input_boolean.kids_home_manual = on (manual override), OR
+    #   - time-window + boern Apollo motion seen in last 4h (auto-detect)
+    # Skipper når børnene ikke er hjemme.
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    # ===== USER GATE 2 2026-05-08 (sprint 2026-05-28 v2): overnight check =====
+    # Verificer at kids har faktisk sovet i boern rum natten igennem (= ikke
+    # sovet et andet sted).
+    #
+    # 2026-08-18: DEN HÅRDE `>= 2.0` AFLYSTE EN HELT NORMAL MORGEN. Målt natten
+    # 08-17→18: Apolloen stod `unavailable` 22:00→00:45 (fejlklasse #9 — en død
+    # sensor tæller som "ikke on", så akkumulatoren tabte 2¾ t i tavshed) og
+    # mistede derefter det sovende barn i to lange huller. Facit 1,18 t < 2,0 →
+    # ingen solopgang, selvom barnet lå i sengen. Til sammenligning: 5,4-8,0 t
+    # på de fem foregående målte morgener — tærsklen er kalibreret mod en
+    # perfekt nat, ikke mod radarens faktiske adfærd.
+    #
+    # `boern_sleep_latch` lærte præcis dette 2026-07-24 (putte-lys-incidentet)
+    # og bruger tre bånd: ≥2,9 t = sov her · 0,25-2,9 t = gråzone, radar-
+    # underrapportering, RØR IKKE · <0,25 t = definitivt tom nat. Den dom er
+    # allerede destilleret ind i `binary_sensor.kids_home` ovenfor (latchen er
+    # dens primære signal), så en anden tærskel HER var samme regel kodet to
+    # steder med to forskellige svar (fejlklasse #2) — og den strengeste vandt.
+    #
+    # Tilbage står kun latchens egen nedre grænse: var natten DEFINITIVT tom,
+    # skal vi ikke lave solopgang for et barn der sov et andet sted. Alt derover
+    # er kids_home's afgørelse. Ikke-numerisk (død sensor) = fail-open, jf.
+    # "hellere en unødig solopgang end en misset vækning" (user-spec 07-17).
+    - condition: template
+      value_template: >-
+        {% set o = states('sensor.boern_occupancy_overnight') %}
+        {{ not is_number(o) or (o | float(0)) > 0.25 }}
+    # ===== Bevarede gates =====
+    # Hvis godnat stadig er on -> wakeup_adults fyrede ikke. Skip kids ogsaa.
+    - condition: state
+      entity_id: input_boolean.godnat_active
+      state: "off"
+    # Skip kunstig sunrise hvis det allerede er lyst udenfor (sommer-morgen
+    # solen staar tidligt op). Lux > morgen_dagslys_lux (80) = naturligt lys gor jobbet.
+    # 2026-10-15 (#2): × global-faktor som de andre morgen_dagslys_lux-gates.
+    - condition: template
+      value_template: >-
+        {% set lux = states('sensor.open_plan_lux') | float(-1) %}
+        {% set f = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+        {{ lux >= 0 and lux < (states('input_number.morgen_dagslys_lux') | float(80)) * f }}
+    # Sprint 2026-05-08 fix: Hvis godnat_boern_active=on (= du eksplicit har
+    # sagt "lad dem sove" via dashboard tile / kalde-knap NED), respekter det.
+    # Tidligere clearede vi flag FØRST + fade-up. Det IGNORERED bruger-intent.
+    # Nu: skip wakeup helt. Kids vågner naturligt; presence_light tager over.
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+  action:
+    # =========================================================================
+    # TIMELINE (sprint 2026-05-17 — slider-tunable speed + brightness):
+    #   Phase 1 (T+0):       5%  @ 2000K (sunrise start, deep warm)
+    #   Phase 2 (T+5*dur):   50% af target @ 2326K + plug som nødlys
+    #   Phase 3 (T+10*dur):  target % @ 2700K + plug-lampe
+    #
+    # SLIDERS:
+    #   input_number.global_kids_wakeup_speed (0-100, default 50)
+    #     → sensor.global_kids_wakeup_duration_factor 0.4..2.0x
+    #   input_number.global_kids_wakeup_brightness (30-100, default 60)
+    #     → Phase 3 max. Phase 2 = 50% af denne.
+    #   input_number.global_kids_wakeup_after_alarm_minutes (0-120, default 15)
+    #     → hvornår rampen starter, målt fra voksenalarmen.
+    # =========================================================================
+    # HOLD: fred rummets lys mod automatisk sluk mens rampen kører. Uden det
+    # slukkede gradvis-sluk 2 min inde (målt 02-09) og rampen aborterede på sit
+    # eget inter-fase-recheck. Se packages/vaekning_boern_hold.yaml.
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.wakeup_kids_hold_active
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.wakeup_kids_hold_stempel
+      data:
+        timestamp: "{{ now().timestamp() }}"
+    - service: logbook.log
+      data:
+        name: "Vækning: børn"
+        message: >
+          Rampe startet ({{ trigger.id }}) — mål
+          {{ (states('sensor.wakeup_kids_maal') | float(0)) | timestamp_custom('%H:%M', true) }},
+          kilde "{{ state_attr('sensor.wakeup_kids_maal', 'kilde') }}".
+          Lyset er fredet mod auto-sluk i
+          {{ states('sensor.vaekning_boern_hold_effektiv') }} min.
+    # Phase 1: Very dim warm light (sunrise start) — kun de dimbare.
+    # Plug-lampen er non-dimbar og holdes ude af "deep sleep"-fasen.
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ boern_dim }}"
+      data:
+        brightness_pct: "{{ [[(5 * (states('sensor.global_brightness_factor') | float(1.0))) | round(0) | int, 100] | min, 2] | max }}"
+        color_temp_kelvin: 2000
+        transition: 60
+    # Delay til Phase 2: 5 min × duration_factor
+    - delay:
+        seconds: >-
+          {% set f = states('sensor.global_kids_wakeup_duration_factor') | float(1.0) %}
+          {{ (300 * f) | int }}
+    # P5 pattern fix audit 2026-05-07: inter-phase re-check. Hvis kid manuelt
+    # slukker lyset mid-ramp via Styrbar, abort gracefully i stedet for at
+    # re-tænde. 2026-08-05: aborter KUN når der faktisk var noget at slukke —
+    # er ingen dimbar lampe tilgængelig (vægkontakt slået fra), skal rampen
+    # fortsætte frem til plug-lampen.
+    - condition: template
+      value_template: >
+        {% set naa = expand(boern_dim)
+             | rejectattr('state', 'in', ['unavailable', 'unknown']) | list %}
+        {{ naa | count == 0
+           or (naa | selectattr('state', 'eq', 'on') | list | count) > 0
+           or is_state(boern_plug, 'on') }}
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ boern_dim }}"
+      data:
+        # Phase 2 = 50% af target brightness slider
+        brightness_pct: >-
+          {% set target = states('input_number.global_kids_wakeup_brightness') | int(60) %}
+          {% set bri = target * 0.5 %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(bri * f) | round(0) | int, 100] | min, 2] | max }}
+        color_temp_kelvin: 2326
+        transition: 120
+    # NØDLYS: er der stadig ingen dimbar lampe tændt, er rummet mørkt (typisk
+    # vægkontakten). Så træder plug-lampen til allerede her i stedet for at
+    # vente til Phase 3.
+    - if:
+        - condition: template
+          value_template: >
+            {{ (expand(boern_dim) | selectattr('state', 'eq', 'on')
+                | list | count) == 0 }}
+      then:
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: "{{ boern_plug }}"
+        - service: logbook.log
+          data:
+            name: "Vækning: børn"
+            message: "Ingen dimbar lampe nåede at tænde — plug-lampen brugt som nødlys."
+    # Delay til Phase 3: 5 min × duration_factor
+    - delay:
+        seconds: >-
+          {% set f = states('sensor.global_kids_wakeup_duration_factor') | float(1.0) %}
+          {{ (300 * f) | int }}
+    # P5: re-check before Phase 3 (samme regel som før Phase 2).
+    - condition: template
+      value_template: >
+        {% set naa = expand(boern_dim)
+             | rejectattr('state', 'in', ['unavailable', 'unknown']) | list %}
+        {{ naa | count == 0
+           or (naa | selectattr('state', 'eq', 'on') | list | count) > 0
+           or is_state(boern_plug, 'on') }}
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ boern_dim }}"
+      data:
+        # Phase 3 = target brightness slider (default 60)
+        brightness_pct: >-
+          {% set target = states('input_number.global_kids_wakeup_brightness') | int(60) %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(target * f) | round(0) | int, 100] | min, 2] | max }}
+        color_temp_kelvin: 2700
+        transition: 120
+    # "Alt lys derinde" — plug-lampen med i fuld-fasen (idempotent hvis
+    # strip-mirror'en allerede har tændt den).
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ boern_plug }}"
+
+# =============================================================================
+# Weekend / Home Vacation: gentle 07:30 sunrise for børneværelse
+# =============================================================================
+# Softer than the weekday wake-up (~83% af target) — kids may already
+# be awake on weekends. Only fires if godnat is still active (room dark)
+# and someone is home. Runs on weekends in Normal mode + Home Vacation.
+#
+# 2026-08-05 (fejlklasse #12 — asymmetriske søster-stier): SAMME lampe-liste og
+# samme abort-regel som hverdags-varianten. Vægkontakten er lige så tit slået
+# fra i weekenden. Tidspunktet er derimod uændret 07:30 — der er ingen
+# voksenalarm at hænge det op på en fridag.
+# =============================================================================
+- id: wakeup_kids_weekend
+  alias: "Vækning: Pigerne kl. 07:30 weekend/ferie"
+  description: "Soft sunrise for børneværelse on weekends and Home Vacation days"
+  mode: single
+  variables:
+    boern_dim: !include ../rosters/boern_morgenlys.yaml
+    boern_plug: light.boernevaerelse_hyggelys
+  trigger:
+    - platform: time
+      at: "07:30:00"
+  condition:
+    # Kill-switch (sprint 2026-05-17): same flag som weekday-variant.
+    - condition: state
+      entity_id: input_boolean.wakeup_kids_enabled
+      state: "on"
+    # M6 fix: gate paa presence_sensors_available
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    # Weekends in Normal mode, OR any day in Home Vacation
+    - condition: or
+      conditions:
+        - condition: and
+          conditions:
+            - condition: state
+              entity_id: input_select.house_mode
+              state: "Normal"
+            - condition: template
+              value_template: "{{ now().isoweekday() > 5 }}"
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "Home Vacation"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Only fire if godnat still active (room is still dark/closed)
+    - condition: state
+      entity_id: input_boolean.godnat_active
+      state: "on"
+    # Don't fire if weekday wake-up already handled it
+    - condition: state
+      entity_id: binary_sensor.arbejdsdag
+      state: "off"
+    # ===== USER GATE 1 2026-05-08: kids must be home =====
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    # ===== USER GATE 2 2026-05-08: motion in boern rum overnight =====
+    - condition: template
+      value_template: >-
+        {% set occ = states('binary_sensor.boernevaerelse_apollo_occupancy') %}
+        {% if occ == 'on' %}
+          true
+        {% elif occ in ['unavailable','unknown','none'] %}
+          false
+        {% else %}
+          {% set lc = states.binary_sensor.boernevaerelse_apollo_occupancy.last_changed %}
+          {{ lc is not none and (now() - lc).total_seconds() < 28800 }}
+        {% endif %}
+    # Sprint 2026-05-08: respekter godnat_boern_active=on (skip hvis user har
+    # eksplicit sat "lad dem sove" mode).
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+  action:
+    # =========================================================================
+    # WEEKEND TIMELINE (sprint 2026-05-17 — slider-tunable speed + bright):
+    #   Phase 1 (T+0):       5%  @ 2000K
+    #   Phase 2 (T+5*dur):   ~42% af target @ 2273K (softer than weekday)
+    #   Phase 3 (T+10*dur):  83% af target @ 2560K + plug-lampe
+    #
+    # Weekend phases lidt blødere end weekday (lavere CT + lavere brightness).
+    # SLIDERS: same som weekday — speed + brightness.
+    # =========================================================================
+    # NB: tidligere clearede vi godnat_boern_active her. Sprint 2026-05-08:
+    # fjernet — wakeup gates nu på godnat_boern_active=off (skip hvis on),
+    # så ingen clear nødvendig.
+    # HOLD: samme fredning som hverdags-rampen (fejlklasse #12 — beskyttelse må
+    # ikke tilføjes asymmetrisk på søster-automations). Weekend-rampen har
+    # PRÆCIS samme fysik: gradvis-sluk fyrer hvert 5. minut på et sovende barn.
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.wakeup_kids_hold_active
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.wakeup_kids_hold_stempel
+      data:
+        timestamp: "{{ now().timestamp() }}"
+    # Phase 1: Very dim warm
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ boern_dim }}"
+      data:
+        brightness_pct: "{{ [[(5 * (states('sensor.global_brightness_factor') | float(1.0))) | round(0) | int, 100] | min, 2] | max }}"
+        color_temp_kelvin: 2000
+        transition: 60
+    # Delay til Phase 2: 5 min × duration_factor
+    - delay:
+        seconds: >-
+          {% set f = states('sensor.global_kids_wakeup_duration_factor') | float(1.0) %}
+          {{ (300 * f) | int }}
+    # P5 pattern fix audit 2026-05-07: same inter-phase re-check som weekday.
+    - condition: template
+      value_template: >
+        {% set naa = expand(boern_dim)
+             | rejectattr('state', 'in', ['unavailable', 'unknown']) | list %}
+        {{ naa | count == 0
+           or (naa | selectattr('state', 'eq', 'on') | list | count) > 0
+           or is_state(boern_plug, 'on') }}
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ boern_dim }}"
+      data:
+        # Phase 2 weekend = ~42% af target (var 25/60 = 42%)
+        brightness_pct: >-
+          {% set target = states('input_number.global_kids_wakeup_brightness') | int(60) %}
+          {% set bri = target * 0.42 %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(bri * f) | round(0) | int, 100] | min, 2] | max }}
+        color_temp_kelvin: 2273
+        transition: 120
+    # NØDLYS (samme regel som hverdag): ingen dimbar lampe tændt = mørkt rum.
+    - if:
+        - condition: template
+          value_template: >
+            {{ (expand(boern_dim) | selectattr('state', 'eq', 'on')
+                | list | count) == 0 }}
+      then:
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: "{{ boern_plug }}"
+    # Delay til Phase 3: 5 min × duration_factor
+    - delay:
+        seconds: >-
+          {% set f = states('sensor.global_kids_wakeup_duration_factor') | float(1.0) %}
+          {{ (300 * f) | int }}
+    # P5: re-check before Phase 3
+    - condition: template
+      value_template: >
+        {% set naa = expand(boern_dim)
+             | rejectattr('state', 'in', ['unavailable', 'unknown']) | list %}
+        {{ naa | count == 0
+           or (naa | selectattr('state', 'eq', 'on') | list | count) > 0
+           or is_state(boern_plug, 'on') }}
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ boern_dim }}"
+      data:
+        # Phase 3 weekend = ~83% af target (var 50/60 = 83%, softer end weekday)
+        brightness_pct: >-
+          {% set target = states('input_number.global_kids_wakeup_brightness') | int(60) %}
+          {% set bri = target * 0.83 %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(bri * f) | round(0) | int, 100] | min, 2] | max }}
+        color_temp_kelvin: 2560
+        transition: 120
+    # "Alt lys derinde" — plug-lampen med i fuld-fasen.
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ boern_plug }}"

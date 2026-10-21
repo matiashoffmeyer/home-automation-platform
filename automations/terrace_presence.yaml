@@ -1,0 +1,294 @@
+# =============================================================================
+# Terrasse-bevidsthed — door-driven outdoor light + indoor adaptation
+# =============================================================================
+# Altandør (balcony door) Matter Parasoll sensor styrer terrasse-lys
+# (terrasse_paerelyskaede via light.terrasse_all) + tilpasser indendørs lys mens
+# nogen er ude. NB 2026-06-15: lyskæden er flyttet til køkkenet (koekken_lyskaede).
+#
+# AUTOMATIONS (4):
+#   1. terrace_welcome_light
+#      Trigger: parasoll_terrassedoer → on
+#      Action: tænd terrasse_paerelyskaede (via light.terrasse_all, lux-aware)
+#      Skip: cirkus_active (party-mode har egen pattern)
+#
+#   2. terrace_dim_indoor
+#      Trigger: parasoll_terrassedoer → on / occupancy → off i 2 min (debounce
+#      2026-07-15 — radar-flaps gav dim-spam på gæste-ugen)
+#      Action: dim spisestue+koekken-loft, sluk entré+depot; sætter episode-flag
+#      input_boolean.terrasse_dim_indoor_active
+#      Conditions: kun hvis living-area Apollos (inkl. køkken) viser tomt
+#
+#   3. terrace_restore_indoor
+#      Trigger: occupancy → on ELLER parasoll_terrassedoer → off
+#      Action: restore presence-brightness baseret på lux; rydder episode-flaget
+#      Conditions: episode-flag on (= dim skete faktisk; erstattede dør=on
+#      2026-07-15)
+#
+#   4. terrace_lights_off — FINDES IKKE (aldrig implementeret; dør-lukket
+#      slukker IKKE terrasse-lys). Nat-sluk ejes af terrace_plug_control.yaml
+#      G (nat-auto-sluk fra sluk-tid-slider) + godnat (alle_lys).
+#
+# CROSS-CUTTING REFS:
+#   - binary_sensor.parasoll_terrassedoer (Matter Myggbett, planned post-flyt rename)
+#   - sensor.open_plan_lux — fallback chain (spisestue→sove→stue)
+#   - input_boolean.cirkus_active — mood mode override
+#   - binary_sensor.terrasse_active (computed via Sherlock) — auto-detect terrasse-aktivitet
+#
+# COMPLICATION: terrasse_active er Sherlock-deduktion (terrace lys ON ELLER
+# open-plan tom <10 min siden + ingen indoor zones aktiv). Denne automation
+# styrer KUN dør-driven path; auto-detect er separat (i activity_state.yaml).
+#
+# Pre-flyt: Parasoll Altandoer er endnu ikke navngivet; sensoren findes som
+# parasoll_standby (Myggbett 2). Post-flyt rename → automation virker uden ændring.
+# =============================================================================
+
+# --- Altandør opens → welcoming terrace light ---
+# 2026-06-23 (B38): terrace_welcome_light FJERNET — pegede på
+# light.terrasse_hue_lily (404, aldrig parret) → fejlede bare i loggen ved hver
+# dør-åbning. Terrassen styres nu af plug + pærelyskæde + Styrbar/dusk-auto-on
+# (rework 2026-06-22), så et separat hue_lily-velkomstlys er overflødigt.
+
+# --- Dim indoor to moderate when nobody inside (person on terrace) ---
+- id: terrace_dim_indoor
+  alias: "Terrasse: Dæmp indendørs lys (moderat)"
+  description: "Dim stue+køkken to moderate when everyone is on the terrace"
+  mode: restart
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      to: "on"
+      for:
+        seconds: 30
+    # 2026-06-21 fix: badevaerelse_inde_occupancy FJERNET fra trigger. Det er en
+    # IKEA-PIR (Myggspray) der flapper off hvert 30-60 s når man står stille i
+    # badet → en flap MENS terrassedøren stod åben (sommernat) fik denne dim til
+    # at tro "alle er på terrassen" og slukke bad-lyset gentagne gange mens
+    # nogen var derinde. Badet ejes nu udelukkende af presence_badevaerelse_off
+    # (5-min grace + wasp-veto + max-on watchdog).
+    # 2026-07-15 (gæste-forensik): for: 2 min debounce — radar-flaps med åben
+    # dør gav 511 dim-fires på gæste-ugen (lys-puls 5%↔60-90% hvert par minut).
+    # + koekken_apollo tilføjet (manglede — person i køkkenet blev dæmpet).
+    - platform: state
+      entity_id:
+        - binary_sensor.stue_apollo_occupancy_filtered
+        - binary_sensor.spisestue_apollo_occupancy_filtered
+        - binary_sensor.koekken_apollo_occupancy_filtered
+        - binary_sensor.sovevaerelse_apollo_occupancy
+        - binary_sensor.boernevaerelse_apollo_occupancy
+      from: "on"
+      to: "off"
+      for:
+        minutes: 2
+  condition:
+    # Kill-switch (sprint 2026-05-17): same flag som terrace_welcome_light.
+    - condition: state
+      entity_id: input_boolean.terrace_presence_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      state: "on"
+    # Nobody in the living areas (sovevaerelse+boernevaerelse may be occupied).
+    # P1 pattern fix audit 2026-05-07: hvis Apollo unavailable, dim never fired.
+    # Template: ingen af de 4 sensorer (3 living-area Apolloer + bad-PIR) "on"
+    # = empty. Bad-PIR'en er BEVIDST kun condition, ikke trigger (flap-fysik,
+    # jf. 2026-06-21-fixet) — kommentar rettet 2026-07-17c (fejlklasse #3).
+    - condition: template
+      value_template: >-
+        {{ states('binary_sensor.stue_apollo_occupancy_filtered') != 'on'
+           and states('binary_sensor.spisestue_apollo_occupancy_filtered') != 'on'
+           and states('binary_sensor.koekken_apollo_occupancy_filtered') != 'on'
+           and states('binary_sensor.badevaerelse_inde_occupancy') != 'on' }}
+    - condition: state
+      entity_id: binary_sensor.mood_pause_terrasse
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    # Don't dim during godnat — family may be in sovevaerelse/boernevaerelse
+    - condition: state
+      entity_id: input_boolean.godnat_active
+      state: "off"
+    # 2026-08-21 (fest-forberedelse): en fest er præcis det scenarie hvor
+    # "ingen indendørs Apollo ser nogen" er FALSK ro — gæsterne står på
+    # terrassen, og det er selve pointen. Uden denne gate slukkede dim'en
+    # entré-loftet og depot-loftet midt i festen, hver gang open-plan var tomt
+    # i 2 min. Samme fysik som gæste-aften-undtagelsen de tre terrasse-nat-lag
+    # allerede har (packages/gaesteaften.yaml, incident 07-24) — derfor gates
+    # der på festen her, hvor flaget er entydigt.
+    - condition: state
+      entity_id: binary_sensor.festlys_aktiv
+      state: "off"
+  action:
+    # Audit-runde 13 fix (O24): kun targets der allerede er ON. Forhindrer
+    # spontant taend af stue+koekken hvis lights var off da altan blev
+    # aabnet. Same pattern som scripts.yaml::room_drift_back.
+    - variables:
+        dim_targets: >
+          {% set ns = namespace(t=[]) %}
+          {% for l in ['light.spisestue_loft'] %}
+            {% if states(l) == 'on' %}{% set ns.t = ns.t + [l] %}{% endif %}
+          {% endfor %}
+          {{ ns.t }}
+    - condition: template
+      value_template: "{{ dim_targets | length > 0 }}"
+    # Episode-flag (2026-07-15): restore fyrer KUN hvis dim faktisk skete.
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.terrasse_dim_indoor_active
+    - service: light.turn_on
+      target:
+        entity_id: "{{ dim_targets }}"
+      data:
+        # Light Aggressiveness factor (Phase 2 sprint 2026-05-07)
+        brightness_pct: >
+          {% set lux = states('sensor.open_plan_lux') | float(50) %}
+          {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}{% set base = 25 %}
+          {% elif lux < (states('input_number.lux_trin_dunkelt') | float(20)) %}{% set base = 15 %}
+          {% else %}{% set base = 5 %}{% endif %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+        transition: 15
+    # Entré: langsom, afbrydelig fade (user-spec 2026-09-12b). Her stod før et
+    # `transition: fade_passage_effective`, men entréen er Matter, og HA
+    # videregiver ALDRIG transition til et Matter-`turn_off` — tallet var dødt,
+    # lyset knipsede ud. Ægte fade kræver at HA selv driver rampen.
+    - choose:
+        # Valhornet SKAL være tomt før vi giver faden bolden. Flaren inde i
+        # script.entre_fade_ud reagerer på præcis den sensor: er den `on` —
+        # enten fordi nogen faktisk står i entréen, eller fordi Matter-sleepy-
+        # enheden hænger `on` uden at sende sit `off` (op mod 40 min) — ville
+        # første trin blusse op og STOPPE, og entréen ville stå tændt resten af
+        # aftenen mens alle er på terrassen. Fejl-sikker retning: falder beviset
+        # væk, slukker vi som før.
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.entre_valhorn_occupancy
+              state: "off"
+          sequence:
+            # `script.turn_on` og ikke `service: script.entre_fade_ud`: denne
+            # automation er `mode: restart`, så et inline kald ville (a) holde
+            # depot-slukningen nedenfor tilbage i hele fade-længden og (b) blive
+            # dræbt midtvejs af enhver re-trigger — med entréen stående halvt
+            # tændt for evigt. Fire-and-forget lader faden eje sig selv.
+            - service: script.turn_on
+              target:
+                entity_id: script.entre_fade_ud
+      default:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id:
+              - light.entre_loft
+    # Turn off depot (ophold-tier — længere fade).
+    # 2026-06-21 fix: light.badevaerelse_all FJERNET herfra. Den flappende
+    # IKEA-PIR fik denne dim til at slukke bad-lyset midt i et bad. Badet ejes nu
+    # kun af presence_badevaerelse_off (5-min grace) — går alle genuint ud på
+    # terrassen, slukker badet via sin egen ejer når PIR har været off i 5 min.
+    - service: light.turn_off
+      target:
+        entity_id:
+          - light.depot_loft
+      data:
+        transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"
+
+# --- Restore when someone comes back inside ---
+- id: terrace_restore_indoor
+  alias: "Terrasse: Gendan indendørs lys"
+  description: "Restore indoor lights when someone comes back inside from terrace"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id:
+        - binary_sensor.stue_apollo_occupancy_filtered
+        - binary_sensor.spisestue_apollo_occupancy_filtered
+        - binary_sensor.koekken_apollo_occupancy_filtered
+        - binary_sensor.badevaerelse_inde_occupancy
+        - binary_sensor.sovevaerelse_apollo_occupancy
+        - binary_sensor.boernevaerelse_apollo_occupancy
+      from: "off"
+      to: "on"
+    # 2026-07-15: dør LUKKES = episoden er slut → restore (før: kom gæsten ind
+    # og lukkede døren HURTIGT, forblev huset dæmpet — dør=on-condition åd
+    # occupancy-triggeren).
+    - platform: state
+      entity_id: binary_sensor.parasoll_terrassedoer
+      to: "off"
+  condition:
+    # Kill-switch (sprint 2026-05-17): same flag som terrace_welcome_light.
+    - condition: state
+      entity_id: input_boolean.terrace_presence_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    # 2026-07-15 (gæste-forensik): dør=on-condition ERSTATTET af episode-flag.
+    # Restore fyrer kun hvis dim faktisk skete (727 flap-restores på gæste-ugen)
+    # og virker nu også EFTER døren er lukket.
+    - condition: state
+      entity_id: input_boolean.terrasse_dim_indoor_active
+      state: "on"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+  action:
+    # Audit-runde 13 fix (O24): kun restore lights der allerede er ON
+    # (= dem terrace_dim_indoor dimmede). Hvis lights var off da person
+    # gik ud, lad dem vaere off ved tilbagekomst — bruger har ikke bedt
+    # om dem. Same pattern som drift_back fix.
+    - choose:
+        - conditions:
+            # Absolut lux-gate (2026-07-24): gate-sensoren folder dag-halvering
+            # (sprint 2026-05-07) + global-faktor ind — se packages/room_lux_tuning.yaml.
+            - condition: template
+              value_template: >-
+                {% set lux = states('sensor.open_plan_lux') | float(50) %}
+                {{ lux < (states('sensor.terrasse_lux_gate') | float(40)) }}
+            - condition: state
+              entity_id: binary_sensor.mood_pause_terrasse
+              state: "off"
+            - condition: state
+              entity_id: input_boolean.cinema_active
+              state: "off"
+            # Spisestue-loftet skal vaere on (koekken_loft nedlagt 2026-07-28)
+            - condition: state
+              entity_id: light.spisestue_loft
+              state: "on"
+          sequence:
+            # Restore spisestue-loftet kun hvis on
+            - choose:
+                - conditions:
+                    - condition: state
+                      entity_id: light.spisestue_loft
+                      state: "on"
+                  sequence:
+                    - service: light.turn_on
+                      target:
+                        entity_id: light.spisestue_loft
+                      data:
+                        # Light Aggressiveness factor (Phase 2 sprint 2026-05-07)
+                        brightness_pct: >
+                          {% set lux = states('sensor.open_plan_lux') | float(50) %}
+                          {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}{% set base = 80 %}
+                          {% elif lux < (states('input_number.lux_trin_dunkelt') | float(20)) %}{% set base = 60 %}
+                          {% else %}{% set base = 35 %}{% endif %}
+                          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+                          {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+                        color_temp_kelvin: 2700
+                        transition: 5
+    # Episode-flag ryddes UANSET om choose-grenen gendannede noget (lyst rum /
+    # cirkus / alt slukket = episoden er stadig slut). Selv-helende efter
+    # godnat/Dormant-sluk: flag ryddes ved første trigger, ingen gen-tænd
+    # (choose kræver mindst ét lys on).
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.terrasse_dim_indoor_active
+
+# 2026-06-23 (B38): hale-"sluk terrasse_hue_lily" FJERNET (404). restore_indoor
+# bevarer kun indendørs stue/køkken-gendannelse. Hele terrace_door_closed-
+# automationen er også fjernet (dens eneste handling var at slukke hue_lily).

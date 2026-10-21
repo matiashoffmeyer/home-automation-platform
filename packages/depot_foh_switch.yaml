@@ -1,0 +1,290 @@
+# =============================================================================
+# Depot Friends-of-Hue wall switch (Fuga, "Works with Hue Switch 1")
+# =============================================================================
+# 4-knaps FoH/Green-Power kontakt importeret via Hue-bridge-integrationen.
+# Knapperne surface'r som event.works_with_hue_switch_1_button_1..4 (platform
+# hue). Et enkelt tryk fyrer initial_press → short_release; vi reagerer KUN på
+# short_release for at undgå dobbelt-fire.
+#
+# Fysisk mapping (bekræftet af bruger 2026-06-05):
+#   button_1 = I        (øverst venstre)  → lås depot-lys tændt 15 min
+#   button_2 = pil op   (nederst venstre) → næste dance-event (depot-only)
+#   button_3 = O        (øverst højre)    → sluk depot helt
+#   button_4 = pil ned  (nederst højre)   → forrige dance-event (depot-only)
+#
+# DESIGN-VALG (2026-06-05): pile-knapperne SOLOER depotet — de tænder
+# dance_room_depot og slukker de øvrige dance-rum, så et tryk fra denne
+# kontakt ALDRIG sætter gang i lysshow i fx børneværelset (jf. prime
+# directive "boern-lys må aldrig blinke når børn sover"). Vil du i stedet
+# have hele-hus-party fra denne kontakt, så sig til.
+#
+# 2026-08-07 (user: "depot strip kom fejlagtigt med på dance! valgte ellers
+# kun bad!"): soloen var DESTRUKTIV — den slukkede de øvrige dance_room_* og
+# gemte ingenting, så ét tryk på væggen slettede brugerens rum-valg permanent.
+# Målt 08-07 07:09:22: brugeren havde valgt KUN bad; et tryk her slog
+# dance_room_bad fra og dance_room_depot til, og cascade-loopet kørte stadig
+# 31 minutter senere. Soloen er nu en LÅN med kvittering
+# (input_text.depot_foh_dance_rooms_saved, samme mønster som dance-modulets
+# egen dance_room_modes_claimed): script.depot_foh_dance_solo gemmer valget
+# ved episodens FØRSTE tryk, script.depot_foh_dance_restore giver det tilbage
+# når manual-eventet ender (O-knap, dashboard eller tids-loftet i
+# dance_manual_event_runner). Uden kvitteringen kunne restore ikke skelne
+# "det slukkede JEG" fra "det fravalgte brugeren selv".
+# =============================================================================
+
+input_boolean:
+  # 2026-06-13 (user-spec early-detect fast-clear): on = depot-strippen blev
+  # PRE-tændt (40 %) af entré-early-detect i presence_badevaerelse.yaml, uden
+  # at nogen faktisk gik ind i depotet. Gør at depot_approach_fast_clear kan
+  # slukke pre-lyset hurtigt (input_number.early_detect_clear_seconds) i stedet
+  # for den normale ophold-ventetid. Cleares når man faktisk går ind
+  # (depot_harry_potter_on skruer op) og når depot-strippen slukker.
+  depot_approach_lit:
+    name: "Depot approach-lys aktivt (pre-niveau)"
+    icon: mdi:lightbulb-on-30
+
+input_text:
+  # 2026-08-07 runtime-kvittering: hvilke dance-rum var valgt FØR pile-knapperne
+  # soloede depotet. Korte nøgler (fx "bad,stue"), sentinel "-" = intet rum var
+  # valgt, tom = ingen solo-episode i gang. "saved" i navnet → runtime, holdes
+  # ude af helper-snapshottet.
+  depot_foh_dance_rooms_saved:
+    name: "Depot FoH: gemt dance-rum-valg (internal)"
+    icon: mdi:content-save-outline
+    max: 100
+
+timer:
+  depot_light_lock:
+    name: "Depot lys-lås (FoH I-knap)"
+    duration: "00:15:00"
+    restore: true
+  # 2026-06-10 (user-request): 30s grace efter manuel O-sluk. Mens denne
+  # kører må valhorn-sensoren IKKE gen-tænde depot-lyset (man står jo selv
+  # i rummet når man trykker O → PIR ville straks tænde igen).
+  # Consumes: condition i depot_harry_potter_on.
+  depot_sensor_grace:
+    name: "Depot sensor-grace (FoH O-knap)"
+    duration: "00:00:30"
+    restore: true
+
+script:
+  # === Solo depotet, men LÅN rum-valget frem for at slette det ===
+  depot_foh_dance_solo:
+    alias: "Depot FoH: soloér depotet (gemmer rum-valget først)"
+    mode: queued
+    max: 5
+    sequence:
+      - variables:
+          nuvaerende: >-
+            {% set ns = namespace(r=[]) %}
+            {% for k in ['entre', 'stue', 'spisestue', 'koekken', 'terrasse', 'boern', 'bad', 'depot'] %}
+              {% if is_state('input_boolean.dance_room_' ~ k, 'on') %}
+                {% set ns.r = ns.r + [k] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.r }}
+          gemt: "{{ states('input_text.depot_foh_dance_rooms_saved') }}"
+      # Gem KUN ved episodens FØRSTE tryk. Tryk nr. 2 (næste event) ville ellers
+      # gemme "kun depot" oven i det ægte valg = kvitteringen blev værdiløs.
+      # En urørt input_text står på 'unknown' (truthy) → eksplicit sentinel-test.
+      - if:
+          - condition: template
+            value_template: "{{ gemt in ['unknown', 'unavailable', 'none', ''] }}"
+        then:
+          - service: input_text.set_value
+            target: {entity_id: input_text.depot_foh_dance_rooms_saved}
+            data:
+              value: "{{ nuvaerende | join(',') if nuvaerende | count > 0 else '-' }}"
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_room_depot}
+      - service: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.dance_room_entre
+            - input_boolean.dance_room_stue
+            - input_boolean.dance_room_spisestue
+            - input_boolean.dance_room_koekken
+            - input_boolean.dance_room_terrasse
+            - input_boolean.dance_room_boern
+            - input_boolean.dance_room_bad
+
+  # === Giv rum-valget tilbage (eneste skriver på restore-vejen) ===
+  depot_foh_dance_restore:
+    alias: "Depot FoH: giv dance-rum-valget tilbage"
+    mode: queued
+    max: 5
+    sequence:
+      - variables:
+          gemt: "{{ states('input_text.depot_foh_dance_rooms_saved') }}"
+      # if/then frem for `condition:` — kaldes fra automations der har flere
+      # trin efter dette (et bart condition ville afbryde kalderen).
+      - if:
+          - condition: template
+            value_template: "{{ gemt not in ['unknown', 'unavailable', 'none', ''] }}"
+        then:
+          # '-' = intet rum var valgt før soloen → intet at tænde igen.
+          - if:
+              - condition: template
+                value_template: "{{ gemt != '-' }}"
+            then:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: >-
+                    {% set ns = namespace(e=[]) %}
+                    {% for k in gemt.split(',') %}
+                      {% set ns.e = ns.e + ['input_boolean.dance_room_' ~ k] %}
+                    {% endfor %}
+                    {{ ns.e }}
+          # Depotet slukkes kun hvis det ikke selv stod i det gemte valg.
+          - if:
+              - condition: template
+                value_template: "{{ 'depot' not in gemt.split(',') }}"
+            then:
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.dance_room_depot}
+          - service: input_text.set_value
+            target: {entity_id: input_text.depot_foh_dance_rooms_saved}
+            data: {value: ""}
+
+automation:
+  - id: depot_foh_switch_control
+    alias: "Depot FoH-kontakt: I/O + dance-pile"
+    mode: queued
+    max: 10
+    trigger:
+      - platform: state
+        entity_id: event.works_with_hue_switch_1_button_1  # I (øverst venstre)
+        id: btn_I
+      - platform: state
+        entity_id: event.works_with_hue_switch_1_button_2  # pil op (nederst venstre)
+        id: btn_up
+      - platform: state
+        entity_id: event.works_with_hue_switch_1_button_3  # O (øverst højre)
+        id: btn_O
+      - platform: state
+        entity_id: event.works_with_hue_switch_1_button_4  # pil ned (nederst højre)
+        id: btn_down
+    condition:
+      # Kun single-press (short_release) — ignorér initial_press/repeat/long_*
+      - condition: template
+        value_template: "{{ trigger.to_state.attributes.event_type == 'short_release' }}"
+    action:
+      - choose:
+          # === I: lås depot-lys tændt 15 min (afbryd evt. dans straks) ===
+          - conditions: "{{ trigger.id == 'btn_I' }}"
+            sequence:
+              # 1) stop manual-event-loopen så den ikke gen-launcher en burst
+              - service: input_select.select_option
+                target: {entity_id: input_select.dance_manual_event}
+                data: {option: "off"}
+              # 2) dræb evt. in-flight burst-script med det samme (ellers
+              #    flimrer lyset videre 1-2 sek efter tryk). Listen over
+              #    event-scripts bor i dance_mode.yaml (2026-09-23, #16) —
+              #    klokke-løkkerne pr. pære skal også dræbes nu.
+              - service: script.dance_stop_bursts
+              # 3) tænd depot på normal funktionel styrke
+              - variables:
+                  depot_pct: >
+                    {% set elev = state_attr('sun.sun', 'elevation') | float(0) %}
+                    {% if elev < 0 %}{% set base = 70 %}{% else %}{% set base = 100 %}{% endif %}
+                    {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+                    {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+              - service: light.turn_on
+                target: {entity_id: light.depot_all}
+                data:
+                  brightness_pct: "{{ depot_pct }}"
+                  color_temp_kelvin: 2700
+                  transition: 1
+              # bri+ct+transition lander depotets TRADFRI WS-pære på 2 %
+              # (2026-08-18) — se packages/light_groups.yaml.
+              - service: script.tradfri_ws_bri_fix
+                data:
+                  entity_id: light.depot_loft_ikea
+                  brightness_pct: "{{ depot_pct }}"
+              - service: timer.start
+                target: {entity_id: timer.depot_light_lock}
+                data: {duration: "00:15:00"}
+          # === O: sluk depot helt (afbryd dans + cancel lås) ===
+          - conditions: "{{ trigger.id == 'btn_O' }}"
+            sequence:
+              - service: timer.cancel
+                target: {entity_id: timer.depot_light_lock}
+              # 30s grace: blokér valhorn-gen-tænd mens man forlader rummet
+              - service: timer.start
+                target: {entity_id: timer.depot_sensor_grace}
+                data: {duration: "00:00:30"}
+              # stop manual-event-loopen + dræb in-flight burst straks
+              - service: input_select.select_option
+                target: {entity_id: input_select.dance_manual_event}
+                data: {option: "off"}
+              - service: script.dance_stop_bursts
+              - service: light.turn_off
+                target: {entity_id: light.depot_all}
+                data: {transition: 2}
+          # === pil op: næste dance-event (soloer depotet) ===
+          - conditions: "{{ trigger.id == 'btn_up' }}"
+            sequence:
+              # Soloen LÅNER rum-valget (gemmer det ved første tryk) — se header.
+              - service: script.depot_foh_dance_solo
+              # 2026-06-06: sluk de hvide depot-loftlamper (IKEA + 2x Hue White)
+              # så de ikke vasker strip-showet ud. Strippen (light.depot_strip)
+              # er IKKE i depot_loft → den danser uforstyrret.
+              - service: light.turn_off
+                continue_on_error: true
+                target: {entity_id: light.depot_loft}
+                data: {transition: 0}
+              - service: input_select.select_next
+                target: {entity_id: input_select.dance_manual_event}
+          # === pil ned: forrige dance-event (soloer depotet) ===
+          - conditions: "{{ trigger.id == 'btn_down' }}"
+            sequence:
+              - service: script.depot_foh_dance_solo
+              # 2026-06-06: sluk de hvide depot-loftlamper (se pil op).
+              - service: light.turn_off
+                continue_on_error: true
+                target: {entity_id: light.depot_loft}
+                data: {transition: 0}
+              - service: input_select.select_previous
+                target: {entity_id: input_select.dance_manual_event}
+
+  # Manual-eventet er slut (O-knap, dashboard, wrap til "off" eller tids-loftet
+  # i dance_manual_event_runner) → giv depotets lånte rum-valg tilbage.
+  # ÉN restore-vej for alle udgange, så O-grenen ikke skal kende kvitteringen.
+  # /5-backstoppen (fejlklasse #4) dækker en HA-restart midt i en solo-episode,
+  # hvor off-flanken ellers ville være tabt og valget hængt for altid.
+  - id: depot_foh_dance_rooms_restore
+    alias: "Depot FoH: restore dance-rum efter solo"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_select.dance_manual_event
+        to: "off"
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: input_select.dance_manual_event
+        state: "off"
+    action:
+      - service: script.depot_foh_dance_restore
+
+  # 15-min lås udløber → tilbage til normal valhorn-styring. Slukker kun hvis
+  # rummet er tomt ved udløb; er der nogen, lader vi valhorn-auto-off køre.
+  - id: depot_light_lock_expiry
+    alias: "Depot FoH-kontakt: 15-min lås udløb"
+    mode: single
+    trigger:
+      - platform: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.depot_light_lock
+    condition:
+      - condition: state
+        entity_id: binary_sensor.depot_valhorn_occupancy
+        state: "off"
+    action:
+      - service: light.turn_off
+        target: {entity_id: light.depot_all}
+        data:
+          transition: "{{ states('sensor.fade_ophold_effective') | int(30) }}"

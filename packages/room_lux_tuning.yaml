@@ -1,0 +1,1244 @@
+# =============================================================================
+# Per-rum LUX tærskler — ABSOLUT LUX (2026-07-24, user-spec; erstatter
+# %-sensitivity-modellen fra 2026-06-18)
+# =============================================================================
+# "lav lux sliders om til lux i stedet for procent." Hvert rum har nu en
+# ABSOLUT lux-tærskel (nat-værdi) i stedet for en %-følsomheds-multiplikator.
+#
+# Model:  effektiv gate-lux = <rum>_lux_threshold (nat, rå lx)
+#                             × (0.5 hvis dag else 1.0)   ← dag halverer (som før)
+#                             × global_lux_threshold_factor  ← global slider (bevaret)
+#   - <rum>_lux_threshold (denne fil): rå lx, default = tidligere nat-base
+#     (stue/sove/terrasse/køkken-loft = 40, børn-morgen = 30). 0 = auto-tænd
+#     ALDRIG (kun manuel/Styrbar) — samme konvention som de øvrige rå-lux-sliders.
+#   - global_lux_threshold_factor (packages/global_tuning.yaml, slider
+#     input_number.global_lux_sensitivity, 50 = 1.0×): overordnet multiplikator
+#     der stadig flytter ALLE rum samlet.
+#
+# Forbrugende automations sammenligner rummets lux mod sensor.<rum>_lux_gate:
+#     {{ states('sensor.<rum>_lux') < states('sensor.<rum>_lux_gate') }}
+#   (lux-KILDEN bliver i forbrugeren — stue/køkken/terrasse måler open_plan_lux,
+#    sove måler sovevaerelse_lux_reel, børn måler den AFLEDTE sensor nedenfor.)
+#
+# KØKKEN (2026-07-24, user-valg "kun lyskæde"; loftet nedlagt 2026-07-28):
+# køkkenets to tilbageværende lys har hver sin EGEN rå-lux-slider:
+#   • lyskæden → koekken_lyskaede_lux_threshold (packages/koekken_lyskaede.yaml)
+#   • spots    → koekken_spots_lux_threshold   (packages/koekken_cooking.yaml)
+# Loftets egen gate (koekken_loft_lux_threshold + sensor.koekken_loft_lux_gate)
+# er FJERNET sammen med pæren — der er intet køkkenloft længere.
+#
+# Rum med lux-gate: stue, køkken-LOFT, sovevaerelse, børn-MORGEN, terrasse.
+# (Børns normale aften-presence bruger sin egen boernevaerelse_lux_threshold,
+#  15 lx — den er IKKE denne fils slider; her styres kun morgen-vækningens
+#  dagslys-vagt 06-11.)
+#
+# Defaults sættes via API ved deploy + init_user_preferences (fresh install).
+# =============================================================================
+
+input_number:
+  # 2026-09-03 (user-spec): hvor længe et RENT dagslys-sample må genbruges efter
+  # det blev taget. Se "Open-plan dagslys-anker" nederst i filen.
+  open_plan_dagslys_hold_minutter:
+    name: "Open-plan dagslys: hold rent sample (min)"
+    icon: mdi:timer-sand
+    min: 5
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+  # 2026-09-13b (user-bug "lyset bør ikke være tændt i open plan, det er meget
+  # lyst"): entré-VALLHORN'en er immun over for open-plannets lamper, men den
+  # måler et ANDET rum på en anden skala. Målt 182 paired 10-min buckets over
+  # 21 døgn, kl. 08-18: open plan er median 2,26× entréen (p10 1,20 / p25 1,76 /
+  # p75 2,93 / p90 3,50), og kun 14 af 182 buckets har entréen lysest.
+  # Defaulten er p25 = 1,75, ikke medianen: fejlretningen betyder noget, og
+  # under-vurdering (= "her er mørkt") er den sikre side for TÆND-vejene.
+  open_plan_entre_fallback_faktor:
+    name: "Open-plan lux: entré-fallback × faktor"
+    icon: mdi:multiplication
+    min: 1.0
+    max: 4.0
+    step: 0.05
+    mode: slider
+  # 2026-09-30b (lux-audit): max 150 → 400. Værdien stod på max siden 24/9
+  # (hot-fix 47 → 150), så stuen kunne ikke gøres mere ivrig uden at skrue
+  # global_lux_sensitivity for HELE huset. Stuen har ingen egen lux-måler
+  # (LTR390 død 5/5, B111) og gater på open_plan_lux, som måles ved vinduet og
+  # køkkenet — sofaen er mørkere end det tal (user tændte selv ved 43-230 lx).
+  stue_lux_threshold:
+    name: "Stue lux-grænse (auto-tænd)"
+    icon: mdi:brightness-6
+    min: 0
+    max: 400
+    step: 1
+    unit_of_measurement: "lx"
+    mode: slider
+  sovevaerelse_lux_threshold:
+    name: "Soveværelse lux-grænse (auto-tænd)"
+    icon: mdi:brightness-6
+    min: 0
+    max: 150
+    step: 1
+    unit_of_measurement: "lx"
+    mode: slider
+  boernevaerelse_morgen_lux_threshold:
+    name: "Børneværelse MORGEN lux-grænse (vækning)"
+    icon: mdi:brightness-6
+    min: 0
+    max: 150
+    step: 1
+    unit_of_measurement: "lx"
+    mode: slider
+  terrasse_lux_threshold:
+    name: "Terrasse lux-grænse (auto-tænd)"
+    icon: mdi:brightness-6
+    min: 0
+    max: 150
+    step: 1
+    unit_of_measurement: "lx"
+    mode: slider
+  # Se BØRNEVÆRELSETS LUX-KILDE nedenfor. min 5 (ikke 0): en 0-andel ville
+  # gøre rummet permanent "bælgmørkt" og tænde loftet døgnet rundt — og en
+  # fresh-min-sentinel skal ADSKILLE sig fra den ønskede default (fejlklasse #5).
+  boernevaerelse_lux_andel_pct:
+    name: "Børneværelse lux — andel af open-plan"
+    icon: mdi:brightness-percent
+    min: 5
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-08-30 (user-bug): "det har været overskyet i dag men jeg har manglet
+  # openplan lys på trods af at jeg har skruet global slider helt op."
+  # Tærsklen måles mod sensor.koekken_dagslys_lx — open-plannets eneste INDRE,
+  # LED-fradragne dagslys-kanal. Se binary_sensor.open_plan_mork_indedag for
+  # hvorfor det IKKE er spisestue-Apolloen og IKKE open_plan_lux.
+  # Målt fordeling 27-30/8 på koekken_dagslys_lx, dagtimer 08-18, n=2051:
+  # p25 = 20, p50 = 31, p75 = 66, p90 = 129 lx. Gaten ganges med den GLOBALE
+  # lux-faktor (0,25-4,0), så sliderens 18 spænder 4,5 → 72 lx. Ved user's
+  # nuværende globale indstilling (3,387) lander den på 61 lx ≈ køkken-spots'
+  # egen tærskel på 60 — husets eneste andet tal på præcis samme måleskala.
+  # 0 = funktionen er slået fra.
+  openplan_indedag_lux_threshold:
+    name: "Open-plan: mørk-indedag lux-grænse (basis)"
+    icon: mdi:weather-cloudy
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # 2026-10-10: "morgen — dagslyset gør jobbet" stod som hårdt 80 lx NI steder:
+  # wakeup_adults (sove_lux_reel), wakeup_kids (open_plan_lux), wakeup_alarm_
+  # driven (sove → open-plan), open_plan_mork_morgen (openplan_entre_velkomst)
+  # og morning_lights_sanity_check ×4. Ét anker nu (fejlklasse #2). NB de fire
+  # template-steder ganger med sensor.global_lux_threshold_factor, de to
+  # numeric_state-wakeups gør IKKE — uændret, som før.
+  morgen_dagslys_lux:
+    name: "Morgen: dagslys nok over"
+    icon: mdi:weather-sunset-up
+    min: 10
+    max: 400
+    step: 5
+    unit_of_measurement: "lx"
+    mode: box
+
+  # 2026-10-10: wakeup_post_sluk sti A (sove-lux over N → sluk pendlen helt;
+  # ellers dæmp ned). Var hårdt 15.
+  wakeup_post_dagslys_lux:
+    name: "Efter vækning: sluk soveloft over"
+    icon: mdi:weather-sunny
+    min: 1
+    max: 150
+    step: 1
+    unit_of_measurement: "lx"
+    mode: box
+
+  # 2026-10-10: godnat_subflag_safety weekend-oprydning (voksne-flaget hænger,
+  # soveværelset tomt + lyst over N → ryd). Var hårdt 30, to steder.
+  godnat_weekend_ryd_lux:
+    name: "Weekend: ryd godnat når soveværelset er lyst over"
+    icon: mdi:weather-sunny
+    min: 5
+    max: 300
+    step: 5
+    unit_of_measurement: "lx"
+    mode: box
+
+  # 2026-10-10: lysstyrke-trinene (lux < 5 → højeste %, lux < 20 → mellem,
+  # ellers lavest) stod hårdt i 12 filer. Nu to fælles ankre (fejlklasse #2):
+  #   bælgmørkt (5): ALLE 15 steder — entre_somrig ×2, terrace_presence ×2,
+  #     airbnb_mode, godmorgen_godnat, wakeup_post_sluk, presence_badevaerelse,
+  #     presence_stue, arrival ×2, mood_flag_safety, light_power_recovery,
+  #     room_logic, boern_morgen_nedtoning.
+  #   dunkelt (20): 11 steder (samme minus de fire herunder).
+  # Bevidst IKKE dunkelt-slideren (eget mellemtrin, uændret): soveloft efter
+  # vækning + børn efter strømsvigt + børne-morgen (15 lx), bad (40 lx).
+  # NB LTR390 rapporterer kun ved ændring ≥ ~20 lx (lux_dagslys.md) — trin
+  # under 20 skelner groft. Max på bælgmørkt = 15, så den aldrig passerer det
+  # laveste mellemtrin.
+  lux_trin_moerkt:
+    name: "Lysstyrke-trin: bælgmørkt under"
+    icon: mdi:weather-night
+    min: 0
+    max: 15
+    step: 1
+    unit_of_measurement: "lx"
+    mode: box
+
+  lux_trin_dunkelt:
+    name: "Lysstyrke-trin: dunkelt under"
+    icon: mdi:weather-sunset
+    min: 15
+    max: 150
+    step: 5
+    unit_of_measurement: "lx"
+    mode: box
+
+template:
+  - sensor:
+      # Effektiv gate-lux pr. rum = slider(nat rå lx) × dag-halvering × global.
+      # Forbrugeren: {{ rum_lux < states('sensor.<rum>_lux_gate') }}.
+      - name: "Stue lux gate"
+        unique_id: stue_lux_gate
+        icon: mdi:brightness-6
+        unit_of_measurement: "lx"
+        state: >
+          {% set thr = states('input_number.stue_lux_threshold') | float(40) %}
+          {% set g = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {% set day = is_state('sensor.sun_bracket', 'day') %}
+          {{ (thr * (0.5 if day else 1.0) * g) | round(1) }}
+
+      # 2026-08-30: mørk-indedag-gaten. Ingen dag-halvering her — hele featuren
+      # ER dagtimer, så en dag-faktor ville bare være en skjult halvering af
+      # sliderens tal. Kun den globale faktor, som er den slider user faktisk
+      # skruede på.
+      - name: "Open-plan mørk-indedag lux gate"
+        unique_id: openplan_indedag_lux_gate
+        icon: mdi:weather-cloudy
+        unit_of_measurement: "lx"
+        state: >
+          {% set thr = states('input_number.openplan_indedag_lux_threshold') | float(18) %}
+          {% set g = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {{ (thr * g) | round(1) }}
+        attributes:
+          maaler_mod: sensor.koekken_dagslys_lx
+          basis: "{{ states('input_number.openplan_indedag_lux_threshold') }}"
+          global_faktor: "{{ states('sensor.global_lux_threshold_factor') }}"
+      # =====================================================================
+      # DAGSLYS-SLUK: tærsklen skal kende TÆND-gaten (2026-08-19, user-bug
+      # "stue lyset (sofa) hænger on selvom her er lyst")
+      # =====================================================================
+      # 2026-10-15 (user-spec "nega forvirrende at sluk over ikke påvirkes af
+      # de samme ting som tænd under … konsolider det fuldstændigt"): sluk-
+      # slideren skaleres nu PRÆCIS som rummets tænd-slider — samme dag-
+      # halvering og samme globale faktor (børneværelset + køkken-spots: ingen
+      # af delene, som deres tænd). Hysterese-slideren er fjernet; tilbage er
+      # kun to sikkerheds-gulve:
+      #
+      #     sluk_effektiv = max( sluk_slider × (0,5 dag) × global,
+      #                          tænd_gate × 1,2,   10 lx )      (slider 0 = fra)
+      #
+      #   • tænd × 1,2: sluk må aldrig komme under tænd (on/off-krig).
+      #   • 10 lx: en lav sluk må ikke kunne slukke på lampens EGET lys.
+      # Sliderne blev omregnet ved skiftet så den effektive DAG-værdi var
+      # uændret: stue 40 → 200, sove 20 → 85 (nat-værdien flyttede sig, fordi
+      # den gamle min()-model brugte forskellige led dag og nat).
+      #
+      # HISTORIK — model 2026-08-19d → 2026-10-15:
+      #     sluk_effektiv = min( max(tænd_gate × hysterese, gulv 10),
+      #                          max(slider, tænd_gate × 1.2) )
+      #
+      #   • Hysteresen flytter KUN sluk-tærsklen opad. Den må ALDRIG røre en
+      #     tænd-gate: gør den det, betyder "mere afstand mellem tænd og sluk"
+      #     i praksis "lyset må slet ikke tænde længere". Målt live samme dag —
+      #     user skruede hysteresen 1,5 → 2,8 og børneværelsets TÆND-gate faldt
+      #     11,7 → 6,2 lx, altså det stik modsatte af det slideren lover.
+      #   • `max(slider, gate × 1.2)` gør sliderens loft u-inverterbart: sætter
+      #     man sluk under tænd, opstår en on/off-krig (begge regler sande
+      #     samtidig). Huset beholder i stedet et minimums-bånd på 20 %.
+      #   • slider = 0 betyder stadig "dagslys-sluk er slået fra".
+      #
+      # Det er dét der før stod som fire indbyrdes uenige tal pr. rum: sliderens
+      # absolutte lx, tænd-gaten, et hardcodet loft i morgen-sanity'en, og —
+      # for børn — en tænd-klamp der trak i den forkerte retning.
+      # Målt 08-19: sofa-zonen tændte 06:00:34 (open_plan_lux < 9 = gaten i
+      # dag-bracket), og hang derefter tændt hele den overskyede morgen —
+      # open_plan_lux nåede 37 kl. 06:45 og 46 kl. 07:00, men dagslys-sluk
+      # kræver 50. Huset sagde altså samtidig "ved 9 lx ville jeg ikke tænde
+      # den lampe" og "jeg slukker den først ved 50" = et dødbånd på 5,5×
+      # hvor lampen er ubegrundet, men udødelig (kun tomt-rum-vejen kan nå
+      # den, og der SAD et menneske). Sluk-tærsklen kendte ikke tænd-gaten.
+      # Nu: sluk ved den LAVESTE af sliderens absolutte tal og gatens
+      # hysterese-multiplum. Gulv på 10 lx så en meget lav tænd-gate ikke kan
+      # gøre sluk-vejen til en natlampe-dræber; sliderens 0 = feature slået
+      # fra bevares som 0.
+      - name: "Stue dagslys-sluk effektiv"
+        unique_id: stue_dagslys_sluk_effektiv
+        icon: mdi:brightness-auto
+        unit_of_measurement: "lx"
+        state: >
+          {% set slider = states('input_number.stue_dagslys_sluk_lux') | float(0) %}
+          {% set gate = states('sensor.stue_lux_gate') | float(0) %}
+          {% set g = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {% set day = is_state('sensor.sun_bracket', 'day') %}
+          {% if slider <= 0 %}
+            0
+          {% else %}
+            {{ [slider * (0.5 if day else 1.0) * g, gate * 1.2, 10] | max | round(1) }}
+          {% endif %}
+        attributes:
+          maaler_mod: sensor.open_plan_lux
+          kilde: "max(slider × (0,5 dag) × global, stue_lux_gate × 1,2, 10)"
+          slider: "{{ states('input_number.stue_dagslys_sluk_lux') }}"
+          taend_gate: "{{ states('sensor.stue_lux_gate') }}"
+
+      # 2026-08-19f: samme model for køkken-spots. Forskellen fra de tre rum
+      # ovenfor er at spots' TÆND-tærskel er sliderens rå lx direkte (der findes
+      # ingen sensor.koekken_spots_lux_gate — automationen sammenligner
+      # koekken_lux_effektiv mod input_number.koekken_spots_lux_threshold uden
+      # dag-halvering og uden global faktor). Klampen er derfor mod DEN værdi.
+      # NB målekanalen: spots' TÆND-vej læser sensor.koekken_dagslys_lx → sluk-vejen
+      # SKAL læse samme kanal, ellers er det #2'eren "samme enhed lx, to skalaer"
+      # der kostede børneværelset en tænd/sluk-krig.
+      # 2026-08-29d: sluk-vejen læste stadig den RÅ koekken_lux_effektiv, mens
+      # tænd-vejen skiftede til dagslys-kanalen 27/8 — netop den to-skala-fælde.
+      # Med kæden hvid ligger rå ~78 lx over dagslys, så sluk-gaten ville fyre på
+      # vores EGET lys midt i madlavningen (selvopfyldende). Inert indtil nu kun
+      # fordi slideren står på 0.
+      - name: "Koekken spots dagslys-sluk effektiv"
+        unique_id: koekken_spots_dagslys_sluk_effektiv
+        icon: mdi:brightness-auto
+        unit_of_measurement: "lx"
+        state: >
+          {% set slider = states('input_number.koekken_spots_dagslys_sluk_lux') | float(0) %}
+          {# 2026-08-29d: den EFFEKTIVE gate (inkl. aktivitets-bonus), ikke den rå
+             slider — ellers kan spots tændes ved 300 lx og slukkes ved 250. #}
+          {% set gate = states('sensor.koekken_spots_lux_gate_effektiv')
+                        | float(states('input_number.koekken_spots_lux_threshold') | float(0)) %}
+          {% if slider <= 0 %}
+            0
+          {% else %}
+            {{ [slider, gate * 1.2, 10] | max | round(1) }}
+          {% endif %}
+        attributes:
+          maaler_mod: sensor.koekken_dagslys_lx
+          kilde: "max(slider (rå, som tænd), koekken_spots_lux_gate_effektiv × 1,2, 10)"
+          slider: "{{ states('input_number.koekken_spots_dagslys_sluk_lux') }}"
+          taend_gate: "{{ states('sensor.koekken_spots_lux_gate_effektiv') }}"
+
+      # 2026-08-19 (fejlklasse #1/#2): "hændelses"-tænd-gaten for open-plan.
+      # Udtrykket (20 hvis dag else 40) × global-faktor stod KOPIERET i fem
+      # automations — fire af dem tænder light.spisestue_loft, som dagslys-sluk
+      # ovenfor slukker igen. Målt samme dag: velkomstlyset tændte ved 16 lx
+      # (egen grænse 18, dagslys-sluk 13,5) og var slukket 2 m 46 s senere =
+      # en on/off-krig pr. konstruktion, præcis den churn user afviste
+      # 2026-08-11 for netop det lys. Klampen hører ÉT sted, ikke i fire kopier.
+      # NB: entré-loftet (arrival_entre_light) bruger med vilje IKKE denne —
+      # entréen er ikke i openplan_lights-rosteren, så dagslys-reglen rører den
+      # aldrig, og en klamp dér ville kun gøre entrélyset dummere.
+      - name: "Open-plan haendelse lux gate"
+        unique_id: openplan_haendelse_lux_gate
+        icon: mdi:door-open
+        unit_of_measurement: "lx"
+        state: >
+          {% set day = is_state('sensor.sun_bracket', 'day') %}
+          {% set f = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {% set egen = (20 if day else 40) * f %}
+          {% set sluk = states('sensor.stue_dagslys_sluk_effektiv') | float(0) %}
+          {{ ([egen, sluk] | min if sluk > 0 else egen) | round(1) }}
+        attributes:
+          kilde: "min((20 dag / 40 nat) × global-faktor, stue_dagslys_sluk_effektiv)"
+          egen_graense: >
+            {% set day = is_state('sensor.sun_bracket', 'day') %}
+            {{ ((20 if day else 40) * (states('sensor.global_lux_threshold_factor') | float(1.0))) | round(1) }}
+          dagslys_sluk: "{{ states('sensor.stue_dagslys_sluk_effektiv') }}"
+
+      # 2026-08-19 (bug: "soveværelse lyset brænder unødigt"). Samme dødbånd som
+      # sofa-lyset havde, målt i soveværelset: TÆND sker under
+      # sensor.sovevaerelse_lux_gate (11,2 lx), men morgen-sanity'ens sluk stod
+      # hardcodet på 50 = et bånd på 4,5×. Målt 08-19: sol-fantomen i den
+      # sydvendte Apollo meldte optaget 40:61:6d-f5:7d:34 mens husets ENESTE
+      # person beviseligt var i open-plan (stue/køkken/spisestue fyrede
+      # kontinuerligt, people_estimate = 1) → pendlen tændte 09:21:49 og brændte
+      # til 09:41:45. Ingen hurtig sluk-vej nåede den: global_absence_wait_factor
+      # er 8,6 (slider 30) = 5-min-reglen er reelt 43 min, og no-motion-
+      # watchdoggen står på 65 min. Kun morgen-sanity'ens 10-min-tomt ryddede op.
+      # 2026-08-19d: loftet var hardcodet 50 — men rummet HAR en slider til
+      # præcis dét tal (`sovevaerelse_dagslys_sluk_lux`, sat til 35), som
+      # døgn-vejen i presence_lights.yaml læste. Samme rum havde altså to
+      # dagslys-sluk-tærskler der ikke kendte hinanden (fejlklasse #2, indført
+      # samme formiddag af mig). Nu ét tal, og begge veje læser dette.
+      - name: "Sovevaerelse dagslys sluk effektiv"
+        unique_id: sovevaerelse_dagslys_sluk_effektiv
+        icon: mdi:brightness-auto
+        unit_of_measurement: "lx"
+        state: >
+          {% set slider = states('input_number.sovevaerelse_dagslys_sluk_lux') | float(0) %}
+          {% set gate = states('sensor.sovevaerelse_lux_gate') | float(0) %}
+          {% set g = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {% set day = is_state('sensor.sun_bracket', 'day') %}
+          {% if slider <= 0 %}
+            0
+          {% else %}
+            {{ [slider * (0.5 if day else 1.0) * g, gate * 1.2, 10] | max | round(1) }}
+          {% endif %}
+        attributes:
+          maaler_mod: sensor.sovevaerelse_lux_reel
+          kilde: "max(slider × (0,5 dag) × global, sovevaerelse_lux_gate × 1,2, 10)"
+          slider: "{{ states('input_number.sovevaerelse_dagslys_sluk_lux') }}"
+          taend_gate: "{{ states('sensor.sovevaerelse_lux_gate') }}"
+
+      # 2026-08-19 (bug: "børneværelset brændte unødigt i morges"). Her vendte
+      # dødbåndet den anden vej: TÆND sker når rummets lux < 20, mens
+      # morgen-sanity slukker når open_plan > 50 = 17,5 lx i rummet. Sluk-
+      # tærsklen lå altså UNDER tænd-tærsklen — et overlap hvor begge regler er
+      # sande samtidig. Målt 08-19: loftet tændt 08:14:24 af presence og slukket
+      # 08:14:56 af sanity, tændt igen 08:15:24, og et menneske greb ind
+      # 08:15:26.
+      #
+      # 2026-08-19d — RETTET RETNING. Første forsøg klampede TÆND ned mod
+      # sanity'ens hardcodede 50-på-open-plan. To ting var galt ved det: (1) det
+      # gjorde hysterese-slideren til en tænd-slider (skruet til 2,8 faldt gaten
+      # til 6,2 lx = rummet tænder aldrig), og (2) det hardcodede 50 var en
+      # tredje tærskel ved siden af rummets EGEN `boernevaerelse_dagslys_sluk_lux`.
+      # Nu er tænd-gaten rummets rå slider — præcis som 07-03 specificerede
+      # ("IKKE global-faktor-skaleret → forudsigelig tænd når rummet er under N
+      # lux") — og hele hysteresen ligger på sluk-siden nedenfor.
+      # Sensoren bevares som ANKER: alle veje ind til børnelysets tænd-gate
+      # læser den, så en fremtidig ændring har ét sted at ske (fejlklasse #2).
+      - name: "Boernevaerelse taend lux gate"
+        unique_id: boernevaerelse_taend_lux_gate
+        icon: mdi:brightness-6
+        unit_of_measurement: "lx"
+        state: >
+          {{ states('input_number.boernevaerelse_lux_threshold') | float(0) | round(1) }}
+        attributes:
+          maaler_mod: sensor.boernevaerelse_lux_reel
+          kilde: "rå slider (bevidst IKKE dag-halveret eller global-skaleret)"
+          slider: "{{ states('input_number.boernevaerelse_lux_threshold') }}"
+
+      # 2026-08-19d: børneværelsets dagslys-sluk fandtes før i TO uforenelige
+      # udgaver — `boernevaerelse_dagslys_sluk_lux` (rum-lux, døgnet rundt, i
+      # presence_lights.yaml) og et hardcodet `open_plan_lux > 50` i
+      # morgen-sanity'en. De to måler ikke engang på samme skala: rummets lux ER
+      # open-plan × andel (35 %), så sanity'ens 50 svarede til 17,5 i rummet,
+      # mens sliderens 35 er 100 på open-plan. Nu ét tal, i rummets egen skala.
+      - name: "Boernevaerelse dagslys sluk effektiv"
+        unique_id: boernevaerelse_dagslys_sluk_effektiv
+        icon: mdi:brightness-auto
+        unit_of_measurement: "lx"
+        state: >
+          {% set slider = states('input_number.boernevaerelse_dagslys_sluk_lux') | float(0) %}
+          {% set gate = states('sensor.boernevaerelse_taend_lux_gate') | float(0) %}
+          {% if slider <= 0 %}
+            0
+          {% else %}
+            {{ [slider, gate * 1.2, 10] | max | round(1) }}
+          {% endif %}
+        attributes:
+          maaler_mod: sensor.boernevaerelse_lux_reel
+          kilde: "max(slider (rå, som tænd), boernevaerelse_taend_lux_gate × 1,2, 10)"
+          slider: "{{ states('input_number.boernevaerelse_dagslys_sluk_lux') }}"
+          taend_gate: "{{ states('sensor.boernevaerelse_taend_lux_gate') }}"
+
+      - name: "Sovevaerelse lux gate"
+        unique_id: sovevaerelse_lux_gate
+        icon: mdi:brightness-6
+        unit_of_measurement: "lx"
+        state: >
+          {% set thr = states('input_number.sovevaerelse_lux_threshold') | float(40) %}
+          {% set g = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {% set day = is_state('sensor.sun_bracket', 'day') %}
+          {{ (thr * (0.5 if day else 1.0) * g) | round(1) }}
+      - name: "Boernevaerelse morgen lux gate"
+        unique_id: boernevaerelse_morgen_lux_gate
+        icon: mdi:brightness-6
+        unit_of_measurement: "lx"
+        state: >
+          {% set thr = states('input_number.boernevaerelse_morgen_lux_threshold') | float(30) %}
+          {% set g = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {% set day = is_state('sensor.sun_bracket', 'day') %}
+          {{ (thr * (0.5 if day else 1.0) * g) | round(1) }}
+      - name: "Terrasse lux gate"
+        unique_id: terrasse_lux_gate
+        icon: mdi:brightness-6
+        unit_of_measurement: "lx"
+        state: >
+          {% set thr = states('input_number.terrasse_lux_threshold') | float(40) %}
+          {% set g = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+          {% set day = is_state('sensor.sun_bracket', 'day') %}
+          {{ (thr * (0.5 if day else 1.0) * g) | round(1) }}
+
+      # =====================================================================
+      # BØRNEVÆRELSETS LUX-KILDE — afledt af open-plan, IKKE af rummets Apollo
+      # =====================================================================
+      # 2026-08-06 (user-spec): "vi kan ikke bruge lux fra apollo børn for vi
+      # kommer ofte til at stille ting foran sensoren. så se på openlux og så
+      # lav et offset da børnerummet er en del mørkere end openplan."
+      #
+      # MÅLT FACIT (14 dages `sensor.boern_lux`-snapshots, /15 min):
+      # Apolloens lux-værdi står STILLE 80 % af wall-clock-tiden — 42 forløb
+      # over 2 t, længste **13,5 t**. 08-05 målte den 8 lx fra 06 til 18 mens
+      # open-plan svingede 1 → 1063 lx. Et LTR390 i et rum med vindue kan ikke
+      # være konstant henover en solopgang; den er tildækket. Blokering er en
+      # ENSIDIG fejl (kan kun sænke aflæsningen), så det er ikke støj der
+      # midler ud — det er en systematisk undervurdering af hvor lyst der er.
+      #
+      # SIDEGEVINST: rummets EGEN pære lyste ind i sensoren, så et tændt loft
+      # hævede aflæsningen og kunne trigge dagslys-slukket = selv-slukkende
+      # feedback-sløjfe. Præcis derfor har `morning_lights_sanity_check.yaml`
+      # altid brugt open_plan_lux for børn. Nu deler alle veje den kilde.
+      #
+      # MODEL: reel_lux ≈ open_plan_lux × andel. En FAKTOR, ikke et fast
+      # fradrag: dagslys skalerer multiplikativt, så et fradrag ville give
+      # negativ lux om natten og stadig 960 lx ved 1000 lx udenfor.
+      #
+      # KALIBRERING af de 35 % — to uafhængige ankre der begge giver ~1/3:
+      #   • user-bugget 2026-07-03: open-plan ~40 lx mens rummet var ~14 = 0,35
+      #     (dét var hele grunden til at rum-sensoren blev taget i brug)
+      #   • live-måling 2026-08-06 08:05: 122,6 → 37,7 = 0,31
+      # Ved 35 % reproducerer gaten netop 07-03-sagen: open-plan 40 → est. 14
+      # → under tænd-tærsklen → lyset tænder, som brugeren ønskede.
+      #
+      # 2026-09-28 → 18 % (user-valg "tænd tidligere generelt"): user måtte
+      # tænde manuelt 16:51 ved open-plan 110 lx (est. 38 > tænd 20). Rummet
+      # har et MANUELT gardin der nogle gange er trukket for — det er usynligt
+      # for open-plan-modellen, så ingen fast andel rammer både åbent og
+      # trukket. (2026-10-05: tænd-slideren 20 → 10, så tænd sker nu under
+      # open-plan ~56 og sluk over ~111 — se constants.yaml.)
+      # 18 % = tænd under open-plan ~110, sluk over ~139 (tænd/sluk
+      # skalerer sammen, båndet er uændret i rum-lux). Prisen: med ÅBENT
+      # gardin tænder/holder rummet lys ved mere dagslys end før. Apolloen
+      # kan IKKE bruges som vidne her: 28/9 stod den på 18,27 lx uændret mens
+      # loftet blev tændt og slukket (tildækket eller sjælden rapportering).
+      # Rå Apollo-lux og open_plan_lux er recorder-ekskluderet → forholdet
+      # kan ikke måles bagud; tallet er user-dikteret, ikke kalibreret.
+      #
+      # ⚠️ MODELLEN OVERVURDERER BEVIDST I FULD SOL. Forholdet er i
+      # virkeligheden kompressivt (målt ~0,20 ved 30-60 lx open-plan, ~0,08 ved
+      # 400-800): open-plan får direkte sol, børneværelset kun diffust lys. En
+      # ret linje er derfor kalibreret til at ramme i **0-60 lx-båndet**, hvor
+      # alle beslutninger ligger (tænd 30 / sluk 45 / morgen 45). Over 60 lx er
+      # svaret "lyst" uanset, så fejlen er uden konsekvens. Skift ikke til en
+      # potensmodel for præcision i en ende hvor intet aflæses.
+      #
+      # FEJLRETNING: er open_plan_lux unavailable, er denne det også — og
+      # forbrugernes `| float(999)` (tænd) / `| float(0)` (sluk) gør så
+      # ingenting. Der faldes BEVIDST ikke tilbage på Apolloen: det ville
+      # lydløst genindføre præcis den blokerede måling vi lige har forladt.
+      # Rå- og LED-kompenseret Apollo-værdi ligger som attributter, så
+      # kalibreringen kan efterprøves uden at nogen automation læser dem.
+      - name: "Boernevaerelse lux reel"
+        unique_id: boernevaerelse_lux_reel
+        icon: mdi:brightness-5
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state_class: measurement
+        state: >
+          {% set opl = states('sensor.open_plan_lux') | float(0) %}
+          {% set andel = states('input_number.boernevaerelse_lux_andel_pct') | float(35) %}
+          {{ [opl * andel / 100, 0] | max | round(1) }}
+        availability: "{{ states('sensor.open_plan_lux') | is_number }}"
+        attributes:
+          kilde: "open_plan_lux × andel"
+          open_plan_lux: "{{ states('sensor.open_plan_lux') | float(0) | round(1) }}"
+          andel_pct: "{{ states('input_number.boernevaerelse_lux_andel_pct') | float(35) | round(0) | int }}"
+          # Kun diagnostik/rekalibrering — INGEN automation må læse disse.
+          apollo_raa: "{{ states('sensor.boernevaerelse_apollo_lux') | float(0) | round(1) }}"
+          apollo_reel: >
+            {% set raa = states('sensor.boernevaerelse_apollo_lux') | float(0) %}
+            {% set f = (state_attr('sensor.apollo_led_lux_fradrag', 'fradrag') or {}).get('boernevaerelse', 0) | float(0) %}
+            {{ [raa - f, 0] | max | round(1) }}
+
+      # ENTRÉ (2026-08-29d) — ÆGTE MÅLING FØRST, proxy kun som fallback.
+      #
+      # Entréen er vinduesløs og havde derfor ingen egen lux; alle gates lånte
+      # `sensor.open_plan_lux`. Det holdt indtil VALLHORN'en kom, og 29/8 kl.
+      # 13:39 kostede det: entréen målte **3 lx**, open-plan **23,8 lx** mod en
+      # tærskel på 20 → `entre_motion_on` sagde "lyst nok" og lod user stå i en
+      # mørk gang. Proxy'en beskriver et rum med vinduer; entréen er et rum uden.
+      #
+      # VALLHORN'en rapporterer lux i SAMME sekund som occupancy (målt 29/8:
+      # motion 13:39:58, lux 13:39:59), så værdien er frisk præcis når gaten
+      # spørger — det er derfor den kan bære en tænd-beslutning alene.
+      #
+      # ⚠️ Loftet lyser ind i VALLHORN'en (målt 26-29/8: lys ON median 35 lx,
+      # spænd 13-47, mod en tærskel på 20), så den RÅ måler må aldrig bære en
+      # gate. 2026-09-04 leveres derfor kun RENE samples — se "ENTRÉ-sample"
+      # længere nede for måledata og user-bug'en der afslørede det.
+      # Rækkefølgen er bevidst: en LIVE ren måling slår et gemt sample, og et
+      # gemt sample slår open-plan-proxy'en (29/8-incidenten: open-plan 23,8 lx
+      # mod entréens egne 3 lx → user stod i en mørk gang).
+      # `packages/anomali_vagt.yaml` er stadig BEVIDST ikke flyttet herover (#10).
+      - name: "Entre lux reel"
+        unique_id: entre_lux_reel
+        icon: mdi:brightness-5
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state_class: measurement
+        state: >
+          {% set egen = states('sensor.entre_valhorn_illuminance') %}
+          {% set hold = states('input_number.open_plan_dagslys_hold_minutter')
+                        | float(45) * 60 %}
+          {% set s = states('sensor.entre_dagslys_sample') %}
+          {% set ts = state_attr('sensor.entre_dagslys_sample', 'maalt_ts') | float(0) %}
+          {% if is_state('binary_sensor.entre_lys_rent', 'on') and egen | is_number %}
+            {{ egen | float(0) | round(1) }}
+          {% elif s | is_number and ts > 0 and (now().timestamp() - ts) < hold %}
+            {# 2026-09-04e: samme loft-regel som spisestue_dagslys_lx. Loftet
+               lyser KUN lux TIL VALLHORN'en, så en rå måling under det gemte
+               sample beviser at samplet er forældet. VALLHORN'en rapporterer
+               kun hvert ~120. sekund, så den er langsom — men aldrig for lav. #}
+            {% if egen | is_number %}
+              {{ [s | float(0), egen | float(0)] | min | round(1) }}
+            {% else %}
+              {{ s | float(0) | round(1) }}
+            {% endif %}
+          {% else %}
+            {{ states('sensor.open_plan_lux') | float(0) | round(1) }}
+          {% endif %}
+        availability: >
+          {{ states('sensor.entre_valhorn_illuminance') | is_number
+             or states('sensor.entre_dagslys_sample') | is_number
+             or states('sensor.open_plan_lux') | is_number }}
+        attributes:
+          kilde: >
+            {% set hold = states('input_number.open_plan_dagslys_hold_minutter')
+                          | float(45) * 60 %}
+            {% set ts = state_attr('sensor.entre_dagslys_sample', 'maalt_ts') | float(0) %}
+            {% if is_state('binary_sensor.entre_lys_rent', 'on')
+                  and states('sensor.entre_valhorn_illuminance') | is_number %}
+              live ren maaling (VALLHORN)
+            {% elif states('sensor.entre_dagslys_sample') | is_number
+                    and ts > 0 and (now().timestamp() - ts) < hold %}
+              rent_sample (loftet lyser/lyste lige)
+            {% else %}
+              open_plan_fallback
+            {% endif %}
+          egen_maaler: "{{ states('sensor.entre_valhorn_illuminance') }}"
+          rent_sample: "{{ states('sensor.entre_dagslys_sample') }}"
+          open_plan_lux: "{{ states('sensor.open_plan_lux') }}"
+
+  # =========================================================================
+  # MØRK INDEDAG (2026-08-30, user-bug: "manglet openplan lys" på en overskyet
+  # dag "på trods af at jeg har skruet global slider helt op")
+  # =========================================================================
+  # Hvorfor denne sensor findes — tre målte forhold, alle 27-30/8, dagtimer
+  # 08-18:
+  #
+  # 1. SPISESTUE-APOLLOEN SIDDER VED VINDUET og er open-plannets LYSESTE punkt,
+  #    ikke dens reneste. n=126: min 33, p50 150, p90 415, max 1277 lx — mens
+  #    køkkenets INDRE dagslys samtidig lå på p50 31, p90 129. Median-forholdet
+  #    er 3,6× og p90 er 11,8×. I 39 % af dagens kvarterer stod spisestuen
+  #    over 100 lx MENS køkkenet lå under 60 = lyst i vindueskarmen, mørkt der
+  #    hvor man er. Derfor kan spisestue-lux ikke besvare "er rummet mørkt".
+  # 2. input_number.spisestue_lux_threshold stod på 25 lx. Kanalens laveste
+  #    DAGTIMEMÅLING på tre døgn er 33 lx → 0 af 126 samples kunne passere.
+  #    Den gate er død i dagtimerne, uanset vejr (fejlklasse 📏-reglen: en
+  #    tærskel skal måles mod fordelingen af den kanal den læser). Den røres
+  #    ikke her — den er user's egen, og aften/nat-adfærden afhænger af den —
+  #    men den er grunden til at spisestue-loftet ikke tændte.
+  # 3. sensor.open_plan_lux er GENNEMSNITTET af de to (p50 117 mod køkkenets
+  #    31), så vindueshjørnet trækker hele open-plannet over enhver gate.
+  #
+  # Derfor: INDRE bevis = sensor.koekken_dagslys_lx (den eneste kanal i
+  # open-plannet der både er indendørs og har fået lyskædens eget lys trukket
+  # fra — se det permanente faktum om at rummets egne lamper lyser ind i
+  # Apolloens LTR390).
+  #
+  # Spisestue-Apolloens rolle er så det user selv pegede på: den er husets
+  # bedste DAGSLYS-proxy i open-plannet, fri af lyskæden. Den bruges som VETO —
+  # blæser der dagslys ind ad vinduet i mængder, breder det sig selv, og vi
+  # skal ikke tænde. NB det er en SÆSON-garanti, ikke en arbejdshest: på de tre
+  # (overskyede) døgn flyttede vetoet kun andelen 57 % → 56 %. Loftet på 400 lx
+  # er kanalens p90.
+  #
+  # delay_on 10 min: en sky der driver forbi er ikke en indedag. Bevidst INTET
+  # delay_off på samme udtryk — det ville re-arme holdet på præcis det blip der
+  # ikke må kunne åbne det (se det permanente faktum om delay_on+delay_off).
+  # Sluk-vejen ejes af husets eksisterende dagslys-sluk, ikke af denne sensor.
+  # ⚠️ entity_id afledes af NAVNET, ikke af unique_id, og HA-slugify laver ø→o
+  # (ikke oe) + bindestreg→underscore: "Open-plan mørk indedag" bliver til
+  # binary_sensor.open_plan_mork_indedag. unique_id'et herunder står bevidst
+  # uændret — det er registry-nøglen, og retter man den, får entity'en et
+  # _2-suffiks fordi det gamle object_id stadig er optaget. Gæt aldrig sluggen;
+  # slå den op i /api/states efter første restart.
+  - binary_sensor:
+      - name: "Open-plan mørk indedag"
+        unique_id: openplan_moerk_indedag
+        icon: mdi:home-lightbulb-outline
+        delay_on:
+          minutes: 10
+        state: >
+          {% set thr = states('sensor.open_plan_mork_indedag_lux_gate') | float(0) %}
+          {% set inde = states('sensor.koekken_dagslys_lx') %}
+          {% set vindue = states('sensor.spisestue_lux_reel') %}
+          {% if thr <= 0 or not (inde | is_number) or not (vindue | is_number) %}
+            false
+          {% else %}
+            {{ is_state('sensor.sun_bracket', 'day')
+               and (inde | float) < thr
+               and (vindue | float) < 400 }}
+          {% endif %}
+        availability: >
+          {{ states('sensor.koekken_dagslys_lx') | is_number
+             and states('sensor.spisestue_lux_reel') | is_number }}
+        attributes:
+          inde_lx: "{{ states('sensor.koekken_dagslys_lx') }}"
+          vindue_lx: "{{ states('sensor.spisestue_lux_reel') }}"
+          gate_lx: "{{ states('sensor.open_plan_mork_indedag_lux_gate') }}"
+
+  # ===========================================================================
+  # OPEN-PLAN DAGSLYS-ANKER — fastholdt RENT sample (2026-09-03, user-spec)
+  # ===========================================================================
+  # "er det egentlig ikke bedre at bare bruge den lux værdi der var i køkkenet
+  # sidste gang lyskæden var slukket (hvis det var mindre end 45min siden) og
+  # ellers bruge entre lux?" + "spisestueapollo blændes også af lyskæden, ikke
+  # helt så meget men nok til at det er et problem. lav den samme løsning dér."
+  #
+  # HVORFOR det slår et fradrag: et fradrag skal KENDE lampens bidrag, og det
+  # bidrag er ikke en konstant. Målt på køkken-Apolloen: hvid lyskæde +78 lx,
+  # SAMME strip i mættet orange +1 lx, og under et 300 s fade følger bidraget en
+  # kvadratisk kurve mens entity'en allerede står 'off'. Over-fradrag klamper
+  # sensoren til 0,0 (målt 16/8), under-fradrag lyver opad (målt 03/09: 76,8 lx
+  # "dagslys" kl. 06:28 mens den immune entré-VALLHORN stod på 3,0). Et
+  # fastholdt rent sample har slet ingen fradrags-matematik: vi måler bare
+  # dagslyset dengang lampen var slukket.
+  #
+  # Spisestue-Apolloen er ramt af det samme, bare svagere (user-observation,
+  # bekræftet 03/09: 56,4 lx med hvid lyskæde → 15,8 lx da kæden skiftede til
+  # mættet orange — MENS solen stod op, altså den forkerte vej). Den får derfor
+  # sit eget sample, ikke en kopi af køkkenets: de to Apollos sidder i hver sin
+  # ende af open-plannet, og spisestuen er nær vinduet.
+  #
+  # Er intet sample friskt nok, falder vi tilbage på entré-VALLHORN — husets
+  # eneste lux-måler der aldrig ser open-plannets lamper.
+  - binary_sensor:
+      # "Rent" = ingen af husets egne lamper kan lyse ind i open-plannets to
+      # Apolloer. De tre rum-sensorer tæller spøgelses-lys med (pære der lyser
+      # videre uden radio), så en død pære ikke gør et lyst rum til et rent
+      # sample. delay_on 6 min fordi HA sætter state til 'off' i SAMME sekund et
+      # transition-sluk sendes: køkkenets fade er 300 s, så lampen lyser videre
+      # i op mod 5 min efter at den ser slukket ud. Bevidst INTET delay_off på
+      # samme udtryk (se det permanente faktum om delay_on+delay_off) — et blip
+      # må ikke kunne re-arme holdet.
+      - name: "Open-plan lys rent"
+        unique_id: open_plan_lys_rent
+        icon: mdi:lightbulb-off-outline
+        delay_on:
+          minutes: 6
+        state: >
+          {{ is_state('binary_sensor.koekken_lys_on_effektiv', 'off')
+             and is_state('binary_sensor.spisestue_lys_on_effektiv', 'off')
+             and is_state('binary_sensor.stue_lys_on_effektiv', 'off') }}
+
+  # KØKKEN-sample. Kilden er koekken_lux_reel (Apolloens EGEN SK6812 er allerede
+  # trukket fra dér) — IKKE koekken_dagslys_lx, som er den skrøbelige
+  # lyskæde-subtraktion denne konstruktion afskaffer. maalt_ts renderes kun når
+  # triggeren fyrer, så den skriver ingen DB-række pr. minut (fejlklasse #24).
+  - trigger:
+      - platform: time_pattern
+        minutes: "/1"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: state
+        entity_id: binary_sensor.open_plan_lys_rent
+        state: "on"
+      - condition: template
+        value_template: "{{ states('sensor.koekken_lux_reel') | is_number }}"
+    sensor:
+      - name: "Koekken dagslys sample"
+        unique_id: koekken_dagslys_sample
+        icon: mdi:weather-sunny
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state: "{{ states('sensor.koekken_lux_reel') | float | round(1) }}"
+        attributes:
+          maalt_ts: "{{ now().timestamp() | round(0) }}"
+
+  # SPISESTUE-sample — samme mekanik, egen kilde.
+  - trigger:
+      - platform: time_pattern
+        minutes: "/1"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: state
+        entity_id: binary_sensor.open_plan_lys_rent
+        state: "on"
+      - condition: template
+        value_template: "{{ states('sensor.spisestue_lux_reel') | is_number }}"
+    sensor:
+      - name: "Spisestue dagslys sample"
+        unique_id: spisestue_dagslys_sample
+        icon: mdi:weather-sunny
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state: "{{ states('sensor.spisestue_lux_reel') | float | round(1) }}"
+        attributes:
+          maalt_ts: "{{ now().timestamp() | round(0) }}"
+          # 2026-09-27: solens position DA samplet blev taget — spisestue_dagslys_lx
+          # fremskriver et fastholdt aften-sample ad solhøjden (se dér).
+          sol_elev: "{{ state_attr('sun.sun', 'elevation') | float(0) | round(2) }}"
+          sol_stiger: "{{ 'ja' if state_attr('sun.sun', 'rising') else 'nej' }}"
+          # 2026-09-28 (user: "mørk stue! spisestuen! fix!"): DAGENS EGEN
+          # faldrate pr. solgrad, målt mellem et anker og nu på rene samples.
+          # 14-døgns-medianen er ~0/° over 9° — men i aften faldt spisestuen
+          # 185 → 108 lx fra ~16° til 12,85° (−0,19/°), og det var dén aften
+          # der blev mørk. `this` = forrige værdi; ankeret rulles når solen er
+          # faldet ≥ 3°, og raten bevares mellem to målinger.
+          anker_lux: >-
+            {% set el = state_attr('sun.sun', 'elevation') | float(0) %}
+            {% set gyldig = this is defined and this.attributes is defined
+               and this.attributes.get('anker_ts', 0) | float(0) >= today_at('00:00').timestamp()
+               and not state_attr('sun.sun', 'rising')
+               and this.attributes.get('anker_elev') is number %}
+            {% if gyldig and this.attributes.anker_elev - el < 3 %}
+              {{ this.attributes.anker_lux }}
+            {% else %}
+              {{ states('sensor.spisestue_lux_reel') | float(0) | round(1) }}
+            {% endif %}
+          anker_elev: >-
+            {% set el = state_attr('sun.sun', 'elevation') | float(0) %}
+            {% set gyldig = this is defined and this.attributes is defined
+               and this.attributes.get('anker_ts', 0) | float(0) >= today_at('00:00').timestamp()
+               and not state_attr('sun.sun', 'rising')
+               and this.attributes.get('anker_elev') is number %}
+            {{ this.attributes.anker_elev if gyldig and this.attributes.anker_elev - el < 3
+               else el | round(2) }}
+          anker_ts: >-
+            {% set el = state_attr('sun.sun', 'elevation') | float(0) %}
+            {% set gyldig = this is defined and this.attributes is defined
+               and this.attributes.get('anker_ts', 0) | float(0) >= today_at('00:00').timestamp()
+               and not state_attr('sun.sun', 'rising')
+               and this.attributes.get('anker_elev') is number %}
+            {{ this.attributes.anker_ts if gyldig and this.attributes.anker_elev - el < 3
+               else now().timestamp() | round(0) }}
+          k_idag: >-
+            {% set el = state_attr('sun.sun', 'elevation') | float(0) %}
+            {% set v = states('sensor.spisestue_lux_reel') | float(0) %}
+            {% set a = this.attributes if this is defined and this.attributes is defined else {} %}
+            {% set idag = a.get('anker_ts', 0) | float(0) >= today_at('00:00').timestamp() %}
+            {% if state_attr('sun.sun', 'rising') or not idag %}
+              ukendt
+            {% elif a.get('anker_elev') is number and a.anker_elev - el >= 1.5
+                    and v > 0.5 and a.get('anker_lux', 0) | float(0) > 0.5 %}
+              {{ ((a.anker_lux | float / v) | log / (a.anker_elev - el)) | round(3) }}
+            {% else %}
+              {{ a.get('k_idag', 'ukendt') }}
+            {% endif %}
+
+  # =========================================================================
+  # ENTRÉ-sample (2026-09-04, user-bug: "hvis gangen bliver mørk lige inden man
+  # går ind i den tænder den ikke når man går derind")
+  # =========================================================================
+  # Filen ADVAREDE allerede mod at entré-loftet lyser ind i VALLHORN'en — men
+  # kun mod SLUK-gates "der kan evalueres mens entré-lyset er tændt". Blind
+  # vinkel: TÆND-gaten i `entre_motion_on` rammes af præcis samme fysik ad en
+  # anden vej. Den læser ikke et tændt lys, den læser et SAMPLE der blev taget
+  # mens lyset var tændt — VALLHORN'en rapporterer kun ~hvert 120. sekund
+  # (målt median), så efter et sluk står den gamle, kontaminerede værdi i op
+  # mod 11 minutter.
+  #
+  # MÅLT 14 døgn: 86 gange gik occupancy on med lyset slukket <10 min forinden
+  # uden at der kom lys. **39 af dem havde lux ≥ 20** (tærsklen), og i næsten
+  # alle er sidste sample taget MENS lampen lyste. Tre af dem alene 4/9:
+  #   06:39:29  lux 47 — lyset slukkede 8 s før   (samplet med lys på: 47)
+  #   06:46:16  lux 20 — lyset slukkede 12 s før  (samplet med lys på: 20)
+  #   07:01:32  lux 23 — lyset slukkede 0 s før   (samplet med lys på: 23)
+  # Anti-fasen er entydig 4/9 06:28-07:06 i mørke: 1 → 18/20/44/47 → 1 → …
+  # i takt med loftet. Loftets eget bidrag er ~+19..46 lx mod en tærskel på 20.
+  #
+  # ⚠️ RETTER ET PERMANENT FAKTUM: CLAUDE.md siger "kryds-tjek altid mod
+  # `sensor.entre_lux_reel` (får intet direkte lys)". Det er FORKERT for den RÅ
+  # VALLHORN — den ser sin egen gang-lampe. Det er først sandt for `entre_lux_
+  # reel` EFTER denne konstruktion, fordi den nu kun leverer rene samples.
+  - binary_sensor:
+      # ÉN AUTORITET for "entréen måler rent lige NU" — både sample-triggeren og
+      # entre_lux_reel's live-gren læser den, så friskheds-reglen kun står ét
+      # sted (fejlklasse #2).
+      #
+      # ⚠️ "Lyset er slukket" er IKKE nok, og det er hele pointen med bug'en:
+      # VALLHORN'en rapporterer kun ca. hvert 120. sekund (målt hale: 11 min),
+      # så i minutterne EFTER slukket er dens seneste rapport stadig den
+      # kontaminerede måling fra da loftet lyste. En gren der bare krævede
+      # `lys == off` ville derfor servere præcis den værdi vi bygger det her for
+      # at undgå. Vi kræver at VALLHORN'en har rapporteret **efter** slukket:
+      # +15 s så rapporten heller ikke er taget midt i entréens fade
+      # (`sensor.fade_passage_effective` = 8 s).
+      #
+      # BEVIDST intet delay_off på samme udtryk — et blip må ikke kunne re-arme
+      # holdet (permanent faktum). Læser `_lys_on_effektiv`, ikke lampens rå
+      # state, så et spøgelses-lys (pære der lyser videre uden radio) ikke bliver
+      # til et "rent" sample.
+      #
+      # NB: templaten gen-renderes når VALLHORN'en rapporterer en NY værdi.
+      # Rapporterer den samme tal som før, fyrer HA intet event — men så er der
+      # heller ingen kontaminering at opdage, og det fastholdte sample (som er
+      # rent) bliver stående. Fail-safe vej rundt.
+      - name: "Entre lys rent"
+        unique_id: entre_lys_rent
+        icon: mdi:lightbulb-off-outline
+        delay_on:
+          seconds: 30
+        state: >
+          {% set off_ts = states.binary_sensor.entre_lys_on_effektiv.last_changed %}
+          {% set rep_ts = states.sensor.entre_valhorn_illuminance.last_updated %}
+          {{ is_state('binary_sensor.entre_lys_on_effektiv', 'off')
+             and off_ts is not none and rep_ts is not none
+             and rep_ts.timestamp() > off_ts.timestamp() + 15 }}
+
+  - trigger:
+      - platform: time_pattern
+        minutes: "/1"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: state
+        entity_id: binary_sensor.entre_lys_rent
+        state: "on"
+      - condition: template
+        value_template: "{{ states('sensor.entre_valhorn_illuminance') | is_number }}"
+    sensor:
+      - name: "Entre dagslys sample"
+        unique_id: entre_dagslys_sample
+        icon: mdi:weather-sunny
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state: "{{ states('sensor.entre_valhorn_illuminance') | float | round(1) }}"
+        attributes:
+          maalt_ts: "{{ now().timestamp() | round(0) }}"
+
+  - sensor:
+      # Spisestuens EGEN dagslys-kanal (2026-07-27-spec'en om at spisestue-loftet
+      # gates på spisestuens egen sensor er intakt — kun kilden er blevet ren).
+      # Forbrugere: presence_light_stue_on's lux-gate + måltids-spiselysets
+      # styrke-skalering. De to skal blive ved med at læse SAMME sensor
+      # (fejlklasse #2) — de er bevidst holdt i sync.
+      # Målt 03/09 hvorfor: spiselyset blev tændt på 17 % fordi det skalerede mod
+      # spisestue_lux_reel = 56,4 lx (hvid lyskæde) i reelt mørke. Ren kanal
+      # havde givet ~0,96 i faktor = 67 %.
+      - name: "Spisestue dagslys lx"
+        unique_id: spisestue_dagslys_lx
+        icon: mdi:brightness-5
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state_class: measurement
+        # 2026-09-04e (user-bug: "burde spisestuen ikke tænde lys nu?"): holdet
+        # er et LOFT, ikke et facit. Vores eget lys kan kun LÆGGE lux TIL, så
+        # den rå Apollo-måling er altid en øvre grænse for dagslyset — er den
+        # LAVERE end det gemte sample, har samplet beviseligt overlevet sin
+        # egen gyldighed. Målt 04/9 18:55 i det vestvendte rum: sample 217,9 lx
+        # (taget 18:17), rå Apollo 20,2, tærskel 85 → gaten var 10× for høj i
+        # de 45 minutter aftensolen forsvandt. Morgen-retningen er UÆNDRET:
+        # dér er rå > sample, så min() vælger samplet præcis som før.
+        # NB rå = sensor.spisestue_apollo_lux, IKKE _lux_reel — sidstnævnte er
+        # LED-fradraget og kan clampe til 0,0 (2026-08-16h), hvilket ville
+        # bryde "rå er en øvre grænse".
+        # 2026-09-27 (user-bug "da vi skulle spise var spisestuen mørk trods
+        # bevægelse"): det fastholdte sample FRØS på 43,9 lx fra 18:24 (køkken-
+        # lyskæden tændte ved hjemkomst → open-plannet ikke længere rent) til
+        # 19:09, mens solen gik ned. min(sample, rå) hjalp ikke: den rå Apollo
+        # så lyskæden (~56 lx). Tærsklen er 25 → dødbånd (18b), ingen tænd-vej
+        # fyrede trods ophold 18:48-19:15; loftet kom først ved Styrbar 19:03.
+        # Og EFTER holdet faldt kanalen til open_plan_lux' fallback = kontamineret
+        # spisestue_lux_reel × 0,65 → 42,3 lx kl. 20:15 med solen på -12°.
+        # FIX (AFTEN-grenen): om aftenen kan dagslyset kun FALDE, så et aften-
+        # sample fremskrives ad solhøjden — MÅLT, 14 døgn rene samples:
+        #  · fald pr. grad under 3° sol: ln-ratio -0,59…-0,85 i ALLE 199 par
+        #    (over 4° kan det stige igen, skyer/direkte sol) → k = 0,55/° er
+        #    langsommere end samtlige målinger = konservativt (for LYST).
+        #  · sol-LOFT 10·e^(elev+1): 4 af ~2000 aften-samples ligger over, alle
+        #    ≤ 0,1 lx over; NUL gange sagde loftet < 25 mens rummet målte ≥ 25.
+        # Counterfactual 27/9: krydser 25 kl. 18:36 → lys ved bevægelsen 18:41.
+        # Grenen gælder mens samplet er friskt ELLER solen er under 3° — imellem
+        # (gammelt sample, høj sol) er adfærden uændret. Morgen-retningen er urørt.
+        state: >
+          {% set s = 'sensor.spisestue_dagslys_sample' %}
+          {% set hold = states('input_number.open_plan_dagslys_hold_minutter')
+                        | float(45) * 60 %}
+          {% set v = states(s) %}
+          {% set ts = state_attr(s, 'maalt_ts') | float(0) %}
+          {% set alder = now().timestamp() - ts %}
+          {% set raa = states('sensor.spisestue_apollo_lux') %}
+          {% set el_s = state_attr(s, 'sol_elev') %}
+          {% set el = state_attr('sun.sun', 'elevation') %}
+          {# 2026-09-28 (user: "mørk stue! spisestuen! fix!"): kravet
+             `alder < hold or el < 3` er FJERNET. Det lod et gammelt sample
+             ved høj sol falde tilbage til open_plan_lux = spisestue-Apolloen
+             × 0,65, som måler KØKKENETS lys: sample 103,4 lx ved 12,85° kl.
+             17:14 (lyskæden tændte), kl. 18:16 ved 4,5° stod kanalen på 55,8
+             (rå 85,8 = køkkenlys) mod tænd-gaten 25 — dødbånd, mørk spisestue.
+             Om aftenen kan dagslyset kun falde (permanent faktum: fald ALDRIG
+             tilbage til en kontamineret fallback), så grenen gælder nu hele
+             aftenen. Rate pr. grad = max(bånd-median, dagens egen rate):
+             bånd MÅLT 14 døgn på køkkenets rene kanal (9617 par, medianer):
+             3-5° −0,30…−0,34, 5-7° −0,20…−0,26, 7-9° −0,14…−0,18, 9-11°
+             −0,05, over 11° ~0 → 0,30/0,20/0,15/0,05/0 (lidt under medianen);
+             under 3° uændret 0,55. Dagens rate (k_idag på samplet, loft 0,55)
+             fanger den mørke aften: 103,4·e^(−0,19·8,3) ≈ 21 lx < 25. #}
+          {% set aften = v | is_number and ts >= today_at('00:00').timestamp()
+                         and state_attr(s, 'sol_stiger') == 'nej'
+                         and state_attr('sun.sun', 'rising') == false
+                         and el_s | is_number and el | is_number %}
+          {% if aften %}
+            {% set ki = state_attr(s, 'k_idag') %}
+            {% set ki = [[ki | float(0), 0] | max, 0.55] | min if ki | is_number else 0 %}
+            {% set nf = namespace(f=0) %}
+            {% for b in [[-90, 3, 0.55], [3, 5, 0.30], [5, 7, 0.20],
+                         [7, 9, 0.15], [9, 11, 0.05], [11, 90, 0]] %}
+              {% set ov = [0, ([b[1], el_s | float] | min) - ([b[0], el | float] | max)] | max %}
+              {% set nf.f = nf.f + ov * ([b[2], ki] | max) %}
+            {% endfor %}
+            {% set fald = nf.f %}
+            {% set kand = [v | float * e ** (-fald),
+                           10 * e ** ((el | float) + 1)]
+                          + ([raa | float] if raa | is_number else []) %}
+            {{ kand | min | round(1) }}
+          {% elif v | is_number and ts > 0 and alder < hold %}
+            {% if raa | is_number %}
+              {{ [v | float, raa | float] | min | round(1) }}
+            {% else %}
+              {{ v | float | round(1) }}
+            {% endif %}
+          {% else %}
+            {{ states('sensor.open_plan_lux') }}
+          {% endif %}
+        availability: >
+          {{ states('sensor.spisestue_dagslys_sample') | is_number
+             or states('sensor.open_plan_lux') | is_number }}
+        attributes:
+          kilde: >
+            {% set s = 'sensor.spisestue_dagslys_sample' %}
+            {% set hold = states('input_number.open_plan_dagslys_hold_minutter')
+                          | float(45) * 60 %}
+            {% set v = states(s) %}
+            {% set ts = state_attr(s, 'maalt_ts') | float(0) %}
+            {% set alder = now().timestamp() - ts %}
+            {% set raa = states('sensor.spisestue_apollo_lux') %}
+            {% set el_s = state_attr(s, 'sol_elev') %}
+            {% set el = state_attr('sun.sun', 'elevation') %}
+            {% set aften = v | is_number and ts >= today_at('00:00').timestamp()
+                           and state_attr(s, 'sol_stiger') == 'nej'
+                           and state_attr('sun.sun', 'rising') == false
+                           and el_s | is_number and el | is_number
+                           and (alder < hold or (el | float) < 3) %}
+            {% if aften %}
+              {% set fald = [0, ([el_s | float, 3] | min) - (el | float)] | max %}
+              {% set sol = [v | float * e ** (-0.55 * fald),
+                            10 * e ** ((el | float) + 1)] | min %}
+              {% if raa | is_number and (raa | float) < sol %}
+                raa_loft
+              {% elif sol < (v | float) - 0.05 %}
+                sol_fremskrevet
+              {% else %}
+                rent_sample
+              {% endif %}
+            {% elif v | is_number and ts > 0 and alder < hold %}
+              {% if raa | is_number and (raa | float) < (v | float) %}
+                raa_loft
+              {% else %}
+                rent_sample
+              {% endif %}
+            {% else %}
+              open_plan_fallback
+            {% endif %}
+
+  # ===========================================================================
+  # ÅRSAGS-AGNOSTISK NET — "måler en dagslys-kanal vores eget lys?" (2026-09-04g)
+  # ===========================================================================
+  # User efter 04f: "sådan nogle bugs må ALDRIG ske!! ... vi får jo airbnb
+  # gæster!" Kilde-fixene (04e's min(sample, rå) og 04f's open_plan_lux-loft)
+  # lukker de kanaler vi KENDER. Dette er laget der fanger den næste — uanset
+  # hvilken sensor der går i stykker, og uden at kende mekanismen.
+  #
+  # FYSIKKEN GØR DET MULIGT: vores eget lys kan kun LÆGGE lux TIL. En kanal der
+  # påstår at måle DAGSLYS kan derfor aldrig legitimt ligge væsentligt over den
+  # eneste kanal der pr. konstruktion er immun over for open-plannets lamper
+  # (sensor.open_plan_lux = rene samples + entré). Ligger den alligevel over,
+  # MENS vores eget lys er tændt, måler den sig selv. Det er præcis den
+  # signatur 04f fandt, men udtrykt som en invariant i stedet for som en
+  # hypotese om ét bestemt rum.
+  #
+  # HVORFOR IKKE "solen er nede": den oplagte invariant — "efter solnedgang må
+  # ingen dagslys-kanal vise noget" — ville have MISSET 04f. Bugget slog kl.
+  # 19:30 med solen 5° OPPE (koekken_dagslys_lx = 213 lx mod entréens 1,0).
+  # Referencen skal være den immune kanal, ikke solens position.
+  #
+  # TÆRSKEL (📏-reglen, målt 3 døgn): open-plannets legitime spredning er
+  # spisestue-hjørnet p50 150 lx mod køkkenets 31 og open_plan_lux' egne 117 —
+  # altså et lovligt overskud på ~35 lx for den lyseste kanal på en normal dag.
+  # 60 lx ligger klar af det, og 04f's egen fejl stod på ~200. delay_on 10 min
+  # så en forbipasserende sky eller en enkelt rapport ikke varsler.
+  # Bevidst INTET delay_off på samme udtryk (permanent faktum: delay_on +
+  # delay_off på ét udtryk bevogter kun åbningen).
+  #
+  # ⚠️ Kanal-listen er et ROSTER (#16): tilføjer du en ny "er der lyst nok?"-
+  # kanal, skal den med her — ellers er den usynlig for nettet.
+  - sensor:
+      - name: "Dagslys kanal overskud"
+        unique_id: dagslys_kanal_overskud
+        unit_of_measurement: "lx"
+        state_class: measurement
+        icon: mdi:magnify-scan
+        availability: "{{ states('sensor.open_plan_lux') | is_number }}"
+        state: >-
+          {% set ref = states('sensor.open_plan_lux') | float(0) %}
+          {% set ns = namespace(v = 0.0) %}
+          {% for k in ['sensor.koekken_dagslys_lx', 'sensor.spisestue_dagslys_lx',
+                       'sensor.entre_lux_reel', 'sensor.stue_lux_reel'] %}
+            {% if states(k) | is_number %}
+              {% set ns.v = [ns.v, (states(k) | float) - ref] | max %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.v | round(1) }}
+        attributes:
+          kanal: >-
+            {% set ref = states('sensor.open_plan_lux') | float(0) %}
+            {% set ns = namespace(v = 0.0, k = 'ingen') %}
+            {% for k in ['sensor.koekken_dagslys_lx', 'sensor.spisestue_dagslys_lx',
+                         'sensor.entre_lux_reel', 'sensor.stue_lux_reel'] %}
+              {% if states(k) | is_number and ((states(k) | float) - ref) > ns.v %}
+                {% set ns.v = (states(k) | float) - ref %}
+                {% set ns.k = k %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.k }}
+          reference_lx: "{{ states('sensor.open_plan_lux') }}"
+
+  - binary_sensor:
+      - name: "Dagslys kanal selvmaaling"
+        unique_id: dagslys_kanal_selvmaaling
+        device_class: problem
+        icon: mdi:alert-decagram-outline
+        delay_on:
+          minutes: 10
+        availability: "{{ states('sensor.dagslys_kanal_overskud') | is_number }}"
+        state: >-
+          {{ (states('sensor.dagslys_kanal_overskud') | float(0)) > 60
+             and (is_state('light.koekken_lyskaede', 'on')
+                  or is_state('light.stue_all', 'on')
+                  or is_state('light.spisestue_loft', 'on')
+                  or is_state('switch.koekken_spots', 'on')) }}
+
+automation:
+  # 2026-09-18 (user-bug "open plan brænder lys trods høj lux"): dagslys-anker-
+  # konstruktionen kan LÅSE SIG SELV fast om morgenen. Kæden målt kl. 08:20:
+  # begge rene samples var 97,7 min gamle mod et hold på 45 → kasseret; entré-
+  # fallbacken var udelukket fordi entréens eget lys var tændt (flappede 18 gange
+  # den morgen); så faldt open_plan_lux igennem til sovevaerelse_lux_reel = 14,0
+  # — et ANDET rum, bag et gardin, på en ukalibreret 1:1-skala — mens rummets
+  # egne Apolloer stod på 65 og 135 og kameraet viste fuldt dagslys ind ad
+  # terrassedøren.
+  #
+  # 14,0 er værre end en forkert værdi: den ligger i DØDBÅNDET mellem tænd-gaten
+  # (9,4) og sluk-gaten (18,8), så hverken tænd- eller sluk-vejen kunne fyre og
+  # lyset brændte videre i timevis. Selvlåsen: gaten siger mørkt → lyset er tændt
+  # → binary_sensor.open_plan_lys_rent kan ikke blive on → intet nyt sample →
+  # gaten bliver ved med at sige mørkt.
+  #
+  # HVORFOR EN PROBE OG IKKE ET FRADRAG: man kan ikke måle dagslys gennem sin
+  # egen lampe. Målt i samme sekund lyset blev slukket: køkken 65,0 → 31,4
+  # (lamperne bidrog +33,6 lx) og spisestue 134,9 → 119,7 (+15 lx) — bidraget er
+  # altså hverken konstant eller ens, præcis som det permanente faktum siger.
+  # Det ENESTE der afgør sagen er et rent sample, og det kræver at lyset er
+  # slukket et øjeblik. Derfor slukker vi og LADER HUSET MÅLE: er der dagslys nok,
+  # bliver lyset slukket af sig selv (målt 73,6 lx > sluk-gaten 18,8); er rummet
+  # reelt mørkt, tænder den almindelige presence-vej det igen inden for et minut.
+  # Proben er altså selv-verificerende — den påstår intet, den skaffer beviset.
+  # 2026-09-24 (B162): kun når open plan er TOMT — se betingelse 4b.
+  - id: open_plan_dagslys_probe
+    alias: "Open plan: dagslys-probe naar samplet er laast ude"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      # 1. Kun i husets EGEN dagslys-bracket. Om natten er open_plan_lux' fald
+      #    tilbage på entré/sove helt legitimt, og en probe ville slukke lyset
+      #    for folk der sidder i stuen. Dette er også hunting-værnet: uden for
+      #    bracketten kan proben slet ikke fyre.
+      - condition: template
+        value_template: >
+          {{ (state_attr('sun.sun', 'elevation') | float(-90))
+             > (states('sensor.sun_day_elevation_effective') | float(4)) }}
+      # 2. Vores eget lys staar tændt — altsaa kan der IKKE tages et rent sample.
+      - condition: state
+        entity_id: binary_sensor.open_plan_lys_rent
+        state: "off"
+      # 3. ... og begge samples er ældre end hold-vinduet, saa open_plan_lux
+      #    kører allerede paa fallback-kæden = huset er BLINDT. Er bare ét sample
+      #    friskt, er der intet at probe efter.
+      - condition: template
+        value_template: >
+          {% set hold = states('input_number.open_plan_dagslys_hold_minutter')
+                        | float(45) * 60 %}
+          {% set nu = now().timestamp() %}
+          {% set ns = namespace(friske=0) %}
+          {% for s in ['sensor.koekken_dagslys_sample',
+                       'sensor.spisestue_dagslys_sample'] %}
+            {% set ts = state_attr(s, 'maalt_ts') | float(0) %}
+            {% if ts > 0 and (nu - ts) < hold %}
+              {% set ns.friske = ns.friske + 1 %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.friske == 0 }}
+      # 4. Slaas aldrig med et menneske: rører proben et rum der staar i Manual,
+      #    ligner den en automation der ignorerer brugerens tryk.
+      - condition: template
+        value_template: >
+          {% from 'rosters.jinja' import open_plan_rum_mode %}{{ open_plan_rum_mode
+             | select('is_state', 'Auto') | list | length == 3 }}
+      # 4b. 2026-09-24 (user-valg c, B162): ALDRIG mens nogen er i open plan.
+      #     Proben slukkede stuen 3 s efter at Auto havde tændt den (07:34:57),
+      #     og "presence-vejen tænder igen" holdt ikke: sofa-tænd kræver en
+      #     off→on-flanke, og en der sidder stille giver ingen (#4). PRIS: den
+      #     selvlås proben blev bygget til (09-18: lys der brænder i dagslys
+      #     mens rummet er optaget) kan nu kun brydes når open plan er tomt.
+      #     Stue-Apolloen latcher i timevis, så proben fyrer sjældnere end før.
+      - condition: state
+        entity_id: binary_sensor.open_plan_occupied
+        state: "off"
+      # 5. AirBnB: at slukke en gæsts lys er at paatvinge en rutine. Gaesten
+      #    kender ikke systemet og kan ikke gennemskue hvorfor lyset gik.
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      # 6. Cooldown baaret af den EKSISTERENDE hold-slider i stedet for et nyt
+      #    magisk tal: hyppigere end hold-vinduet kan en probe alligevel ikke
+      #    gøre nytte, for saa er det forrige sample stadig frisk (betingelse 3).
+      #    NB entity_id'et er afledt af `alias:`, ikke af `id:` — rammer man
+      #    forkert, returnerer state_attr None og cooldownen blokerer ALDRIG.
+      - condition: template
+        value_template: >
+          {% set sidst = state_attr(
+               'automation.open_plan_dagslys_probe_naar_samplet_er_laast_ude',
+               'last_triggered') %}
+          {% set hold = states('input_number.open_plan_dagslys_hold_minutter')
+                        | float(45) * 60 %}
+          {{ sidst is none or (now() - sidst).total_seconds() > hold }}
+    action:
+      # continue_on_error: en CHIP-timeout paa ét Matter-lys maa ikke abortere
+      # resten af proben og efterlade open-plannet halvt tændt.
+      - action: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id:
+            - light.koekken_room
+            - light.koekken_lyskaede
+            - light.spisestue_loft
+            - light.stue_room
+      - action: logbook.log
+        data:
+          name: "Dagslys-probe"
+          message: >
+            Open-plan lyset slukket for at maale dagslyset — begge rene samples
+            var forældede, saa open_plan_lux kørte paa fallback
+            ({{ states('sensor.open_plan_lux') }} lx).
+          entity_id: sensor.open_plan_lux

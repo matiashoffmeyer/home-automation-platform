@@ -1,0 +1,77 @@
+# =============================================================================
+# Solo hurtig-sluk: én person hjemme, og personen er et ANDET sted end open plan
+# (2026-09-26, user-spec)
+# =============================================================================
+# USER: "ved 1 person hjemme skal lys slukke mere aggressivt ved tomt rum. se
+#  f.eks 21.45 den 25. sep. jeg var længe i soveværelset og så tydeligvis film
+#  men stuelys brændte videre i tomt rum."
+#
+# MÅLT 25/9: stuen tom fra 21:34:17, soveværelset optaget 21:35:55 (film i
+# sove, dark_mode scopet til 'sove' → cinema_active OFF hele aftenen),
+# people_estimate = 1 hele aftenen. Sofa-lyset brændte til user selv slukkede
+# 22:07:46. To ting holdt det:
+#   1. binary_sensor.stue_manuel_lys_hold — et Styrbar/app-tryk i stuen 19:51
+#      giver et FLADT 3-timers hold, der kun spørger "er NOGEN hjemme?" (hus-
+#      bredt, #26) — ikke om personen er i et andet rum.
+#   2. Selv uden holdet: sensor.sofa_stue_off_sekunder = 6,5 min × global
+#      faktor 4,47 = 29 min.
+# 7 døgn: 8 episoder med stue-lys i tom stue ≥ 20 min mens et andet rum var
+# optaget; 2 af dem med people_estimate = 1 (begge 25/9).
+#
+# ANKERET: binary_sensor.solo_uden_for_open_plan = people_estimate == 1 (med
+# fuld konfidens), hele open plan tom, og personen BEKRÆFTET i et rum uden for
+# open plan (sove/børn/bad) — holdt i 5 min (delay_on), så et radar-blip i
+# soveværelset (fantom i eftermiddagssol, permanent faktum) ikke kan slukke
+# stuen. Sove/børn tæller som "optaget" op til 10 min efter radaren slap:
+# sove-Apolloen taber en person der ligger stille i 5-15 min (permanent faktum),
+# og uden overbygningen ville hvert hul nulstille delay_on (#25). Går personen
+# ind i open plan, slår open-plan-kravet ankeret fra med det samme. Er det on:
+#   • stue_manuel_lys_hold slipper (packages/room_modes.yaml)
+#   • sofa_stue_off_sekunder / spisestue_off_sekunder klampes til
+#     input_number.solo_tom_rum_sluk_minutter (packages/room_absence_tuning.yaml)
+# Sluk-vejene (presence_light_sofa_off / _spisestue_off) har allerede
+# re-arm på holdets off-flanke + /5-/10-backstops der måler tom-tiden i en
+# condition → de ser de nye tal uden egne ændringer.
+#
+# SCOPE: kun når personen er UDEN FOR open plan. Står personen i køkkenet, er
+# sofa-lamperne open-plan-ambient og følger de normale tider.
+# AIRBNB: slået fra (gæstens lys følger husets normale tider; people_estimate
+# kender ikke gæsternes antal lige så godt). Familie-modes = Normal + Home
+# Vacation. Cinema/mood-pause i STUEN blokerer stadig sluk-vejene som før.
+# =============================================================================
+
+input_number:
+  # 0 = funktionen fra (ankeret er altid off).
+  solo_tom_rum_sluk_minutter:
+    name: "Solo hjemme: sluk tomt open-plan-rum efter (min, 0=fra)"
+    icon: mdi:account-arrow-right
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+template:
+  - binary_sensor:
+      - name: "Solo uden for open plan"
+        unique_id: solo_uden_for_open_plan
+        icon: mdi:account-arrow-right
+        delay_on: "00:05:00"
+        state: >-
+          {% set ns = namespace(andet=is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')) %}
+          {% for e in ['binary_sensor.sovevaerelse_apollo_occupancy',
+                       'binary_sensor.boernevaerelse_apollo_occupancy'] %}
+            {% set x = states[e] %}
+            {% if x is not none and (x.state == 'on'
+                  or (x.state == 'off' and (now() - x.last_changed).total_seconds() < 600)) %}
+              {% set ns.andet = true %}
+            {% endif %}
+          {% endfor %}
+          {{ (states('input_number.solo_tom_rum_sluk_minutter') | float(0)) > 0
+             and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+             and (states('sensor.people_estimate') | int(0)) == 1
+             and (state_attr('sensor.people_estimate', 'konfidens_pct') | int(0)) >= 80
+             and is_state('binary_sensor.stue_apollo_occupancy_filtered', 'off')
+             and is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'off')
+             and is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'off')
+             and ns.andet }}

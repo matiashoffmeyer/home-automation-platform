@@ -1,0 +1,134 @@
+# =============================================================================
+# Post-Wakeup Sove Sluk — smart LUX-aware (B13 fix, sprint 2026-05-06 Blok F.5)
+# =============================================================================
+# Hvorfor: wakeup_alarm_driven (+ wakeup_adults legacy + weekend variants)
+# fader sove-lys op fra 5%→40%→80% over ~30 min for at vække blødt. MEN ingen
+# automation slukker bagefter. Resultat: sove-lys står ON hele dagen indtil
+# manuel sluk eller drift_back ceiling 12h senere. Energispild + bulb-wear.
+#
+# User-decision 2026-05-05 (smart LUX-aware, ikke blind off):
+#   Trigger: 15 min efter wakeup completer (= godnat_voksne_active går off)
+#   Mål: sove apollo lux
+#   Hvis LUX > 15 (= dagslys er kommet) → fade off completely over 2 min
+#   Hvis LUX < 15 (= stadig mørkt udenfor) → fade DOWN over 2 min til
+#                                            LUX-bracket level (60/40/25%)
+#                                            som matcher presence_sovevaerelse_on
+#   Derefter handover til normal presence-rules (5-min absence sluk).
+# =============================================================================
+
+- id: wakeup_post_sluk_voksne
+  alias: "Vækning: Sove sluk/dim 15 min efter wakeup (smart LUX)"
+  description: >
+    15 min efter godnat_voksne_active flipper off (= wakeup completer eller
+    user trigger godmorgen), check sove lux. Dagslys = fade off over 2 min.
+    Stadig mørkt = fade DOWN til presence-bracket level over 2 min.
+    Derefter handover til normal presence rules.
+
+    Audit-fixes 2026-05-06 (A6+A7+A11+A12):
+    - A6: skip hvis user back in bed (still_target=on)
+    - A7: skip hvis user manuelt har dimmed sove til <70% (= ikke wakeup-target)
+    - A11: backup time-trigger 08:00 hvis HA restartede mid-wakeup og missed transition
+    - A12: skip hvis voksne_active blev togglet ON i sidste 15 min (re-fire grace)
+  mode: restart
+  trigger:
+    # Sprint 2026-05-17: post-sluk delay slider-tunable (var hardcoded 15 min).
+    # input_number.global_wakeup_post_sluk_minutes default 15, range 5-60.
+    - platform: state
+      entity_id: input_boolean.godnat_voksne_active
+      from: "on"
+      to: "off"
+      for:
+        minutes: "{{ states('input_number.global_wakeup_post_sluk_minutes') | int(15) }}"
+    # A11 fix sprint 2026-05-06: backup time-trigger 08:00. Hvis HA restartede
+    # mid-wakeup, state-trigger kan have missed transition → light hænger på
+    # hele dagen. 08:00 fanger common case (wakeup typisk 06:00-07:30).
+    - platform: time
+      at: "08:00:00"
+      id: backup_time
+  condition:
+    # Sove lys skal være ON for at have noget at slukke
+    - condition: state
+      entity_id: light.spisestue_pendel
+      state: "on"
+    # Morgen-vindue (skip eftermiddag/aften)
+    - condition: time
+      after: "04:00:00"
+      before: "12:00:00"
+    # Skip hvis godnat_active er gået ON igen (= user gik tilbage til seng)
+    - condition: state
+      entity_id: input_boolean.godnat_active
+      state: "off"
+    # Skip hvis godnat-flags genåbnes (= cinema mode etc.)
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+    # 2026-05-21 fix (to-partner audit #3): REMOVED still_target=on skip.
+    # Tidligere skippede automation hvis EN partner var tilbage i seng — men
+    # det efterlod 80% sove-lys ON i timer indtil drift_back 12h senere.
+    # Bedre policy: lad path A (lux>15 → fade off) eller path B (lux<15 →
+    # dim til 12-35%) køre. Begge er sleep-friendly:
+    #   - Path A: 80% → off over 2 min = lyset forsvinder, ingen lysspike.
+    #   - Path B: 80% → 12-35% over 2 min = behageligt nightlight-niveau.
+    # A7 brightness >= 178 (70%) condition under sikrer at user-dimmet
+    # læselys ikke overskrives.
+    # A7 fix sprint 2026-05-06: skip hvis user manuelt har dimmed til <87,5%
+    # af wakeup-target = user-adjusted læselys, ikke wakeup-bekræftelse →
+    # respect user choice.
+    # 2026-07-17 bug hunt (fejlklasse #2): grænsen var hardcodet 178 (=70% af
+    # det GAMLE 80%-target) mens restart-recovery afleder samme grænse af
+    # slideren (target*2.54*0.875). Med slider <70% ville post-sluk aldrig
+    # fyre (lys på hele dagen). Nu samme formel begge steder.
+    - condition: template
+      value_template: >
+        {% set target = states('input_number.global_wakeup_brightness_pct') | int(80) %}
+        {{ state_attr('light.spisestue_pendel', 'brightness') | int(0)
+           >= (target * 2.54 * 0.875) }}
+    # A12 fix sprint 2026-05-06: skip hvis voksne_active blev cycled (off→on→off)
+    # inden for 15 min. Forhindrer re-fire ved godnat→godmorgen toggle.
+    # Hvis last_changed var <900 sek siden = sandsynligvis cycle, skip.
+    - condition: template
+      value_template: >
+        {% set lc = states.input_boolean.godnat_voksne_active.last_changed %}
+        {% if lc is none %}
+          true
+        {% else %}
+          {{ (now() - lc).total_seconds() >= 900 }}
+        {% endif %}
+  action:
+    - choose:
+        # ===== Path A: dagslys er kommet → fade OFF helt =====
+        - conditions:
+            - condition: numeric_state
+              entity_id: sensor.sovevaerelse_lux_reel
+              above: input_number.wakeup_post_dagslys_lux
+          sequence:
+            - service: logbook.log
+              data:
+                name: "Wakeup post-sluk"
+                message: "LUX > {{ states('input_number.wakeup_post_dagslys_lux') | int(15) }} (dagslys), fade sove off over 2 min"
+            - service: light.turn_off
+              target:
+                entity_id: light.spisestue_pendel
+              data:
+                transition: 120
+      # ===== Path B (default): stadig mørkt → fade DOWN til LUX-bracket =====
+      default:
+        - service: logbook.log
+          data:
+            name: "Wakeup post-sluk"
+            message: >
+              LUX < {{ states('input_number.wakeup_post_dagslys_lux') | int(15) }} ({{ states('sensor.sovevaerelse_lux_reel') }}),
+              fade sove DOWN til presence-bracket level over 2 min
+        - service: light.turn_on
+          target:
+            entity_id: light.spisestue_pendel
+          data:
+            brightness_pct: >
+              {# Same bracket-logik som presence_sovevaerelse_on (efter
+                 sove-dim-fix 2026-05-05): lux<lux_trin_moerkt(5)→35, lux<15→22, else 12 #}
+              {% set lux = states('sensor.sovevaerelse_lux_reel') | float(50) %}{# A52 fix: failsafe → fade-down to mid (not 35% bright) #}
+              {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}35
+              {% elif lux < 15 %}22
+              {% else %}12{% endif %}
+            color_temp_kelvin: 2300
+            transition: 120

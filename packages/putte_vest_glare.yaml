@@ -1,0 +1,209 @@
+# =============================================================================
+# Putte-glare: luk spisestue-vest-gardin når aftensolen blænder ind mod
+# børneværelset (2026-06-24, user-spec)
+# =============================================================================
+# PROBLEM (user): når børnene er hjemme, solen skinner, og solen står rimelig
+# lavt i VEST, skinner den ind ad spisestuens vest-vindue, gennem spisestuen og
+# helt hen til børneværelset → holder Child A & Child B vågne ved sengetid.
+#
+# LØSNING: luk cover.gardin_spisestue_vest AUTOMATISK når ALLE gælder:
+#   • putte-vinduet er åbent  (binary_sensor.putning_vindue_aktivt — implicerer
+#     børn-hjemme + efter sengetid; "hvis putte vinduet er åbent")
+#   • solen er OPPE men LAV i VEST: above_horizon + elevation < slider
+#     (input_number.putte_vest_glare_elevation, default 15°, "finjuster hvor
+#     lavt") + azimut 240–320° (vest, samme range som summer_defense)
+#   • solen SKINNER: weather.forecast_home cloud_coverage < 70 % (ikke tungt
+#     overskyet → reel blænding). Unavailable vejr → antag klart → luk
+#     (børnenes søvn vægter højst).
+# … og BLIVER NEDE natten over: et flag (putte_glare_spisestue_vest_ned) gør at
+# summer_defense IKKE må gen-åbne gardinet (behandles som manuelt-holdt), og
+# INTET andet auto-åbner spisestue-vest om aftenen/natten (morning_curtains
+# kører kun 06–12). Næste morgen åbner morning_curtains det → flaget ryddes.
+#
+# Manuel åbning vinder altid (flaget ryddes når gardinet åbnes). F3-fix
+# 2026-07-02: flag-clear alene var IKKE nok — /15-backstoppen re-lukkede ≤15 min
+# efter manuel åbning mens betingelserne stadig holdt. Nu stemples manuel åbning
+# (context.user_id sat = app/dashboard, ikke automation) i
+# input_datetime.putte_glare_manual_open_at, og close kræver at putte-vinduet er
+# STARTET EFTER sidste manuelle åbning (ny putning = ny lukning; samme putning =
+# manuel åbning respekteres natten ud).
+# =============================================================================
+
+input_datetime:
+  putte_glare_manual_open_at:
+    name: "Putte-glare: sidste manuelle åbning af spisestue-vest"
+    has_date: true
+    has_time: true
+
+input_number:
+  putte_vest_glare_elevation:
+    name: "Putte: luk vest-gardin når sol under (°)"
+    icon: mdi:weather-sunset-down
+    min: 0          # 0 = reelt fra (sol er ~aldrig 0–0° oppe → lukker aldrig)
+    max: 45
+    step: 1
+    unit_of_measurement: "°"
+    mode: slider
+    # Ingen `initial:` → persisterer restarts. Live-default (15) sat via API +
+    # snapshot; fresh-install loader på MIN (0 = feature reelt fra = sikkert).
+
+  # 2026-09-23: min. dagslys i spisestuen før der lukkes (se close-conditionen).
+  putte_vest_glare_min_lux:
+    name: "Putte: luk vest-gardin kun ved dagslys over (lx)"
+    icon: mdi:white-balance-sunny
+    min: 0
+    max: 1000
+    step: 10
+    unit_of_measurement: "lx"
+    mode: slider
+
+input_boolean:
+  # ON = putte-glare ejer spisestue-vest (hold nede). Sættes når feature lukker;
+  # ryddes når gardinet åbnes (morgen/manuelt). Ingen `initial:` → overlever
+  # restarts. summer_defense behandler spisestue-vest som manuelt-holdt mens on.
+  putte_glare_spisestue_vest_ned:
+    name: "Putte-glare: spisestue-vest holdt nede"
+    icon: mdi:curtains-closed
+
+automation:
+  # ---------------------------------------------------------------------------
+  # LUK spisestue-vest ved aften-blænding under putning.
+  # ---------------------------------------------------------------------------
+  - id: putte_vest_glare_close
+    alias: "Putte-glare: luk spisestue-vest når aftensol blænder mod børn"
+    description: >
+      Lukker cover.gardin_spisestue_vest når putte-vinduet er åbent + solen er
+      lav i vest + det er klart. Sætter flag så summer_defense ikke gen-åbner;
+      gardinet bliver nede til morning_curtains åbner det næste morgen.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.putning_vindue_aktivt
+        from: "off"
+        to: "on"
+      # Robust catch-all (jf. morning_curtains-lektien: edge-triggere misser):
+      # re-tjek hvert 15. min — fanger sol-nedgang + vejr-skift i vinduet.
+      # Condition + flag-gating gør det til no-op når det allerede er lukket.
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.putning_vindue_aktivt
+        state: "on"
+      # Ikke allerede ejet/lukket af denne feature (flag-gated → fyrer én gang).
+      - condition: state
+        entity_id: input_boolean.putte_glare_spisestue_vest_ned
+        state: "off"
+      # Solen OPPE men lav, i VEST.
+      - condition: state
+        entity_id: sun.sun
+        state: "above_horizon"
+      - condition: template
+        value_template: >-
+          {{ (state_attr('sun.sun', 'elevation') | float(90))
+             < (states('input_number.putte_vest_glare_elevation') | float(15)) }}
+      - condition: template
+        value_template: >-
+          {% set az = state_attr('sun.sun', 'azimuth') | float(-1) %}
+          {{ 240 <= az <= 320 }}
+      # Solen SKINNER (ikke tungt overskyet). Unavailable → 0 → antag klart → luk.
+      - condition: template
+        value_template: >-
+          {{ (state_attr('weather.forecast_home', 'cloud_coverage') | float(0)) < 70 }}
+      # Solen skal faktisk NÅ ind (2026-09-23, user-spec "spisestue gardinet
+      # skal heller ikke rulle ned for putning hvis der er mørkt udenfor").
+      # met.no's skydække er en prognose; lux'en er målingen. Målt 09-09→22:
+      # solrige aftener 200-900 lx ved 3-10° elev, overskyede < 100 lx. Begge
+      # lukninger i perioden (16/09 + 18/09 kl. 18:45) skete ved 56-72 lx =
+      # solen var væk bag husene, lukningen gav kun motorlarm.
+      # unavailable → 0 → intet luk (motorlarm er værre end en mistet lukning).
+      - condition: template
+        value_template: >-
+          {{ (states('sensor.spisestue_dagslys_lx') | float(0))
+             >= (states('input_number.putte_vest_glare_min_lux') | float(150)) }}
+      # Respektér manuel-ned-grace via LUK-listen `held_luk` (B123: `held` er
+      # åbne-forbuddet og bærer AirBnB-tæppet). Putning er familie-logik → AirBnB
+      # holdes ude af en eksplicit mode-gate i stedet for af tæppet.
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+      - condition: template
+        value_template: >-
+          {{ 'cover.gardin_spisestue_vest'
+             not in (state_attr('sensor.gardiner_manual_hold', 'held_luk') | default([])) }}
+      # F3: manuel åbning vinder resten af DENNE putning — luk kun hvis
+      # putte-vinduet startede EFTER sidste manuelle åbning af gardinet.
+      - condition: template
+        value_template: >-
+          {{ as_timestamp(states.binary_sensor.putning_vindue_aktivt.last_changed, 0)
+             > (state_attr('input_datetime.putte_glare_manual_open_at', 'timestamp') | float(0)) }}
+    action:
+      - service: cover.close_cover
+        continue_on_error: true
+        target:
+          entity_id: cover.gardin_spisestue_vest
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.putte_glare_spisestue_vest_ned
+      - service: logbook.log
+        data:
+          name: "Putte-glare"
+          message: >-
+            Spisestue-vest lukket — aftensol lav i vest (elev
+            {{ state_attr('sun.sun','elevation') | round(0) }}° az
+            {{ state_attr('sun.sun','azimuth') | round(0) }}°, skyer
+            {{ state_attr('weather.forecast_home','cloud_coverage') }}%) under
+            putte-vindue → holdes nede natten over (åbnes igen i morgen).
+          entity_id: cover.gardin_spisestue_vest
+
+  # ---------------------------------------------------------------------------
+  # RYD flag når spisestue-vest åbnes igen (morning_curtains om morgenen, eller
+  # manuelt) → summer_defense + normal styring genoptager kontrollen.
+  # ---------------------------------------------------------------------------
+  - id: putte_vest_glare_flag_clear
+    alias: "Putte-glare: ryd flag når spisestue-vest åbnes"
+    mode: single
+    trigger:
+      # not_from (2026-09-29): en restart giver unavailable → open = ingen åbning.
+      - platform: state
+        entity_id: cover.gardin_spisestue_vest
+        to: "open"
+        not_from: ["unavailable", "unknown"]
+    condition:
+      - condition: state
+        entity_id: input_boolean.putte_glare_spisestue_vest_ned
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.putte_glare_spisestue_vest_ned
+
+  # ---------------------------------------------------------------------------
+  # F3: stempl MANUELLE åbninger (app/dashboard = context.user_id sat; se
+  # conditionen) → close-conditionen ovenfor re-lukker
+  # ikke i samme putte-vindue.
+  # ---------------------------------------------------------------------------
+  - id: putte_vest_glare_manual_open_stamp
+    alias: "Putte-glare: stempl manuel åbning af spisestue-vest"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: cover.gardin_spisestue_vest
+        to: "open"
+        not_from: ["unavailable", "unknown"]
+    condition:
+      # 2026-09-29 (bug-hunt, fejlklasse #3): var `parent_id is none` — det
+      # har en TIDS-trigget automation også. Målt: stemplet blev sat af begge
+      # restarts 23/9 07:15/07:17 og af morning_curtains 28/9 06:45:04. Et
+      # falsk stempel efter putte-vinduets start blokerer lukningen natten ud.
+      # Manuel = app/dashboard = user_id (gardinet har ingen fysisk knap).
+      - condition: template
+        value_template: "{{ trigger.to_state.context.user_id is not none }}"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.putte_glare_manual_open_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"

@@ -1,0 +1,1241 @@
+# =============================================================================
+# Cykel-batteri-lader på entré-plug — billig-time-planlægning (user-spec 2026-07-28)
+# =============================================================================
+# User: "der er et nyt smart plug i entreen som lader cykel batterier
+# (forlængerledning giver adgang til 2 cykelbatterier) … plugget skal sørge for
+# at vi lader når strømmen er billig. på hverdage mellem 08 og 16 vil vi ofte
+# være væk med cykelbatterierne. det tager ca 4 timer at lade batterierne
+# (slider til at styre længden på sessions). hvis man kan se på smartplug
+# enheden hvornår der lades, så skal vi bruge den info til at gøre det smart.
+# der er max 2 batterier sat til. på hverdage kl. 07 skal batterierne være
+# færdig opladet. det kan ske at 1 batteri sættes til, lader noget tid, og så
+# kommer det næste batteri og skal også lade på samme smart plug."
+#
+# HARDWARE (parret 2026-07-28, entities omdøbt samme dag):
+#   switch.entre_cykel_lader_plug     — Third Reality 3RSPE01044BZ (Zigbee)
+#   sensor.entre_cykel_lader_effekt   — W, live
+#   sensor.entre_cykel_lader_energi   — kWh total
+#
+# MÅLT PÅ DEN FAKTISKE PLUG (2026-07-28 17:41, ét batteri tilsluttet):
+#   plug OFF            → 0.3-0.4 W
+#   plug ON + lader     → 177-179 W   (ét batteri; to ≈ det dobbelte)
+#   Effekt-sensoren beholder sin SIDSTE værdi i ~8 sek efter sluk (Zigbee
+#   rapporterer on-change) → "under idle"-tjek må først gælde når pluggen har
+#   været tændt i et settle-vindue, ellers læser vi et stale tal.
+# Tærsklerne herunder er sat ud fra de tal, ikke gættet.
+#
+# PLAN-MODEL: vi vælger de `session_timer` BILLIGSTE timer i vinduet
+# [vindue_start .. deadline) ud fra Energi Data Service (raw_today +
+# raw_tomorrow, all-in pris inkl. tariffer, lokale tidsstempler).
+#   • Deadline default 07:00 (user-spec: fuldt opladet kl. 07 på hverdage).
+#   • Vindue-start default 16:00 → vi lader ALDRIG i hverdags-vinduet 08-16
+#     hvor batterierne er ude af huset (user-spec).
+#   • DEADLINE-PRES er automatisk: udvalget sker blandt de RESTERENDE timer.
+#     Kl. 05:00 er kun {05,06} tilbage → 4 billigste af 2 = begge → pluggen
+#     bliver tændt hele vejen til deadline. Ingen særlogik nødvendig.
+#   • Ingen prisdata → fallback: de sidste `session_timer` timer før deadline
+#     (batterierne bliver stadig fulde; vi mister kun optimeringen).
+#   • OVERRUN: en ladning der FAKTISK løber (måler > `lade_watt`) afbrydes
+#     ikke af at vinduet lukker. Deadline 07:00 med et halvt batteri →
+#     der lades videre til effekten falder. Kun reel last forlænger.
+#
+# EFFEKT-MÅLINGEN GØR DET SMART (user-spec):
+#   • FÆRDIG-detektion: pluggen tændt + effekt under `idle_watt` i
+#     `faerdig_minutter` → alt tilsluttet er fuldt → sluk + kvittering.
+#     Fanger også "der var slet ikke sat noget til".
+#   • BATTERI NR. 2: når `faerdig` er sat er pluggen slukket, og så kan vi
+#     IKKE se at et nyt batteri sættes i (ingen strøm = ingen måling). Derfor
+#     PROBE: inde i en planlagt billig-time tændes pluggen i `probe_minutter`
+#     — stiger effekten over `lade_watt` OG holder den sig der
+#     (`probe_hold_pct` efter `probe_bekraeft_sekunder`, se 2026-09-16 nedenfor),
+#     er der kommet et nyt batteri → `faerdig` ryddes og ladningen fortsætter.
+#     Ellers slukkes der igen. Det er den eneste måde at opdage batteri nr. 2 på.
+#   • `probe_minutter` + `probe_bekraeft_sekunder` SKAL være mindre end
+#     `faerdig_minutter` (live 09-16: 2 min + 60 s < 5 min), ellers ville
+#     færdig-detektoren kunne fyre midt i en probe. Proben sætter desuden
+#     `probe_aktiv`, som færdig-detektoren udelukker på — og stuck-backstoppens
+#     margin (`probe_minutter` + 10 min) dækker begge faser.
+#
+# PROBE-FREKVENS (user-spec 2026-07-29): "proben lader jo på det batteri der
+# er færdigopladet — det vil lade fra 99 til 100 igen og det er dårligt. Giv
+# mig slider til at styre probefrekvens, default hver 2. billige time."
+#   Målt natten 07-28→29: batteriet blev fuldt 02:21, hvorefter proben fyrede
+#   NI gange (02:30 … 06:30, hver /30) = ~45 min strøm på et fuldt batteri.
+#   Li-ion-ladere genoptager en top-off når cellen falder et par procent →
+#   hver probe = en lille ekstra ladecyklus.
+#   Opfølgende user-spec samme dag: "kun probe 16-23 + én morgen-probe" …
+#   "aah probe også en gang kl 02 om natten". Derfor TRE spor:
+#     AFTEN  (vindue_start → midnat): ét tick pr. time, kun i en billig time,
+#            og kun hver `probe_interval`-te af dem (tælleren
+#            `cykel_lader_probe_cursor`, nulstillet når `faerdig` sættes og
+#            ved deadline). Det er her nogen faktisk kommer hjem med et
+#            batteri — derfor er det eneste spor med en kadence.
+#     NAT    kl. `cykel_lader_nat_probe` (02:00) — ét fast tjek.
+#     MORGEN (05:00) FJERNET 2026-10-16 (user-spec: "vi behøver ikke tjekke
+#            mellem 2 og 5 … vi beholder 2am proben" — han hørte 05:00-
+#            probens klik fra entréen). Prisen: en ladning der stopper for
+#            tidligt efter 02:00 (15/8: 127 Wh) fanges ikke før næste nat.
+#            Gendan: `git log -S cykel_lader_morgen_probe`.
+#   Natten 07-28→29 ville med dette have givet 2 aften-probes + 2 faste = 4
+#   i stedet for 9, og INGEN i de døde timer 03-06.
+#   HVILE-GATE på nat-proben (2026-07-31, målt på tre døgns drift): den
+#   springes over hvis `sidst_faerdig` er under
+#   `cykel_lader_probe_hvile_timer` (3 t) gammel — en ladning der lige er
+#   meldt færdig kan ikke have fået et nyt batteri kl. 03. Se automationens
+#   kommentar for de tre datapunkter der kalibrerer tærsklen.
+#   Hvorfor en tæller og ikke "N timer siden sidst": billige timer ligger ikke
+#   nødvendigvis i forlængelse af hinanden — user bad om hver 2. BILLIGE time,
+#   ikke hver 2. time. Og planen kan ikke huske fortiden (den indeholder kun
+#   RESTERENDE timer), så bagud-tælling er ikke mulig — tælleren er fremad.
+#
+# TOP-OFF-LÅS (user-spec 2026-07-29): "hvis de slår til efter en probe og så
+# fra igen relativt hurtigt (inden for 30 min) over natten, så skal der ikke
+# probes mere overhovedet den nat og morgen. Husk at de nok altid vil gå i gang
+# med at lade lidt når du tænder pluggen, men kun kortvarigt."
+#   Konsekvensen af den observation: `effekt > lade_watt` ALENE kan ikke skelne
+#   "nyt batteri" fra "fuldt batteri der tager en top-off da pluggen fik strøm".
+#   Varigheden kan. Derfor stempler proben sit fund (`cykel_lader_probe_fund_at`)
+#   og færdig-detektoren måler bagefter hvor længe den ladning varede:
+#     kort (< `cykel_lader_probe_stop_minutter`, 30) → det var en top-off →
+#       `input_boolean.cykel_lader_probe_stop` sættes = begge spor spærret
+#       resten af vinduet (ryddes ved deadline).
+#     lang  → ægte nyt batteri → probing fortsætter som før.
+#   Målingen korrigerer for begge kunstige forsinkelser: stemplet sættes efter
+#   probens `probe_minutter`-delay (ladningen kørte allerede), og triggeren
+#   fyrer først `faerdig_minutter` efter effekten faldt. Uden korrektionen ville
+#   30-minutters-slideren reelt betyde ~27 min ladning.
+#   Der findes ingen "prøv igen"-vej ud af låsen med vilje: sætter man et rigtigt
+#   batteri til efter låsen faldt, fanges det ved næste deadline-reset — det er
+#   prisen for aldrig at top-off'e et fuldt batteri.
+#
+# "BILLIG" = DE N BILLIGSTE TIMER I VINDUET — ALDRIG EN ABSOLUT GRÆNSE
+# (user-spec 2026-07-29: "billigt betyder billigeste indenfor deadline (om
+# morgenen), der må ikke skippes opladning hvis der er dyr strøm hele natten").
+# Der findes derfor INGEN pris-tærskel nogen steder i denne fil: udvalget er
+# rent relativt (`sort(attribute='p')[:need]`). Fordi planen genberegnes hver
+# time blandt de RESTERENDE timer, findes der ALTID billige timer helt frem
+# til deadline — er strømmen dyr hele natten, lades der bare i nattens mindst
+# dyre timer. Tilføj aldrig en "kun under X kr/kWh"-betingelse her.
+#
+# AIRBNB: ladningen er gatet til Normal/Home Vacation. En gæst skal ikke have
+# et lithium-ladekredsløb tændt automatisk i entréen, og familien er væk med
+# cyklerne alligevel. `faerdig`/`probe_aktiv`/`probe_stop` ryddes ved mode-skift
+# begge veje (`alarm_lock` undtaget — se automations/airbnb_mode.yaml).
+#
+# SLID-REGNSKAB: probe-antal, fund, top-offs og de Wh der gik ind i et allerede
+# fuldt batteri tælles i packages/cykel_lader_slid.yaml (dagligt push + grafer
+# på Statistik-siden). Denne fil KALDER kun tællerne + bogførings-scriptet — al
+# beregning bor derovre.
+#
+# SIKKERHED: røgalarmen over batterierne kan sætte
+# `input_boolean.cykel_lader_alarm_lock` → al ladning spærret indtil den
+# ryddes manuelt (se packages/roegalarm.yaml). Det er en HÅRD spærring:
+# ingen tids-udløb, fordi en lithium-brand ikke må kunne genoptages
+# automatisk.
+# =============================================================================
+
+input_boolean:
+  cykel_lader_enabled:
+    name: "🔋 Cykel-lader — automatik"
+    icon: mdi:ev-station
+  # Runtime: alt tilsluttet er fuldt opladet i DETTE vindue. Ryddes ved
+  # deadline (nyt vindue) og når en probe finder et nyt batteri.
+  cykel_lader_faerdig:
+    name: "🔋 Cykel-lader — batterier fulde (runtime)"
+    icon: mdi:battery-check
+  # Runtime: en probe kører lige nu → færdig-detektoren skal holde sig væk.
+  cykel_lader_probe_aktiv:
+    name: "🔋 Cykel-lader — probe kører (runtime)"
+    icon: mdi:magnify-scan
+  # Runtime: en probe fandt "last", men ladningen stoppede igen inden for
+  # `probe_stop_minutter` → det var ikke et nyt batteri, bare et fuldt batteri
+  # der tog en kort top-off da pluggen fik strøm. Så holder vi HELT op med at
+  # probe resten af vinduet (aften + nat). Ryddes ved deadline.
+  cykel_lader_probe_stop:
+    name: "🔋 Cykel-lader — færdig med at probe i nat (runtime)"
+    icon: mdi:magnify-close
+  # HÅRD spærring sat af røgalarmen. Ryddes kun manuelt.
+  cykel_lader_alarm_lock:
+    name: "🔋 Cykel-lader — spærret af røgalarm"
+    icon: mdi:hand-back-right-off
+
+  notif_cykel_lader_enabled:
+    name: "🔋 Cykel-lader — send"
+    icon: mdi:ev-station
+  notif_cykel_lader_parent_a:
+    name: "🔋 Cykel-lader — Parent A"
+    icon: mdi:cellphone
+  notif_cykel_lader_parent_b:
+    name: "🔋 Cykel-lader — Parent B"
+    icon: mdi:cellphone
+  notif_cykel_lader_airbnb:
+    name: "🔋 Cykel-lader — også i AirBnB"
+    icon: mdi:home-account
+  notif_cykel_lader_hjemme:
+    name: "🔋 Cykel-lader — vent til hjemme"
+    icon: mdi:timer-sand
+
+input_number:
+  # MANUEL OVERSTYRING af hvor mange billige timer vi reserverer.
+  # 0 = auto (default) → `sensor.cykel_lader_timer_noedvendige` regner det ud
+  # af batteri-kapaciteten og den MÅLTE ladeeffekt. Sæt kun et tal her hvis du
+  # bevidst vil overrule fysikken; ét tal duer ikke til to forskellige ladere
+  # (målt 2026-08-15: hans ~175 W → 4 t, hendes ~72 W → 9 t for samme 504 Wh).
+  cykel_lader_session_timer:
+    name: "🔋 Cykel-lader: session-længde manuelt (0 = auto)"
+    min: 0
+    max: 12
+    step: 0.5
+    unit_of_measurement: "t"
+    icon: mdi:timer-sand
+    mode: slider
+  # Over denne effekt = der lades rigtigt. Målt: ét batteri = ~178 W.
+  # 50 W ligger trygt over enhver standby og trygt under én lader.
+  cykel_lader_lade_watt:
+    name: "🔋 Cykel-lader: effekt der betyder 'lader' (W)"
+    min: 10
+    max: 300
+    step: 5
+    unit_of_measurement: "W"
+    icon: mdi:flash
+    mode: box
+  # Under denne effekt = intet at lade / alt fuldt. Målt: 0.3-0.4 W i tomgang.
+  cykel_lader_idle_watt:
+    name: "🔋 Cykel-lader: effekt der betyder 'tomgang' (W)"
+    min: 1
+    max: 100
+    step: 1
+    unit_of_measurement: "W"
+    icon: mdi:sleep
+    mode: box
+  # Hvor længe effekten skal ligge i tomgang før vi kalder det færdigt.
+  # SKAL være større end probe_minutter (se header).
+  cykel_lader_faerdig_minutter:
+    name: "🔋 Cykel-lader: tomgang før 'færdig' (min)"
+    min: 2
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:battery-check
+    mode: box
+  # Hvor længe en probe holder pluggen tændt for at se om et nyt batteri er sat i.
+  cykel_lader_probe_minutter:
+    name: "🔋 Cykel-lader: probe-længde (min)"
+    min: 2
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:magnify-scan
+    mode: box
+  # Hvor sjældent vi prober. 1 = hver billig time, 2 (default) = hver anden.
+  # Hver probe giver det fuldt opladede batteri en lille top-off → færre er
+  # bedre for batteriet, prisen er langsommere opdagelse af batteri nr. 2.
+  cykel_lader_probe_interval:
+    name: "🔋 Cykel-lader: probe hver N. billige time"
+    min: 1
+    max: 12
+    step: 1
+    unit_of_measurement: "t"
+    icon: mdi:timer-refresh
+    mode: box
+  # En ladning der starter efter en probe og stopper igen inden for så mange
+  # minutter var ikke et nyt batteri — user: "de vil nok altid gå i gang med at
+  # lade lidt når du tænder pluggen, men kun kortvarigt". Bemærk at
+  # `faerdig_minutter` (tomgangs-detektionen) tæller med i de minutter.
+  cykel_lader_probe_stop_minutter:
+    name: "🔋 Cykel-lader: kort ladning = top-off under (min)"
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:magnify-close
+    mode: box
+  # Hvile efter en netop afsluttet ladning: den FASTE nat-probe
+  # springes over hvis batterierne blev meldt fulde for mindre end så mange
+  # timer siden. Se probe-automationen for kalibreringen. Kun den faste — aften-
+  # sporet skal fortsat kunne fange batteri nr. 2 kort efter nr. 1 blev færdig.
+  # Fresh-min 0,5 er bevidst forskellig fra default 3 (fejlklasse #5): en
+  # sentinel der er lig den ønskede værdi lader init-guarden overskrive
+  # brugerens tal ved hver restart. 0,5 t = i praksis slået fra.
+  cykel_lader_probe_hvile_timer:
+    name: "🔋 Cykel-lader: fast probe kræver hvile siden færdig (t)"
+    min: 0.5
+    max: 12
+    step: 0.5
+    unit_of_measurement: "t"
+    icon: mdi:sleep
+    mode: box
+  # HOLD-TESTEN (2026-09-16). Probens fund-test var ÉT øjebliksbillede efter
+  # `probe_minutter`, og det kan ikke skelne et plateau fra en kurve der falder
+  # forbi tærsklen. MÅLT på alle seks morgen-probes 02/9-16/9:
+  #   09-02  56,8 W @120 s → 26,1 W @180 s  (46 %)  → FALSK fund, plug 10,7 min
+  #   09-03  42,6            0,7            ( 2 %)
+  #   09-04   2,2            0,2            ( 9 %)
+  #   09-05  32,9            0,4            ( 1 %)
+  #   09-15  54,4           23,3            (43 %)  → FALSK fund, plug 10,1 min
+  #   09-16  34,3            0,7            ( 2 %)
+  # Alle seks har samme form: 82-94 W indrykningsspids når pluggen tænder på et
+  # FULDT batteri, derefter monotont fald. To af dem lå tilfældigt stadig over
+  # de 50 W præcis da der blev målt — fundet var et lodkast om hvor på
+  # faldkurven sample-øjeblikket landede. Nul ægte fund i 14 døgn.
+  # En ÆGTE ladning er derimod et PLATEAU: 171-181 W (hans lader) eller
+  # 72-73 W (Parent B's), holdt i timer. Derfor kræves nu et ANDET sample, og at
+  # effekten har HOLDT. Den falske population ligger på 1-46 %, et plateau på
+  # ~100 %; 80 % ligger i et meget bredt hul. Det er niveau-tærsklen
+  # (`lade_watt`) der stadig er gulvet — dette er formen oven i.
+  cykel_lader_probe_hold_pct:
+    name: "🔋 Cykel-lader: probe-fund skal holde (% af første måling)"
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    icon: mdi:chart-line-variant
+    mode: box
+  cykel_lader_probe_bekraeft_sekunder:
+    name: "🔋 Cykel-lader: probe-fund bekræftes efter (s)"
+    min: 15
+    max: 300
+    step: 5
+    unit_of_measurement: "s"
+    icon: mdi:timer-sand
+    mode: box
+  # Batteriets kapacitet. Begge cykelbatterier er 504 Wh (14 Ah × 36 V,
+  # user-oplyst 2026-08-15); hans største målte enkelt-session leverede 501 Wh,
+  # så tallet er bekræftet fra to sider. Det er LADERNE der er forskellige.
+  cykel_lader_batteri_wh:
+    name: "🔋 Cykel-lader: batteri-kapacitet (Wh)"
+    min: 100
+    max: 1500
+    step: 1
+    unit_of_measurement: "Wh"
+    icon: mdi:battery-high
+    mode: box
+  # Li-ion lader ikke ved fuld effekt hele vejen: CC-plateauet afløses af en
+  # CV-taper. Kalibreret på 08-08: 501 Wh ved 175 W tog 208 min = 3,47 t, mod
+  # 2,86 t hvis effekten havde holdt → faktor 1,21.
+  cykel_lader_taper_faktor:
+    name: "🔋 Cykel-lader: taper-tillæg (×)"
+    min: 1.0
+    max: 2.0
+    step: 0.05
+    icon: mdi:chart-bell-curve
+    mode: box
+  # Den LANGSOMSTE laders effekt. Bruges før nattens egen måling findes, så
+  # planen starter pessimistisk (= afsætter nok timer) og først korrigerer NED
+  # når en hurtig lader faktisk er målt. Under-afsætning giver et fladt
+  # batteri; over-afsætning koster ~0 kr, fordi færdig-detektionen slukker
+  # pluggen så snart der ikke lades mere.
+  cykel_lader_langsom_watt:
+    name: "🔋 Cykel-lader: langsomste laders effekt (W)"
+    min: 20
+    max: 300
+    step: 1
+    unit_of_measurement: "W"
+    icon: mdi:speedometer-slow
+    mode: box
+  # Runtime-cursor: nattens målte ladeeffekt (den LAVESTE plateau-effekt set i
+  # dette vindue = den langsomste lader der har siddet på pluggen). 0 = ikke
+  # målt endnu. Nulstilles ved deadline. "cursor" i navnet → ude af snapshottet.
+  cykel_lader_effekt_cursor:
+    name: "🔋 Cykel-lader: målt ladeeffekt (cursor)"
+    min: 0
+    max: 500
+    step: 1
+    unit_of_measurement: "W"
+    icon: mdi:flash-alert
+    mode: box
+  # Runtime-cursor: billige timer talt siden sidste probe. Navnet indeholder
+  # "cursor" → holdes bevidst ude af helper-snapshottet (helpers_export.py),
+  # så git-filen ikke ændrer sig hver nat.
+  cykel_lader_probe_cursor:
+    name: "🔋 Cykel-lader: billige timer siden probe (cursor)"
+    min: 0
+    max: 24
+    step: 1
+    icon: mdi:counter
+    mode: box
+
+input_datetime:
+  # Batterierne skal være fulde her (user-spec: kl. 07 på hverdage).
+  cykel_lader_deadline:
+    name: "🔋 Cykel-lader: klar senest"
+    icon: mdi:clock-check
+    has_date: false
+    has_time: true
+  # Tidligste ladetidspunkt. Default 16:00 → vi lader aldrig i hverdags-
+  # vinduet 08-16 hvor batterierne er ude af huset (user-spec).
+  cykel_lader_vindue_start:
+    name: "🔋 Cykel-lader: tidligst fra"
+    icon: mdi:clock-start
+    has_date: false
+    has_time: true
+  # Den FASTE nat-probe uden for aften-vinduet (user-spec 2026-07-29: "aah
+  # probe også en gang kl 02 om natten"). Ét enkelt tjek — tæller ikke med i
+  # `probe_interval` og kræver ikke en billig time. Morgen-proben (05:00) er
+  # fjernet 2026-10-16 (user-spec, se headeren).
+  cykel_lader_nat_probe:
+    name: "🔋 Cykel-lader: nat-probe kl."
+    icon: mdi:weather-night
+    has_date: false
+    has_time: true
+  # Runtime-cursors (IKKE config — hører ikke i DATETIME_CONFIG/snapshot).
+  # Hvornår en probe sidst fandt last — bruges til at måle hvor kort den
+  # efterfølgende ladning var.
+  cykel_lader_probe_fund_at:
+    name: "🔋 Cykel-lader: probe fandt last (runtime)"
+    icon: mdi:battery-plus-variant
+    has_date: true
+    has_time: true
+  cykel_lader_sidst_faerdig:
+    name: "🔋 Cykel-lader: sidst meldt fuld"
+    icon: mdi:battery-clock
+    has_date: true
+    has_time: true
+
+template:
+  # ===========================================================================
+  # ÉNVEJS-KÆDE: vindue → plan → billig_nu. Ingen template læser sig SELV
+  # (self-reference render'er én cyklus forsinket + kan trippe HA's
+  # "Template loop detected"), og vindues-matematikken står KUN ét sted
+  # (fejlklasse #2). Alle tre bruger now() → HA re-render'er dem hvert minut,
+  # så planen følger timeskiftet uanset pris-sensorens rapport-tempo.
+  # ===========================================================================
+  - sensor:
+      # LED 1 — ladevinduet som "ISO_start|ISO_deadline".
+      # Håndterer midnats-krydsning (fejlklasse #8): står vi FØR start men
+      # stadig før deadline, hører vi til den IGANGVÆRENDE nat → skub et døgn
+      # tilbage. Kl. 10:00 (efter deadline, før start) skubbes der IKKE →
+      # vinduet peger på den kommende nat og i_vindue er false = ingen ladning
+      # i hverdags-vinduet 08-16 hvor batterierne er ude af huset (user-spec).
+      - name: "Cykel lader vindue"
+        unique_id: cykel_lader_vindue
+        icon: mdi:calendar-range
+        state: >-
+          {% set sh = state_attr('input_datetime.cykel_lader_vindue_start', 'hour') | int(16) %}
+          {% set sm = state_attr('input_datetime.cykel_lader_vindue_start', 'minute') | int(0) %}
+          {% set dh = state_attr('input_datetime.cykel_lader_deadline', 'hour') | int(7) %}
+          {% set dm = state_attr('input_datetime.cykel_lader_deadline', 'minute') | int(0) %}
+          {% set st = today_at('%02d:%02d' % (sh, sm)) %}
+          {% set dl = today_at('%02d:%02d' % (dh, dm)) %}
+          {% if dl <= st %}{% set dl = dl + timedelta(days=1) %}{% endif %}
+          {% if now() < st and now() < dl - timedelta(days=1) %}
+            {% set st = st - timedelta(days=1) %}
+            {% set dl = dl - timedelta(days=1) %}
+          {% endif %}
+          {{ st.isoformat() ~ '|' ~ dl.isoformat() }}
+
+      # LED 2 — de `timer_noedvendige` BILLIGSTE resterende timer i vinduet,
+      # som "HH,HH,HH" (state, ikke attribut, så LED 3 kan læse den uden
+      # self-reference). Tom streng = ingen timer valgt / uden for vindue.
+      #
+      # Udvalget sker blandt de RESTERENDE timer → deadline-pres er
+      # automatisk: kl. 05:00 er kun {05,06} tilbage, og 4 billigste af 2 =
+      # begge → pluggen er tændt hele vejen til deadline. Ingen særlogik.
+      # Re-planlægningen betyder også at en NY måling af ladeeffekten (fx da
+      # den langsomme lader blev sat i kl. 23) automatisk udvider planen blandt
+      # de resterende timer — der skal ikke gøres noget aktivt ved timeskiftet.
+      # Bemærk: fordi der re-planlægges hver time kan der samlet blive ladet
+      # MERE end `timer_noedvendige` timer (nye billige timer dukker op i
+      # resten af vinduet). Det er ufarligt — det er effekt-målingen, ikke
+      # timetallet, der afslutter ladningen (færdig-detektionen).
+      # LED 1½ — HVOR MANGE timer skal planen afsætte i nat?
+      #
+      # Husets to cykelbatterier er lige store (504 Wh), men LADERNE er ikke:
+      # målt over 10 døgn i recorderen er hans plateau 171-181 W og hendes
+      # 72-73 W. Ét fast timetal kan derfor ikke passe begge — 5 timer giver
+      # ham 875 Wh (rigeligt) og hende 360 Wh (aldrig fuldt). Derfor regnes
+      # behovet ud af kapacitet ÷ den faktisk MÅLTE effekt.
+      #
+      # Før nattens måling findes bruges `langsom_watt` = pessimistisk. Det er
+      # den billige fejlretning: afsætter vi for mange timer, slukker
+      # færdig-detektionen alligevel pluggen når batteriet er fuldt; afsætter
+      # vi for få, står nogen med et fladt batteri kl. 07.
+      - name: "Cykel lader timer noedvendige"
+        unique_id: cykel_lader_timer_noedvendige
+        icon: mdi:timer-cog
+        unit_of_measurement: "t"
+        state: >-
+          {% set manuel = states('input_number.cykel_lader_session_timer') | float(0) %}
+          {% if manuel > 0 %}
+            {{ manuel | round(0) | int }}
+          {% else %}
+            {% set wh = states('input_number.cykel_lader_batteri_wh') | float(504) %}
+            {% set f = states('input_number.cykel_lader_taper_faktor') | float(1.2) %}
+            {% set maalt = states('input_number.cykel_lader_effekt_cursor') | float(0) %}
+            {% set p = maalt if maalt > 0
+                       else states('input_number.cykel_lader_langsom_watt') | float(72) %}
+            {{ [[(wh * f / [p, 1] | max) | round(0, 'ceil') | int, 1] | max, 24] | min }}
+          {% endif %}
+        attributes:
+          kilde: >-
+            {% if (states('input_number.cykel_lader_session_timer') | float(0)) > 0 %}
+              manuel
+            {% elif (states('input_number.cykel_lader_effekt_cursor') | float(0)) > 0 %}
+              maalt
+            {% else %}
+              antaget_langsom
+            {% endif %}
+          effekt_w: >-
+            {% set maalt = states('input_number.cykel_lader_effekt_cursor') | float(0) %}
+            {{ maalt if maalt > 0
+               else states('input_number.cykel_lader_langsom_watt') | float(72) }}
+
+      - name: "Cykel lader plan"
+        unique_id: cykel_lader_plan
+        icon: mdi:calendar-clock
+        state: >-
+          {% set v = states('sensor.cykel_lader_vindue') %}
+          {% if '|' not in v %}
+            {{ '' }}
+          {% else %}
+            {% set st = v.split('|')[0] | as_datetime %}
+            {% set dl = v.split('|')[1] | as_datetime %}
+            {% set need = (states('sensor.cykel_lader_timer_noedvendige')
+                           | float(4)) | round(0) | int %}
+            {% set cur = now().replace(minute=0, second=0, microsecond=0) %}
+            {% set floor = [st, cur] | max %}
+            {% set raw = (state_attr('sensor.energi_data_service', 'raw_today') or [])
+                       + (state_attr('sensor.energi_data_service', 'raw_tomorrow') or []) %}
+            {% set ns = namespace(win=[]) %}
+            {% for r in raw %}
+              {% set h = r.hour | as_datetime %}
+              {% if h is not none and floor <= h < dl %}
+                {% set ns.win = ns.win + [{'h': h.strftime('%H'), 'p': r.price | float(99)}] %}
+              {% endif %}
+            {% endfor %}
+            {% if ns.win | count == 0 %}
+              {# Ingen prisdata → fallback: de sidste `need` timer før deadline.
+                 Batterierne bliver stadig fulde; vi mister kun optimeringen. #}
+              {% set ns2 = namespace(out=[]) %}
+              {% for i in range(need) %}
+                {% set h = dl - timedelta(hours=need - i) %}
+                {% if h >= floor %}{% set ns2.out = ns2.out + [h.strftime('%H')] %}{% endif %}
+              {% endfor %}
+              {{ ns2.out | join(',') }}
+            {% else %}
+              {% set ns3 = namespace(out=[]) %}
+              {% for c in (ns.win | sort(attribute='p'))[:need] %}
+                {% set ns3.out = ns3.out + [c.h] %}
+              {% endfor %}
+              {{ ns3.out | sort | join(',') }}
+            {% endif %}
+          {% endif %}
+        attributes:
+          i_vindue: >-
+            {% set v = states('sensor.cykel_lader_vindue') %}
+            {% if '|' in v %}
+              {{ (v.split('|')[0] | as_datetime) <= now()
+                 < (v.split('|')[1] | as_datetime) }}
+            {# `{{ false }}`, ikke bare `false`: sidstnævnte bliver STRENGEN
+               "false", som er truthy hos begge forbrugere (`... and`, `not ...`)
+               → LED3 og overrun-guarden ville læse et lukket vindue som åbent. #}
+            {% else %}{{ false }}{% endif %}
+          behov_timer: >-
+            {{ (states('sensor.cykel_lader_timer_noedvendige') | float(4)) | round(0) | int }}
+          behov_kilde: >-
+            {{ state_attr('sensor.cykel_lader_timer_noedvendige', 'kilde') }}
+          kilde: >-
+            {{ 'energi_data_service'
+               if (state_attr('sensor.energi_data_service', 'raw_today') or []) | count > 0
+               else 'fallback_sidste_timer' }}
+          pris_nu: "{{ states('sensor.energi_data_service') }}"
+
+  - sensor:
+      # HISTORIK-tvillingen til sensor.entre_cykel_lader_effekt (2026-10-05).
+      # Den rå sensor er ekskluderet fra recorderen (configuration.yaml): med
+      # relæet slukket svinger måleren 0,2-1,7 W ~250 gange i timen. Her er
+      # slukket/standby = 0, og under ladning skrives kun ændringer ≥ 2 W —
+      # rigeligt til at skelne de to ladere (plateauerne ligger ~2,4× fra
+      # hinanden). Ingen automation læser den; den er til analyse (hq.py).
+      - name: "Cykel lader effekt ren"
+        unique_id: cykel_lader_effekt_ren
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        icon: mdi:flash
+        state: >-
+          {%- set w = states('sensor.entre_cykel_lader_effekt') | float(0) -%}
+          {%- if not is_state('switch.entre_cykel_lader_plug', 'on') or w < 3 -%}
+            0
+          {%- else -%}
+            {%- set gl = this.state | float(-1) if this is defined else -1 -%}
+            {{ gl if gl > 0 and (w - gl) | abs < 2 else w | round(0) }}
+          {%- endif -%}
+
+  - binary_sensor:
+      # Lader der FAKTISK lige nu? (pluggen tændt + reel last på måleren)
+      - name: "Cykel lader nu"
+        unique_id: cykel_lader_nu
+        icon: mdi:battery-charging
+        state: >-
+          {{ is_state('switch.entre_cykel_lader_plug', 'on')
+             and (states('sensor.entre_cykel_lader_effekt') | float(0))
+                 > (states('input_number.cykel_lader_lade_watt') | float(50)) }}
+        # 2026-10-05: attributten `effekt_w` (spejl af effekten) er fjernet —
+        # ingen læste den, og den skrev ~6.100 attribut-rækker/døgn (#24).
+
+      # LED 3 — ENESTE anker for "må vi lade nu" (styring OG probe læser den).
+      - name: "Cykel lader billig nu"
+        unique_id: cykel_lader_billig_nu
+        icon: mdi:cash-clock
+        state: >-
+          {{ state_attr('sensor.cykel_lader_plan', 'i_vindue') | default(false, true)
+             and now().strftime('%H') in states('sensor.cykel_lader_plan').split(',') }}
+        attributes:
+          kilde: "{{ state_attr('sensor.cykel_lader_plan', 'kilde') }}"
+          timer_valgt: "{{ states('sensor.cykel_lader_plan') }}"
+
+automation:
+  # ===========================================================================
+  # STYRING — ét sted der ejer switch-tilstanden (fejlklasse #1: probe og
+  # færdig-detektor skriver også, men kun inde i deres egne, snævre vinduer).
+  # Skriver KUN når tilstanden faktisk skal ændres (ingen no-op relæ-slag).
+  # ===========================================================================
+  - id: cykel_lader_styring
+    alias: "Cykel-lader: tænd/sluk efter billig-time-planen"
+    description: >
+      Pluggen er tændt når vi er i en planlagt billig time og batterierne ikke
+      er meldt fulde. /5-tick + flanker på plan/færdig/spærring.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"
+      - platform: state
+        entity_id:
+          - binary_sensor.cykel_lader_billig_nu
+          - input_boolean.cykel_lader_faerdig
+          - input_boolean.cykel_lader_enabled
+          - input_boolean.cykel_lader_alarm_lock
+    condition:
+      # En probe ejer pluggen mens den kører.
+      - condition: state
+        entity_id: input_boolean.cykel_lader_probe_aktiv
+        state: "off"
+    action:
+      - variables:
+          er_taendt: "{{ is_state('switch.entre_cykel_lader_plug', 'on') }}"
+          # OVERRUN: afbryd ALDRIG en ladning der faktisk løber, blot fordi
+          # HELE VINDUET lukkede (deadline 07:00 nået med et halvt batteri) —
+          # bedre sent end tomt batteri kl. 08. Den slutter af sig selv:
+          # batteriet bliver fuldt eller tages ud → effekten falder →
+          # færdig-detektionen slukker.
+          #
+          # `not i_vindue` er ESSENTIEL (live-testet 2026-07-28): uden den
+          # gælder overrun også mellem DYRE timer INDE i vinduet, og så
+          # låser pluggen sig fast tændt fra første billige time til
+          # batteriet er fuldt — hele pris-optimeringen væk når de billigste
+          # timer ikke ligger i forlængelse af hinanden.
+          overrun: >-
+            {{ er_taendt and is_state('binary_sensor.cykel_lader_nu', 'on')
+               and not (state_attr('sensor.cykel_lader_plan', 'i_vindue')
+                        | default(false, true)) }}
+          # MANUEL TÆNDING VINDER (fejlklasse #3: en time_pattern-backstop
+          # RE-ASSERTER sin tilstand, så "manuel betjening vinder" er falsk
+          # uden en eksplicit mekanisme). Målt 2026-08-15 20:17-20:42: user
+          # tændte pluggen tre gange i hånden, og /5-ticket slukkede den efter
+          # 2-4 min hver gang, fordi vi var INDE i vinduet men i en dyr time →
+          # `overrun` (som kræver `not i_vindue`) reddede den ikke.
+          # Et menneskeligt tryk bærer `context.user_id`; automationens egne
+          # kald og probens gør ikke. Vi slukker derfor ikke en plug et
+          # menneske selv har tændt — den slutter af sig selv når batteriet er
+          # fuldt (færdig-detektionen) eller ved en hard_stop.
+          # BEVIDST ASYMMETRISK (fejlklasse #12): manuel SLUK respekteres IKKE,
+          # for så ville ét tryk slå hele nattens ladning fra i tavshed —
+          # det er hvad `input_boolean.cykel_lader_enabled` er til.
+          manuel_taendt: >-
+            {{ er_taendt
+               and states.switch.entre_cykel_lader_plug is not none
+               and states.switch.entre_cykel_lader_plug.context.user_id is not none }}
+          skal_lade: >-
+            {{ is_state('input_boolean.cykel_lader_enabled', 'on')
+               and is_state('input_boolean.cykel_lader_alarm_lock', 'off')
+               and is_state('input_boolean.cykel_lader_faerdig', 'off')
+               and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+               and (is_state('binary_sensor.cykel_lader_billig_nu', 'on')
+                    or overrun or manuel_taendt) }}
+          # `unavailable`/`unknown` er hverken on eller off (fejlklasse #9).
+          # Pris-templaten kan kortvarigt ikke renderes når EDS-integrationen
+          # genindlæses (~1×/dag, under et sekund) — og fordi det er en
+          # state-FLANKE på `billig_nu`, ramte den styringen med det samme:
+          #   07-29 16:20:06  prisdata → unavailable, plug OFF i SAMME sekund
+          #                   ved 184 W, tilbage først 16:25 på /5-ticket
+          #                   = 5 min af dagens billigste time (0,38 kr/kWh)
+          #                   tabt + en ekstra tænd/sluk-cyklus på laderen.
+          #   07-30 16:54:55  samme, 5 s afbrydelse midt i en ladning.
+          # Vi TÆNDER stadig kun på et ægte 'on' (`skal_lade` kræver det), men
+          # vi SLUKKER ikke længere på en ukendt pris — næste rigtige flanke
+          # (som kommer under et sekund senere) afgør sagen.
+          pris_kendt: >-
+            {{ states('binary_sensor.cykel_lader_billig_nu') in ['on', 'off'] }}
+          # Stop-årsager der IKKE har med prisen at gøre: røgalarm-låsen,
+          # kill-switchen, batterier fulde, mode-skift til AirBnB. De skal
+          # kunne slukke pluggen også mens pris-sensoren er ukendt — ellers
+          # ville pris_kendt-guarden ovenfor blokere en sikkerheds-sluk.
+          # (Røgalarmen slukker desuden pluggen DIREKTE i packages/
+          # roegalarm.yaml, så det her er andet lag, ikke det eneste.)
+          hard_stop: >-
+            {{ is_state('input_boolean.cykel_lader_enabled', 'off')
+               or is_state('input_boolean.cykel_lader_alarm_lock', 'on')
+               or is_state('input_boolean.cykel_lader_faerdig', 'on')
+               or states('input_select.house_mode') not in ['Normal', 'Home Vacation'] }}
+      - choose:
+          - conditions: "{{ skal_lade and not er_taendt }}"
+            sequence:
+              - service: switch.turn_on
+                target: {entity_id: switch.entre_cykel_lader_plug}
+              - service: logbook.log
+                data:
+                  name: "Cykel-lader"
+                  message: >-
+                    Tændt — billig time ({{ states('sensor.energi_data_service')
+                    | float(0) | round(2) }} kr/kWh). Plan:
+                    {{ states('sensor.cykel_lader_plan') }}.
+          - conditions: "{{ er_taendt and (hard_stop or (not skal_lade and pris_kendt)) }}"
+            sequence:
+              - service: switch.turn_off
+                target: {entity_id: switch.entre_cykel_lader_plug}
+
+  # ===========================================================================
+  # EFFEKT-MÅLING — hvilken lader sidder der på pluggen i nat?
+  #
+  # `numeric_state` fyrer kun på KRYDSNINGEN op over tærsklen, og `for:` kræver
+  # at effekten bliver deroppe i 3 min. Det udelukker begge falske kilder:
+  #   • et fuldt batteri der tager en top-off-puls ved en probe falder under
+  #     50 W igen inden for ~50 s (målt) → krydsningen fyrer, men `for:` løber ud
+  #   • CV-taperen i slutningen af en ægte session GÅR NEDAD gennem 50-80 W →
+  #     den krydser aldrig OP igen, så den kan ikke forveksles med en langsom
+  #     lader der lige er sat i
+  # Tre minutter inde i et forløb er vi midt på CC-plateauet = laderens identitet.
+  #
+  # Vi gemmer den LAVESTE måling i vinduet: sidder begge batterier på pluggen i
+  # løbet af natten, er det den langsomste der bestemmer hvor mange timer der
+  # skal afsættes. Nulstilles ved deadline (se `cykel_lader_nyt_vindue`).
+  # ===========================================================================
+  - id: cykel_lader_maal_effekt
+    alias: "Cykel-lader: mål laderens effekt"
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.entre_cykel_lader_effekt
+        above: input_number.cykel_lader_lade_watt
+        for:
+          minutes: 3
+    action:
+      - variables:
+          ny: "{{ states('sensor.entre_cykel_lader_effekt') | float(0) }}"
+          gl: "{{ states('input_number.cykel_lader_effekt_cursor') | float(0) }}"
+      - service: input_number.set_value
+        target: {entity_id: input_number.cykel_lader_effekt_cursor}
+        data:
+          value: "{{ (ny if gl <= 0 else [ny, gl] | min) | round(0) }}"
+      - service: logbook.log
+        data:
+          name: "Cykel-lader"
+          entity_id: sensor.cykel_lader_timer_noedvendige
+          message: >-
+            Ladeeffekt målt til {{ ny | round(0) }} W
+            {%- if gl > 0 and gl <= ny %} (beholder {{ gl | round(0) }} W —
+            den langsomste i vinduet bestemmer){% endif %}.
+
+  # ===========================================================================
+  # FÆRDIG-DETEKTION — effekten falder til tomgang mens pluggen er tændt.
+  # numeric_state + for: (IKKE last_changed — analog sensor, fejlklasse #14).
+  # ===========================================================================
+  - id: cykel_lader_faerdig_detekt
+    alias: "Cykel-lader: tomgang → batterier fulde"
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.entre_cykel_lader_effekt
+        below: input_number.cykel_lader_idle_watt
+        for:
+          minutes: "{{ states('input_number.cykel_lader_faerdig_minutter') | int(10) }}"
+    condition:
+      - condition: state
+        entity_id: switch.entre_cykel_lader_plug
+        state: "on"
+      # Settle: effekt-sensoren beholder sin sidste værdi ~8 s efter sluk →
+      # kræv at pluggen har været tændt et stykke tid, så vi ikke læser stale.
+      - condition: template
+        value_template: >-
+          {{ (now() - states.switch.entre_cykel_lader_plug.last_changed
+             ).total_seconds() > 120 }}
+      - condition: state
+        entity_id: input_boolean.cykel_lader_probe_aktiv
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.cykel_lader_faerdig
+        state: "off"
+    action:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.cykel_lader_faerdig}
+      # Nulstil probe-tælleren: der skal gå et fuldt interval af billige timer
+      # før vi giver det netop fyldte batteri en top-off.
+      - service: input_number.set_value
+        target: {entity_id: input_number.cykel_lader_probe_cursor}
+        data:
+          value: 0
+      # Var denne ladning startet af en probe, og varede den kun kort? (slid)
+      # User-spec 2026-07-29: "de vil nok altid gå i gang med at lade lidt når
+      # du tænder pluggen, men kun kortvarigt" → en kort ladning efter en probe
+      # er IKKE et nyt batteri, og så skal vi holde helt op med at probe.
+      #
+      # `timestamp`-attributten, ikke as_timestamp(states(...)) — sidstnævnte
+      # parser den naive streng som UTC (+2 t skew, B67). 0 = aldrig stemplet.
+      # Selve LADE-tiden er ikke (now - fund_ts): stemplet blev sat efter
+      # probens delay (ladningen kørte allerede), og triggeren her fyrer først
+      # `faerdig_minutter` efter effekten faldt. Derfor korrigeres begge veje,
+      # så slideren betyder præcis dét brugeren sagde: "slår fra igen inden 30
+      # min".
+      - variables:
+          fund_ts: >-
+            {{ state_attr('input_datetime.cykel_lader_probe_fund_at', 'timestamp')
+               | float(0) }}
+          lade_min: >-
+            {% set t = state_attr('input_datetime.cykel_lader_probe_fund_at',
+                                  'timestamp') | float(0) %}
+            {% set raa = (now().timestamp() - t) / 60
+                         - (states('input_number.cykel_lader_faerdig_minutter') | float(5))
+                         + (states('input_number.cykel_lader_probe_minutter') | float(2)) %}
+            {{ 0 if t <= 0 else [raa, 0] | max | round(1) }}
+          stop_min: >-
+            {{ states('input_number.cykel_lader_probe_stop_minutter') | float(30) }}
+      - if:
+          - condition: template
+            value_template: "{{ fund_ts > 0 and lade_min | float(0) < stop_min | float(30) }}"
+        then:
+          - service: input_boolean.turn_on
+            target: {entity_id: input_boolean.cykel_lader_probe_stop}
+          # SLID: dette ER "99 → 100 igen". Tæl den og bogfør de Wh der gik ind
+          # fra probens stempel og frem (pluggen slukkes få linjer nede).
+          - service: counter.increment
+            target:
+              entity_id:
+                - counter.cykel_lader_topoff_24h
+                - counter.cykel_lader_topoff_total
+          - service: script.turn_on
+            target: {entity_id: script.cykel_lader_slid_bogfoer}
+          - service: logbook.log
+            data:
+              name: "Cykel-lader"
+              message: >-
+                Proben "fandt" en last der kun ladede ~{{ lade_min }} min
+                (< {{ stop_min | round(0) }}) = et fuldt batteri der tog en kort
+                top-off, ikke et nyt batteri. Ingen flere probes før deadline.
+        else:
+          # Ægte ladning (eller manuelt tilsluttet batteri) → intet slid.
+          # Ryd stemplet, ellers ville næste bogføring tælle hele denne rigtige
+          # ladning med som slid.
+          - service: input_number.set_value
+            target: {entity_id: input_number.cykel_lader_energi_cursor_probe}
+            data:
+              value: 0
+          - if:
+              - condition: template
+                value_template: "{{ fund_ts > 0 }}"
+            then:
+              - service: logbook.log
+                data:
+                  name: "Cykel-lader"
+                  message: >-
+                    Probe-fundet ladede ~{{ lade_min }} min
+                    (≥ {{ stop_min | round(0) }}) = ægte nyt batteri.
+                    Probing fortsætter i vinduet.
+      # Ryd stemplet: næste færdig-detektion må ikke måle mod et gammelt fund.
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.cykel_lader_probe_fund_at}
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.cykel_lader_sidst_faerdig}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: switch.turn_off
+        target: {entity_id: switch.entre_cykel_lader_plug}
+      - service: script.push_notify
+        data:
+          notif_id: cykel_lader
+          title: "🔋 Cykelbatterier fulde"
+          message: >-
+            Ladningen er færdig ({{ states('sensor.entre_cykel_lader_effekt') }} W
+            i tomgang). Pluggen er slukket.
+            {% if is_state('input_boolean.cykel_lader_probe_stop', 'on') %}
+            Ladningen varede kun ~{{ lade_min }} min efter en probe = top-off på
+            et fuldt batteri → jeg prober ikke mere før deadline.
+            {% else %}
+            Sætter du et batteri mere til, finder jeg det ved næste probe (om
+            aftenen hver
+            {{ states('input_number.cykel_lader_probe_interval') | int(2) }}. billige
+            time, ellers kl.
+            {{ states('input_datetime.cykel_lader_nat_probe')[:5] }}).
+            {% endif %}
+          # Lander typisk midt om natten (billigste timer er 01-04) → LYDLØS.
+          # `importance: low` = ingen lyd/vibration, men beskeden ligger klar
+          # om morgenen. Samme `tag` på alle cykel-lader-pushes → de erstatter
+          # hinanden i stedet for at stakke.
+          payload:
+            tag: cykel_lader
+            channel: "Cykel-lader"
+            importance: low
+
+  # ===========================================================================
+  # PROBE — eneste måde at opdage batteri nr. 2 (user-spec): pluggen er slukket
+  # når `faerdig` er sat, så et nyt batteri er usynligt uden at tænde kort.
+  # Time_pattern (ikke flanke) fordi `billig_nu` kan stå ON i timer i træk →
+  # ingen ny flanke at hænge proben på (fejlklasse #4).
+  #
+  # TO PROBE-SPOR (user-spec 2026-07-29: "aah probe også en gang kl 02 om
+  # natten"; morgen-proben 05:00 fjernet 2026-10-16, user-spec):
+  #   AFTEN  — ét tick pr. time (:02, ikke :00: plan/billig_nu er now()-
+  #            templates der re-render'er på minut-skiftet, så :02 sikrer at vi
+  #            ikke prober på en stale plan). Kun fra `vindue_start` til
+  #            midnat = det tidsrum hvor nogen faktisk KOMMER HJEM og sætter et
+  #            batteri til. Kun i en billig time, og kun hver
+  #            `probe_interval`-te af dem.
+  #   NAT    — ét fast tjek kl. `cykel_lader_nat_probe` (02:00). Hviler efter en
+  #            netop afsluttet ladning (se hvile-guarden nedenfor).
+  # Nat-proben er U-GATET på billig-time og tæller ikke med i intervallet:
+  # den er én probe, og hele pointen er at fange et batteri der blev sat
+  # til uden for aften-vinduet, mens der stadig er timer nok før deadline.
+  # Aften-vinduet følger `vindue_start` frem for et hårdkodet 16 (fejlklasse
+  # #2: to steder med samme tal divergerer når slideren flyttes).
+  # ===========================================================================
+  - id: cykel_lader_probe
+    alias: "Cykel-lader: probe for nyt batteri"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "2"
+        id: aften
+      - platform: time
+        at: input_datetime.cykel_lader_nat_probe
+        id: nat
+    condition:
+      - condition: state
+        entity_id: input_boolean.cykel_lader_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.cykel_lader_alarm_lock
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.cykel_lader_faerdig
+        state: "on"
+      # En probe har allerede afsløret sig selv som top-off → ingen flere
+      # probes i dette vindue, hverken aften eller nat (user-spec).
+      - condition: state
+        entity_id: input_boolean.cykel_lader_probe_stop
+        state: "off"
+      - condition: template
+        value_template: >-
+          {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+    action:
+      # HVILE efter en netop afsluttet ladning (2026-07-31, målt på de første
+      # tre døgns drift). Nat-proben findes for at fange et batteri der
+      # blev sat til UDEN FOR aften-vinduet — men blev en ægte ladning meldt
+      # færdig for få timer siden, er der intet nyt at finde: ingen sætter et
+      # batteri til kl. 03. Facit fra history:
+      #   07-30 05:00  færdig 41 min før  → 26 W puls, intet fundet, 1 Wh slid
+      #   07-31 05:00  færdig 2,6 t før   → 81 W puls, intet fundet, 2 Wh slid
+      #   07-30 02:00  færdig 9,3 t før   → 96 W = ÆGTE batteri, 134 min ladning
+      # Kløften mellem spild (≤ 2,6 t) og fund (9,3 t) er bred; 3 t ligger
+      # trygt imellem. Begge spild-probes var blevet sprunget over, den
+      # produktive beholdt. Gælder KUN `fast`: aften-sporet skal stadig kunne
+      # opdage batteri nr. 2 en halv time efter nr. 1 blev færdig.
+      #
+      # Guarden læser `sidst_faerdig` (skrives af færdig-detektoren ved hver
+      # ægte afslutning) via `timestamp`-attributten, som er korrekt for en SAT
+      # værdi — jf. CLAUDE.md's note om at en ALDRIG-sat has_date-helper står
+      # på dagens midnat og læses 2 t forskudt. Kravet om et POSITIVT gap gør
+      # at et fremtidigt/uskrevet stempel ikke kan spærre proben permanent.
+      #
+      - if:
+          - condition: template
+            value_template: >-
+              {% set hvile = states('input_number.cykel_lader_probe_hvile_timer')
+                             | float(3) %}
+              {% set f = state_attr('input_datetime.cykel_lader_sidst_faerdig',
+                                    'timestamp') | float(0) %}
+              {% set gap = now().timestamp() - f %}
+              {{ trigger.id == 'nat' and f > 0 and 0 < gap < hvile * 3600 }}
+        then:
+          - service: logbook.log
+            data:
+              name: "Cykel-lader"
+              message: >-
+                Nat-probe sprunget over — batterierne blev meldt fulde
+                {{ ((now().timestamp()
+                     - (state_attr('input_datetime.cykel_lader_sidst_faerdig',
+                                   'timestamp') | float(0))) / 3600) | round(1) }} t
+                siden (kræver {{ states('input_number.cykel_lader_probe_hvile_timer')
+                | float(3) | round(1) }} t hvile). Ingen top-off på et fuldt batteri.
+          - stop: "Fast probe i hvile-vinduet efter en netop afsluttet ladning."
+      # Den faste nat-probe springer hele aften-logikken over.
+      - if:
+          - condition: template
+            value_template: "{{ trigger.id == 'aften' }}"
+        then:
+          # Uden for aften-vinduet, eller i en dyr time → rør ikke pluggen.
+          - if:
+              - condition: template
+                value_template: >-
+                  {% set fra = state_attr('input_datetime.cykel_lader_vindue_start',
+                                          'hour') | int(16) %}
+                  {{ now().hour < fra
+                     or is_state('binary_sensor.cykel_lader_billig_nu', 'off') }}
+            then:
+              - stop: "Uden for aften-probevinduet / ikke en billig time."
+          # Billig time nr. `taeller` siden sidste probe. Er vi ikke nået til
+          # intervallet, tæller vi bare op og går hjem — pluggen røres ikke, og
+          # det fulde batteri får ingen top-off.
+          - variables:
+              taeller: >-
+                {{ (states('input_number.cykel_lader_probe_cursor') | float(0))
+                   | round(0) | int + 1 }}
+              interval: >-
+                {{ (states('input_number.cykel_lader_probe_interval') | float(2))
+                   | round(0) | int }}
+          - if:
+              - condition: template
+                value_template: "{{ taeller < interval }}"
+            then:
+              - service: input_number.set_value
+                target: {entity_id: input_number.cykel_lader_probe_cursor}
+                data:
+                  value: "{{ taeller }}"
+              - stop: "Billig time {{ taeller }}/{{ interval }} siden sidste probe — venter."
+          - service: input_number.set_value
+            target: {entity_id: input_number.cykel_lader_probe_cursor}
+            data:
+              value: 0
+      # SLID-REGNSKAB (packages/cykel_lader_slid.yaml): tæl proben og stempl
+      # integrations-tællerens stand, så vi bagefter kan måle præcis hvor mange
+      # Wh der gik ind i batteriet under proben. Stemplet ryddes af
+      # `script.cykel_lader_slid_bogfoer` (eller af færdig-detektoren når
+      # ladningen viste sig at være ægte).
+      - service: counter.increment
+        target:
+          entity_id:
+            - counter.cykel_lader_probe_24h
+            - counter.cykel_lader_probe_total
+      - service: input_number.set_value
+        target: {entity_id: input_number.cykel_lader_energi_cursor_probe}
+        data:
+          value: "{{ states('sensor.cykel_lader_effekt_energi') | float(0) }}"
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.cykel_lader_probe_aktiv}
+      - service: switch.turn_on
+        target: {entity_id: switch.entre_cykel_lader_plug}
+      - delay:
+          minutes: "{{ states('input_number.cykel_lader_probe_minutter') | int(5) }}"
+      - variables:
+          effekt_1: "{{ states('sensor.entre_cykel_lader_effekt') | float(0) }}"
+          graense: "{{ states('input_number.cykel_lader_lade_watt') | float(50) }}"
+      # HOLD-TESTEN (2026-09-16). Niveauet alene er ikke et fund: når pluggen
+      # tænder på et FULDT batteri, kommer der en indrykningsspids på 82-94 W
+      # som derefter falder monotont, og ét øjebliksbillede kan ikke skelne den
+      # fra et plateau. Målt på alle seks morgen-probes 02/9-16/9: to af dem lå
+      # tilfældigt stadig over de 50 W netop da der blev målt, og begge holdt så
+      # pluggen tændt ~10 min på et fuldt batteri. Nul ægte fund i 14 døgn.
+      # En ægte ladning HOLDER sit niveau (171-181 W hans, 72-73 W Parent B's, i
+      # timer); den falske population var faldet til 1-46 % et minut senere.
+      # Derfor et andet sample. Det koster `probe_bekraeft_sekunder` ekstra
+      # plug-tid på et ægte fund — men det fund lader videre i timer alligevel,
+      # så prisen rammer kun de falske, hvor den sparer 8 minutter.
+      # REPLAY af alle seks probes med begge nye værn: 09-15 spærres af hvilen,
+      # 09-02 af hold-testen (den havde ingen forudgående `faerdig` i vinduet,
+      # så hvilen kunne ikke hjælpe dér — derfor skal BEGGE værn findes), og de
+      # fire øvrige falder allerede på niveauet. Nul ægte fund blev berørt.
+      #
+      # BEVIDST FAIL-OPEN: effekt-pluggen er delta-rapporteret, så et
+      # sample-hul betyder "uændret" (CLAUDE.md). Stopper rapporteringen mellem
+      # de to målinger, læses samme værdi to gange = 100 % = fund. Det er den
+      # rigtige retning: en spildt probe koster 1-2 Wh slid, en misset ladning
+      # koster en cykeltur. Begge udfald skriver procenten i logbogen, så en
+      # fejlagtig afvisning af et ÆGTE batteri er synlig bagefter.
+      - delay:
+          seconds: >-
+            {{ states('input_number.cykel_lader_probe_bekraeft_sekunder')
+               | int(60) }}
+      - variables:
+          effekt: "{{ states('sensor.entre_cykel_lader_effekt') | float(0) }}"
+          hold_pct: >-
+            {{ states('input_number.cykel_lader_probe_hold_pct') | float(80) }}
+          holdt: >-
+            {{ effekt_1 | float(0) > 0
+               and (effekt | float(0)) >= (effekt_1 | float(0)) * hold_pct / 100 }}
+      - choose:
+          - conditions: "{{ effekt_1 | float(0) > graense and holdt }}"
+            sequence:
+              - service: counter.increment
+                target: {entity_id: counter.cykel_lader_fund_24h}
+              # Nyt batteri → frisk session.
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.cykel_lader_faerdig}
+              # Stempel: færdig-detektoren måler herfra hvor længe "fundet"
+              # faktisk ladede. Kort ladning = det var ikke et nyt batteri.
+              - service: input_datetime.set_datetime
+                target: {entity_id: input_datetime.cykel_lader_probe_fund_at}
+                data:
+                  datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+              - service: logbook.log
+                data:
+                  name: "Cykel-lader"
+                  message: >-
+                    Probe ({{ trigger.id }}) fandt last: {{ effekt_1 | round(0) }} W
+                    > {{ graense | round(0) }} W, og effekten HOLDT
+                    ({{ effekt | round(0) }} W efter
+                    {{ states('input_number.cykel_lader_probe_bekraeft_sekunder')
+                       | int(60) }} s =
+                    {{ (100 * effekt | float(0)
+                        / (effekt_1 | float(1))) | round(0) }} %,
+                    kræver {{ hold_pct | round(0) }} %) → lader videre.
+              - service: script.push_notify
+                data:
+                  notif_id: cykel_lader
+                  title: "🔋 Nyt cykelbatteri fundet"
+                  message: >-
+                    Der er sat et batteri mere til ({{ effekt | round(0) }} W).
+                    Det lades færdigt inden
+                    {{ state_attr('input_datetime.cykel_lader_deadline', 'timestamp')
+                       | int // 3600 }}:00.
+                  payload:
+                    tag: cykel_lader
+                    channel: "Cykel-lader"
+                    importance: low
+        default:
+          - service: switch.turn_off
+            target: {entity_id: switch.entre_cykel_lader_plug}
+          # "Intet nyt batteri" betyder ikke "ingen strøm brugt": et fuldt
+          # batteri slår typisk til et øjeblik når pluggen tændes og er faldet
+          # til ro igen inden vi måler. Bogfør hvad der faktisk gik ind.
+          # Fire-and-forget — scriptet venter 90 s på integrations-sensoren.
+          - service: script.turn_on
+            target: {entity_id: script.cykel_lader_slid_bogfoer}
+          - service: logbook.log
+            data:
+              name: "Cykel-lader"
+              message: >-
+                Probe ({{ trigger.id }}) fandt intet nyt batteri —
+                {% if effekt_1 | float(0) <= graense | float(0) %}
+                  {{ effekt_1 | round(0) }} W ≤ {{ graense | round(0) }} W.
+                {% else %}
+                  {{ effekt_1 | round(0) }} W faldt til {{ effekt | round(0) }} W
+                  ({{ (100 * effekt | float(0)
+                       / (effekt_1 | float(1))) | round(0) }} %, kræver
+                  {{ hold_pct | round(0) }} %) = et fuldt batteris
+                  indrykningsspids, ikke en ladning.
+                {% endif %}
+                Pluggen slukket igen.
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.cykel_lader_probe_aktiv}
+
+  # ===========================================================================
+  # STUCK-BACKSTOP for `probe_aktiv`. Proben sætter flaget, venter
+  # `probe_minutter` og rydder det — men en HA-restart (eller reload) MIDT i
+  # delayen dræber sekvensen og efterlader flaget ON. Flaget er en condition i
+  # styringen, så et stuck ON spærrer AL ladning lydløst for altid.
+  # Samme mønster som husets øvrige godnat-subflag-safety.
+  # ===========================================================================
+  - id: cykel_lader_probe_stuck
+    alias: "Cykel-lader: ryd hængende probe-flag"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: state
+        entity_id: input_boolean.cykel_lader_probe_aktiv
+        state: "on"
+      # Binært flag → last_changed er lovligt her (fejlklasse #14 gælder kun
+      # analoge sensorer). Margin: probe-længden + 10 min.
+      - condition: template
+        value_template: >-
+          {{ (now() - states.input_boolean.cykel_lader_probe_aktiv.last_changed
+             ).total_seconds()
+             > (states('input_number.cykel_lader_probe_minutter') | float(5) + 10) * 60 }}
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.cykel_lader_probe_aktiv}
+      - service: logbook.log
+        data:
+          name: "Cykel-lader"
+          message: >-
+            Ryddede hængende probe-flag (afbrudt sekvens, formentlig restart).
+            Styringen kan lade igen.
+
+  # ===========================================================================
+  # NYT VINDUE ved deadline: ryd `faerdig` så næste nat planlægges forfra.
+  # Er batterierne IKKE fulde, siger vi det — og ladningen FORTSÆTTER, fordi
+  # styringens `overrun` ikke afbryder en ladning der faktisk løber (bedre
+  # sent end tomt batteri kl. 08). Den slutter selv når effekten falder.
+  # ===========================================================================
+  - id: cykel_lader_nyt_vindue
+    alias: "Cykel-lader: nulstil ved deadline"
+    mode: single
+    trigger:
+      - platform: time
+        at: input_datetime.cykel_lader_deadline
+    action:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.cykel_lader_faerdig
+                state: "off"
+              - condition: state
+                entity_id: input_boolean.cykel_lader_enabled
+                state: "on"
+              - condition: state
+                entity_id: input_boolean.cykel_lader_alarm_lock
+                state: "off"
+            sequence:
+              - service: script.push_notify
+                data:
+                  notif_id: cykel_lader
+                  title: "🔋 Cykelbatterier ikke meldt fulde"
+                  message: >-
+                    Deadline nået uden at effekten faldt til tomgang. Effekt nu:
+                    {{ states('sensor.entre_cykel_lader_effekt') }} W. Enten
+                    lader den stadig, eller der har ikke været noget tilsluttet.
+                  # Denne skal HØRES — den kommer kl. 07 og er handlingsbar
+                  # (batteriet er ikke fuldt inden du skal ud ad døren).
+                  payload:
+                    tag: cykel_lader
+                    channel: "Cykel-lader"
+      # Vent til plan/billig_nu har fulgt timeskiftet før `faerdig` ryddes.
+      # Uden dette fyrede styringen på faerdig-flanken mens `billig_nu` stadig
+      # var stale ON fra timen før → pluggen blev tændt og slukket igen i
+      # samme sekund (observeret 07-29 07:00:00) = et unødigt relæ-slag og en
+      # ministrømpuls til et fuldt batteri.
+      - delay:
+          seconds: 30
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.cykel_lader_faerdig}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.cykel_lader_probe_aktiv}
+      # Top-off-låsen gælder ét vindue: en ny dag skal kunne probe igen.
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.cykel_lader_probe_stop}
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.cykel_lader_probe_fund_at}
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: input_number.set_value
+        target: {entity_id: input_number.cykel_lader_probe_cursor}
+        data:
+          value: 0
+      # Nyt vindue = nyt slid-regnskab: et hængende stempel (fx probe afbrudt af
+      # restart) må ikke måle hen over hele det næste døgns ægte ladning.
+      - service: input_number.set_value
+        target: {entity_id: input_number.cykel_lader_energi_cursor_probe}
+        data:
+          value: 0
+      # Nyt vindue = ny lader-antagelse. Nulstil til 0 = "ikke målt endnu", så
+      # planen igen starter pessimistisk (langsom lader). Gør vi det ikke,
+      # arver i morgen nat hans 175 W og afsætter 4 timer til hendes batteri.
+      - service: input_number.set_value
+        target: {entity_id: input_number.cykel_lader_effekt_cursor}
+        data:
+          value: 0

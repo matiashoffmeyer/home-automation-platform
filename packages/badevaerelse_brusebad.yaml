@@ -1,0 +1,1324 @@
+# =============================================================================
+# Brusebad-detektion via klima-signatur (2026-09-01, user-spec)
+# =============================================================================
+# HARDWARE: IKEA TIMMERFLOTTE (Matter node 463, parret 2026-09-01) monteret i
+# badet → sensor.badevaerelse_timmerflotte_humidity / _temperature.
+# Rapporterings-kadence målt på husets FØRSTE TIMMERFLOTTE (køkkenet, node 434,
+# 48 t): min-gap 19 s, gennemsnit 309 s, max 1172 s. Den rapporterer altså KUN
+# hurtigt når værdien faktisk bevæger sig — hvilket er præcis under et brusebad.
+# Konsekvens: alt måles i VINDUER (10/20 min), aldrig som en kant mellem to
+# samples, og aldrig som en `for:` på selve råsensoren.
+#
+# PROBLEMET (målt 2026-09-01, user i bad kl. 06:17-06:21):
+#   Wasp krævede en NY inde-PIR-flanke bag lukket dør. Går man direkte i
+#   bruseren bag glasset, kommer den flanke aldrig — PIR'erne var tavse fra
+#   06:17:15 og leave-off slukkede 06:21:15 midt i badet. Dør-lukning-stien
+#   (badevaerelse_wasp_arm_doerluk) blev bygget samme dag, men dørsensoren
+#   rapporterede ÅBEN hele besøget den morgen, så den sti havde ikke selv
+#   fanget det. Badet mangler et bevis der hverken kræver PIR eller dør.
+#
+# TØRRETUMBLEREN (user 2026-09-01): badet rummer også en tørretumbler, som
+# løfter både fugt og varme — bare langsommere og mindre. Den må ALDRIG tænde
+# lyset. Magnituden alene kan ikke skelne dem, men FORMEN kan: signaturen
+# kræver derfor både en 10-min-magnitude OG en 5-min-BURST. En tumbler smører
+# sin stigning ud over 30-90 min og kan ikke levere bursten. Ekstra lag: en
+# indre-PIR skal være set inden for indgangs-vinduet (den der startede
+# tumbleren er gået igen; den der går i bad er lige kommet ind).
+# Alle tre tal er gæt — binary_sensor.badevaerelse_tumbler_mistanke
+# mærker tumbler-formen i historikken uden at gøre noget, så en uges data kan
+# afgøre hvor skellet reelt ligger.
+#
+# LØSNINGEN: DAMPEN er beviset. Et brusebad er den eneste ting i lejligheden
+# der løfter luftfugtigheden mange point på få minutter SAMTIDIG med at
+# temperaturen stiger. Ingen af de to alene er nok (et vådt håndklæde løfter
+# fugt uden varme; morgensolen løfter varme uden fugt) — signaturen er PARRET.
+# (2026-10-01: ikke længere — fugten alene er nok, se nederst i headeren.)
+#
+# SESSIONEN (user-spec): når signaturen ses, erklæres FULD session i badet, og
+# den holder indtil nogen trigger de indre bad-PIR'er igen = man er trådt ud af
+# bruseren. Sessionen slukker IKKE lyset når den slipper — den giver bare
+# badets normale stadie-maskineri (som står på Fuld) styringen tilbage, så
+# leave-off/medium-off først slukker efter deres egne vinduer. "Ikke lige når
+# det sker", som user formulerede det.
+#
+# UDGANGE, alle automatiske (ingen kan hænge):
+#   1. (FJERNET 2026-10-01, user-spec: "hvis der har været høj fugt skal lyset
+#      først slukke når fugtigheden begynder at falde". En indre-PIR slap
+#      sessionen 06:11:21 mens fugten steg til 79,3 % frem til 06:21:27.)
+#   2. Fugten er faldet mærkbart fra sessionens 10-min-top → hovedvejen.
+#   3. Hård levetid (maks-minutter) → sidste net. Badets egen max-on watchdog
+#      er BEVIDST ikke vetoet og er derfor stadig det ydre net oven i denne.
+#
+# BLANKING (historisk): de indre PIR'er fyrer mens man klæder om lige FØR badet,
+# så PIR-udgangen talte tidligst blank_minutter efter armeringen. PIR-udgangen
+# er væk (2026-10-01); slideren er nu fald-udgangens mindste sessions-alder.
+#
+# AIRBNB: ingen mode-gate. En gæst der går i bad skal have præcis samme
+# beskyttelse, og alle tre udgange er automatiske — der er ingen tilstand han
+# kan blive fanget i uden at kende systemet. Flagene ryddes ved AirBnB entry og
+# exit (automations/airbnb_mode.yaml) så gæst og familie ikke arver hinandens
+# session.
+#
+# TÆRSKLERNE VAR GÆT — ÉT ægte bad er nu målt (2026-09-02, 06:14-06:30):
+#   RH 58,01 → 79,06 (+21,1 point, top efter 8 min), temp 24,66 → 25,09
+#   (+0,43 °C, top efter 11 min). Rapporterings-kadencen holdt: sensoren gik fra
+#   293 s i hvile til 58-175 s da værdien bevægede sig — MEN det første sample
+#   der overhovedet viste badet kom 5 min efter indgangen. Det er sensorens
+#   fysiske gulv, og det kan ikke kodes væk: en klima-baseret detektion kan
+#   ALDRIG nå at forhindre et sluk der falder 4 min inde. Den kan kun rejse
+#   lyset igen bagefter — derfor er genrejsningen i arm-actionen (og
+#   stadie-løftet foran den) lige så kritisk som selve armeringen.
+# Fugt-tærsklerne (8 point/10 min, 5 point/5 min) er stadig gæt og lå med god
+# margen under det målte. Temp-tærsklen ER kalibreret — se slideren nedenfor.
+#
+# 2026-10-01 — FUGTEN ER BEVISET, TEMPERATUREN ER IKKE (user-bug: "bad lys gik
+# ud på Parent B da hun var i bad! blev fugtigt inden! den skal vente på en
+# fugtmåling!"). Forløbet: besøg 05:58:08, første Timmerflotte-sample 06:01:55
+# viste RH 50,98 → 61,53 = +10,6 point på ét sample — men temp-leddet stod på
+# +0,07 °C, så signaturen armede ikke. Ventetiden ("afventer klimabevis")
+# slap i SAMME sekund, fordi den kun ventede på AT sensoren sagde noget, ikke
+# på HVAD den sagde. Leave-off slukkede 06:04:05, hun vinkede lyset tilbage
+# 06:04:08. Målt 14 døgn (17/9-1/10): 26 fugt-burst-episoder (burst ≥ 3),
+# ALLE under et bad-besøg med lys + PIR; ikke-bad-halvtimer topper på 2,24.
+# Temp-leddet forsinkede armeringen 30-498 s og nåede ALDRIG 0,2 °C i 7 af 26
+# (typisk bad nr. 2 i et allerede varmt bad), og 4 af 9 mørke-episoder under
+# et bad lå i netop det hul. Derfor: temp-kravet er FJERNET (user bekræftede
+# samme dag: "fugt er alt rigeligt"; tumbleren giver minimale stigninger),
+# ventetiden holder broen til sessionen når fugten har
+# sagt "bad" (binary_sensor.badevaerelse_fugt_bevis), og fugt-vinduerne bærer
+# forrige sample med (sensor.badevaerelse_fugt_forrige) — sensorens hviletakt
+# er 293 s mod et 300-s burst-vindue, så bunden kunne fordampe.
+# =============================================================================
+
+input_number:
+  # Hvor mange RH-point fugten skal være steget over de seneste 10 min før det
+  # tæller som damp. GÆT: et varmt brusebad løfter typisk badets RH fra 50-60 %
+  # til 85-95 % på 3-5 min = 6-12 point pr. 10-min-vindue selv med udsugning.
+  # For lavt → håndvask med varmt vand kan arme; for højt → et kort/køligt bad
+  # ses aldrig. (Et temp-krav var tænkt som sikkerheden — det er fjernet
+# 2026-10-01; de to fugt-tærskler bærer nu alene.)
+  badevaerelse_brusebad_fugt_stigning_point:
+    name: "Bad brusebad: fugt-stigning"
+    icon: mdi:water-percent-alert
+    min: 2
+    max: 30
+    step: 0.5
+    unit_of_measurement: "point"
+    mode: slider
+
+  # RATE-kravet, og husets eneste skarpe skel mellem BRUSEBAD og TØRRETUMBLER
+  # (user 2026-09-01: "der er også en tørretumbler i badeværelset ... men slet
+  # ikke så meget og så hurtigt som badet"). Begge løfter fugt OG varme, så
+  # magnituden alene kan ikke skelne — men FORMEN kan: et brusebad leverer
+  # næsten hele sin stigning på 3-5 min, en tumbler smører den samme (eller
+  # større) stigning ud over 30-90 min. GÆT: tumbler 55→75 % over 45 min ≈ 2,2
+  # point/5 min, brusebad ≈ 5-12. Skru OP hvis tumbleren armer sessionen; skru
+  # NED hvis et kort/køligt bad ikke ses. Aflæs begge i historikken på
+  # sensor.badevaerelse_fugt_burst (5 min) vs _fugt_stigning (10 min) og på
+  # binary_sensor.badevaerelse_tumbler_mistanke.
+  badevaerelse_brusebad_fugt_burst_point:
+    name: "Bad brusebad: fugt-burst (5 min)"
+    icon: mdi:chart-line-variant
+    min: 1
+    max: 20
+    step: 0.5
+    unit_of_measurement: "point"
+    mode: slider
+
+  # (badevaerelse_brusebad_temp_stigning_grader FJERNET 2026-10-01, user:
+  # "vi behøver ikke temp stigning, fugt er alt rigeligt" — og tumbleren giver
+  # minimale stigninger sammenlignet med et bad. Måledata i headeren.)
+
+  # Hvor gammel fugt-målingen højst må være når badets lys slukkes (2026-10-01,
+  # user-spec: "jeg vil ikke ha at du slukker lys i badet uden at der er blevet
+  # tjekket en frisk måling fra fugt måleren"). Målt 14 døgn: sensoren tikker
+  # hvert ~58,6 s og rapporterer hver 293 s i hvile, hver 58-175 s når fugten
+  # bevæger sig. 120 s = to tick: et bad der er begyndt siden sidste rapport
+  # når næsten altid at blive rapporteret. Koster i hvile 0-3 min ekstra lys.
+  badevaerelse_fugt_frisk_sekunder:
+    name: "Bad: fugt-måling højst så gammel ved sluk"
+    icon: mdi:water-sync
+    min: 60
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Udgang 2: hvor mange RH-point under sessionens 10-min-top fugten skal
+  # falde før badet regnes for slut. Fugten falder først for alvor når døren
+  # åbnes, så dette er et backstop — ikke hovedvejen.
+  badevaerelse_brusebad_fald_point:
+    name: "Bad brusebad: fugt-fald = slut"
+    icon: mdi:water-minus
+    min: 3
+    max: 30
+    step: 0.5
+    unit_of_measurement: "point"
+    mode: slider
+
+  # Mindste sessions-alder før et fugt-FALD må slutte den: en kraftig udsugning
+  # kan trække fugten ned mens man stadig står i bruseren. 2026-10-01: var
+  # "blanking før PIR tæller" (PIR-udgangen er fjernet), og fald-udgangen
+  # læste blank + 5 → værdien er sat til den effektive 4 + 5 = 9 og formlen
+  # læser den nu direkte (samme adfærd, ærligt navn).
+  badevaerelse_brusebad_blank_minutter:
+    name: "Bad brusebad: fugt-fald tæller tidligst efter"
+    icon: mdi:timer-off-outline
+    min: 0
+    max: 20
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Udgang 3: hård levetid på en session. Et brusebad varer ikke en time.
+  badevaerelse_brusebad_maks_minutter:
+    name: "Bad brusebad: maks sessions-varighed"
+    icon: mdi:clock-alert-outline
+    min: 10
+    max: 90
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Sanity-gate: der skal være set en indre-PIR inden for dette vindue før en
+  # klima-signatur må arme. Uden det kunne en ren vejr-/varme-hændelse i et
+  # TOMT bad tænde lyset i op til maks-minutter.
+  badevaerelse_brusebad_indgang_vindue_minutter:
+    name: "Bad brusebad: indgangs-vindue"
+    icon: mdi:door-open
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Hvor længe et bad-besøg højst må holde lyset mens vi VENTER på det første
+  # klima-sample fra Timmerflotten (user-spec 2026-09-02: "the light waits with
+  # turn off until we have signal from timmerflotte after an initial sensor has
+  # been triggered").
+  #
+  # Målt 02-09 på morgenens ægte bad: personen gik ind 06:14:10, og det første
+  # sample der overhovedet VISTE badet kom 06:19:10 — fem minutter. I den
+  # periode kan signaturen strukturelt ikke arme, uanset hvor godt den er
+  # skruet sammen, så et sluk 4 minutter inde vinder hver gang. Ventetiden er
+  # ikke en tærskel man tuner efter smag: den er sensorens hviletakt (målt
+  # min-gap 19 s, snit 309, max 1172) plus luft.
+  #
+  # Loftet findes fordi ventetiden ellers blev uendelig hvis Timmerflotten dør:
+  # en `unavailable` sensor rapporterer aldrig, og holdet ville stå for evigt
+  # (fejlklasse #9 — en tavs kanal må ikke kunne blokere en sluk-vej permanent).
+  badevaerelse_klimabevis_maks_minutter:
+    name: "Bad: maks ventetid på klima-bevis"
+    icon: mdi:timer-sand-full
+    min: 2
+    max: 20
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Hvor længe efter et udskudt sluk-alt vi stadig må færdiggøre det. Vinduet
+  # skal kunne rumme et helt bad + aftørring (målt: klima-signaturen slipper
+  # først 15 min efter sidste damp-burst), men må ikke stå åbent hele natten:
+  # uden for vinduet er et bad-lys en NATTUR, og den har sin egen sluk-vej med
+  # sin egen forsinkelse, som vi ikke må skære over.
+  badevaerelse_sluk_alt_efterslaeb_minutter:
+    name: "Bad: efterslæb-vindue efter udskudt sluk-alt"
+    icon: mdi:timer-sync-outline
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+input_boolean:
+  # Selve sessionen. INGEN `initial:` → overlever HA-restart (initial PÅTVINGER,
+  # den restorer ikke — permanent faktum). En restart midt i et brusebad skal
+  # ikke frigive holdet.
+  badevaerelse_brusebad_session:
+    name: "Bad: brusebad-session aktiv"
+    icon: mdi:shower-head
+
+  # Én-gangs-markør: lyset er blevet rejst igen inden for DENNE session. Uden
+  # den kunne genrejsningen og en sluk-vej vi ikke har vetoet slås i ring.
+  badevaerelse_brusebad_lys_genrejst:
+    name: "Bad: brusebad-lys genrejst"
+    icon: mdi:lightbulb-alert-outline
+
+  # 2026-10-11: sat mens kun bruse-spotten (spot 2) lyser fordi en sluk-vej
+  # venter på fugt-målingen. Ryddes når gruppen slukker eller lyset genrejses.
+  badevaerelse_fugt_venteslukket:
+    name: "Bad: kun bruse-spot mens fugt ventes"
+    icon: mdi:lightbulb-on-30
+
+input_datetime:
+  # Armerings-stempel. SKREVET værdi — last_changed nulstilles ved HA-restart
+  # og duer ikke som alders-mål (fejlklasse #5/#23).
+  badevaerelse_brusebad_stempel:
+    name: "Bad: brusebad armeret kl."
+    icon: mdi:timer-outline
+    has_date: true
+    has_time: true
+
+  # Sidste gang en indre bad-PIR gik on. Samme grund: sanity-gaten skal kunne
+  # svare korrekt efter en restart, hvor sensorens egen last_changed er
+  # boot-tidspunktet og ikke en observation.
+  badevaerelse_sidste_indre_pir:
+    name: "Bad: sidste indre-PIR kl."
+    icon: mdi:motion-sensor
+    has_date: true
+    has_time: true
+
+  # Besøgets start = den FØRSTE sensor der rørte sig (PIR eller dør). Bevidst
+  # et andet stempel end `badevaerelse_sidste_indre_pir`: DET bærer arme-gatens
+  # krav om at en indre-PIR er set, og hvis døren også skrev i det, kunne en
+  # ren dør-åbning lukke en klima-signatur ind i et tomt bad. To spørgsmål,
+  # to stempler (fejlklasse #10 — udvid ikke et anker til at betyde noget nyt).
+  badevaerelse_besoeg_start:
+    name: "Bad: besøg begyndte kl."
+    icon: mdi:door-open
+    has_date: true
+    has_time: true
+
+  # Et sluk-alt (godnat / entré-NED / AirBnB-NED) løb mens badet var undtaget.
+  # Undtagelsen er en UDSÆTTELSE, ikke en frafaldelse — stemplet er kvitteringen
+  # der gør den indsamlelig igen. Nulstilles til 00:00:00 når den er indfriet.
+  badevaerelse_sluk_alt_udskudt:
+    name: "Bad: sluk-alt udskudt kl."
+    icon: mdi:clock-alert-outline
+    has_date: true
+    has_time: true
+
+# =============================================================================
+# Måle-lag: vinduer, ikke kanter
+# =============================================================================
+sensor:
+  - platform: statistics
+    name: "Badeværelse fugt min 10m"
+    unique_id: badevaerelse_fugt_min_10m
+    entity_id: sensor.badevaerelse_timmerflotte_humidity
+    state_characteristic: value_min
+    sampling_size: 120
+    max_age:
+      minutes: 10
+    precision: 2
+
+  # 5-min-bunden bærer RATE-testen (brusebad vs tørretumbler). Kortere vindue
+  # end de 10 min med vilje: det er formen på stigningen der skiller dem.
+  - platform: statistics
+    name: "Badeværelse fugt min 5m"
+    unique_id: badevaerelse_fugt_min_5m
+    entity_id: sensor.badevaerelse_timmerflotte_humidity
+    state_characteristic: value_min
+    sampling_size: 120
+    max_age:
+      minutes: 5
+    precision: 2
+
+  - platform: statistics
+    name: "Badeværelse fugt maks 10m"
+    unique_id: badevaerelse_fugt_maks_10m
+    entity_id: sensor.badevaerelse_timmerflotte_humidity
+    state_characteristic: value_max
+    sampling_size: 120
+    max_age:
+      minutes: 10
+    precision: 2
+
+  # Temp-kæden (min 20m → temp-stigning → maks 15m) er IKKE brusebad-bevis
+  # længere (2026-10-01). Den lever for gulvvarme-varslet (automations/
+  # security.yaml: varme UDEN fugt) og tumbler-mistanken som det læser.
+  - platform: statistics
+    name: "Badeværelse temp min 20m"
+    unique_id: badevaerelse_temp_min_20m
+    entity_id: sensor.badevaerelse_timmerflotte_temperature
+    state_characteristic: value_min
+    sampling_size: 120
+    max_age:
+      minutes: 20
+    precision: 2
+
+  # ---------------------------------------------------------------------------
+  # LATCHE (2026-09-02) — de tre delsignaler TOPPER PÅ FORSKELLIGE TIDSPUNKTER
+  # ---------------------------------------------------------------------------
+  # MÅLT på husets første ægte brusebad (02-09, 06:14-06:30, RH 58,0 → 79,1):
+  #   burst (5 min)  toppede 06:19:10 (+10,8) og var nede på +1,0 kl. 06:25 —
+  #                  fordi 5-min-bunden selv var løbet med op.
+  #   temp (20 min)  krydsede først sin tærskel 06:25:02 (+0,43 °C) — føleren
+  #                  sidder i et plastikhus og halter ~6 min efter fugten.
+  # De to vinduer var altså ALDRIG over tærsklen SAMTIDIG, og signaturen —
+  # som ANDede dem øjeblikkeligt — armede aldrig. Sessionen blev ikke sat én
+  # eneste gang under et bad der løftede fugten 21 point.
+  #
+  # LÆRING: man kan ikke AND'e to vinduer hvis udslag er strukturelt forskudt i
+  # tid. Hvert delsignal LATCHES derfor i 15 min (value_max over den afledte
+  # Δ-sensor), og signaturen ANDer LATCHENE — "er alle tre set inden for samme
+  # kvarter?" i stedet for "er alle tre sande i præcis dette sekund?".
+  # 15 min er valgt til at rumme den målte forskydning (~6 min) med rigelig
+  # margen, og er stadig kortere end det korteste bad vi vil beskytte + hold.
+  #
+  # TUMBLER-DISKRIMINATOREN OVERLEVER: en tørretumbler leverer aldrig en burst
+  # over tærsklen i noget enkelt sample, så dens burst-MAKS er også under
+  # tærsklen. Latchen gør et langsomt forløb bredere, ikke stejlere.
+  - platform: statistics
+    name: "Badeværelse fugt-stigning maks 15m"
+    unique_id: badevaerelse_fugt_stigning_maks_15m
+    entity_id: sensor.badevaerelse_fugt_stigning
+    state_characteristic: value_max
+    sampling_size: 120
+    max_age:
+      minutes: 15
+    precision: 2
+
+  - platform: statistics
+    name: "Badeværelse fugt-burst maks 15m"
+    unique_id: badevaerelse_fugt_burst_maks_15m
+    entity_id: sensor.badevaerelse_fugt_burst
+    state_characteristic: value_max
+    sampling_size: 120
+    max_age:
+      minutes: 15
+    precision: 2
+
+  - platform: statistics
+    name: "Badeværelse temp-stigning maks 15m"
+    unique_id: badevaerelse_temp_stigning_maks_15m
+    entity_id: sensor.badevaerelse_temp_stigning
+    state_characteristic: value_max
+    sampling_size: 120
+    max_age:
+      minutes: 15
+    precision: 2
+
+template:
+  # FORRIGE fugt-sample (2026-10-01). Statistics-vinduerne ser kun samples der
+  # LIGGER i vinduet, og Timmerflotten hviler med 293 s mellem rapporter mod et
+  # 300-s burst-vindue (7 s margen; målt 09-25: 586 s hul → bunden var væk, og
+  # badets første sample målte burst 0). Det forrige sample er bunden der ALTID
+  # findes. Ikke båret hen over et udfald: er nogen af siderne ikke et tal,
+  # bliver den `none`, og vinduerne står alene som før.
+  - trigger:
+      - platform: state
+        entity_id: sensor.badevaerelse_timmerflotte_humidity
+        to: ~
+    sensor:
+      - name: "Badeværelse fugt forrige"
+        unique_id: badevaerelse_fugt_forrige
+        icon: mdi:history
+        state: >-
+          {% set ny = trigger.to_state.state if trigger.to_state is not none else '' %}
+          {% set gl = trigger.from_state.state if trigger.from_state is not none else '' %}
+          {{ gl | float if (ny | is_number and gl | is_number) else none }}
+
+  - sensor:
+      # Hvor mange RH-point er vi over vinduets bund? Det er "stiger voldsomt
+      # pludseligt" udtrykt så det tåler en uregelmæssig rapporterings-kadence:
+      # et enkelt sample-hul ændrer ikke bunden.
+      # 2026-10-01: bunden er min(vindue, forrige sample) — se fugt-forrige.
+      - name: "Badeværelse fugt-stigning"
+        unique_id: badevaerelse_fugt_stigning
+        unit_of_measurement: "point"
+        state_class: measurement
+        icon: mdi:water-percent-alert
+        state: >-
+          {% set cur = states('sensor.badevaerelse_timmerflotte_humidity') | float(-1) %}
+          {% set bund = [states('sensor.badevaerelse_fugt_min_10m') | float(-1),
+                         states('sensor.badevaerelse_fugt_forrige') | float(-1)]
+                        | select('ge', 0) | list %}
+          {{ 0 if (cur < 0 or not bund) else (cur - bund | min) | round(2) }}
+
+      # Samme regnestykke over 5 min = hvor STEJL stigningen er lige nu.
+      # Sammenlign de to i historikken for at se forskel på et brusebad
+      # (burst ≈ stigning, alt sker på få minutter) og en tørretumbler
+      # (burst << stigning, en lang jævn rampe).
+      - name: "Badeværelse fugt-burst"
+        unique_id: badevaerelse_fugt_burst
+        unit_of_measurement: "point"
+        state_class: measurement
+        icon: mdi:chart-line-variant
+        state: >-
+          {% set cur = states('sensor.badevaerelse_timmerflotte_humidity') | float(-1) %}
+          {% set bund = [states('sensor.badevaerelse_fugt_min_5m') | float(-1),
+                         states('sensor.badevaerelse_fugt_forrige') | float(-1)]
+                        | select('ge', 0) | list %}
+          {{ 0 if (cur < 0 or not bund) else (cur - bund | min) | round(2) }}
+
+      # Samme vindue, modsat vej: hvor langt er vi UNDER toppen. Bruges som
+      # slut-backstop ("fugtigheden vil hurtigt begynde at falde").
+      - name: "Badeværelse fugt-fald"
+        unique_id: badevaerelse_fugt_fald
+        unit_of_measurement: "point"
+        state_class: measurement
+        icon: mdi:water-minus
+        state: >-
+          {# 2026-10-01: toppen er max(vindue, forrige sample) — står fugten helt
+             stille på et plateau i > 10 min, er vinduet tomt når den begynder at
+             falde, og det første fald-sample ville måle 0 (se fugt-forrige). #}
+          {% set cur = states('sensor.badevaerelse_timmerflotte_humidity') | float(-1) %}
+          {% set top = [states('sensor.badevaerelse_fugt_maks_10m') | float(-1),
+                        states('sensor.badevaerelse_fugt_forrige') | float(-1)]
+                       | select('ge', 0) | list %}
+          {{ 0 if (cur < 0 or not top) else (top | max - cur) | round(2) }}
+
+      - name: "Badeværelse temp-stigning"
+        unique_id: badevaerelse_temp_stigning
+        unit_of_measurement: "°C"
+        state_class: measurement
+        icon: mdi:thermometer-chevron-up
+        state: >-
+          {% set cur = states('sensor.badevaerelse_timmerflotte_temperature') | float(-99) %}
+          {% set mn = states('sensor.badevaerelse_temp_min_20m') | float(-99) %}
+          {{ 0 if (cur < -90 or mn < -90) else (cur - mn) | round(2) }}
+
+      # Sessionens alder i minutter. Eksponeret så backstop-tick, logbog og
+      # dashboard læser SAMME tal (fejlklasse #2).
+      - name: "Badeværelse brusebad-alder"
+        unique_id: badevaerelse_brusebad_alder
+        unit_of_measurement: "min"
+        icon: mdi:timer-sand
+        state: >-
+          {# Gated på sessionen: uden for en session returneres en KONSTANT, så
+             now()-templaten ikke skriver en DB-række hvert minut for evigt
+             (fejlklasse #24). Kvantiseret til hele minutter af samme grund. #}
+          {% if not is_state('input_boolean.badevaerelse_brusebad_session', 'on') %}
+            0
+          {% else %}
+            {% set stempel = states('input_datetime.badevaerelse_brusebad_stempel') %}
+            {# 'timestamp'-attributten er lokal-bevidst pr. stempel; en
+               utcoffset()-korrektion bruger offsettet NU og bliver 1 t forkert
+               hen over DST (permanent faktum; B127). #}
+            {% set t = state_attr('input_datetime.badevaerelse_brusebad_stempel',
+                                  'timestamp') | float(0) %}
+            {{ 0 if t <= 0 else ((as_timestamp(now()) - t) / 60) | round(0) | int }}
+          {% endif %}
+
+      # ANKER for hel-hus-sluk (2026-09-02c). `godnat_fuld` havde siden 07-16 en
+      # user-spec om at et godnat ikke må mørklægge et OPTAGET bad — men reglen
+      # lå inline i DET ene script, så entré-Somrigs NED-tryk (både Normal-vejen
+      # script.entre_ned_sluk_alt og AirBnB-grenen i entre_somrig.yaml) slukkede
+      # `light.alle_lys` rå og tog bad-spottene med (fejlklasse #2/#12: samme
+      # beskyttelse tilføjet asymmetrisk på søsterveje). Ankeret gør at en NY
+      # sluk-alt-vej arver undtagelsen gratis ved at subtrahere 'lys'.
+      #
+      # Autoriteten er wasp_active (user-spec 2026-07-22: IKKE det bredere
+      # optaget_lukket_doer, som hang på et stale toilet-besøg) UNIONERET med
+      # brusebad_hold — klima-beviset er netop bygget til den der står stille i
+      # bruseren hvor ingen PIR kan se dem, og wasp armeres slet ikke når døren
+      # står åben ved indgang.
+      #
+      # state = ANTAL (0 = badet er frit) så Lovelace kan gate på numeric_state;
+      # listen ligger i attributten, jf. sensor.gardiner_manual_hold.
+      - name: "Badeværelse sluk-alt undtagelse"
+        unique_id: badevaerelse_sluk_alt_undtagelse
+        icon: mdi:shower-head
+        # 2026-09-23 (B156, user-spec): "hvis vi er 2 personer [i sengen], så er
+        # der ikke nogen mennesker i badeværelset" → ligger alle voksne der er
+        # hjemme i sengen (packages/sove_seng_taeller.yaml, fejler LUKKET ved et
+        # usandsynligt tal / sleepover-gæster), er undtagelsen tom.
+        state: >-
+          {% if (is_state('input_boolean.badevaerelse_wasp_active', 'on')
+                 or is_state('binary_sensor.badevaerelse_brusebad_hold', 'on'))
+                and not is_state('binary_sensor.sove_alle_voksne_i_seng', 'on') %}
+            {{ state_attr('light.badevaerelse_all', 'entity_id')
+               | default([], true) | list | count }}
+          {% else %}
+            0
+          {% endif %}
+        attributes:
+          lys: >-
+            {% if (is_state('input_boolean.badevaerelse_wasp_active', 'on')
+                   or is_state('binary_sensor.badevaerelse_brusebad_hold', 'on'))
+                  and not is_state('binary_sensor.sove_alle_voksne_i_seng', 'on') %}
+              {{ state_attr('light.badevaerelse_all', 'entity_id')
+                 | default([], true) | list }}
+            {% else %}
+              {{ [] }}
+            {% endif %}
+
+  - binary_sensor:
+      # BEVIS-sensoren. KUN `delay_on` — ingen `delay_off`. De to sammen på
+      # samme udtryk bevogter kun åbningen og lader et enkelt blip re-arme
+      # holdet (permanent faktum). Holdet ejes af input_boolean'en, ikke af
+      # denne sensor.
+      # 2026-09-02: læser LATCHENE (15-min maksima), ikke øjebliksværdierne —
+      # de tre delsignaler topper 3-6 min fra hinanden og var aldrig sande
+      # samtidig. Se latch-blokken i sensor-sektionen for måledata.
+      # delay_on sænket 60 → 30 s: latchen holder allerede 15 min, så de ekstra
+      # 30 s købte ingen robusthed men kostede en hel rapporterings-interval i
+      # armerings-forsinkelse — og forsinkelse er hele problemet her.
+      # 2026-10-01: = fugt-bevis + delay_on (ét udtryk, læst både her og af
+      # ventetiden, #2). Temp-leddet er fjernet (user: "fugt er alt rigeligt").
+      - name: "Badeværelse brusebad-signatur"
+        unique_id: badevaerelse_brusebad_signatur
+        icon: mdi:shower
+        delay_on:
+          seconds: 30
+        state: >-
+          {{ is_state('binary_sensor.badevaerelse_fugt_bevis', 'on') }}
+
+      # FUGTEN HAR SAGT "BAD" (2026-10-01). Begge fugt-latche over tærsklerne —
+      # ingen delay: ventetiden nedenfor skal kunne se dommen i det sekund den
+      # falder, ellers åbner signaturens 30 s delay_on et hul (målt 09-24:
+      # sluk 13 s efter første burst-sample).
+      - name: "Badevaerelse fugt bevis"
+        unique_id: badevaerelse_fugt_bevis
+        icon: mdi:water-check
+        state: >-
+          {% if not (states('sensor.badevaerelse_timmerflotte_humidity') | is_number) %}
+            false
+          {% else %}
+            {% set dh = states('sensor.badevaerelse_fugt_stigning_maks_15m') | float(0) %}
+            {% set db = states('sensor.badevaerelse_fugt_burst_maks_15m') | float(0) %}
+            {% set kh = states('input_number.badevaerelse_brusebad_fugt_stigning_point') | float(8) %}
+            {% set kb = states('input_number.badevaerelse_brusebad_fugt_burst_point') | float(5) %}
+            {{ dh >= kh and db >= kb }}
+          {% endif %}
+
+      # FRISK FUGT-MÅLING (2026-10-01, user-spec). Alle badets automatiske
+      # sluk-veje VENTER på denne før de slukker, og afgør derefter på
+      # brusebad_hold — ét anker, så reglen ikke kodes 8 steder (#2/#21).
+      # `last_reported`, ikke last_changed: en rapport med samme værdi er også en
+      # måling. now() → re-render hvert minut; en rapport med ny værdi ses straks.
+      - name: "Badevaerelse fugt frisk"
+        unique_id: badevaerelse_fugt_frisk
+        icon: mdi:water-sync
+        state: >-
+          {% set s = states.sensor.badevaerelse_timmerflotte_humidity %}
+          {% set n = states('input_number.badevaerelse_fugt_frisk_sekunder') | float(120) %}
+          {{ s is not none and s.state | is_number
+             and (as_timestamp(now()) - as_timestamp(s.last_reported, 0)) <= n }}
+
+      # DIAGNOSE, ingen handling. Mærker de forløb hvor fugt OG varme stiger
+      # jævnt uden burst = tørretumbler-formen. Findes den i historikken på
+      # samme tid som et manglende bad (eller omvendt: samtidig med at
+      # brusebad-signaturen armede), er det præcis der tærsklerne skal flyttes.
+      # Kører med bevidst LAVE bundgrænser: den skal fange formen, ikke bevise
+      # den. delay_on 120 s mod enkelt-samples.
+      # NAVNET er bevidst "tumbler", ikke "tørretumbler": HA-slugify laver ø→o,
+      # så navnet ville give entity_id ..._torretumbler_... mens unique_id'et
+      # og alle forbrugere sagde ..._toerretumbler_... (målt 09-01: sensoren
+      # fandtes, gulvvarme-varslets condition læste tomt og var stille-falsk
+      # for evigt, #9). Ingen ø i navnet = ingen tvetydighed.
+      - name: "Badeværelse tumbler-mistanke"
+        unique_id: badevaerelse_tumbler_mistanke
+        icon: mdi:tumble-dryer
+        delay_on:
+          seconds: 120
+        state: >-
+          {% set h = states('sensor.badevaerelse_timmerflotte_humidity') %}
+          {% if not (h | is_number) %}
+            false
+          {% else %}
+            {# 2026-09-02: samme LATCH-værdier som signaturen, så de to sensorer
+               er hinandens komplement på burst-leddet og kan sammenlignes 1:1 i
+               historikken. Læste den øjebliksværdier, kunne begge være on
+               samtidig og "tumbler vs. bad" blev umuligt at aflæse (#2). #}
+            {% set dh = states('sensor.badevaerelse_fugt_stigning_maks_15m') | float(0) %}
+            {% set db = states('sensor.badevaerelse_fugt_burst_maks_15m') | float(0) %}
+            {% set dt = states('sensor.badevaerelse_temp_stigning_maks_15m') | float(0) %}
+            {% set kb = states('input_number.badevaerelse_brusebad_fugt_burst_point') | float(5) %}
+            {{ dh >= 2.5 and dt >= 0.15 and db < kb }}
+          {% endif %}
+
+      # VENTER VI PÅ KLIMA-BEVIS? On fra det øjeblik et besøg begynder (PIR
+      # eller dør) og indtil Timmerflotten har rapporteret MINDST ÉN gang
+      # bagefter — eller til loftet er nået. 2026-10-01: siger rapporten "bad"
+      # (fugt-bevis), venter vi videre til sessionen har overtaget.
+      #
+      # Hvorfor `last_reported` og ikke `last_changed`: vi spørger "har
+      # sensoren sagt noget?", ikke "har værdien ændret sig". Et bad der lige
+      # er begyndt kan sagtens rapportere samme fugt to gange i træk, og med
+      # last_changed ville den rapport ikke tælle. Begge nulstilles ved
+      # HA-restart (permanent faktum), men det fejler her i den SIKRE retning:
+      # efter et boot er last_reported nyere end et stempel fra før boot, så
+      # holdet slipper i stedet for at hænge.
+      - name: "Badevaerelse afventer klimabevis"
+        unique_id: badevaerelse_afventer_klimabevis
+        device_class: running
+        icon: mdi:progress-clock
+        state: >-
+          {% set start = states('input_datetime.badevaerelse_besoeg_start') %}
+          {% if start in ['unknown', 'unavailable', 'none', ''] %}
+            false
+          {% elif start[11:] == '00:00:00' %}
+            {# Urørt input_datetime står på DAGENS midnat, ikke 1970 — uden
+               denne guard ville et ikke-skrevet stempel ligne et friskt besøg
+               i de første minutter efter midnat (permanent faktum). #}
+            false
+          {% else %}
+            {# 'timestamp'-attributten er lokal-bevidst pr. stempel; en
+               utcoffset()-korrektion bruger offsettet NU og bliver 1 t forkert
+               hen over DST (B127). #}
+            {% set t0 = state_attr('input_datetime.badevaerelse_besoeg_start',
+                                   'timestamp') | float(0) %}
+            {% set alder = (as_timestamp(now()) - t0) / 60 %}
+            {% set maks = states('input_number.badevaerelse_klimabevis_maks_minutter')
+                          | float(8) %}
+            {% set s = states.sensor.badevaerelse_timmerflotte_humidity %}
+            {% set rapport = (as_timestamp(s.last_reported, 0)
+                              if s is not none else 0) %}
+            {# 2026-10-01: en rapport er ikke en DOM. Fugt-latchene regnes FRA
+               rapporten og lander først et øjeblik efter — uden de 10 s faldt
+               ventetiden (og hele brusebad_hold) kortvarigt væk på selve
+               bad-samplet. Afgøres på næste minut-tick. #}
+            {% set nu = as_timestamp(now()) %}
+            {% set venter = rapport <= t0 or (nu - rapport) < 10 %}
+            {# BROEN: rapporten SAGDE bad (fugt-bevis), men sessionen er ikke
+               armeret endnu (signaturens delay_on) → bliv ved med at vente. Kun på damp fra DETTE besøg:
+               fugt-beviset tændte efter t0, og ingen session er armeret siden
+               t0. Gammel damp fra et forrige bad (latchen husker 15 min) holder
+               ikke et nyt besøg — målt ved deploy 01-10 06:27: en 20-min-regel
+               holdt et tomt bad. Loft = sessionens egen maks, og fugt-latchen
+               slipper selv 15 min efter sidste burst, så broen kan ikke hænge.
+               (Et reload nulstiller last_changed → broen kan holde et tomt bad
+               til latchen slipper; sikker retning, den tænder intet.) #}
+            {% set st = state_attr('input_datetime.badevaerelse_brusebad_stempel',
+                                   'timestamp') | float(0) %}
+            {% set fb = states.binary_sensor.badevaerelse_fugt_bevis %}
+            {% set bevis_t = as_timestamp(fb.last_changed, 0) if fb is not none else 0 %}
+            {% set bro = is_state('binary_sensor.badevaerelse_fugt_bevis', 'on')
+                         and is_state('input_boolean.badevaerelse_brusebad_session', 'off')
+                         and bevis_t > t0 and st < t0
+                         and alder < (states('input_number.badevaerelse_brusebad_maks_minutter') | float(45)) %}
+            {{ t0 > 0 and ((alder < maks and venter) or bro) }}
+          {% endif %}
+
+      # Læses af badets sluk-veje som veto. Ét delt RESULTAT frem for den samme
+      # regel kodet i syv automations (fejlklasse #2). Ventetiden hænger HER og
+      # ikke på de enkelte sluk-veje — ellers skulle den samme betingelse
+      # tilføjes ni steder og ville drifte fra hinanden (fejlklasse #21).
+      - name: "Badeværelse brusebad-hold"
+        unique_id: badevaerelse_brusebad_hold
+        device_class: occupancy
+        icon: mdi:lock-clock
+        state: >-
+          {{ is_state('input_boolean.badevaerelse_brusebad_session', 'on')
+             or is_state('binary_sensor.badevaerelse_afventer_klimabevis', 'on') }}
+
+script:
+  # Kaldes af ALLE tre sluk-alt-veje (godnat_fuld, entre_ned_sluk_alt,
+  # AirBnB-NED-grenen) lige før de subtraherer ankeret. Ét ejerskab frem for
+  # den samme betingelse tre steder (fejlklasse #2/#12).
+  badevaerelse_sluk_alt_udskyd:
+    alias: "Bad: kvittér for et udskudt sluk-alt"
+    mode: single
+    sequence:
+      - condition: numeric_state
+        entity_id: sensor.badevaerelse_sluk_alt_undtagelse
+        above: 0
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.badevaerelse_sluk_alt_udskudt
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # 2026-10-11 (user-spec): "hvis det eneste der holder det fra at slukke er en
+  # frisk fugtmåling, så må alle bad spots undtagen spot 2 gerne slukke. spot 2
+  # sidder nemlig i badet." Kaldes ikke-blokerende af HVER sluk-vej lige før
+  # dens fugt_frisk-vent (grep fugt_ventesluk) — da har vejen allerede afgjort
+  # at rummet er tomt; kun fugt-reglen (1/10) holder lyset. Fugt-reglen selv er
+  # urørt: spot 2 slukker først når målingen er frisk og vejen afgør det.
+  # Fade: Matter-spots (1, 3) ignorerer transition på turn_off (permanent
+  # faktum) → alle fire fades ned via turn_on til ~1 %, derefter et rent sluk.
+  # Genrejsning: automationen badevaerelse_fugt_ventesluk_genrejs nedenfor.
+  badevaerelse_fugt_ventesluk:
+    alias: "Bad: kun bruse-spot mens fugt-målingen ventes"
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - condition: template
+        value_template: >-
+          {{ is_state('binary_sensor.badevaerelse_fugt_frisk', 'off')
+             and is_state('light.badevaerelse_spot_2', 'on')
+             and is_state('input_boolean.badevaerelse_fugt_venteslukket', 'off')
+             and is_state('binary_sensor.badevaerelse_brusebad_hold', 'off')
+             and not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+             and not is_state('input_select.room_mode_badevaerelse', 'Manual')
+             and not (is_state('input_boolean.dance_mode', 'on')
+                      and is_state('input_boolean.dance_room_bad', 'on')) }}
+      - variables:
+          andre: >-
+            {% set ns = namespace(s=[]) %}
+            {% for n in [1, 3, 4, 5] %}
+              {% if is_state('light.badevaerelse_spot_' ~ n, 'on') %}
+                {% set ns.s = ns.s + ['light.badevaerelse_spot_' ~ n] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.s | join(',') }}
+          fade: "{{ states('sensor.fade_ophold_effective') | int(20) }}"
+      - condition: template
+        value_template: "{{ andre | length > 0 }}"
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.badevaerelse_fugt_venteslukket
+      - service: logbook.log
+        data:
+          name: "Bad fugt-vent"
+          message: "Venter på frisk fugt-måling — kun bruse-spotten (spot 2) bliver tændt imens"
+          entity_id: light.badevaerelse_all
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: "{{ andre.split(',') }}"
+        data:
+          brightness: 3
+          transition: "{{ fade }}"
+      - delay:
+          seconds: "{{ fade + 1 }}"
+      # Nogen kom ind under fade'en → genrejseren har ryddet flaget og løftet
+      # lyset; sluk ikke oven i den.
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.badevaerelse_fugt_venteslukket', 'on')
+             and not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on') }}
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: "{{ andre.split(',') }}"
+
+automation:
+  # ---------------------------------------------------------------------------
+  # GENREJS efter fugt-ventesluk (2026-10-11, user-spec: "hvis der så kommer
+  # folk ind i badeværelset mens den ene spot er tændt, så fader alle spots
+  # selvfølgelig op"). Tænd-vejen (presence_light_badevaerelse_on) kræver at
+  # gruppen er OFF — med spot 2 tændt er den ON, så den ville aldrig fyre.
+  # Genrejs ved: dør/inde-PIR off→on, eller brusebad-hold on (fugt-målingen
+  # siger bad = nogen står derinde). Niveau + farve kopieres fra spot 2, så
+  # natlys forbliver natlys; ramp'en (badevaerelse_spots_ramp) klatrer derfra.
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_fugt_ventesluk_genrejs
+    alias: "Bad: genrejs spots efter fugt-ventetiden"
+    mode: queued
+    max: 3
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.badevaerelse_inde_1_occupancy
+          - binary_sensor.badevaerelse_inde_2_occupancy
+          - binary_sensor.parasoll_badevaerelse
+          - binary_sensor.badevaerelse_brusebad_hold
+        from: "off"
+        to: "on"
+        id: ind
+      - platform: state
+        entity_id: light.badevaerelse_all
+        to: "off"
+        id: ryd
+      - platform: state
+        entity_id: light.badevaerelse_spot_2
+        from: "on"
+        id: ryd
+      - platform: homeassistant
+        event: start
+        id: ryd
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_fugt_venteslukket
+        state: "on"
+    action:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ trigger.id == 'ind'
+                     and is_state('light.badevaerelse_spot_2', 'on') }}
+            sequence:
+              - service: script.turn_off
+                target:
+                  entity_id: script.badevaerelse_fugt_ventesluk
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.badevaerelse_fugt_venteslukket
+              - variables:
+                  maal: >-
+                    {% set ns = namespace(s=[]) %}
+                    {% for e in states('sensor.badevaerelse_fase_spots').split(',') %}
+                      {% if e.startswith('light.badevaerelse_spot_')
+                            and e != 'light.badevaerelse_spot_2' %}
+                        {% set ns.s = ns.s + [e] %}
+                      {% endif %}
+                    {% endfor %}
+                    {{ ns.s | join(',') }}
+                  bri: "{{ state_attr('light.badevaerelse_spot_2', 'brightness') | int(153) }}"
+                  kelvin: "{{ state_attr('light.badevaerelse_spot_2', 'color_temp_kelvin') | int(0) }}"
+                  fade: "{{ states('sensor.fade_ind_effektiv') | int(3) }}"
+              - condition: template
+                value_template: "{{ maal | length > 0 }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ kelvin > 0 }}"
+                then:
+                  - service: light.turn_on
+                    continue_on_error: true
+                    target:
+                      entity_id: "{{ maal.split(',') }}"
+                    data:
+                      brightness: "{{ bri }}"
+                      color_temp_kelvin: "{{ kelvin }}"
+                      transition: "{{ fade }}"
+                else:
+                  - service: light.turn_on
+                    continue_on_error: true
+                    target:
+                      entity_id: "{{ maal.split(',') }}"
+                    data:
+                      brightness: "{{ bri }}"
+                      transition: "{{ fade }}"
+              - service: logbook.log
+                data:
+                  name: "Bad fugt-vent"
+                  message: "Nogen i badet ({{ trigger.entity_id }}) — alle spots fadet op igen"
+                  entity_id: light.badevaerelse_all
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ trigger.id == 'ryd'
+                     and not is_state('light.badevaerelse_spot_2', 'on') }}
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.badevaerelse_fugt_venteslukket
+
+  # ---------------------------------------------------------------------------
+  # STEMPEL: sidste indre-PIR. Bærer sanity-gaten nedenfor.
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_indre_pir_stempel
+    alias: "Bad brusebad: stempl sidste indre-PIR"
+    description: >
+      Skriver et tidsstempel hver gang union-PIR'en går on. Sensorens egen
+      last_changed duer ikke: den nulstilles ved HA-restart, og en sensor der
+      booter hængende `on` ville få boot-tidspunktet som "observation"
+      (fejlklasse #23). Én skrivning pr. bad-besøg.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_inde_occupancy
+        from: "off"
+        to: "on"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.badevaerelse_sidste_indre_pir
+        data:
+          timestamp: "{{ now().timestamp() }}"
+
+  # ---------------------------------------------------------------------------
+  # STEMPEL: besøgets start. Åbner ventetiden på klima-bevis.
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_besoeg_start_stempel
+    alias: "Bad brusebad: stempl besøgets start (PIR eller dør)"
+    description: >
+      Den FØRSTE sensor der rører sig starter ventetiden — user-spec 02-09:
+      lyset må ikke slukkes før Timmerflotten har sagt noget efter dette
+      tidspunkt. Døren tæller med, fordi man åbner den før man går ind: den er
+      det tidligste varsel vi har, og de fem blinde minutter skal måles fra
+      det tidligste punkt, ikke det seneste.
+
+      Eksplicit `from:` på begge dør-flanker: uden den er `unavailable -> off`
+      en gyldig state-flanke, og både et template.reload og en Thread-blip
+      ville starte en ventetid i et tomt bad (permanent faktum).
+
+      Stempler kun når vi ikke ALLEREDE venter. Ellers ville en PIR hvert
+      minut skubbe loftet foran sig, og en død Timmerflotte kunne holde lyset
+      i det uendelige i stedet for i maks-minutter.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_inde_occupancy
+        from: "off"
+        to: "on"
+      - platform: state
+        entity_id: binary_sensor.parasoll_badevaerelse
+        from: "off"
+        to: "on"
+      - platform: state
+        entity_id: binary_sensor.parasoll_badevaerelse
+        from: "on"
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_afventer_klimabevis
+        state: "off"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.badevaerelse_besoeg_start
+        data:
+          timestamp: "{{ now().timestamp() }}"
+
+  # ---------------------------------------------------------------------------
+  # ARMÉR: klima-signaturen holdt → Fuld session.
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_brusebad_arm
+    alias: "Bad brusebad: armér session (damp)"
+    description: >
+      Fugt-stigning OG fugt-burst over tærsklerne i mindst 30 s = brusebad
+      (2026-10-01: temp-kravet fjernet — fugten alene er beviset).
+      Armerer wasp (som løfter stadiet til Fuld via badevaerelse_stage_full —
+      ét ejerskab, fejlklasse #2), stempler sessionen og rejser lyset hvis en
+      sluk-vej allerede nåede at slukke det.
+
+      SANITY-GATE: en indre-PIR skal være set inden for indgangs-vinduet. Uden
+      den kunne en klima-hændelse i et tomt bad tænde lyset. Vi kan IKKE kræve
+      at PIR'en er on lige nu — hele pointen er at en der står i bruseren bag
+      glasset er usynlig for begge PIR'er (målt 09-01: tavse fra 06:17:15).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_brusebad_signatur
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_brusebad_session
+        state: "off"
+      # 2026-10-01: off-fasen skal være ÆGTE. Et template.reload eller en
+      # restart skriver signaturen unavailable → off → (delay_on) → on, så
+      # længe fugt-latchen husker et bad — målt ved deploy 06:27:36: falsk
+      # flanke 06:28:06, session armeret og lyset tændt i et TOMT bad. Den
+      # kunstige off-fase varer præcis delay_on (30 s); en ægte varer fra
+      # sidste latch-udløb. Broen i afventer_klimabevis dækker et ægte bad.
+      - condition: template
+        value_template: >-
+          {% set off_s = (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() %}
+          {{ off_s > 45 }}
+      # Nogen er gået ind i badet inden for vinduet (skrevet stempel, ikke
+      # last_changed). Lys tændt / stadie i gang / wasp armeret tæller også som
+      # bevis — så et bad der detekteres MENS besøget kører, aldrig falder på
+      # et stempel der er blevet gammelt.
+      - condition: template
+        value_template: >-
+          {% set stempel = states('input_datetime.badevaerelse_sidste_indre_pir') %}
+          {% set vindue = (states('input_number.badevaerelse_brusebad_indgang_vindue_minutter') | int(30)) * 60 %}
+          {# 'timestamp'-attributten er lokal-bevidst pr. stempel; en
+             utcoffset()-korrektion bruger offsettet NU og bliver 1 t forkert
+             hen over DST (B127). #}
+          {% set t = state_attr('input_datetime.badevaerelse_sidste_indre_pir',
+                                'timestamp') | float(0) %}
+          {% set frisk = t > 0 and (as_timestamp(now()) - t) < vindue %}
+          {{ frisk
+             or is_state('light.badevaerelse_all', 'on')
+             or is_state('input_boolean.badevaerelse_wasp_active', 'on')
+             or not is_state('input_select.badevaerelse_visit_stage', 'Ingen') }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.badevaerelse_brusebad_session
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.badevaerelse_brusebad_stempel
+        data:
+          timestamp: "{{ now().timestamp() }}"
+      # Wasp er husets "vi VED der er nogen derinde"-lås. At sætte den her er en
+      # tredje arm-sti ved siden af PIR-flanken (06-18) og dør-lukningen (09-01)
+      # — og den eneste der hverken kræver PIR eller dørsensor.
+      - if:
+          - condition: state
+            entity_id: input_boolean.badevaerelse_wasp_active
+            state: "off"
+        then:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.badevaerelse_wasp_active
+      # Lad stadie-eskaleringen (badevaerelse_stage_full) nå at køre før fasen
+      # aflæses — fase-brightness returnerer 0 så længe stadiet er "Ingen".
+      - delay:
+          seconds: 2
+      # 2026-09-02 (hul fundet under samme analyse): stadie-løftet ovenfor sker
+      # KUN som bivirkning af en wasp-FLANKE. Var wasp allerede on — eller nåede
+      # en sluk-vej at afslutte besøget og sætte stadiet tilbage til "Ingen"
+      # inden signaturen krydsede — kommer den flanke aldrig, fase-brightness
+      # står på 0, og hele genrejsningen nedenfor bliver en tavs no-op.
+      # Præcis det scenarie sessionen findes for at redde. Et brusebad ER det
+      # stærkest mulige bevis for et dybt besøg, så stadiet sættes direkte.
+      - if:
+          - condition: state
+            entity_id: input_select.badevaerelse_visit_stage
+            state: "Ingen"
+        then:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.badevaerelse_visit_stage
+            data:
+              option: "Fuld"
+          - delay:
+              seconds: 1
+      - if:
+          - condition: state
+            entity_id: light.badevaerelse_all
+            state: "off"
+          - condition: template
+            value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+          - condition: template
+            value_template: "{{ states('sensor.badevaerelse_fase_brightness') | int(0) > 0 }}"
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+            data:
+              # Fase-brightness, ikke Fuld-slideren: er natlys aktivt (godnat /
+              # før morgen-gaten) giver den 8 %. Kardinalreglen om at badet
+              # aldrig bliver lyst om natten gælder også en brusebad-session.
+              brightness_pct: "{{ states('sensor.badevaerelse_fase_brightness') | int(100) }}"
+              transition: 2
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.badevaerelse_brusebad_lys_genrejst
+      - service: logbook.log
+        data:
+          name: "Bad brusebad"
+          message: >-
+            Session ARMERET — fugt +{{ states('sensor.badevaerelse_fugt_stigning') }}
+            point/10min (tærskel {{ states('input_number.badevaerelse_brusebad_fugt_stigning_point') }}),
+            burst +{{ states('sensor.badevaerelse_fugt_burst') }} point/5min,
+            RH nu {{ states('sensor.badevaerelse_timmerflotte_humidity') }} %.
+            Holder til fugten falder.
+          entity_id: input_boolean.badevaerelse_brusebad_session
+
+  # UDGANG 1 (badevaerelse_brusebad_slut_pir, "frisk indre-PIR efter blanking
+  # = ude af bruseren") er FJERNET 2026-10-01 — user-spec: "hvis der har været
+  # høj fugt skal lyset først slukke når fugtigheden begynder at falde". Målt
+  # samme morgen: PIR'en slap sessionen 06:11:21, fugten steg til 06:21:27.
+
+  # ---------------------------------------------------------------------------
+  # UDGANG 2 + 3: fugt-fald og hård levetid. Tick, ikke kant.
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_brusebad_backstop
+    alias: "Bad brusebad: backstop (fugt falder / maks tid)"
+    description: >
+      /1-tick i stedet for `for:`-kanter: en HA-restart dræber ethvert
+      ventende `to: X for: N`, og begge udgange her måler netop TID
+      (permanent faktum). Betingelserne læser et SKREVET stempel, så de svarer
+      korrekt efter en restart midt i en session.
+
+      Fugt-faldet kræver at sessionen er mindst blank_minutter gammel: en
+      kraftig udsugning kan trække fugten ned mens man stadig står i bruseren,
+      så et tidligt fald er ikke bevis for at badet er slut.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_brusebad_session
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set alder = states('sensor.badevaerelse_brusebad_alder') | int(0) %}
+          {% set maks = states('input_number.badevaerelse_brusebad_maks_minutter') | int(45) %}
+          {% set blank = states('input_number.badevaerelse_brusebad_blank_minutter') | int(9) %}
+          {% set fald = states('sensor.badevaerelse_fugt_fald') | float(0) %}
+          {% set fald_k = states('input_number.badevaerelse_brusebad_fald_point') | float(12) %}
+          {{ alder >= maks or (alder >= blank and fald >= fald_k) }}
+    action:
+      - variables:
+          aarsag: >-
+            {% if (states('sensor.badevaerelse_brusebad_alder') | int(0))
+                  >= (states('input_number.badevaerelse_brusebad_maks_minutter') | int(45)) %}maks-tid
+            {% else %}fugt-fald{% endif %}
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.badevaerelse_brusebad_session
+      - service: logbook.log
+        data:
+          name: "Bad brusebad"
+          message: >-
+            Session SLUT ({{ aarsag | trim }}) efter
+            {{ states('sensor.badevaerelse_brusebad_alder') }} min — fugten er
+            {{ states('sensor.badevaerelse_fugt_fald') }} point under 10-min-toppen.
+          entity_id: input_boolean.badevaerelse_brusebad_session
+
+  # ---------------------------------------------------------------------------
+  # OPRYDNING: ryd én-gangs-markøren når sessionen slipper (uanset udgang).
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_brusebad_ryd
+    alias: "Bad brusebad: ryd markører ved sessions-slut"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.badevaerelse_brusebad_session
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_brusebad_lys_genrejst
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.badevaerelse_brusebad_lys_genrejst
+
+  # ---------------------------------------------------------------------------
+  # SIKKERHEDSNET: en sluk-vej vi ikke har vetoet slukkede alligevel.
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_brusebad_lys_genrejs
+    alias: "Bad brusebad: genrejs lys slukket af en automation"
+    description: >
+      Alle badets kendte sluk-veje er vetoet på
+      binary_sensor.badevaerelse_brusebad_hold (fejlklasse #21). Denne er nettet
+      under nettet: slukker NOGET alligevel lyset midt i et brusebad, og gjorde
+      det uden en bruger-kontekst, rejses det én gang.
+
+      MANUELT SLUK VINDER: manuel = context.user_id is not none (fejlklasse #3
+      — parent_id duer ikke, en tids-trigget automation ser ud præcis som en
+      bruger på det felt). Trykker man selv på kontakten, bliver der mørkt.
+      Max ÉN genrejsning pr. session, ellers kunne den slås i ring med en
+      sluk-vej vi har overset.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: light.badevaerelse_all
+        to: "off"
+        for:
+          seconds: 5
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_brusebad_session
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.badevaerelse_brusebad_lys_genrejst
+        state: "off"
+      - condition: template
+        value_template: "{{ trigger.to_state.context.user_id is none }}"
+      - condition: template
+        value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+      - condition: template
+        value_template: "{{ states('sensor.badevaerelse_fase_brightness') | int(0) > 0 }}"
+    action:
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+        data:
+          brightness_pct: "{{ states('sensor.badevaerelse_fase_brightness') | int(100) }}"
+          transition: 2
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.badevaerelse_brusebad_lys_genrejst
+      # 2026-10-01: logbogen lå siden 769fef3 i efterslæbet nedenfor (indsat
+      # midt i denne automation) — her har den hjemme.
+      - service: logbook.log
+        data:
+          name: "Bad brusebad"
+          message: >-
+            Lyset blev slukket af en automation midt i brusebad-sessionen
+            ({{ states('sensor.badevaerelse_brusebad_alder') }} min inde) —
+            genrejst på {{ states('sensor.badevaerelse_fase_brightness') }} %.
+            Kun én genrejsning pr. session.
+          entity_id: light.badevaerelse_all
+
+  # ---------------------------------------------------------------------------
+  # EFTERSLÆB: indfri et sluk-alt der blev udskudt af bad-undtagelsen
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_sluk_alt_efterslaeb
+    alias: "Bad: færdiggør et udskudt sluk-alt når badet bliver frit"
+    description: >
+      2026-09-02d (user-bug "bad lys slukker ikke trods godnat!!!"): godnat kørte
+      21:45:51 mens sensor.badevaerelse_sluk_alt_undtagelse stod på 5, så alle
+      fem spots blev sprunget over. Personen forlod badet 21:45:52 — ét sekund
+      senere — og så var der ingen der kom tilbage efter dem. Undtagelsen blev
+      givet på en KANT og aldrig indsamlet (fejlklasse #4/#19).
+
+      Badets egne presence-sluk-veje er ikke svaret: de er alle vetoet på det
+      samme brusebad_hold, så deres occupancy-off-kant faldt netop mens vetoet
+      var oppe og re-fyrede aldrig. Målingen: lyset stod tændt fra 21:45:51 til
+      det blev slukket i hånden 21:48:36.
+
+      Måler TILSTANDEN, ikke kanten, så den er immun over for hvornår kanterne
+      faldt — og er no-op i et mørkt bad. Vinduet efter kvitteringen er hele
+      bindingen til det oprindelige tryk: uden for det er et tændt bad-lys en
+      nattur med sin egen sluk-vej, og den må vi ikke skære over.
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.badevaerelse_sluk_alt_undtagelse
+        below: 1
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_inde_occupancy
+        from: "on"
+        to: "off"
+        for:
+          seconds: 60
+      # Backstop: begge kanter ovenfor kan falde mens vi står i mode single
+      # eller under en restart. Tilstanden holder, så et tick indhenter dem.
+      - platform: time_pattern
+        minutes: "/2"
+    condition:
+      # Kvitteringen findes og er frisk. Urørt input_datetime står på DAGENS
+      # midnat, ikke 1970 (permanent faktum) → tidsdelen er sentinel'en.
+      - condition: template
+        value_template: >-
+          {% set s = states('input_datetime.badevaerelse_sluk_alt_udskudt') %}
+          {% if s in ['unknown', 'unavailable', 'none', ''] or s[11:] == '00:00:00' %}
+            false
+          {% else %}
+            {% set v = states('input_number.badevaerelse_sluk_alt_efterslaeb_minutter')
+                       | float(45) %}
+            {{ (now() - strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo))
+               .total_seconds() < v * 60 }}
+          {% endif %}
+      # Undtagelsen er sluppet — badet er ikke længere optaget.
+      - condition: numeric_state
+        entity_id: sensor.badevaerelse_sluk_alt_undtagelse
+        below: 1
+      - condition: state
+        entity_id: light.badevaerelse_all
+        state: "on"
+      # Rummet skal være tomt OG have været det et minut. last_changed er her
+      # forsvarligt: efter en restart er den boot-tidspunktet, altså FRISKERE
+      # end sandheden, så vi venter længere i stedet for at slukke for tidligt.
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_inde_occupancy
+        state: "off"
+      - condition: template
+        value_template: >-
+          {% set s = states.binary_sensor.badevaerelse_inde_occupancy %}
+          {{ s is not none
+             and (now() - s.last_changed).total_seconds() >= 60 }}
+      - condition: template
+        value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    action:
+      # Kort fade frem for et snap: det oprindelige tryk var et godnat/NED, og
+      # ZHA-halen på gruppen ryddes af badevaerelse_spots_confirm_off (Matter
+      # honorerer ikke transition på turn_off — permanent faktum).
+      # 2026-10-01 (user-spec): frisk fugt-måling før sluk — samme blok som
+      # badets sluk-veje i presence_badevaerelse.yaml (grep fugt_frisk).
+      # 2026-10-06 (bug-hunt nat, 📏): timeout 10 → 30 min og ALDRIG videre ved
+      # timeout. Målt 3 døgn: 834 huller, p99 464 s, men 5 over 600 s (max 1581 s)
+      # — 10-min-grænsen (586 s målt 1/10) slukkede i dem uden frisk måling.
+      # Død sensor = intet sluk her; max-on watchdog er det ydre net.
+      # 2026-10-11 (user-spec): venter vi KUN på fugt-målingen, slukker alt
+      # undtagen bruse-spotten (spot 2) med fade imens. Ikke-blokerende.
+      - service: script.turn_on
+        continue_on_error: true
+        target:
+          entity_id: script.badevaerelse_fugt_ventesluk
+      - wait_template: "{{ is_state('binary_sensor.badevaerelse_fugt_frisk', 'on') }}"
+        timeout: "00:30:00"
+        continue_on_timeout: false
+      - condition: numeric_state
+        entity_id: sensor.badevaerelse_sluk_alt_undtagelse
+        below: 1
+      - condition: template
+        value_template: >-
+          {{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+             and is_state('light.badevaerelse_all', 'on')
+             and not is_state('input_select.room_mode_badevaerelse', 'Manual') }}
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.badevaerelse_all
+        data:
+          transition: 3
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.badevaerelse_sluk_alt_udskudt
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d 00:00:00') }}"
+      - service: logbook.log
+        data:
+          name: "Bad sluk-alt"
+          message: >-
+            Udskudt sluk-alt indfriet — badet er frit (ingen brusebad/wasp,
+            ingen bevægelse i 60 s) og fugt-målingen er frisk.
+          entity_id: light.badevaerelse_all

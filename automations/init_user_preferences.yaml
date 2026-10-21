@@ -1,0 +1,1355 @@
+# =============================================================================
+# Init User Preferences on First Boot — fresh-install protection
+# =============================================================================
+# Sprint 2026-05-07 (audit-fix persistence): efter fjernelse af `initial:` fra
+# user-tunable input_numbers, fresh installs starter på `min:` value (typisk 0).
+# Denne automation sætter sensible defaults HVIS værdien er "min" på HA-start.
+#
+# Existing installations (= værdier allerede sat) bevarer deres værdier på tværs
+# af restarts/updates fordi HA's state registry restorer last-set value.
+#
+# Fires kun hvis input_number == min OG prefs_fresh_install.
+#
+# 2026-09-14: ALLE 301 guards brugte før `last_changed < 60s` som "aldrig sat af
+# et menneske". Den test er ALTID sand her: last_changed nulstilles ved HA-start,
+# og denne automation fyrer PÅ `homeassistant: start`. Den reelle guard var
+# derfor `value == min` alene — og den kan ikke skelne en fresh install fra en
+# user der bevidst vælger minimum. Målt offer: user satte
+# koekken_session_aktiv_minutter til 1 (= min) kl. 12:58; version-bumpet
+# 17→18 skrev den til 3 kl. 21:57:40 med tom context_user_id.
+#
+# Et version-bump seeder derfor IKKE længere nye sliders på en eksisterende
+# install — de sættes live via API ved deploy (fejlklasse #5's "API-set"), og
+# blokken her er kun til gavn for en ægte fresh install.
+#
+# 2026-10-04 (konsolidering P1, docs/konsolidering.md): input_number-værdierne
+# kommer nu fra snapshottet (ét loop øverst i action, via den afledte
+# config_snapshots/fresh_install/input_number.yaml), ikke fra 321 håndskrevne
+# blokke. 6.230 → ~1.350 linjer. En NY slider skal derfor IKKE have en blok
+# her — `helpers_export.py` + commit er dens fresh-install-default. Tilbage
+# står: kill-switches (booleans), datetimes, selects/texts og Apollo-NVRAM-
+# pushet, som ikke er "en værdi pr. slider". Bevist i staging (frisk install):
+# alle snapshot-sliders = tunet værdi (før: 329/644), 0 på min (før: 32).
+# Runtime-tællere er holdt ude af snapshottet (helpers_export.RUNTIME_NUMBERS).
+# =============================================================================
+
+- id: init_user_preferences_first_boot
+  alias: "Init: User preferences default values (first-boot only)"
+  description: >
+    Sætter sensible defaults for tunable input_numbers HVIS de er på min-værdi
+    OG aldrig har været ændret af user. Fresh-install protection.
+  mode: single
+  variables:
+    # B39-fix 2026-07-19: versioneret init-gate. BUMP prefs_code_version naar
+    # du tilfoejer en NY slider → init koerer EEN gang til og seeder dens
+    # default (via de self-guardede value<=min-blokke). prefs_fresh_install
+    # skelner genuine fresh install (kill-switches taendes) fra en version-bump
+    # re-run (KUN slider-value-seeding; alle boolean/kill-switch-blokke er
+    # gated paa fresh_install → user-fravalg overlever bumpet).
+    prefs_code_version: 20  # 20 = 2026-10-01 people v5 (afgang-vindue, hold 900, decay fjernet)
+    prefs_stored_version: "{{ states('input_number.user_prefs_version') | int(0) }}"
+    prefs_fresh_install: "{{ is_state('input_boolean.user_prefs_initialized', 'off') }}"
+  trigger:
+    - platform: homeassistant
+      event: start
+  # 2026-06-11 persistence-fix + B39-fix 2026-07-19: init koerer naar stored
+  # version < code version (fresh install: stored=0 → koerer). 2026-09-14:
+  # ogsaa slider-blokkene er nu gated paa prefs_fresh_install — "value <= min"
+  # var aldrig en self-guard, for min er en lovlig user-vaerdi.
+  condition:
+    - condition: template
+      value_template: "{{ prefs_stored_version < prefs_code_version }}"
+  action:
+    # Wait 30s for HA to fully boot + state registry to load
+    - delay:
+        seconds: 30
+    # Init each input_number conditionally (only if at min AND never changed)
+    - service: logbook.log
+      data:
+        name: "Init user preferences"
+        message: "Checking for fresh-install defaults to apply..."
+
+    # SLIDER-VÆRDIER PÅ EN FRISK INSTALL = DET SIDSTE SNAPSHOT (konsolidering
+    # 2026-10-04, docs/konsolidering.md P1). Her stod 305 håndskrevne blokke à
+    # ~15 linjer, én pr. slider. Målt i `scripts/ha_offline.py staging` (= en
+    # frisk install): de gav 283 af 644 sliders en FABRIKS-default der afveg
+    # fra brugerens tunede værdi, og 32 fik ingen værdi overhovedet. Snapshottet
+    # (scripts/helpers_export.py) ER de tunede værdier, så det er nu den ene
+    # kilde: en ny slider får sin fresh-install-værdi ved at blive eksporteret,
+    # ikke ved en ny blok her. Kører FØR de resterende blokke, så de ser en
+    # slider der ikke længere står på min og springer over (inkl. gate-seeds →
+    # apply_all_gates skubber de TUNEDE gates til Apollo-NVRAM, ikke defaults).
+    # Gamle per-slider-begrundelser: `git show 21709ab7:automations/init_user_preferences.yaml`.
+    #
+    # Kilden er den AFLEDTE fil config_snapshots/fresh_install/input_number.yaml
+    # (kun tal, skrevet atomisk af helpers_export.py), ikke helper_values.yaml:
+    # HA læser denne fil ved HVER start, og en streng med backslash, Jinja eller
+    # en merge-konflikt i det rå snapshot ville ellers sende hele huset i
+    # recovery mode. !include_dir_named giver {} hvis mappen mangler (målt i
+    # 2026.9.2) — så restorer init bare ingenting, i stedet for at vælte HA.
+    - variables:
+        snapshot: !include_dir_named ../config_snapshots/fresh_install
+    - if:
+        - condition: template
+          value_template: "{{ prefs_fresh_install }}"
+      then:
+        - repeat:
+            for_each: "{{ (snapshot.input_number | default({})).items() | list }}"
+            sequence:
+              - variables:
+                  eid: "input_number.{{ repeat.item[0] }}"
+              - if:
+                  # Kun en slider der står på sin min (= aldrig sat). Findes den
+                  # ikke længere, springes den over i stedet for at fejle.
+                  # Kræver også et TAL fra filen: `| float` på en streng kaster en
+                  # TemplateError, som continue_on_error IKKE fanger — den ville
+                  # aborte resten af init (kill-switches, versions-stemplet).
+                  - condition: template
+                    value_template: >-
+                      {% set s = states[eid] %}
+                      {{ repeat.item[1] is number
+                         and s is not none and s.state not in ['unknown', 'unavailable']
+                         and (s.state | float(-1e9)) == (s.attributes.min | float(-2e9)) }}
+                then:
+                  - service: input_number.set_value
+                    # Klemt ind i [min, max]: et snapshot fra før en range-
+                    # ændring må ikke vælte resten af init (set_value kaster).
+                    continue_on_error: true
+                    target:
+                      entity_id: "{{ eid }}"
+                    data:
+                      value: >-
+                        {{ [[repeat.item[1] | float, state_attr(eid, 'max') | float] | min,
+                            state_attr(eid, 'min') | float] | max }}
+        - service: logbook.log
+          data:
+            name: "Init user preferences"
+            message: >-
+              Frisk install: de af {{ (snapshot.input_number | default({})) | length }}
+              snapshot-sliders der stod på min, er sat til snapshot-værdien
+              (mappen config_snapshots/fresh_install).
+
+
+    - if:
+        - condition: template
+          value_template: "{{ prefs_fresh_install }}"
+      then:
+        - service: script.stue_apollo_apply_all_gates
+        - service: script.spisestue_apollo_apply_all_gates
+        - service: script.koekken_apollo_apply_all_gates
+        - service: script.boernevaerelse_apollo_apply_all_gates
+
+    - if:
+        - condition: template
+          value_template: "{{ prefs_fresh_install }}"
+      then:
+        - service: script.sove_apollo_apply_all_gates
+
+
+    - if:
+        - condition: template
+          value_template: >-
+            {% set ts = state_attr('input_datetime.boern_ankomst_suppress_timer', 'timestamp') | float(0) %}
+            {{ ts == 0 }}
+      then:
+        # 2026-10-04: var `input_datetime.set_value`, som ikke findes → på en
+        # FRISK install aborterede hele init her (step 55), så 477 sliders blev
+        # på min og user_prefs_initialized blev aldrig sat. Fanget af
+        # `scripts/ha_offline.py staging` (staging = frisk install).
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.boern_ankomst_suppress_timer
+            time: "06:00:00"
+
+
+    # Terrasse nat-sluk-tid — default 23:30 (2026-07-14). Fresh time-only
+    # input_datetime lander på 00:00:00 → sæt default. NB: ro-minutter-slideren
+    # har BEVIDST ingen init (0 = gyldig user-værdi = hård sluk; live-default
+    # 20 sat via API + snapshot, jf. roborock_elpris-mønstret).
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.terrasse_lys_nat_sluk_tid') %}
+            {% set lc = states.input_datetime.terrasse_lys_nat_sluk_tid.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.terrasse_lys_nat_sluk_tid
+            time: "23:30:00"
+
+
+    # Flagermus ekstra-dæmp-tid — default 22:30 (2026-07-18). Sentinel = 00:00:00.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.flagermus_ekstra_dim_tid') %}
+            {% set lc = states.input_datetime.flagermus_ekstra_dim_tid.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.flagermus_ekstra_dim_tid
+            time: "22:30:00"
+
+    # Flagermus curfew-tid — default 23:00 (2026-07-18, user tuner selv). Sentinel = 00:00:00.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.flagermus_curfew_tid') %}
+            {% set lc = states.input_datetime.flagermus_curfew_tid.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.flagermus_curfew_tid
+            time: "23:00:00"
+
+
+
+    # 2026-06-21: elpris_kr_kwh (flad pris-slider) FJERNET. Nye pris-komponenter
+    # + setup-overhead-antagelser (packages/setup_cost.yaml) får defaults her.
+    # Fresh install = min (0) → sættes til danske 2026-estimater. Værdierne er
+    # ANTAGELSER brugeren retter efter sin regning på Statistik-siden.
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >-
+                {% set v = states('input_number.cost_tariff_hojlast') | float(-1) %}
+                {{ v == 0 and (now() - states.input_number.cost_tariff_hojlast.last_changed).total_seconds() < 90 }}
+          sequence:
+            # Fallback-nettarif (EDS er primær). Real Radius + transmission +
+            # systemtarif (net 0.106/0.159/0.414 + 0.115). Bruges kun hvis EDS nede.
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_tariff_lavlast, value: 0.22}
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_tariff_hojlast, value: 0.27}
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_tariff_spidslast, value: 0.53}
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_elafgift_kr_kwh, value: 0.76}
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_markup_kr_kwh, value: 0.10}
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_spot_fallback_kr_kwh, value: 0.40}
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_nuc_watt, value: 14}
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_dongles_watt, value: 1.5}
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_apollo_watt, value: 2.5}
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_kamera_watt, value: 3.5}
+            - service: input_number.set_value
+              data: {entity_id: input_number.cost_batteri_kr_aar, value: 250}
+
+
+    # 2026-10-03: Sofa Zen automatik (packages/sofa_zen_auto.yaml). Fresh-install-
+    # defaults; det LIVE hus seedes via API (ét sæt kald, jf. CLAUDE.md #5).
+    - if:
+        - condition: template
+          value_template: >-
+            {{ prefs_fresh_install and is_state('input_boolean.sofa_zen_auto_enabled', 'off') }}
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.sofa_zen_auto_enabled
+    - if:
+        - condition: template
+          value_template: >-
+            {{ states('input_datetime.sofa_zen_fra') in ['00:00:00', 'unknown'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.sofa_zen_fra
+            time: "20:30:00"
+
+
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.regn_rapport_tid') %}
+            {% set lc = states.input_datetime.regn_rapport_tid.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.regn_rapport_tid
+            time: "07:30:00"
+
+
+    # =========================================================================
+    # Kill-switches — default ON (= feature aktiv). KUN paa genuine fresh
+    # install (prefs_fresh_install) — en version-bump re-run maa ALDRIG
+    # gen-taende kill-switches user har slaaet fra (B39-fix 2026-07-19).
+    # =========================================================================
+    - if:
+        - condition: template
+          value_template: "{{ prefs_fresh_install }}"
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id:
+              - input_boolean.elpris_notif_enabled
+              - input_boolean.cykel_lader_enabled
+              - input_boolean.roegalarm_blink_enabled
+              - input_boolean.wakeup_adults_enabled
+              - input_boolean.wakeup_kids_enabled
+              - input_boolean.arrival_welcome_enabled
+              # 2026-09-04: AirBnB velkomst-ceremoni (kill-switch, default on).
+              - input_boolean.airbnb_velkomst_enabled
+              - input_boolean.terrace_presence_enabled
+              - input_boolean.flagermus_enabled
+              - input_boolean.winter_solar_enabled
+              - input_boolean.winter_active_dark_close_enabled
+              - input_boolean.summer_defense_enabled
+              - input_boolean.gardin_dormant_pause_enabled
+              # 2026-09-23: mosbillede-solbeskyttelsen (kill-switch, default on).
+              - input_boolean.mosbillede_solbeskyttelse_enabled
+              # 2026-09-03: sove-gardinets aftenluk (solnedgang + slider).
+              - input_boolean.sove_gardin_aftenluk_enabled
+              - input_boolean.auto_godnat_enabled
+              - input_boolean.auto_putning_enabled
+              - input_boolean.morning_sanity_enabled
+              - input_boolean.weather_warning_enabled
+              - input_boolean.legetoejsdag_varsel_enabled
+              - input_boolean.drift_back_enabled
+              - input_boolean.sovevaerelse_morgen_beskyttelse_enabled
+              - input_boolean.airbnb_natmode_enabled
+              # 2026-08-13g: Sleep Over-kill-switchen står ON — featuren gør
+              # først noget når input_boolean.sleepover_i_nat armes pr. nat.
+              - input_boolean.sleepover_enabled
+              # 2026-08-15: børneværelsets morgen-beskyttelse (barn 1 oppe,
+              # barn 2 sover videre) — ON, men gør kun noget når børn er hjemme.
+              - input_boolean.boern_morgen_beskyttelse_enabled
+              # 2026-08-18: reserve-alarmen. ON = huset vækker også på en
+              # hverdag hvor INGEN telefon melder en alarm (08-18: alle tre
+              # kanaler var døde samtidig, og ingen blev vækket).
+              - input_boolean.wakeup_fallback_enabled
+              # 2026-10-10: kill-switch-jagt — dvale-skema + gæste-mode-auto.
+              - input_boolean.dormant_skema_hverdag_enabled
+              - input_boolean.dormant_skema_weekend_enabled
+              - input_boolean.guest_mode_auto_enabled
+
+    # 2026-08-18: reserve-alarmens klokkeslæt. Sentinel = 00:00:00 (urørt
+    # time-only helper). 05:55 er valgt bevidst frem for 06:15, fordi
+    # sensor.wakeup_kids_maal = voksen-alarm + global_kids_wakeup_after_alarm_minutes
+    # (10) — 05:55 holder børnene på præcis deres 06:05, mens et senere tal
+    # ville skubbe dem med.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.wakeup_fallback_tid') %}
+            {% set lc = states.input_datetime.wakeup_fallback_tid.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.wakeup_fallback_tid
+            time: "05:55:00"
+
+    # 2026-08-15: børn — hvornår morgen-mørket slipper. Sentinel = 00:00:00
+    # (urørt time-only helper). Default 07:30 = user-spec.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.boern_morgen_beskyttelse_slut') %}
+            {% set lc = states.input_datetime.boern_morgen_beskyttelse_slut.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.boern_morgen_beskyttelse_slut
+            time: "07:30:00"
+
+    # 2026-08-26h (user-spec): aften-låsenes startpunkt. Sentinel = 00:00:00
+    # (urørt time-only helper). 20:00 for soveværelset, 18:30 for børneværelset.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.sove_manual_off_lock_start') %}
+            {% set lc = states.input_datetime.sove_manual_off_lock_start.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.sove_manual_off_lock_start
+            time: "20:00:00"
+
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.boern_manual_off_lock_start') %}
+            {% set lc = states.input_datetime.boern_manual_off_lock_start.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.boern_manual_off_lock_start
+            time: "18:30:00"
+
+    # 2026-08-13g: Sleep Over — hvornår open-plan-mørket slipper om morgenen.
+    # Sentinel = 00:00:00 (urørt time-only helper). Default 07:30 dækker
+    # vinduet fra godnat-flagenes rydning (06:00) til gæsten reelt står op.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.sleepover_morgen_slut') %}
+            {% set lc = states.input_datetime.sleepover_morgen_slut.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.sleepover_morgen_slut
+            time: "07:30:00"
+
+
+    # 2026-06-18: bad wasp entry-arm vindue FJERNET (entry-timer arm-sti udgået
+    # i robust rewrite — wasp armeres nu kun event-drevet, ingen timer).
+
+    # 2026-06-19: lys_kpi_alarm_timer init-override FJERNET. User vil BEVIDST
+    # holde watchdog-alarmen på 4 t/dag pr. rum (= slider-min, så fresh-install
+    # giver den selv). Den gamle override satte 14 ved HVER boot og overskrev
+    # brugerens 4 → de måtte re-sætte den hver gang. Lad den være.
+
+
+    # Morgen-vinduet 06:00-09:00 (user-spec). Sentinel = 00:00:00.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.badevaerelse_bruser_vagt_start') %}
+            {% set lc = states.input_datetime.badevaerelse_bruser_vagt_start.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.badevaerelse_bruser_vagt_start
+            time: "06:00:00"
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.badevaerelse_bruser_vagt_slut') %}
+            {% set lc = states.input_datetime.badevaerelse_bruser_vagt_slut.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.badevaerelse_bruser_vagt_slut
+            time: "09:00:00"
+    - if:
+        - condition: template
+          value_template: >-
+            {{ is_state('input_boolean.badevaerelse_bruser_vagt_enabled', 'off')
+               and prefs_fresh_install }}
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.badevaerelse_bruser_vagt_enabled
+
+    - if:
+        - condition: template
+          value_template: >-
+            {% set lc = states.input_boolean.thread_watchdog_enabled.last_changed %}
+            {{ prefs_fresh_install
+               and is_state('input_boolean.thread_watchdog_enabled', 'off')
+               and prefs_fresh_install }}
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.thread_watchdog_enabled
+
+
+    # 2026-07-09: sove aften-grænse (presence-START → sengelys) — default 22:00.
+    # Fresh-install: time-only input_datetime lander på 00:00:00.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.sove_aften_graense') %}
+            {% set lc = states.input_datetime.sove_aften_graense.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.sove_aften_graense
+            time: "22:00:00"
+
+    # 2026-08-01: godnat auto-off må tidligst erklære morgen kl. 06:00 (var
+    # hardcodet 05:00 → ryddede godnat på en nat-tur, hvorefter huset lyste op).
+    # Sentinel = 00:00:00: midnat er aldrig en tilsigtet værdi her, fordi vinduet
+    # slutter 12:00 og en start ved midnat ville gøre hele nat-guarden meningsløs.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.godnat_autooff_tidligst') %}
+            {% set lc = states.input_datetime.godnat_autooff_tidligst.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.godnat_autooff_tidligst
+            time: "06:00:00"
+
+    # 2026-07-28: Dark Mode nat-cutover til godnat — default 03:00.
+    # Fresh-install: time-only input_datetime lander på 00:00:00 (= også en gyldig
+    # cutover-tid, men 00:00 vil aldrig fyre useful → sæt kun på ægte fresh-install
+    # via last_changed<60s, så en bevidst brugervalgt tid ikke overskrives).
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.dark_mode_godnat_cutover') %}
+            {% set lc = states.input_datetime.dark_mode_godnat_cutover.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.dark_mode_godnat_cutover
+            time: "03:00:00"
+
+    # 2026-08-14: Sleep Over — hvornår gæste-mørket slipper om morgenen.
+    # Manglede både init-default og snapshot (fejlklasse #5), og 00:00:00 er
+    # her IKKE en harmløs værdi: sensoren sammenligner "sekunder siden midnat"
+    # mod tidspunktet, så 00:00 = mørket slutter i det sekund godnat ryddes
+    # 06:00 — præcis det hul featuren blev bygget for at lukke.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.sleepover_morgen_slut') %}
+            {% set lc = states.input_datetime.sleepover_morgen_slut.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.sleepover_morgen_slut
+            time: "07:30:00"
+
+    # 2026-07-30: alarm-vækningens fuldførelses-stempel. Et date+time
+    # input_datetime lander fresh på **I DAG 00:00** — ikke epoch — så
+    # `binary_sensor.sove_alarm_morgen_lys` ville tro der var vækket ved
+    # midnat og stå ON hele natten (lukket gardin = privacy-betingelsen
+    # opfyldt). Nulstil til 1970 så "aldrig vækket" er entydigt.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set ts = state_attr('input_datetime.wakeup_alarm_ramp_faerdig_at', 'timestamp') | float(0) %}
+            {{ ts > 0 and (ts | timestamp_custom('%H:%M:%S', true)) == '00:00:00'
+               and (ts | timestamp_custom('%Y', true)) != '1970' }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.wakeup_alarm_ramp_faerdig_at
+            datetime: "1970-01-01 00:00:00"
+
+    # 2026-07-31: samme fælde for morgen-sekvensens to stempler. Gyldigheden
+    # måles nu mod `today_at('04:00')` (og dagens midnat læses 2 t forskudt =
+    # ~02:00 < 04:00), så en fresh helper falder allerede igennem dér — men
+    # 1970 gør "aldrig set" entydigt i logbook og på dashboardet.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set ts = state_attr('input_datetime.sove_alarm_morgen_2p_at', 'timestamp') | float(0) %}
+            {{ ts > 0 and (ts | timestamp_custom('%H:%M:%S', true)) == '00:00:00'
+               and (ts | timestamp_custom('%Y', true)) != '1970' }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.sove_alarm_morgen_2p_at
+            datetime: "1970-01-01 00:00:00"
+
+    - if:
+        - condition: template
+          value_template: >-
+            {% set ts = state_attr('input_datetime.sove_morgen_afgang_at', 'timestamp') | float(0) %}
+            {{ ts > 0 and (ts | timestamp_custom('%H:%M:%S', true)) == '00:00:00'
+               and (ts | timestamp_custom('%Y', true)) != '1970' }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.sove_morgen_afgang_at
+            datetime: "1970-01-01 00:00:00"
+
+    # Deadline 07:00 (user: "på hverdage kl. 07 skal batterierne være færdig
+    # opladet"). Fresh-install time-only lander på 00:00:00.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.cykel_lader_deadline') %}
+            {% set lc = states.input_datetime.cykel_lader_deadline.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.cykel_lader_deadline
+            time: "07:00:00"
+    # Tidligst-fra 16:00 → aldrig ladning i hverdags-vinduet 08-16 hvor
+    # batterierne er ude af huset (user-spec).
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.cykel_lader_vindue_start') %}
+            {% set lc = states.input_datetime.cykel_lader_vindue_start.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.cykel_lader_vindue_start
+            time: "16:00:00"
+    # Den faste nat-probe uden for aften-vinduet (user-spec 2026-07-29;
+    # morgen-proben fjernet 2026-10-16).
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.cykel_lader_nat_probe') %}
+            {% set lc = states.input_datetime.cykel_lader_nat_probe.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.cykel_lader_nat_probe
+            time: "02:00:00"
+
+    # 2026-07-29e: baseline-spandet = "hvornår ville en dum lader have kørt?"
+    # 17-21 = nettarifs-spidslasten og aftenens dyreste spot-timer (user-valg:
+    # "brug 17-21 baseline i stedet, det er mere realistisk").
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.cykel_lader_baseline_start') %}
+            {% set lc = states.input_datetime.cykel_lader_baseline_start.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.cykel_lader_baseline_start
+            time: "17:00:00"
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.cykel_lader_baseline_slut') %}
+            {% set lc = states.input_datetime.cykel_lader_baseline_slut.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.cykel_lader_baseline_slut
+            time: "21:00:00"
+
+    # 2026-07-29c: dagligt slid-overblik (packages/cykel_lader_slid.yaml) —
+    # lige efter deadline (07:00), så rapporten dækker nattens ladevindue.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.cykel_lader_rapport_tid') %}
+            {% set lc = states.input_datetime.cykel_lader_rapport_tid.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.cykel_lader_rapport_tid
+            time: "07:15:00"
+
+
+    # Optimeringen er ON som default — det gamle faste 00-06-vindue tabte penge
+    # halvdelen af dagene. Intet `initial:` på selve helperen (den ville blive
+    # PÅTVUNGET ved hver HA-start); her sættes den kun når den er nyfødt.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set lc = states.input_boolean.robot_lade_optimering_enabled.last_changed %}
+            {{ is_state('input_boolean.robot_lade_optimering_enabled', 'off')
+               and prefs_fresh_install }}
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.robot_lade_optimering_enabled
+
+    # =========================================================================
+    # 2026-08-06: morgen-udskydelse af manuel støvsugning
+    # (packages/roborock_morgen_udskyd.yaml, user-spec "en ting til morgener
+    # (07-10)"). Vinduet er brugerens eget tal.
+    # =========================================================================
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.roborock_morgen_udskyd_start') %}
+            {% set lc = states.input_datetime.roborock_morgen_udskyd_start.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.roborock_morgen_udskyd_start
+            time: "07:00:00"
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.roborock_morgen_udskyd_slut') %}
+            {% set lc = states.input_datetime.roborock_morgen_udskyd_slut.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.roborock_morgen_udskyd_slut
+            time: "10:00:00"
+
+
+    # 2026-06-05: putte-natlys farve — default 12000 K (blå-hvid).
+    # SLETTET 2026-08-06 (fejlklasse #5): sentinellen var `v <= 5000`, altså et
+    # HELT BÅND af legitime varme værdier — sliderens min ER 2000 K (varmest).
+    # Brugeren kørte bevidst på 2000; version-bumpet til 10 gjorde restarten kl.
+    # 08:48 til en re-run og skrev 12000 oven i det. En fresh-min-sentinel duer
+    # kun når dens værdi er én ingen bevidst ville vælge. Fresh-install-vejen er
+    # config_snapshots/helper_values.yaml + scripts/helpers_restore.py.
+
+
+    # 2026-06-06: puttelys-tid (fase 1) — default 19:10. Fresh input_datetime
+    # (time-only) starter på 00:00:00 → sæt default. Bevarer user-justering.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.puttelys_start') %}
+            {% set lc = states.input_datetime.puttelys_start.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.puttelys_start
+            time: "19:10:00"
+
+    # 2026-06-06: natlys-tid (fase 2 bagkant) — default 20:30.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.natlys_start') %}
+            {% set lc = states.input_datetime.natlys_start.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.natlys_start
+            time: "20:30:00"
+
+    # 2026-06-12: putning-vindue start — default 18:30 (user-spec: alt efter
+    # 18:30 med børn hjemme = putningsorienteret lys).
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.putning_vindue_start') %}
+            {% set lc = states.input_datetime.putning_vindue_start.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.putning_vindue_start
+            time: "18:30:00"
+
+    # 2026-08-07: putning-vindue SLUT — default 22:00 (user-spec: "jeg skal kunne
+    # putte lidt sent som i dag også"). Trigger A + D brugte før natlys_start
+    # (20:30) som bagkant = natlysets bagkant, ikke putningens.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set v = states('input_datetime.putning_vindue_slut') %}
+            {% set lc = states.input_datetime.putning_vindue_slut.last_changed %}
+            {{ v in ['00:00:00', 'unknown', 'unavailable'] and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.putning_vindue_slut
+            time: "22:00:00"
+
+
+    # 2026-09-14: de to nye burst-/alarm-slidere i samme pakke. Sentinel = min,
+    # og her er min IKKE en gyldig bruger-værdi: 5 sekunder mellem bursts ville
+    # gøre køkkenet til et stroboskop, og en 5-sekunders alarm kan ikke nå at
+    # blive afbrudt af en knytnæve der kræver ~2,1 sekunders hold. Står de på
+    # min, er de nyfødte — ikke valgt.
+    - if:
+        - condition: template
+          value_template: >-
+            {{ states('input_number.koekken_gestus_burst_interval_s') | float(-1) == 5 }}
+      then:
+        - service: input_number.set_value
+          data:
+            entity_id: input_number.koekken_gestus_burst_interval_s
+            value: 20
+    - if:
+        - condition: template
+          value_template: >-
+            {{ states('input_number.koekken_gestus_alarm_sek') | float(-1) == 5 }}
+      then:
+        - service: input_number.set_value
+          data:
+            entity_id: input_number.koekken_gestus_alarm_sek
+            value: 15
+
+    # Kill-switchen fødes ON: featuren skal virke på en fresh install, og
+    # kontakten er til at slå den FRA igen.
+    - if:
+        - condition: state
+          entity_id: input_boolean.koekken_kamera_krop_enabled
+          state: "off"
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.koekken_kamera_krop_enabled
+
+    - if:
+        - condition: template
+          value_template: >-
+            {% set lc = states.input_boolean.morgenrampe_enabled.last_changed %}
+            {{ prefs_fresh_install
+               and is_state('input_boolean.morgenrampe_enabled', 'off')
+               and prefs_fresh_install }}
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.morgenrampe_enabled
+
+    - if:
+        - condition: template
+          value_template: >-
+            {% set lc = states.input_datetime.koekken_lyskaede_cooking_taend_start.last_changed %}
+            {{ states('input_datetime.koekken_lyskaede_cooking_taend_start') in ['00:00:00', 'unknown']
+               and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.koekken_lyskaede_cooking_taend_start
+            time: "17:00:00"
+    - if:
+        - condition: template
+          value_template: >-
+            {% set lc = states.input_datetime.koekken_lyskaede_cooking_taend_slut.last_changed %}
+            {{ states('input_datetime.koekken_lyskaede_cooking_taend_slut') in ['00:00:00', 'unknown']
+               and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.koekken_lyskaede_cooking_taend_slut
+            time: "22:00:00"
+
+
+    # Bad per-fase spot-toggles (sprint 2026-06-24d) — default ALLE on (= hele
+    # gruppen tænder = nuværende adfærd). input_boolean falder ellers til off på
+    # fresh install. Kun ved frisk-oprettet (<60s) for ikke at over-skrive user-valg.
+    - repeat:
+        for_each:
+          - badevaerelse_quick_spot_1
+          - badevaerelse_quick_spot_2
+          - badevaerelse_quick_spot_3
+          - badevaerelse_quick_spot_4
+          - badevaerelse_quick_spot_5
+          - badevaerelse_medium_spot_1
+          - badevaerelse_medium_spot_2
+          - badevaerelse_medium_spot_3
+          - badevaerelse_medium_spot_4
+          - badevaerelse_medium_spot_5
+          - badevaerelse_fuld_spot_1
+          - badevaerelse_fuld_spot_2
+          - badevaerelse_fuld_spot_3
+          - badevaerelse_fuld_spot_4
+          - badevaerelse_fuld_spot_5
+        sequence:
+          - if:
+              - condition: template
+                value_template: >-
+                  {% set e = 'input_boolean.' ~ repeat.item %}
+                  {{ prefs_fresh_install
+                     and is_state(e, 'off')
+                     and prefs_fresh_install }}
+            then:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: "input_boolean.{{ repeat.item }}"
+
+
+    # =========================================================================
+    # 2026-07-03: Varsel-klokkeslæt (packages/alert_timing.yaml) — 8 input_datetime
+    # + interval-slider. Fresh-install: input_datetime lander på 00:00:00 (ingen
+    # initial:) → init sætter default-tiden; interval lander på min 5 → bump til 30.
+    # Live-system (init=run-once) får værdierne sat via REST ved deploy + snapshot.
+    # =========================================================================
+    - repeat:
+        for_each:
+          - { name: varsel_apollo_rgb_on, default: "06:05:00" }
+          - { name: varsel_apollo_rgb_off, default: "10:00:00" }
+          - { name: varsel_morgen_blink_start, default: "06:30:00" }
+          - { name: varsel_morgen_blink_slut, default: "10:00:00" }
+          - { name: varsel_morgen_push, default: "06:30:00" }
+          - { name: varsel_aften_1, default: "16:30:00" }
+          - { name: varsel_aften_2, default: "17:00:00" }
+          - { name: varsel_aften_3, default: "18:30:00" }
+          # 2026-07-05: bad dagmode senest-tid (packages/badevaerelse_faser.yaml)
+          - { name: badevaerelse_dagmode_senest, default: "05:00:00" }
+          # 2026-07-05: idle→Dormant dag-vindue (packages/dormant_idle.yaml)
+          - { name: dormant_idle_dagstart, default: "08:00:00" }
+          - { name: dormant_idle_dagslut, default: "22:00:00" }
+          # 2026-10-10: dvale-skemaets tider (automations/dormant_schedule.yaml)
+          - { name: dormant_skema_hverdag_tid, default: "09:30:00" }
+          - { name: dormant_skema_weekend_start, default: "09:31:00" }
+          - { name: dormant_skema_weekend_slut, default: "15:00:00" }
+        sequence:
+          - if:
+              - condition: template
+                value_template: >-
+                  {% set e = 'input_datetime.' ~ repeat.item.name %}
+                  {% set lc = states[e].last_changed %}
+                  {{ states(e) == '00:00:00' and prefs_fresh_install }}
+            then:
+              - service: input_datetime.set_datetime
+                data:
+                  entity_id: "input_datetime.{{ repeat.item.name }}"
+                  time: "{{ repeat.item.default }}"
+
+    # Kill-switch default ON (fresh install; ikke initial: → user-off overlever restart).
+    - if:
+        - condition: template
+          value_template: >-
+            {{ prefs_fresh_install
+               and is_state('input_boolean.maaltid_detektion_enabled', 'off')
+               and prefs_fresh_install }}
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.maaltid_detektion_enabled
+
+
+    # 2026-07-10: Dvale-lås kill-switches + flap-jagt default ON (fresh install;
+    # ikke initial: → user-off overlever restart). Se dormant_door_lock.yaml +
+    # apollo_flap_hunt.yaml (flap-jagt: initial: on fjernet 2026-07-10 så en
+    # restart ikke gen-tænder den mens familien er hjemme).
+    # 2026-07-18: auto_enabled ændret til default ON (var OFF). ÅRSAG: uden den
+    # engagerede dvale-låsen KUN ved manuel dvale — den automatiske idle-dvale
+    # (som huset bruger når familien er væk) fik ingen lås, så robottens egen
+    # radar-flap (Roborock starter 2 min efter Dormant) vækkede huset → Active →
+    # docker robotten → ~41 min loop hele ferien. Med auto_enabled ON kræver
+    # ENHVER Dormant→Active nu hoveddør/GPS; sensor-flaps ignoreres.
+    - repeat:
+        for_each:
+          - input_boolean.dormant_door_lock_enabled
+          - input_boolean.dormant_door_lock_gps_enabled
+          - input_boolean.dormant_door_lock_auto_enabled
+          - input_boolean.apollo_flap_hunt_enabled
+          # 2026-07-28: gate-decay (apollo_gate_decay.yaml) — jagten mod max
+          # følsomhed. Kører kun når flap-jagten selv er på, så ON er sikkert.
+          - input_boolean.apollo_gate_decay_enabled
+          # 2026-08-16f: nat-kalibrering. ON er sikkert: vinduet kræver
+          # voksen-godnat, som via godnat_common_active blokerer fælles-rummenes
+          # presence-lys — et kalibrerings-spøgelse kan altså ikke tænde lys.
+          - input_boolean.apollo_natkalib_enabled
+          # 2026-08-06: lås-detektoren (apollo_latch_detect.yaml). Den er
+          # husets eneste værn mod at en enkelt hængt radar veto'er Dormant
+          # for evigt → ON på fresh install.
+          - input_boolean.apollo_latch_enabled
+        sequence:
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ prefs_fresh_install
+                     and is_state(repeat.item, 'off')
+                     and prefs_fresh_install }}
+            then:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: "{{ repeat.item }}"
+
+    # =========================================================================
+    # 2026-07-12: Notifikationer (packages/notifikationer.yaml) — master + 17
+    # typer × (enable/Parent A/Parent B) + tidsvinduer. Fresh-install: booleans
+    # lander OFF → tænd master + alle enable + alle Parent A (default modtager) +
+    # Parent B på de 3 der historisk gik til begge tlf (vandlæk/elpris/thread).
+    # Tidsvinduer: fresh = 00:00:00 (= ALTID) → kun de vindue-styrede typer får
+    # en default-tid; "altid"-typer (vandlæk/thread/dug/nordlys/airbnb) forbliver
+    # 00:00/00:00. Live-system (init=run-once) får værdierne sat via REST + snapshot.
+    # =========================================================================
+    - repeat:
+        for_each:
+          - notifikationer_master_enabled
+          - notif_batteri_enabled
+          - notif_batteri_parent_a
+          - notif_remote_offline_enabled
+          - notif_remote_offline_parent_a
+          - notif_lys_watchdog_enabled
+          - notif_lys_watchdog_parent_a
+          - notif_bad_lys_enabled
+          - notif_bad_lys_parent_a
+          - notif_planter_enabled
+          - notif_planter_parent_a
+          - notif_putning_enabled
+          - notif_putning_parent_a
+          - notif_vejr_enabled
+          - notif_vejr_parent_a
+          - notif_dug_enabled
+          - notif_dug_parent_a
+          # 2026-08-29 (user-spec): høj luftfugtighed = kun Parent A's telefon
+          # ("giv MIG en notifikation"). `_hjemme` sættes i listen nedenfor.
+          - notif_fugt_enabled
+          - notif_fugt_parent_a
+          # 2026-08-01: regn-facit ON + kun Parent A (user bad om "min tlf").
+          - notif_regn_rapport_enabled
+          - notif_regn_rapport_parent_a
+          - notif_nordlys_enabled
+          - notif_nordlys_parent_a
+          - notif_vandlaek_enabled
+          - notif_vandlaek_parent_a
+          - notif_vandlaek_parent_b
+          - notif_airbnb_enabled
+          - notif_airbnb_parent_a
+          - notif_apollo_enabled
+          - notif_apollo_parent_a
+          - notif_elpris_enabled
+          - notif_elpris_parent_a
+          - notif_elpris_parent_b
+          - notif_lys_forbrug_enabled
+          - notif_lys_forbrug_parent_a
+          - notif_maaltid_enabled
+          - notif_maaltid_parent_a
+          - notif_thread_enabled
+          - notif_thread_parent_a
+          - notif_thread_parent_b
+          - notif_sove_radar_enabled
+          - notif_sove_radar_parent_a
+          # 2026-07-15: Anomali-vagt (packages/anomali_vagt.yaml) — killswitch
+          # + 3 nye notif-typer (enable + Parent A; Parent B default off).
+          - anomali_vagt_enabled
+          - notif_anomali_lys_enabled
+          - notif_anomali_lys_parent_a
+          - notif_anomali_moerke_enabled
+          - notif_anomali_moerke_parent_a
+          - notif_anomali_plug_enabled
+          - notif_anomali_plug_parent_a
+          # 2026-07-23: VALLHORN-watchdogs, entré + depot (packages/valhorn_watchdog.yaml)
+          # — enable + Parent A ON; _airbnb BEVIDST udeladt (default OFF = silent i
+          # AirBnB, jf. vejr/dug-mønstret).
+          - notif_valhorn_watchdog_enabled
+          - notif_valhorn_watchdog_parent_a
+          # 2026-07-23: Batteri-enheds watchdog (packages/batteri_watchdog.yaml)
+          # — enable + Parent A ON; _airbnb udeladt (default OFF = silent i AirBnB).
+          - notif_batteri_watchdog_enabled
+          - notif_batteri_watchdog_parent_a
+          # 2026-08-02: GPS-watchdog (packages/gps_watchdog.yaml) — enable +
+          # Parent A ON. _parent_b udeladt (default OFF; hendes iPhone er netop den
+          # der fryser, og han er den der fejlsøger). _airbnb udeladt = silent.
+          - notif_gps_stale_enabled
+          - notif_gps_stale_parent_a
+          # 2026-08-18b: aftenvarsel kl. 21 (packages/parent_b_alarm.yaml) —
+          # reserve-alarmen ringer i nat / Parent B's genvej er død. Egen kategori
+          # frem for gps_stale, hvis scope er "en telefon er frosset": slår man
+          # DEN fra, må vække-varslet ikke følge med. _parent_b udeladt (default
+          # OFF), _airbnb udeladt = silent under gæsteophold.
+          - notif_vaekning_enabled
+          - notif_vaekning_parent_a
+          # 2026-08-17: "Parent B er hjemme"-ankomst-push
+          # (packages/parent_b_ios_geofence.yaml) — enable + Parent A ON.
+          # _parent_b udeladt (hun behøver ingen besked om sin egen ankomst),
+          # _airbnb udeladt = silent under gæsteophold.
+          - notif_parent_b_hjem_enabled
+          - notif_parent_b_hjem_parent_a
+          # 2026-07-15b: System-varsler (packages/system_varsler.yaml) —
+          # sikkerhed (døre) + backup (enable + Parent A; Parent B default off).
+          - notif_sikkerhed_enabled
+          - notif_sikkerhed_parent_a
+          - notif_backup_enabled
+          - notif_backup_parent_a
+          # 2026-08-16d (user-spec "ingen varsler af nogen art" under gæste-
+          # ophold): AirBnB-opt-in pr. type (notif_<id>_airbnb) er nu default
+          # OFF for alt undtagen tre kategorier — LIVSFARE (vandlæk, vandventil
+          # via egen package; røgalarmen går uden om push_notify og kan ikke
+          # slås fra), CHECK-IN (airbnb, airbnb_gaester) og HUS-NEDBRUD (thread,
+          # remote_offline, batteri). Alt andet er husholdnings-støj for en gæst
+          # — og for os er den ubrugelig, fordi vi ikke er der til at handle på
+          # den. Tilvælg enkelt-typer på settings-dashboardet hvis nødvendigt.
+          - notif_vandlaek_airbnb
+          - notif_airbnb_airbnb
+          - notif_thread_airbnb
+          - notif_remote_offline_airbnb
+          - notif_batteri_airbnb
+          # 2026-07-17: AirBnB gæster (packages/airbnb_gaester.yaml) — _airbnb
+          # SKAL være ON (nid'ets formål er push UNDER AirBnB). + folke-estimat
+          # trænings-feedback (packages/people_estimate.yaml).
+          - notif_airbnb_gaester_enabled
+          - notif_airbnb_gaester_parent_a
+          - notif_airbnb_gaester_airbnb
+          - people_feedback_enabled
+          # 2026-07-17c: AI-trænere (packages/ai_trainer.yaml)
+          - trainer_aktivitet_enabled
+          - trainer_sherlock_enabled
+          - trainer_dug_enabled
+          - trainer_maaltid_enabled
+          # 2026-09-19: køkken-timer — var nedtællingen ægte? (træner #6)
+          - trainer_timer_enabled
+          # 2026-08-01: regn-facit (packages/regn_rapport.yaml).
+          - regn_rapport_enabled
+          # 2026-07-18: Roborock-varsler (packages/roborock_varsler.yaml) —
+          # enable + Parent A (Parent B + airbnb default off).
+          - notif_roborock_enabled
+          - notif_roborock_parent_a
+          # 2026-08-31 (user-spec): plan-varsel om morgenen — BEGGE telefoner
+          # ("jeg og parent_b"). airbnb default off (gæsten skal ikke varsles
+          # om husets robot-kadence); `roborock_plan_varsel_let_enabled`
+          # default off = kun hel-hus varsles.
+          - notif_robotplan_enabled
+          - notif_robotplan_parent_a
+          - notif_robotplan_parent_b
+          # 2026-07-27: altid-forsigtig (obstacle avoidance) default ON.
+          - roborock_forsigtig_enabled
+          # 2026-09-20 (user-spec "jeg skal fra min tlf godkende alle roborock
+          # dormant kørsler"): default ON — gaten fejler LUKKET, så en frisk
+          # installation skal have den tændt, ellers starter robotten uspurgt.
+          - roborock_godkendelse_enabled
+          # 2026-08-08 (user-spec): let stue-rengøring på de dage hvor
+          # hel-hus-intervallet ikke er nået. Default ON — det ER user-spec'en.
+          - roborock_let_stue_enabled
+          # 2026-08-24: Styrbar-fjernbetjeningens rum-valg
+          # (packages/roborock_styrbar.yaml). Defaults spejler den adfærd
+          # knapperne HAVDE før de blev konfigurerbare: kort OP = Spisestue
+          # (segment 16), langt OP = hele huset — derfor alle otte rum tændt,
+          # så et skift til "valgte rum" ikke lander på en tavs knap.
+          - roborock_styrbar_kort_op_spisestue
+          - roborock_styrbar_lang_op_stue
+          - roborock_styrbar_lang_op_spisestue
+          - roborock_styrbar_lang_op_koekken
+          - roborock_styrbar_lang_op_entre
+          - roborock_styrbar_lang_op_sovevaerelse
+          - roborock_styrbar_lang_op_boernevaerelse
+          - roborock_styrbar_lang_op_badevaerelse
+          - roborock_styrbar_lang_op_depot
+          # 2026-07-18: Hjemkomst-kø (packages/notif_hjemme.yaml) — default ON
+          # for fysisk-handling-typer (planter/støvsuger/batterier/dug); alt
+          # andet (sikkerhed/vandlæk/backup mv.) default OFF = send straks.
+          - notif_planter_hjemme
+          - notif_roborock_hjemme
+          - notif_maaltid_hjemme
+          - notif_batteri_hjemme
+          - notif_remote_offline_hjemme
+          - notif_dug_hjemme
+          # 2026-08-29: fugt-varslet er en opfordring til at lufte ud — kan
+          # kun handles på hjemme, så det køes mens han er væk.
+          - notif_fugt_hjemme
+          # 2026-07-28: Pre-Dark Mode (packages/projektor_predark.yaml) —
+          # auto-dæmpning når projektoren afspiller. Default ON.
+          - predark_enabled
+          # 2026-09-23: projektoren starter/stopper fuld Dark Mode (dark_mode.yaml).
+          - dark_mode_ved_projektor
+          # 2026-09-23: sove-lyskædens automatik (packages/sove_lyskaede.yaml).
+          - sove_lyskaede_enabled
+          # 2026-09-23: sengetæller (packages/sove_seng_taeller.yaml).
+          - sove_seng_taeller_enabled
+          # 2026-07-28: Cykel-lader (packages/cykel_lader.yaml) — enable +
+          # Parent A. `_hjemme` ON: "batterierne er fulde" kan man kun handle på
+          # hjemme. Parent B + airbnb default OFF (en gæst skal ikke have et
+          # lithium-ladekredsløb tændt automatisk i entréen).
+          - notif_cykel_lader_enabled
+          - notif_cykel_lader_parent_a
+          - notif_cykel_lader_hjemme
+          # 2026-07-29: Mad-planlægning (packages/mad_planlaegning.yaml) —
+          # BEGGE telefoner er hele pointen (en ret kræver svar fra begge).
+          # `_airbnb` + `_hjemme` BEVIDST udeladt (default OFF: gæsteophold skal
+          # ikke fylde vores madplan, og indkøbslisten skal komme med det samme).
+          # Tidsvinduer forbliver 00:00/00:00 = ALTID — tidspunktet styres af
+          # sliderne på Mad-siden (ét sted = én autoritet, fejlklasse #2).
+          - notif_mad_spoergsmaal_enabled
+          - notif_mad_spoergsmaal_parent_a
+          - notif_mad_spoergsmaal_parent_b
+          - notif_mad_indkoeb_enabled
+          - notif_mad_indkoeb_parent_a
+          - notif_mad_indkoeb_parent_b
+          # 2026-08-26: morgenspørgsmålet på indkøbsdage. `_parent_b` er BEVIDST
+          # udeladt (default OFF) — user-spec "kun action notifikation til
+          # Parent A tlf.", og to svar ville flytte anker-datoen to gange.
+          - notif_mad_indkoeb_morgen_enabled
+          - notif_mad_indkoeb_morgen_parent_a
+          - mad_spoergsmaal_enabled
+          - mad_indkoeb_enabled
+          - mad_basisvarer_filter_enabled
+          # 2026-08-06: svar-vagten er ON som default — den findes netop fordi
+          # tabte svar-tryk ikke opdages af sig selv.
+          - mad_paamind_enabled
+        sequence:
+          - if:
+              - condition: template
+                value_template: >-
+                  {% set e = 'input_boolean.' ~ repeat.item %}
+                  {{ prefs_fresh_install
+                     and is_state(e, 'off')
+                     and prefs_fresh_install }}
+            then:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: "input_boolean.{{ repeat.item }}"
+    - repeat:
+        for_each:
+          # Drift 07:00–23:00
+          - { name: notif_batteri_start, default: "07:00:00" }
+          - { name: notif_batteri_slut, default: "23:00:00" }
+          - { name: notif_remote_offline_start, default: "07:00:00" }
+          - { name: notif_remote_offline_slut, default: "23:00:00" }
+          - { name: notif_lys_watchdog_start, default: "07:00:00" }
+          - { name: notif_lys_watchdog_slut, default: "23:00:00" }
+          - { name: notif_bad_lys_start, default: "07:00:00" }
+          - { name: notif_bad_lys_slut, default: "23:00:00" }
+          - { name: notif_sove_radar_start, default: "07:00:00" }
+          - { name: notif_sove_radar_slut, default: "23:00:00" }
+          - { name: notif_apollo_start, default: "07:00:00" }
+          - { name: notif_apollo_slut, default: "23:00:00" }
+          # Vejr 06:00–22:00
+          - { name: notif_vejr_start, default: "06:00:00" }
+          - { name: notif_vejr_slut, default: "22:00:00" }
+          # Info 08:00–21:00
+          - { name: notif_planter_start, default: "08:00:00" }
+          - { name: notif_planter_slut, default: "21:00:00" }
+          - { name: notif_putning_start, default: "08:00:00" }
+          - { name: notif_putning_slut, default: "21:00:00" }
+          - { name: notif_maaltid_start, default: "08:00:00" }
+          - { name: notif_maaltid_slut, default: "21:00:00" }
+          - { name: notif_lys_forbrug_start, default: "08:00:00" }
+          - { name: notif_lys_forbrug_slut, default: "21:00:00" }
+          # Elpris: egen stille-nat (06:30–23:00, jf. elpris_notifikation.yaml)
+          - { name: notif_elpris_start, default: "06:30:00" }
+          - { name: notif_elpris_slut, default: "23:00:00" }
+          # Anomali-vagt 2026-07-15: lys/mørke = dagvindue; plug = altid
+          # (regn-sikkerhed → forbliver 00:00/00:00, ingen entry nødvendig).
+          - { name: notif_anomali_lys_start, default: "07:00:00" }
+          - { name: notif_anomali_lys_slut, default: "23:00:00" }
+          - { name: notif_anomali_moerke_start, default: "07:00:00" }
+          - { name: notif_anomali_moerke_slut, default: "23:00:00" }
+          # System-varsler 2026-07-15b: sikkerhed + backup = altid
+          # (00:00/00:00 = 24-7, ingen entry nødvendig — døre/backup må
+          # ikke sove; user kan snævre vinduet på 🔔-fanen).
+          # AirBnB gæster 2026-07-17: 24-7 (00:00/00:00, ingen entry).
+          # Folke-estimat trænings-push: spørges kl. 20:00.
+          - { name: people_feedback_tid, default: "20:00:00" }
+          # 2026-07-17c: AI-trænere — aktivitet 17:30 (spredt fra people-
+          # pushen kl 20), dug-facit 08:30 (efter morgenrutinen).
+          - { name: trainer_aktivitet_tid, default: "17:30:00" }
+          - { name: trainer_dug_tid, default: "08:30:00" }
+          # 2026-07-29: Mad — dagens ret-spørgsmål + indkøbsliste kl 17:00
+          # (user-spec). Selve notif-vinduerne holdes 00:00/00:00 = altid.
+          - { name: mad_spoergsmaal_tid, default: "17:00:00" }
+          - { name: mad_indkoeb_tid, default: "17:00:00" }
+          # 2026-08-26: morgenspørgsmålet skal ligge før arbejdsdagen, men efter
+          # at telefonen er vågen — og med rigelig luft til at nå at svare før
+          # listen laves kl. 17.
+          - { name: mad_indkoeb_morgen_tid, default: "07:30:00" }
+          # 2026-08-31 (user-spec): "notifikation den samme morgen kl 0630 så
+          # vi kan fjerne ting fra gulvet". Selve notif-vinduet
+          # (notif_robotplan_start/_slut) holdes 00:00/00:00 = altid, så det
+          # ikke kan komme til at spærre for varsel-tidspunktet.
+          - { name: notif_robotplan_tid, default: "06:30:00" }
+          # 2026-08-05 (item 10): dug-varslets lås + push var hardkodet til hhv.
+          # ~21:00 (implicit, via dæknings-tabet) og 21:30. Defaults her
+          # reproducerer derfor nøjagtigt den gamle adfærd.
+          - { name: dug_laas_tid, default: "21:00:00" }
+          - { name: dug_varsel_tid, default: "21:30:00" }
+          # 2026-08-06 (user-spec): dug-varsel på stue/køkken-Apolloernes RGB —
+          # 19:00→22:00. Ligger FØR dug_varsel_tid med vilje: LED'en er den
+          # tidlige, passive påmindelse mens man rydder af bordet.
+          - { name: dug_apollo_rgb_on, default: "19:00:00" }
+          - { name: dug_apollo_rgb_off, default: "22:00:00" }
+        sequence:
+          - if:
+              - condition: template
+                value_template: >-
+                  {% set e = 'input_datetime.' ~ repeat.item.name %}
+                  {% set lc = states[e].last_changed %}
+                  {{ states(e) == '00:00:00' and prefs_fresh_install }}
+            then:
+              - service: input_datetime.set_datetime
+                data:
+                  entity_id: "input_datetime.{{ repeat.item.name }}"
+                  time: "{{ repeat.item.default }}"
+
+
+    # Anker = første indkøbs-tirsdag (afgør HVILKE uger der købes ind i).
+    # NB: HA giver en fresh dato-helper DAGENS dato (ikke 1970) → sentinel er
+    # fresh-install + lige oprettet, ikke en bestemt værdi. En fortidig tirsdag
+    # er stadig et gyldigt anker: uger tælles fremad fra den (paritet).
+    - if:
+        - condition: template
+          value_template: >-
+            {{ prefs_fresh_install
+               and prefs_fresh_install }}
+      then:
+        - service: input_datetime.set_datetime
+          data:
+            entity_id: input_datetime.mad_indkoeb_anker
+            date: "2026-08-04"
+    # Ugedag: tirsdag (fresh install lander på første option = Mandag).
+    - if:
+        - condition: template
+          value_template: >-
+            {{ prefs_fresh_install
+               and is_state('input_select.mad_indkoeb_ugedag', 'Mandag')
+               and prefs_fresh_install }}
+      then:
+        - service: input_select.select_option
+          target:
+            entity_id: input_select.mad_indkoeb_ugedag
+          data:
+            option: Tirsdag
+
+    # 2026-08-24: Styrbar langt OP = MAX clean hele huset (fresh install lander
+    # på første option = "Valgte rum — hurtig"). Kort OP skal netop BLIVE på
+    # første option, så den har ingen linje her.
+    - if:
+        - condition: template
+          value_template: >-
+            {{ prefs_fresh_install
+               and is_state('input_select.roborock_styrbar_lang_op',
+                            'Valgte rum — hurtig')
+               and prefs_fresh_install }}
+      then:
+        - service: input_select.select_option
+          target:
+            entity_id: input_select.roborock_styrbar_lang_op
+          data:
+            option: "Hele huset — MAX (kraftigst)"
+
+
+    # Kill-switchene pr. kommando-ord starter TAENDT. En afbryder der er slaaet
+    # fra fra foedslen betyder at featuren ikke virker paa en frisk installation
+    # og at ingen kan se hvorfor. `initial: on` ville have gjort det samme, men
+    # den paatvinger ved HVER start — saa et bevidst "sluk timer-ordet" ville
+    # blive rullet tilbage naeste gang HA genstartede.
+    - if:
+        - condition: template
+          value_template: "{{ prefs_fresh_install }}"
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id:
+              - input_boolean.voice_cmd_party_time
+              - input_boolean.voice_cmd_auto_mode
+              - input_boolean.voice_cmd_timer
+              - input_boolean.gestus_kommandoer_enabled
+              - input_boolean.koekken_stemme_arm_enabled
+              - input_boolean.koekken_blik_arm_enabled
+
+    # Armerings-gestussen. En uroert input_text staar paa 'unknown', som er
+    # truthy — den skal saettes EKSPLICIT, ellers sammenligner armeringen
+    # gestus-navnet med strengen 'unknown' og matcher aldrig.
+    #
+    # `call_me` og ikke `open_palm` (18/9): open_palm er OGSAA 5 i
+    # fingertaellingen, og gestus-kommandoerne er taendt igen — en flad haand
+    # holdt op for at armere mikrofonen ville dermed ogsaa starte en
+    # 5-minutters timer. call_me (tommel + lillefinger) er en af de tre
+    # gestus taellingen bevidst ignorerer, og den kraever tre foldede fingre,
+    # saa den opstaar ikke tilfaeldigt under madlavning.
+    - if:
+        - condition: template
+          value_template: "{{ prefs_fresh_install }}"
+      then:
+        - service: input_text.set_value
+          target:
+            entity_id: input_text.koekken_stemme_arm_gestus
+          data:
+            value: "call_me"
+
+    # SIDSTE STEP: markér init som done + stemp aktuel version — saa den
+    # kun koerer igen naar prefs_code_version bumpes (B39-fix 2026-07-19).
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.user_prefs_initialized
+    - service: input_number.set_value
+      data:
+        entity_id: input_number.user_prefs_version
+        value: "{{ prefs_code_version }}"

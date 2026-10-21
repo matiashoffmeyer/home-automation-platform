@@ -1,0 +1,203 @@
+# =============================================================================
+# Luksus-lys: blok auto-tænd ved høj el-pris (2026-06-24, user-spec)
+# =============================================================================
+# MÅL: når el-prisen er HØJ, skal "luksus-lys" (rene ambiance/nice-to-have lys)
+# ikke AUTO-tænde. Manuel tænding (app/dashboard/Styrbar) virker ALTID.
+#
+# TRE genbrugelige primitiver:
+#   1. input_number.luksus_lys_elpris_aggressivitet (0–100):
+#        0   = OFF (blokerer aldrig).
+#        100 = super-aggressiv (blokér når spot bare er OVER 30-dages-gns).
+#      Mapping: blokér når pris-ratio x > (1 − slider/100), hvor
+#        x = clamp((spot − 30d-gns) / 30d-gns, 0, 1)
+#      = præcis samme ratio som el-pris-DÆMPNINGEN bruger (elpris_dim_factor i
+#        packages/elpris_styring.yaml) → konsistent "hvor dyrt er det lige nu".
+#      Eksempler: slider 50 → blokér når spot > 1,5× månedsnormen; slider 100 →
+#      blokér når spot > månedsnormen; slider 0 → aldrig.
+#   2. light.luksus_lys (gruppe): DEFINER hér hvilke lys der er luksus. Tilføj/
+#      fjern frit — det er single source of truth for hvilke lys feature'en
+#      gælder. Kan genbruges andre steder (scener, automations, dashboards).
+#      ⚠️ Tilføjer du et lys: giv det også et counterfactual-vindue i
+#      packages/luksus_besparelse.yaml, ellers blokeres det uden at nogen kan
+#      se hvad det sparer (kronerne ryger så ikke med i All-Time-totalen).
+#   3. binary_sensor.luksus_lys_elpris_block: ON = "det er for dyrt til luksus
+#      lige nu". Genbrugeligt signal — gate hvad som helst på det.
+#
+# ANVENDELSE (to mønstre — vælg efter lysets auto-tænd-topologi):
+#   A) ÉT rent auto-tænd-sted (fx terrasse-pærelyskædens dusk-tænd):
+#      gate dér med en condition. Se automations/terrace_plug_control.yaml.
+#      → ingen flash, manuel-stier urørt.
+#      Samme mønster for sofa-hyggelampen: dens to auto-tænd-steder (presence_
+#      light_sofa_on + presence_lux_sofa_on) tænder hele sofa-zonen fra ÉN
+#      `sofa_lights`-variabel, så blokken er et filter på tænd-listen — ikke en
+#      condition, for de fire øvrige sofa-lys skal stadig tænde. Filteret gælder
+#      KUN Normal/Home Vacation (user-valg 2026-07-31): en AirBnB-gæst får den
+#      fulde sofa-zone, jf. husreglen om aldrig at påtvinge gæster familiens
+#      optimeringer. NB terrasse-kæden er ligeledes Normal-only, mens børne-
+#      strippens suppressor bevidst kører i alle modes (natlys, ikke ambiance).
+#   B) SPREDT auto-tænd (fx børne-strippen: putning + godnat + presence + …):
+#      en suppressor-automation (nederst) der slukker lyset igen hvis det
+#      auto-tænder under blok — spejler bedroom_night_guard's bevisте manuel-
+#      undtagelse (context.user_id + race-frit Styrbar-intent-stempel).
+#
+# PRIS-KILDE: sensor.elpris_spot_aktuel + sensor.elspot_30d_gns (elpris_styring.
+# yaml). Er prisen unavailable → fail-SAFE: blokerer IKKE (luksus tillades), så
+# en død Nord Pool-feed aldrig efterlader børnene uden natlys.
+# =============================================================================
+
+input_number:
+  luksus_lys_elpris_aggressivitet:
+    name: "Luksus-lys: el-pris aggressivitet"
+    icon: mdi:cash-lock
+    min: 0
+    max: 100
+    step: 1
+    mode: slider
+    # Ingen `initial:` → persisterer på tværs af restarts. Fresh-install-default
+    # (50) sættes af init_user_preferences; live-default sat via API + snapshot.
+
+light:
+  # =========================================================================
+  # DEFINÉR LUKSUS-LYSENE HER. Single source of truth for feature'en.
+  # Tilføj/fjern entities frit — binary_sensor + suppressor + gates læser
+  # medlemskab herfra (state_attr('light.luksus_lys','entity_id')).
+  # =========================================================================
+  - platform: group
+    name: "Luksus lys"
+    unique_id: luksus_lys
+    entities:
+      - light.terrasse_paerelyskaede     # udendørs pærelyskæde (dusk-ambiance)
+      # 2026-09-28 (user): børne-strippen UD — "den skal ha lov at køre".
+      # Suppressor + besparelses-led nedenfor gates på medlemskab og er
+      # dermed inaktive; genindsæt linjen for at genaktivere dem.
+      # - light.boernevaerelse_hygge_strip
+      # 2026-07-31 (user: "it felt warm yesterday"): sofa-hyggelampen er en
+      # GLØDEPÆRE — målt 39 W, husets suverænt dyreste lyspunkt (næstmest er
+      # spisestue-loftet på 12 W). Ren ambiance, og sofa-zonens fire ØVRIGE lys
+      # tænder stadig under blok, så ingen kommer til at sidde i mørke.
+      - light.stue_plug                  # sofa-hyggelampe (39 W glødepære)
+
+template:
+  - binary_sensor:
+      # "Det er for dyrt til luksus-lys lige nu." Genbrugeligt gate-signal.
+      # NB: name-slug SKAL matche unique_id (entity_id afledes af name) → "elpris"
+      # i ÉT ord, ikke "el-pris" (→ ville give ..._el_pris_block).
+      - name: "Luksus lys elpris block"
+        unique_id: luksus_lys_elpris_block
+        icon: mdi:cash-lock
+        state: >-
+          {% set k = states('input_number.luksus_lys_elpris_aggressivitet') | float(0) %}
+          {% set p = states('sensor.elpris_spot_aktuel') | float(-999) %}
+          {% set avg = states('sensor.elspot_30d_gns') | float(0) %}
+          {% if k <= 0 or p < -100 or avg <= 0 %}
+            false
+          {% else %}
+            {% set x = [[(p - avg) / avg, 0] | max, 1] | min %}
+            {{ x > (1 - k / 100) }}
+          {% endif %}
+        attributes:
+          spot_kr_kwh: "{{ states('sensor.elpris_spot_aktuel') }}"
+          gns_30d_kr_kwh: "{{ states('sensor.elspot_30d_gns') }}"
+          ratio_over_gns: >-
+            {% set p = states('sensor.elpris_spot_aktuel') | float(-999) %}
+            {% set avg = states('sensor.elspot_30d_gns') | float(0) %}
+            {% if p < -100 or avg <= 0 %}n/a
+            {% else %}{{ ([[(p - avg) / avg, 0] | max, 1] | min) | round(2) }}{% endif %}
+          taerskel: >-
+            {% set k = states('input_number.luksus_lys_elpris_aggressivitet') | float(0) %}
+            {{ (1 - k / 100) | round(2) if k > 0 else 'off' }}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # SUPPRESSOR (mønster B): børne-strippen har SPREDT auto-tænd (putning, godnat,
+  # natlys-guard, presence). Slet at gate hvert sted er skørt + let at misse en
+  # sti. Denne fanger ALLE auto-tændinger og slukker igen under blok — spejler
+  # bedroom_night_guard's race-frie manuel-undtagelse, så en forælder ALTID kan
+  # tænde manuelt (app ELLER Styrbar). User-spec 2026-06-24: "alt auto-tænd,
+  # også natlys" → slukkes HELT (ikke til 1% natlys) når el er dyrt.
+  # 2026-08-07 AFGRÆNSNING: "natlys" i den spec var det PRESENCE-drevne natlys.
+  # En aktiv PUTNING er undtaget — se condition'en nedenfor.
+  # ---------------------------------------------------------------------------
+  - id: luksus_lys_elpris_suppress_boern_strip
+    alias: "Luksus-lys: blok auto-tænd af børne-strip ved høj el-pris"
+    description: >
+      Slukker light.boernevaerelse_hygge_strip igen hvis den AUTO-tænder mens
+      binary_sensor.luksus_lys_elpris_block er on. Undtager ægte manuel tænd
+      (app/dashboard via context.user_id; fysisk Styrbar via det race-frie
+      bedroom_styrbar_intent_at-stempel, <8 s). Genbruger stemplet fra
+      bedroom_night_guard.yaml::bedroom_styrbar_emergency_intent.
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id: light.boernevaerelse_hygge_strip
+        to: "on"
+    condition:
+      # El-pris-blok aktiv.
+      - condition: state
+        entity_id: binary_sensor.luksus_lys_elpris_block
+        state: "on"
+      # Strippen er faktisk i luksus-listen (gruppen = single source of truth).
+      - condition: template
+        value_template: >-
+          {{ 'light.boernevaerelse_hygge_strip'
+             in (state_attr('light.luksus_lys', 'entity_id') or []) }}
+      # IKKE app/dashboard-manuel (de har context.user_id; Styrbar/automation = none).
+      - condition: template
+        value_template: "{{ trigger.to_state.context.user_id is none }}"
+      # 2026-08-07: putning/natlys er UNDTAGET. Målt 19:47:11 tændte
+      # script.puttelys_phase1_apply strippen, og suppressoren slukkede den
+      # 19:47:12 — nedtrapningens natlys-fade sprang den derefter over (den
+      # rører kun en TÆNDT strip), så børnene stod uden natlys hele natten.
+      # Ved nedtrapningens bund brænder strippen på 1 % (~0,1 W): det er et
+      # natlys, ikke ambiance, og filens egen fail-SAFE-regel er netop at en
+      # el-pris aldrig må efterlade børnene i mørke. `puttelys_phase1_fired`
+      # sættes FØR strippen tændes i phase1_apply → ingen race.
+      - condition: template
+        value_template: >-
+          {{ not (is_state('input_boolean.puttelys_phase1_fired', 'on')
+                  or is_state('input_boolean.puttelys_descent_active', 'on')
+                  or is_state('input_boolean.godnat_boern_active', 'on')) }}
+      # 2026-09-02: MORGEN-vækningen er samme fail-safe-argument som putningen
+      # ovenfor, bare i den anden ende af døgnet. Rampen tænder strippen som en
+      # af sine tre dimbare lamper, og suppressoren ville slukke den igen ~1 s
+      # senere — en el-pris må aldrig aflyse en vækning.
+      - condition: state
+        entity_id: binary_sensor.boernevaerelse_vaekning_hold
+        state: "off"
+      # 2026-09-12: samme fail-safe-argument i aften-enden (fejlklasse #12 —
+      # beskyttelsen fandtes kun for putningen og morgenvækningen). Har user selv
+      # sat strippen i aften-vinduet, må en el-pris ikke slukke den igen.
+      - condition: template
+        value_template: >-
+          {{ not states('input_text.boern_aften_niveau_hold').startswith('hold') }}
+    action:
+      # Race-fri Styrbar-manuel-tjek: vent 0,5 s så bedroom_styrbar_emergency_
+      # intent har stemplet ved et fysisk tryk; tryk indenfor 8 s → ABORT (manuel).
+      - delay:
+          milliseconds: 500
+      - condition: template
+        value_template: >-
+          {% set ia = states('input_datetime.bedroom_styrbar_intent_at') %}
+          {% set ia_e = (state_attr('input_datetime.bedroom_styrbar_intent_at', 'timestamp') | float(0)) if ia not in ['unknown','unavailable','',none] else 0 %}
+          {{ (as_timestamp(now()) - ia_e) >= 8 }}
+      # Re-tjek: stadig tændt + blok stadig aktiv (kan være ændret i de 0,5 s).
+      - condition: state
+        entity_id: light.boernevaerelse_hygge_strip
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.luksus_lys_elpris_block
+        state: "on"
+      - service: light.turn_off
+        target:
+          entity_id: light.boernevaerelse_hygge_strip
+        data:
+          transition: 1
+      - service: logbook.log
+        data:
+          name: "Luksus-lys"
+          message: >-
+            Børne-strip auto-tændte under høj el-pris (spot
+            {{ states('sensor.elpris_spot_aktuel') }} vs 30d-gns
+            {{ states('sensor.elspot_30d_gns') }}) → slukket igen. Tænd manuelt hvis ønsket.
+          entity_id: light.boernevaerelse_hygge_strip

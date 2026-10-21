@@ -1,0 +1,933 @@
+# =============================================================================
+# Højttaler — AxiomAir N3 i SOFASTUEN (forberedt 2026-10-05; bestilt, ikke ankommet)
+# =============================================================================
+# User-spec 2026-10-05: "den skal være slukket/standby når huset er dormant og
+# tændt og klar på at få afspillet musik når vi er hjemme (active house). under
+# godnat skal den også slukke/standby." Den kører på wifi med fast strøm, og
+# "der kommer intet målestik". + "vi kan sagtens lade højttaleren stå tændt
+# uden noget på som standby … den har lavt energiforbrug." Rum: sofastuen
+# (afspiller-kort på Lys-siden under Stue + status-siden, skjult til parring).
+#
+# HARDWARE (research 2026-10-05: Axiom-manual R1.11/R1.12, axiomaudio.com,
+# Volumio2/3-kildekoden, HA's volumio-komponent):
+#   · Raspberry Pi + Volumio 2-OEM (seneste fw v2.13.2, 2020). Web-UI
+#     http://axiomair.local/ (eller axiomair-xxxxxx.local). Wi-Fi er KUN
+#     2,4 GHz via en USB-dongle — Ethernet-porten er den stabile vej.
+#   · Der findes INGEN standby. Den er tændt, eller den er HELT lukket ned
+#     (knappen foran: tryk = sikker nedlukning på ~20 s), og efter en nedlukning
+#     starter KUN knappen den igen (~45 s boot). Hverken Volumio-REST eller HA's
+#     integration har tænd/sluk; Volumio kan lukke ned over socket.io, men intet
+#     kan vække den igen over nettet.
+#   · Batteri-modulet: et strømbrud slår bare over på batteri → et smart-stik
+#     kan hverken slukke den eller tænde den igen. Manualen advarer mod at
+#     trække stikket før nedlukning.
+# DERFOR er "standby" her SOFTWARE: afspilningen stoppes, højttaleren bliver
+# stående tændt på nettet — og "tændt og klar" kræver så ingen handling, den
+# er klar i samme sekund nogen vil spille. Ingen nedlukning: HA kan ikke
+# tænde den igen, og det er præcis "klar når vi er hjemme" der ville ryge.
+#
+# INTEGRATION (Claude gør det ved ankomst — tjekliste i docs/hardware_shopping.md):
+#   Volumio-integrationen (zeroconf `_Volumio._tcp`, ellers host + port 3000)
+#   → media_player → OMDØB entity_id til media_player.hoejttaler (alt herunder
+#   peger på det navn; findes den ikke, er hver betingelse bare falsk).
+#   · Integrationen poller hvert 10. s. Core FRYSER på sidste state når
+#     højttaleren er slukket; override'en gør den `unavailable` (08/10). "Spiller" kræver derfor binary_sensor.hoejttaler_online (ping,
+#     off 13 s efter en nedlukning, målt 08/10). IKKE last_updated: ved
+#     webradio er positionen None, og den flytter sig kun ved nyt nummer —
+#     11 af 36 huller > 120 s (max 330 s) under 48 min P4.
+#   · LIVE 2026-10-08 på 192.0.2.42 via OVERRIDE custom_components/volumio:
+#     N3'ens Volumio 2-OEM (V2.13.2) mangler REST-ruterne core bruger
+#     (getSystemInfo/replaceAndPlay), så play_media går via socket.io.
+#     Se README.md dér. Ingen bas/diskant i firmwaren (DSP-sektionen er tom).
+#   · play_media tager KUN JSON: media_content_id
+#     '{"uri":"http://…","service":"webradio"}' + media_content_type: channel.
+#     En bar URL eller media-source://tts/… kaster JSONDecodeError → TTS går
+#     via en URL fra /api/tts_get_url (packages/hoejttaler_annoncering.yaml).
+#   · Den er også UPnP-renderer + AirPlay (dlna_dmr kan finde den) og har
+#     Spotify Connect.
+#
+# RADIO (DR-favoritter, morgen-P4, Styrbar stue som radio-fjernbetjening):
+# packages/hoejttaler_radio.yaml (B193).
+# BESKEDER (køkken-timer start/færdig, vejrvarslet læst op):
+# packages/hoejttaler_annoncering.yaml (B199).
+#
+# AirBnB: tomt hus → stop i ALLE modes (gæsten er gået; neutralt). Godnat →
+# kun familie-modes: AirBnB's nat-regime sætter godnat-flagene direkte
+# (packages/airbnb_natmode.yaml), og en gæsts musik er ikke vores rutine at
+# stoppe (CLAUDE.md 🏡 punkt 5).
+# =============================================================================
+
+input_boolean:
+  hoejttaler_auto_stop_enabled:
+    name: "Højttaler: stop musikken når huset er tomt eller sover"
+    icon: mdi:speaker-off
+  # B202 (2026-10-09): genoplivning af Spotify Connect + Spotify-overtagelse
+  # (automationerne hoejttaler_spotify_* nederst). Kill-switch på begge veje.
+  # B207: også kill-switch for scripts/ma_watch.py (SSH-add-on-daemon: app-pause
+  # på MA's soloist → pause MA-køen; hængt Connect-dealer → reload pluginnet).
+  hoejttaler_spotify_vagt_enabled:
+    name: "Højttaler: hold Spotify Connect i live"
+    icon: mdi:spotify
+  # B204 (2026-10-09): Music Assistant-knappen. On = add-on'en kører: den
+  # ekstra Spotify-enhed "Højttaler via HA" (go-librespot → DLNA) OG HA kan
+  # spille bestemte sange (script.hoejttaler_spil_sang, B205). Højttalerens
+  # egen "myair" (librespot i firmwaren) kører uanset knappen og vogtes altid
+  # af genopliv. Off STOPPER add-on'en. Automationen hoejttaler_spotify_metode.
+  # Var oprindeligt en enten-eller-METODE-knap; user 09/10 efter testen: myair
+  # er bedst fra telefonen, "men ingen grund til ikke at ha begge aktive".
+  # Key'en beholdt (snapshot, dashboard). I helpers_export-snapshottet (on):
+  # uden add-on'en er start-kaldet en logget no-op, og intet andet afhænger af den.
+  # 14/10 (user: "a, fjern via HA"): Spotify-enheden "Højttaler via HA" (MA's
+  # spotify_connect-plugin) er slået FRA i MA — dealeren hang 3× på én
+  # eftermiddag, og appens play efter radioen startede radioen (DLNA-resume uden
+  # ny URI). Knappen styrer nu kun HA's sange. Genaktivér: MA → Indstillinger →
+  # Plugins → Spotify Connect (eller config/providers/save enabled true).
+  hoejttaler_spotify_via_ha:
+    name: "Højttaler: Music Assistant (sange fra HA)"
+    icon: mdi:home-sound-out
+  # B237 (17/10, user: "har jeg en knap … ha højttaler til?"): Spotify-broen
+  # (add-on'en local_spotify_bro, enheden "Højttaler" i Spotify-appen).
+  # On = add-on'en kører, off = stoppet. Automationen hoejttaler_spotify_bro.
+  # (Volumios disablePlugin/enablePlugin på music_service/volspotconnect2 er
+  # no-ops på N3'en — svar null, samme zeroconf-port før og efter, 17/10 05:20
+  # → myair-knappen herunder bruger plugin'ets konto-side i stedet.)
+  hoejttaler_spotify_bro:
+    name: "Højttaler: Spotify-bro (\"Højttaler\" i appen)"
+    icon: mdi:spotify
+  # myair = højttalerens egen Spotify Connect (librespot i firmwaren). User
+  # 17/10: "ok slå myair fra", og "vi kører med det her setup uden myair" →
+  # står FRA; broen er husets Spotify-vej. Fra = plugin'ets "Multi-user device" fra uden
+  # konto → ingen zeroconf, væk fra telefonerne; højttaleren genstartes ikke
+  # (scripts/hoejttaler_spotify.py myair on|off). Vagten (genopliv) kræver on.
+  hoejttaler_myair:
+    name: "Højttaler: myair (højttalerens egen Spotify)"
+    icon: mdi:speaker-wireless
+
+input_number:
+  # Dormant-flanken må gerne have stået lidt før musikken stoppes: en Dormant
+  # der rettes af næste bevægelse skal ikke nå at slukke nogens musik.
+  # 10 min = gæt (højttaleren findes ikke endnu) — mål når den er i brug.
+  hoejttaler_dormant_stop_minutter:
+    name: "Højttaler: stop efter tomt hus i (min)"
+    icon: mdi:timer-sand
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+  # SOVEMUSIK (user 17/10: "jeg prøvede at bruge musikken til at falde i
+  # søvn … stoppede hurtigt"): godnat-backstoppen stoppede musik der var
+  # startet EFTER godnat inden for 10 min (22:48 + 22:50, 16/10). Nu må musik
+  # spille så længe uafbrudt, før backstoppen stopper den under godnat.
+  # Godnat-flanken stopper stadig det der spiller i det øjeblik man siger godnat.
+  # 60 min = gæt (ingen målinger af sovemusik endnu) — justér efter brug.
+  hoejttaler_sovemusik_minutter:
+    name: "Højttaler: sovemusik efter godnat (min)"
+    icon: mdi:sleep
+    min: 0
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+  # STANDBY (user 08/10): N3 kan ikke slukkes og tændes fra HA (shutdown =
+  # Pi'en helt af nettet, kun knappen tænder; batteriet holder den kørende
+  # uden strøm) → "standby" = stop + volumen 0. Startes radioen bagefter UDEN
+  # egen volumen (favorit på dashboardet), hæver script.hoejttaler_radio til denne.
+  hoejttaler_standby_start_volumen:
+    name: "Højttaler: start-volumen efter standby"
+    icon: mdi:volume-low
+    min: 5
+    max: 80
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Ryd en hængende Volumio-state (2026-10-11). Volumio står på 'playing' uden
+  # at noget spiller (binary_sensor.hoejttaler_spiller_reelt off) → Lys-sidens
+  # tile viser gårsdagens AirPlay, og appens play/pause rammer ingenting.
+  # MÅLT: stop (REST OG socket.io) rydder IKKE en hængende AirPlay — 55 stop
+  # natten 10-11/10 svarede alle "efter socket.io stop: play". Kun en anden
+  # kilde der tager over slap den (MA-sangen 06:30). En hængende webradio
+  # slap på stop + ryd kø (målt 07:10). Derfor: stop + ryd kø, og hænger den
+  # stadig → overtag med en radiostrøm på volumen 0, stop, ryd, volumen tilbage.
+  # Alle modes: ingen lyd, og intet der reelt spiller røres (🏡 neutral).
+  # ---------------------------------------------------------------------------
+  - id: hoejttaler_ryd_haengende_state
+    alias: "Højttaler: ryd en hængende 'spiller' der intet spiller"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: template
+        value_template: >-
+          {{ is_state('media_player.hoejttaler', 'playing')
+             and is_state('binary_sensor.hoejttaler_spiller_reelt', 'off') }}
+        for:
+          minutes: 5
+      # Fejlklasse #4: en genstart midt i hænget giver ingen ny flanke.
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: state
+        entity_id: media_player.hoejttaler
+        state: "playing"
+        for:
+          minutes: 5
+      - condition: state
+        entity_id: binary_sensor.hoejttaler_spiller_reelt
+        state: "off"
+        for:
+          minutes: 5
+      - condition: template
+        value_template: >-
+          {{ is_state('script.hoejttaler_annoncer', 'off')
+             and is_state('script.hoejttaler_spil_sang', 'off')
+             and is_state('script.hoejttaler_radio', 'off')
+             and is_state('script.hoejttaler_morgenradio_fade', 'off') }}
+    action:
+      - variables:
+          app: "{{ state_attr('media_player.hoejttaler', 'app_name') | default('', true) }}"
+          titel: "{{ state_attr('media_player.hoejttaler', 'media_title') | default('', true) }}"
+          vol: "{{ state_attr('media_player.hoejttaler', 'volume_level') | float(-1) }}"
+      - service: media_player.media_stop
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+      - service: media_player.clear_playlist
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+      - delay:
+          seconds: 15
+      - if:
+          - condition: state
+            entity_id: media_player.hoejttaler
+            state: "playing"
+        then:
+          - service: media_player.volume_set
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+            data:
+              volume_level: 0
+          - service: media_player.play_media
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+            data:
+              media_content_type: channel
+              media_content_id: >-
+                {{ {'uri': 'https://live-icy.dr.dk/A/A03H.mp3', 'service': 'webradio',
+                    'type': 'webradio', 'title': 'DR P1'} | to_json }}
+          - delay:
+              seconds: 5
+          - service: media_player.media_stop
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+          - service: media_player.clear_playlist
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+          - if:
+              - condition: template
+                value_template: "{{ vol >= 0 }}"
+            then:
+              - service: media_player.volume_set
+                continue_on_error: true
+                target:
+                  entity_id: media_player.hoejttaler
+                data:
+                  volume_level: "{{ vol }}"
+          - delay:
+              seconds: 15
+      - service: logbook.log
+        data:
+          name: "Højttaler"
+          message: >-
+            Hængende "spiller" ryddet ({{ app }}{{ ': ' ~ titel if titel else '' }}) —
+            {{ 'ryddet' if not is_state('media_player.hoejttaler', 'playing') else 'hænger STADIG' }}.
+
+  - id: hoejttaler_auto_stop
+    alias: "Højttaler: stop musikken når huset er tomt eller sover"
+    description: >
+      Software-standby for AxiomAir N3 (den har ingen standby, og HA kan ikke
+      tænde den igen efter en nedlukning): stop afspilningen når huset har
+      været Dormant i N min, eller når de voksne siger godnat. Højttaleren
+      bliver stående tændt og er klar igen med det samme.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_select.house_state
+        from: "Active"
+        to: "Dormant"
+        for:
+          minutes: "{{ states('input_number.hoejttaler_dormant_stop_minutter') | int(10) }}"
+        id: dormant
+      # Kun den VOKSNE/fulde godnat — børne-putningen (godnat_boern_active) må
+      # ikke stoppe stuens musik for de voksne der stadig er oppe (samme skel
+      # som binary_sensor.godnat_common_active). godnat_pending/kalde er ikke
+      # søvn endnu.
+      - platform: state
+        entity_id:
+          - input_boolean.godnat_active
+          - input_boolean.godnat_voksne_active
+        from: "off"
+        to: "on"
+        id: godnat
+      # Fejlklasse #4: en HA-genstart dræber `for:`-flanken, og musik der
+      # STARTES mens huset sover (Volumio-alarm, en telefon på nettet) har
+      # ingen flanke overhovedet.
+      - platform: time_pattern
+        minutes: "/10"
+        id: backstop
+    condition:
+      - condition: state
+        entity_id: input_boolean.hoejttaler_auto_stop_enabled
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set p = states.media_player.hoejttaler %}
+          {{ p is not none and p.state == 'playing'
+             and is_state('binary_sensor.hoejttaler_online', 'on') }}
+      # last_changed nulstilles ved genstart → backstoppen venter da N min
+      # efter boot før den stopper noget (den konservative retning).
+      - condition: template
+        value_template: >-
+          {% set familie = states('input_select.house_mode') in ['Normal', 'Home Vacation'] %}
+          {% set hs = states.input_select.house_state %}
+          {% set n = (states('input_number.hoejttaler_dormant_stop_minutter') | float(10)) * 60 %}
+          {% set tomt = hs is not none and hs.state == 'Dormant'
+             and (now() - hs.last_changed).total_seconds() >= n %}
+          {% set godnat = is_state('input_boolean.godnat_active', 'on')
+             or is_state('input_boolean.godnat_voksne_active', 'on') %}
+          {# Sovemusik: under godnat stopper backstoppen kun musik der har spillet
+             uafbrudt i hoejttaler_sovemusik_minutter (pause/genstart starter forfra =
+             den konservative retning). En glemt flanke efter en genstart rammes
+             derfor også først efter de N min. #}
+          {% set sove = (states('input_number.hoejttaler_sovemusik_minutter') | float(60)) * 60 %}
+          {% set mp = states.media_player.hoejttaler %}
+          {% set spillet = (now() - mp.last_changed).total_seconds() if mp is not none else 0 %}
+          {% if trigger.id == 'dormant' %}{{ hs is not none and hs.state == 'Dormant' }}
+          {% elif trigger.id == 'godnat' %}{{ familie }}
+          {% else %}{{ tomt or (godnat and familie and spillet >= sove) }}{% endif %}
+    action:
+      - variables:
+          aarsag: >-
+            {% if trigger.id == 'godnat' %}godnat
+            {% elif trigger.id == 'dormant' %}huset er tomt
+            {% elif is_state('input_select.house_state', 'Dormant') %}huset er tomt (backstop)
+            {% else %}godnat — sovemusikkens tid er gået (backstop){% endif %}
+      - service: media_player.media_stop
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+      # Midlertidig standby (user 08/10): stop + skru helt ned.
+      - service: media_player.volume_set
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+        data:
+          volume_level: 0
+      - service: logbook.log
+        data:
+          name: "Højttaler"
+          message: "Standby — {{ aarsag | trim }}: musikken stoppet og volumen 0. Højttaleren står tændt og er klar."
+
+  # ---------------------------------------------------------------------------
+  # SPOTIFY CONNECT (B202, 2026-10-09). N3'ens librespot (0.1.0) forsvandt
+  # 08/10 om aftenen — ingen _spotify-connect i mDNS, telefonerne (iPhone OG
+  # Android finder den samme vej) så ikke højttaleren — mens radioen spillede
+  # videre. Først efter at højttaleren var af nettet 01:23 → 06:41 var den
+  # tilbage. Firmwaren har intet kald der genstarter KUN Spotify-servicen
+  # (web-UI'ets socket.io-events gennemgået) → reboot når den står stille.
+  # sensor.hoejttaler_spotify = scripts/hoejttaler_spotify.py (mDNS + librespots
+  # getInfo). Reboot'et er lydløst (startup_sound er slået fra i firmwaren) og
+  # VERIFICERET 09/10 08:12: tilbage efter ~40 s, Spotify Connect inden 80 s
+  # (NB socket.io `shutdown` er noget andet — den slukker Pi'en helt, og kun
+  # knappen tænder den igen). iPhone-reserve uden Spotify: AirPlay 2 ("myair-AP2").
+  - id: hoejttaler_spotify_genopliv
+    alias: "Højttaler: genstart når Spotify Connect er forsvundet"
+    description: >
+      Står højttaleren på nettet, men uden Spotify Connect i 5 min (1 min hvis
+      en telefon lige spillede Spotify på den), og spiller den ikke,
+      genstartes den (højst én gang pr. 2 timer).
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: sensor.hoejttaler_spotify
+        to: "off"
+        for:
+          minutes: 5
+      # 14/10 08:16:55 pause i Spotify-appen → Connect væk 08:18:01 → appen
+      # kunne ikke genoptage, et play uden om HA gav P4 (Volumios sidste kø).
+      # Var en telefon lige på (myair: Volumio står stadig på volspotconnect2
+      # pause/play), er nogen i gang → genstart efter 1 min, ikke 5.
+      - platform: state
+        entity_id: sensor.hoejttaler_spotify
+        to: "off"
+        for:
+          minutes: 1
+      # Fejlklasse #4: en HA-genstart dræber `for:`-flanken.
+      - platform: time_pattern
+        minutes: "/10"
+    condition:
+      - condition: state
+        entity_id: input_boolean.hoejttaler_spotify_vagt_enabled
+        state: "on"
+      # myair slået fra med vilje (17/10): Connect er VÆK med vilje — et
+      # reboot ville ikke bringe den tilbage, kun genstarte højttaleren.
+      - condition: state
+        entity_id: input_boolean.hoejttaler_myair
+        state: "on"
+      # Music Assistant spiller (Spotify via HA eller en sang fra HA, B205):
+      # Volumios status er STALE under DLNA, så MPD-kilden er beviset — et
+      # reboot ville afbryde strømmen.
+      - condition: template
+        value_template: "{{ state_attr('sensor.hoejttaler_spotify', 'kilde') != 'ha' }}"
+      # last_changed nulstilles ved HA-genstart → efter boot venter vi 5 min
+      # (den konservative retning). Online-kravet skiller "Spotify væk" fra
+      # "højttaleren slukket med knappen" (så er sensoren også off).
+      # "Spiller den ikke" = spiller_reelt, IKKE kun Spotify-statussen: 15/10
+      # 15:14:35 genstartede vagten midt i P4, som user selv havde valgt 18 s
+      # før — status stod stadig på Spotifys 'pause' (30-s-poll, og den ser
+      # kun Spotify), mens radioen spillede.
+      - condition: template
+        value_template: >-
+          {% set sp = states.sensor.hoejttaler_spotify %}
+          {% set on = states.binary_sensor.hoejttaler_online %}
+          {% set lt = state_attr(this.entity_id, 'last_triggered') %}
+          {% set vent = 60 if (sp is not none and sp.attributes.myair | default(false) == true) else 300 %}
+          {{ sp is not none and sp.state == 'off'
+             and (now() - sp.last_changed).total_seconds() >= vent
+             and on is not none and on.state == 'on'
+             and (now() - on.last_changed).total_seconds() >= 300
+             and state_attr('sensor.hoejttaler_spotify', 'status') != 'play'
+             and not is_state('binary_sensor.hoejttaler_spiller_reelt', 'on')
+             and (lt is none or (now() - lt).total_seconds() >= 7200) }}
+    action:
+      # Målt 09/10 08:12: reboot → af nettet 5-30 s, API igen efter ~40 s,
+      # Spotify Connect igen (ny port) inden 80 s — MEN volumen kommer op på
+      # 50 % (stod på 25). Genstartens volumen gemmes og skrives tilbage, så en
+      # standby-0 ikke bliver til en høj Spotify-start.
+      - variables:
+          vol_foer: "{{ state_attr('media_player.hoejttaler', 'volume_level') | float(-1) }}"
+      - service: shell_command.hoejttaler_reboot
+        continue_on_error: true
+      - service: logbook.log
+        data:
+          name: "Højttaler"
+          message: "Spotify Connect har været væk i 5 min — højttaleren genstartes (tilbage om ~1 min)."
+      - delay:
+          seconds: 30
+      - wait_template: >-
+          {{ states('sensor.hoejttaler_spotify') == 'on'
+             and states('media_player.hoejttaler') not in ['unavailable', 'unknown'] }}
+        timeout:
+          minutes: 5
+        continue_on_timeout: false
+      - if:
+          - condition: template
+            value_template: "{{ vol_foer | float(-1) >= 0 }}"
+        then:
+          - service: media_player.volume_set
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+            data:
+              volume_level: "{{ vol_foer | float }}"
+
+  # Spotify-appens play ramte radioen (user 14/10: "a" = play i Spotify-appen).
+  # 08:16:55 pause i appen → Connect væk 08:18:01 → appens play 08:19:35 nåede
+  # Volumio, men den genoptog sin egen sidste kø (P4) i stedet for Spotify.
+  # Signatur: pauset Spotify-nummer → playing en http-stream, uden HA-context
+  # (HA's radio-script og Lys-sidens play bærer context). Brugeren ville have
+  # Spotify, ikke radioen → stop radioen og genstart højttaleren straks, så
+  # Spotify Connect er tilbage om ~1 min. 10-min-loftet holder den fra at
+  # genstarte to gange efter hinanden (genopliv kan lige have gjort det).
+  - id: hoejttaler_spotify_play_fejlrutet
+    alias: "Højttaler: Spotify-appens play startede radioen — stop og genstart"
+    description: >
+      Går højttaleren fra et pauset Spotify-nummer direkte til at spille
+      radio, uden at HA bad om det, stoppes radioen, og højttaleren
+      genstartes, så Spotify Connect kommer tilbage.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: media_player.hoejttaler
+        to: "playing"
+    condition:
+      - condition: state
+        entity_id: input_boolean.hoejttaler_spotify_vagt_enabled
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set f = trigger.from_state %}
+          {% set t = trigger.to_state %}
+          {{ f is not none and t is not none
+             and f.state == 'paused'
+             and ((f.attributes.media_content_id | default('', true)) | string).startswith('spotify:')
+             and ((t.attributes.media_content_id | default('', true)) | string).startswith('http')
+             and t.context.user_id is none and t.context.parent_id is none }}
+    action:
+      - service: media_player.media_stop
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+      - service: logbook.log
+        data:
+          name: "Højttaler"
+          message: >-
+            Spotify-appens play startede radioen i stedet for Spotify —
+            radioen stoppet{{ ', højttaleren genstartes (Spotify igen om ~1 min)'
+            if (now() - (state_attr('automation.hojttaler_genstart_nar_spotify_connect_er_forsvundet', 'last_triggered')
+                         or (now() - timedelta(days=1)))).total_seconds() >= 600 else '' }}.
+      - if:
+          - condition: template
+            value_template: >-
+              {% set lt = state_attr('automation.hojttaler_genstart_nar_spotify_connect_er_forsvundet', 'last_triggered') %}
+              {{ lt is none or (now() - lt).total_seconds() >= 600 }}
+        then:
+          # Genopliv gemmer og genskriver volumen og venter på Connect. Den
+          # læser ikke trigger.* (fejlklasse #4) og kører mode: single.
+          - service: automation.trigger
+            target:
+              entity_id: automation.hojttaler_genstart_nar_spotify_connect_er_forsvundet
+            data:
+              skip_condition: true
+
+  # Spotify tager over. Broen (B237, trigger `bro`) er husets Spotify-vej fra
+  # 17/10; myair-vejen herunder står kun til hvis myair slås til igen.
+  # myair: en telefon vælger højttaleren (scannerens `myair` går
+  # true — activeUser alene så det aldrig, målt 10/10). Står radioen stadig og spiller (Volumio-kilden er webradio),
+  # stoppes den, så Spotify får lyden. Og står volumen på 0 (standby fra
+  # hoejttaler_auto_stop), hæves den — ellers "spiller" Spotify lydløst.
+  # Via HA (B204, trigger `ha`): MPD begynder at spille Music Assistants strøm.
+  # Radioen er allerede erstattet af DLNA — og Volumios service/status er da
+  # STALE (viser stadig webradio + play), så radio-stoppet må IKKE køre her:
+  # det ville stoppe Spotify selv. Kun volumen-løftet.
+  - id: hoejttaler_spotify_overtager
+    alias: "Højttaler: Spotify tager over fra radio og standby"
+    description: >
+      Når en telefon vælger højttaleren (Spotify-broen, myair eller AirPlay):
+      stop radioen hvis den stadig spiller (kun myair), slip radio-flaget, og
+      hæv volumen fra standby (0) til start-volumen.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: sensor.hoejttaler_spotify
+        attribute: myair
+        from: false
+        to: true
+        id: myair
+      - platform: state
+        entity_id: sensor.hoejttaler_spotify
+        attribute: kilde
+        to: "ha"
+        id: ha
+      # AirPlay fra en iPhone tager også højttaleren (radio-flaget skal ryddes).
+      - platform: state
+        entity_id: media_player.hoejttaler
+        attribute: app_name
+        to: "airplay"
+        id: airplay
+      # Spotify-broen (B237): broen har selv erstattet radioen (replaceAndPlay)
+      # → intet radio-stop, kun volumen-løft + flag. 17/10 15:29: uden denne
+      # stod P4-flaget under broens Spotify (adopteren tog Volumios stale uri).
+      - platform: state
+        entity_id: binary_sensor.spotify_bro_spiller
+        from: "off"
+        to: "on"
+        id: bro
+    condition:
+      - condition: state
+        entity_id: input_boolean.hoejttaler_spotify_vagt_enabled
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% if trigger.id == 'ha' %}
+          {{ trigger.to_state is not none
+             and not is_state('script.hoejttaler_spil_sang', 'on') }}
+          {% else %}
+          {{ trigger.to_state is not none }}
+          {% endif %}
+    action:
+      # Broens trigger fyrer ved HVER resume (spiller off → on) — nødvendigt,
+      # for en resume efter auto-stop står på standby-volumen 0. Men logbogen
+      # skal kun have en linje når der faktisk blev hævet eller sluppet noget.
+      - variables:
+          gjort: >-
+            {{ trigger.id != 'bro'
+               or (state_attr('media_player.hoejttaler', 'volume_level') | float(1)) < 0.01
+               or states('input_text.hoejttaler_radio_kanal') not in ['', 'unknown', 'unavailable'] }}
+      - if:
+          - condition: template
+            value_template: >-
+              {{ trigger.id == 'myair'
+                 and state_attr('sensor.hoejttaler_spotify', 'service') == 'webradio'
+                 and state_attr('sensor.hoejttaler_spotify', 'status') == 'play' }}
+        then:
+          - service: media_player.media_stop
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+      - if:
+          - condition: template
+            value_template: >-
+              {{ (state_attr('media_player.hoejttaler', 'volume_level') | float(1)) < 0.01 }}
+        then:
+          - service: media_player.volume_set
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+            data:
+              volume_level: >-
+                {{ (states('input_number.hoejttaler_standby_start_volumen') | float(25)) / 100 }}
+      # Ryd radio-flaget (13/10 17:46): stod P4 tilbage under Spotify via HA,
+      # troede beskederne og Styrbar at radioen spillede og startede den igen.
+      # Nu er det personens musik — radioen kommer kun tilbage når nogen
+      # vælger den (dashboard, Styrbar-favorit, morgenradio næste morgen).
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_text.hoejttaler_radio_kanal') not in ['', 'unknown', 'unavailable'] }}
+        then:
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.hoejttaler_radio_kanal
+            data:
+              value: ""
+      - if:
+          - condition: template
+            value_template: "{{ gjort }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Højttaler"
+              message: >-
+                {{ {'ha': 'Music Assistant tog over', 'airplay': 'AirPlay tog over',
+                    'bro': 'Spotify tog over (broen)'}.get(trigger.id, 'Spotify tog over') }}
+                — radioen er sluppet (genoptages ikke af beskeder) / volumen hævet fra standby hvor nødvendigt.
+
+  # ---------------------------------------------------------------------------
+  # METODE-KNAPPEN (B204, 2026-10-09): input_boolean.hoejttaler_spotify_via_ha
+  # er sandheden; Music Assistant-add-on'en følger den. Add-on'en har
+  # boot: manual (startes kun herfra) + supervisor-watchdog (crash → genstart).
+  # STOP sker KUN på flanken til off — en add-on user selv starter fra UI'et
+  # for at kigge, mens knappen står off, får lov at køre. START sker på
+  # flanken, ved HA-start (host-reboot lader en boot:manual-add-on stå) og på
+  # backstoppen (fejlklasse #4). MA's opsætning (go-librespot, DLNA-afspilleren
+  # "Højttaler via HA", streams bind_ip 192.0.2.151) ligger i add-on'ens data
+  # — se B204 + scripts/ma_api.py.
+  # ---------------------------------------------------------------------------
+  # B237: knappen til Spotify-broen. Samme mønster som Music Assistant herunder:
+  # knappen ejer start/stop, backstoppen genstarter kun en bro der er faldet ud
+  # mens knappen står on. En manuel start fra UI'et med knappen off får lov.
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # myair til/fra (17/10). Kun på knap-flanken: indstillingen ligger i Volumios
+  # egen config og overlever genstart af både HA og højttaleren, og hvert kald
+  # genstarter højttalerens librespot (afbryder en telefon der spiller).
+  # ---------------------------------------------------------------------------
+  - id: hoejttaler_myair
+    alias: "Højttaler: myair til/fra"
+    mode: queued
+    max: 3
+    trigger:
+      - platform: state
+        entity_id: input_boolean.hoejttaler_myair
+        from: ["on", "off"]
+        to: ["on", "off"]
+    action:
+      - service: shell_command.hoejttaler_myair
+        continue_on_error: true
+        data:
+          tilstand: "{{ trigger.to_state.state }}"
+      - service: logbook.log
+        data:
+          name: "Højttaler"
+          message: >-
+            myair (højttalerens egen Spotify) {{ 'slået til' if trigger.to_state.state == 'on'
+            else 'slået fra — væk fra telefonernes enhedsliste' }}.
+
+  - id: hoejttaler_spotify_bro
+    alias: "Højttaler: Spotify-bro — start/stop"
+    description: >
+      Knappen "Spotify-bro" til: start broen (enheden "Højttaler" i
+      Spotify-appen) — husets Spotify-vej (myair er slået fra). Fra: stop den.
+    mode: queued
+    max: 3
+    trigger:
+      - platform: state
+        entity_id: input_boolean.hoejttaler_spotify_bro
+        from: ["on", "off"]
+        to: ["on", "off"]
+        id: knap
+      - platform: homeassistant
+        event: start
+        id: start
+      - platform: time_pattern
+        minutes: "/15"
+        id: backstop
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.id == 'knap'
+             or (is_state('input_boolean.hoejttaler_spotify_bro', 'on')
+                 and is_state('binary_sensor.spotify_bro_running', 'off')) }}
+    action:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay:
+              seconds: 60
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.hoejttaler_spotify_bro
+                state: "on"
+              # Knappen starter altid: Supervisor-sensoren poller ~30 s og stod
+              # stadig 'on' 12 s efter et stop (målt 17/10) → off→on gjorde intet.
+              # addon_start på en kørende add-on er ufarlig (continue_on_error).
+              - condition: template
+                value_template: >-
+                  {{ trigger.id == 'knap'
+                     or not is_state('binary_sensor.spotify_bro_running', 'on') }}
+            sequence:
+              - service: hassio.addon_start
+                continue_on_error: true
+                data:
+                  addon: local_spotify_bro
+              - service: logbook.log
+                data:
+                  name: "Højttaler"
+                  message: "Spotify-broen startet (\"Højttaler\" i Spotify-appen)."
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.hoejttaler_spotify_bro
+                state: "off"
+              - condition: trigger
+                id: knap
+            sequence:
+              - service: hassio.addon_stop
+                continue_on_error: true
+                data:
+                  addon: local_spotify_bro
+              - service: logbook.log
+                data:
+                  name: "Højttaler"
+                  message: "Spotify-broen stoppet."
+
+  - id: hoejttaler_spotify_metode
+    alias: "Højttaler: Music Assistant — start/stop"
+    description: >
+      Knappen "Music Assistant" til: start Music Assistant (HA kan spille
+      sange, fx regnsangen). Fra: stop den. Spotify fra telefonen går via
+      Spotify-broen ("Højttaler" i appen).
+    mode: queued
+    max: 3
+    trigger:
+      - platform: state
+        entity_id: input_boolean.hoejttaler_spotify_via_ha
+        from: ["on", "off"]
+        to: ["on", "off"]
+        id: knap
+      - platform: homeassistant
+        event: start
+        id: start
+      - platform: time_pattern
+        minutes: "/15"
+        id: backstop
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.id == 'knap'
+             or (is_state('input_boolean.hoejttaler_spotify_via_ha', 'on')
+                 and not is_state('binary_sensor.music_assistant_running', 'on')) }}
+    action:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay:
+              seconds: 60
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.hoejttaler_spotify_via_ha
+                state: "on"
+              - condition: template
+                value_template: "{{ not is_state('binary_sensor.music_assistant_running', 'on') }}"
+            sequence:
+              - service: hassio.addon_start
+                continue_on_error: true
+                data:
+                  addon: d5369777_music_assistant
+              - service: logbook.log
+                data:
+                  name: "Højttaler"
+                  message: >-
+                    Music Assistant startet
+                    ({{ 'knappen' if trigger.id == 'knap' else 'genoprettet efter ' ~ trigger.id }}).
+          - conditions:
+              - condition: trigger
+                id: knap
+              - condition: state
+                entity_id: input_boolean.hoejttaler_spotify_via_ha
+                state: "off"
+              - condition: state
+                entity_id: binary_sensor.music_assistant_running
+                state: "on"
+            sequence:
+              - service: hassio.addon_stop
+                continue_on_error: true
+                data:
+                  addon: d5369777_music_assistant
+              - service: logbook.log
+                data:
+                  name: "Højttaler"
+                  message: >-
+                    Music Assistant stoppet — HA kan ikke spille sange (Spotify
+                    fra telefonen går stadig via broen).
+
+template:
+  - binary_sensor:
+      # Lys-sidens Højttaler-tile styrer Volumio: volumen virker på AL musik,
+      # play/stop kun på radioen (B202: myair-pause ikke bekræftet; Spotify via
+      # HA går uden om Volumio, og dens metadata er stale). Denne viser linjen
+      # "Spotify styres fra telefonen" mens en telefon har Spotify på den.
+      # myair: scannerens `myair` (Volumio-kilden volspotconnect2 — activeUser
+      # er TOM med konto-login, målt 10/10); via HA: MPD spiller MA-strømmen
+      # (men ikke en sang HA selv har sat på); broen (B237, husets Spotify-vej
+      # fra 17/10): binary_sensor.spotify_bro_spiller (packages/spotify_bro.yaml).
+      - name: "Hoejttaler Spotify aktiv"
+        unique_id: hoejttaler_spotify_aktiv
+        icon: mdi:spotify
+        state: >-
+          {{ is_state('binary_sensor.spotify_bro_spiller', 'on')
+             or state_attr('sensor.hoejttaler_spotify', 'myair') == true
+             or (state_attr('sensor.hoejttaler_spotify', 'kilde') == 'ha'
+                 and not is_state('script.hoejttaler_spil_sang', 'on')) }}
+      # "Spiller en ANDEN kilde end HA's radio?" — ÉT anker (fejlklasse #2) for
+      # radio-tilstanden, radio-adopteren og beskederne. User 14/10: "Vi skal
+      # respekteres og ikke afbrydes når vi gør manuelle ting". 13/10 17:46:
+      # Spotify via HA melder webradio/'channel' som radioen → beskederne
+      # genoptog P4 oven i den, to gange.
+      #   · kilde 'ha' = MPD spiller Music Assistants strøm (30-s-poll);
+      #     Volumio-titlen 'uuid:…' er samme strøm og ses STRAKS.
+      #   · myair kun ved 'play': efter ~20 s pause kan appen alligevel ikke
+      #     genoptage (B207), og en hængende 'pause' må ikke blokere for evigt.
+      #   · AirPlay/myair via app_name kun når spiller_reelt er on (AirPlay
+      #     hænger på 'playing' natten over, 10-11/10).
+      #   · Spotify-broen (B237): broen ejer højttaleren (pushet af add-on'en,
+      #     FØR Volumio skifter uri — 17/10 15:29 stod P4 4 s efter broens
+      #     start) ELLER Volumio spiller broens URL (push, ses straks).
+      - name: "Hoejttaler anden kilde"
+        unique_id: hoejttaler_anden_kilde
+        icon: mdi:account-music
+        state: >-
+          {% set p = states.media_player.hoejttaler %}
+          {% set app = (p.attributes.app_name | default('', true)) if p is not none else '' %}
+          {% set titel = ((p.attributes.media_title | default('', true)) if p is not none else '') | string %}
+          {% if not is_state('binary_sensor.hoejttaler_online', 'on') %}false
+          {% elif state_attr('sensor.hoejttaler_spotify', 'kilde') == 'ha' %}true
+          {% elif is_state('binary_sensor.spotify_bro_spiller', 'on')
+                  or (p is not none and p.state == 'playing'
+                      and ':8098/spotify.' in (p.attributes.media_content_id | default('', true) | string)) %}true
+          {% elif state_attr('sensor.hoejttaler_spotify', 'myair') == true
+                  and state_attr('sensor.hoejttaler_spotify', 'status') == 'play' %}true
+          {% elif p is not none and p.state == 'playing'
+                  and is_state('binary_sensor.hoejttaler_spiller_reelt', 'on')
+                  and (app in ['airplay', 'volspotconnect2'] or titel.startswith('uuid:')) %}true
+          {% else %}false{% endif %}
+      # "Spiller den REELT?" — ÉT anker for alle der spørger (beskeder, sange,
+      # morgenradio; fejlklasse #2). Volumio's 'playing' hænger: målt 10-11/10
+      # stod den på 'playing' AirPlay ("Emil Aflægger Afholdsløfte", et nummer på
+      # 344 s) fra 16:40 til 06:30 — telefonen var for længst væk, men auto-stop
+      # sendte media_stop hvert 10. min hele natten uden virkning, vejr-oplæsningen
+      # 06:30 blev sprunget over ("anden musik spiller") og morgenradioen startede
+      # aldrig. Og 10/10 14:34-16:21 stod den på 'playing' DR P3 med MPD stop.
+      #   · MPD-kilder (radio, MA-strøm, Spotify-broen): MPD's egen state (scannerens `kilde`,
+      #     30-s-poll) er sandheden når den siger stop/pause — efter 60 s, så
+      #     pollens forsinkelse ikke dømmer en radio der lige er startet.
+      #   · AirPlay går uden om MPD: samme titel længere end nummerets længde
+      #     + 2 min = intet spiller (eller pauset på telefonen — intet at miste).
+      #     Ukendt længde (0) → stoles der på Volumio.
+      #   · Spotify Connect (volspotconnect2) går også uden om MPD → Volumio.
+      - name: "Hoejttaler spiller reelt"
+        unique_id: hoejttaler_spiller_reelt
+        icon: mdi:speaker-play
+        state: >-
+          {% set p = states.media_player.hoejttaler %}
+          {% if p is none or p.state != 'playing'
+                or not is_state('binary_sensor.hoejttaler_online', 'on') %}false
+          {% else %}
+            {% set app = p.attributes.app_name | default('', true) %}
+            {% set kilde = state_attr('sensor.hoejttaler_spotify', 'kilde') %}
+            {% set dur = p.attributes.media_duration | default(0, true) | float(0) %}
+            {% set siden = as_timestamp(states('sensor.hoejttaler_titel_siden'), 0) %}
+            {% if app not in ['airplay', 'volspotconnect2'] and kilde in ['stop', 'pause']
+                  and (now() - p.last_changed).total_seconds() > 60 %}false
+            {% elif app == 'airplay' and dur > 0 and siden > 0
+                  and now().timestamp() - siden > dur + 120 %}false
+            {% else %}true{% endif %}
+          {% endif %}
+  # Hvornår skiftede titlen sidst (eller startede en ny session efter > 60 s
+  # pause)? Skrevet stempel — media_player's last_changed nulstilles ved
+  # genstart og følger ikke titlen. Volumio's ~11-s idle-blips og genstarts-
+  # rækken (titel None → samme titel) flytter det IKKE.
+  - trigger:
+      - platform: state
+        entity_id: media_player.hoejttaler
+        attribute: media_title
+      - platform: state
+        entity_id: media_player.hoejttaler
+        to: "playing"
+    sensor:
+      - name: "Hoejttaler titel siden"
+        unique_id: hoejttaler_titel_siden
+        device_class: timestamp
+        icon: mdi:music-clock
+        state: >-
+          {% set p = trigger.to_state %}
+          {% set f = trigger.from_state %}
+          {% set ny = (p.attributes.media_title | default('', true)) if p is not none else '' %}
+          {% set gl = this.attributes.get('titel', '') if this is defined else '' %}
+          {% set ny_session = p is not none and f is not none and p.state == 'playing'
+               and f.state != 'playing' and (p.last_changed - f.last_changed).total_seconds() > 60 %}
+          {% set gammel = this.state if this is defined else 'unknown' %}
+          {% if ny != '' and (ny != gl or ny_session) %}{{ now().isoformat() }}
+          {% elif gammel not in ['unknown', 'unavailable', ''] %}{{ gammel }}
+          {% else %}{{ now().isoformat() }}{% endif %}
+        attributes:
+          titel: >-
+            {% set p = trigger.to_state %}
+            {% set ny = (p.attributes.media_title | default('', true)) if p is not none else '' %}
+            {{ ny if ny != '' else (this.attributes.get('titel', '') if this is defined else '') }}
+
+command_line:
+  - sensor:
+      name: hoejttaler_spotify
+      unique_id: hoejttaler_spotify
+      command: "python3 /config/scripts/hoejttaler_spotify.py"
+      command_timeout: 25
+      value_template: "{{ value_json.connect }}"
+      json_attributes:
+        - user
+        - port
+        - service
+        - status
+        - kilde
+        - myair
+      scan_interval: 30
+      icon: mdi:spotify
+
+shell_command:
+  hoejttaler_reboot: "python3 /config/scripts/hoejttaler_spotify.py reboot"
+  hoejttaler_myair: "python3 /config/scripts/hoejttaler_spotify.py myair {{ 'on' if tilstand == 'on' else 'off' }}"

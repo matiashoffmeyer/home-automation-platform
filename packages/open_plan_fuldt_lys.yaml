@@ -1,0 +1,249 @@
+# =============================================================================
+# Open plan: FULDT LYS-HOLD — langt OP-tryk på stue-Styrbaren
+# =============================================================================
+# User-spec 2026-09-23: "langt tryk op på stue styrbar skal sikre at lyset
+# holdes fuldt bright i open-plan i mindst 30min, derefter, hvis det er tomt i
+# noget tid kan det gå tilbage til auto."
+#
+# HVORFOR DET IKKE HOLDT FØR (målt i logbogen): script.styrbar_snap_full tænder
+# light.stue_all (spisestue-loft + køkken-lyskæde + sofa-zonen) + køkkenspottene
+# på 100 %, men script.styrbar_stamp_press satte KUN room_mode_stue = Manual.
+# Køkken og spisestue blev stående i Auto, og deres egne regler tog lyset ned:
+# 22/9 19:41 → spots slukket 20:03, 22/9 20:22 → slukket 20:42, 19/9 08:38 →
+# slukket 08:41 (alle "Lysnet: Køkken spots aggressiv sluk (central zone tom)").
+#
+# DESIGN
+# - START (samme zha_event som snap_full): stuen stemples af Styrbar-handleren
+#   som altid; HER stemples spisestue + køkken også (Manual + last_press) og
+#   hold-flaget sættes med et skrevet start-stempel (permanent faktum:
+#   last_changed nulstilles ved restart og duer ikke som alders-mål).
+# - UNDER HOLDET: rummene er Manual (alle Auto-veje der respekterer Manual
+#   holder sig væk), og veje der IKKE respekterer Manual er gated direkte på
+#   input_boolean.open_plan_fuldt_lys. Drift-back (automations/room_drift_back
+#   .yaml) slipper IKKE de tre rum enkeltvis mens flaget er on — ellers ville
+#   en tom spisestue gå i Auto og slukke midt i open-plan mens man sidder i
+#   sofaen. Drift-backs 1,5-t-loft (room_manual_on_hold_hours) og 24-t-backstop
+#   gælder fortsat uændret.
+# - SLIP: tidligst efter input_number.open_plan_fuldt_lys_min_minutter (30),
+#   og først når HELE open-plan (binary_sensor.open_plan_occupied = union af de
+#   tre filtrerede Apolloer) har været tom i open_plan_fuldt_lys_tomt_minutter
+#   → alle tre rum drifter til Auto via script.room_drift_back (samme blide
+#   handover som al anden drift-back). time_pattern-backstop + HA-start dækker
+#   restart og en tom-flanke der skete inden for de første 30 min (#4).
+# - AFBRYD (flaget ryddes, rummene røres ikke): godnat, Dark Mode, biograf,
+#   dance/party, huset Dormant, house_mode-skift, eller et af de tre rum
+#   forlader Manual ad en anden vej (app, stemme, drift-backs loft).
+# - DIREKTE GATES: presence_koekken_spots_off (ingen Manual-gate) læser
+#   flaget; køkken-lyskæden ser flaget som en LÅNER i
+#   binary_sensor.koekken_lyskaede_laant → enforceren holder fingrene væk og
+#   re-armer selv når holdet slutter. Sofa-zone + spisestue-loft er allerede
+#   dækket af binary_sensor.stue_manuel_lys_hold (stue-trykkets 3-t-stempel);
+#   SLIP skriver input_datetime.open_plan_fuldt_lys_sluppet, som frigiver
+#   netop det hold, så et tomt open-plan faktisk går tilbage til Auto.
+# - AirBnB: en gæst der holder OP får samme hold, og det slipper af sig selv når
+#   rummet er tomt — ingen ny tilstand at sidde fast i.
+# =============================================================================
+
+input_boolean:
+  open_plan_fuldt_lys:
+    name: "Open plan: fuldt lys-hold (stue-Styrbar langt OP)"
+    icon: mdi:brightness-7
+
+input_datetime:
+  open_plan_fuldt_lys_start:
+    name: "Open plan: fuldt lys-hold startet"
+    icon: mdi:clock-start
+    has_date: true
+    has_time: true
+  # Skrevet ved SLIP (ikke ved afbryd). Læses af binary_sensor.stue_manuel_lys_hold
+  # (packages/room_modes.yaml): trykkets 3-t-hold slipper sammen med dette.
+  open_plan_fuldt_lys_sluppet:
+    name: "Open plan: fuldt lys-hold sluppet"
+    icon: mdi:clock-end
+    has_date: true
+    has_time: true
+
+input_number:
+  open_plan_fuldt_lys_min_minutter:
+    name: "Open plan fuldt lys: hold mindst (min)"
+    icon: mdi:timer-lock
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+  open_plan_fuldt_lys_tomt_minutter:
+    name: "Open plan fuldt lys: derefter tomt i (min) → Auto"
+    icon: mdi:timer-sand
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+automation:
+  - id: open_plan_fuldt_lys_start
+    alias: "Open plan fuldt lys: stue-Styrbar langt OP → hold alle tre rum"
+    mode: queued
+    max: 3
+    trigger:
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "7e:44:f6:62:8e:f4:b1:23"   # Stue Styrbar
+          command: "move_with_on_off"
+    # Samme tilstande som afbryd-automationen nedenfor (#12): et langt tryk
+    # under godnat/mørke/fest tænder stadig lyset (snap_full), men armerer
+    # intet hold — de tilstande ejer lyset.
+    condition:
+      - condition: state
+        entity_id:
+          - binary_sensor.godnat_common_active
+          - input_boolean.dark_mode
+          - input_boolean.cinema_active
+          - input_boolean.dance_mode
+          - binary_sensor.scene_party_active
+        state: "off"
+      # 2026-10-05 (B193): langt OP er radio-volumen mens radioen spiller.
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.styrbar_stue_radio', 'on') }}"
+      # 2026-10-17 (user-spec): OP der slipper gæste-holdet skal give open-plan
+      # AUTO, ikke et Manual-hold. sleepover_gaest_op_clear kører på samme
+      # tryk og slukker i_nat inden for millisekunder → læs også flankens
+      # alder, så rækkefølgen mellem de to automations er ligegyldig (#2/#4).
+      - condition: template
+        value_template: >-
+          {{ is_state('binary_sensor.sleepover_openplan_moerkt', 'off')
+             and (now() - states.input_boolean.sleepover_i_nat.last_changed).total_seconds() > 5 }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.open_plan_fuldt_lys_start
+        data:
+          timestamp: "{{ now().timestamp() }}"
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.open_plan_fuldt_lys
+      # Stuen stemples af styrbar_snap_full selv; de to andre rum her.
+      - repeat:
+          for_each: ["spisestue", "koekken"]
+          sequence:
+            - service: script.styrbar_stamp_press
+              data:
+                room: "{{ repeat.item }}"
+      - service: logbook.log
+        data:
+          name: "Open plan fuldt lys"
+          message: >-
+            Hold startet (min {{ states('input_number.open_plan_fuldt_lys_min_minutter') | int(30) }} min,
+            derefter tomt {{ states('input_number.open_plan_fuldt_lys_tomt_minutter') | int(10) }} min → Auto)
+          entity_id: input_boolean.open_plan_fuldt_lys
+
+  - id: open_plan_fuldt_lys_slip
+    alias: "Open plan fuldt lys: slip til Auto efter min-tid + tomt"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.open_plan_occupied
+        from: "on"
+        to: "off"
+        for:
+          minutes: "{{ states('input_number.open_plan_fuldt_lys_tomt_minutter') | int(10) }}"
+      # Backstop: tom-flanken kan være sket MENS min-tiden løb (#4), og en
+      # restart dræber en ventende for: (permanent faktum).
+      - platform: time_pattern
+        minutes: "/5"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: state
+        entity_id: input_boolean.open_plan_fuldt_lys
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set start = state_attr('input_datetime.open_plan_fuldt_lys_start', 'timestamp') | float(0) %}
+          {{ start > 0 and (now().timestamp() - start) / 60
+             >= states('input_number.open_plan_fuldt_lys_min_minutter') | float(30) }}
+      - condition: state
+        entity_id: binary_sensor.open_plan_occupied
+        state: "off"
+      # last_changed nulstilles ved restart → efter en genstart tæller tomt-
+      # tiden forfra (slipper senere, aldrig tidligere).
+      - condition: template
+        value_template: >-
+          {{ (now() - states.binary_sensor.open_plan_occupied.last_changed).total_seconds() / 60
+             >= states('input_number.open_plan_fuldt_lys_tomt_minutter') | float(10) }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.open_plan_fuldt_lys_sluppet
+        data:
+          timestamp: "{{ now().timestamp() }}"
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.open_plan_fuldt_lys
+      # Re-arm (#4): køkkenspottenes tom-flanker (inkl. 20-min open-plan-
+      # backstoppet) kan være sket MENS holdet gatede dem. Open-plan har her
+      # beviseligt været tom i N min, og spot-reglen tænder aldrig selv → sluk.
+      # Sofa-zone/spisestue-loft samles op af deres egne /5- og /10-backstops,
+      # når stue_manuel_lys_hold slipper på stemplet ovenfor.
+      - if:
+          - condition: state
+            entity_id: switch.koekken_spots
+            state: "on"
+        then:
+          - service: switch.turn_off
+            continue_on_error: true
+            target:
+              entity_id: switch.koekken_spots
+      - repeat:
+          for_each: ["stue", "spisestue", "koekken"]
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ not is_state('input_select.room_mode_' ~ repeat.item, 'Auto') }}"
+              then:
+                - service: script.room_drift_back
+                  data:
+                    room: "{{ repeat.item }}"
+      - service: logbook.log
+        data:
+          name: "Open plan fuldt lys"
+          message: "Hold sluppet: open-plan tom → stue/spisestue/køkken tilbage til Auto"
+          entity_id: input_boolean.open_plan_fuldt_lys
+
+  - id: open_plan_fuldt_lys_afbryd
+    alias: "Open plan fuldt lys: afbryd (godnat/mørke/fest/Dormant/rum forlader Manual)"
+    mode: queued
+    max: 5
+    trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.godnat_common_active
+          - input_boolean.dark_mode
+          - input_boolean.cinema_active
+          - input_boolean.dance_mode
+          - binary_sensor.scene_party_active
+        from: "off"
+        to: "on"
+      - platform: state
+        entity_id: input_select.house_state
+        to: "Dormant"
+      - platform: state
+        entity_id: input_select.house_mode
+      - platform: state
+        entity_id: !include ../rosters/open_plan_rum_mode.yaml
+        from: "Manual"
+    condition:
+      - condition: state
+        entity_id: input_boolean.open_plan_fuldt_lys
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.open_plan_fuldt_lys
+      - service: logbook.log
+        data:
+          name: "Open plan fuldt lys"
+          message: "Hold afbrudt af {{ trigger.entity_id }} → {{ trigger.to_state.state }}"
+          entity_id: input_boolean.open_plan_fuldt_lys

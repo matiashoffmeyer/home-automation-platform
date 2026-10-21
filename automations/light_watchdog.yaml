@@ -1,0 +1,459 @@
+# =============================================================================
+# Lys super-watchdog — automatik (2026-06-15)
+# =============================================================================
+# Helpers + dokumentation: packages/light_watchdog.yaml
+# =============================================================================
+
+- id: global_light_watchdog
+  alias: "Lys: super-watchdog (sluk fastlåst lys efter N timer)"
+  description: >
+    /30-min scan: slukker ethvert light.* der har stået ON uafbrudt i mere end
+    input_number.global_max_light_hours timer (default 6) — antaget fastlåst
+    hardware. Ekskluderer grupper (*_all) + Apollo-RGB. Kill-switch:
+    input_boolean.global_light_watchdog_enabled. Skipper under cinema/cirkus/
+    dance (intentionelt langt-tændt lys).
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/30"
+  condition:
+    - condition: state
+      entity_id: input_boolean.global_light_watchdog_enabled
+      state: "on"
+    # Skip når lys bevidst holdes tændt længe.
+    - condition: template
+      value_template: >-
+        {{ not (is_state('input_boolean.cinema_active', 'on')
+                or is_state('input_boolean.cirkus_active', 'on')
+                or is_state('input_boolean.dance_mode', 'on')) }}
+  action:
+    - variables:
+        max_s: "{{ (states('input_number.global_max_light_hours') | float(6)) * 3600 }}"
+        stuck: >-
+          {# KUN børnenes 1% natlys-strip brænder legitimt hele natten → undtag
+             den mens BØRNENE er puttet, så watchdog'en ikke slukker den før
+             morgen. Gated på godnat_boern_active (børnenes putte-flag), IKKE
+             godnat_active (de voksnes hus-flag): natlyset følger putningen, så
+             det skal beskyttes selv hvis en voksen stadig er oppe. (2026-06-18:
+             var godnat_active → dræbte natlyset 04:00 da fix'et ikke var deployet;
+             nu afkoblet fra voksen-godnat.)
+             Bad-lyset er IKKE undtaget: et nat-toilet (nightwalk) er kortvarigt
+             og rammer aldrig N-timers-grænsen, men hvis bad-spots reelt HÆNGER
+             for længe SKAL watchdog'en stadig dræbe dem (user-spec 2026-06-18). #}
+          {% set boern_puttet = is_state('input_boolean.godnat_boern_active', 'on') %}
+          {% set night_exempt = ['light.boernevaerelse_hygge_strip'] if boern_puttet else [] %}
+          {% set ns = namespace(l=[]) %}
+          {% for s in states.light %}
+            {# 'entity_id' i attrs == HA-lysgruppe (alle_lys, alle_indvendige,
+               *_all, depot_loft, ...). ALDRIG sluk en gruppe — det kaskaderer
+               til alle medlemmer (slukkede natlys 04:00 2026-06-18). Det gamle
+               endswith('_all') fangede ikke alle_lys/alle_indvendige.
+               'group_entities' == ZHA-GRUPPE (vejrvarsel morgen/aften, 30/8).
+               Den bruger et ANDET attribut-navn end HA's egne grupper, så
+               guarden ovenfor så den ikke — og et sluk på den er et groupcast
+               til alle medlemmer på én gang. Tilføj nye gruppe-typers markør
+               her, ikke en entity-navne-liste. #}
+            {% if s.state == 'on'
+               and 'entity_id' not in s.attributes
+               and 'group_entities' not in s.attributes
+               and '_apollo_rgb' not in s.entity_id
+               and s.entity_id not in night_exempt
+               and (now() - s.last_changed).total_seconds() >= max_s %}
+              {% set ns.l = ns.l + [s.entity_id] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.l }}
+    # Stop hvis intet er fastlåst.
+    - condition: template
+      value_template: "{{ stuck | length > 0 }}"
+    - service: light.turn_off
+      target:
+        entity_id: "{{ stuck }}"
+    - service: logbook.log
+      data:
+        name: "Lys super-watchdog"
+        message: >-
+          Slukkede {{ stuck | length }} lys der havde brændt uafbrudt >
+          {{ states('input_number.global_max_light_hours') }}t (antaget fastlåst):
+          {{ stuck | join(', ') }}
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: lys_watchdog
+        title: "💡 Lys-watchdog: slukkede fastlåst lys"
+        message: >-
+          {{ stuck | length }} lys havde brændt >
+          {{ states('input_number.global_max_light_hours') }}t uafbrudt og blev
+          slukket: {{ stuck | map('replace', 'light.', '') | join(', ') }}
+
+# =============================================================================
+# Uopnåeligt lys ved godnat → sluk det i sekundet det er tilbage (2026-08-12)
+# =============================================================================
+# Super-watchdog'en ovenfor er BLIND for netop dette: den kræver state == 'on',
+# og en pære der falder af nettet mens den lyser står 'unavailable' — fysisk
+# tændt, digitalt usynlig (fejlklasse #9). script.godnat_uopnaaelige_lys_stamp
+# skriver listen ved godnat; her lukkes hullet i den anden ende (fejlklasse #4:
+# retur-flanken findes ikke som trigger, fordi entity-listen først kendes ved
+# runtime → /2-min tick mens godnat kører; billigt, da conditionen falder med
+# det samme når listen er tom).
+# =============================================================================
+- id: lys_offline_sluk_ved_retur
+  alias: "Lys: sluk uopnåeligt godnat-lys når det kommer tilbage"
+  description: >
+    Lys der ikke kunne nås ved godnat slukkes så snart de er på nettet igen —
+    ellers ville de lyse natten ud, fordi godnat's sluk-kommando blev droppet
+    og ingen flanke re-fyrer.
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/2"
+  condition:
+    - condition: state
+      entity_id: input_boolean.global_light_watchdog_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "on"
+    # Urørt input_text står på 'unknown' (truthy) → test eksplicit for sentinel.
+    - condition: template
+      value_template: >-
+        {{ states('input_text.godnat_uopnaaelige_lys')
+           not in ['', 'unknown', 'unavailable'] }}
+  action:
+    - variables:
+        venter: >-
+          {{ states('input_text.godnat_uopnaaelige_lys').split(',')
+             | reject('eq', '') | list }}
+        tilbage: >-
+          {{ states('input_text.godnat_uopnaaelige_lys').split(',')
+             | reject('eq', '')
+             | reject('is_state', 'unavailable')
+             | reject('is_state', 'unknown') | list }}
+    - condition: template
+      value_template: "{{ tilbage | length > 0 }}"
+    # Rent off uden transition — IKEA/TRADFRI mishandler transition på turn_off.
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: "{{ tilbage }}"
+    # Fjern de slukkede fra listen; resten venter på næste tick.
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.godnat_uopnaaelige_lys
+      data:
+        value: "{{ venter | reject('in', tilbage) | join(',') }}"
+    - service: logbook.log
+      data:
+        name: "Lys-watchdog"
+        message: >-
+          {{ tilbage | length }} lys kom tilbage på nettet under godnat og blev
+          slukket: {{ tilbage | join(', ') }}
+
+# Ryd listen når godnat slutter — den beskriver NATTENS uopnåelige lys, og et
+# stale stempel ville slukke en pære brugeren selv tænder i morgen tidlig.
+- id: lys_offline_liste_ryd
+  alias: "Lys: ryd uopnåelig-liste ved godnat slut"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.godnat_any_active
+      from: "on"
+      to: "off"
+  condition:
+    - condition: template
+      value_template: >-
+        {{ states('input_text.godnat_uopnaaelige_lys')
+           not in ['', 'unknown', 'unavailable'] }}
+  action:
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.godnat_uopnaaelige_lys
+      data:
+        value: ""
+
+# =============================================================================
+# 👻 Spøgelses-lys: pæren lyser videre uden radio (2026-08-13, user-spec)
+# =============================================================================
+# Armerer på flanken on → unavailable (efter slideren, default 10 min) og
+# rydder når pæren er tilbage på nettet. Baggrund + hvorfor tvetydigheden
+# accepteres: packages/light_watchdog.yaml.
+#
+# Rosteret er LEAF-pærer med live states — grupper er udeladt (en gruppe med ét
+# unavailable medlem melder stadig 'on'), og de 6 registry-rester
+# (stue_sofa_lampe(_2), stue_hjoernelampe, boernevaerelse_lampe, depot_loft_ikea,
+# sovevaerelse_loft) er udeladt fordi de ALTID er unavailable = evigt spøgelse.
+# NB light.spisestue_pendel hænger fysisk i soveværelset (light_groups.yaml).
+# =============================================================================
+- id: lys_spoegelse_arm
+  alias: "Lys: marker + varsl om lys der lyser uden radio"
+  description: >
+    En pære der taber radioen MENS den lyser bliver stående fysisk tændt, men
+    står 'unavailable' i HA = usynlig for watchdog, statistik og energi-estimat
+    (fejlklasse #9). Her latches den, så den tæller med — og brugeren får det
+    ene der kan hjælpe: besked om at slukke på kontakten.
+  mode: queued
+  max: 10
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id:
+        - light.stue_plug
+        - light.stue_laesehygge
+        - light.koekken_lyskaede
+        - light.spisestue_loft
+        - light.spisestue_pendel
+        - light.boernevaerelse_loft
+        - light.boernevaerelse_hygge_strip
+        - light.boernevaerelse_hyggelys
+        - light.badevaerelse_spot_1
+        - light.badevaerelse_spot_2
+        - light.badevaerelse_spot_3
+        - light.badevaerelse_spot_4
+        - light.badevaerelse_spot_5
+        - light.depot_loft_hue_1
+        - light.depot_loft_hue_2
+        - light.depot_strip
+        - light.entre_loft
+        - light.terrasse_paerelyskaede
+      from: "on"
+      to: "unavailable"
+      for:
+        minutes: >-
+          {{ states('input_number.lys_spoegelse_varsel_minutter') | int(10) }}
+  condition:
+    - condition: state
+      entity_id: input_boolean.global_light_watchdog_enabled
+      state: "on"
+    # Bad-strømmen er husets eneste ægte vidne: er den væk, er spots fysisk
+    # mørke — så er 'unavailable' korrekt læst som slukket, ikke som spøgelse.
+    - condition: template
+      value_template: >-
+        {{ not (trigger.entity_id.startswith('light.badevaerelse_')
+                and is_state('binary_sensor.badevaerelse_bad_strom_ok', 'off')) }}
+  action:
+    - variables:
+        raw: "{{ states('input_text.lys_spoegelser') }}"
+        liste: >-
+          {% set r = states('input_text.lys_spoegelser') %}
+          {{ (r.split(',') | reject('eq', '') | list)
+             if r not in ['', 'unknown', 'unavailable'] else [] }}
+        ny: "{{ (liste + [trigger.entity_id]) | unique | list }}"
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.lys_spoegelser
+      data:
+        value: "{{ ny | join(',') }}"
+    - service: logbook.log
+      data:
+        name: "Spøgelses-lys"
+        message: >-
+          {{ trigger.entity_id }} mistede radioen mens den var tændt — tæller
+          nu med som tændt i statistik + effekt-estimat indtil den er tilbage.
+    # Thread-vagten ejer bad-spot-sagen (egen push + selvhealing) → ingen
+    # dobbelt-push når det bare er Thread der hænger (jf. notifikations-støj).
+    - condition: template
+      value_template: >-
+        {{ not (trigger.entity_id.startswith('light.badevaerelse_spot_')
+                and is_state('binary_sensor.badevaerelse_matter_spots_ok', 'off')) }}
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: lys_watchdog
+        title: "👻 Lys lyser uden radio"
+        # Visningsnavn frem for entity_id (2026-10-20): "entre_loft" → "Entré Loft".
+        message: >-
+          {% from 'tekst.jinja' import dansk %}
+          {%- set e = trigger.entity_id -%}
+          {{ dansk(state_attr(e, 'friendly_name') | default(e | replace('light.', ''), true)) }}
+          mistede forbindelsen for {{ states('input_number.lys_spoegelse_varsel_minutter') | int(10) }}
+          min siden mens den var tændt — den lyser nok endnu, og huset kan ikke
+          slukke den. Sluk på kontakten.
+          {%- if states('sensor.lys_spoegelser') | int(0) > 1 %}
+          ({{ states('sensor.lys_spoegelser') }} lys i alt lige nu.)
+          {%- endif %}
+
+# Ryd latchen når pæren er tilbage. Retur-flanken dækker den normale vej;
+# /15-ticket er backstop for det HA-restart hvor pæren kom tilbage mens vi var
+# nede (så flanken aldrig fandtes — fejlklasse #4).
+- id: lys_spoegelse_ryd
+  alias: "Lys: fjern spøgelse når radioen er tilbage"
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id:
+        - light.stue_plug
+        - light.stue_laesehygge
+        - light.koekken_lyskaede
+        - light.spisestue_loft
+        - light.spisestue_pendel
+        - light.boernevaerelse_loft
+        - light.boernevaerelse_hygge_strip
+        - light.boernevaerelse_hyggelys
+        - light.badevaerelse_spot_1
+        - light.badevaerelse_spot_2
+        - light.badevaerelse_spot_3
+        - light.badevaerelse_spot_4
+        - light.badevaerelse_spot_5
+        - light.depot_loft_hue_1
+        - light.depot_loft_hue_2
+        - light.depot_strip
+        - light.entre_loft
+        - light.terrasse_paerelyskaede
+      from: "unavailable"
+    - platform: time_pattern
+      minutes: "/15"
+  condition:
+    - condition: template
+      value_template: >-
+        {{ states('input_text.lys_spoegelser')
+           not in ['', 'unknown', 'unavailable'] }}
+  action:
+    - variables:
+        liste: >-
+          {% set r = states('input_text.lys_spoegelser') %}
+          {{ (r.split(',') | reject('eq', '') | list)
+             if r not in ['', 'unknown', 'unavailable'] else [] }}
+        beholdt: >-
+          {{ liste | reject('is_state', 'on') | reject('is_state', 'off')
+             | list }}
+    - condition: template
+      value_template: "{{ beholdt | count != liste | count }}"
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.lys_spoegelser
+      data:
+        value: "{{ beholdt | join(',') }}"
+    - service: logbook.log
+      data:
+        name: "Spøgelses-lys"
+        message: >-
+          Tilbage på nettet:
+          {{ liste | reject('in', beholdt) | map('replace', 'light.', '')
+             | join(', ') }}{% if beholdt | count > 0 %} —
+          {{ beholdt | count }} venter stadig{% endif %}
+
+# =============================================================================
+# NAT-VAGT — et open-plan-lys må ikke overleve natten i et tomt rum (2026-08-26e)
+# =============================================================================
+# INCIDENT: natten 25→26/8 tændte light.koekken_lyskaede 04:13:49 i et tomt hus
+# og brændte til 07:54:00 = 3t41m. TRE lag svigtede samtidig: auto-godnat havde
+# aldrig armeret (B100), house_state stod Active hele natten, og tænd-beviset
+# var én radar-frame. Super-watchdog'en ovenfor måler 6 TIMER og så den aldrig.
+#
+# Derfor det her lag: det er CAUSE-AGNOSTISK. Det spørger ikke hvorfor lyset
+# tændte — kun om nogen er der.
+#
+# NØGLEVALGET er hvad graceperioden måles PÅ. Alle presence-baserede timere
+# (open_plan_empty_for_20m, occupancy-sensorernes last_changed) nulstilles af et
+# spøgelse — det var præcis dét der holdt lyskæden i live: spøgelser hver 10-40
+# min. LYSETS egen `last_changed` kan et spøgelse derimod ikke røre. Derfor:
+#   (a) occupancy skal være off NU  → beskytter mennesket der sidder stille
+#                                      (still-feltet er 6 m, en læser holder on)
+#   (b) lyset skal have brændt >= N min → spøgelses-immun pr. konstruktion
+# Så snart der er ÉT tick hvor open-plan er tomt, dør lyset. Under nattens
+# spøgelses-storm var der huller på 17-23 min = rigeligt.
+#
+# AirBnB kører IKKE her: gæstens sluk-vej er allerede den hurtige (i AirBnB er
+# lyskædens `empty`/`rearm`-flanker tilladt, se presence_koekken.yaml), og at
+# slukke en gæstes lys er at påtvinge en familie-rutine.
+# =============================================================================
+
+- id: nat_lysvagt_openplan
+  alias: "Lys: nat-vagt (sluk open-plan-lys i tomt rum om natten)"
+  description: >
+    /5-min scan mellem 23 og 06: slukker open-plan-lys der har brændt længere
+    end input_number.nat_lysvagt_minutter MENS alle tre open-plan-Apolloer
+    melder tomt. Graceperioden måles på LYSETS last_changed, ikke på en
+    presence-timer, så et radar-spøgelse ikke kan holde lyset i live.
+    Kill-switch: input_boolean.global_light_watchdog_enabled.
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: input_boolean.global_light_watchdog_enabled
+      state: "on"
+    # 23:00-06:00 (2026-10-02, var 07:00 — user-bug "stue spots? de er
+    # slukkede" 06:55). MÅLT 20/9-2/10: 10 fyringer, 8 af dem 06:15-06:55
+    # EFTER at godnat var ryddet og familien var oppe (et enkelt tomt tick mens
+    # nogen var på badet/hos børnene); de eneste ægte var 23:00 og 05:05. Den
+    # gamle præmis "morgenlyset re-tænder hvis nogen står op" holder ikke for
+    # følger-lys: stue-spottene spejler læselampen og tænder kun igen når DEN
+    # skifter. 04:13-incidentet dækkes stadig — det ville være slukket ~04:30.
+    - condition: template
+      value_template: "{{ now().hour >= 23 or now().hour < 6 }}"
+    # Bevidst langt-tændt lys.
+    - condition: template
+      value_template: >-
+        {{ not (is_state('input_boolean.cinema_active', 'on')
+                or is_state('input_boolean.cirkus_active', 'on')
+                or is_state('input_boolean.dance_mode', 'on')) }}
+    # Gæsten får ikke påtvunget husets natrutine (se hoved-kommentaren).
+    - condition: template
+      value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+  action:
+    - variables:
+        rum: !include ../rosters/open_plan_occupancy.yaml
+        # Fejlklasse #9: unavailable er hverken on eller off. Er ét af de tre
+        # øjne blindt, ved vi ikke om rummet er tomt → rør ingenting.
+        tomt: >-
+          {{ rum | map('states') | select('eq', 'off') | list | count == 3 }}
+        grace_s: >-
+          {{ (states('input_number.nat_lysvagt_minutter') | float(15)) * 60 }}
+        # Roster som GRUPPE-opslag (fejlklasse #16): tilføjes en lampe til
+        # light.stue_room, er den dækket her uden en ekstra edit.
+        kandidater: >-
+          {{ (state_attr('light.stue_room', 'entity_id') | default([], true) | list)
+             + ['light.koekken_lyskaede', 'light.spisestue_loft'] }}
+        braender: >-
+          {% set ns = namespace(l=[]) %}
+          {% for e in kandidater %}
+            {% if is_state(e, 'on')
+               and (now() - states[e].last_changed).total_seconds() >= (grace_s | float(900)) %}
+              {% set ns.l = ns.l + [e] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.l }}
+        spots_braender: >-
+          {{ is_state('switch.koekken_spots', 'on')
+             and (now() - states['switch.koekken_spots'].last_changed).total_seconds()
+                 >= (grace_s | float(900)) }}
+    - condition: template
+      value_template: >-
+        {{ tomt and (braender | count > 0 or spots_braender) }}
+    - choose:
+        - conditions: "{{ braender | count > 0 }}"
+          sequence:
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: "{{ braender }}"
+              data:
+                transition: 5
+    - choose:
+        - conditions: "{{ spots_braender }}"
+          sequence:
+            - service: switch.turn_off
+              continue_on_error: true
+              target:
+                entity_id: switch.koekken_spots
+    - service: logbook.log
+      data:
+        name: "Nat-vagt"
+        message: >-
+          Slukkede {{ braender | count + (1 if spots_braender else 0) }} open-plan-lys
+          der havde brændt > {{ states('input_number.nat_lysvagt_minutter') }} min i et
+          tomt rum: {{ (braender + (['switch.koekken_spots'] if spots_braender else []))
+                       | map('replace', 'light.', '') | map('replace', 'switch.', '')
+                       | join(', ') }}
+    - service: script.push_notify
+      continue_on_error: true
+      data:
+        notif_id: nat_lysvagt
+        title: "🌙 Nat-vagt slukkede lys"
+        message: >-
+          {{ (braender + (['switch.koekken_spots'] if spots_braender else []))
+             | map('replace', 'light.', '') | map('replace', 'switch.', '')
+             | join(', ') }} brændte i et tomt open-plan om natten.

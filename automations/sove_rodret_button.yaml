@@ -1,0 +1,133 @@
+# =============================================================================
+# Sove RODRET-knap — simpel styring af voksen-soveværelset (omkodet 2026-06-28)
+# =============================================================================
+# Den fysiske RODRET-knap (IEEE 56:25:d3:d2:0b:bd:62:42) sad tidligere som
+# børnenes kalde-/putte-knap. User-spec 2026-06-28: omkod til SIMPEL direkte
+# styring af voksen-sovelyset (light.spisestue_pendel — sove-pendlen):
+#
+#   kort-op  (command "on")               → tænd på LUX-tilpasset niveau
+#                                            (open_plan_lux: mørk→lys = højere %)
+#   lang-op  (command "move_with_on_off") → skru op til 100 %
+#   kort-ned (command "off")              → sluk
+#   lang-ned (command "move")             → sluk (samme som kort-ned)
+#
+# Mode-håndtering: tænd sætter room_mode=Auto (presence kan overtage/sluk efter
+# fravær). Sluk sætter room_mode=Off = soft presence-block så still_target IKKE
+# straks gentænder lyset lige efter et knap-tryk (drift_back → Auto når rummet
+# har været tomt ~20 min — samme mønster som den fysiske sove-Styrbar kort-ned).
+#
+# Lux-kilde: sensor.open_plan_lux (per user-spec). Color temp følger
+# sensor.auto_color_temp_evening (sol-tilpasset, varmere om aftenen).
+# BEMÆRK: global_brightness_factor anvendes IKKE her — den står pt på ~3,0 og
+# ville mætte hele kurven til 100 % og udviske forskellen på kort-op vs lang-op.
+#
+# De gamle kalde-/putte-flows er fjernet fra godnat_night.yaml (samme sprint).
+# =============================================================================
+
+- id: sove_rodret_kort_op
+  alias: "Sove RODRET: kort-op → tænd lux-tilpasset"
+  description: >
+    Kort tryk på TOP af RODRET (56:25:d3:d2:0b:bd:62:42) → tænd sove-pendlen på
+    et lux-tilpasset niveau (open_plan_lux). Sætter room_mode=Auto.
+  mode: single
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "56:25:d3:d2:0b:bd:62:42"
+        command: "on"
+  action:
+    # 2026-08-29 (user-incident): stemplet SKAL sættes før lyset tændes.
+    # RODRET'en sætter room_mode=Auto (bevidst — knapper er en del af Auto), og
+    # den bærer intet context.user_id (zha_event). Dark Modes re-assert testede
+    # netop de to ting og konkluderede "auto-tænd" → den snappede brugerens eget
+    # tryk slukket 2 s efter. Målt 28/8: fire tryk dræbt 21:25-21:39.
+    # last_press er husets kanoniske "en finger rørte noget indendørs"-vidne.
+    - service: script.styrbar_stamp_press
+      data:
+        room: sovevaerelse
+        set_manual: false
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.room_mode_sovevaerelse
+      data:
+        option: "Auto"
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        # 2026-07-01 (opg 3+4): START-niveau ("find ting i skuffer") på den varme
+        # default-farve. Slider-styret; erstatter lux-baseret 60/40/25 @ evening.
+        # Rå %, ingen global faktor. Settle-fade dæmper til hygge når du ligger.
+        brightness_pct: "{{ states('input_number.sovevaerelse_start_brightness') | int(30) }}"
+        color_temp_kelvin: "{{ states('input_number.sovevaerelse_default_warmth_k') | int(2200) }}"
+        # 2026-10-04 (user-spec: "husk langsomme transitions"): i aften-vinduet
+        # fader loftet blødt op (passage-fade, følger den globale fade-slider);
+        # pærelyskæden venter selv til loftet er oppe (packages/sove_lyskaede.yaml).
+        transition: >-
+          {{ states('sensor.fade_passage_effective') | int(8)
+             if is_state('binary_sensor.sove_aften_laasevindue', 'on') else 2 }}
+
+- id: sove_rodret_lang_op
+  alias: "Sove RODRET: lang-op → 100 %"
+  description: >
+    Hold TOP af RODRET (move_with_on_off) → skru sove-pendlen op til 100 %.
+    Sætter room_mode=Auto.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "56:25:d3:d2:0b:bd:62:42"
+        command: "move_with_on_off"
+  action:
+    # Samme stempel som kort-op (2026-08-29) — se begrundelsen dér.
+    - service: script.styrbar_stamp_press
+      data:
+        room: sovevaerelse
+        set_manual: false
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.room_mode_sovevaerelse
+      data:
+        option: "Auto"
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        brightness_pct: 100
+        # 2026-07-01 (opg 3): varm default-farve (var auto_color_temp_evening).
+        color_temp_kelvin: "{{ states('input_number.sovevaerelse_default_warmth_k') | int(2200) }}"
+        transition: 1
+
+- id: sove_rodret_ned_sluk
+  alias: "Sove RODRET: ned (kort/lang) → sluk"
+  description: >
+    Kort-ned (off) ELLER lang-ned (move) på RODRET → sluk sove-pendlen. Sætter
+    room_mode=Off som soft presence-block så still_target ikke straks gentænder
+    (drift_back → Auto efter ~20 min tomt rum).
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "56:25:d3:d2:0b:bd:62:42"
+        command: "off"
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "56:25:d3:d2:0b:bd:62:42"
+        command: "move"
+  action:
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.room_mode_sovevaerelse
+      data:
+        option: "Off"
+    - service: light.turn_off
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        transition: 2

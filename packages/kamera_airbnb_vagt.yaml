@@ -1,0 +1,167 @@
+# Kamera-vagt: AirBnB må aldrig starte med et kamera der stadig står fremme.
+#
+# ⚠️ BEVIDST UNDTAGELSE FRA "AirBnB = SILENT" (user-spec 2026-09-11).
+# Huset sender normalt INGEN push i AirBnB-mode, fordi telefonen kan være i
+# gæstens hænder. Denne ene feature gør det alligevel, fordi varslet rammer
+# user i det sekund HAN selv flipper mode — altså mens han står med telefonen
+# og forbereder lejligheden. Uden varslet er der ingen der opdager fejlen.
+# Sætter du en house_mode-gate på disse automations for at "rette" det, slår du
+# hele featuren fra. Lad være.
+#
+# Hvorfor en menneskelig bekræftelse og ikke en sensor: kravet er "hevet ud af
+# stikket OG pakket væk". Et netværks-tjek kan kun bevise det første — et
+# kamera der ligger strømløst på køkkenbordet er usynligt for enhver ping, og
+# det er præcis den tilstand der skal fanges. Derfor er ankeret et bevidst
+# menneskeligt "ja", ikke en måling.
+#
+# Hvorfor input_text og ikke input_boolean: `input_boolean.reload` gen-påtvinger
+# ALLE `initial:` i hele huset, så en ny boolean ikke kan deployes uden restart.
+# input_text er husets eneste gratis helper-reload. Værdien bærer derfor sin
+# tilstand som streng, og fordi den ikke har `initial:`, overlever den en restart.
+
+input_text:
+  kamera_airbnb_status:
+    name: "Kamera: AirBnB-status"
+    icon: mdi:cctv-off
+    max: 40
+
+automation:
+  - id: kamera_airbnb_vagt_ved_entry
+    alias: "Kamera-vagt: AirBnB slået til uden at kameraet er pakket væk"
+    description: >-
+      Fyrer i det sekund house_mode skifter til AirBnB. Backstoppen nedenfor
+      gentager varslet; denne findes for at reaktionen er ØJEBLIKKELIG, hvor
+      backstoppen kan være op til 15 min forsinket.
+    mode: single
+
+    triggers:
+      - trigger: state
+        entity_id: input_select.house_mode
+        to: "AirBnB"
+        # Eksplicit from: — uden den er `unavailable -> AirBnB` efter et reload
+        # en gyldig flanke, og varslet ville fyre ved hver template.reload.
+        not_from:
+          - "unknown"
+          - "unavailable"
+
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ not states('input_text.kamera_airbnb_status').startswith('pakket_vaek') }}
+
+    actions:
+      - action: script.kamera_airbnb_varsel
+        data:
+          aarsag: "AirBnB blev slået til"
+
+  - id: kamera_airbnb_vagt_backstop
+    alias: "Kamera-vagt: gentag varsel mens kameraet stadig står fremme"
+    description: >-
+      Måler TILSTANDEN i stedet for flanken. Nødvendig af to grunde: en
+      flanke-trigger er død efter en HA-restart, og AirBnB kan sættes ad andre
+      veje end den ene state-flanke ovenfor (#21 — et kill-switch der ikke er
+      på hver vej ind, er pynt). Gentagelsen er selve pointen: varslet skal
+      blive ved indtil kameraet ER væk (#13).
+    mode: single
+
+    triggers:
+      - trigger: time_pattern
+        minutes: "/15"
+
+    conditions:
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "AirBnB"
+      - condition: template
+        value_template: >-
+          {{ not states('input_text.kamera_airbnb_status').startswith('pakket_vaek') }}
+
+    actions:
+      - action: script.kamera_airbnb_varsel
+        data:
+          aarsag: "AirBnB er stadig aktiv"
+
+  - id: kamera_airbnb_vagt_kvitter
+    alias: "Kamera-vagt: kvittér for at kameraet er pakket væk"
+    description: >-
+      Knapsvaret kræver netværk til HA (hjemme-wifi eller Tailscale). Derfor er
+      input_text'en også direkte skrivbar fra dashboardet — udebliver svaret,
+      betyder det ikke at user ignorerede spørgsmålet.
+    mode: single
+
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "KAMERA_PAKKET_VAEK"
+
+    actions:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.kamera_airbnb_status
+        data:
+          value: "pakket_vaek:{{ now().timestamp() | int }}"
+
+      - alias: "Fjern varslet fra telefonen"
+        action: notify.mobile_app_phone_a
+        data:
+          message: clear_notification
+          data:
+            tag: kamera_airbnb
+
+  - id: kamera_airbnb_vagt_nulstil
+    alias: "Kamera-vagt: nulstil ved skift VÆK fra AirBnB"
+    description: >-
+      Uden denne ville kvitteringen fra ét ophold gøre vagten permanent tavs
+      ved næste (🏡-regel 3: gæsten arver ikke familiens tilstand og omvendt).
+      Bemærk asymmetrien — vi nulstiller til "står fremme", aldrig til "pakket
+      væk". Et krav som dette skal fejle mod at varsle.
+    mode: single
+
+    triggers:
+      - trigger: state
+        entity_id: input_select.house_mode
+        from: "AirBnB"
+        not_to:
+          - "unknown"
+          - "unavailable"
+
+    actions:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.kamera_airbnb_status
+        data:
+          value: "staar_fremme"
+
+script:
+  kamera_airbnb_varsel:
+    alias: "Kamera-vagt: send varsel"
+    description: >-
+      Ét sted at ændre varslets ordlyd og prioritet. Samme `tag:` fra begge
+      kaldere, så gentagelser ERSTATTER varslet i stedet for at stable sig op.
+    mode: single
+    fields:
+      aarsag:
+        description: "Hvad udløste varslet"
+        example: "AirBnB blev slået til"
+    sequence:
+      - action: notify.mobile_app_phone_a
+        data:
+          title: "🚨 Kameraet står stadig fremme"
+          message: >-
+            {{ aarsag | default('AirBnB er aktiv', true) }}, men køkken-kameraet
+            er ikke markeret som pakket væk. Hiv det ud af stikket og pak det
+            væk — og kvittér så her. Husk at MIKROFONEN også er slået til; den
+            er omfattet af samme forbud som linsen.
+          data:
+            tag: kamera_airbnb
+            channel: Kamera
+            importance: high
+            priority: high
+            # ttl: 0 + priority high leveres selv gennem Androids Doze.
+            ttl: 0
+            # Bevidst IKKE sticky: sticky slog appens egen oprydning fra og
+            # blokerede svaret sidst det blev prøvet.
+            actions:
+              - action: "KAMERA_PAKKET_VAEK"
+                title: "✅ Pakket væk"

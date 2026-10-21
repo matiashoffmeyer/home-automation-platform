@@ -1,0 +1,150 @@
+# =============================================================================
+# script.scene_overwrite — overskriv en scene med nuværende lys + gardiner
+# =============================================================================
+# Kaldes fra dashboards/scenes.yaml "Overskriv"-knapperne. Bygger en payload
+# med de LIVE states for scenens lys + gardiner (via Jinja — HA har dem
+# natively, tokenfrit), base64-encoder den, og sender til
+# shell_command.scene_overwrite → scripts/scene_overwrite.py som skriver
+# scene_snapshots/snap_<name>.yaml. Derefter scene.reload → scene.snap_<name>
+# bliver live uden HA-restart.
+#
+# scene_map = pr.-scene entity-set (lys + room-scope gardiner). Light-grupper
+# (alle_lys, badevaerelse_all) ekspanderes af expand(); ikke-eksisterende /
+# unavailable entities (fx pre-flyt gardiner) droppes automatisk.
+#
+# 2026-10-03 (user: "overskriv virkede ikke på nyligt tilføjede lys som sofa
+# spots"): stue-lysene var en HÅRDKODET liste (tre sofalamper der ikke findes
+# længere + plug), så hverken læselampen eller de to Thread-spots kom med i
+# nogen snapshot. Rosteret er nu lysgruppen `light.stue_room` — en ny pære i
+# gruppen (den standard-opskrift for en ny pære) kommer med af sig selv
+# (fejlklasse #16). `openplan` (= light.stue_all) sendes med som 3. argument, så
+# scripts/scene_overwrite.py også kan skrive den AFLEDTE scene snap_<name>_openplan
+# (kun lys i open-plan) som den automatiske scene-motor bruger.
+#
+# Hvorfor ikke bare læse API'et i python: HA Core's shell_command-token
+# afvises (401) af supervisor-proxyen, og recorder-DB'en gemmer ikke
+# brightness/farve pålideligt. Se scripts/scene_overwrite.py for detaljer.
+# =============================================================================
+
+scene_overwrite:
+  alias: "Scene: overskriv med nuværende lys + gardiner"
+  description: >
+    Gemmer current state for scenens lys + gardiner som scene.snap_<name> så
+    scenen fremover reproducerer præcis det brugeren har sat manuelt. Slet
+    scene_snapshots/snap_<name>.yaml for at falde tilbage til default-scenen.
+  mode: parallel
+  max: 5
+  fields:
+    name:
+      description: "Scene-navn (cinema, zen, cirkus, party, full_bright, private, blue, happy, sunset, cyberpunk, sofa_laesning, spisestue_middag, madlavning, hverdagsaften, winddown)"
+      example: zen
+  variables:
+    # Alt i ét selvstændigt template (ingen afhængighed af HA's nested-variable
+    # rendering): byg scenens entity-liste → expand() light-grupper → live
+    # states → base64(JSON). Unavailable/ikke-eksisterende entities (fx pre-flyt
+    # gardiner) sendes med eller droppes; python filtrerer unavailable fra.
+    # Open-plan-rosteret (kun lys-id'er) til den afledte open-plan-scene.
+    openplan: >-
+      {{ expand('light.stue_all') | map(attribute='entity_id') | list
+         | tojson | base64_encode }}
+    payload: >-
+      {# Stue-lysene = gruppen, IKKE en liste her (se headeren). #}
+      {% set stue_lamps = expand('light.stue_room') | map(attribute='entity_id') | list %}
+      {% from 'rosters.jinja' import open_plan_gardiner %}{% set sc = open_plan_gardiner
+         %}
+      {% set vc = ['cover.gardin_sovevaerelse'] %}
+      {# 2026-06-05: pendlen (light.spisestue_pendel) flyttet til soveloft.
+         Dining/open-plan scener snapshotter ikke længere pendlen; sove-scener
+         (private + winddown) peger nu på pendlen i stedet for sovevaerelse_loft. #}
+      {% set m = {
+        'zen': ['light.spisestue_loft'] + stue_lamps +
+          ['light.depot_strip',
+          'light.koekken_lyskaede', 'light.terrasse_paerelyskaede'] + sc,
+        'cirkus': ['light.koekken_lyskaede', 'light.terrasse_paerelyskaede',
+          'light.spisestue_loft'] + stue_lamps + ['light.depot_strip'] + sc,
+        'party': ['light.spisestue_loft']
+          + stue_lamps + ['light.koekken_lyskaede',
+          'light.terrasse_paerelyskaede', 'light.boernevaerelse_loft',
+          'light.boernevaerelse_lampe', 'light.badevaerelse_all',
+          'light.depot_strip', 'light.entre_loft'] + sc,
+        'full_bright': ['light.alle_lys'] + sc + vc,
+        'private': ['light.spisestue_pendel', 'light.koekken_lyskaede',
+          'light.terrasse_paerelyskaede'] + vc,
+        'blue': ['light.spisestue_loft']
+          + stue_lamps + ['light.boernevaerelse_loft',
+          'light.boernevaerelse_lampe', 'light.badevaerelse_all',
+          'light.koekken_lyskaede', 'light.terrasse_paerelyskaede',
+          'light.depot_strip', 'light.entre_loft'] + sc,
+        'happy': ['light.spisestue_loft']
+          + stue_lamps + ['light.boernevaerelse_loft',
+          'light.boernevaerelse_lampe', 'light.badevaerelse_all',
+          'light.koekken_lyskaede', 'light.terrasse_paerelyskaede',
+          'light.depot_strip', 'light.entre_loft'] + sc,
+        'sunset': ['light.spisestue_loft'] + stue_lamps + ['light.koekken_lyskaede',
+          'light.terrasse_paerelyskaede', 'light.depot_strip',
+          'light.boernevaerelse_loft', 'light.boernevaerelse_lampe',
+          'light.badevaerelse_all', 'light.entre_loft'] + sc,
+        'sofa_laesning': ['light.spisestue_loft'] + stue_lamps +
+          ['light.depot_strip'] + sc,
+        'spisestue_middag': ['light.spisestue_loft'] + stue_lamps + ['light.depot_strip',
+          'light.koekken_lyskaede', 'light.terrasse_paerelyskaede'] + sc,
+        'cyberpunk': ['light.spisestue_loft'] + stue_lamps + ['light.boernevaerelse_loft',
+          'light.boernevaerelse_lampe', 'light.badevaerelse_all',
+          'light.koekken_lyskaede', 'light.terrasse_paerelyskaede',
+          'light.depot_strip', 'light.entre_loft'] + sc,
+        'madlavning': ['light.spisestue_loft'] + stue_lamps + sc,
+        'hverdagsaften': ['light.spisestue_loft']
+          + stue_lamps + ['light.depot_strip',
+          'light.entre_loft', 'light.koekken_lyskaede'] + sc,
+        'winddown': ['light.spisestue_loft']
+          + stue_lamps + ['light.depot_strip',
+          'light.spisestue_pendel', 'light.badevaerelse_all',
+          'light.boernevaerelse_loft', 'light.boernevaerelse_lampe',
+          'light.entre_loft', 'light.depot_loft', 'light.koekken_lyskaede',
+          'light.terrasse_paerelyskaede'] + sc + vc
+      } %}
+      {% set objs = expand(m.get(name, [])) %}
+      {% set ns = namespace(d={}) %}
+      {% for o in objs %}
+      {% set a = o.attributes %}
+      {% set ns.d = dict(ns.d, **{ o.entity_id: {
+        'state': o.state,
+        'brightness': a.brightness | default(none),
+        'color_mode': a.color_mode | default(none),
+        'color_temp_kelvin': a.color_temp_kelvin | default(none),
+        'hs_color': a.hs_color | default(none),
+        'rgb_color': a.rgb_color | default(none),
+        'xy_color': a.xy_color | default(none),
+        'current_position': a.current_position | default(none) } }) %}
+      {% endfor %}
+      {{ ns.d | tojson | base64_encode }}
+  sequence:
+    - service: shell_command.scene_overwrite
+      continue_on_error: true
+      data:
+        scene: "{{ name }}"
+        payload: "{{ payload | trim }}"
+        openplan: "{{ openplan | trim }}"
+      response_variable: sh
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ sh is defined and (sh.returncode | default(1)) == 0 }}"
+          sequence:
+            - service: scene.reload
+            - service: persistent_notification.create
+              data:
+                notification_id: "scene_overwrite_{{ name }}"
+                title: "Scene overskrevet"
+                message: >
+                  Scenen "{{ name }}" husker nu de aktuelle lys + gardiner.
+                  Tryk scenen for at se den anvende dit gemte snapshot.
+      default:
+        - service: persistent_notification.create
+          data:
+            notification_id: "scene_overwrite_{{ name }}_err"
+            title: "Overskriv fejlede"
+            message: >
+              Kunne ikke gemme scene "{{ name }}":
+              {{ (sh.stderr if sh is defined else 'shell_command fejlede')
+                 | default('ukendt fejl') }}

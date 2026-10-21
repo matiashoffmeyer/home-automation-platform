@@ -1,0 +1,111 @@
+# =============================================================================
+# OPEN-PLAN VÅGNER FØR KL. 06 (2026-08-21, user-spec)
+# =============================================================================
+# "Child B og jeg stod op før de andre … så stod jeg op (1 person ud af
+#  soveværelset) gik ud i entre og så stue. efter kl 05.00 skal den sekvens køre
+#  til vågent hus i openplan, men de andre soveværelser skal holdes i godnat
+#  indtil en anden autmation ændrer det."
+#
+# Målt i morges (21/8): han forlod soveværelset 05:35:50 og stod i stuen fra
+# 05:35:57. Fælles-rummenes morgen-undtagelse begyndte først 06:00, så hans
+# opstigning blev behandlet som en NATTUR — `godnat_voksen_nattur_dim_stue_kokken`
+# fyrede 05:35:50 og satte stue+køkken på nattur-dæmpning. Han sad i det i 24 min.
+#
+# HVAD DER SLIPPES, OG HVAD DER IKKE GØR:
+# Automationen rydder INTET godnat-flag. Den stempler kun at en voksen er oppe,
+# og stemplet trækker `binary_sensor.godnat_faelles_morgen_fri` on en time før
+# normalt (packages/activity_state.yaml). Grunden er at `godnat_common_active`
+# ikke kun gater fælles-rummene — den gater også soveværelsets eget auto-lys, og
+# sove-Apolloen taber en sovende krop i 5-15 min ad gangen (CLAUDE.md), så en
+# still_target-flanke ville tænde loftet over Parent B. Soveværelse og
+# børneværelse bliver derfor i godnat til `godnat_auto_clear` rydder 06:00 =
+# "indtil en anden automation ændrer det".
+#
+# HVORFOR ENTRÉ-VALLHORN ER VOKSEN-VIDNET:
+# Man skal fysisk gennem entréen for at forlade soveværelset (samme præmis som
+# godmorgen_auto_detect siden 2026-05-07). Målt i morges holder den: barnets løb
+# fra børneværelset til spisestuen ~05:30 rørte den ALDRIG — 05:35:50 var
+# morgenens første entré-flanke. Køkkenet duer ikke som bekræftelse (xray-mode
+# gør at køkken-Apolloen ser ind i badet), og spisestuen er netop barnets
+# ankomst-rum.
+#
+# HVORFOR 3 MINUTTER:
+# En nattur er entréen → badet → tilbage i seng. Bekræftelsen er derfor ikke
+# flanken, men at han STADIG er i stuen tre minutter senere. I morges: stuen var
+# besat 05:38:50 (og resten af morgenen). Fejlklasse #14 gælder ikke — det er en
+# binær sensor, og vi spørger til dens tilstand på ét tidspunkt, ikke til en
+# varighed.
+# =============================================================================
+
+input_datetime:
+  # Stempel, ikke en indstilling: sættes af automationen nedenfor og læses af
+  # binary_sensor.godnat_faelles_morgen_fri. Urørt står den på DAGENS midnat
+  # (fejlklasse #5) — derfor tjekker forbrugeren eksplicit at tidsdelen ikke er
+  # '00:00:00', ikke bare at datoen er i dag.
+  voksen_oppe_at:
+    name: "Voksen stod op (tidlig morgen)"
+    icon: mdi:account-clock-outline
+    has_date: true
+    has_time: true
+
+automation:
+  - id: openplan_voksen_oppe_foer_seks
+    alias: "Open-plan: voksen oppe før 06:00 → slip fælles-rummene fri"
+    description: >
+      Entré-flanke 05:00-06:00 + stadig presence i stuen 3 min senere =
+      en voksen er stået op for alvor (ikke en nattur). Stempler
+      input_datetime.voksen_oppe_at, som trækker fælles-rummenes
+      morgen-undtagelse frem fra 06:00 til nu.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.entre_valhorn_occupancy
+        to: "on"
+    condition:
+      # Kun timen før den normale undtagelse. Efter 06:00 gælder den alligevel,
+      # og før 05:00 er det nat (user-spec: "efter kl 05.00").
+      - condition: time
+        after: "05:00:00"
+        before: "06:00:00"
+      # Ingen opgave hvis fælles-rummene ikke er blokeret i forvejen.
+      - condition: state
+        entity_id: binary_sensor.godnat_common_active
+        state: "on"
+      # Familie-logik → begge familie-modes (CLAUDE.md: `Normal`-only udelukker
+      # også Home Vacation). AirBnB har sit eget nat-regime og sine egne gæster:
+      # en gæst der går på toilettet kl. 05 skal ikke tænde hele stueetagen, og
+      # AirBnB-natmoden sætter godnat-flagene direkte uden om denne kæde.
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+      # 🛋️ Sover der en gæst i open-plan, ER stue-Apolloen gæsten — samme vidne-
+      # indvending som godnat_auto_clear har haft siden 2026-08-14.
+      - condition: state
+        entity_id: binary_sensor.sleepover_openplan_moerkt
+        state: "off"
+    action:
+      # Nattur-filteret: er han tilbage i sengen om tre minutter, sker der intet.
+      - delay:
+          minutes: 3
+      - condition: state
+        entity_id: binary_sensor.stue_apollo_occupancy_filtered
+        state: "on"
+      # Ventetiden kan have krydset 06:00, hvor undtagelsen gælder alligevel —
+      # og et stempel derefter ville stå og lyve resten af timen.
+      - condition: time
+        after: "05:00:00"
+        before: "06:00:00"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.voksen_oppe_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: logbook.log
+        data:
+          name: "Open-plan tidlig morgen"
+          message: >
+            Voksen bekræftet oppe (entré → stue, stadig i stuen efter 3 min).
+            Fælles-rummene slippes fri nu i stedet for 06:00; soveværelse og
+            børneværelse bliver i godnat.

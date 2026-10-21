@@ -1,0 +1,503 @@
+# =============================================================================
+# Light Power Recovery — sun-aware default efter strøm-tilbagevenden
+# =============================================================================
+# Bath + sove styres af BÅDE Styrbar OG fysiske kontakter — så strøm tages
+# regelmæssigt fra disse pærer (familien tænder/slukker via vægkontakt).
+# Når strøm kommer tilbage skal bulben "vågne op" på passende styrke for
+# tidspunktet — IKKE 100% warm white (zha_auto_config default) der blænder
+# om aftenen.
+#
+# AUDIT-RUNDE 9 — ADAPTIV FIRMWARE INTEGRATION (2026-05-01):
+#   automations/bulb_firmware_defaults.yaml er nu primaer mekanisme: bulb's
+#   NVRAM start_up_current_level + start_up_color_temperature opdateres
+#   adaptivt baseret pa sun-bracket + godnat. Bulb wake'r derefter direkte
+#   paa target-niveau (ingen 30%-blink).
+#
+#   Denne recovery-automation er derfor nu FALLBACK:
+#     - Night/godnat (firmware = 76): trigger fyrer, fader til 30% — no-op
+#       visuelt fordi target = wake. Harmless.
+#     - Day (firmware = 178): trigger fyrer IKKE (178 > 79 range). Bulb
+#       staar paa 178 = target. Korrekt.
+#     - Twilight (firmware = 127): trigger fyrer IKKE (127 > 79 range). Bulb
+#       staar paa 127 = target. Korrekt.
+#     - Edge case: adaptive firmware var out-of-sync (bulb unreachable ved
+#       update). Bulb wake'r paa OLD firmware. Hvis 76, recovery faded til
+#       new target. Hvis andet, bulb staar paa wrong level (manuel reset
+#       via Styrbar).
+#
+# AUDIT-RUNDE 8 TRIGGER-FIX (2026-05-01):
+#   Tidligere version brugte `platform: state, to: "on"` som trigger. Det
+#   fejlede ofte fordi:
+#     - Wall switch off afbryder strøm UDEN at sende Zigbee off-command
+#     - HA's consider_unavailable_mains (default 7200 sek = 2 timer) holder
+#       bulb cached som "on" indtil timeout
+#     - Subsequent wall-switch power-cycles inden 2 timer giver INGEN state
+#       transition i HA → state-trigger fyrer ALDRIG
+#     - Symptom: ingen traces dukker op naar man trykker paa vaegkontakt
+#
+#   Loesning: Trigger paa numeric_state for brightness-attribut i range 73-79.
+#   Det er firmware-default signaturen (Innr 0-254 skala: 76 = 30%) og
+#   level_control cluster rapporterer brightness=76 paalideligt ved HVER
+#   power-on, uanset om HA havde detekteret bulb som unavailable foerst.
+#
+# AUDIT-RUNDE 7 RACE-FIX (2026-04-29):
+#   Tidligere brightness-range tjek som condition fejlede pga ZHA's on_off
+#   cluster report ankom foer level_control cluster report → race. Med
+#   numeric_state trigger paa brightness ER race irrelevant — trigger fyrer
+#   FORST naar level_control har rapporteret brightness=76. Brightness-check
+#   inde i action er fjernet (overflødig) og delay reduceret 2s → 0.5s.
+#
+# Brightness-logik (matcher bath presence_lights for konsistens):
+#   godnat_active = ON  → 30% varm hvid @ 2326K (matcher firmware-wake, ingen jolt)
+#   sun < -6° (mørk)    → low brightness (bath 30%, sove 25%)
+#   sun < 0° (twilight) → medium (bath 50%, sove 40%)
+#   sun > 0° (dag)      → high (bath 70%, sove 60%)
+#
+# DIAGNOSTIK:
+#   logbook.log entry "Triggered: ..." fyres ved action-start. Hvis trace
+#   viser denne entry, conditions passed og fade er paa vej.
+#   Hvis ingen entry: context-check blokerede (state-change var service-call,
+#   ikke Zigbee-driven).
+#
+# KENDT BEGRAENSNING — blink ved wake:
+#   Bulb wake'r synligt paa 30% (firmware-default) i ~0.5 sek foer fade
+#   starter. Total fade-time til target: ~3.5 sek. For at eliminere 30%-fasen
+#   helt skal start_up_current_level opdateres adaptivt baseret pa sun
+#   elevation (separat task, ikke implementeret endnu).
+# =============================================================================
+
+- id: badelys_power_recovery
+  alias: "Badelys: post-strom -> sun-aware default"
+  description: >
+    Bath bulb wake fra wall-switch eller mesh-flicker → fader til sun-aware
+    target. Trigger paa brightness=76 (firmware-default signature) for at virke
+    uafhaengigt af consider_unavailable_mains caching.
+  mode: single
+  trigger:
+    # O4 (audit-runde 9): 3 numeric_state triggers for at fange ALLE
+    # firmware-default brightness-vaerdier paa bath bulb. Adaptive sigter
+    # paa at saette korrekte vaerdi for current bracket — disse triggers
+    # er fallback hvis adaptive var out-of-sync (bulb offline ved bracket-
+    # change). Hver trigger fyrer kun ved transition INTO range, ingen
+    # spurious fires under fade. Mode: single + context-check forhindrer
+    # re-fire fra vores egne fades.
+    #
+    # Bath firmware-default brightness-vaerdier:
+    #   76  = 30% = godnat / night
+    #   127 = 50% = twilight
+    #   178 = 70% = day
+    # Sprint 2026-05-10: triggere på BÅDE loft + 5 spots (Innr RGBW samme
+    # firmware-pattern). Når spot pares, dets brightness-trigger fyrer
+    # automatic uden ændring. Action bruger trigger.entity_id for korrekt
+    # bulb i fade-back.
+    - platform: numeric_state
+      entity_id: !include ../rosters/bad_spots.yaml
+      attribute: brightness
+      above: 72
+      below: 80
+    - platform: numeric_state
+      entity_id: !include ../rosters/bad_spots.yaml
+      attribute: brightness
+      above: 123
+      below: 131
+    - platform: numeric_state
+      entity_id: !include ../rosters/bad_spots.yaml
+      attribute: brightness
+      above: 174
+      below: 182
+  condition:
+    # Sprint 2026-05-10 fix: Dormant gate. Recovery skal IKKE fyre mens family
+    # er væk. Tidligere: bath light blev tændt til 30%-70% efter mesh-flicker
+    # under 2-dages absence (incident 2026-05-08-10 — bulb fired 12 min siden).
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-06-30: AirBnB har sin EGEN recovery (airbnb_power_recovery_all i
+    # samme fil, bad=fuld) → de normale per-rum recoveries springer over i AirBnB.
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    # Context tom = Zigbee-driven (bulb's egen rapport efter firmware-boot)
+    # IKKE service-call (HA automation/scene/UI har non-empty context).
+    # Filtrer Styrbar/scene/presence_lights der ogsa kan saette bri til
+    # vaerdi i en af de 3 ranges.
+    - condition: template
+      value_template: >
+        {% set ctx = trigger.to_state.context %}
+        {{ ctx.user_id is none and ctx.parent_id is none }}
+    # Audit-runde 13 fix (O13): from_state skal IKKE vaere 'on' for at
+    # vaere ægte wake. User-dim via Styrbar (rare context-leak case) gaar
+    # fra on→on og vil her blive blokeret. Ægte wake gaar fra off/unavailable→on.
+    - condition: template
+      value_template: >
+        {{ trigger.from_state is none or trigger.from_state.state != 'on' }}
+    # O4+O15 fix audit-runde 17: kun fade hvis brightness afviger >30 fra
+    # current target (= meningsfuld correction). Skipper no-op hvor wake
+    # = target (ingen visuel aendring). Plus catches O15 stuck-state random
+    # brightness der ikke matcher firmware-defaults.
+    - condition: template
+      value_template: >
+        {% set elev = state_attr('sun.sun', 'elevation') | float(0) %}
+        {% set godnat = is_state('input_boolean.godnat_active', 'on') %}
+        {% if godnat %}{% set target_pct = states('input_number.godnat_brightness_pct') | int(30) %}
+        {% elif elev > 0 %}{% set target_pct = 70 %}
+        {% elif elev > -6 %}{% set target_pct = 50 %}
+        {% else %}{% set target_pct = states('input_number.godnat_brightness_pct') | int(30) %}
+        {% endif %}
+        {% set target_bri = ((target_pct | int) * 2.54) | round(0) | int %}
+        {% set actual = trigger.to_state.attributes.brightness | int(0) %}
+        {{ (actual - target_bri) | abs > 30 }}
+  action:
+    # Sprint 2026-05-10: bruger trigger.entity_id (= den specifikke bulb der
+    # vågnede på firmware-default) i stedet for hardcoded loft. Dækker både
+    # bath_loft og 5 spots automatisk.
+    - service: logbook.log
+      data:
+        name: "Badelys recovery"
+        message: >
+          Triggered: entity={{ trigger.entity_id }}
+          brightness={{ trigger.to_state.attributes.brightness }}
+          state={{ trigger.to_state.state }}
+          elev={{ state_attr('sun.sun', 'elevation') }}
+          godnat={{ states('input_boolean.godnat_active') }}
+    - choose:
+        # Godnat-mode: bliv pa 30% varm hvid (2326K) — matcher firmware-wake
+        # state, ingen warm→rod jolt. Bevarer dark-vision acceptabelt.
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.godnat_active
+              state: "on"
+          sequence:
+            - service: light.turn_on
+              target:
+                entity_id: "{{ trigger.entity_id }}"
+              data:
+                # O14 fix: pull godnat target fra constants.yaml
+                brightness_pct: "{{ states('input_number.godnat_brightness_pct') | int(30) }}"
+                color_temp_kelvin: "{{ states('input_number.godnat_kelvin') | int(2326) }}"
+                transition: 1
+      # Ikke-godnat: sun-aware varm hvid. Aldrig 100% blændende.
+      default:
+        # 0.5 sek delay for mesh-stabilisering (var 2 sek pga race-fix, men
+        # nu er race irrelevant fordi trigger garanterer brightness=76 og
+        # level_control har allerede rapporteret).
+        - delay:
+            milliseconds: 500
+        - service: light.turn_on
+          target:
+            entity_id: "{{ trigger.entity_id }}"   # bath_loft eller spot_X
+          data:
+            brightness_pct: >
+              {% set elev = state_attr('sun.sun', 'elevation') | float(0) %}
+              {% if elev < -6 %}30
+              {% elif elev < 0 %}50
+              {% else %}70{% endif %}
+            # B1.1 fix audit-runde 19: brug central sensor (4 brackets med
+            # 2500K twilight transition zone) i stedet for inline 3-bracket
+            # template. Konsistent CT på tværs af alle rum.
+            color_temp_kelvin: "{{ states('sensor.auto_color_temp_evening') | int(2700) }}"
+            transition: 3  # 3-sek smooth fade fra 30% wake til target
+
+- id: sovelys_power_recovery
+  alias: "Sovelys: post-strom -> sun-aware default"
+  description: >
+    Sove bulb wake fra wall-switch eller mesh-flicker → fader til sun-aware
+    target. Mere dim end bath (privat-rum, hyggelig stemning).
+  mode: single
+  trigger:
+    # O4 (audit-runde 9): 4 numeric_state triggers for sove (mere dim end bath).
+    #   64  = 25% = night
+    #   76  = 30% = godnat (overlap med bath night)
+    #   102 = 40% = twilight
+    #   153 = 60% = day
+    - platform: numeric_state
+      entity_id: light.spisestue_pendel
+      attribute: brightness
+      above: 60
+      below: 68
+    - platform: numeric_state
+      entity_id: light.spisestue_pendel
+      attribute: brightness
+      above: 72
+      below: 80
+    - platform: numeric_state
+      entity_id: light.spisestue_pendel
+      attribute: brightness
+      above: 99
+      below: 105
+    - platform: numeric_state
+      entity_id: light.spisestue_pendel
+      attribute: brightness
+      above: 150
+      below: 156
+  condition:
+    # Sprint 2026-05-10 fix: Dormant gate (mirror badelys_power_recovery).
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-06-30: AirBnB har sin EGEN recovery (airbnb_power_recovery_all i
+    # samme fil, bad=fuld) → de normale per-rum recoveries springer over i AirBnB.
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    - condition: template
+      value_template: >
+        {% set ctx = trigger.to_state.context %}
+        {{ ctx.user_id is none and ctx.parent_id is none }}
+    # 2026-08-19: ctx-gaten ovenfor kan IKKE skelne vække-rampen fra en
+    # firmware-power-on — en TEMPLATE-trigget automations egne skrivninger har
+    # både user_id og parent_id = None. Rampens Phase 2 (40 % → brightness 102)
+    # rammer præcis 99-105-triggeren, så denne automation slukkede lyset 1 sek
+    # efter rampen tændte det (målt 08-19 05:58:30 + 06:00:00 = blink).
+    # To spærringer, begge fail-open udenfor morgenen:
+    #   (a) samme from_state-krav som søsteren boernelys_power_recovery (#12):
+    #       en ægte strøm-wake kommer fra off/unavailable, aldrig fra 'on'.
+    #   (b) hele vække-vinduet, som også dækker rampens første tænd (off → on).
+    - condition: template
+      value_template: >
+        {{ trigger.from_state is none or trigger.from_state.state != 'on' }}
+    - condition: template
+      value_template: >
+        {{ not is_state('binary_sensor.wakeup_alarm_imminent', 'on') }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Sovelys recovery"
+        message: >
+          Triggered: brightness={{ trigger.to_state.attributes.brightness }}
+          state={{ trigger.to_state.state }}
+          elev={{ state_attr('sun.sun', 'elevation') }}
+          godnat={{ states('input_boolean.godnat_active') }}
+    - choose:
+        # 2026-06-22 (user-spec, KRITISK): under godnat/nat må soveloftet ALDRIG
+        # tænde ved et strømglip/mesh-flicker. Pendlen (light.spisestue_pendel)
+        # har INGEN NVRAM-firmware-default (se bulb_firmware_defaults.yaml TODO),
+        # så den kan fysisk vågne ON ved power-on — denne gren snapper den
+        # ØJEBLIKKELIGT slukket igen i stedet for at holde den på 30%.
+        # Gælder ALLE godnat-flags (master/voksne) via union-sensoren.
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.godnat_any_active
+              state: "on"
+          sequence:
+            - service: light.turn_off
+              target:
+                entity_id: light.spisestue_pendel
+              data:
+                transition: 1
+        # 2026-08-26h (fejlklasse #21): aften-låsen skal gate HVER vej ind, og
+        # denne fyrer i hullet mellem lås-tidspunktet (20:00) og godnat — i aftes
+        # 2 t 23 min bredt. Samme fysik som godnat-grenen: pendlen har ingen
+        # NVRAM-default og vågner fysisk ON, så det er ikke nok at lade være med
+        # at tænde — den skal snappes slukket igen. (Børneværelsets tilsvarende
+        # lås læses længere nede, 2026-08-23.)
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.sovevaerelse_manual_off_lock
+              state: "on"
+          sequence:
+            - service: light.turn_off
+              target:
+                entity_id: light.spisestue_pendel
+              data:
+                transition: 1
+      # Ikke-godnat: sun-aware warm hvid, lidt mere dim end bath
+      default:
+        - delay:
+            milliseconds: 500
+        - service: light.turn_on
+          target:
+            entity_id: light.spisestue_pendel
+          data:
+            brightness_pct: >
+              {% set elev = state_attr('sun.sun', 'elevation') | float(0) %}
+              {% if elev < -6 %}25
+              {% elif elev < 0 %}40
+              {% else %}60{% endif %}
+            # B1.1 fix audit-runde 19: central sensor i stedet for inline.
+            color_temp_kelvin: "{{ states('sensor.auto_color_temp_evening') | int(2700) }}"
+            transition: 3
+
+- id: boernelys_power_recovery
+  alias: "Børneværelselys: post-strøm → lux-aware default"
+  description: >
+    Boern bulb waker fra wall-switch på NVRAM-default 5% (brightness=13).
+    NVRAM er intentionelt sat til 5% som anti-flash pattern for nightlight.
+    Recovery fader op til lux-adaptivt niveau — spejler Path 1 i
+    presence_boernevaerelse men uden lux-gate (= fixer bug hvor dagslys
+    blokerede presence-automationen → bulb stuck på 5%).
+    Gated på godnat_boern_active=off: nightlight-scenariet er korrekt 5%.
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: light.boernevaerelse_loft
+      attribute: brightness
+      above: 10
+      below: 16
+  condition:
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # 2026-06-30: AirBnB har sin EGEN recovery (airbnb_power_recovery_all i
+    # samme fil, bad=fuld) → de normale per-rum recoveries springer over i AirBnB.
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: input_select.house_mode
+          state: "AirBnB"
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    # 2026-08-23: låsen er "rummet skal blive mørkt" — også når pæren selv
+    # kommer tilbage fra radio-/strøm-udfald. Uden den her var recovery den
+    # eneste tænd-vej i rummet der ikke læste låsen (fejlklasse #21), og den
+    # fyrer 80 % i mørke. Rammer bl.a. en gæst der sover derinde.
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_manual_off_lock
+      state: "off"
+    - condition: template
+      value_template: >
+        {% set ctx = trigger.to_state.context %}
+        {{ ctx.user_id is none and ctx.parent_id is none }}
+    - condition: template
+      value_template: >
+        {{ trigger.from_state is none or trigger.from_state.state != 'on' }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Børneværelselys recovery"
+        message: >
+          Triggered: brightness={{ trigger.to_state.attributes.brightness }}
+          elev={{ state_attr('sun.sun', 'elevation') }}
+          lux={{ states('sensor.open_plan_lux') }}
+    - delay:
+        milliseconds: 500
+    - service: light.turn_on
+      target:
+        entity_id: light.boernevaerelse_loft
+      data:
+        brightness_pct: >
+          {% set lux = states('sensor.open_plan_lux') | float(50) %}
+          {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}{% set base = 80 %}
+          {% elif lux < 15 %}{% set base = 55 %}
+          {% else %}{% set base = 30 %}{% endif %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+        color_temp_kelvin: "{{ states('sensor.auto_color_temp_evening') | int(2700) }}"
+        transition: 3
+
+# =============================================================================
+# AirBnB power recovery — ALLE lys vågner på passende niveau (bad = fuld)
+# =============================================================================
+# Undtagelse 2 (user 2026-06-30): I AirBnB skal et vægkontakt-flip (strøm væk →
+# tilbage) tænde lyset igen på et passende lux-niveau — for ALLE lys, ikke kun
+# bad/sove/børn. BAD hopper direkte til FULD (100%). Depot + børneværelse er
+# bevidst IKKE med (undtagelse 1 — airbnb_block_depot_boern_lights holder dem
+# slukket uanset). Terrasse-kæden styres separat (ude).
+#
+# Mekanik: pæren rapporterer state→on med TOM context når den får strøm igen
+# (Zigbee/Matter-driven, ikke et service-call). Context-tom-checken sikrer at
+# vi KUN reagerer på fysisk strøm-wake — IKKE på presence/app/Styrbar (som har
+# user_id/parent_id i context). from != on = ægte wake (off/unavailable→on).
+# Begrænsning: hvis en pære er HA-cached 'on' (consider_unavailable_mains) og
+# vægkontakten cykles indenfor cache-vinduet kommer der ingen state-transition
+# → ingen korrektion (pæren vågner dog selv på sin hardware/NVRAM-default =
+# synligt lys). Accepteret (jf. user "svært at kode måske").
+- id: airbnb_power_recovery_all
+  alias: "AirBnB: Alle lys post-strøm → lux-aware (bad=fuld)"
+  description: >
+    AirBnB undtagelse 2: vægkontakt-genstart tænder lys på passende niveau for
+    alle indvendige lys (undtagen depot/børn). Bad → 100%.
+  mode: parallel
+  max: 20
+  trigger:
+    - platform: state
+      entity_id:
+        - light.spisestue_loft
+        - light.koekken_lyskaede
+        - light.stue_sofa_lampe
+        - light.stue_sofa_lampe_2
+        - light.stue_hjoernelampe
+        - light.stue_plug
+        - light.stue_laesehygge
+        - light.spisestue_pendel
+        - light.entre_loft
+        - light.badevaerelse_spot_1
+        - light.badevaerelse_spot_2
+        - light.badevaerelse_spot_3
+        - light.badevaerelse_spot_4
+        - light.badevaerelse_spot_5
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "AirBnB"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    # Tom context = Zigbee/Matter-driven strøm-wake (ikke service-call).
+    - condition: template
+      value_template: >
+        {% set ctx = trigger.to_state.context %}
+        {{ ctx.user_id is none and ctx.parent_id is none }}
+    # Ægte wake: off/unavailable/unknown → on (ikke on→on user-dim).
+    - condition: template
+      value_template: >
+        {{ trigger.from_state is none or trigger.from_state.state != 'on' }}
+    # 2026-07-12: entre_loft (TRADFRI) sender spøgelses-"on" fra 'off' UDEN
+    # strøm-cyklus (se entre_loft_phantom_on_suppress i entre_motion.yaml).
+    # Ægte vægkontakt-cyklus ses som unavailable→on; hurtig-flick off→on
+    # accepteres kun hvis nogen faktisk står i entréen (valhorn). Ellers
+    # blæser recovery spøgelset op til 90% om natten i de ~2 s før
+    # suppressoren slukker (sket 2026-07-12 02:49 med gæster i huset).
+    - condition: template
+      value_template: >
+        {{ trigger.entity_id != 'light.entre_loft'
+           or trigger.from_state is none
+           or trigger.from_state.state != 'off'
+           or is_state('binary_sensor.entre_valhorn_occupancy', 'on') }}
+  action:
+    # Kort mesh-stabiliserings-delay (matcher per-rum recoveries).
+    - delay:
+        milliseconds: 500
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: "{{ trigger.entity_id }}"
+      data:
+        # 2026-07-08 (#11a, user-spec): FLAD 90% på normal varm hvid (2700K);
+        # bad hopper til 100%. (Var lux-aware 80/60/35 + adaptiv CCT.) Hardcodet
+        # 90/100/2700 — slider på request.
+        # 2026-07-15 (gæste-forensik): UNDER godnat/natmode får bad NATLYS-niveau
+        # (badevaerelse_godnat_brightness, 8% @ 2000K) i st.f. 100%-slam — gæsten
+        # cyklede bad-vægkontakten om natten og fik 5 spots på fuld i øjnene.
+        # Øvrige lys beholder 90% (vægkontakt-tænd om natten = bevidst ønske om lys).
+        brightness_pct: >
+          {% set bad = 'badevaerelse' in trigger.entity_id %}
+          {% set nat = is_state('binary_sensor.godnat_any_active', 'on') %}
+          {% if bad and nat %}
+            {{ states('input_number.badevaerelse_godnat_brightness') | int(8) }}
+          {% elif bad %}
+            100
+          {% else %}
+            90
+          {% endif %}
+        color_temp_kelvin: >
+          {{ 2000 if ('badevaerelse' in trigger.entity_id
+                      and is_state('binary_sensor.godnat_any_active', 'on'))
+             else 2700 }}
+        transition: 3
+    - service: logbook.log
+      data:
+        name: "AirBnB lys-recovery"
+        message: >
+          {% set bad = 'badevaerelse' in trigger.entity_id %}
+          {% set nat = is_state('binary_sensor.godnat_any_active', 'on') %}
+          {{ trigger.entity_id }} vågnede fra strøm → sat
+          {{ 'natlys (bad under godnat)' if bad and nat
+             else '100% (bad=fuld)' if bad
+             else '90% varm hvid' }}.

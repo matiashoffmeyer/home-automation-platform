@@ -1,0 +1,444 @@
+# =============================================================================
+# Stue-spots: ild i Auto (B227, 2026-10-12)
+# =============================================================================
+# User-spec 2026-10-12: "vi testede i morges ild event på stue spots. det skal
+# vi ha på som auto for den (med en ild killswitch i indstillinger så jeg kan
+# slå det fra og komme tilbage til som det er nu), men med 5x nedsat tempo på
+# skiftende, kun bløde langsomme skift." + "og jeg skal kunne styre om det er
+# 5x eller flere eller færre".
+#
+# Testen var dance-eventet `fire` (dance_mode.yaml, EVENT 15) 11/10 16:33:30
+# med 3 aktive pærer → Pb = 0,6 s pr. pære, overgang ~0,3 s, gnister snappede
+# (transition 0). Her: dance-ildens farver UDEN gnisterne (user 12/10: "skal
+# ikke ha hvide gnister" — sat 25-50 % = hvidlig) → 38 % glød · 62 % flamme
+# (samme forhold som før). B234 (15/10): kun lysstyrken skifter — farven
+# sættes ÉN gang når ilden starter (ildens gennemsnit, hs 17/91). Styrken
+# skaleres med spottens Auto-styrke (din huskede, ellers standard, 0 =
+# læselampens) × el-pris — samme kilde som spejlet — × ild-lysstyrken;
+# ild-flakken styrer hvor dybt glød/flamme svinger.
+#
+# EJERSKAB (fejlklasse #2/#27):
+# - Spejlet (stue_spots.yaml) TÆNDER/SLUKKER stadig spotsene og tænder dem i
+#   din farve; mens binary_sensor.stue_spots_ild_aktiv er on, rører det ikke en
+#   spot der lyser (løkken ejer farve + styrke). Gaten → off ⇒ spejlet sætter
+#   din farve igen (pause_slut) = "som det er nu".
+# - Løkken TÆNDER ALDRIG en slukket spot — den modulerer kun en der lyser. Så
+#   kan den ikke genoplive en spot som godnat/sluk-alt/probe lige slukkede.
+# - Fremmed skrivning (en anden automation/scene/bruger: context med parent
+#   eller user_id, som ikke er løkkens egen) ⇒ HELE løkken stopper. Lånere
+#   (regn-blink, legetøjsdag, gestus-alarm …) får spotsene i fred; starteren
+#   genoptager først når spotsene har været urørte i 90 s.
+# - Familie-only: en gæst får de rolige spots (CLAUDE.md 🏡 pkt. 5).
+# Recorder: sensor.open_plan_lampe_tilstand viser "ild" i stedet for spottens
+# styrke mens løkken kører (ellers en DB-række pr. tick, fejlklasse #24).
+#
+# THREAD-BUDGET (user-spec 15/10: "ild skal være super lav-belastende og
+# simpelt"; "meget forsigtige med at belaste entre loft og stue spots"):
+# Al trafik til stue-spotsene går gennem entré-loftet — stuens eneste vej til
+# OTBR'en (.claude/rules/thread_matter.md).
+# - Farven ÉN gang ved start (1 kommando pr. spot), derefter KUN lysstyrke:
+#   ét MoveToLevel pr. spot hvert input_number.stue_spots_ild_sekunder (gulv
+#   30 s, default 60) med en overgang der fylder hele intervallet.
+#   60 s = 120 kommandoer/t for begge spots (B234-ilden: målt ~360/t, loft 1440)
+#   — men pæren SVARER med ~4 rapporter pr. blødt skift (CurrentLevel pr. ~50
+#   trin + 2× RemainingTime, målt 15/10) → ≈ 550 udvekslinger/t mod ≈ 1600.
+# - Ingen kald-kanaler/flimmer/opblus — ét direkte kald, continue_on_error.
+# - Spotify-stemning (17/10, packages/stue_spots_spotify.yaml) kører løkken
+#   også med ild-kontakten fra (ild_mulig) — samme takt som ilden. Ny sang ⇒
+#   spottens næste tick bærer farve + lysstyrke (2 kommandoer i stedet for 1)
+#   ≈ +2 pr. sang for begge spots. Styrken ånder da mellem top og bund hvert
+#   tick (spot 2 dt/2 efter spot 1) i stedet for ildens tilfældige glød/flamme
+#   — samme antal kald.
+# - Pause (binary_sensor.stue_spots_ild_thread_pause): RCP-resets/t ≥ loftet,
+#   border-routeren nede, ELLER en stue-spot/entré-loftet er unavailable —
+#   så er broen syg, og hver kommando gør den værre.
+# - Byge-bremse (17/10, user "a. byg den" efter OTBR-crashet 07:53): ≥
+#   stue_spots_ild_rcp_byge RCP-resets på 10 min → pause i
+#   stue_spots_ild_rcp_byge_minutter (stempel input_datetime.
+#   stue_spots_ild_rcp_byge_til, restart-sikkert). Timeloftet kom 20 s før
+#   crashet; bygen (07:42-07:53, 11 resets) stod på 3 i 10-min-vinduet allerede
+#   07:50. Daemonen måler hvert 2. min → 10-min-vinduet, ikke 5 (et 5-min-vindue
+#   så kun 2 af dem 07:50). Målt 14-17/10: ≥ 3 på 10 min ≈ 5 gange/døgn.
+# =============================================================================
+
+input_boolean:
+  # Kill switch. Ingen `initial:` — sat on via API ved deploy.
+  stue_spots_ild:
+    name: "Stue-spots: ild i Auto"
+    icon: mdi:fire
+
+input_number:
+  # B234: sekunder mellem to lysstyrke-skift på SAMME spot (spotsene skiftes
+  # på skift, så rummet ændrer sig hvert halve interval). Gulv 30 s = Thread-
+  # budgettet for broen; 60 s ≈ 120 kommandoer/t.
+  stue_spots_ild_sekunder:
+    name: "Stue-spots: ild sekunder pr. skift"
+    icon: mdi:timer-sand
+    min: 30
+    max: 300
+    step: 10
+    unit_of_measurement: "s"
+    mode: box
+
+  # 2026-10-12 (user: "slider til at styrke hvor stærk ilden i stuen er"):
+  # hvor kraftigt ilden flakker. Hvert skifts farve og styrke trækkes mod
+  # ildens gennemsnit (≈ 46 % styrke, hue 17, sat 91) eller væk fra det:
+  # 100 % = som før (uændret default), 0 % = rolig glød uden at svinge,
+  # 200 % = dybere glød-dyk og stærkere flammer. (B234: kun styrken — farven
+  # er fast.) Lysmængden i snit styres
+  # stadig af spottens Auto-styrke.
+  stue_spots_ild_styrke:
+    name: "Stue-spots: ild-flakken (%)"
+    icon: mdi:fire-circle
+    min: 0
+    max: 200
+    step: 10
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-10-12 (user: "jeg mente altså hvor stærk lysstyrken er"): ildens
+  # lysstyrke som % af spottens Auto-styrke (din huskede, ellers standard)
+  # × el-pris. 100 % = som før (uændret default). Gælder kun mens ilden kører
+  # — spejlet tænder stadig spotsene i deres egen Auto-styrke.
+  stue_spots_ild_lysstyrke:
+    name: "Stue-spots: ild-lysstyrke (%)"
+    icon: mdi:brightness-6
+    min: 10
+    max: 200
+    step: 10
+    unit_of_measurement: "%"
+    mode: slider
+
+  # B234 (14/10): ilden pauser når OTBR'en har haft så mange RCP-resets den
+  # seneste time (sensor.otbr_rcp_resets_1t fra otbr_selfheal.sh-daemonen) og
+  # genoptages under det halve. Uden ild 0-4/t; den gamle langsomme ild 18-35/t.
+  stue_spots_ild_rcp_loft:
+    name: "Stue-spots: ild pauser ved Thread-resets/t"
+    icon: mdi:access-point-network-off
+    min: 2
+    max: 60
+    step: 1
+    unit_of_measurement: "/t"
+    mode: box
+
+  # Byge-bremsen (se header). Default 3 / 30 min.
+  stue_spots_ild_rcp_byge:
+    name: "Stue-spots: ild pauser ved Thread-resets på 10 min"
+    icon: mdi:access-point-network-off
+    min: 2
+    max: 10
+    step: 1
+    mode: box
+  stue_spots_ild_rcp_byge_minutter:
+    name: "Stue-spots: ild-pause efter Thread-byge"
+    icon: mdi:timer-pause
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+input_datetime:
+  # Byge-bremsens stempel: ilden holder pause til dette tidspunkt.
+  stue_spots_ild_rcp_byge_til:
+    name: "Stue-spots: ild-pause (Thread-byge) til"
+    icon: mdi:timer-pause
+    has_date: true
+    has_time: true
+
+template:
+  - binary_sensor:
+      # ÉT anker for hvornår ilden må køre — læses af løkken (hvert tick),
+      # starteren og spejlet. Auto-definitionen er spejlets `auto_fast`.
+      # 2026-10-13: kilden er læselampen ELLER ild-morgenens flag (læselampen
+      # er slukket i starten af en mørk morgen — packages/stue_ild_morgen.yaml).
+      - name: "Stue-spots ild aktiv"
+        unique_id: stue_spots_ild_aktiv
+        icon: mdi:fire
+        state: >-
+          {{ is_state('binary_sensor.stue_spots_ild_mulig', 'on')
+             and (is_state('light.stue_laesehygge', 'on')
+                  or is_state('input_boolean.stue_ild_morgen_aktiv', 'on')) }}
+      # Alt undtagen kilden — også ild-morgenens gate.
+      # 17/10 (user: Spotify-farver også uden ild → "ja"): Spotify-stemningen
+      # åbner gaten selv når ild-kontakten er fra — løkken kører da kun
+      # stemningsfarve + bølge (ingen ild-flakken), med samme ejerskab og takt.
+      - name: "Stue-spots ild mulig"
+        unique_id: stue_spots_ild_mulig
+        icon: mdi:fire
+        state: >-
+          {{ (is_state('input_boolean.stue_spots_ild', 'on')
+              or is_state('binary_sensor.stue_spots_spotify_aktiv', 'on'))
+             and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+             and is_state('input_select.room_mode_stue', 'Auto')
+             and not is_state('binary_sensor.dark_mode_stue', 'on')
+             and not is_state('binary_sensor.filmmoerke_stue', 'on')
+             and is_state('binary_sensor.scene_party_active', 'off')
+             and is_state('input_boolean.dance_mode', 'off')
+             and is_state('binary_sensor.sofa_zen_holder_sofa', 'off')
+             and is_state('input_boolean.roegalarm_blink_active', 'off')
+             and is_state('binary_sensor.stue_spots_ild_thread_pause', 'off') }}
+      # B234: Thread er under pres → ingen ild-trafik. B234: også når broen
+      # (entré-loftet) eller en stue-spot er væk. Hysterese på resets: på ved
+      # loftet, af under det halve. Sensoren fodres af daemonen hvert 2. min
+      # → mangler den eller er den > 15 min gammel (daemonen død), tæller den
+      # som 0 (ilden er alligevel lav-belastning).
+      - name: "Stue-spots ild Thread-pause"
+        unique_id: stue_spots_ild_thread_pause
+        icon: mdi:access-point-network-off
+        state: >-
+          {% set s = states.sensor.otbr_rcp_resets_1t %}
+          {% set r = s.state | int(0) if s is not none
+                     and (now() - s.last_updated).total_seconds() < 900 else 0 %}
+          {% set loft = states('input_number.stue_spots_ild_rcp_loft') | float(10) %}
+          {{ is_state('binary_sensor.thread_border_router_nede', 'on')
+             or ['light.stue_spot_1', 'light.stue_spot_2', 'light.entre_loft']
+                | select('is_state', 'unavailable') | list | count > 0
+             or r >= loft or (this.attributes.get('loft_hold', false) and r > loft / 2)
+             or now().timestamp() < state_attr('input_datetime.stue_spots_ild_rcp_byge_til', 'timestamp') | float(0) }}
+        attributes:
+          # Hysteresen gælder kun timeloftet: en pause fra bygen eller en væk
+          # spot må ikke holdes af `this.state` (17/10: en udløbet byge-pause
+          # hang ellers til resets/t faldt under loftet/2 ≈ op til 1 t).
+          loft_hold: >-
+            {% set s = states.sensor.otbr_rcp_resets_1t %}
+            {% set r = s.state | int(0) if s is not none
+                       and (now() - s.last_updated).total_seconds() < 900 else 0 %}
+            {% set loft = states('input_number.stue_spots_ild_rcp_loft') | float(10) %}
+            {{ r >= loft or (this.attributes.get('loft_hold', false) and r > loft / 2) }}
+
+script:
+  stue_spots_ild:
+    alias: "Stue-spots: ild (langsom, bløde skift)"
+    icon: mdi:fire
+    mode: single
+    max_exceeded: silent
+    sequence:
+      # Lad spejlets tænd-fade køre færdig (velkomst/mørk morgen er en lang
+      # rampe), og vent mindst 6 s så rapporterne fra spejlets kald har fået
+      # en frisk context (HA: 5 s) — ellers ligner de en fremmed skrivning.
+      - delay:
+          seconds: >-
+            {% set r = state_attr('sensor.open_plan_fade_ind_effektiv', 'regime') %}
+            {% set v = states('sensor.open_plan_fade_ind_effektiv') | int(3) if r in ['velkomst', 'moerk_morgen'] else 0 %}
+            {{ [v, 0] | max + 6 }}
+      - variables:
+          # Context'erne spotsene står med NU (spejlets, en restore …) er ikke
+          # fremmede — kun en NY skrivning efter starten er.
+          start_ids: >-
+            {% set ns = namespace(l=[]) %}
+            {% for e in ['light.stue_spot_1', 'light.stue_spot_2'] %}
+              {% if states[e] is not none %}{% set ns.l = ns.l + [states[e].context.id] %}{% endif %}
+            {% endfor %}
+            {{ ns.l }}
+      # Farven ÉN gang (ildens gennemsnit, eller Spotify-stemningens farve pr.
+      # spot — packages/stue_spots_spotify.yaml) — resten er lysstyrke-kald.
+      - repeat:
+          for_each:
+            - light.stue_spot_1
+            - light.stue_spot_2
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ is_state(repeat.item, 'on') }}"
+              then:
+                - service: light.turn_on
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                  data:
+                    hs_color: >-
+                      {{ state_attr('binary_sensor.stue_spots_spotify_aktiv', 'hs_' ~ repeat.item[-1])
+                         if is_state('binary_sensor.stue_spots_spotify_aktiv', 'on') else [17, 91] }}
+                    transition: 3
+      # ÉN løkke der skiftevis tager spot 1 og 2. IKKE `parallel:` — grenene
+      # deler variabel-scope (HA 2026.9): målt 12/10 skrev begge grene til spot 2.
+      # Glød (38 %) = lav styrke, flamme (62 %) = høj.
+      - repeat:
+          while:
+            - condition: state
+              entity_id: binary_sensor.stue_spots_ild_aktiv
+              state: "on"
+          sequence:
+            - variables:
+                fremmed: >-
+                  {% set ns = namespace(f=false) %}
+                  {% for e in ['light.stue_spot_1', 'light.stue_spot_2'] %}
+                    {% set s = states[e] %}
+                    {% if s is not none and s.context.id != context.id
+                          and s.context.id not in start_ids
+                          and (s.context.parent_id is not none or s.context.user_id is not none) %}
+                      {% set ns.f = true %}
+                    {% endif %}
+                  {% endfor %}
+                  {{ ns.f }}
+            - if:
+                - condition: template
+                  value_template: "{{ fremmed }}"
+              then:
+                - stop: "En anden skrev til spotsene — ilden holder pause"
+            - variables:
+                spot: "{{ ['light.stue_spot_1', 'light.stue_spot_2'][repeat.index % 2] }}"
+                t0: "{{ now().timestamp() }}"
+                dt: "{{ [states('input_number.stue_spots_ild_sekunder') | float(60), 30] | max }}"
+                k: "{{ [states('input_number.stue_spots_ild_styrke') | float(100), 0] | max / 100 }}"
+                # Spottens Auto-styrke 0-1 (spejlets regel) × el-pris.
+                lvl: >-
+                  {% set egen = states('input_number.' ~ spot.split('.')[1] ~ '_brugerstyrke') | float(0) %}
+                  {% set pct = egen if egen > 0 else states('input_number.stue_spots_auto_brightness_pct') | float(0) %}
+                  {% set base = pct / 100 if pct > 0 else state_attr('light.stue_laesehygge', 'brightness') | int(255) / 255 %}
+                  {{ base * [states('sensor.elpris_dim_factor') | float(1.0), 1.0] | min
+                     * [states('input_number.stue_spots_ild_lysstyrke') | float(100), 10] | max / 100 }}
+                # 17/10 (user: "stemningslyset må gerne bølge langsomt i
+                # lysstyrke, forskudt af hinanden" → "jeg kan ikke se at det
+                # varierer i løbet af den samme sang"): med Spotify-stemning
+                # ånder hver spot mellem top og bund — står den over midten,
+                # går den mod bunden, ellers mod toppen — over hele intervallet
+                # (0,95·dt). Hel bølge = 2 × stue_spots_ild_sekunder; spot 2
+                # følger dt/2 efter spot 1. Det er den hurtigste bølge Thread-
+                # budgettet tillader (samme ene kald pr. tick som ilden). Den
+                # første sinus (240 s, ±15 point) var for langsom og lav til
+                # at ses inden for en sang. Dybde: stue_spots_spotify_boelge_dybde.
+                boelge: "{{ is_state('binary_sensor.stue_spots_spotify_aktiv', 'on') }}"
+                bri: >-
+                  {% if boelge %}
+                    {% set d = [[states('input_number.stue_spots_spotify_boelge_dybde') | float(35), 0] | max, 48] | min %}
+                    {% set midt = 50 * 2.55 * lvl | float(1) %}
+                    {% set nu = state_attr(spot, 'brightness') | float(0) %}
+                    {% set p = 50 - d if nu > midt else 50 + d %}
+                  {% else %}
+                    {% set p = range(15, 31) | random if (range(1, 101) | random) <= 38 else range(45, 76) | random %}
+                    {% set p = 46 + (p - 46) * k | float(1) %}
+                  {% endif %}
+                  {% set p = [[p, 3] | max, 100] | min %}
+                  {{ [[(p * 2.55 * lvl | float(1)) | round(0) | int, 2] | max, 255] | min }}
+                # 17/10: Spotify-stemningen (packages/stue_spots_spotify.yaml)
+                # flytter farven; ild-orange når den ikke er aktiv.
+                maal: >-
+                  {{ state_attr('binary_sensor.stue_spots_spotify_aktiv', 'hs_' ~ spot[-1])
+                     if is_state('binary_sensor.stue_spots_spotify_aktiv', 'on') else [17, 91] }}
+                # Afviger spottens farve fra målet (Matter melder hue ±1,5°
+                # tilbage, målt 17/10), bærer dette tick farve + lysstyrke.
+                ny_farve: >-
+                  {% set hs = state_attr(spot, 'hs_color') %}
+                  {% if hs is none or maal is not sequence or maal | count != 2 %}{{ false }}
+                  {% else %}
+                    {% set dh = (hs[0] | float(0) - maal[0] | float(0)) | abs %}
+                    {{ [dh, 360 - dh] | min > 6 or (hs[1] | float(0) - maal[1] | float(0)) | abs > 8 }}
+                  {% endif %}
+            # Løkken tænder aldrig en slukket spot (godnat/sluk-alt/probe).
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ is_state(spot, 'on') and is_state('binary_sensor.stue_spots_ild_aktiv', 'on') }}
+              then:
+                - if:
+                    - condition: template
+                      value_template: "{{ ny_farve }}"
+                  then:
+                    - service: light.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ spot }}"
+                      data:
+                        hs_color: "{{ maal }}"
+                        brightness: "{{ bri | int }}"
+                        transition: >-
+                          {{ [states('input_number.stue_spots_spotify_overgang') | float(20),
+                              (dt | float * 0.95) | round(1)] | min }}
+                  else:
+                    - service: light.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ spot }}"
+                      data:
+                        brightness: "{{ bri | int }}"
+                        transition: "{{ (dt | float * 0.95) | round(1) }}"
+            # Halvt interval til den anden spots tur; vågn straks hvis ilden
+            # stopper (gaten → off: spejlet sætter din farve).
+            - wait_template: "{{ not is_state('binary_sensor.stue_spots_ild_aktiv', 'on') }}"
+              timeout:
+                seconds: >-
+                  {{ [0, (t0 | float + dt | float / 2 - now().timestamp()) | round(1)] | max }}
+              continue_on_timeout: true
+
+automation:
+  # Byge-bremsen: hver måling (daemonen, hvert 2. min) med ≥ byge resets på
+  # 10 min skubber pausen frem — en vedvarende byge holder ilden nede.
+  - id: stue_spots_ild_rcp_byge
+    alias: "Stue-spots: ild-pause ved Thread-byge"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: sensor.otbr_rcp_resets_1t
+        attribute: resets_10m
+    condition:
+      - condition: template
+        value_template: >-
+          {{ state_attr('sensor.otbr_rcp_resets_1t', 'resets_10m') | int(0)
+             >= states('input_number.stue_spots_ild_rcp_byge') | int(3) }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.stue_spots_ild_rcp_byge_til
+        data:
+          timestamp: >-
+            {{ now().timestamp() + states('input_number.stue_spots_ild_rcp_byge_minutter') | int(30) * 60 }}
+      - service: logbook.log
+        data:
+          name: "Stue-spots ild"
+          message: >-
+            Thread-byge ({{ state_attr('sensor.otbr_rcp_resets_1t', 'resets_10m') }} resets på 10 min)
+            — pause i {{ states('input_number.stue_spots_ild_rcp_byge_minutter') | int(30) }} min.
+
+  - id: stue_spots_ild_start
+    alias: "Stue-spots: start ild i Auto"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.stue_spots_ild_aktiv
+        from: "off"
+        to: "on"
+        for: {seconds: 2}
+        id: gate
+      # Spejlet har lige tændt dem (i din farve).
+      - platform: state
+        entity_id:
+          - light.stue_spot_1
+          - light.stue_spot_2
+        from: "off"
+        to: "on"
+        for: {seconds: 2}
+        id: taendt
+      # Backstop: genoptag efter en låner / reload / restart (CLAUDE.md:
+      # restart dræber ventende `for:`).
+      - platform: time_pattern
+        minutes: "/1"
+        id: backstop
+      - platform: homeassistant
+        event: start
+        id: backstop
+    condition:
+      - condition: state
+        entity_id: binary_sensor.stue_spots_ild_aktiv
+        state: "on"
+      - condition: state
+        entity_id: script.stue_spots_ild
+        state: "off"
+      - condition: template
+        value_template: >-
+          {{ ['light.stue_spot_1', 'light.stue_spot_2'] | select('is_state', 'on') | list | count > 0 }}
+      # Backstoppen venter til ingen har rørt spotsene i 90 s — en låner der
+      # stoppede ilden skal være færdig, før den genoptages.
+      - condition: template
+        value_template: >-
+          {{ trigger.id != 'backstop'
+             or (['light.stue_spot_1', 'light.stue_spot_2']
+                 | map('states') | list | count == 2
+                 and (now() - states.light.stue_spot_1.last_updated).total_seconds() > 90
+                 and (now() - states.light.stue_spot_2.last_updated).total_seconds() > 90) }}
+    action:
+      - service: script.turn_on
+        target:
+          entity_id: script.stue_spots_ild

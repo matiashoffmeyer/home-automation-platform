@@ -1,0 +1,256 @@
+# =============================================================================
+# NATTUR-RETUR — gå i seng igen, og lyset går straks ud
+# =============================================================================
+# User-spec 2026-08-27: "når du ser en person gå ind i soveværelset efter en
+# nattur (apollo sove distance er lav så medium så høj, move, brugt til at tælle
+# personer oppe) så kan du slukke alt nattur-lys instantly hvis der ikke er anden
+# meget tydelig apollo aktivitet eller bad/entre/depot aktivitet."
+#
+# FØR: nattur-lyset døde først når stue OG spisestue havde været tomme i
+# `sensor.rum_tom_sluk_sekunder` (~5 min) — altså brændte spisestue-loft og
+# køkken-lyskæden i minutter efter man var tilbage under dynen.
+#
+# RETNINGS-BEVISET
+# ----------------
+# Soveværelsets Apollo sidder LIGE VED DØREN (permanent faktum). Derfor er
+# `moving_distance` husets eneste retnings-signal: på vej UD falder den mod
+# sensoren, på vej IND stiger den. Sengen ligger på 229-240 cm; dør-zonen er
+# `input_number.sove_morgen_2p_doerzone_cm` (120 cm) — SAMME anker som
+# to-oppe-detektionen bruger (fejlklasse #2: samme fysiske grænse må ikke
+# kodes to steder og drive fra hinanden).
+#
+# Vi kræver to punkter i rækkefølge inden for ét vindue:
+#   1. et bevægende mål INDE i dør-zonen   (= nogen står i døren)
+#   2. derefter et bevægende mål ved SENGEN (= samme gang endte ved sengen)
+# `moving_distance` er `unknown` når radaren ikke ser et bevægende mål, så et
+# NUMERISK sample ER beviset for bevægelse — vi behøver ikke læse
+# `moving_target` og undgår dermed en race mellem de to rapporter.
+#
+# HVORFOR DEN MODSATTE VEJ IKKE FYRER
+# -----------------------------------
+# På vej UD er dør-zonen det SIDSTE der ses (seng → dør → væk), så der kommer
+# aldrig et seng-sample bagefter. Den ene farlige rest er: A går ud (dør-stempel
+# sat), og partneren B vender sig i sengen få sekunder senere på 230 cm →
+# "A er tilbage" selvom A står på badeværelset.
+#
+# Den lukkes af en INVARIANT, ikke af held:
+#     sove_retur_min_sekunder  >  sove_retur_vindue_sekunder
+# Nattur-lyset tænder i samme øjeblik A forlader soveværelset, så kravet "lyset
+# skal have været tændt i mindst N sek" dækker præcis det vindue hvor dør-
+# stemplet fra A's UDGANG stadig er friskt. Ændrer du den ene slider, så tjek
+# den anden — det er hele beskyttelsen. (Se tile-teksten i settings.yaml.)
+#
+# HVIS VI ALLIGEVEL SLUKKER FOR TIDLIGT
+# -------------------------------------
+# `godnat_adult_nightwalk` fyrer på enhver `entre_valhorn_occupancy → on`, så
+# næste bevægelse i entréen tænder lyset igen. Udgangen er automatisk — det er
+# også kravet for at feature'n må findes (AirBnB-regel 2), selvom den er
+# familie-gated.
+# =============================================================================
+
+input_boolean:
+  sove_retur_enabled:
+    name: "Nattur-retur: sluk lyset når man er tilbage i sengen"
+    icon: mdi:bed-clock
+
+input_number:
+  # Hvor langt væk fra Apolloen (= døren) sengen begynder. Målt: sengen ligger
+  # på 229-240 cm, dør-zonen på 120 cm. 200 cm ligger i hullet og tåler at man
+  # sætter sig på sengekanten frem for at lægge sig helt ind.
+  sove_retur_seng_cm:
+    name: "Nattur-retur: seng starter ved (cm)"
+    icon: mdi:bed-outline
+    min: 130
+    max: 300
+    step: 5
+    unit_of_measurement: "cm"
+    mode: slider
+
+  # Hvor længe et dør-zone-stempel er gyldigt. Gåturen dør → seng tager 2-3 sek;
+  # vinduet er rundhåndet, fordi man kan stoppe op undervejs. SKAL være mindre
+  # end sove_retur_min_sekunder — se invarianten i header-kommentaren.
+  sove_retur_vindue_sekunder:
+    name: "Nattur-retur: dør → seng må tage (s)"
+    icon: mdi:timer-sand
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Hvor længe nattur-lyset skal have været tændt, før en retur tæller. Lukker
+  # "partneren vender sig lige efter du gik ud"-hullet. SKAL være større end
+  # sove_retur_vindue_sekunder.
+  sove_retur_min_sekunder:
+    name: "Nattur-retur: nattur skal have varet (s)"
+    icon: mdi:clock-alert-outline
+    min: 0
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+
+template:
+  # ---------------------------------------------------------------------------
+  # Dør-zone-stempel + retur-flanke. Begge hænger på SAMME trigger, så de dømmer
+  # på samme sample. Rækkefølgen er ligegyldig: et dør-nært sample kan aldrig
+  # samtidig være et seng-sample, så binary_sensor'en læser aldrig et stempel
+  # den selv lige har sat.
+  # ---------------------------------------------------------------------------
+  - trigger:
+      - platform: state
+        entity_id: sensor.sovevaerelse_apollo_radar_moving_distance
+    sensor:
+      - name: "Sove doerzone stempel"
+        unique_id: sove_doerzone_stempel
+        icon: mdi:door-open
+        # Unix-sekunder. Bevidst IKKE last_changed på en anden entity:
+        # last_changed nulstilles ved HA-restart og duer aldrig som friskheds-mål
+        # (permanent faktum). Går stemplet tabt ved en restart, fejler det LUKKET
+        # — et manglende stempel slukker ingenting.
+        state: >-
+          {% set d = trigger.to_state.state %}
+          {% set z = states('input_number.sove_morgen_2p_doerzone_cm') | float(120) %}
+          {% set forrige = states('sensor.sove_doerzone_stempel') | float(0) %}
+          {% if d not in ['unknown', 'unavailable', 'none', '']
+                and (d | float(9999)) < z %}
+            {{ now().timestamp() | round(0) | int }}
+          {% else %}
+            {{ forrige | round(0) | int }}
+          {% endif %}
+    binary_sensor:
+      - name: "Sove retur til seng"
+        unique_id: sove_retur_til_seng
+        icon: mdi:bed
+        # Pulsen skal dø af sig selv: automationen fyrer på off→on-flanken, og
+        # uden auto_off ville sensoren stå `on` til næste sample og aldrig kunne
+        # give en ny flanke.
+        auto_off:
+          seconds: 30
+        state: >-
+          {% set d = trigger.to_state.state %}
+          {% set seng = states('input_number.sove_retur_seng_cm') | float(200) %}
+          {% set vindue = states('input_number.sove_retur_vindue_sekunder') | float(45) %}
+          {% set stempel = states('sensor.sove_doerzone_stempel') | float(0) %}
+          {{ d not in ['unknown', 'unavailable', 'none', '']
+             and (d | float(0)) >= seng
+             and stempel > 0
+             and (now().timestamp() - stempel) <= vindue }}
+
+automation:
+  - id: nattur_retur_seng_sluk
+    alias: "Nattur: tilbage i sengen → sluk nattur-lyset straks"
+    description: >
+      Soveværelsets radar har set en gang fra dør-zonen til sengen inden for
+      vinduet — altså er den der var oppe, lagt sig igen. Slukker nattur-lyset
+      med det samme i stedet for at vente på open-plans 5-minutters tomheds-
+      timer. Fyrer kun hvis INTET andet rum viser aktivitet: er der stadig nogen
+      oppe, er lyset stadig i brug.
+    mode: single
+    trigger:
+      # Bevidst UDEN `from: "off"`: en trigger-baseret template-sensor står
+      # `unknown` indtil sit første sample, så et from-krav ville sluge den
+      # allerførste ægte retur (fejlklasse #4). `auto_off` sikrer at den falder
+      # tilbage, så flanken kan komme igen. Genopstår den `on` efter en restart,
+      # er lysets last_changed = boot-tidspunktet → min_sekunder blokerer.
+      - platform: state
+        entity_id: binary_sensor.sove_retur_til_seng
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.sove_retur_enabled
+        state: "on"
+      # Familie-logik: Normal + Home Vacation. Gæsten har sit eget nat-regime
+      # (packages/airbnb_natmode.yaml) og kender ikke husets escape-veje, så en
+      # feature der SLUKKER lys holdes ude af AirBnB.
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.kalde_active
+        state: "off"
+      # Ingen no-op-fyringer: er lyset allerede slukket, er der intet at gøre.
+      # Samme roster som godnat_adult_nightwalk_off (#2 — ændrer du nattur-lysets
+      # sammensætning, skal BEGGE steder rettes).
+      - condition: template
+        value_template: >-
+          {{ is_state('light.spisestue_loft', 'on')
+             or is_state('light.entre_loft', 'on')
+             or (is_state('light.koekken_lyskaede', 'on')
+                 and is_state('switch.koekken_spots', 'off')) }}
+      # Nattur'en skal have varet et stykke tid. Dette er beskyttelsen mod at
+      # partnerens vending i sengen tolkes som "du er tilbage" umiddelbart efter
+      # du gik ud — se invarianten i header-kommentaren.
+      - condition: template
+        value_template: >-
+          {% set krav = states('input_number.sove_retur_min_sekunder') | float(90) %}
+          {% set ns = namespace(nyeste = 0) %}
+          {% for e in ['light.spisestue_loft', 'light.entre_loft', 'light.koekken_lyskaede'] %}
+            {% if is_state(e, 'on') %}
+              {% set ns.nyeste = [ns.nyeste, states[e].last_changed.timestamp()] | max %}
+            {% endif %}
+          {% endfor %}
+          {{ krav <= 0 or (ns.nyeste > 0 and (now().timestamp() - ns.nyeste) >= krav) }}
+      # User-spec: bad / entré / depot. VALLHORN'erne er blinde 10-18 % af tiden
+      # og kan hænge på `on`; hænger de, er deres `on` nul evidens og må ikke
+      # blokere for evigt → læs hængt-vagten med.
+      - condition: template
+        value_template: >-
+          {{ not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+             and not (is_state('binary_sensor.entre_valhorn_occupancy', 'on')
+                      and is_state('binary_sensor.entre_vallhorn_haengt', 'off'))
+             and not (is_state('binary_sensor.depot_valhorn_occupancy', 'on')
+                      and is_state('binary_sensor.depot_vallhorn_haengt', 'off')) }}
+      # "Anden meget tydelig apollo aktivitet" = de tre open-plan-rum, altså
+      # præcis dér nattur-lyset lyser. De FILTREREDE sensorer, så et spøgelse
+      # ikke holder lyset tændt.
+      - condition: template
+        value_template: >-
+          {{ not is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on')
+             and not is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'on')
+             and not is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'on') }}
+      # Børneværelset gates på BEVÆGELSE, ikke occupancy: sovende børn holder
+      # occupancy tændt hele natten og ville blokere feature'n permanent. Er en
+      # voksen inde ved børnene, skal open-plan-lyset blive — de skal jo tilbage.
+      - condition: state
+        entity_id: binary_sensor.boernevaerelse_apollo_radar_moving_target
+        state: "off"
+    action:
+      # 2 sek er "instantly" uden at slå lyset i hovedet på nogen der lige har
+      # lagt sig. User-spec siger straks, ikke fade — derfor ingen slider.
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id:
+            - light.entre_loft
+            - light.spisestue_loft
+        data:
+          transition: 2
+      - service: logbook.log
+        data:
+          name: "Nattur-retur"
+          message: >-
+            Tilbage i sengen — gang fra dør-zonen
+            ({{ states('input_number.sove_morgen_2p_doerzone_cm') | int(120) }} cm)
+            til {{ states('sensor.sovevaerelse_apollo_radar_moving_distance') }} cm
+            inden for {{ states('input_number.sove_retur_vindue_sekunder') | int(45) }} s.
+            Intet andet rum viste aktivitet → nattur-lyset slukket straks i
+            stedet for om ~5 min.
+          entity_id: binary_sensor.sove_retur_til_seng
+      # Spots on = madlavning, ikke nattur → rør ikke kæden. Samme undtagelse
+      # som i godnat_adult_nightwalk_off (2026-08-26g).
+      - condition: state
+        entity_id: switch.koekken_spots
+        state: "off"
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.koekken_lyskaede
+        data:
+          transition: 2

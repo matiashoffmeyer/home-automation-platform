@@ -1,0 +1,156 @@
+# =============================================================================
+# AirBnB check-ud: grundig rengøring + retur til Normal (Sprint 2026-07-17)
+# =============================================================================
+# User-spec: "en airbnb check ud knap i airbnb siden så starter støvsuger og
+# gulvask (grundigt) men med indstillingerne sat til at den ikke kører ind i
+# noget (meget følsom) for vi ved ikke om gæsterne har glemt ting på gulvet."
+# User-valg (AskUserQuestion): knappen starter rengøring OG skifter house_mode
+# → Normal med det samme.
+#
+# FLOW (script.airbnb_checkout, knap på AirBnB-siden m. confirmation):
+#   1. Flag `airbnb_checkout_clean_active` ON (gater restore-automationen).
+#   2. Rå Roborock-kommando `set_collision_avoid_status status=1` = forsigtig
+#      kollisions-undgåelse (reactive obstacle avoidance) — robotten undviger
+#      glemte gæste-ting på gulvet. (python-roborock RoborockCommand; ikke
+#      eksponeret som HA-entity.)
+#   3. Grundig-indstillinger: mop_mode deep + mop_intensity intense + fan max
+#      (normal FULL kører standard/standard/balanced).
+#   4. Manuel-stempel `roborock_manual_start_at` (manuel start er ALDRIG
+#      elpris-gated og undtaget airbnb_block_auto_clean hvis mode-flip racer).
+#   5. Session-maskineriet (type=full + active=on) → vacuum.start.
+#   6. house_mode → Normal (trigger selv AirBnB-resume-flowet + gæste-reset).
+#   7. Push til Parent A — inkl. VAND-ADVARSEL hvis dokken mangler rent vand
+#      (sensor.s8_maxv_ultra_dock_dock_error / water_shortage) — uden vand
+#      bliver gulvvasken tør. Push er OK: mode er Normal EFTER flip.
+#
+# RESTORE (automation, session_active on→off gated på flaget — dækker BÅDE
+# selv-gennemført OG afbrudt session): collision_avoid tilbage til baseline via
+# script.roborock_apply_forsigtig (→ 1 hvis forsigtig-killswitch ON OG huset er
+# ude/Dormant, ellers 0 — 2026-07-27) + mop/fan tilbage til standard/standard/balanced + flag off + kvitterings-push
+# (mode-tjekket — silent hvis huset igen er AirBnB, fejlklasse-disciplin).
+# =============================================================================
+
+input_boolean:
+  airbnb_checkout_clean_active:
+    name: "🧹 AirBnB check-ud rengøring aktiv"
+    icon: mdi:robot-vacuum-alert
+
+script:
+  airbnb_checkout:
+    alias: "AirBnB: CHECK-UD (grundig rengøring + Normal-mode)"
+    icon: mdi:exit-run
+    description: >
+      Starter grundig støvsug+gulvvask med forsigtig kollisions-undgåelse
+      (gæster kan have glemt ting på gulvet) og skifter huset til Normal.
+    sequence:
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.airbnb_checkout_clean_active}
+      # Forsigtig-mode FØR start (rå kommando, 2 s settle)
+      - service: vacuum.send_command
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data:
+          command: set_collision_avoid_status
+          params: {"status": 1}
+      - delay: "00:00:02"
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_mode}
+        data: {option: deep}
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+        data: {option: intense}
+      - service: vacuum.set_fan_speed
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data: {fan_speed: max}
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_manual_start_at}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_select.select_option
+        target: {entity_id: input_select.roborock_session_type}
+        data: {option: full}
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.roborock_session_active}
+      - service: vacuum.start
+        target: {entity_id: vacuum.s8_maxv_ultra}
+      - service: input_select.select_option
+        target: {entity_id: input_select.house_mode}
+        data: {option: Normal}
+      - service: logbook.log
+        data:
+          name: "AirBnB"
+          message: >-
+            CHECK-UD: grundig rengøring startet (deep mop + intense + max fan,
+            forsigtig kollisions-undgåelse) — house_mode → Normal.
+      # Push er tilladt her: mode er netop flippet til Normal.
+      # B215: via push_notify (notif_airbnb-toggles + master) — var direkte.
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: airbnb
+          title: "🧹 AirBnB check-ud"
+          message: >-
+            {% set dock_err = states('sensor.s8_maxv_ultra_dock_dock_error') %}
+            {% set water = is_state('binary_sensor.s8_maxv_ultra_water_shortage', 'on') %}
+            Grundig rengøring startet (deep mop, intens, max sug — forsigtig
+            kørsel pga. evt. glemte ting). Huset er skiftet til Normal.
+            {%- if dock_err not in ['ok', 'none', 'unknown', 'unavailable'] or water %}
+            ⚠️ DOKKEN MELDER VANDPROBLEM ({{ dock_err }}) — fyld rent vand på,
+            ellers vasker den tørt!
+            {%- endif %}
+          payload:
+            tag: airbnb_checkout
+
+automation:
+  # --- Restore: session slut (gennemført ELLER afbrudt) → normale settings ---
+  - id: airbnb_checkout_restore
+    alias: "AirBnB check-ud: restore robot-settings efter rengøring"
+    description: >
+      Når check-ud-sessionen slutter (session_active on→off dækker både
+      selv-gennemført via roborock_session_completed OG afbrudt via
+      roborock_stop_dock), rulles forsigtig-mode + grundig-settings tilbage
+      til daglig standard. Gated på checkout-flaget — rører ALDRIG andre
+      sessioner.
+    trigger:
+      - platform: state
+        entity_id: input_boolean.roborock_session_active
+        from: "on"
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.airbnb_checkout_clean_active
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.airbnb_checkout_clean_active}
+      # 2026-07-27: collision-avoid rulles tilbage til baseline via helper i
+      # stedet for hårdt 0 — status=1 hvis forsigtig-killswitch ON OG huset er
+      # ude/Dormant, ellers 0 (hurtig clean når hjemme).
+      - service: script.roborock_apply_forsigtig
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_mode}
+        data: {option: standard}
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+        data: {option: standard}
+      - service: vacuum.set_fan_speed
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data: {fan_speed: balanced}
+      - service: logbook.log
+        data:
+          name: "AirBnB"
+          message: "CHECK-UD rengøring slut — robot-settings rullet tilbage til standard."
+      # Silent-regel: push kun hvis huset IKKE er (gen-)sat i AirBnB
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+        then:
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: airbnb
+              title: "🧹 AirBnB check-ud"
+              message: >-
+                Check-ud-rengøringen er slut — robotten er tilbage på normale
+                indstillinger (standard mop, balanced sug, alm. kørsel).
+              payload:
+                tag: airbnb_checkout

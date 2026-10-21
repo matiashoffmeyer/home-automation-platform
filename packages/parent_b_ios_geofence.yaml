@@ -1,0 +1,561 @@
+# =============================================================================
+# Parent B: iOS-drevet geofence → virtuel kontakt (erstatter app-baggrundsGPS)
+# =============================================================================
+# BAGGRUND (sprint 2026-08-14b): iOS satte Companion-appen ned til "Authorized
+# when in use" → appen får ingen baggrunds-lokation → device_tracker frøs på
+# `home` og huset troede Parent B var hjemme mens hun var ude. Rodårsagen er
+# strukturel: HA's egen app skal bede om "Altid"-adgang, og iOS straffer det
+# med jævnlige "appen har brugt din placering i baggrunden"-pop-ups, som før
+# eller siden bliver klikket væk til "Kun mens appen bruges".
+#
+# LØSNINGEN VENDER ANSVARET OM: iOS ejer selv geofencen (system-niveau, ingen
+# pop-ups) og TRYKKER PÅ EN KNAP her. HA holder op med at overvåge hende.
+# `input_boolean.parent_b_hjemme_ios` ER den knap.
+#
+# TO RUTER TIL AT TRYKKE PÅ KNAPPEN — HA-siden er identisk:
+#
+#   RUTE A — Apple Home (HomeKit).
+#     HA's HomeKit Bridge eksponerer kontakten i Hjem-appen; en
+#     Hjem-automatik "Når Parent B ankommer/forlader" tænder/slukker den.
+#     ⚠️ KRÆVER EN HOME HUB (HomePod eller Apple TV). Huset har pr. 2026-08-14
+#     INGEN — hverken Apple TV, HomePod eller HomeKit-bridge (verificeret mod
+#     core.config_entries + /api/states). Uden hub er Automatik-fanen i
+#     Hjem-appen slet ikke tilgængelig, så rute A kan ikke sættes op i dag.
+#     TIL GENGÆLD er den den mest robuste: hub'en står HJEMME på LAN'et, så
+#     "hun forlod"-beskeden kommer fra hub'en — ikke fra en telefon der lige
+#     er røget af hjemme-wifi.
+#
+#   RUTE B — Genveje (Shortcuts). Ingen hardware.
+#     Personlig automatik: "Når jeg ankommer/forlader Hjem" → handlingen
+#     "Home Assistant: Kald tjeneste" → input_boolean.turn_on/off på
+#     parent_b_hjemme_ios. Sæt "Kør med det samme" + slå "Giv besked ved kørsel"
+#     FRA = nul pop-ups. Genvejes lokations-triggere er system-niveau og
+#     udløser ikke lokations-advarslen.
+#     ⚠️ AFHÆNGIGHED: selve tjeneste-kaldet er et HTTP-kald til HA. Når hun
+#     FORLADER hjemmet er hun pr. definition af hjemme-wifi → det kræver
+#     Tailscale aktiv på hendes telefon (huset har ingen Nabu Casa; se
+#     CLAUDE.md om at knapsvar/HTTP kun når frem via wifi eller Tailscale).
+#     Er Tailscale nede, tabes præcis den besked vi bygger det hele for.
+#
+# Efter opsætning skal appens lokations-adgang sættes til "Kun mens appen
+# bruges" (eller "Aldrig") — det er hele pointen. Så bliver device_tracker'en
+# permanent frossen, og `parent_b_ios_geofence_enabled` gør iOS-kontakten
+# autoritativ i stedet.
+# =============================================================================
+
+input_boolean:
+  # Selve knappen iOS trykker på. Ingen automatik i huset må skrive til den —
+  # den er et VIDNE udefra, ikke en tilstand vi vedligeholder.
+  # ÉN UNDTAGELSE (2026-08-15): et MENNESKE der trykker "hun er ude" på
+  # stille-hus-varslet nedenfor. Det er stadig et vidne udefra — bare et med
+  # øjne i stedet for en geofence. Automatik skriver stadig aldrig SELV, og
+  # det er et bevidst valg: hendes genvej trykker kun ved ANKOMST, så et
+  # forkert auto-clear ville hænge fast til hun fysisk havde forladt hjemmet
+  # og var kommet hjem igen. Der er ingen re-arm at fejle til.
+  parent_b_hjemme_ios:
+    name: "📍 Parent B hjemme (iOS geofence)"
+    icon: mdi:cellphone-check
+
+  # Kill-switch (#21): så længe den er OFF er hele denne pakke inert, og
+  # GPS-vejen kører præcis som før. Sættes ON når iOS-automatikken er testet.
+  parent_b_ios_geofence_enabled:
+    name: "📍 Parent B: brug iOS-geofence som facit"
+    icon: mdi:map-marker-radius
+
+  # Ankomst-push (user-spec 2026-08-17). `_parent_b` udeladt med vilje — hun
+  # behøver ikke en besked om at hun selv er kommet hjem. `_airbnb` default OFF
+  # = silent under gæsteophold, og `_hjemme` (udskyd til hjemkomst) er bevidst
+  # ikke defineret: pointen er netop at få den mens man er ude.
+  notif_parent_b_hjem_enabled:
+    name: "🏠 Parent B hjemme — send"
+    icon: mdi:home-import-outline
+  notif_parent_b_hjem_parent_a:
+    name: "🏠 Parent B hjemme — Parent A"
+    icon: mdi:cellphone
+  notif_parent_b_hjem_airbnb:
+    name: "🏠 Parent B hjemme — også i AirBnB"
+    icon: mdi:home-account
+
+input_number:
+  # Hvor længe et ENKELT rum skal være uafbrudt optaget, før det tæller som en
+  # troværdig krop i stille-hus-vidnet nedenfor. Målt 14 dage: p90 for et
+  # sammenhængende occupancy-udslag er 110 s (spisestue) / 214 s (stue) / 17 s
+  # (køkken), så 15 min ligger langt over alt hvad en radar-fantom producerer.
+  parent_b_stille_hus_krop_minutter:
+    name: "📍 Parent B stille-hus: krop-bevis (min uafbrudt ophold)"
+    min: 5
+    max: 90
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:seat-outline
+
+input_datetime:
+  # Friskhed skal komme fra en SKREVET værdi, aldrig last_changed (#5 —
+  # last_changed nulstilles ved HA-restart).
+  parent_b_ios_geofence_sidst:
+    name: "Parent B iOS-geofence: sidste tryk"
+    has_date: true
+    has_time: true
+
+  # Dedupe-stempel for modstrids-varslet nedenfor.
+  parent_b_ios_geofence_modstrid_varslet:
+    name: "Parent B iOS-geofence: modstrid sidst varslet"
+    has_date: true
+    has_time: true
+
+template:
+  # ---------------------------------------------------------------------------
+  # ÉT ANKER for "er Parent B hjemme" (#1/#2) — læs DENNE, ikke kilderne
+  # ---------------------------------------------------------------------------
+  # 2026-08-15c: da GPS-vejen blev slået fra, blev `person.parent_b` og
+  # `device_tracker.phone_b` PERMANENT `home`. De er ikke bare
+  # upålidelige — de er et selvsikkert forkert svar (#9), og huset havde 43
+  # referencer til dem. Konsekvensen var tavs og alvorlig: GPS-fast Dormant
+  # kræver `c == 'not_home'` og kunne derfor ALDRIG fyre igen; lås-detektoren
+  # kræver `person.parent_b == 'not_home'` og var dermed også død — netop den
+  # nødudgang der skal redde huset når en radar hænger.
+  #
+  # Spørg altid dette anker når spørgsmålet er "er hun hjemme". Læs KUN de rå
+  # kilder når du undersøger selve GPS'ens helbred (gps_freshness,
+  # gps_watchdog, permission-varslet) — dér er trackerens tavshed netop pointen.
+  - binary_sensor:
+      - name: "Parent B hjemme anker"
+        unique_id: parent_b_hjemme_anker
+        icon: mdi:home-account
+        state: >
+          {% if is_state('input_boolean.parent_b_ios_geofence_enabled', 'on') %}
+            {{ is_state('input_boolean.parent_b_hjemme_ios', 'on') }}
+          {% else %}
+            {{ is_state('device_tracker.phone_b', 'home') }}
+          {% endif %}
+        attributes:
+          # Så en fremtidig session kan se HVILKEN kilde der svarede, uden at
+          # skulle udlede det. Konstant pr. gren = ingen recorder-churn (#24).
+          kilde: >
+            {{ 'ios-kontakt'
+               if is_state('input_boolean.parent_b_ios_geofence_enabled', 'on')
+               else 'gps-tracker' }}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # iOS har trykket → stempl + før det igennem til hjemme-flaget
+  # ---------------------------------------------------------------------------
+  - id: parent_b_ios_geofence_apply
+    alias: "Tilstedeværelse: Parent B's iOS-geofence → hjemme-flag"
+    description: >
+      input_boolean.parent_b_hjemme_ios er husets eneste ægte vidne om Parent B
+      når appens baggrunds-GPS er slået fra. Den skrives KUN af iOS.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.parent_b_hjemme_ios
+        to: "on"
+      - platform: state
+        entity_id: input_boolean.parent_b_hjemme_ios
+        to: "off"
+      # Kill-switchen tændes midt i en tilstand → synkronisér med det samme,
+      # ellers arver vi GPS-vejens (frosne) svar til næste geofence-flanke.
+      - platform: state
+        entity_id: input_boolean.parent_b_ios_geofence_enabled
+        to: "on"
+      # #4/#15: et tryk der lander mens HA genstarter har ingen flanke bagefter.
+      - platform: homeassistant
+        event: start
+      # #15: hele automationen er gated OFF under AirBnB, så hvert tryk i
+      # gæsteperioden er tabt for hjemme-flaget. iOS-kontakten selv er stadig
+      # ajour (den skrives udefra), så resync ved udgangen frem for at arve
+      # gæsteperiodens sidste kendte svar.
+      - platform: state
+        entity_id: input_select.house_mode
+        from: "AirBnB"
+    condition:
+      - condition: state
+        entity_id: input_boolean.parent_b_ios_geofence_enabled
+        state: "on"
+      # Spejler presence_*_arrive/leave: tracking kører ikke i AirBnB.
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+    action:
+      # Stempl kun når det var et ægte tryk (ikke ved restart/enable-sync),
+      # så friskheds-tallet bliver ved med at betyde "sidst iOS sagde noget".
+      - if:
+          - condition: template
+            value_template: >-
+              {{ trigger.platform == 'state'
+                 and trigger.entity_id == 'input_boolean.parent_b_hjemme_ios' }}
+        then:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.parent_b_ios_geofence_sidst
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: >-
+          {{ 'input_boolean.turn_on'
+             if is_state('input_boolean.parent_b_hjemme_ios', 'on')
+             else 'input_boolean.turn_off' }}
+        target:
+          entity_id: input_boolean.parent_b_home
+
+  # ---------------------------------------------------------------------------
+  # Modstrids-vagt: iOS og en ÆGTE GPS-position er uenige
+  # ---------------------------------------------------------------------------
+  # En ren tavsheds-vagt duer ikke: hun kan legitimt være hjemme i dagevis uden
+  # et eneste tryk. Det der ER et fejlsignal, er at de to kilder modsiger
+  # hinanden — så er iOS-automatikken slettet, hub'en offline, eller Tailscale
+  # nede, og vi er tilbage i præcis den fejl pakken skulle fjerne.
+  # Kræver at trackeren er FRISK; en frossen tracker er nul evidens (08-14b) og
+  # må aldrig anklage iOS-kontakten.
+  - id: parent_b_ios_geofence_modstrid
+    alias: "Tilstedeværelse: Parent B's iOS-geofence modsiger GPS → varsel"
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: state
+        entity_id: input_boolean.parent_b_ios_geofence_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.parent_b_gps_fresh
+        state: "on"
+      # 2026-08-18 (user: "vi bruger jo hendes shortcut nu, ikke hendes gps
+      # position — hvor hun er er lige meget, vi skal bare vide at hun har
+      # forladt hjemmet"). `gps_fresh` måler om trackeren har SAGT noget for
+      # nylig; det er en staleness-tærskel. Men app-tilladelsen står bevidst på
+      # "Kun mens appen bruges", og da kan trackeren pr. konstruktion ALDRIG
+      # melde et zone-skift — den fryser på sin sidste zone og re-rapporterer
+      # den friskt hver gang hun åbner appen. En frisk `not_home` er derfor
+      # ikke en modsigelse, den er et ekko: kilden er ikke langsom, den KAN
+      # ikke (jf. CLAUDE.md, "iOS Companion uden Authorized Always").
+      # Målt 08-18 01:00: kontakten HJEMME, tracker not_home, permission
+      # "Authorized when in use" → varsel om en tilstand der er selve designet.
+      # `parent_b_gps_baggrund_ok` er husets ene vidne om at trackeren
+      # overhovedet HAR ret til at melde afgang; uden den er sammenligningen
+      # meningsløs. Backstoppen "iOS siger hjemme, men huset er stille"
+      # nedenfor er den vagt der stadig dækker en død genvejs-rute.
+      - condition: state
+        entity_id: binary_sensor.parent_b_gps_baggrund_ok
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set tracker = states('device_tracker.phone_b') %}
+          {% set ios = is_state('input_boolean.parent_b_hjemme_ios', 'on') %}
+          {{ tracker not in ['unknown', 'unavailable', 'none']
+             and (tracker == 'home') != ios }}
+      # Dedupe: ét varsel pr. 6 t, og kun når modstriden har stået ved.
+      - condition: template
+        value_template: >-
+          {% set ts = state_attr('input_datetime.parent_b_ios_geofence_modstrid_varslet', 'timestamp') | float(0) %}
+          {{ ts < 946771200 or (as_timestamp(now()) - ts) > 21600 }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.parent_b_ios_geofence_modstrid_varslet
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: gps_stale
+          title: "⚠️ Parent B's iOS-geofence passer ikke med GPS"
+          message: >-
+            iOS-kontakten siger
+            {{ 'HJEMME' if is_state('input_boolean.parent_b_hjemme_ios', 'on') else 'UDE' }},
+            men en frisk GPS-position siger
+            {{ 'HJEMME' if is_state('device_tracker.phone_b', 'home') else 'UDE' }}.
+
+            Tjek at automatikken på hendes telefon stadig findes — og at
+            Tailscale er aktiv, hvis I bruger Genveje-ruten.
+          payload:
+            tag: gps_stale
+
+  # ---------------------------------------------------------------------------
+  # Backstop: iOS siger HJEMME, men huset har været helt stille
+  # ---------------------------------------------------------------------------
+  # DEN ENE MÅDE GENVEJE-RUTEN KAN SVIGTE PÅ: afgangs-beskeden er et HTTP-kald
+  # afsendt i det sekund hun krydser geofencen — altså pr. definition EFTER hun
+  # er af hjemme-wifi. Er Tailscale suspenderet på telefonen, eller er der intet
+  # signal i kælderen/parkeringshuset, går beskeden tabt. Så bliver
+  # `parent_b_hjemme_ios` hængende ON, og fordi iOS-kilden er autoritativ har vi
+  # bevidst slået GPS-backstoppen fra = præcis fejlen fra 08-14, uden net.
+  #
+  # Vidnet er huset selv: står hun opført som hjemme ALENE, og har intet
+  # sensor-/knap-signal rørt sig i timevis, er "hjemme" ikke troværdigt.
+  #
+  # 2026-08-15 — DEN FEJLEDE I PRAKSIS, FØRSTE GANG DEN BLEV BRUGT. Begge
+  # familiens voksne var ude 14:46-19:48; kontakten hang ON fra 13:11. Varslet
+  # kom aldrig, af to UAFHÆNGIGE grunde — begge rettet her:
+  #
+  #   (1) `physical_presence_recent` stod ON hele fraværet. Soveværelsets
+  #       Apollo fyrede NI korte udslag i et beviseligt tomt hus (12:42-16:11,
+  #       sydvendt vindue, gardinet oppe hele dagen, robotten dokket) og hvert
+  #       udslag friskede `sensor.last_physical_activity`, hvis 3t-vindue
+  #       holdt gren (b) oppe permanent. Sensoren er altså IKKE et brugbart
+  #       "huset er tomt"-vidne om dagen. Det der derimod skiller et menneske
+  #       fra en fantom er BREDDEN: en person der er hjemme i timevis rører
+  #       mere end ét rum. Fantomen rørte præcis ét, og de øvrige syv rum var
+  #       tavse i fem timer.
+  #   (2) Grace-vinduet målte fra HENDES tryk (`sidst` + 6 t). Hun trykkede
+  #       "hjemme" 13:11 og kørte 14:46 — så selv med et sundt vidne kunne
+  #       varslet tidligst komme 19:11, fire timer efter afgangen. Uret skal
+  #       løbe fra MISTANKEN (hans bekræftede afgang), ikke fra hendes ankomst.
+  #
+  # VARSLER, RYDDER IKKE — uændret. En sovende krop kan se ud som stilstand,
+  # og et fejlagtigt auto-clear har ingen re-arm (se kommentaren ved
+  # `parent_b_hjemme_ios`). Nyt er kun at pushen har en KNAP, så mennesket kan
+  # afgøre det med ét tryk i stedet for at grave i Indstillinger.
+  - id: parent_b_ios_geofence_stille_hus
+    alias: "Tilstedeværelse: Parent B står hjemme, men huset er stille → ryd"
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/30"
+    condition:
+      - condition: state
+        entity_id: input_boolean.parent_b_ios_geofence_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+      - condition: state
+        entity_id: input_boolean.parent_b_hjemme_ios
+        state: "on"
+      # Kun når hun er den eneste voksne — ellers kan stilheden være hvem som
+      # helst. `for:` gør det til en SITUATION frem for et øjeblik, og uret
+      # løber fra det eneste hårde afgangs-bevis huset har (hans GPS virker).
+      - condition: state
+        entity_id: input_boolean.parent_a_home
+        state: "off"
+        for: "01:30:00"
+      # BREDDE-VIDNET (erstatter `physical_presence_recent`, se 08-15 ovenfor).
+      # Tæl rum der er occupied NU eller har haft en flanke i vinduet. Én
+      # radar-fantom rører ét rum; et menneske der bor her i halvanden time
+      # rører flere. Derfor: højst ÉT rum = ingen troværdig krop.
+      # last_changed nulstilles ved HA-restart (#5) → efter en restart tæller
+      # alle otte rum som "rørt", og varslet holder mund til vinduet er gået.
+      # Det er den rigtige retning at fejle i: en forsinket mistanke, aldrig
+      # en falsk anklage.
+      #
+      # DYBDE-VIDNET (2026-09-04c). Bredden ALENE er strukturelt blind for den
+      # der sidder stille i ÉT rum — altså en hjemmearbejdsdag. Målt: Parent B
+      # blev sat "ude" 12:00 mens `spisestue_apollo_occupancy_filtered` havde
+      # stået uafbrudt `on` siden 09:58 (121 min) og huset havde markeret
+      # `maaltid_hjemmearbejde_dag` kl. 08:35. Bredden så præcis ét rum → 1 <= 1
+      # → ryd. Personen var ikke stille nok til at blive set; hun var for stille.
+      # Derfor: vedvarende ophold i ét rum er i sig selv en krop.
+      #   • Tærskel 15 min ligger langt over enhver fantom — p90 for et
+      #     sammenhængende udslag er 110 s (spisestue) / 214 s (stue) / 17 s
+      #     (køkken) over 14 dage.
+      #   • Ghost-guard hvor den findes: `frossen_ghost` on = occupancy holder
+      #     mens afstanden er død = møbel, ikke krop. Uden den ville et latchet
+      #     rum kunne blokere rydningen for evigt.
+      #   • Depot + entré er UDE af dybde-rosteret: VALLHORN'erne er Matter
+      #     sleepy end devices der kan hænge `on` i op mod 40 min når de mister
+      #     forælderen (målt: ét tomt-hus-udslag på 39 min) — dér er vedvarende
+      #     `on` netop IKKE et krops-bevis.
+      #   • Spisestuen måles desuden på husets eksisterende akkumulator, som er
+      #     immun over for at sensoren blinker et øjeblik og nulstiller
+      #     `last_changed`.
+      # Alle tre veto'er er NUTIDS-beviser der decayer af sig selv, så en
+      # hjemmearbejdsdag ikke kan hænge kontakten ON resten af dagen.
+      - condition: template
+        value_template: >-
+          {% from 'rosters.jinja' import husets_occupancy %}{% set rum = husets_occupancy
+            %}
+          {% set dybde = [
+            ('binary_sensor.stue_apollo_occupancy_filtered',
+             'binary_sensor.stue_apollo_frossen_ghost'),
+            ('binary_sensor.spisestue_apollo_occupancy_filtered',
+             'binary_sensor.spisestue_apollo_frossen_ghost'),
+            ('binary_sensor.koekken_apollo_occupancy_filtered',
+             'binary_sensor.koekken_apollo_frossen_ghost'),
+            ('binary_sensor.badevaerelse_inde_occupancy', 'none'),
+            ('binary_sensor.sovevaerelse_apollo_occupancy', 'none'),
+            ('binary_sensor.boernevaerelse_apollo_occupancy', 'none') ] %}
+          {% set krav_min = states('input_number.parent_b_stille_hus_krop_minutter') | float(15) %}
+          {% set ns = namespace(aktive=0, krop=false) %}
+          {% for s in rum %}
+            {% if is_state(s, 'on')
+                  or (states[s] is not none
+                      and (now() - states[s].last_changed).total_seconds() < 5400) %}
+              {% set ns.aktive = ns.aktive + 1 %}
+            {% endif %}
+          {% endfor %}
+          {% for d in dybde %}
+            {% if is_state(d[0], 'on') and states[d[0]] is not none
+                  and (now() - states[d[0]].last_changed).total_seconds() >= krav_min * 60
+                  and not is_state(d[1], 'on') %}
+              {% set ns.krop = true %}
+            {% endif %}
+          {% endfor %}
+          {% set bord = states('sensor.hjemmearbejde_ophold_min_i_vindue') | float(0) %}
+          {{ ns.aktive <= 1 and not ns.krop and bord < krav_min }}
+      # Dør-guard: døre lyver ikke som radar gør, men de skelner heller ikke
+      # "hun tog med" fra "hun blev hjemme" — begge ser ens ud EFTER afgangen.
+      # De bruges derfor kun som sikkerhed: har nogen krydset dørtrinnet for
+      # nylig, er der bevægelse vi ikke kan gøre rede for → hold mund.
+      - condition: template
+        value_template: >-
+          {% set ns = namespace(rort=false) %}
+          {% for d in ['binary_sensor.parasoll_hoveddoer',
+                       'binary_sensor.parasoll_terrassedoer'] %}
+            {% if states[d] is not none
+                  and (now() - states[d].last_changed).total_seconds() < 5400 %}
+              {% set ns.rort = true %}
+            {% endif %}
+          {% endfor %}
+          {{ not ns.rort }}
+      # Dagtimer: om natten er stilstand det normale, ikke et fejlsignal.
+      - condition: time
+        after: "08:00:00"
+        before: "22:00:00"
+      # Grace så et ankomst-tryk når at sætte sig (og så vi ikke varsler oven
+      # på en HA-restart, hvor presence-historikken er tom). 90 min — IKKE de
+      # gamle 6 t, som målte fra hendes tryk og dermed gjorde en afgang kort
+      # efter ankomst usynlig i timevis (grund 2 ovenfor).
+      - condition: template
+        value_template: >-
+          {% set ts = state_attr('input_datetime.parent_b_ios_geofence_sidst', 'timestamp') | float(0) %}
+          {{ ts > 946771200 and (as_timestamp(now()) - ts) > 5400 }}
+      - condition: template
+        value_template: >-
+          {% set ts = state_attr('input_datetime.parent_b_ios_geofence_modstrid_varslet', 'timestamp') | float(0) %}
+          {{ ts < 946771200 or (as_timestamp(now()) - ts) > 21600 }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.parent_b_ios_geofence_modstrid_varslet
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      # ✅ RYDDER — varsler ikke (user-spec 2026-08-15c: "det skal bare virke,
+      # så huset går i dormant når vi ikke er hjemme"). Dette omgør det bevidste
+      # varsel-valg fra 08-15: et spørgsmål der venter på et svar er ikke en
+      # rettelse, og svaret kræver netværk hjem, som er præcis det der manglede.
+      # Asymmetrien afgør retningen: en hængende ON er IKKE selvhelbredende (5 t
+      # målt), mens en forkert rydning bliver rullet tilbage af den første ægte
+      # bevægelse — huset vågner til Active af sig selv — eller med ét tryk på
+      # knappen nedenfor.
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.parent_b_hjemme_ios
+      - service: logbook.log
+        data:
+          name: "Parent B iOS-geofence"
+          message: >-
+            Kontakten ryddet automatisk: huset stille i 90 min (højst ét rum
+            rørt, ingen dør-flanker) og Parent A væk i 1½ t. Formentlig tabt
+            "forlad"-kald.
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: gps_stale
+          title: "🚪 Satte Parent B til 'ude'"
+          message: >-
+            Hun stod som hjemme siden
+            {{ states('input_datetime.parent_b_ios_geofence_sidst') }}, men huset
+            har været stille i halvanden time (højst ét rum rørt, ingen døre) og
+            du er væk — så "forlad"-beskeden fra hendes telefon nåede
+            sandsynligvis aldrig frem.
+
+            Huset kan nu gå i dvale. Var det forkert, så tryk.
+          payload:
+            tag: gps_stale
+            actions:
+              - action: "PARENT_B_IOS_HJEMME"
+                title: "🏠 Nej, hun ER hjemme"
+
+  # ---------------------------------------------------------------------------
+  # Svar på stille-hus-pushen — den manuelle korrektion i BEGGE retninger
+  # ---------------------------------------------------------------------------
+  # Knapsvar er et HTTP-kald tilbage til HA (CLAUDE.md): leveringen af pushen
+  # virker overalt, men SVARET kræver hjemme-wifi eller Tailscale. Udebliver
+  # svaret betyder det derfor ikke "han ignorerede spørgsmålet" — og netop
+  # derfor må huset ikke VENTE på svaret. Rydningen sker i stille_hus; her
+  # ligger kun menneskets mulighed for at omgøre den (eller for at melde en
+  # afgang huset endnu ikke har set).
+  - id: parent_b_ios_geofence_svar
+    alias: "Tilstedeværelse: svar på Parent B's stille-hus-varsel"
+    mode: single
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      # #21: kill-switchen skal gate hver eneste vej ind — også et tryk på en
+      # gammel notifikation der lå og ventede mens pakken blev slået fra.
+      - condition: state
+        entity_id: input_boolean.parent_b_ios_geofence_enabled
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default('')).startswith('PARENT_B_IOS_') }}
+    action:
+      # Uanset svaret: stempl dedupen, så de næste 6 t er tavse. Stemplet
+      # sættes ved SVARET, ikke ved pushen — en push kan ligge ulæst i timevis,
+      # og så er "6 t siden vi spurgte" ikke det samme som "6 t siden han tog
+      # stilling".
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.parent_b_ios_geofence_modstrid_varslet
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      # Skriver KUN til selve kontakten — hjemme-flaget følger med via
+      # `parent_b_ios_geofence_apply`, så der bliver ved med at være én eneste
+      # vej fra kontakt til presence (#1).
+      - if:
+          - condition: template
+            value_template: "{{ trigger.event.data.action == 'PARENT_B_IOS_UDE' }}"
+        then:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.parent_b_hjemme_ios
+      # 🔁 RE-ARM. Efter 08-15c rydder huset selv kontakten, og hendes genvej
+      # trykker kun ved ANKOMST — så uden denne gren ville en fejlagtig
+      # auto-rydning hænge OFF til hun fysisk var kørt hjemmefra og tilbage
+      # igen. Knappen ER re-arm-kanalen, og derfor skal HJEMME skrive.
+      - if:
+          - condition: template
+            value_template: "{{ trigger.event.data.action == 'PARENT_B_IOS_HJEMME' }}"
+        then:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.parent_b_hjemme_ios
+
+  # ---------------------------------------------------------------------------
+  # "Parent B er hjemme" → push til Parent A (user-spec 2026-08-17)
+  # ---------------------------------------------------------------------------
+  # Hænger på ANKERET, ikke på iOS-kontakten: så følger pushen med hvis
+  # presence-ruten en dag skifter tilbage til GPS (#1/#2 — ét sted at ændre).
+  # `from: "off"` er nødvendig: ankeret står `unknown` indtil template-motoren
+  # har evalueret efter en restart, og unknown→on er et ekko, ikke en ankomst.
+  - id: parent_b_hjem_push
+    alias: "Tilstedeværelse: Parent B kommet hjem → push"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parent_b_hjemme_anker
+        from: "off"
+        to: "on"
+    condition:
+      # Én push pr. fysisk hjemkomst. Fortryd-knappen "🏠 Nej, hun ER hjemme"
+      # på stille-hus-varslet skriver kontakten ON igen — det er et re-arm af en
+      # fejlagtig rydning, ikke en ny ankomst.
+      - condition: template
+        value_template: >-
+          {{ this.attributes.last_triggered is none
+             or (now() - this.attributes.last_triggered).total_seconds() > 1800 }}
+    action:
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: parent_b_hjem
+          title: "🏠 Parent B er hjemme"
+          # 2026-10-20: kilden ("ios-kontakt") var til os, ikke til user — den
+          # står stadig i ankerets `kilde`-attribut.
+          message: "Kom hjem kl. {{ now().strftime('%H:%M') }}."
+          payload:
+            tag: parent_b_hjem

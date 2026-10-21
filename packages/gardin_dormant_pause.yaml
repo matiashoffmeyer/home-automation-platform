@@ -1,0 +1,158 @@
+# =============================================================================
+# Gardin-forsvar dvale-pause (2026-07-18, user-spec) — spar batteri på ferie
+# =============================================================================
+# User: "på ferie vil jeg ikke ha at setuppet kører gardiner op og ned
+# automatisk hvis der har været 24 timer med dormant — spild af batteri. Send
+# notifikation om at det slås fra efter 24t dormant. Slås til igen ved næste
+# open main door event."
+#
+# VERIFICERET (fejlklasse #1 — grep cover.* i alle automations): det ENESTE der
+# rører gardiner mens huset er Dormant er sæsonforsvaret:
+#   - summer_defense_close   (Dormant + hedt → luk)
+#   - summer_defense_reopen  (Dormant + køligt → åbn, 07:00 + 19:00 dagligt)
+#   - winter_defense_close   (Dormant→ + koldt → luk)
+# Alt andet gardin-arbejde (morning_curtains, wakeup_*, godnat, Active-tier
+# forsvar, solar gain) er gated på house_state == Active / presence, så det
+# kører ALDRIG mens huset er i dvale. → Denne pause gater kun de tre ovenfor
+# via input_boolean.gardin_dormant_pause_active (condition tilføjet i deres filer).
+#
+# NY MED-EJER 2026-09-23 (user-spec, mosbillede-beskyttelsen): featuren i
+# packages/mosbillede_solbeskyttelse.yaml lukker spisestue-vest mod direkte sol
+# i BÅDE Active og Dormant. Den respekterer pausen på sin ÅBN-vej, men IKKE på
+# sin luk-vej: at lukke ÉN gang og lade gardinet blive nede er den billigste
+# tilstand der stadig beskytter billedet — det er de gentagne op/ned pausen
+# findes for at undgå. Listen ovenfor er derfor "de tre + mosbillede-luk".
+#
+# UNDTAGELSE lukket 2026-07-19 (B63): winter_cold_snap_force_close er IKKE
+# house_state-gated (dens eneste betingelse er winter_solar_active) → den kunne
+# traekke syd-gardinet i dvale trods pausen. Fix: winter_solar_flag_clear_on_dormant
+# (winter_defense.yaml) rydder flaget ved Dormant-entry → cold_snap kan aldrig
+# fyre i dvale. Så "det ENESTE"-listen ovenfor holder igen (fejlklasse #1).
+#
+# MEKANIK: en /30-scan tjekker hvor længe house_state uafbrudt har været
+# "Dormant" (enum-state → last_changed er valid, IKKE fejlklasse #14). Har det
+# stået i ≥ slider-timer → sæt pause_active on + push. Scannen ER selv sin egen
+# backstop (survives restart-loses-edge, fejlklasse #4 — last_changed nulstilles
+# ved restart, men tærsklen nås bare igen ~1 dag senere; acceptabelt for en
+# batteri-spare-feature). Ægte aktivitet under dvalen flipper house_state og
+# nulstiller uret = korrekt (så var der nogen).
+#
+# FRIGIV: hoveddør åbnes (user-spec) ELLER house_state→Active (backstop mod
+# stuck-suspended, fejlklasse #15). Kun i Normal — AirBnB er silent + gæst
+# styrer selv gardiner.
+# =============================================================================
+
+input_boolean:
+  # Kill-switch — hele featuren til/fra (default ON via init_user_preferences).
+  # _enabled → snapshottes, user-fra overlever restart.
+  gardin_dormant_pause_enabled:
+    name: "Gardin-dvale-pause: spar batteri på ferie"
+    icon: mdi:battery-heart-variant
+
+  # Runtime-tilstand: on = sæsonforsvar er sat på pause lige nu. IKKE _enabled
+  # → ikke i snapshot; restores over restart så en igangværende pause overlever.
+  gardin_dormant_pause_active:
+    name: "Gardin-dvale-pause aktiv"
+    icon: mdi:window-shutter-cog
+
+input_number:
+  # Hvor mange timers uafbrudt dvale før pausen slår til (user: 24t).
+  gardin_dormant_pause_hours:
+    name: "Gardin-dvale-pause: timer før pause"
+    icon: mdi:timer-sand
+    min: 4
+    max: 96
+    step: 1
+    unit_of_measurement: "t"
+    mode: box
+
+automation:
+  # --- ENGAGE: house har været uafbrudt Dormant i ≥ slider-timer ---
+  - id: gardin_dormant_pause_engage
+    alias: "Gardin-dvale-pause: sæt sæsonforsvar på pause efter lang dvale"
+    description: >
+      /30-scan: har house_state stået uafbrudt "Dormant" i ≥
+      gardin_dormant_pause_hours timer, sættes sæsonforsvaret (summer/winter
+      close + reopen) på pause for at spare gardin-batteri på ferie. Push til
+      brugeren. Slås fra igen ved hoveddør-åbning / house→Active.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/30"
+    condition:
+      - condition: state
+        entity_id: input_boolean.gardin_dormant_pause_enabled
+        state: "on"
+      # Kun i Normal — AirBnB er silent + gæst styrer selv gardiner.
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "Normal"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Dormant"
+      # Ikke allerede på pause (idempotent — undgår re-push hver /30).
+      - condition: state
+        entity_id: input_boolean.gardin_dormant_pause_active
+        state: "off"
+      # Uafbrudt dvale-varighed ≥ slider. house_state er enum → last_changed
+      # nulstilles kun ved reel state-ændring (ægte aktivitet) = korrekt.
+      - condition: template
+        value_template: >-
+          {{ (now() - states.input_select.house_state.last_changed).total_seconds()
+             >= (states('input_number.gardin_dormant_pause_hours') | float(24)) * 3600 }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.gardin_dormant_pause_active
+      # Master-toggle (user 2026-10-11: "master toggle skal også slå dem fra").
+      - if:
+          - condition: state
+            entity_id: input_boolean.notifikationer_master_enabled
+            state: "on"
+        then:
+          - service: notify.mobile_app_phone_a
+            data:
+              title: "🪟 Gardin-forsvar sat på pause"
+              message: >-
+                Huset har været i dvale i
+                {{ (states('input_number.gardin_dormant_pause_hours') | float(24)) | round(0) | int }}t
+                (ferie) — sæsonforsvaret kører ikke gardinerne op/ned længere, så
+                batteriet spares. Slås til igen automatisk når hoveddøren åbnes.
+
+  # --- RELEASE: hoveddør åbnet (user-spec) eller house→Active (backstop) ---
+  - id: gardin_dormant_pause_release
+    alias: "Gardin-dvale-pause: genoptag sæsonforsvar ved hjemkomst"
+    description: >
+      Frigiver pausen når hoveddøren åbnes (user-spec) eller huset går Active
+      (backstop mod stuck-suspended, fejlklasse #15). Kun én gang (guard på
+      pause_active on). Push kun i Normal (AirBnB silent).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_hoveddoer
+        to: "on"
+      - platform: state
+        entity_id: input_select.house_state
+        to: "Active"
+    condition:
+      - condition: state
+        entity_id: input_boolean.gardin_dormant_pause_active
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.gardin_dormant_pause_active
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "Normal"
+      # Master-toggle (user 2026-10-11: "master toggle skal også slå dem fra").
+      - if:
+          - condition: state
+            entity_id: input_boolean.notifikationer_master_enabled
+            state: "on"
+        then:
+          - service: notify.mobile_app_phone_a
+            data:
+              title: "🪟 Gardin-forsvar genoptaget"
+              message: >-
+                Hjemkomst registreret — sæsonforsvaret styrer gardinerne igen som normalt.

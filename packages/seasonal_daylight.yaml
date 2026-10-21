@@ -1,0 +1,142 @@
+# =============================================================================
+# Sæson-styret "dag"-grænse for sun_bracket (2026-06-23, user-spec)
+# =============================================================================
+# sun_bracket (packages/activity_state.yaml) kalder det "dag" når solen er over
+# en elevation-tærskel. "Dag" HALVERER lux-tærsklen i ~10 rum-gates ("der er lyst,
+# vent med lys"). Om sommeren er det fint (0° = masser af lys over horisonten),
+# men om vinteren står solen knap over 0° midt på dagen → svagt lys, men systemet
+# kalder det stadig "dag" → lyset bliver mindre ivrigt netop når I har brug for det.
+#
+# LØSNING (user-spec): tærsklen følger nu AUTOMATISK kalenderåret via en glat
+# cosinus-kurve — bund om sommeren (solhverv ~21. jun), top om vinteren (solhverv
+# ~21. dec). Default-kurve: sommer 0° (= hidtidig adfærd, så INTET ændrer sig nu)
+# → vinter 8°. Højere vinter-tærskel = svagt vinterlys tæller IKKE som "dag" →
+# lyset forbliver ivrigt gennem dunkle vinterdage. Ingen mode at huske.
+#
+# FINJUSTERING + LÆRING: slideren sun_day_elevation_finetune viser ALTID den
+# aktuelle måneds aktive værdi. Skruer du på den, LÆRER systemet at DEN måned skal
+# bruge din værdi fremover (gemt per-måned som JSON i input_text.sun_day_elev_
+# learned). Måneder du aldrig rører følger auto-kurven. Næste år bruger en lært
+# måned din værdi automatisk. (Samme idé som adaptive lys-læring, bare per måned.)
+#
+# SIKKERT NU: i juni giver auto-kurven ~0° = præcis nuværende adfærd. Slideren
+# sættes af sync-automationen ved HA-start (ingen manuel init nødvendig); tomt
+# learned-felt → auto-kurve. sun_bracket har float(0)-fallback → unavailable =
+# nuværende adfærd.
+# =============================================================================
+
+input_number:
+  sun_day_elevation_finetune:
+    name: "Sæson: 'dag'-grænse finjuster (denne måned)"
+    icon: mdi:sun-angle
+    min: -10
+    max: 15
+    step: 0.5
+    unit_of_measurement: "°"
+    mode: slider
+
+input_text:
+  # Lærte per-måned overrides som JSON {"1": 8.0, ..., "12": 0.0}. Kun måneder
+  # bruger har finjusteret står her; resten følger auto-kurven. Runtime-læring
+  # (ikke i helper-snapshot — runtime-state hører ikke til i snapshottet).
+  sun_day_elev_learned:
+    name: "Sæson: lærte 'dag'-grænser per måned (JSON)"
+    icon: mdi:brain
+    max: 255
+
+template:
+  - sensor:
+      # Den AKTIVE "dag"-elevation lige nu: lært værdi for denne måned hvis sat,
+      # ellers den glatte auto-sæson-kurve. sun_bracket læser denne.
+      - name: "Sun day elevation effective"
+        unique_id: sun_day_elevation_effective
+        unit_of_measurement: "°"
+        icon: mdi:sun-angle
+        state: >
+          {% set m = now().month | string %}
+          {% set raw = states('input_text.sun_day_elev_learned') %}
+          {% set learned = (raw | from_json) if (raw not in ['unknown','unavailable',''] and raw.startswith('{')) else {} %}
+          {% if m in learned %}
+            {{ learned[m] | float(0) | round(1) }}
+          {% else %}
+            {# Glat cosinus: peak ved vinter-solhverv (doy~355), bund ved sommer (doy~172) #}
+            {% set doy = now().strftime('%j') | int %}
+            {% set winter = 8.0 %}
+            {% set summer = 0.0 %}
+            {% set mid = (winter + summer) / 2 %}
+            {% set amp = (winter - summer) / 2 %}
+            {{ (mid + amp * cos(2 * pi * (doy - 355) / 365.0)) | round(1) }}
+          {% endif %}
+        attributes:
+          kilde: >
+            {% set m = now().month | string %}
+            {% set raw = states('input_text.sun_day_elev_learned') %}
+            {% set learned = (raw | from_json) if (raw not in ['unknown','unavailable',''] and raw.startswith('{')) else {} %}
+            {{ 'lært (måned ' ~ m ~ ')' if m in learned else 'auto sæson-kurve' }}
+          maaned: "{{ now().strftime('%B') }}"
+          laerte_maaneder: >
+            {% set raw = states('input_text.sun_day_elev_learned') %}
+            {% set learned = (raw | from_json) if (raw not in ['unknown','unavailable',''] and raw.startswith('{')) else {} %}
+            {{ learned }}
+
+automation:
+  # --- LÆRING: bruger skruer på finjuster-slideren → gem for DENNE måned --------
+  - id: sun_day_elev_learn
+    alias: "Sæson: lær 'dag'-grænse for denne måned (slider → lager)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_number.sun_day_elevation_finetune
+    condition:
+      # KUN ægte bruger-justeringer (UI/app har context.user_id). Sync-automationens
+      # egne skrivninger har user_id=None → lærer ikke (ingen loop).
+      - condition: template
+        value_template: "{{ trigger.to_state.context.user_id is not none }}"
+      - condition: template
+        value_template: "{{ trigger.to_state.state not in ['unknown', 'unavailable'] }}"
+    action:
+      - variables:
+          m: "{{ now().month | string }}"
+          val: "{{ trigger.to_state.state | float(0) }}"
+          raw: "{{ states('input_text.sun_day_elev_learned') }}"
+          cur: >
+            {{ (raw | from_json) if (raw not in ['unknown','unavailable',''] and raw.startswith('{')) else {} }}
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.sun_day_elev_learned
+        data:
+          value: "{{ cur | combine({m: val}) | to_json }}"
+      - service: logbook.log
+        data:
+          name: "Sæson dag-grænse"
+          message: >-
+            Lært: måned {{ m }} → {{ val }}° (gælder den måned fremover; øvrige
+            måneder følger auto-kurven).
+
+  # --- SYNC: ved HA-start + dagligt 00:01 sættes slideren = denne måneds aktive
+  # (effective) værdi, så slideren altid afspejler "denne måneds" niveau og
+  # fanger månedsskift. Service-kald → user_id=None → trigger ikke læring. --------
+  - id: sun_day_elev_sync_slider
+    alias: "Sæson: sync finjuster-slider til denne måneds aktive værdi"
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+      - platform: time
+        at: "00:01:00"
+    action:
+      # Lad effective-sensoren sætte sig efter HA-start.
+      - delay:
+          seconds: 15
+      - variables:
+          eff: "{{ states('sensor.sun_day_elevation_effective') | float(-999) }}"
+      # Kun skriv hvis sensoren er gyldig OG slideren afviger (undgå no-op writes).
+      - condition: template
+        value_template: >-
+          {{ eff > -99
+             and (states('input_number.sun_day_elevation_finetune') | float(-999) - eff) | abs > 0.01 }}
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.sun_day_elevation_finetune
+        data:
+          value: "{{ eff }}"

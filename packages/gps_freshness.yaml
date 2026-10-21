@@ -1,0 +1,136 @@
+# =============================================================================
+# GPS Freshness Sensors — expire stale device_tracker reports efter 30 min
+# =============================================================================
+# User-spec 2026-05-17:
+#   "geo locations skal expire. lige nu bruger den en fra 4 dage siden. det
+#    virker maerkeligt. parent_b og jeg tog begge paa ferie og slog battery
+#    saver paa. en geo location skal expire og blive til unknown efter 30 min
+#    hvis der ikke er en ny."
+#
+# PROBLEM: device_tracker.{phone_a,phone_b} bevarer last-known state
+# selv naar Companion app ikke har rapporteret i dage (battery saver, offline,
+# permission revoked). Eksempel 2026-05-17 PM: Parent B iPhone last_updated
+# 6114 min ago (~4 dage), state stadig "home" → input_boolean.
+# parent_b_home=on misleadingly.
+#
+# DESIGN: trigger-based template binary_sensor genevaluerer hver 2 min plus
+# paa device_tracker state changes. Hvis last_updated > 30 min → off ("stale").
+#
+# DOWNSTREAM:
+#   - automations/presence_gps_stale.yaml clearer parent_a_home/parent_b_home
+#     naar freshness flipper off (= phone offline længe nok til ikke at stole
+#     paa last-known location).
+#   - packages/presence.yaml::presence_*_arrive faar ekstra trigger paa
+#     freshness off→on (= phone reporting igen, re-evaluer home zone).
+#
+# WHY last_updated (not last_changed):
+#   - last_changed = kun naar state ENGLISH ("home" → "not_home") skifter.
+#     Phone offline = state freezer, last_changed flytter ikke.
+#   - last_updated = ANY attribute change. Companion app paa aktiv telefon
+#     pinger lat/lon/battery konstant → last_updated bumper hver ping.
+#     Phone offline → last_updated freezer = perfekt freshness signal.
+#
+# CAVEAT: HA restart bumper last_updated paa alle entities til restart-tid.
+# Lige efter restart vil et phone der har vaeret offline i dage staa som
+# "fresh" indtil 30 min er gaaet uden ægte ping. = "grace period" post-
+# restart. For Parent B (4-dages-ferie) betyder det: efter restart har vi
+# ~30 min hvor parent_b_home stadig kan vaere on, derefter clearer det
+# automatisk hvis ingen ægte ping. Acceptabel kompromis.
+# =============================================================================
+
+input_number:
+  # 2026-08-05 (item 6): hvor længe en telefon må være tavs MENS trackeren
+  # stadig står i home-zonen, før hjemme-flaget ryddes på ren staleness.
+  # Erstatter den hårdkodede 45-minutters dag-tærskel i
+  # automations/presence_gps_stale.yaml. Se dén fils header for målingen.
+  presence_gps_stale_hjemme_timer:
+    name: "📍 Hjemme-flag: timer tavs før det ryddes"
+    min: 1
+    max: 48
+    step: 1
+    unit_of_measurement: "t"
+    icon: mdi:home-clock-outline
+
+  # 2026-08-14: samme tærskel, men for en telefon der IKKE LÆNGERE KAN melde
+  # afgang (baggrunds-lokation frataget). Se binary_sensor.parent_b_gps_baggrund_ok.
+  presence_gps_stale_degraderet_minutter:
+    name: "📍 Hjemme-flag: minutter når baggrunds-GPS er slået fra"
+    min: 5
+    max: 720
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:map-marker-off-outline
+
+template:
+  - trigger:
+      # Periodisk re-eval saa freshness flipper off naar last_updated alders.
+      # 2-min cadence er nok — 30-min threshold tolererer 2-min slop.
+      - platform: time_pattern
+        minutes: "/2"
+      # Re-eval øjeblikkeligt naar device_tracker bumper (= ny ping ankommer)
+      - platform: state
+        entity_id:
+          - device_tracker.phone_a
+          - device_tracker.phone_b
+          - sensor.phone_b_location_permission
+      # HA restart resilience
+      - platform: homeassistant
+        event: start
+    binary_sensor:
+      - name: "Parent A GPS fresh"
+        unique_id: parent_a_gps_fresh
+        device_class: connectivity
+        icon: mdi:cellphone-marker
+        state: >
+          {% set t = states.device_tracker.phone_a %}
+          {% if t is none %}
+            off
+          {% else %}
+            {{ (now() - t.last_updated).total_seconds() < 1800 }}
+          {% endif %}
+        attributes:
+          tracker_state: >
+            {{ states('device_tracker.phone_a') }}
+
+      - name: "Parent B GPS fresh"
+        unique_id: parent_b_gps_fresh
+        device_class: connectivity
+        icon: mdi:cellphone-marker
+        state: >
+          {% set t = states.device_tracker.phone_b %}
+          {% if t is none %}
+            off
+          {% else %}
+            {{ (now() - t.last_updated).total_seconds() < 1800 }}
+          {% endif %}
+        attributes:
+          tracker_state: >
+            {{ states('device_tracker.phone_b') }}
+
+      # =====================================================================
+      # 2026-08-14: KAN telefonen overhovedet melde en afgang?
+      # =====================================================================
+      # "GPS fresh" måler kun HVOR LÆNGE SIDEN sidste rapport — den kan ikke
+      # skelne "tavs fordi hun ligger stille hjemme" (normalt for en iPhone,
+      # hele grunden til at 26-timers-tærsklen findes) fra "tavs fordi iOS har
+      # frataget appen baggrunds-lokation". I det sidste tilfælde er trackeren
+      # ikke langsom — den er STRUKTURELT UDE AF STAND til nogensinde at melde
+      # `not_home`, og en frossen `home` er derfor ikke svag evidens, men NUL
+      # evidens. Målt 08-14: permission faldt til "Authorized when in use"
+      # kl. 06:40, trackeren stod frosset på `home` fra 21:12 aftenen før, og
+      # parent_b_home blev stående on mens hun var ude.
+      #
+      # FEJLER ÅBENT: `unknown`/`unavailable` (typisk lige efter en HA-restart,
+      # før Companion har sendt sine sensorer) læses som OK — vi rydder aldrig
+      # et hjemme-flag på et manglende svar, kun på et kendt-dårligt.
+      # Kun Parent B har denne sensor; Android (phone_a) rapporterer den ikke.
+      - name: "Parent B GPS baggrund ok"
+        unique_id: parent_b_gps_baggrund_ok
+        device_class: connectivity
+        icon: mdi:map-marker-check-outline
+        state: >
+          {% set p = states('sensor.phone_b_location_permission') %}
+          {{ p in ['unknown', 'unavailable', 'none', ''] or 'always' in p | lower }}
+        attributes:
+          permission: >
+            {{ states('sensor.phone_b_location_permission') }}

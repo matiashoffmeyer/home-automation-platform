@@ -1,0 +1,508 @@
+# =============================================================================
+# Sofastuens to IKEA Thread-spots (farve) — parret 2026-09-23 (node 473/474)
+# =============================================================================
+# User-spec 2026-09-23: "der kommer to ikea thread spots op i sofa stuen,
+# color, integrer dem på forhånd så det er nemt at føre dem ind når de er
+# parret. under party mode skal de fungere som individuelle pærer (med
+# forskellige farver). i automode skal de bare ha samme styrke og farve som
+# sofa læselampen og følge samme tænd og sluk som sofa læselampen."
+#
+# ▶ VED PARRING (Matter → docs/matter_pairing_playbook.md FØRST): navngiv
+#   enhederne "Stue spot 1" og "Stue spot 2" → light.stue_spot_1 /
+#   light.stue_spot_2 (tjek sluggen i /api/states). Så virker alt herunder.
+#   Grupperne (stue_room, alle_indvendige, alle_lys) er legacy-grupper og
+#   opdaterer KUN ved restart (permanent faktum) → genstart HA efter parring.
+#
+# DESIGN — tænd/sluk + styrke er stadig et SPEJL af læselampen
+# (light.stue_laesehygge): ~20 filer styrer den (presence, lux, scener,
+# Styrbar, dark mode …), og at lægge spotsene i hver af dem ville være 20
+# roster-rettelser (fejlklasse #16). FARVEN er derimod hverken et spejl eller
+# en fast værdi — spejlet sender ALDRIG farve (se FARVE nedenfor).
+# UNDTAGELSER (spejlet holder pause):
+#   - party-scenen (binary_sensor.scene_party_active) → scene_party giver dem
+#     hver sin farve,
+#   - dance mode (input_boolean.dance_mode) → dance_mode.yaml animerer dem
+#     som individuelle pærer (stue-rosteret).
+#   - ild (binary_sensor.stue_spots_ild_aktiv, B227) → stue_spots_ild.yaml
+#     ejer farve + styrke på en tændt spot; spejlet tænder/slukker stadig.
+#   Når pausen slutter, synkes de straks igen.
+# FARVE (user-spec 2026-10-05: "gør det sådan at sofa spots bare bruger den
+#   farve de sidst har været på … så kan jeg justere" + samme dag: "automation
+#   farver skal ikke persiste på spots"): spotsene husker DIN farve, ikke
+#   effekternes.
+#   - stue_spots_husk_brugerfarve gemmer farven når DU sætter den direkte på en
+#     spot (app/dashboard: light.turn_on med user_id). Kald fra en scene eller et
+#     script tæller ikke — de arver dit user_id når du starter dem med en finger
+#     (samme diskriminator som manual_override.yaml: scenens/scriptets egen
+#     context.id = kaldets). Automations har intet user_id og tæller aldrig.
+#     Gemt som "hs:H,S" / "rgb:R,G,B" / "xy:X,Y" / "k:KELVIN" i
+#     input_text.stue_spot_1_brugerfarve / _2_ (præfikset forhindrer at HA
+#     native-parser "R,G,B" til en tuple).
+#   - Spejlet sætter den gemte farve når det tænder en SLUKKET spot, og når en
+#     fest/dance slutter (pause_slut). Mens en spot lyser, rører spejlet ikke
+#     farven — ellers kæmpede det med regn-blinkets lån (2026-10-02-buggen).
+#   - Intet gemt endnu (urørt felt) → kun styrke → pæren beholder sin sidste farve.
+#   Sofa Zen sætter sin egen kelvin og afleverer uden at rette den; næste gang
+#   spotsene tændes fra slukket, er det din farve igen.
+# KØLIGERE (historisk, 2026-09-23/30): input_number.stue_spots_auto_kelvin_offset
+#   bruges IKKE her — kun Sofa Zen-scenen
+#   (packages/sofa_zen_auto.yaml) læser den stadig, til sin egen kelvin.
+# STYRKE I AUTO (user-spec 2026-09-24: "sæt de nye stue spots til 90% som
+#   default på auto mode — de er dækket af en filtplade", straks rettet til
+#   "100% er bedre"; 2026-10-07: "giv mig control over spots stues lysstyrke
+#   på auto også, ligesom jeg nu kan styre farverne"): i Auto får hver spot
+#   SIN EGEN huskede styrke (input_number.stue_spot_1_brugerstyrke / _2_),
+#   fanget af stue_spots_husk_brugerfarve når DU sætter styrken direkte på
+#   spotten (samme diskriminator som farven). 0 = intet husket → den fælles
+#   input_number.stue_spots_auto_brightness_pct er fallback (0 dér = følg
+#   læselampen). Begge ganges med el-pris-dæmpningen. Dark Mode / filmmørke i
+#   stuen undtaget — dér dæmpes læselampen bevidst, og spotsene følger den ned.
+#   Uden for Auto spejler de læselampens styrke som før.
+#   MØRK MORGEN (2026-10-11): når spotsene spejler, får de læselampen ÷
+#   input_number.stue_spots_morgen_forhold (1,4) — læselampen skal være den
+#   stærkeste om morgenen. Huskede Auto-styrker vinder over forholdet.
+#   Rører du en spot i Auto, sætter manual_override rummet Manual, og spejlet
+#   fyrer på det skift — den spot du LIGE har rørt (state skrevet af en bruger
+#   < 10 s siden) springes over i netop den kørsel, ellers rullede spejlet din
+#   styrke tilbage til læselampens 0,8 s efter.
+# Husdækkende sluk (godnat, sluk-alt, dark mode) rammer dem via grupperne.
+# =============================================================================
+
+input_text:
+  # 2026-10-05: din sidst valgte farve pr. spot (se FARVE i header). Ingen
+  # `initial:` — skrives af stue_spots_husk_brugerfarve; input_text.reload er
+  # husets eneste gratis helper-reload.
+  stue_spot_1_brugerfarve:
+    name: "Stue spot 1: din farve (husket)"
+    icon: mdi:palette
+    max: 40
+  stue_spot_2_brugerfarve:
+    name: "Stue spot 2: din farve (husket)"
+    icon: mdi:palette
+    max: 40
+
+input_number:
+  # Bruges ikke af spot-spejlet (det sender ingen farve, se FARVE i header) —
+  # kun Sofa Zen-scenen (packages/sofa_zen_auto.yaml) læser den.
+  stue_spots_auto_kelvin_offset:
+    name: "Sofa Zen: spots køligere end lampe (K)"
+    icon: mdi:thermometer-plus
+    min: 0
+    max: 1500
+    step: 50
+    unit_of_measurement: "K"
+    mode: slider
+
+  # 2026-10-07: din styrke i Auto pr. spot (se STYRKE I AUTO i header). Ingen
+  # `initial:` — skrives af stue_spots_husk_brugerfarve (eller fra Indstillinger).
+  # 0 = intet husket → fallback til stue_spots_auto_brightness_pct.
+  stue_spot_1_brugerstyrke:
+    name: "Stue spot 1: din styrke i Auto (husket)"
+    icon: mdi:brightness-percent
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+  stue_spot_2_brugerstyrke:
+    name: "Stue spot 2: din styrke i Auto (husket)"
+    icon: mdi:brightness-percent
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-10-11 (user-spec: "spots i stuen spejler lysstyrken af læselampen om
+  # morgenen 1 til 1. Det skal være 1 til 1.4 i stedet hvor læselampen er
+  # stærkest"): på en mørk morgen (binary_sensor.open_plan_mork_morgen, familie)
+  # får spotsene læselampens styrke ÷ dette tal når de ellers ville spejle den
+  # 1:1. Dine huskede Auto-styrker vinder ("ja auto styrker skal vinde",
+  # 2026-10-11). 1,0 = spejl 1:1 som før.
+  stue_spots_morgen_forhold:
+    name: "Stue-spots: læselampe ÷ forhold om morgenen"
+    icon: mdi:division
+    min: 1.0
+    max: 3.0
+    step: 0.1
+    mode: slider
+
+  # 2026-09-24: fast styrke i Auto (filtpladen dæmper dem). 0 = spejl læselampen.
+  # Siden 2026-10-07 kun FALLBACK for en spot uden egen husket styrke.
+  stue_spots_auto_brightness_pct:
+    name: "Stue-spots: styrke i Auto (%)"
+    icon: mdi:brightness-6
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # 2026-09-28 (user-spec): "fast max på 80% for auto-lys. el-pris må gerne
+  # tage den ned. og her snakker vi kun læselampen i stuen." Loftet sættes på
+  # skyder-delen (grundværdi × aggressivitet); el-prisen ganges på EFTER, så
+  # den kan trække under loftet. Læses af presence_light_sofa_on og af
+  # live-omskaleringen i packages/global_tuning.yaml.
+  stue_laeselampe_auto_max_pct:
+    name: "Stue-læselampe: max i Auto (%)"
+    icon: mdi:floor-lamp
+    min: 10
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+automation:
+  - id: stue_spots_spejl_laeselampe
+    alias: "Stue-spots: følg sofa-læselampen (tænd/sluk, styrke) — tænder i din farve"
+    # restart + kort debounce: en fade på læselampen giver ~1 rapport/sek;
+    # kun den sidste skal kopieres.
+    mode: restart
+    trigger:
+      # 2026-10-02 (user-bug: "spots hænger fast på vejrvarsel"): UDEN from/to/
+      # not_to — HA ignorerer attribut-ændringer så snart ét af dem er sat.
+      # Med `not_to` så spejlet kun tænd/sluk: sidste kørsel 06:30:09 kopierede
+      # regn-blinkets blå (xy 215°), og varslets 2700 K-bookend + scene-restore
+      # (kun farve, lampen forblev tændt) så det aldrig → spottene hang blå.
+      # unavailable/unknown filtreres i stedet af en condition nedenfor.
+      - platform: state
+        entity_id: light.stue_laesehygge
+      # Pausen slutter → synk med det samme.
+      - platform: state
+        entity_id: binary_sensor.scene_party_active
+        from: "on"
+        to: "off"
+        id: pause_slut
+      - platform: state
+        entity_id: input_boolean.dance_mode
+        from: "on"
+        to: "off"
+        id: pause_slut
+      # B227: ilden slipper (kill switch, Manual, Dark Mode …) → din farve igen.
+      - platform: state
+        entity_id: binary_sensor.stue_spots_ild_aktiv
+        from: "on"
+        to: "off"
+        id: pause_slut
+      # 2026-10-13: ild-morgenens flag er kilden mens læselampen er slukket
+      # (packages/stue_ild_morgen.yaml) → off uden læselampe = sluk spotsene.
+      - platform: state
+        entity_id: input_boolean.stue_ild_morgen_aktiv
+        from: ["on", "off"]
+        to: ["on", "off"]
+      - platform: state
+        entity_id: input_number.stue_spots_auto_brightness_pct
+      # Din styrke pr. spot skruet fra Indstillinger → vis den med det samme.
+      # Når husk-automationen selv skriver den (du rørte spotten), er spotten
+      # allerede der — conditionen nedenfor lader kun en brugers egen skrivning
+      # igennem (som condition, så en ventende kørsel ikke genstartes).
+      - platform: state
+        entity_id:
+          - input_number.stue_spot_1_brugerstyrke
+          - input_number.stue_spot_2_brugerstyrke
+        not_from: ["unavailable", "unknown"]
+        id: brugerstyrke
+      - platform: state
+        entity_id:
+          - binary_sensor.dark_mode_stue
+          - binary_sensor.filmmoerke_stue
+        from: ["on", "off"]
+        to: ["on", "off"]
+      - platform: state
+        entity_id: input_select.room_mode_stue
+        not_from: ["unavailable", "unknown"]
+      # En spot kommer tilbage på nettet (første parring, Thread-flap) → synk.
+      - platform: state
+        entity_id:
+          - light.stue_spot_1
+          - light.stue_spot_2
+        from: "unavailable"
+    condition:
+      # Erstatter læselampe-triggerens gamle `not_to` — gælder KUN dens egen
+      # flanke, så de øvrige triggere opfører sig som før.
+      - condition: template
+        value_template: >-
+          {{ trigger is not defined
+             or trigger.entity_id != 'light.stue_laesehygge'
+             or trigger.to_state is none
+             or trigger.to_state.state not in ['unavailable', 'unknown'] }}
+      - condition: template
+        value_template: >-
+          {{ trigger is not defined
+             or trigger.id != 'brugerstyrke'
+             or (trigger.to_state.context.user_id is not none
+                 and is_state('input_select.room_mode_stue', 'Auto')) }}
+      - condition: state
+        entity_id: binary_sensor.scene_party_active
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.dance_mode
+        state: "off"
+      # 2026-10-03 (user: "overskriv virkede ikke på nyligt tilføjede lys som sofa
+      # spots"): en gemt scene (Overskriv) der INDEHOLDER spotsene må ikke blive
+      # overskrevet af spejlet 800 ms senere — det kopierer læselampens look over
+      # det brugeren gemte. Spejlet holder pause mens (a) den automatiske Sofa Zen
+      # ejer open-plan, eller (b) en dashboard-scene med spots i sit snapshot er
+      # aktiv og stuen ikke er Auto. (b) kræver Manual: input_select.active_scene
+      # ryddes kun af godnat/knapper, så en gammel scene må ikke fryse spotsene i
+      # Auto. Bevidst INGEN trigger på at pausen slutter — et slip må ikke få
+      # spotsene til at hoppe til Auto-styrken; næste læselampe-skift synker dem.
+      - condition: state
+        entity_id: binary_sensor.sofa_zen_holder_sofa
+        state: "off"
+      - condition: template
+        value_template: >-
+          {% set sc = states('input_select.active_scene') %}
+          {% set e = states['scene.snap_' ~ sc] if sc not in ['none', 'unknown', 'unavailable', ''] else none %}
+          {% set ents = (e.attributes.entity_id or []) if (e is not none and e.state != 'unavailable') else [] %}
+          {{ is_state('input_select.room_mode_stue', 'Auto')
+             or not ('light.stue_spot_1' in ents or 'light.stue_spot_2' in ents) }}
+    action:
+      - delay:
+          milliseconds: 800
+      # Gen-tjek efter debounce: en kørsel der startede lige FØR Zen tændte må ikke
+      # skrive over spotsene der er ved at fade (2026-10-03).
+      - condition: state
+        entity_id: binary_sensor.sofa_zen_holder_sofa
+        state: "off"
+      - variables:
+          spots: >-
+            {{ ['light.stue_spot_1', 'light.stue_spot_2']
+               | reject('is_state', 'unavailable') | reject('is_state', 'unknown') | list }}
+          # 2026-10-07: rummet forlader Auto FORDI du lige selv rørte en spot
+          # (state skrevet med dit user_id < 10 s siden; manual_override flippede
+          # rummet) → ingen synk på netop det skift. Ellers rullede spejlet din
+          # styrke tilbage 0,8 s efter, og den anden spot hoppede mens du
+          # justerede. Næste læselampe-skift synker som før.
+          egen_beroering: >-
+            {% set ns = namespace(r=false) %}
+            {% if trigger is defined and trigger.entity_id in ['input_select.room_mode_stue', 'binary_sensor.stue_spots_ild_aktiv', 'input_boolean.stue_ild_morgen_aktiv']
+                  and not is_state('input_select.room_mode_stue', 'Auto') %}
+              {% for e in ['light.stue_spot_1', 'light.stue_spot_2'] %}
+                {% set s = states[e] %}
+                {% if s is not none and s.context.user_id is not none
+                      and (now() - s.last_updated).total_seconds() < 10 %}
+                  {% set ns.r = true %}
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            {{ ns.r }}
+          # 2026-10-13: + ild-morgenens flag (læselampen slukket i starten).
+          kilde_on: >-
+            {{ is_state('light.stue_laesehygge', 'on')
+               or is_state('input_boolean.stue_ild_morgen_aktiv', 'on') }}
+          # Auto (uden Dark Mode/filmmørke): fast styrke i stedet for
+          # læselampens — filtpladen foran spotsene dæmper dem. Selve tallet
+          # vælges pr. spot i løkken nedenfor (din huskede, ellers den fælles).
+          auto_fast: >-
+            {{ is_state('input_select.room_mode_stue', 'Auto')
+               and not is_state('binary_sensor.dark_mode_stue', 'on')
+               and not is_state('binary_sensor.filmmoerke_stue', 'on') }}
+          # 2026-09-28 (user: "spots må også gerne kunne påvirkes nedad af el
+          # pris"): fast styrke × el-pris-dæmpningen (1,0 = neutral).
+          pf: "{{ [states('sensor.elpris_dim_factor') | float(1.0), 1.0] | min }}"
+          lampe_bri: "{{ state_attr('light.stue_laesehygge', 'brightness') | int(0) }}"
+          # 2026-10-11: mørk morgen (familie) → læselampen ÷ forholdet, så
+          # læselampen er den stærkeste. Erstatter KUN 1:1-spejlet — dine
+          # huskede Auto-styrker vinder (user 2026-10-11). Se stue_spots_morgen_forhold.
+          morgen_forhold: >-
+            {{ [states('input_number.stue_spots_morgen_forhold') | float(1.4), 1.0] | max
+               if is_state('binary_sensor.open_plan_mork_morgen', 'on')
+                  and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+               else 0 }}
+          # 2026-10-07 (user-spec "blid ramp som køkken"): mens entré-velkomsten
+          # venter (packages/openplan_entre_velkomst.yaml) følger spottene
+          # læselampens langsomme morgen-rampe i stedet for at hoppe op på 1 s.
+          # 2026-10-08: + mørk morgen (× slider). Tempo og regime bor i
+          # sensor.open_plan_fade_ind_effektiv — samme som læselampens tænd-veje.
+          tr: >-
+            {{ states('sensor.open_plan_fade_ind_effektiv') | int(3)
+               if state_attr('sensor.open_plan_fade_ind_effektiv', 'regime') in ['velkomst', 'moerk_morgen']
+               else 1 }}
+      - condition: template
+        value_template: "{{ spots | length > 0 and not egen_beroering }}"
+      - if:
+          - condition: template
+            value_template: "{{ not kilde_on }}"
+        then:
+          - service: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: "{{ spots }}"
+            data:
+              transition: 2
+        else:
+          # Pr. spot: DIN farve når den tændes fra slukket eller en fest/dance
+          # slutter; ellers kun styrke (farven røres ikke mens den lyser).
+          # Se FARVE i header.
+          # B227: mens ilden er aktiv ejer stue_spots_ild farve + styrke på en
+          # spot der lyser — spejlet tænder kun de slukkede (i din farve).
+          - repeat:
+              for_each: >-
+                {{ spots | reject('is_state', 'on') | list
+                   if is_state('binary_sensor.stue_spots_ild_aktiv', 'on') else spots }}
+              sequence:
+                - variables:
+                    gem: >-
+                      {% set g = states('input_text.' ~ repeat.item.split('.')[1] ~ '_brugerfarve') %}
+                      {{ g if g[:3] in ['hs:', 'xy:'] or g[:4] == 'rgb:' or g[:2] == 'k:' else '' }}
+                    saet_farve: >-
+                      {{ gem != '' and (not is_state(repeat.item, 'on')
+                         or (trigger.id if trigger is defined else '') == 'pause_slut') }}
+                    # Din huskede styrke for DENNE spot (0 = intet husket →
+                    # den fælles slider; 0 dér = følg læselampen).
+                    bri: >-
+                      {% set egen = states('input_number.' ~ repeat.item.split('.')[1] ~ '_brugerstyrke') | float(0) %}
+                      {% set pct = egen if egen > 0 else states('input_number.stue_spots_auto_brightness_pct') | float(0) %}
+                      {% if auto_fast and pct > 0 %}
+                        {{ [(pct * pf * 2.54) | round(0) | int, 3] | max }}
+                      {% elif morgen_forhold | float(0) >= 1 %}
+                        {{ (lampe_bri / (morgen_forhold | float(1.4))) | round(0) | int }}
+                      {% else %}
+                        {{ lampe_bri }}
+                      {% endif %}
+                - choose:
+                    - conditions: "{{ saet_farve and gem[:3] == 'hs:' }}"
+                      sequence:
+                        - service: light.turn_on
+                          continue_on_error: true
+                          target: {entity_id: "{{ repeat.item }}"}
+                          data:
+                            brightness: "{{ [bri, 1] | max }}"
+                            hs_color: "{{ gem[3:].split(',') | map('float') | list }}"
+                            transition: "{{ tr }}"
+                    - conditions: "{{ saet_farve and gem[:4] == 'rgb:' }}"
+                      sequence:
+                        - service: light.turn_on
+                          continue_on_error: true
+                          target: {entity_id: "{{ repeat.item }}"}
+                          data:
+                            brightness: "{{ [bri, 1] | max }}"
+                            rgb_color: "{{ gem[4:].split(',') | map('int') | list }}"
+                            transition: "{{ tr }}"
+                    - conditions: "{{ saet_farve and gem[:3] == 'xy:' }}"
+                      sequence:
+                        - service: light.turn_on
+                          continue_on_error: true
+                          target: {entity_id: "{{ repeat.item }}"}
+                          data:
+                            brightness: "{{ [bri, 1] | max }}"
+                            xy_color: "{{ gem[3:].split(',') | map('float') | list }}"
+                            transition: "{{ tr }}"
+                    - conditions: "{{ saet_farve and gem[:2] == 'k:' }}"
+                      sequence:
+                        - service: light.turn_on
+                          continue_on_error: true
+                          target: {entity_id: "{{ repeat.item }}"}
+                          data:
+                            brightness: "{{ [bri, 1] | max }}"
+                            color_temp_kelvin: "{{ gem[2:] | int }}"
+                            transition: "{{ tr }}"
+                  default:
+                    - service: light.turn_on
+                      continue_on_error: true
+                      target: {entity_id: "{{ repeat.item }}"}
+                      data:
+                        brightness: "{{ [bri, 1] | max }}"
+                        transition: "{{ tr }}"
+
+  # ---------------------------------------------------------------------------
+  # 2026-10-05 (user-spec "automation farver skal ikke persiste på spots"):
+  # husk den farve DU sætter direkte på en spot. Se FARVE i header.
+  # 2026-10-07: samme vej husker også din STYRKE (se STYRKE I AUTO i header).
+  # Målt 10 døgn: appen sender styrke som `brightness_pct` alene (19 kald) og
+  # farve som hs_color/color_temp_kelvin alene — aldrig brightness_step.
+  # ---------------------------------------------------------------------------
+  - id: stue_spots_husk_brugerfarve
+    alias: "Stue-spots: husk den farve og styrke du selv sætter (effekter huskes ikke)"
+    mode: queued
+    max: 10
+    max_exceeded: silent
+    trigger:
+      - platform: event
+        event_type: call_service
+        event_data:
+          domain: light
+          service: turn_on
+    condition:
+      # Ægte bruger (app/dashboard). Automations har user_id = None.
+      - condition: template
+        value_template: "{{ trigger.event.context.user_id is not none }}"
+      # Direkte kald: hverken en scene eller et script du har startet — de arver
+      # dit user_id, og deres egen context.id er kaldets (manual_override.yaml,
+      # målt 30/8). En fest-/Zen-scene tappet med en finger er en EFFEKT-farve.
+      - condition: template
+        value_template: >-
+          {% set ctx = trigger.event.context.id %}
+          {{ states.scene | selectattr('context.id', 'eq', ctx) | list | count == 0
+             and states.script | selectattr('context.id', 'eq', ctx) | list | count == 0 }}
+      # Rammer en spot direkte (ikke via en gruppe) OG sætter en farve eller
+      # en absolut styrke.
+      - condition: template
+        value_template: >-
+          {% set sd = trigger.event.data.service_data or {} %}
+          {% set t = sd.get('entity_id', []) %}
+          {% set t = [t] if t is string else (t | list) %}
+          {{ ('light.stue_spot_1' in t or 'light.stue_spot_2' in t)
+             and (sd.keys() | select('in', ['hs_color', 'rgb_color', 'xy_color',
+                                             'color_temp_kelvin', 'color_temp',
+                                             'brightness_pct', 'brightness'])
+                  | list | count) > 0 }}
+    action:
+      - variables:
+          farve: >-
+            {% set sd = trigger.event.data.service_data %}
+            {% set ns = namespace(v='') %}
+            {% if 'hs_color' in sd %}
+              {% set ns.v = 'hs:' ~ (sd['hs_color'][0] | float | round(1)) ~ ',' ~ (sd['hs_color'][1] | float | round(1)) %}
+            {% elif 'rgb_color' in sd %}
+              {% set ns.v = 'rgb:' ~ (sd['rgb_color'] | map('int') | join(',')) %}
+            {% elif 'xy_color' in sd %}
+              {% set ns.v = 'xy:' ~ (sd['xy_color'][0] | float | round(4)) ~ ',' ~ (sd['xy_color'][1] | float | round(4)) %}
+            {% elif 'color_temp_kelvin' in sd %}
+              {% set ns.v = 'k:' ~ (sd['color_temp_kelvin'] | int) %}
+            {% elif 'color_temp' in sd %}
+              {% set ns.v = 'k:' ~ ((1000000 / (sd['color_temp'] | float(370))) | round(0) | int) %}
+            {% endif %}
+            {{ ns.v }}
+          # Styrke i hele % (0 = kaldet satte ingen styrke / slukkede).
+          styrke: >-
+            {% set sd = trigger.event.data.service_data %}
+            {% if 'brightness_pct' in sd %}
+              {% set p = sd['brightness_pct'] | float(0) %}
+            {% elif 'brightness' in sd %}
+              {% set p = sd['brightness'] | float(0) / 2.55 %}
+            {% else %}
+              {% set p = 0 %}
+            {% endif %}
+            {{ [[p | round(0) | int, 1] | max, 100] | min if p > 0 else 0 }}
+          ramt: >-
+            {% set t = trigger.event.data.service_data.get('entity_id', []) %}
+            {% set t = [t] if t is string else (t | list) %}
+            {{ ['light.stue_spot_1', 'light.stue_spot_2'] | select('in', t) | list }}
+      - condition: template
+        value_template: "{{ farve != '' or styrke | int(0) > 0 }}"
+      - repeat:
+          for_each: "{{ ramt }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ farve != '' }}"
+              then:
+                - service: input_text.set_value
+                  target:
+                    entity_id: "input_text.{{ repeat.item.split('.')[1] }}_brugerfarve"
+                  data:
+                    value: "{{ farve }}"
+            # Value-compare: samme tal igen = ingen skrivning (slider-drag).
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ styrke | int(0) > 0
+                       and states('input_number.' ~ repeat.item.split('.')[1] ~ '_brugerstyrke') | float(-1) != styrke | float(0) }}
+              then:
+                - service: input_number.set_value
+                  target:
+                    entity_id: "input_number.{{ repeat.item.split('.')[1] }}_brugerstyrke"
+                  data:
+                    value: "{{ styrke | int(0) }}"

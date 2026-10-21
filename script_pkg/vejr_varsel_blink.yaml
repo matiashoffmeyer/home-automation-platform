@@ -1,0 +1,158 @@
+# =============================================================================
+# script_pkg/vejr_varsel_blink.yaml — fælles renderer for vejr-varslernes blink
+# =============================================================================
+# CALLED-FROM: automations/rain_warning.yaml
+#   - vejr_morgen_regn_vind_blink  (regn / sne / vind / UV)
+#   - vejr_aften_nat_varsel        (regn / vind)
+#
+# HVORFOR (2026-08-30, målt): blink-løkken var copy-pastet 6 gange, og hver
+# iteration sendte FARVEN igen selvom den er identisk hele blokken igennem.
+# På ZHA koster det to zigbee-frames pr. pære (farve-cluster + level-cluster)
+# hvor et sluk kun koster én. Målt over 3 døgn på de 3 lamper der faktisk er på
+# nettet (spisestue_loft, stue_laesehygge, koekken_lyskaede):
+#
+#     ON-bølge  (farve+niveau):  p50 101 ms · p90 275 ms · max 554 ms
+#     OFF-bølge (kun on/off):    p50  58 ms · p90  85 ms · max 112 ms
+#
+# Præcis 2:1 = farve-framen. Konsekvensen var synlig: sne-blinket havde en
+# ON-fase på 120 ms, altså KORTERE end den tid det tog at nå ud til alle tre
+# pærer — den sidste pære fik typisk sin tænding efter at slukket allerede var
+# sendt. Det er "tungt, asynkront og urytmisk".
+#
+# GREBET: farven sættes ÉN gang før løkken, og blink 2..n er rene niveau-kald.
+# Zigbee-pærer beholder sidst-aktive farve hen over et sluk (samme egenskab som
+# varslets bookends allerede læner sig op ad), så det ses ikke — men ON-bølgen
+# bliver lige så hurtig som OFF-bølgen, og blinket bliver symmetrisk.
+#
+# TRADE-OFF: taber en pære præcis den FØRSTE (farve-bærende) frame, blinker den
+# resten af blokken i forkert farve i stedet for at selv-hele på næste blink.
+# Accepteret: hver effekt-blok sætter farven forfra, bookends re-asserter, og
+# de deltagende pærer har 1 unavailable-flanke på 3 døgn.
+#
+# ON_MS-GULV: et blink kan aldrig se synkront ud hvis dets ON-fase er kortere
+# end den bølge det tager at nå alle pærer. Under unicast var bølgen p90 85 ms
+# pr. frame, og gulvet var derfor 250 ms.
+#
+# 2026-08-30, GROUPCAST: `lamps` er nu ZHA-GRUPPER (light.zbt_2_vejrvarsel_
+# morgen/aften, zigbee.db group 2/3), ikke lister. Ét frame til gruppe-adressen
+# rammer alle pærer samtidig, så der er ingen per-pære-serialisering tilbage at
+# være usynkron i. Gulvet er derfor sænket til 120 ms = sneens designværdi.
+# Pærernes egen `on_off_transition_time` er 0 → de smører ikke selv kanten ud.
+#
+# PRÆMISSEN ER MÅLKANALEN, ikke tallet: gulvet gælder kun så længe `lamps` er
+# en gruppe-entity. Kaldes scriptet med en LISTE af pærer, er bølgen tilbage og
+# 120 ms er for kort — så skal kalderen selv sende on_ms ≥ 250.
+#
+# GROUPCAST-TRADE-OFF: et gruppe-frame er broadcast = ingen APS-ACK pr. pære.
+# Misser en pære et frame, er der ingen retry (unicast havde en). Samme
+# accept-argument som farve-grebet ovenfor: hver blok sætter forfra, og
+# bookends re-asserter.
+#
+# MÅLE-ADVARSEL: ZHA skriver ANTAGET state på gruppens medlemmer efter et
+# gruppe-kald, så member-rækkerne i recorderen ligger < 3 ms fra hinanden uanset
+# hvad radioen gjorde. Recorderen kan altså IKKE længere bevise gruppe-blinkets
+# synkronitet — kun pærernes egne attribut-reports (dem der ligger 100+ ms fra
+# hinanden) er ægte målinger. Skal synkroniteten efterprøves, er det på
+# bookend-kaldene eller fysisk, ikke på blink-rækkerne.
+# =============================================================================
+
+vejr_varsel_blink:
+  alias: "Vejr-varsel: render blink-mønster"
+  description: >
+    Blinker et sæt lamper N gange i én farve. Farven sendes kun på første
+    blink (se fil-header) — resten er rene niveau-kald, så bølgen ud til
+    pærerne er lige hurtig ved tænd og sluk.
+  mode: single
+  max_exceeded: silent
+  fields:
+    lamps:
+      description: >
+        Blink-mål. Send en ZHA-GRUPPE (ét groupcast-frame). En liste virker
+        også, men så gælder on_ms-gulvet på 120 ms ikke — se fil-headeren.
+      required: true
+      example: "light.zbt_2_vejrvarsel_morgen"
+    count:
+      description: "Antal blink."
+      required: true
+      example: 2
+    on_ms:
+      description: "Hvor længe lyset er tændt pr. blink (ms). Gulv: 120."
+      required: true
+      example: 500
+    gap_ms:
+      description: "Mørk pause efter hvert blink (ms)."
+      required: true
+      example: 400
+    gap_ms_max:
+      description: >
+        Sæt > gap_ms for en TILFÆLDIG pause i intervallet gap_ms..gap_ms_max
+        (sne-sprinkle). Udelades = fast pause.
+      example: 900
+    hue:
+      description: "Farve-hue 0-360 ved fuld mætning. Udelades = brug kelvin."
+      example: 216
+    kelvin:
+      description: "Hvid-temperatur. Bruges kun når hue udelades."
+      example: 6500
+  sequence:
+    # NB `| default(x)` er ikke pynt: et felt der ikke sendes med i kaldet er
+    # UDEFINERET i script-`variables:`, og et bart `| int(0)` rejser
+    # UndefinedError → hele automationen aborterer (målt 30/8: varslet stoppede
+    # efter bookenden fordi gap_ms_max kun sendes af sne-grenen).
+    - variables:
+        # Gulv, ikke kosmetik: under bølge-tiden kan blinket ikke være synkront.
+        # 120 forudsætter at `lamps` er en ZHA-gruppe (bølge ≈ 0) — se headeren.
+        on_d: "{{ [on_ms | default(500) | int(500), 120] | max }}"
+        g_min: "{{ gap_ms | default(400) | int(400) }}"
+        g_max: "{{ gap_ms_max | default(0) | int(0) }}"
+
+    # --- Farven sættes ÉN gang; denne tænding ER første blink ---
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ hue is defined }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: "{{ lamps }}"
+              data:
+                hs_color: "{{ [hue | default(216) | float(216), 100] }}"
+                brightness: 255
+                transition: 0
+      default:
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: "{{ lamps }}"
+          data:
+            color_temp_kelvin: "{{ kelvin | default(2700) | int(2700) }}"
+            brightness: 255
+            transition: 0
+
+    - repeat:
+        count: "{{ count | default(2) | int(2) }}"
+        sequence:
+          # Blink 2..n: kun level-clusteret — pæren har farven i behold.
+          - if:
+              - condition: template
+                value_template: "{{ not repeat.first }}"
+            then:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: "{{ lamps }}"
+                data:
+                  brightness: 255
+                  transition: 0
+          - delay:
+              milliseconds: "{{ on_d }}"
+          - service: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: "{{ lamps }}"
+            data:
+              transition: 0
+          - delay:
+              milliseconds: >-
+                {{ range(g_min, g_max + 1) | random if g_max > g_min else g_min }}

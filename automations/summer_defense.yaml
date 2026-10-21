@@ -1,0 +1,545 @@
+# =============================================================================
+# Sommer-forsvar (Summer Defense) — TO temperatur-tærskler (Dormant + Active)
+# =============================================================================
+# DORMANT tier (ingen hjemme): fuld luk. Alle gardiner 100% ned for at blokere
+#   solvarme. Tærskel: input_number.summer_defense_temp_threshold (default 24).
+#   Genåbnes ved kølige perioder (summer_defense_reopen) / ved hjemkomst.
+#
+# ACTIVE tier (nogen hjemme) — TILFØJET 2026-06-19 (user-spec): "det bliver
+#   simpelthen for varmt". Når TIMMERFLOTTE > en SEPARAT, højere tærskel
+#   (input_number.summer_defense_active_temp_threshold, default 26) lukkes KUN
+#   den sol-ramte side, baseret på sol-azimut:
+#     - solen i VEST (az ~240–320) → begge vest-gardiner ned
+#     - solen i SYD (az ~130–245)  → stue syd ned
+#   SOVEVÆRELSET (syd) afgøres IKKE af azimut men af rummets egen LUX-sensor
+#   (user-spec 2026-07-28: "den er mere præcis, men brug azimut som fallback")
+#   > input_number.sove_sol_blast_lux. Lux-vinduet er smallere end azimut-
+#   vinduet → egen "sen luk"-gren når solen når soveværelset efter stue syd.
+#   Genåbnes når det køler (under tærskel − 1°C hysterese), solen forlader siden,
+#   eller huset forlader Active. Rører KUN det den selv lukkede (tracking-flag),
+#   og springer manuelt-holdte gardiner over. Se summer_defense_active.
+#
+# GARDINER (4 i alt, 2026-07-28): stue syd (S) · stue vest (V) · spisestue vest
+# (V) · soveværelse (S — user-spec: "sove-gardinet er syd, vigtigt for sommer-
+# forsvaret"). Sove er derfor med i BEGGE tiers, på syd-siden sammen med stue
+# syd. Børneværelset har ingen gardin-motor (droppet 2026-07-28).
+# =============================================================================
+
+- id: summer_defense_close
+  alias: "Sommer-forsvar: Rul gardiner ned"
+  description: >
+    Close curtains when Dormant and TIMMERFLOTTE-temperatur indicates heat:
+    open-plan fully (sun up), sove on its own LUX (azimut fallback). 2026-06-19 (user-spec): temp-kilde skiftet fra
+    stue_apollo (upålidelig pga. ESP-selvopvarmning) til den autoritative
+    TIMMERFLOTTE-måler, og tærsklen er nu slider-styret
+    (input_number.summer_defense_temp_threshold = aggressivitet). Kører kun om
+    dagen (09-20) og kun når huset er Dormant.
+    B6.3 fix sprint 2026-05-06: per-room lux gates (was open_plan_lux for all).
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.indoor_temperature_resilient
+      above: input_number.summer_defense_temp_threshold
+      for:
+        minutes: 5
+    # Also trigger when house goes Dormant during hot weather
+    - platform: state
+      entity_id: input_select.house_state
+      to: "Dormant"
+      for:
+        minutes: 2
+    # 2026-10-10 (B214, fejlklasse #19): tidsvinduet åbner kl. 09. Blev huset
+    # Dormant / temp krydset FØR 09 på en varm morgen, var begge flanker brugt,
+    # og grenen fyrede aldrig den dag.
+    - platform: time
+      at: "09:00:00"
+  condition:
+    # Kill-switch (sprint 2026-05-17): toggle off hvis ikke ønsker auto-luk.
+    - condition: state
+      entity_id: input_boolean.summer_defense_enabled
+      state: "on"
+    # Ferie-batterispar (2026-07-18): pauset efter langvarig dvale, se
+    # packages/gardin_dormant_pause.yaml. Slås til igen ved hoveddør-åbning.
+    - condition: state
+      entity_id: input_boolean.gardin_dormant_pause_active
+      state: "off"
+    # Kun når huset er Dormant (ingen hjemme).
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Dormant"
+    # Temp over slider-tærsklen (køkkenets TIMMERFLOTTE, depot-reserve — indoor_temperature_resilient).
+    - condition: numeric_state
+      entity_id: sensor.indoor_temperature_resilient
+      above: input_number.summer_defense_temp_threshold
+    # Kun om dagen — solvarme rammer i dette vindue.
+    - condition: time
+      after: "09:00:00"
+      before: "20:00:00"
+    # 2026-07-01 (user-spec): skip luk når det er for overskyet (solen rammer
+    # ikke ind → en luk gør bare rummet mørkt). Skydække skal være UNDER tærsklen.
+    # Fail-safe: manglende vejr-data → antag klart (float(0)) = behold hede-
+    # beskyttelsen (temp-gaten ovenfor gælder stadig).
+    - condition: template
+      value_template: >-
+        {{ (state_attr('weather.forecast_home', 'cloud_coverage') | float(0))
+           <= (states('input_number.summer_defense_max_cloud_cover') | float(70)) }}
+    # Sprint C.8 fix audit 2026-05-07: tilfojet cinema/cirkus/airbnb_mode +
+    # godnat-flags gates (mirror winter_solar). Forhindrer at gardiner slammer
+    # ned over en AirBnB-gæst der har transient leave + hot day, eller mid-cinema.
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.cirkus_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+    # 2026-10-07 (B198): familie-logik = Normal + Home Vacation (CLAUDE.md 🏡
+    # punkt 1; samme valg som vinter-forsvaret fik i B123). `state: "Normal"`
+    # udelukkede Home Vacation. AirBnB er fortsat ude (gæsten styrer selv).
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+  action:
+    # === Open-plan gardiner: fuld luk når solen er oppe ===
+    # 2026-10-10 (B214, user: "fix dormant sommerforsvar"): gaten var
+    # open_plan_lux > 8000, men sensoren når max 3214 (maj) / ≤ 573 siden
+    # Apollo-omkodningen 15/6 → open-plan blev ALDRIG lukket i et tomt hus.
+    # Tilbage til Dormant-designet ("fuld luk", headeren): ingen er hjemme til at
+    # savne dagslyset, temp-/skydække-/09-20-gaterne afgør allerede om solvarmen
+    # er reel. Azimut duer ikke her (mode single, fyrer én gang — solen går syd→
+    # vest bagefter). Genåbnes af summer_defense_reopen (07/19 ved køling) og
+    # house_state_to_active ved hjemkomst.
+    # 2026-10-07 (B198): filtreret på held_luk (luk-kontrakten i
+    # packages/gardin_manual_grace.yaml: manuel-ned-grace, Sleep Over,
+    # mosbillede-holdet).
+    - variables:
+        dormant_luk: >-
+          {% from 'rosters.jinja' import open_plan_gardiner %}{{ open_plan_gardiner
+             | reject('in', state_attr('sensor.gardiner_manual_hold', 'held_luk') or [])
+             | list }}
+    - if:
+        - condition: numeric_state
+          entity_id: sun.sun
+          attribute: elevation
+          above: 0
+        - condition: template
+          value_template: "{{ dormant_luk | length > 0 }}"
+      then:
+        - service: cover.close_cover
+          target:
+            entity_id: "{{ dormant_luk }}"
+    # === Sove gardin (SYD-vendt, tilføjet 2026-07-28, user-spec) ===
+    # User-valg 2026-07-28: LUX er PRIMÆR ("den er mere præcis"), sol-azimut
+    # kun FALLBACK når sensoren ikke svarer. Rummets egen LTR390 måler faktisk
+    # indfald; azimut siger kun at solen *kunne* ramme (ser ikke skygge fra
+    # nabohus/træer). Tærskel = input_number.sove_sol_blast_lux (250 lx),
+    # kalibreret mod 3 døgns sensor.sove_lux-historik: median 101 / p90 293 /
+    # max 410 lx, og maksimerne falder 12–14 hvor solen står i syd.
+    # Temp-/skydække-/09-20-gates ovenfor gælder stadig.
+    # NB: den RÅ Apollo-sensor læses live — den er recorder-ekskluderet pga.
+    # skrive-volumen (13-decimal floats), men state() er upåvirket. Historik
+    # til kalibrering ligger i 15-min-snapshottet sensor.sove_lux
+    # (packages/sensor_snapshots.yaml).
+    - if:
+        - condition: template
+          value_template: >-
+            {% set lux = states('sensor.sovevaerelse_lux_reel') %}
+            {% if lux not in ['unknown', 'unavailable', 'none', ''] %}
+              {{ lux | float(0) > states('input_number.sove_sol_blast_lux') | float(250) }}
+            {% else %}
+              {{ (state_attr('sun.sun', 'elevation') | float(-90)) > 0
+                 and 130 <= (state_attr('sun.sun', 'azimuth') | float(-1)) <= 245 }}
+            {% endif %}
+      then:
+        - service: cover.close_cover
+          continue_on_error: true
+          target:
+            entity_id: cover.gardin_sovevaerelse
+    - service: notify.persistent_notification
+      data:
+        title: "Sommer-forsvar aktiveret"
+        message: >
+          Gardiner evalueret per-room (Dormant, inde
+          {{ states('sensor.indoor_temperature_resilient') }}°C ≥ tærskel
+          {{ states('input_number.summer_defense_temp_threshold') }}°C).
+          Open-plan: {{ 'lukket' if (state_attr('sun.sun', 'elevation') | float(-90)) > 0 else 'urørt (solen nede)' }}.
+          Sove: {{ states('sensor.sovevaerelse_lux_reel') }} lux
+          (sol az {{ state_attr('sun.sun', 'azimuth') | round(0) }}°).
+
+# Sprint D.15 fix audit 2026-05-07: re-open path. Tidligere antagelse "house
+# goes Active opens curtains" var forkert under multi-day vacation hvor
+# house bliver Dormant og curtains lukker → planter får INGEN lys i 3+ dage.
+# Re-open når temp falder + cool moment (morning/evening) selvom hus stadig
+# Dormant. Conservative: fyrer kun hvis ALL conditions samtidigt = ægte
+# kølig moment, ikke heat-spike pause.
+- id: summer_defense_reopen
+  alias: "Sommer-forsvar: Genåbn gardiner ved kølige perioder under Dormant"
+  description: >
+    Re-open curtains during multi-day vacation når temp falder + sun-elev lav.
+    Plants get morning + evening light selvom hus stadig Dormant. Skip hvis
+    Active (house_state_to_active handler det) eller cinema/cirkus.
+  mode: single
+  trigger:
+    # Morning: 07:00 daily check (cool overnight)
+    - platform: time
+      at: "07:00:00"
+    # Evening: 19:00 daily check (sun-elev dropping)
+    - platform: time
+      at: "19:00:00"
+  condition:
+    # Kill-switch (sprint 2026-05-17): same flag som summer_defense_close.
+    - condition: state
+      entity_id: input_boolean.summer_defense_enabled
+      state: "on"
+    # Ferie-batterispar (2026-07-18): se packages/gardin_dormant_pause.yaml.
+    - condition: state
+      entity_id: input_boolean.gardin_dormant_pause_active
+      state: "off"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Dormant"
+    # 2026-10-07 (B198): familie-logik = Normal + Home Vacation (CLAUDE.md 🏡
+    # punkt 1; samme valg som vinter-forsvaret fik i B123). `state: "Normal"`
+    # udelukkede Home Vacation. AirBnB er fortsat ude (gæsten styrer selv).
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+    # Genåbn først når TIMMERFLOTTE er kølet 2°C under luk-tærsklen (koblet til
+    # samme slider → følger aggressiviteten). 2026-06-19 fix: HA accepterer IKKE
+    # template i numeric_state below → brug template-condition i stedet (var
+    # disabled siden slider-commit).
+    - condition: template
+      value_template: >-
+        {{ (states('sensor.indoor_temperature_resilient') | float(99))
+           < (states('input_number.summer_defense_temp_threshold') | float(24)) - 2 }}
+  action:
+    - service: cover.open_cover
+      continue_on_error: true
+      target:
+        # Spring manuelt nedrullede gardiner over (gardin_manual_grace — den
+        # holder også sove mens putning_sove_active er on) + putte-glare-holdt
+        # spisestue-vest (må ikke genåbnes mens børnene puttes/sover).
+        # 🌙 2026-07-29: sove-gardinet er HELT ude af listen — det åbnes via
+        # script.sove_gardin_op nedenfor, så snooze + bad-gate (nøgenhed) også
+        # gælder her. Dormant kan være en fejlklassifikation mens der soves
+        # videre, og 07:00-genåbningen falder midt i morgenbadet.
+        entity_id: >
+          {% from 'rosters.jinja' import open_plan_gardiner %}{{ open_plan_gardiner
+             | reject('in', (state_attr('sensor.gardiner_manual_hold', 'held') | default([]))
+                 + (['cover.gardin_spisestue_vest']
+                    if is_state('input_boolean.putte_glare_spisestue_vest_ned', 'on') else []))
+             | list }}
+    - service: script.sove_gardin_op
+    - service: notify.persistent_notification
+      continue_on_error: true
+      data:
+        title: "Sommer-forsvar: gardiner åbnet"
+        message: >
+          Cool moment (inde {{ states('sensor.indoor_temperature_resilient') }}°C)
+          under Dormant — gardiner åbnet til plant-lys. Re-luk hvis temp ≥
+          {{ states('input_number.summer_defense_temp_threshold') }}°C.
+
+# =============================================================================
+# ACTIVE-tier sommer-forsvar (2026-06-19, user-spec) — for varmt mens hjemme
+# =============================================================================
+# "Hvis TIMMERFLOTTE > 26°C skal gardinerne ned SELV om huset er Active." Egen,
+# højere tærskel (slider summer_defense_active_temp_threshold). Lukker kun den
+# sol-ramte side ud fra sol-azimut: vest-gardiner når solen er i vest, syd-gardin
+# når solen er i syd. Genåbner når det køler (1°C hysterese), solen forlader
+# siden, eller huset forlader Active.
+#
+# Robusthed:
+#   - Gardin-state læses IKKE (IKEA-gardinerne rapporterer ofte 'unknown') —
+#     i stedet tracker to flag (summer_active_closed_syd/_vest) hvad DENNE
+#     automation selv lukkede, så genåbningen aldrig rører godnat-/manuelt-/
+#     Dormant-lukkede gardiner.
+#   - Manuelt-holdte gardiner (sensor.gardiner_manual_hold) springes over.
+#   - Forlader huset Active → flag ryddes (ingen cover-kommando), og Dormant-
+#     forsvaret overtager.
+#   - Gated fra under godnat/cinema/cirkus/AirBnB (mirror Dormant-forsvaret).
+# Azimut: 0=N, 90=Ø, 180=S, 270=V. "More or less" → syd 130–245, vest 240–320.
+# =============================================================================
+- id: summer_defense_active
+  alias: "Sommer-forsvar (Active): luk sol-ramt side når for varmt"
+  description: >
+    Når huset er Active og TIMMERFLOTTE > active-tærsklen lukkes den sol-ramte
+    side (vest-gardiner når solen er i vest, syd-gardin når solen er i syd).
+    Genåbner ved køling/solskift/ikke-Active. Kun den side automationen selv
+    lukkede (flag-tracked), springer manuelt-holdte gardiner over.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # Re-evaluér løbende mens solen vandrer.
+    - platform: time_pattern
+      minutes: "/15"
+    # Temp passerer tærskel opad → luk.
+    - platform: numeric_state
+      entity_id: sensor.indoor_temperature_resilient
+      above: input_number.summer_defense_active_temp_threshold
+      for:
+        minutes: 5
+    # Temp falder under tærsklen → vågn op og genåbn (HA accepterer IKKE
+    # template i numeric_state below → entity-ref; selve hysterese-grænsen
+    # (tærskel − 1°C) håndteres i action'ens keep-logik + /15-tikket).
+    - platform: numeric_state
+      entity_id: sensor.indoor_temperature_resilient
+      below: input_number.summer_defense_active_temp_threshold
+      for:
+        minutes: 5
+    # Hus skifter til/fra Active → re-evaluér straks (også flag-rydning).
+    - platform: state
+      entity_id: input_select.house_state
+  condition:
+    - condition: state
+      entity_id: input_boolean.summer_defense_enabled
+      state: "on"
+    # 2026-10-07 (B198): familie-logik = Normal + Home Vacation (CLAUDE.md 🏡
+    # punkt 1; samme valg som vinter-forsvaret fik i B123). `state: "Normal"`
+    # udelukkede Home Vacation. AirBnB er fortsat ude (gæsten styrer selv).
+    - condition: state
+      entity_id: input_select.house_mode
+      state:
+        - "Normal"
+        - "Home Vacation"
+    - condition: state
+      entity_id: input_boolean.cinema_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.cirkus_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "off"
+  action:
+    - variables:
+        active: "{{ is_state('input_select.house_state', 'Active') }}"
+        temp: "{{ states('sensor.indoor_temperature_resilient') | float(0) }}"
+        thr: "{{ states('input_number.summer_defense_active_temp_threshold') | float(26) }}"
+        hyst: 1.0
+        elev: "{{ state_attr('sun.sun', 'elevation') | float(-90) }}"
+        az: "{{ state_attr('sun.sun', 'azimuth') | float(-1) }}"
+        sun_up: "{{ (state_attr('sun.sun', 'elevation') | float(-90)) > 0 }}"
+        # 2026-06-24 (user-spec putte-glare): mens putte-glare ejer spisestue-vest
+        # (holdt nede natten over), behandles den som manuelt-holdt → summer_defense
+        # hverken lukker eller GEN-ÅBNER den (køling om aftenen må ikke vække børnene).
+        # 🌙 2026-07-29: sove-gardinet behandles som holdt mens sove-SNOOZEN kører
+        # (godnat-knappen trykket om morgenen) — hverken luk eller genåbn dér.
+        held: >-
+          {{ (state_attr('sensor.gardiner_manual_hold', 'held') | default([]))
+             + (['cover.gardin_spisestue_vest']
+                if is_state('input_boolean.putte_glare_spisestue_vest_ned', 'on') else [])
+             + (['cover.gardin_sovevaerelse']
+                if is_state('binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv', 'on') else []) }}
+        # 2026-10-07 (B198): LUK-veje læser held_luk (kontrakten i
+        # gardin_manual_grace.yaml), åbne-veje `held`. Uden for AirBnB er de to
+        # identiske, så skiftet ændrer ingen adfærd her.
+        held_luk_s: >-
+          {{ (state_attr('sensor.gardiner_manual_hold', 'held_luk') | default([]))
+             + (['cover.gardin_spisestue_vest']
+                if is_state('input_boolean.putte_glare_spisestue_vest_ned', 'on') else [])
+             + (['cover.gardin_sovevaerelse']
+                if is_state('binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv', 'on') else []) }}
+    - variables:
+        sun_south: "{{ sun_up and 130 <= az <= 245 }}"
+        sun_west: "{{ sun_up and 240 <= az <= 320 }}"
+        # 2026-07-28 (user-spec): soveværelset har sin EGEN sol-detektion —
+        # LUX-PRIMÆR (rummets LTR390 måler faktisk indfald, ser skygge fra
+        # nabohus/træer), azimut kun FALLBACK når sensoren ikke svarer. Samme
+        # udtryk som Dormant-grenen ovenfor (ét anker, jf. fejlklasse #2).
+        # Lux-vinduet er markant smallere end azimut-vinduet (3 døgns data:
+        # maksimerne falder 12–14) — derfor den sene luk-gren nedenfor.
+        sove_sol: >-
+          {% set lux = states('sensor.sovevaerelse_lux_reel') %}
+          {% if lux not in ['unknown', 'unavailable', 'none', ''] %}
+            {{ lux | float(0) > states('input_number.sove_sol_blast_lux') | float(250) }}
+          {% else %}
+            {{ sun_up and 130 <= az <= 245 }}
+          {% endif %}
+        # 2026-07-01 (user-spec): kun luk (og HOLD lukket) når solen faktisk
+        # skinner — dvs. skydække ≤ tærsklen. Skyer det til mens gardinet er
+        # nede → sun_shining bliver false → keep bliver false → genåbn (køling
+        # er ikke nødvendig; det er bare blevet overskyet). Fail-safe: manglende
+        # vejr-data → antag klart (float(0)) = behold hede-beskyttelsen.
+        sun_shining: >-
+          {{ (state_attr('weather.forecast_home', 'cloud_coverage') | float(0))
+             <= (states('input_number.summer_defense_max_cloud_cover') | float(70)) }}
+        # 2026-07-02 (B48): keep bruger tærskel+10 point sky-margin — cloud_coverage
+        # der svinger lige omkring slideren (fx 38↔42 ved slider 40) må ikke flappe
+        # gardinet op/ned hvert kvarter. Luk kræver ægte sol; genåbn kræver ægte skyet.
+        sun_shining_keep: >-
+          {{ (state_attr('weather.forecast_home', 'cloud_coverage') | float(0))
+             <= (states('input_number.summer_defense_max_cloud_cover') | float(70)) + 10 }}
+        # close = bliv lukket (over tærskel); keep = forbliv lukket (over tærskel−hyst).
+        syd_close: "{{ active and temp > thr and sun_south and sun_shining }}"
+        syd_keep: "{{ active and temp > (thr - hyst) and sun_south and sun_shining_keep }}"
+        vest_close: "{{ active and temp > thr and sun_west and sun_shining }}"
+        vest_keep: "{{ active and temp > (thr - hyst) and sun_west and sun_shining_keep }}"
+        vest_targets: >-
+          {{ ['cover.gardin_stue_vest_1', 'cover.gardin_spisestue_vest']
+             | reject('in', held) | list }}
+        vest_close_targets: >-
+          {{ ['cover.gardin_stue_vest_1', 'cover.gardin_spisestue_vest']
+             | reject('in', held_luk_s) | list }}
+        # 2026-07-28: sove-gardinet er syd-vendt → følger syd-siden.
+        # 2026-07-29: genåbningen af SOVE går gennem script.sove_gardin_op i
+        # st.f. denne liste, så bad-gaten (nøgenhed) og snoozen gælder også når
+        # sommer-forsvaret ruller op midt på dagen. Scriptet har sit eget
+        # pending-flag + /15-backstop, så gardinet ikke hænger nede fordi det
+        # tilfældigvis blev badet i netop det kvarter (fejlklasse #4).
+        syd_targets: >-
+          {{ ['cover.gardin_stue_syd'] | reject('in', held) | list }}
+        # LUK-listen: stue syd følger azimut (dens eget LTR390 er defekt, B12),
+        # sove følger sit eget lux-tjek.
+        syd_close_targets: >-
+          {{ (['cover.gardin_stue_syd']
+              + (['cover.gardin_sovevaerelse'] if sove_sol else []))
+             | reject('in', held_luk_s) | list }}
+    # === Ikke Active → ryd flag (handoff til Dormant-forsvar), rør ikke covers ===
+    - if:
+        - condition: template
+          value_template: "{{ not active }}"
+      then:
+        - if:
+            - condition: state
+              entity_id: input_boolean.summer_active_closed_syd
+              state: "on"
+          then:
+            - service: input_boolean.turn_off
+              target: {entity_id: input_boolean.summer_active_closed_syd}
+        - if:
+            - condition: state
+              entity_id: input_boolean.summer_active_closed_vest
+              state: "on"
+          then:
+            - service: input_boolean.turn_off
+              target: {entity_id: input_boolean.summer_active_closed_vest}
+        - stop: "Ikke Active — Dormant-forsvaret ejer gardinerne."
+    # === SYD (stue syd + soveværelse) ===
+    - choose:
+        # Luk syd (kun én gang — flag-gated; spring manuelt-holdt over).
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ syd_close and is_state('input_boolean.summer_active_closed_syd', 'off')
+                   and syd_close_targets | length > 0 }}
+          sequence:
+            - service: cover.close_cover
+              continue_on_error: true
+              target: {entity_id: "{{ syd_close_targets }}"}
+            - service: input_boolean.turn_on
+              target: {entity_id: input_boolean.summer_active_closed_syd}
+            - service: logbook.log
+              data:
+                name: "Sommer-forsvar (Active)"
+                message: >-
+                  Syd-gardiner lukket ({{ syd_close_targets | join(', ') }}) — inde
+                  {{ temp }}°C > {{ thr }}°C, sol i syd (az {{ az | round(0) }}°),
+                  sove-lux {{ states('sensor.sovevaerelse_lux_reel') }}.
+                entity_id: cover.gardin_stue_syd
+        # Sen luk af SOVE: lux-vinduet er smallere end azimut-vinduet, så solen
+        # kan ramme soveværelset EFTER at stue-syd allerede blev lukket (flaget
+        # er on = den første gren fyrer ikke igen). Gardinet har ægte positions-
+        # feedback → 'open' er et pålideligt "ikke lukket endnu".
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ syd_keep and is_state('input_boolean.summer_active_closed_syd', 'on')
+                   and sove_sol
+                   and 'cover.gardin_sovevaerelse' not in held_luk_s
+                   and is_state('cover.gardin_sovevaerelse', 'open') }}
+          sequence:
+            - service: cover.close_cover
+              continue_on_error: true
+              target: {entity_id: cover.gardin_sovevaerelse}
+            - service: logbook.log
+              data:
+                name: "Sommer-forsvar (Active)"
+                message: >-
+                  Sove-gardin lukket (sen sol-blast — lux
+                  {{ states('sensor.sovevaerelse_lux_reel') }} >
+                  {{ states('input_number.sove_sol_blast_lux') }}).
+                entity_id: cover.gardin_sovevaerelse
+        # Genåbn syd (kun det vi selv lukkede; spring manuelt-holdt over).
+        # 2026-08-05 (user item 4, "kritisk"): morgen-gaten. Denne gren var
+        # spærret hele natten af `godnat_any_active == off` og fyrede derfor i
+        # SAMME sekund godnat blev ryddet 06:00 — gardinerne røg op 06:00:00
+        # præcis 08-04 og 08-05 uden at nogen var vågnet. Blokeringen tabte ikke
+        # handlingen, den samlede den op og udløste den i det øjeblik gaten
+        # åbnede. Flaget bliver stående, så genåbningen sker af sig selv når
+        # ankeret tillader det (eller kl. 12:00).
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ is_state('input_boolean.summer_active_closed_syd', 'on') and not syd_keep
+                   and is_state('binary_sensor.open_plan_gardin_op_tilladt', 'on') }}
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ syd_targets | length > 0 }}"
+              then:
+                - service: cover.open_cover
+                  continue_on_error: true
+                  target: {entity_id: "{{ syd_targets }}"}
+            # Sove-gardinet: bad-/snooze-gated oprulning (scriptet no-op'er selv
+            # hvis det er manuelt holdt).
+            - service: script.sove_gardin_op
+            - service: input_boolean.turn_off
+              target: {entity_id: input_boolean.summer_active_closed_syd}
+            - service: logbook.log
+              data:
+                name: "Sommer-forsvar (Active)"
+                message: >-
+                  Syd-gardiner genåbnet ({{ syd_targets | join(', ') }} + sove via
+                  bad-gate — køling/solskift, inde {{ temp }}°C,
+                  az {{ az | round(0) }}°).
+                entity_id: cover.gardin_stue_syd
+    # === VEST (begge) ===
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ vest_close and is_state('input_boolean.summer_active_closed_vest', 'off')
+                   and vest_close_targets | length > 0 }}
+          sequence:
+            - service: cover.close_cover
+              continue_on_error: true
+              target: {entity_id: "{{ vest_close_targets }}"}
+            - service: input_boolean.turn_on
+              target: {entity_id: input_boolean.summer_active_closed_vest}
+            - service: logbook.log
+              data:
+                name: "Sommer-forsvar (Active)"
+                message: >-
+                  Vest-gardiner lukket ({{ vest_close_targets | join(', ') }}) — inde
+                  {{ temp }}°C > {{ thr }}°C, sol i vest (az {{ az | round(0) }}°).
+                entity_id: cover.gardin_stue_vest_1
+        # 2026-08-05 (user item 4): samme morgen-gate som syd-genåbningen ovenfor
+        # — det var netop VEST-grenen der rullede stue/spisestue op 06:00:00.
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ is_state('input_boolean.summer_active_closed_vest', 'on') and not vest_keep
+                   and is_state('binary_sensor.open_plan_gardin_op_tilladt', 'on') }}
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ vest_targets | length > 0 }}"
+              then:
+                - service: cover.open_cover
+                  continue_on_error: true
+                  target: {entity_id: "{{ vest_targets }}"}
+            - service: input_boolean.turn_off
+              target: {entity_id: input_boolean.summer_active_closed_vest}
+            - service: logbook.log
+              data:
+                name: "Sommer-forsvar (Active)"
+                message: >-
+                  Vest-gardiner genåbnet (køling/solskift — inde {{ temp }}°C,
+                  az {{ az | round(0) }}°).
+                entity_id: cover.gardin_stue_vest_1

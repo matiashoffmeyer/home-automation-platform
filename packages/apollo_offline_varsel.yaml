@@ -1,0 +1,68 @@
+# =============================================================================
+# Apollo offline-varsel — en død radar ligner et TOMT rum (2026-09-23)
+# =============================================================================
+# User-bug 22/09 19:24: "soveværelsets lys tænder ikke trods presence og mørke
+# … har haft en følelse af at et mærkeligt flag sidder fast". Der var intet
+# flag: sove-Apolloen var `unavailable` fra 19:02 (ESPHome-forbindelsen tabt),
+# og en død radar sender ingen flanker → ingen presence-automation evaluerer
+# overhovedet (fejlklasse #9). Samme radar var væk i 52 t fra 09/09.
+# device_health_check fanger det kun kl. 09:00 dagen efter.
+#
+# Push når en Apollo har været unavailable i 20 min. Genbruger push_notify-
+# frameworket (nid `apollo`, samme som ESP-temp-canaryen) → master/per-nid
+# enable, tidsvindue og AirBnB-tavshed håndteres dér. Restart dræber `for:`
+# (permanent faktum) → HA-start-grenen tjekker igen efter 25 min.
+# OBSERVERER KUN.
+# =============================================================================
+
+automation:
+  - id: apollo_offline_varsel
+    alias: "Varsel: Apollo radar offline"
+    mode: queued
+    max: 5
+    trigger:
+      - platform: state
+        entity_id: !include ../rosters/apollo_occupancy.yaml
+        to: "unavailable"
+        for:
+          minutes: 20
+        id: flanke
+      - platform: homeassistant
+        event: start
+        id: start
+    action:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay:
+              minutes: 25
+      - variables:
+          doede: >-
+            {% set ns = namespace(d=[]) %}
+            {% from 'rosters.jinja' import apollo_occupancy %}{% for e in apollo_occupancy
+                         %}
+              {% if states(e) == 'unavailable' %}
+                {% set ns.d = ns.d + [e.split('.')[1].split('_apollo')[0]] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.d | join(', ') }}
+      - condition: template
+        value_template: "{{ doede | trim | length > 0 }}"
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: apollo
+          title: "📡 Apollo offline"
+          # Danske rumnavne (2026-10-20): slug'en "sovevaerelse" → "soveværelse".
+          message: >-
+            {% from 'tekst.jinja' import dansk %}Radaren i {{ dansk(doede | trim) }}
+            har været væk i over 20 min — huset ser rummet som tomt, så lyset
+            tænder ikke af sig selv. Træk strømmen i 10 s, hvis den ikke kommer
+            igen.
+          payload:
+            tag: apollo_offline
+      - service: logbook.log
+        data:
+          name: "Apollo offline"
+          message: "Unavailable ≥ 20 min: {{ doede }}"

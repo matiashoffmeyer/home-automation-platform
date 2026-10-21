@@ -1,0 +1,203 @@
+# =============================================================================
+# Varsel-klokkeslæt — fuld tid-kontrol pr. fyring, morgen + aften (2026-07-03)
+# =============================================================================
+# User: "også sliders til at styre klokkeslæt de fyres af, både morgen og aften,
+# fuld kontrol." Valg (AskUserQuestion): INDIVIDUELLE tider morgen (6 felter) +
+# 3 INDIVIDUELLE klokkeslæt aften (ikke vindue). Klokkeslæt = input_datetime
+# (tid-vælger, has_time/ikke has_date); interval = input_number-slider.
+#
+# HVAD HVER STYRER (wiret i automations/rain_warning.yaml + legetoejsdag.yaml):
+#   MORGEN (6):
+#     varsel_apollo_rgb_on   → tid for Apollo-RGB blå LED ON (regn_..._rgb_on)
+#     varsel_apollo_rgb_off  → tid for Apollo-RGB OFF (regn_..._rgb_off)
+#     varsel_morgen_blink_start → morgen-blinkets vindue-START
+#     varsel_morgen_blink_slut  → morgen-blinkets vindue-SLUT
+#     varsel_morgen_push     → tid for 06:30-push til Parent A
+#   AFTEN (3):
+#     varsel_aften_1/2/3     → PUSH-fyringerne for nattens vejr. Efter 2026-09-19
+#                              er 1 = aften-BLINKETS vindue-START og 3 = dets
+#                              vindue-SLUT (blinket fyrer ét sted derimellem).
+#
+# MEKANIK (2026-09-19, user-spec "varsler skal kun vises 1 gang, og på et
+# tidspunkt hvor du ved vi er i open plan"): BEGGE blink triggeer /1 min og
+# gater på vindue + `binary_sensor.open_plan_varsel_publikum` + et dato-stempel
+# → ÉT blink pr. dag pr. vindue, i det minut huset kan se at der ER nogen i
+# open-plannet. Det gamle `varsel_morgen_interval`-modulo er væk (sliderne
+# gentog blinket 4x/morgen og 3x/aften uanset om nogen var hjemme — målt
+# 2026-09-05..19). Apollo/push er stadig rene `at: input_datetime`-triggers;
+# PUSHENE er UÆNDRET (de skal frem uanset hvor i huset man står).
+# Legetøjsdag-disko følger varsel_morgen_blink_start (uanset ny tid).
+#
+# KOBLINGER (fejlklasse #1 — skjulte med-ejere): varsel_morgen_blink_start
+# driver BÅDE morgen-blinket OG legetøjsdag-diskoen. sensor.vejr_varsel_i_nat
+# blev afkoblet fra de gamle 16:20/16:50/18:20-pre-warms → opdaterer nu /30
+# (HH:25/HH:55) så den er frisk ved ENHVER bruger-valgt aften-tid.
+#
+# INGEN `initial:` (persistens-konvention) → værdier overlever restart. Fresh-
+# install-defaults sættes af init_user_preferences (sentinel 00:00:00 / min);
+# live-system får dem sat via API + snapshot (config_snapshots/helper_values).
+# Tiles på Indstillinger (🌙-fanen, ved vejr-varsel-toggle).
+# =============================================================================
+
+input_datetime:
+  # --- MORGEN ---------------------------------------------------------------
+  varsel_apollo_rgb_on:
+    name: "Varsel morgen: Apollo-RGB blå ON"
+    icon: mdi:led-on
+    has_time: true
+    has_date: false
+    # Default 06:05. Blå LED på sove+køkken-Apollo = "husk regntøj" under påklædning.
+
+  varsel_apollo_rgb_off:
+    name: "Varsel morgen: Apollo-RGB OFF"
+    icon: mdi:led-off
+    has_time: true
+    has_date: false
+    # Default 10:00. Slukker Apollo-RGB uanset om regn-varsel fyrede.
+
+  varsel_morgen_blink_start:
+    name: "Varsel morgen: blink-vindue START"
+    icon: mdi:clock-start
+    has_time: true
+    has_date: false
+    # Default 06:30. Blinket gentages fra denne tid. Driver OGSÅ legetøjsdag-disko.
+
+  varsel_morgen_blink_slut:
+    name: "Varsel morgen: blink-vindue SLUT"
+    icon: mdi:clock-end
+    has_time: true
+    has_date: false
+    # Default 10:00. Sidste tid blinket kan fyre.
+
+  varsel_morgen_push:
+    name: "Varsel morgen: push-tid (Parent A)"
+    icon: mdi:cellphone-message
+    has_time: true
+    has_date: false
+    # Default 06:30. Kl for morgen-push med dagens vejrvarsel.
+  # B209 RUNTIME-stempel (ikke konfiguration → IKKE i DATETIME_CONFIG-allowlisten):
+  # afgangen fra soveværelset som morgen-varslet venter ud fra, fanget i det
+  # første minut varslet ellers ville have fyret mens en voksen sov. Fanges
+  # SELV (sticky), fordi sove_morgen_afgang_at er "SENESTE afgang" og både
+  # flytter sig og ryddes (10-09: ryddet 07:21 → uret ville være forsvundet).
+  # Gyldig når nyere end dagens 04:00. Afslører hvornår familien står op →
+  # med i AirBnB-purgen (#16).
+  varsel_morgen_venter_fra:
+    name: "Varsel morgen: venter fra (stempel)"
+    icon: mdi:timer-sand
+    has_date: true
+    has_time: true
+
+  # --- AFTEN ----------------------------------------------------------------
+  varsel_aften_1:
+    name: "Varsel aften: fyring 1"
+    icon: mdi:weather-night
+    has_time: true
+    has_date: false
+    # Default 16:30. Aften-blink + push for nattens vejr (regn/vind).
+
+  varsel_aften_2:
+    name: "Varsel aften: fyring 2"
+    icon: mdi:weather-night
+    has_time: true
+    has_date: false
+    # Default 17:00. PUSH-tid (blinket bruger kun 1 og 3 som vindue).
+
+  varsel_aften_3:
+    name: "Varsel aften: fyring 3"
+    icon: mdi:weather-night
+    has_time: true
+    has_date: false
+    # Default 18:30. Sidste push-tid OG aften-blinkets vindue-SLUT.
+
+input_number:
+  varsel_publikum_accum_minutter:
+    name: "Varsel: akkumuleret open-plan-tid før blink (min)"
+    icon: mdi:account-clock
+    min: 0
+    max: 30
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: box
+    # Default 3. Hvor meget frisk open-plan-tilstedeværelse der skal være
+    # akkumuleret i det rullende 30-min-vindue før et vejr-blink må fyre.
+    # MÅLT 2026-09-19 over 15 døgn (2 vs 3 vs 5 min): tærsklen flytter
+    # blink-tidspunktet 1-4 min, IKKE hvilke dage der rammes → 3 min er
+    # rigelig støjdæmpning. Egen slider frem for at låne gardinernes
+    # morning_curtain_accum_minutes: de to må kunne skrues uafhængigt.
+  # B209 (user-spec 2026-10-10): "vent med vejrvarsel til begge er oppe men vent
+  # højest 60 min efter en voksen er stået op". Morgen-varslet (blink +
+  # oplæsning + regn-sang) holdes tilbage mens binary_sensor.
+  # sovevaerelse_voksne_oppe er off, højst så mange minutter regnet fra
+  # afgangen (input_datetime.varsel_morgen_venter_fra) — derefter fyrer det
+  # HELE, også lyden. Uden registreret afgang venter det på begge-oppe.
+  # 0 = vent ikke (blink straks, lyd kun når begge er oppe = før-B209).
+  varsel_morgen_max_vent_minutter:
+    name: "Varsel morgen: max ventetid på begge oppe (min)"
+    icon: mdi:account-multiple-check
+    min: 0
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+input_text:
+  # DEDUPE-STEMPLER (fejlklasse: last_changed nulstilles ved restart → skriv
+  # stemplet selv). Værdien er en DATO-streng 'YYYY-MM-DD' = "blinket er vist
+  # i dag". INGEN `initial:` → overlever restart; urørt står den 'unknown',
+  # som er != enhver dato → første fyring slipper igennem (og 'unknown' er
+  # truthy, så den skal sammenlignes eksplicit, aldrig testes for sandhed).
+  # Med i export-allowlisten? NEJ — runtime-tilstand, ikke konfiguration.
+  varsel_blink_morgen_dato:
+    name: "Varsel: morgen-blink vist (dato)"
+    icon: mdi:weather-sunset-up
+    max: 10
+  varsel_blink_aften_dato:
+    name: "Varsel: aften-blink vist (dato)"
+    icon: mdi:weather-night
+    max: 10
+
+template:
+  - binary_sensor:
+      # "Er der PUBLIKUM til et vejr-varsel lige nu?" (user-spec 2026-09-19:
+      # "vejr varsler skal kun vises 1 gang, men gør det på et tidspunkt hvor
+      # du ved vi er i open plan — noget med noget akkumuleret og recent
+      # aktivitet"). ÉN definition, læst af BÅDE morgen- og aften-blinket
+      # (fejlklasse #2: samme regel i to filer divergerer).
+      #
+      # TO LED, og begge er nødvendige:
+      #   1) AKKUMULERET: sensor.open_plan_active_recent (history_stats, TIMER)
+      #      over binary_sensor.open_plan_occupied_frisk i et rullende 30-min-
+      #      vindue → et enkelt 5-sekunders radar-blip kan ikke udløse et blink.
+      #   2) NU: samme frisk-maskerede sensor skal være `on` I DETTE MINUT —
+      #      ellers blinker vi til et rum nogen forlod for 20 min siden
+      #      (fejlklasse #20: en akkumulator alene måler tid siden vinduets
+      #      start, ikke at nogen er her NU).
+      # Frisk-varianten (ikke rå open_plan_occupied) arves fra morgen-gardinerne:
+      # den maskerer en Apollo der har hængt `on` siden før 05:30 (latch).
+      #
+      # BEVIDST IKKE genbrug af binary_sensor.open_plan_gardin_op_tilladt: den
+      # er ubetinget `true` efter kl. 12 (gardin-gaten gælder kun om morgenen)
+      # og ville derfor lukke aften-blinket igennem til et tomt hus.
+      - name: "Open plan varsel publikum"
+        unique_id: open_plan_varsel_publikum
+        icon: mdi:account-eye
+        state: >
+          {{ is_state('binary_sensor.open_plan_occupied_frisk', 'on')
+             and (states('sensor.open_plan_active_recent') | float(0) * 60)
+                 >= (states('input_number.varsel_publikum_accum_minutter') | float(3)) }}
+        attributes:
+          akkumuleret_min: >
+            {{ (states('sensor.open_plan_active_recent') | float(0) * 60) | round(1) }}
+          taerskel_min: >
+            {{ states('input_number.varsel_publikum_accum_minutter') | float(3) }}
+          grund: >
+            {% set acc = (states('sensor.open_plan_active_recent') | float(0) * 60) | round(1) %}
+            {% set thr = states('input_number.varsel_publikum_accum_minutter') | float(3) %}
+            {% if not is_state('binary_sensor.open_plan_occupied_frisk', 'on') %}
+              Ingen frisk open-plan-tilstedeværelse lige nu ({{ acc }} min akkumuleret).
+            {% elif acc < thr %}
+              Nogen er her, men kun {{ acc }} / {{ thr }} min akkumuleret i sidste halve time.
+            {% else %}
+              Publikum: {{ acc }} / {{ thr }} min akkumuleret OG til stede nu.
+            {% endif %}

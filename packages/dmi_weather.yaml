@@ -1,0 +1,378 @@
+# =============================================================================
+# DMI HARMONIE regn-forecast — anden kilde for vejr-varsler (B34, 2026-06-11)
+# =============================================================================
+# Baggrund: 2026-06-11 kom voldsomme korte byger som met.no's timeforecast
+# aldrig så (0,0 mm + tørre symboler hele dagen, kun 31-36% sandsynlighed).
+# DMI's HARMONIE-model (dansk, højere opløsning) bruges nu som ANDEN kilde:
+# vejr_varsel_i_dag/_i_nat varsler hvis BARE ÉN kilde ser regn.
+#
+# API: DMI Open Data (opendataapi.dmi.dk) — keyless siden platform-opdatering
+# ultimo 2025 (brugerregistrering + API-nøgler afskaffet). EDR position-query
+# på harmonie_dini_sf, parameter total-precipitation (kg/m² = mm, AKKUMULERET
+# fra model-run start → time-mm = diff mellem nabopunkter).
+#
+# RATE LIMIT: endpointet load-shedder aggressivt med 429 "Server is busy"
+# (observeret ved implementering). Derfor:
+#   - Poll kun 1×/time (minut 12 — offset fra varsel-sensorernes :25/:55)
+#   - 429/fejl → sensoren BEHOLDER sidste gode værdi (this-fallback)
+#   - fetched_at attribut viser data-alder; varsel-sensorerne falder tilbage
+#     til met.no alene hvis sensoren er unavailable/aldrig har hentet
+# =============================================================================
+
+rest_command:
+  dmi_harmonie_precip:
+    # POINT(lon lat) — læst fra zone.home ved hvert kald (ingen koordinater i git). KUN regn: udetemp kom kortvarigt
+    # herfra (2m-temp), men DMI's nøgle-løse endpoint 429-fejler ~konstant →
+    # udetemp flyttet til met.no (sensor.udetemp nedenfor), user-valg 2026-07-19.
+    url: "https://opendataapi.dmi.dk/v1/forecastedr/collections/harmonie_dini_sf/position?coords=POINT({{ state_attr('zone.home', 'longitude') }}%20{{ state_attr('zone.home', 'latitude') }})&parameter-name=total-precipitation&f=CoverageJSON"
+    method: GET
+    timeout: 45
+  # Observationer (metObs) — se kommentaren ved sensor.dmi_udefugt længere nede.
+  # 2026-09-10: den gamle host `dmigw.govcloud.dk` er NEDLAGT — den resolver
+  # ikke længere i DNS (NXDOMAIN, verificeret mod 8.8.8.8), så kaldet fejlede
+  # instant og sensorerne hang på deres this-fallback i 16 t uden at blive
+  # unavailable. metObs bor nu på SAMME host som forecast'en, men stadig under
+  # **v2** — `/v1/metObs/...` er 404. Nøgle-løs som før.
+  # UDEN parameterId: ét kald giver ALLE stationens parametre, og vi skal bruge
+  # tre af dem (humidity + temp_dry + temp_dew). Absolut fugt kan kun beregnes
+  # af RH og temperatur MÅLT SAMME STED SAMME ØJEBLIK — parrer man DMI's RH med
+  # met.no's temperatur, regner man på to forskellige luftmasser.
+  # limit=120: stationen sender ~18 parametre pr. 10-min-cyklus, men
+  # precip_past1min kommer hvert minut og fylder rækkerne op. 120 rækker ≈ 3
+  # cyklusser = margin hvis en enkelt parameter mangler i nyeste cyklus.
+  dmi_metobs_now:
+    url: >-
+      https://opendataapi.dmi.dk/v2/metObs/collections/observation/items?stationId=06180&limit=120
+    method: GET
+    timeout: 30
+
+template:
+  - trigger:
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: 12
+      - platform: event
+        event_type: event_template_reloaded
+    action:
+      - service: rest_command.dmi_harmonie_precip
+        response_variable: resp
+        # rest_command kaster ved HTTP-fejl i nogle HA-versioner — continue
+        # så this-fallback nedenfor bevarer sidste gode værdier.
+        continue_on_error: true
+      - variables:
+          # CoverageJSON content-type indeholder 'json' → resp.content er dict.
+          # Defensive: accepter også string-body (from_json) og 429-error-body.
+          payload: >-
+            {% if resp is defined and resp.content is defined %}
+              {% if resp.content is mapping %}{{ resp.content }}
+              {% elif resp.content is string and resp.content[:1] == '{' %}{{ resp.content | from_json }}
+              {% else %}{{ {} }}{% endif %}
+            {% else %}{{ {} }}{% endif %}
+          ok: "{{ payload.get('domain') is not none and payload.get('ranges') is not none }}"
+          calc: >-
+            {% if not ok %}{{ {} }}{% else %}
+              {% set ts = payload.domain.axes.t['values'] %}
+              {% set vs = payload.ranges['total-precipitation']['values'] %}
+              {# Byg timeliste: mm for timen der SLUTTER på ts[i] (akkum-diff) #}
+              {% set nowts = as_timestamp(now()) %}
+              {# timedelta, ikke +86400: DST-dagen har 23/25 t (H1) #}
+              {% set midnight = as_timestamp(today_at('00:00') + timedelta(days=1)) %}
+              {% set night0 = as_timestamp(today_at('16:00')) %}
+              {% set night1 = as_timestamp(today_at('09:00') + timedelta(days=1)) %}
+              {% set ns = namespace(today=0.0, tonight=0.0, next18=0.0, maxh=0.0, next3=0.0) %}
+              {% for i in range(1, ts | length) %}
+                {% set t_end = as_timestamp(ts[i]) %}
+                {% set mm = [(vs[i] | float(0)) - (vs[i-1] | float(0)), 0] | max %}
+                {% if t_end > nowts %}
+                  {% if t_end <= midnight %}{% set ns.today = ns.today + mm %}{% endif %}
+                  {# next3h = imminent rain (terrasse plug auto-off "regner snart") #}
+                  {% if t_end <= nowts + 3*3600 %}{% set ns.next3 = ns.next3 + mm %}{% endif %}
+                  {% if t_end <= nowts + 18*3600 %}
+                    {% set ns.next18 = ns.next18 + mm %}
+                    {% set ns.maxh = [ns.maxh, mm] | max %}
+                  {% endif %}
+                {% endif %}
+                {% if t_end > night0 and t_end <= night1 %}{% set ns.tonight = ns.tonight + mm %}{% endif %}
+              {% endfor %}
+              {{ {'today': ns.today | round(2), 'tonight': ns.tonight | round(2),
+                  'next18': ns.next18 | round(2), 'maxh': ns.maxh | round(2),
+                  'next3': ns.next3 | round(2), 'run': ts[0]} }}
+            {% endif %}
+    sensor:
+      - name: "DMI regn forecast"
+        unique_id: dmi_regn_forecast
+        unit_of_measurement: "mm"
+        icon: mdi:weather-pouring
+        state: >-
+          {% if ok %}{{ calc.next18 }}
+          {% elif this is defined and this.state is not none %}{{ this.state }}
+          {% else %}unavailable{% endif %}
+        attributes:
+          mm_today: >-
+            {% if ok %}{{ calc.today }}
+            {% elif this is defined %}{{ this.attributes.get('mm_today') }}
+            {% else %}none{% endif %}
+          mm_tonight: >-
+            {% if ok %}{{ calc.tonight }}
+            {% elif this is defined %}{{ this.attributes.get('mm_tonight') }}
+            {% else %}none{% endif %}
+          max_hourly_mm: >-
+            {% if ok %}{{ calc.maxh }}
+            {% elif this is defined %}{{ this.attributes.get('max_hourly_mm') }}
+            {% else %}none{% endif %}
+          mm_next3h: >-
+            {% if ok %}{{ calc.next3 }}
+            {% elif this is defined %}{{ this.attributes.get('mm_next3h') }}
+            {% else %}none{% endif %}
+          model_run: >-
+            {% if ok %}{{ calc.run }}
+            {% elif this is defined %}{{ this.attributes.get('model_run') }}
+            {% else %}none{% endif %}
+          fetched_at: >-
+            {% if ok %}{{ now().isoformat() }}
+            {% elif this is defined %}{{ this.attributes.get('fetched_at') }}
+            {% else %}none{% endif %}
+          last_attempt_ok: "{{ ok }}"
+
+# =============================================================================
+# Udendørs LUFTFUGTIGHED (DMI metObs) — sensor.dmi_udefugt
+# =============================================================================
+# 2026-08-30 (user-spec): "på fugt grafen på statistik siden skal der indføres
+# en fugtlinie for udendørs så jeg kan se om huset er på niveau med udendørs
+# fugten. via vejr integration, helst DMI."
+#
+# Kilden er metObs — DMI's MÅLTE observationer fra station 06180 — ikke
+# HARMONIE-prognosen ovenfor. Det er bevidst: spørgsmålet "ligger huset på
+# niveau med udenfor?" skal sammenligne to MÅLINGER, ellers sammenligner man
+# et instrument med en model.
+#
+# NB de to DMI-endpoints deler host men IKKE version: prognosen er
+# opendataapi.dmi.dk/**v1**/forecastedr (429-fejler ~konstant), observationerne
+# er opendataapi.dmi.dk/**v2**/metObs. Der findes ingen metObs-collection på v1
+# (404), så URL'en må stadig ikke "moderniseres" til v1 — kun hosten flyttede,
+# da dmigw.govcloud.dk blev nedlagt 2026-09.
+#
+# met.no's weather.forecast_home har også en humidity-attribut, men (a) den er
+# en prognose, (b) en attribut kan ikke tegnes i et statistics-graph-kort, og
+# (c) huset har allerede målt at met.no's RH er biased (se dug-modellen).
+#
+# Stationen ligger 5,5 km væk = "fugten i området". Til en niveau-sammenligning
+# på time-/døgnskala er det rigeligt; til noget der skal reagere på haven selv
+# kræver det en fysisk sensor.
+#
+# Kadence: DMI opdaterer hvert 10. minut, så /10 er den fulde opløsning =
+# 144 kald/døgn, samme budget som regn_nu (fejlklasse #7).
+  - trigger:
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: "/10"
+      - platform: event
+        event_type: event_template_reloaded
+    action:
+      - service: rest_command.dmi_metobs_now
+        response_variable: hresp
+        continue_on_error: true
+      - variables:
+          hpayload: >-
+            {% if hresp is defined and hresp.content is defined %}
+              {% if hresp.content is mapping %}{{ hresp.content }}
+              {% elif hresp.content is string and hresp.content[:1] == '{' %}{{ hresp.content | from_json }}
+              {% else %}{{ {} }}{% endif %}
+            {% else %}{{ {} }}{% endif %}
+          props: >-
+            {{ (hpayload.get('features') or []) | map(attribute='properties') | list }}
+          # Rækkerne kommer nyeste-først, men vi sorterer selv — rækkefølgen er
+          # ikke en dokumenteret garanti, og en forkert række her ville blive
+          # til en tavst forkert fugt-værdi.
+          hfeat: >-
+            {% set l = props | selectattr('parameterId','eq','humidity')
+                             | sort(attribute='observed', reverse=true) | list %}
+            {{ l[0] if l | count > 0 else {} }}
+          tfeat: >-
+            {% set l = props | selectattr('parameterId','eq','temp_dry')
+                             | sort(attribute='observed', reverse=true) | list %}
+            {{ l[0] if l | count > 0 else {} }}
+          dfeat: >-
+            {% set l = props | selectattr('parameterId','eq','temp_dew')
+                             | sort(attribute='observed', reverse=true) | list %}
+            {{ l[0] if l | count > 0 else {} }}
+          hok: "{{ hfeat.get('value') is not none }}"
+          # Absolut fugt kræver BEGGE målinger — mangler temperaturen, må
+          # RH-sensoren stadig gerne opdatere.
+          aok: "{{ hfeat.get('value') is not none and tfeat.get('value') is not none }}"
+          abs_g: >-
+            {% if aok %}
+              {% set t = tfeat.value | float %}
+              {% set rh = hfeat.value | float %}
+              {{ (216.7 * (rh / 100 * 6.112 * (e ** (17.62 * t / (243.12 + t)))
+                  / (273.15 + t))) | round(2) }}
+            {% else %}{{ none }}{% endif %}
+    sensor:
+      - name: "DMI udefugt"
+        unique_id: dmi_udefugt
+        unit_of_measurement: "%"
+        device_class: humidity
+        # state_class er hele pointen: uden den bygger recorder ingen
+        # long-term statistics, og statistics-graph-kortet kan ikke tegne linjen.
+        state_class: measurement
+        icon: mdi:water-percent
+        state: >-
+          {% if hok %}{{ hfeat.value | float | round(1) }}
+          {% elif this is defined and this.state is not none %}{{ this.state }}
+          {% else %}unavailable{% endif %}
+        attributes:
+          observed: >-
+            {% if hok %}{{ hfeat.get('observed') }}
+            {% elif this is defined %}{{ this.attributes.get('observed') }}
+            {% else %}none{% endif %}
+          station: "06180"
+          last_attempt_ok: "{{ hok }}"
+
+      # =====================================================================
+      # ABSOLUT fugt ude — sensor.dmi_ude_absolut_fugt
+      # =====================================================================
+      # 2026-08-30 (user-valg efter måling): RH kan IKKE besvare "ligger huset
+      # på niveau med udendørs?", fordi RH er temperatur-afhængig. Målt samme
+      # dag: ude 17,7 °C / 100 % RH = 15,1 g/m³, inde 24,6 °C / 64 % RH =
+      # 14,4 g/m³. RH-linjerne står 36 point fra hinanden; det faktiske
+      # vandindhold er praktisk talt ens. Om vinteren vender fortegnet:
+      # ude 0 °C/90 % = 4,4 g/m³ mod inde 21 °C/45 % = 8,2 g/m³, altså dobbelt
+      # så meget vand INDENDØRS mens RH påstår det modsatte. Det er præcis den
+      # situation (huset producerer selv fugt) der er værd at opdage.
+      #
+      # Formel: Magnus-Tetens. AH = 216,7 · (RH/100 · 6,112 · e^(17,62·T /
+      # (243,12+T)) / (273,15+T)). Jinja har ingen exp(), men `e ** x` virker
+      # (verificeret mod /api/template: 15,05 mod Pythons 15,1).
+      - name: "DMI ude absolut fugt"
+        unique_id: dmi_ude_absolut_fugt
+        unit_of_measurement: "g/m³"
+        state_class: measurement
+        icon: mdi:water-outline
+        state: >-
+          {% if aok %}{{ abs_g }}
+          {% elif this is defined and this.state is not none %}{{ this.state }}
+          {% else %}unavailable{% endif %}
+        attributes:
+          temp_c: >-
+            {% if aok %}{{ tfeat.value }}
+            {% elif this is defined %}{{ this.attributes.get('temp_c') }}
+            {% else %}none{% endif %}
+          rh_pct: >-
+            {% if aok %}{{ hfeat.value }}
+            {% elif this is defined %}{{ this.attributes.get('rh_pct') }}
+            {% else %}none{% endif %}
+          # DMI beregner selv dugpunktet — gratis krydstjek af vores egen
+          # Magnus-Tetens: ved 100 % RH skal dugpunkt == temperatur.
+          dugpunkt_dmi_c: >-
+            {% if dfeat.get('value') is not none %}{{ dfeat.value }}
+            {% elif this is defined %}{{ this.attributes.get('dugpunkt_dmi_c') }}
+            {% else %}none{% endif %}
+          observed: >-
+            {% if aok %}{{ tfeat.get('observed') }}
+            {% elif this is defined %}{{ this.attributes.get('observed') }}
+            {% else %}none{% endif %}
+          station: "06180"
+          last_attempt_ok: "{{ aok }}"
+
+# =============================================================================
+# Udendørs temp-anker (met.no) — sensor.udetemp
+# =============================================================================
+# ANKER for al vinter-forsvar temp-gating (automations/winter_defense.yaml).
+# Kilde-historik: indendørs → met.no → DMI 2m → MET.NO (2026-07-19, user-valg:
+# DMI's nøgle-løse endpoint 429-fejler ~konstant, sås upålidelig). Consumers
+# peger på sensor.udetemp så en fremtidig kilde-skift kun er ÉN edit her.
+# met.no (weather.forecast_home) er keyless + pålidelig; går den unavailable →
+# numeric_state-gates bliver false = intet forsvar = sikker degradering (#9).
+# NB: dette er ANDET listepunkt under det ENE template:-anker øverst (linje 31).
+# Et separat top-level "template:"-key her ville være en DUPLIKAT-nøgle → YAML
+# beholder kun det sidste → dmi_regn_forecast droppes tavst (fejlklasse #2/#3;
+# ramte 2026-07-27: sensor.dmi_regn_forecast = unavailable/restored).
+# =============================================================================
+  - sensor:
+      - name: "Udetemp"
+        unique_id: udetemp
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        icon: mdi:thermometer
+        state: >-
+          {% set t = state_attr('weather.forecast_home', 'temperature') %}
+          {% if t is not none %}{{ t | float | round(1) }}{% else %}unavailable{% endif %}
+        attributes:
+          kilde: "met.no (weather.forecast_home)"
+
+      # =====================================================================
+      # ABSOLUT fugt inde — sensor.inde_absolut_fugt
+      # =====================================================================
+      # Modstykket til sensor.dmi_ude_absolut_fugt, samme formel og samme
+      # enhed, så de to linjer på fugt-grafen er direkte sammenlignelige.
+      # TIMMERFLOTTE er husets autoritative indeklima-kilde (Apollo-rumtemp er
+      # upålidelig pga. ESP-selvopvarmning), og BEGGE kanaler skal komme fra
+      # SAMME instrument — parrer man ét rums temperatur med et andets RH,
+      # bliver fejlen større end det signal man leder efter.
+      #
+      # RESERVE (15/10, user: "hvis den har fugt måler så skal den med overalt
+      # vi måler fugt"): køkkenets TIMMERFLOTTE var væk ~40 af 75 t 13-15/10
+      # (Thread-øen, B234) → genvex-forsøget og badets tørretid stod stille.
+      # Broadlink RM4 Pro i DEPOTET har eget temp+RH (samme instrument).
+      # Målt 1-15/10 (1153 kvarterer): depot = køkken + 0,52 g/m³, sd 0,27;
+      # døgnmidler 0,38-0,66. MEN depotet får bad-dampen: +0,5-3,4 g/m³ i
+      # 10-20 min efter hvert bad → 30-min-middel (statistics nedenfor). På
+      # 23 bade 27/9-12/10 gav "depot 30 min − 0,5" som stue-reference samme
+      # tørretid som TIMMERFLOTTE (median-forskel 0 min, middel −1,6). Rå
+      # depot gav −5 min, 60-min-minimum +21 min.
+      - name: "Inde absolut fugt"
+        unique_id: inde_absolut_fugt
+        unit_of_measurement: "g/m³"
+        state_class: measurement
+        icon: mdi:water
+        availability: >-
+          {{ (states('sensor.timmerflotte_temperature') | is_number
+              and states('sensor.timmerflotte_humidity') | is_number)
+             or states('sensor.depot_absolut_fugt_30_min') | is_number }}
+        state: >-
+          {% if states('sensor.timmerflotte_temperature') | is_number
+                and states('sensor.timmerflotte_humidity') | is_number %}
+            {% set t = states('sensor.timmerflotte_temperature') | float %}
+            {% set rh = states('sensor.timmerflotte_humidity') | float %}
+            {{ (216.7 * (rh / 100 * 6.112 * (e ** (17.62 * t / (243.12 + t)))
+                / (273.15 + t))) | round(2) }}
+          {% else %}
+            {{ (states('sensor.depot_absolut_fugt_30_min') | float - 0.52) | round(2) }}
+          {% endif %}
+        attributes:
+          kilde: >-
+            {{ 'køkken' if states('sensor.timmerflotte_temperature') | is_number
+               and states('sensor.timmerflotte_humidity') | is_number else 'depot' }}
+          temp_c: "{{ states('sensor.timmerflotte_temperature') }}"
+          rh_pct: "{{ states('sensor.timmerflotte_humidity') }}"
+
+      # Depotets Broadlink RM4 Pro (temp + RH fra samme instrument). Står
+      # ~26 °C → lavere RH end køkkenet, men g/m³ er sammenlignelig.
+      - name: "Depot absolut fugt"
+        unique_id: depot_absolut_fugt
+        unit_of_measurement: "g/m³"
+        state_class: measurement
+        icon: mdi:water
+        availability: >-
+          {{ states('sensor.broadlink_rm4_pro_temperature') | is_number
+             and states('sensor.broadlink_rm4_pro_humidity') | is_number }}
+        state: >-
+          {% set t = states('sensor.broadlink_rm4_pro_temperature') | float %}
+          {% set rh = states('sensor.broadlink_rm4_pro_humidity') | float %}
+          {{ (216.7 * (rh / 100 * 6.112 * (e ** (17.62 * t / (243.12 + t)))
+              / (273.15 + t))) | round(2) }}
+
+sensor:
+  # Glatter bad-dampen ud af depot-reserven (se Inde absolut fugt). Broadlink
+  # poller ~1×/min, så vinduet tømmes ikke.
+  - platform: statistics
+    name: "Depot absolut fugt 30 min"
+    unique_id: depot_absolut_fugt_30_min
+    entity_id: sensor.depot_absolut_fugt
+    state_characteristic: average_step
+    max_age: {minutes: 30}
+    sampling_size: 200
+    precision: 2

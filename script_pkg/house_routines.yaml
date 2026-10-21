@@ -1,0 +1,1050 @@
+# Splittet fra scripts.yaml 2026-05-05 (Phase 2.1 refactor)
+# Scripts: puttelys_phase1_apply, godnat_toggle, godnat_fuld, godnat,
+# godmorgen, sluk_alt
+#
+# Kommentarer + Jinja-format BEVARES verbatim fra original.
+# =============================================================================
+
+puttelys_phase1_apply:
+  alias: "Puttelys: anvend fase 1-scene (loft 30% + strip lyserød 40% + plug)"
+  description: >
+    Single source of truth for fase 1 (2026-06-12). Kaldes af tre indgange:
+    bad-besøg ≥3 min (putning_auto_detect Trigger A, tidlig tænd), slider-
+    bagkanten (puttelys_phase1_scene, "senest da") og Styrbar OP i putte-
+    kontekst (manuel fallback). Sætter puttelys_phase1_fired så bad/slider
+    ikke re-applier oven i manuelle justeringer senere på aftenen.
+  mode: single
+  max_exceeded: silent
+  # 2026-10-06: saet_flag=false giver KUN udseendet (sen hjemkomst og — fra
+  # 10-07 — børne-tændet efter sengetid bruger puttelyset som almindeligt
+  # presence-lys) — uden flaget fredes strippen
+  # ikke, så tom-sluk slukker det som ethvert presence-lys. Udseendet bor
+  # stadig ét sted (#2).
+  fields:
+    saet_flag:
+      description: "Sæt puttelys_phase1_fired (default ja)"
+      default: true
+  sequence:
+    - if:
+        - condition: template
+          value_template: "{{ saet_flag | default(true) | bool(true) }}"
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.puttelys_phase1_fired
+    # Loft 30 % i farven fra global_putte_loft_kelvin (hardware kan være
+    # offline). 2026-10-05 (user: "den var meget kold idag"): før hardcodet
+    # 6535 K = pærens koldeste; slideren sat til 2700 K (= presence-tændets farve).
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.boernevaerelse_loft
+      data:
+        color_temp_kelvin: "{{ states('input_number.global_putte_loft_kelvin') | int(2700) }}"
+        brightness_pct: 30
+        transition: 3
+    # Hygge-strip: lyserød 40% (rgb → bevarer xy-mode til blødt fase-2-fade)
+    # 2026-10-07: som presence-lys (saet_flag=false — børne-tændet efter
+    # sengetid og sen hjemkomst) rører vi IKKE en strip user selv har sat i
+    # aften (boern_aften_niveau_hold, user-spec 09-12: "holder den på det
+    # niveau indtil solopgang"). En rigtig putte-start (flaget) er en ny
+    # beslutning og tager strippen som før.
+    - if:
+        - condition: template
+          value_template: >-
+            {{ saet_flag | default(true) | bool(true)
+               or not states('input_text.boern_aften_niveau_hold').startswith('hold') }}
+      then:
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: light.boernevaerelse_hygge_strip
+          data:
+            rgb_color: [255, 150, 200]
+            brightness_pct: 40
+            transition: 3
+    # Børnehygge plug-lampe (non-dimmable teddy): bare ON
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.boernevaerelse_hyggelys
+    - service: logbook.log
+      data:
+        name: "Puttelys (fase 1)"
+        message: >-
+          {{ now().strftime('%H:%M') }} fase 1: loft 30% + strip lyserød
+          40% + hyggelys on.
+
+# 2026-06-21 (user-spec): bad-/tids-triggeren skal IKKE tænde puttelyset i et TOMT
+# rum (det "står bare og brænder for ingen verdens nytte"). Denne wrapper armerer
+# i stedet og tænder fase 1 FØRST når Apollo børn første gang ser BEVÆGELSE
+# (børnene faktisk ankommer fra badet). Ingen bevægelse inden arm-timeout → fase 1
+# tændes ALDRIG = intet spildt lys. Ser Apollo allerede bevægelse → tænd straks.
+# Manuel Styrbar OP + Trigger D (lægge-presence) går UDEN OM denne (egen eksplicit
+# intent / presence-bekræftelse) og kalder puttelys_phase1_apply direkte.
+# mode:restart → en senere trigger (fx tids-bagkant efter bad) gen-armer rent.
+puttelys_phase1_when_present:
+  alias: "Puttelys: arm fase 1 — vent på Apollo børn-bevægelse"
+  description: >
+    Armér fase 1 og tænd den når Apollo børn (moving_target) første gang ser
+    bevægelse efter trigger. Timeout uden bevægelse → tænd aldrig (sparet lys).
+  mode: restart
+  max_exceeded: silent
+  # 2026-10-07: bagkantens genstart-vej armerer kun RESTEN af vinduet.
+  fields:
+    timeout_minutter:
+      description: "Arm-timeout i min (default input_number.puttelys_arm_timeout_minutes)"
+  sequence:
+    - variables:
+        arm_min: >-
+          {{ timeout_minutter | default(states('input_number.puttelys_arm_timeout_minutes') | int(15)) | int(15) }}
+    - choose:
+        # Apollo ser allerede bevægelse → børnene er der → tænd straks.
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.boernevaerelse_apollo_radar_moving_target
+              state: "on"
+          sequence:
+            - service: script.puttelys_phase1_apply
+      default:
+        - service: logbook.log
+          data:
+            name: "Puttelys armed"
+            message: >-
+              Fase 1 armeret {{ now().strftime('%H:%M') }} — venter på at Apollo
+              børn ser bevægelse (op til {{ arm_min }} min).
+              Tænder ikke et tomt rum.
+        - wait_for_trigger:
+            - platform: state
+              entity_id: binary_sensor.boernevaerelse_apollo_radar_moving_target
+              to: "on"
+          timeout:
+            minutes: "{{ arm_min }}"
+          continue_on_timeout: true
+        - choose:
+            - conditions:
+                # Bevægelse set + gates stadig OK (kan have ændret sig i ventetiden).
+                - condition: state
+                  entity_id: binary_sensor.boernevaerelse_apollo_radar_moving_target
+                  state: "on"
+                - condition: state
+                  entity_id: input_boolean.godnat_boern_active
+                  state: "off"
+                - condition: state
+                  entity_id: input_boolean.puttelys_descent_active
+                  state: "off"
+                - condition: state
+                  entity_id: input_boolean.puttelys_phase1_fired
+                  state: "off"
+                - condition: state
+                  entity_id: input_boolean.boernevaerelse_manual_off_lock
+                  state: "off"
+              sequence:
+                - service: script.puttelys_phase1_apply
+          default:
+            - service: logbook.log
+              data:
+                name: "Puttelys armed timeout"
+                message: >-
+                  Ingen børn-bevægelse i Apollo inden timeout (eller putning gik
+                  videre ad anden vej) → fase 1 IKKE tændt = intet spildt lys.
+
+# 2026-08-20: ENESTE vej til natlys på hygge-strippen. Kelvin-slideren oversættes
+# til RGB, fordi strippen (ZHA, innr FL 230 C = RGBW) ikke kan crossfade mellem
+# RGB-motoren og sin hvide kanal: et color_temp-kald skifter color_mode xy →
+# color_temp, og farven SNAPPER til hvid mens brightness stadig fader. Fase 1
+# sætter med vilje rgb (linje 37) netop for at bevare xy-mode — nedtrapningen
+# ophævede det igen. Målt: strip stod xy/rgb(255,151,200), natlys-kaldet bad om
+# color_temp_kelvin. Rør ikke kelvin-slideren; den er stadig sandheden.
+boern_natlys_set:
+  alias: "Puttelys: sæt børne-strip på natlys (RGB — ingen color_mode-skift)"
+  description: >
+    Sætter hygge-strippen på natlys (kelvin- + brightness-slider) via rgb_color,
+    så color_mode aldrig skifter og fadet forbliver blødt. transition i sekunder.
+  mode: parallel
+  max: 5
+  fields:
+    transition:
+      description: "Fade-tid i sekunder"
+      default: 5
+  sequence:
+    - variables:
+        natlys_rgb: >-
+          {%- set t = (states('input_number.global_putte_natlys_kelvin') | float(2700)) / 100 -%}
+          {%- if t <= 66 -%}
+            {%- set r = 255 -%}
+            {%- set g = 99.4708025861 * log(t) - 161.1195681661 -%}
+            {%- set b = 0 if t <= 19 else 138.5177312231 * log(t - 10) - 305.0447927307 -%}
+          {%- else -%}
+            {%- set r = 329.698727446 * ((t - 60) ** -0.1332047592) -%}
+            {%- set g = 288.1221695283 * ((t - 60) ** -0.0755148492) -%}
+            {%- set b = 255 -%}
+          {%- endif -%}
+          {{ [ [[r | round(0) | int, 0] | max, 255] | min,
+               [[g | round(0) | int, 0] | max, 255] | min,
+               [[b | round(0) | int, 0] | max, 255] | min ] }}
+    # 2026-09-12 (user-spec): har user selv sat strippen i aften-vinduet, står
+    # DET niveau til solopgang. Vetoet ligger her i TRAGTEN og ikke hos de fire
+    # kaldere (puttelys fase 1/2, nedtrapningen, godnat) — én regel, ét sted
+    # (fejlklasse #2). Scriptet er husets eneste vej til at skrive et
+    # natlys-niveau på strippen, så det er nok at stoppe her.
+    - condition: template
+      value_template: >-
+        {{ not states('input_text.boern_aften_niveau_hold').startswith('hold') }}
+    - service: light.turn_on
+      continue_on_error: true
+      target:
+        entity_id: light.boernevaerelse_hygge_strip
+      data:
+        rgb_color: "{{ natlys_rgb }}"
+        brightness_pct: "{{ states('input_number.global_putte_natlys_brightness') | int(1) }}"
+        transition: "{{ transition | float(5) }}"
+
+# 2026-06-18: putte-nedtrapnings-koreografi UDTRUKKET fra automations/godnat_
+# night.yaml::puttelys_descent til genbrugbart script m. varigheds-parameter.
+# Kaldere: (1) puttelys_descent-automationen (still_target 2 min) → fuld
+# varighed; (2) puttelys_styrbar_start (Styrbar-OP-putning, ankomst-aften) →
+# forkortet varighed (allerede-puttet-tid trukket fra). mode:restart → ny
+# still/Styrbar-trigger genstarter rent.
+#
+# 2026-10-05 (user: "puttefade lys skete ikke … faden skal ske ud over hele
+# putningen"): loftet fader nu over HELE nedtrapningen (før 0-65 %), og HA
+# driver rampen i GEOMETRISKE trin (~30 s). Før var det ÉN light.turn_on med
+# transition = 65 % af w → Innr-pæren kørte en lineær MoveToLevel i firmware,
+# som ikke kan ses (samme fund som godnat_fuld 09-05: nul mellemtrin). Målt
+# 10-05: user slukkede selv loftet 16 min inde, hvor det skulle stå på ~10 %.
+# Rampen er en gren i `parallel` — så stopper script.turn_off/mode:restart
+# begge grene, og der er ingen ny stop-vej at vedligeholde (#21).
+# Strip/hyggelys/godnat-flip-tidslinjen er uændret (65/85/100 %).
+puttelys_descent_run:
+  alias: "Puttelys: kør nedtrapning (fase 1 → natlys over N min)"
+  description: >
+    Single source of truth for putte-nedtrapningen. Parameter duration_minutes
+    styrer varigheden; loftet fader geometrisk over hele forløbet og slukker
+    ved 100 %, hyggelys 85 %, strip late-fade fra 65 %, godnat-flip 100 %.
+  mode: restart
+  fields:
+    duration_minutes:
+      description: "Nedtrapningens varighed i minutter"
+      default: 20
+  sequence:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.puttelys_descent_active
+    - variables:
+        w: "{{ (duration_minutes | float(20)) * 60 }}"
+        t0: "{{ as_timestamp(now()) }}"
+        strip_start: "{{ ((duration_minutes | float(20)) * 60 * 0.65) | int }}"
+        strip_t: "{{ ((duration_minutes | float(20)) * 60 * 0.35) | int }}"
+        hygge_delay: "{{ ((duration_minutes | float(20)) * 60 * 0.20) | int }}"
+        final_delay: "{{ ((duration_minutes | float(20)) * 60 * 0.15) | int }}"
+        # Loft-rampen: ét trin pr. ~30 s (10-120 trin), fra loftets AKTUELLE
+        # niveau ned til 5 raw (~2 % — gulvet godnat_fuld også bruger).
+        loft_trin: "{{ [[ ((duration_minutes | float(20)) * 2) | round(0) | int, 10 ] | max, 120 ] | min }}"
+        loft_interval: "{{ (duration_minutes | float(20)) * 60 / ([[ ((duration_minutes | float(20)) * 2) | round(0) | int, 10 ] | max, 120 ] | min) }}"
+        loft_start: "{{ state_attr('light.boernevaerelse_loft', 'brightness') | int(0) if is_state('light.boernevaerelse_loft', 'on') else 0 }}"
+        loft_slut: 5
+    - service: logbook.log
+      data:
+        name: "Puttelys (nedtrapning)"
+        message: >-
+          {{ now().strftime('%H:%M') }} putte-nedtrapning startet
+          ({{ (duration_minutes | float(20)) | round(0) | int }} min).
+    - parallel:
+        # --- LOFT: geometrisk 0 → 100 %, derefter HELT slukket ---
+        # Trin i = start · (slut/start)^(i/n) → det OPFATTEDE fald er konstant.
+        # Rampen stopper (uden at skrive) når loftet er slukket, eller når nogen
+        # har flyttet det væk fra rampens forrige trin (app/Styrbar/godnat) —
+        # og et trin går ALDRIG over det nuværende niveau (PRIME DIRECTIVE:
+        # vi dæmper kun ned). Slukket ved 100 % sker uanset, som før ved 65 %
+        # (user-spec 2026-10-06: "loft lyset skal slukke" — også efter en
+        # manuel justering undervejs).
+        - sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ loft_start | int(0) > 0 }}"
+              then:
+                - if:
+                    - condition: template
+                      value_template: "{{ loft_start | int(0) > loft_slut | int(5) }}"
+                  then:
+                    - repeat:
+                        while:
+                          - condition: template
+                            value_template: >-
+                              {% set n = loft_trin | int %}
+                              {% set s0 = loft_start | float %}
+                              {% set forrige = s0 * ((loft_slut | float) / s0) ** ((repeat.index - 1) / n) %}
+                              {% set b = state_attr('light.boernevaerelse_loft', 'brightness') %}
+                              {{ repeat.index <= n
+                                 and is_state('light.boernevaerelse_loft', 'on')
+                                 and b is not none
+                                 and ((b | float) - forrige) | abs <= [4, forrige * 0.25] | max }}
+                        sequence:
+                          - service: light.turn_on
+                            continue_on_error: true
+                            target:
+                              entity_id: light.boernevaerelse_loft
+                            data:
+                              brightness: >-
+                                {% set s0 = loft_start | float %}
+                                {% set maal = s0 * ((loft_slut | float) / s0) ** (repeat.index / (loft_trin | int)) %}
+                                {% set b = state_attr('light.boernevaerelse_loft', 'brightness') | int(255) %}
+                                {{ [[maal | round(0) | int, loft_slut | int] | max, b] | min }}
+                              transition: "{{ (loft_interval | float * 1.2) | round(1) }}"
+                          - delay:
+                              milliseconds: "{{ (loft_interval | float * 1000) | round(0) | int }}"
+                # Resten af w (rampen kan være stoppet tidligt af en manuel ændring).
+                - delay:
+                    seconds: "{{ [ (w | float) - (as_timestamp(now()) - (t0 | float)), 0 ] | max | round(0) | int }}"
+                - if:
+                    - condition: state
+                      entity_id: light.boernevaerelse_loft
+                      state: "on"
+                  then:
+                    - service: light.turn_off
+                      continue_on_error: true
+                      target:
+                        entity_id: light.boernevaerelse_loft
+                      data:
+                        transition: 10
+        # --- STRIP + HYGGELYS: tidslinjen fra før 10-05 (65/85/100 %) ---
+        - sequence:
+            - delay:
+                seconds: "{{ strip_start }}"
+            # 65 → 100 %: strippen late-fader 40 % lyserød → 1 % blå-hvid natlys.
+            # 2026-08-07: else-grenen er ikke kosmetik. En slukket strip betød før at
+            # natlyset TAVST blev sprunget over (målt: el-pris-suppressoren slukkede
+            # strippen 1 s efter fase 1, og børnene stod uden natlys hele natten) —
+            # samme fejl-form som 08-06d's oversprungne loft. Nedtrapningen ENDER i
+            # natlys, så den skal kunne TÆNDE det, ikke kun dæmpe et allerede tændt.
+            # To bevidste undtagelser hvor mørkt er det RIGTIGE svar: Dark Mode i
+            # børneværelset (user-spec 08-07: "dark mode … skal slukke lys, selv
+            # puttelys") og en armeret manuel-sluk-lås.
+            - if:
+                - condition: state
+                  entity_id: light.boernevaerelse_hygge_strip
+                  state: "on"
+              then:
+                - service: script.boern_natlys_set
+                  data:
+                    transition: "{{ strip_t }}"
+              else:
+                - if:
+                    - condition: state
+                      entity_id: binary_sensor.dark_mode_boern
+                      state: "off"
+                    - condition: state
+                      entity_id: input_boolean.boernevaerelse_manual_off_lock
+                      state: "off"
+                  then:
+                    - service: script.boern_natlys_set
+                      data:
+                        transition: 5
+                    - service: logbook.log
+                      data:
+                        name: "Puttelys (nedtrapning)"
+                        message: >-
+                          {{ now().strftime('%H:%M') }} strippen var slukket ved natlys-trinnet
+                          → tændt direkte på natlys-niveau (else-gren).
+                        entity_id: light.boernevaerelse_hygge_strip
+            # 85 %: hyggelys plug (non-dimmable) + apollo-RGB slukkes
+            - delay:
+                seconds: "{{ hygge_delay }}"
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id:
+                  - light.boernevaerelse_hyggelys
+                  - light.boernevaerelse_apollo_rgb_light
+            - delay:
+                seconds: "{{ final_delay }}"
+    # --- 100 %: konvergér til natlys (efter begge grene) ---
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.puttelys_descent_active
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.godnat_boern_active
+    - service: logbook.log
+      data:
+        name: "Puttelys (nedtrapning)"
+        message: >-
+          {{ now().strftime('%H:%M') }} nedtrapning færdig → natlys, godnat_boern_active=on.
+
+godnat_toggle:
+  alias: "Godnat: smart toggle (godnat hvis off, godmorgen hvis on)"
+  description: >
+    Dashboard-bruger script. Tjekker input_boolean.godnat_active og kører
+    enten script.godnat (start godnat) eller script.godmorgen (slut godnat).
+    Tilfojet 2026-05-03 saa én knap kan begge retninger.
+  mode: single
+  sequence:
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.godnat_active
+              state: "off"
+          sequence:
+            - service: script.godnat
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.godnat_active
+              state: "on"
+          sequence:
+            - service: script.godmorgen
+
+# ÉN liste over de scene-/mørke-flag der er døde når huset går i seng (B102,
+# fejlklasse #2): script.godnat og script.godnat_fuld kaldte hver sin kopi, og
+# godnat_fuld (Somrig-knappen) manglede cinema/cirkus/kalde + active_scene.
+# Blokerende kald (ingen script.turn_on), så flagene er nede før kalderen går
+# videre til sluk/gardiner.
+godnat_ryd_scener:
+  alias: "Godnat: ryd scene- og mørke-flag"
+  icon: mdi:broom
+  mode: queued
+  sequence:
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          - input_boolean.cinema_active
+          - input_boolean.cirkus_active
+          - input_boolean.kalde_active
+          - input_boolean.godnat_pending
+          # 2026-08-27c: dark_mode overlevede godnat og holdt køkken-lyskædens
+          # enforcer i live (den havde dark_mode som undtagelse). Et
+          # mørklægnings-flag er pr. definition dødt når man går i seng.
+          - input_boolean.dark_mode
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.active_scene
+      data:
+        option: "none"
+
+godnat_fuld:
+  alias: "Godnat (hele huset)"
+  description: >
+    Hel-hus godnat — single source of truth for Somrig kort-ned (60s fade),
+    Somrig lang-ned (6s fade) OG telefon-widget (kald uden data → 60s).
+    Sætter alle 3 godnat-flags, fader ALT lys (light.alle_lys inkl. terrasse)
+    ud UNDTAGEN børne-hyggestrippen (light.boernevaerelse_hygge_strip = 1%
+    natlys der måske kører), lukker gardiner (syd+sove+boern — IKKE vest,
+    der står åbent om natten per user-spec 2026-06-12), stamper godnat_force_at
+    (entre_motion_night holder ro). fade default 60 sek.
+  fields:
+    fade:
+      description: "Fade-tid i sekunder for lys-sluk"
+      example: 60
+      default: 60
+  mode: restart
+  sequence:
+    - variables:
+        fade_s: "{{ fade | default(60) | int }}"
+    # Knap/widget = nogen er hjemme per definition.
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_state
+      data:
+        option: "Active"
+    # Master + voksne ALTID. Boern-flaget KUN hvis børn faktisk er hjemme
+    # (2026-06-18 user-spec): hele-huset-godnat skal ikke putte ikke-
+    # eksisterende børn (= flippe godnat_boern_active → Fase 2 natlys + nat-mode
+    # i et tomt børneværelse). kids_home er nu "kræv stærkt signal".
+    - service: input_boolean.turn_on
+      target:
+        entity_id:
+          - input_boolean.godnat_voksne_active
+          - input_boolean.godnat_active
+    - if:
+        - condition: state
+          entity_id: binary_sensor.kids_home
+          state: "on"
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.godnat_boern_active
+    # 2026-10-04 (B102): Somrig-knappen går gennem DENNE vej, ikke script.godnat
+    # — her blev kun godnat_pending + dark_mode ryddet, så et hængende
+    # cinema/cirkus/kalde-flag overlevede et godnat-tryk. Én fælles liste nu.
+    - service: script.godnat_ryd_scener
+    # entre_motion_night blokerer entre i 30 min ("ro nu" semantik).
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.godnat_force_at
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    # Luk gardiner FØRST (prompt) — før lys-faden, så gardinerne ikke venter på
+    # fade_s-delayen nedenfor. Sove-gardinet lukker ALTID. Syd + vest gates per-
+    # gardin af nat-cyklus-knapperne (gardin_*_natcyklus_enabled, user 2026-06-16)
+    # — begge default OFF, så syd/vest lukkes kun hvis knappen er tændt.
+    # VEST-NATREGEL 2026-06-12 bevares som default (vest-knap OFF = åben natten).
+    # Vest-delen filtreres på held_luk (B198, luk-kontrakten i
+    # gardin_manual_grace.yaml: Sleep Over/grace/mosbillede). Kun vest —
+    # sove/syd-adfærden er uændret.
+    - service: cover.close_cover
+      continue_on_error: true
+      target:
+        entity_id: >-
+          {{ ['cover.gardin_sovevaerelse']
+             + (['cover.gardin_stue_syd']
+                if is_state('input_boolean.gardin_syd_natcyklus_enabled', 'on') else [])
+             + ((['cover.gardin_stue_vest_1', 'cover.gardin_spisestue_vest']
+                 | reject('in', state_attr('sensor.gardiner_manual_hold', 'held_luk') or [])
+                 | list)
+                if is_state('input_boolean.gardin_vest_natcyklus_enabled', 'on') else []) }}
+    # Sluk ALT lys (inkl. terrasse) UNDTAGEN børne-strippen (light.alle_lys =
+    # single-source-of-truth). 2026-07-08 (#4, user-bug: "alt lys snapper i st.f.
+    # at fade ved godnat kort-tryk"): mange pærer honorerer IKKE transition på
+    # light.turn_off → de snapper. ROBUST FADE = ramp de TÆNDTE pærer ned til 1%
+    # via light.turn_on (Level Control move-to-level honoreres pålideligt) over
+    # fade_s, DEREFTER et rent sluk. Kun tændte pærer rampes (slukkede blitzer
+    # ikke on→off; on/off-plugs kan ikke dæmpe → de slukker ved det afsluttende
+    # turn_off). Ramp NEDAD rører aldrig bedroom_night_guard (kun OP-ramper i godnat).
+    # 2026-07-16 (user-spec): godnat må IKKE mørklægge et OPTAGET bad → spring
+    # bad-spots over (gruppe-medlemslisten fra light.badevaerelse_all = single
+    # authority, ingen roster-kopi). 2026-07-22 (user-bug: "godnat slukkede
+    # ikke bad selvom wasp var off"): gate KUN på wasp_active — IKKE det bredere
+    # optaget_lukket_doer (= wasp ELLER committet-visit-stage). Committet-stage
+    # (Medium/Fuld) eskalerer kun opad og rydder først når døren åbnes → et
+    # stale/toilet-besøg bag lukket dør holdt badet tændt gennem godnat selvom
+    # wasp (den pålidelige "nogen bruser NU"-armering) var off. Wasp armeres kun
+    # ved frisk inde-PIR bag lukket dør = den autoritet user forventer. Badets
+    # egne sluk-flows rydder resten. skip_lights beregnes ÉN gang her så fade +
+    # begge off-pass er konsistente.
+    # 2026-09-02c: bad-undtagelsen læses nu fra det delte anker
+    # sensor.badevaerelse_sluk_alt_undtagelse i stedet for at gentage
+    # wasp-reglen her. Ankeret unionerer wasp_active med brusebad_hold
+    # (klima-beviset), så en der står stille i bruseren bag en dør der stod
+    # åben ved indgang — hvor wasp aldrig armeres — også er beskyttet.
+    # 2026-09-02d: undtagelsen er en UDSÆTTELSE, ikke en frafaldelse. Kvittér,
+    # så badevaerelse_sluk_alt_efterslaeb kan indhente spottene når badet bliver
+    # frit — ellers gives undtagelsen på en kant og indsamles aldrig (#4/#19).
+    - service: script.badevaerelse_sluk_alt_udskyd
+    - variables:
+        skip_lights: >-
+          {{ ['light.boernevaerelse_hygge_strip']
+             + (state_attr('sensor.badevaerelse_sluk_alt_undtagelse', 'lys')
+                | default([], true) | list) }}
+        fade_lights: >-
+          {{ expand('light.alle_lys')
+             | selectattr('state', 'eq', 'on')
+             | rejectattr('entity_id', 'in', skip_lights)
+             | map(attribute='entity_id') | list }}
+    - if:
+        - condition: template
+          value_template: "{{ fade_lights | length > 0 and fade_s > 1 }}"
+      then:
+        # 2026-07-08 (user-fund): ramp til 2 % (IKKE 1) — IKEA white bulbs kan
+        # hænge glødende på minimums-niveauet.
+        # 2026-09-05 (user-bug: "godnat fade down hakker i soveværelset"): ÉN
+        # turn_on med transition = fade_s lader PÆREN køre hele rampen i sin egen
+        # firmware — HA sender ét MoveToLevel og rører den aldrig igen (målt på
+        # sidste godnat: præcis to state-rækker, on → off, nul mellemtrin).
+        # Soveværelsets innr RF 271 T kvantiserer den lange transition groft, og
+        # da lysopfattelse er logaritmisk bliver hvert firmware-trin et STORT
+        # opfattet spring i den mørke ende = hakket.
+        # Fix: HA driver rampen, og trinnene lægges GEOMETRISK
+        # (lvl_i = 100 · 0,02^(i/steps)), så det OPFATTEDE fald er konstant hele
+        # vejen ned. Hvert trin targeter kun de pærer der lige nu er LYSERE end
+        # trinnet → sættet krymper monotont og ingen pære kan rampe OP (en pære
+        # der tændes midt i godnat er i forvejen ude, da fade_lights er låst).
+        # transition ×1,2 af intervallet, så pæren stadig er i bevægelse når næste
+        # kommando overtager — ellers står den stille i slutningen af hvert trin.
+        # Samlet varighed er uændret fade_s; loop-omkostning ~2-3 kald/s (husets
+        # loft er 5-10/s).
+        - variables:
+            fade_steps: "{{ [[ (fade_s / 5) | round(0) | int, 4 ] | max, 20 ] | min }}"
+            fade_interval: "{{ fade_s / (fade_steps | int) }}"
+        - repeat:
+            count: "{{ fade_steps | int }}"
+            sequence:
+              - variables:
+                  lvl: "{{ 100 * (2.0 / 100) ** (repeat.index / (fade_steps | int)) }}"
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: >-
+                    {{ expand(fade_lights)
+                       | selectattr('state', 'eq', 'on')
+                       | selectattr('attributes.brightness', 'defined')
+                       | rejectattr('attributes.brightness', 'none')
+                       | selectattr('attributes.brightness', 'gt', lvl * 2.54)
+                       | map(attribute='entity_id') | list }}
+                data:
+                  brightness_pct: "{{ [ lvl | round(0) | int, 2 ] | max }}"
+                  transition: "{{ (fade_interval * 1.2) | round(1) }}"
+              - delay:
+                  milliseconds: "{{ (fade_interval * 1000) | round(0) | int }}"
+    # 2026-07-08 (user-fund, entré-loft TRADFRI): det afsluttende sluk skal være
+    # et RENT off UDEN transition (ren ZCL Off-kommando). turn_off MED transition
+    # er præcis dét IKEA white bulbs mishandler — pæren kan blive hængende på ~1 %
+    # glød mens HA rapporterer 'off'. Snap fra 2 % er usynligt.
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: >-
+          {{ expand('light.alle_lys')
+             | rejectattr('entity_id', 'in', skip_lights)
+             | map(attribute='entity_id') | list }}
+    # Bælte+seler: gentag det rene off 2 s senere til HELE sættet — HA's state
+    # kan ikke bruges som filter her (den rapporterer 'off' selv når pæren
+    # gløder), så gensendingen er ubetinget. Fanger også droppede kommandoer
+    # under mesh-trængsel ved godnat (mange samtidige sluk).
+    - delay:
+        seconds: 2
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: >-
+          {{ expand('light.alle_lys')
+             | rejectattr('entity_id', 'in', skip_lights)
+             | map(attribute='entity_id') | list }}
+    # 2026-08-12 (user-bug "depot lys hænger, vi sover"): et sluk kan IKKE nå en
+    # pære der er faldet af radionettet — og den står fysisk tændt imens.
+    - service: script.godnat_uopnaaelige_lys_stamp
+      data:
+        skip: "{{ skip_lights }}"
+
+godnat_uopnaaelige_lys_stamp:
+  alias: "Godnat: registrér lys der ikke kunne nås"
+  description: >
+    Kaldes til sidst af begge godnat-veje. Et lys der står 'unavailable' er
+    hverken tændt eller slukket i HA's øjne (fejlklasse #9) — men fysisk lyser
+    det videre, og godnat's light.turn_off blev droppet. Facit 2026-08-12:
+    light.depot_strip mistede radioen kl. 07:06 MENS den var ON og lyste 15
+    timer; hverken godnat, force-instant eller super-watchdog'en (kræver
+    state == 'on') kunne se den. Vi stempler derfor de uopnåelige lys, så
+    lys_offline_sluk_ved_retur kan slukke dem i sekundet de kommer tilbage, og
+    sender ét varsel — når radioen er væk er "sluk den ved kontakten" den
+    ENESTE handling der findes.
+  fields:
+    skip:
+      description: "Lys der bevidst blev sprunget over (hyggestrip, optaget bad)"
+      example: "['light.boernevaerelse_hygge_strip']"
+      default: []
+  mode: single
+  sequence:
+    - variables:
+        # Registry-rester fra før flytningen: verificeret 2026-08-12 at disse 5
+        # har NUL live states i hele recorderens historik (depot_strip havde
+        # 'on' kl. 07:03 samme dag = ægte). Uden dem ville varslet fyre hver
+        # eneste nat om pærer der ikke findes = cry wolf. Bliver én af dem
+        # paret igen, holder den op med at være 'unavailable' og forsvinder
+        # herfra af sig selv. Tjek: SELECT ... FROM states WHERE state NOT IN
+        # ('unavailable','unknown') for entity'en.
+        doede: >-
+          {{ ['light.depot_loft_ikea', 'light.boernevaerelse_lampe',
+              'light.stue_hjoernelampe', 'light.stue_sofa_lampe',
+              'light.stue_sofa_lampe_2'] }}
+        # Kun leaf-pærer: en gruppe (har 'entity_id'-attr) kan stå unavailable
+        # blot fordi ét medlem er væk, og et sluk på gruppen kaskaderer.
+        offline: >-
+          {{ expand('light.alle_lys')
+             | rejectattr('attributes.entity_id', 'defined')
+             | rejectattr('entity_id', 'in', skip | default([], true))
+             | rejectattr('entity_id', 'in', doede)
+             | selectattr('state', 'in', ['unavailable', 'unknown'])
+             | map(attribute='entity_id') | list }}
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.godnat_uopnaaelige_lys
+      data:
+        # Fyld op til input_text'ens 255 tegn — et fast loft på 6 skar
+        # light.stue_spot_1 fra 08/10 (7 Thread-lys faldt, den lyste natten ud).
+        value: >-
+          {% set ns = namespace(ud=[]) %}
+          {% for e in offline %}
+            {% if (ns.ud + [e]) | join(',') | length <= 255 %}
+              {% set ns.ud = ns.ud + [e] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.ud | join(',') }}
+    - if:
+        - condition: template
+          value_template: "{{ offline | length > 0 }}"
+      then:
+        - service: logbook.log
+          data:
+            name: "Godnat"
+            message: >-
+              {{ offline | length }} lys kunne ikke nås (offline) og kan stå
+              fysisk tændt: {{ offline | join(', ') }}
+        # notif_id genbruger lys_watchdog — samme betydning ("et lys hænger"),
+        # og dermed samme kill-switch/tidsvindue/telefonvalg som brugeren
+        # allerede har sat op. Ingen nye notif-helpers.
+        - service: script.push_notify
+          continue_on_error: true
+          data:
+            notif_id: lys_watchdog
+            title: "⚠️ Godnat kunne ikke nå {{ offline | length }} lys"
+            # Visningsnavne + ental/flertal (2026-10-20) — før stod der
+            # "terrasse_paerelyskaede … De slukkes" om ét lys.
+            message: >-
+              {% from 'tekst.jinja' import dansk %}
+              {%- set ns = namespace(n=[]) -%}
+              {%- for e in offline -%}
+                {%- set ns.n = ns.n + [dansk(state_attr(e, 'friendly_name') | default(e | replace('light.', ''), true))] -%}
+              {%- endfor -%}
+              {%- set en = offline | length == 1 -%}
+              {{ ns.n | join(', ') }} svarer ikke og kan stå
+              tændt. {{ 'Den slukkes' if en else 'De slukkes' }} automatisk, når
+              {{ 'den' if en else 'de' }} kommer tilbage — ellers sluk på kontakten
+              eller stikket.
+
+godnat:
+  alias: "Godnat"
+  description: >
+    Manual goodnight - activates full godnat mode, kills ALL scenes (cinema/cirkus/zen/etc),
+    resets active_scene to none, closes curtains. 2026-05-05 update: scene
+    clear tilfojet (var kun cinema før).
+  sequence:
+    # 2026-05-06: capture active_scene FØR vi nullstiller, så vi kan vide
+    # om Private var aktiv (= terrasse skal også slukkes).
+    - variables:
+        scene_was_private: "{{ is_state('input_select.active_scene', 'private') }}"
+    # Master + voksne ALTID. Boern-flaget KUN hvis børn faktisk er hjemme
+    # (2026-06-18 user-spec) — se godnat_fuld.
+    - service: input_boolean.turn_on
+      target:
+        entity_id:
+          - input_boolean.godnat_active
+          - input_boolean.godnat_voksne_active
+    - if:
+        - condition: state
+          entity_id: binary_sensor.kids_home
+          state: "on"
+      then:
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.godnat_boern_active
+    # 2026-05-05: KILL ALL SCENES (var kun cinema før). Listen bor siden
+    # 2026-10-04 i script.godnat_ryd_scener, som godnat_fuld også kalder (B102).
+    - service: script.godnat_ryd_scener
+    # A54 fix audit-3 2026-05-06 PM: continue_on_error så hele script.godnat
+    # ikke aborts hvis Chromecast offline / integration broken. Tidligere
+    # var manglen → user pressed godnat → script aborts før sluk + curtain
+    # close → lights stays on, scenes uncleared.
+    # 2026-07-28: entity_id var ghost (media_player.stue_chromecast findes ikke i
+    # /api/states) → godnat har ALDRIG slukket casten, og continue_on_error
+    # skjulte det. Relevant nu hvor 03:00-cutover'en kalder script.godnat efter
+    # "faldt i søvn under filmen". Projektoren er husets ENESTE levende Cast-
+    # enhed (port 8009-scan 2026-07-28); Chromecast5234/Hyggestue/Bathroom TV/
+    # GoogleTV7139 er døde registry-rester fra før flytningen.
+    - service: media_player.turn_off
+      continue_on_error: true
+      target:
+        entity_id: media_player.projector
+    # Luk gardiner FØRST (prompt) — før lys-faden, så de ikke blokeres af
+    # fade-delayen nedenfor (spejler godnat_fuld). O21 (audit-19): stue-gardiner
+    # med → forhindrer kuldenedfald + tidlig solopvågning hvis nogen sover på
+    # sofa. Sove-gardinet lukker altid; syd + vest gates per-gardin af nat-cyklus-
+    # knapperne (user 2026-06-16, begge default OFF). VEST-NATREGEL 2026-06-12
+    # bevares som default (vest-knap OFF = åben hele natten).
+    # Vest-delen filtreres på held_luk (B198, luk-kontrakten i
+    # gardin_manual_grace.yaml: Sleep Over/grace/mosbillede). Kun vest —
+    # sove/syd-adfærden er uændret.
+    - service: cover.close_cover
+      continue_on_error: true
+      target:
+        entity_id: >-
+          {{ ['cover.gardin_sovevaerelse']
+             + (['cover.gardin_stue_syd']
+                if is_state('input_boolean.gardin_syd_natcyklus_enabled', 'on') else [])
+             + ((['cover.gardin_stue_vest_1', 'cover.gardin_spisestue_vest']
+                 | reject('in', state_attr('sensor.gardiner_manual_hold', 'held_luk') or [])
+                 | list)
+                if is_state('input_boolean.gardin_vest_natcyklus_enabled', 'on') else []) }}
+    # 2026-05-06: hvis Private scene var aktiv, slukker vi terrasse også
+    # (fordi Private TÆNDTE den, og user vil have godnat slukker scenen helt).
+    - if:
+        - condition: template
+          value_template: "{{ scene_was_private }}"
+      then:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id:
+              - light.koekken_lyskaede
+              - light.terrasse_paerelyskaede
+          data:
+            transition: 5
+    # 2026-05-05: bruger light.alle_indvendige (group) — fanger ALLE scene-
+    # touchede lys. Excluder terrasse (godnat slukker ikke ude — generelt).
+    # 2026-07-16 (user-spec): spring badet over hvis nogen sidder derinde bag
+    # lukket dør (binary_sensor.badevaerelse_optaget_lukket_doer) — "stille hus"
+    # ved auto-godnat kan netop betyde at personen ER på badet. Spejler godnat_fuld
+    # (igen fra 2026-09-23 — se nedenfor).
+    # 2026-07-18 (bug-hunt #12): ROBUST FADE — rå turn_off m. transition
+    # mishandles af IKEA/TRADFRI (snap + ~1% glød-hæng mens HA melder 'off',
+    # især entré-loft-TRADFRI). Ramp de TÆNDTE indvendige pærer til 2% over 5s,
+    # DEREFTER et rent off UDEN transition (ren ZCL Off som IKEA honorerer) +
+    # gentag 2s senere (fanger droppede kommandoer under godnat-mesh-trængsel).
+    # Samme mønster som godnat_fuld (Somrig kort/lang-ned). skip_lights = SAMME
+    # bad-optaget-skip som før → uændret lys-scope, kun robust sluk.
+    # 2026-09-23 (#4, fejlklasse #2): "Spejler godnat_fuld" var ikke længere
+    # sandt — godnat_fuld skiftede 2026-09-02c til det delte anker
+    # sensor.badevaerelse_sluk_alt_undtagelse (wasp ELLER brusebad_hold) + en
+    # efterslæbs-kvittering, mens denne vej (Godnat-tilen) blev på det brede
+    # optaget_lukket_doer, som et afsluttet Medium/Fuld-besøg kan holde on til
+    # døren åbnes → badet blev stående tændt, og intet indhentede det senere.
+    - service: script.badevaerelse_sluk_alt_udskyd
+    - variables:
+        skip_lights: >-
+          {{ state_attr('sensor.badevaerelse_sluk_alt_undtagelse', 'lys')
+             | default([], true) | list }}
+        fade_lights: >-
+          {{ expand('light.alle_indvendige')
+             | selectattr('state', 'eq', 'on')
+             | rejectattr('entity_id', 'in', skip_lights)
+             | map(attribute='entity_id') | list }}
+    - if:
+        - condition: template
+          value_template: "{{ fade_lights | length > 0 }}"
+      then:
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: "{{ fade_lights }}"
+          data:
+            brightness_pct: 2
+            transition: 5
+        - delay:
+            seconds: 5
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: >-
+          {{ expand('light.alle_indvendige')
+             | rejectattr('entity_id', 'in', skip_lights)
+             | map(attribute='entity_id') | list }}
+    - delay:
+        seconds: 2
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: >-
+          {{ expand('light.alle_indvendige')
+             | rejectattr('entity_id', 'in', skip_lights)
+             | map(attribute='entity_id') | list }}
+    # Samme uopnåelig-tjek som godnat_fuld (delt script, ikke kopieret regel).
+    - service: script.godnat_uopnaaelige_lys_stamp
+      data:
+        skip: "{{ skip_lights }}"
+
+# --- Good morning routine ---
+
+godmorgen:
+  alias: "God morgen"
+  description: "Morning routine - clear all godnat flags, open curtains, gentle light"
+  sequence:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: !include ../rosters/godnat_flag.yaml
+    # Sove-gardinet åbner ALTID. Syd + vest åbnes kun hvis deres nat-cyklus-knap
+    # er tændt (user 2026-06-16) — symmetrisk med godnat-luk, så et gardin med
+    # cyklus OFF aldrig auto-flyttes (hverken luk eller åbn) af nat-flowet.
+    - service: cover.open_cover
+      continue_on_error: true
+      target:
+        # Spring manuelt nedrullede gardiner over (gardin_manual_grace).
+        entity_id: >-
+          {{ (['cover.gardin_sovevaerelse']
+             + (['cover.gardin_stue_syd']
+                if is_state('input_boolean.gardin_syd_natcyklus_enabled', 'on') else [])
+             + (['cover.gardin_stue_vest_1', 'cover.gardin_spisestue_vest']
+                if is_state('input_boolean.gardin_vest_natcyklus_enabled', 'on') else []))
+             | reject('in', state_attr('sensor.gardiner_manual_hold', 'held') | default([]))
+             | list }}
+    - service: light.turn_on
+      target:
+        entity_id:
+          - light.spisestue_loft
+      data:
+        brightness_pct: 70
+        color_temp_kelvin: 2850
+        transition: 10
+
+# --- All lights off ---
+
+sluk_alt:
+  alias: "Sluk alt lys"
+  description: >
+    Sluk alt lys, deaktiver cinema/cirkus, luk alle gardiner. C1: bruger
+    light.alle_lys group fra packages/light_groups.yaml — ny pære tilfojes
+    der og bliver automatisk inkluderet uden kode-edits her.
+  sequence:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.cinema_active
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.cirkus_active
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.alle_lys
+      data:
+        transition: 3
+    # VEST-NATREGEL 2026-06-12 (user-spec, udvidet): vest lukkes heller ikke
+    # af sluk_alt — vest skal i udgangspunktet være åbent (også om natten).
+    - service: cover.close_cover
+      target:
+        entity_id:
+          - cover.gardin_stue_syd
+          - cover.gardin_sovevaerelse
+
+entre_ned_sluk_alt:
+  alias: "Entré NED: sluk alt lys (uden gardiner) + grace"
+  description: >
+    2026-06-16 (user-spec): entré-Styrbar NED (kort ELLER lang) slukker ALT
+    lys — også entré — men rører IKKE gardiner (modsat sluk_alt). Sætter
+    5-min nedluknings-grace (input_boolean.entre_shutdown_grace) så bevægelse
+    ikke tænder lys igen mens man går mod døren/sengen. Snapshotter alt + tænder
+    undo-grace så TOP-quick indenfor 10 min kan gendanne (samme undo som før).
+    2026-10-18 (user-spec): fader også højttaleren ud inden for 10 s og stopper
+    den (standby, volumen 0) — script.hoejttaler_fade_ud, fyr-og-glem.
+  sequence:
+    - service: script.turn_on
+      continue_on_error: true
+      target:
+        entity_id: script.hoejttaler_fade_ud
+      data:
+        variables:
+          sekunder: 8
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          - input_boolean.cinema_active
+          - input_boolean.cirkus_active
+    # Snapshot alt (lys + plugs + gardiner) → TOP-quick undo indenfor 10 min.
+    - service: scene.create
+      data:
+        scene_id: entre_somrig_undo_snapshot
+        snapshot_entities: >
+          {{ (expand('light.alle_lys') | map(attribute='entity_id') | list)
+             + (expand('group.alle_smart_plugs') | map(attribute='entity_id') | list)
+             + (expand('group.alle_gardiner') | map(attribute='entity_id') | list) }}
+    # 2026-09-02c: subtrahér et OPTAGET bad — samme undtagelse som godnat_fuld
+    # (user-spec 07-16), som hidtil kun fandtes dér (fejlklasse #2/#12).
+    # Snapshottet ovenfor tager stadig HELE huset med, så TOP-undo gendanner
+    # uændret. Ankeret: sensor.badevaerelse_sluk_alt_undtagelse.
+    # 2026-09-02d: kvittér for udsættelsen, så efterslæbet kan indhente den.
+    - service: script.badevaerelse_sluk_alt_udskyd
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: >-
+          {{ expand('light.alle_lys')
+             | rejectattr('entity_id', 'in',
+                 state_attr('sensor.badevaerelse_sluk_alt_undtagelse', 'lys')
+                 | default([], true) | list)
+             | map(attribute='entity_id') | list }}
+      data:
+        transition: 3
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.entre_brightness_cursor
+      data:
+        value: 0
+    - service: input_boolean.turn_on
+      target:
+        entity_id:
+          - input_boolean.entre_shutdown_grace
+          - input_boolean.entre_somrig_undo_grace
+
+# =============================================================================
+# Bulb defaults configuration scripts
+# =============================================================================
+# Saetter Power-on behavior + brightness + (for color bulbs) start-up color
+# temperature paa nyligt parrede paerer via direkte ZHA cluster-commands.
+# Tager kun IEEE — virker uanset om device er omdoebt eller ej.
+#
+# Cluster attribute reference:
+#   OnOff cluster (0x0006):
+#     start_up_on_off (0x4003): 0=Off, 1=On, 2=Toggle, 0xFF=Previous
+#   Level Control cluster (0x0008):
+#     start_up_current_level (0x4000): 0..254 = level, 0xFF = Previous
+#   Color Control cluster (0x0300):
+#     start_up_color_temperature_mireds (0x4010): mireds, 0xFFFF = Previous
+#
+# Anvendelse:
+#   Developer Tools -> Services
+#     service: script.innr_color_bulb_defaults
+#     data: { ieee: "ba:1a:39:ec:8c:0a:f4:fc" }
+# =============================================================================
+
+# =============================================================================
+# Gardin manuel-ned stempel (2026-06-18) — helpers i packages/gardin_manual_grace.yaml
+# =============================================================================
+# Stempler "manuel ned" for ét gardin (sætter dets input_datetime → starter
+# grace-vinduet hvor auto-op er blokeret). Kaldes af detektor-automationen
+# (app/dashboard-luk uden parent) OG af RODRET-stue-handlers (knap-luk).
+gardin_mark_manual_down:
+  alias: "Gardin: stempel manuel ned"
+  mode: parallel
+  max: 10
+  fields:
+    cover:
+      description: "cover.* entity der blev manuelt lukket"
+      example: cover.gardin_stue_syd
+  sequence:
+    - variables:
+        dt: >-
+          {% set m = {
+               'cover.gardin_stue_syd': 'input_datetime.gardin_manual_down_syd',
+               'cover.gardin_stue_vest_1': 'input_datetime.gardin_manual_down_vest_1',
+               'cover.gardin_spisestue_vest': 'input_datetime.gardin_manual_down_spisestue_vest',
+               'cover.gardin_sovevaerelse': 'input_datetime.gardin_manual_down_sove' } %}
+          {{ m.get(cover, '') }}
+    - condition: template
+      value_template: "{{ dt != '' }}"
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: "{{ dt }}"
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - service: logbook.log
+      data:
+        name: "Gardin manuel-ned"
+        message: >-
+          {{ cover }} markeret manuelt ned — auto-op blokeret i
+          {{ states('input_number.gardin_manual_grace_minutes') }} min.
+
+# Syd-gardin (stue/sofa) TOGGLE med ét tryk — beregnet til en telefon-widget
+# (HA-app: Script-widget på Android, eller Actions/Genveje på iOS).
+# 2026-06-23 (user): var luk-ONLY, nu toggle (op/ned). Script-NØGLEN er bevaret
+# (script.gardin_stue_syd_luk) så den eksisterende widget stadig virker uændret.
+#   Åbent/delvist  → LUK + stempl manuel-ned (parent-context → gardin_manual_
+#                    down_detect springer det over; sommer-forsvar/auto-op
+#                    genåbner det ikke straks).
+#   Lukket         → ÅBN + ryd manuel-ned-stemplet (så det ikke regnes som
+#                    "manuelt holdt nede" mens det står åbent → normal auto-styring
+#                    kan tage over igen).
+gardin_stue_syd_luk:
+  alias: "Syd-gardin op/ned (stue sofa, toggle)"
+  icon: mdi:window-shutter
+  mode: single
+  sequence:
+    - choose:
+        # Åbent (helt eller delvist / opening) → luk.
+        - conditions:
+            - condition: template
+              value_template: "{{ states('cover.gardin_stue_syd') != 'closed' }}"
+          sequence:
+            - service: cover.close_cover
+              target:
+                entity_id: cover.gardin_stue_syd
+            - service: script.gardin_mark_manual_down
+              data:
+                cover: cover.gardin_stue_syd
+      # Lukket → åbn + ryd manuel-ned-stemplet.
+      default:
+        - service: cover.open_cover
+          target:
+            entity_id: cover.gardin_stue_syd
+        - service: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.gardin_manual_down_syd
+          data:
+            datetime: "1970-01-01 00:00:00"
+

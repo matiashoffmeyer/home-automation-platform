@@ -1,0 +1,129 @@
+# =============================================================================
+# Lejlighedens klima — gennemsnit af de tre rumfølere, renset for bad (2026-10-15)
+# =============================================================================
+# User 15/10: "vi har en masse statistik grafer med temp og fugt. de skal bruge
+# gennemsnit af de tre når det giver mening, renset for bad effekt i nogle af
+# de grafer". De tre = køkkenets TIMMERFLOTTE (node 434), depotets Broadlink
+# RM4 Pro og badets TIMMERFLOTTE (node 463).
+#
+# DEPOT-TEMPERATUREN ER IKKE EN RUMTEMPERATUR (user 15/10: Broadlink'en sidder
+# højt oppe lige ved NUC'en, "så det skal selvfølgelig ikke vride vores tal
+# falsk"): temperatur-middelet = køkken + bad. Depotet bruges KUN som reserve
+# når begge mangler (som køkken-ækvivalent, x − o_depot; EMA-reservefejl sd
+# 0,23 °C — bedre end badets 0,31, NUC-varmen er ret konstant). Absolut fugt
+# er derimod uafhængig af opvarmningen (temp og RH måles i samme probe), så
+# depotet er med i fugt-middelet.
+#
+# FORSKYDNINGERNE DRIFTER (ugemedianer fra LTS 15/6-15/10): depot − køkken
+# 2,80-4,11 °C og 0,47-0,82 g/m³; bad − køkken (tørt) 0,60-2,19 °C og
+# 0,28-0,54 g/m³ (badet har gulvvarme; depotet ingen radiator, men NUC'en),
+# køkkenet falder af Thread (215 af 1747 kvarterer 27/9-15/10).
+# → et rå-gennemsnit hopper ~1 °C hver gang en føler forsvinder. Derfor:
+#   kende = middel af de RENE følere omregnet til køkken-niveau (x − forskyd.)
+#   temp:  lejlighed = kende + o_bad / 2            (= rå middel af køkken+bad)
+#   fugt:  lejlighed = kende + (o_depot + o_bad) / 3 (= rå 3-middel)
+#   — når alle er der og badet er tørt.
+# Forskydningerne læres løbende (EMA, tidskonstant 24 t = α 1/288 pr. 5 min),
+# kun når køkkenet OG den anden føler er der og badet er tørt. Seed = uge 41.
+#
+# BAD-RENSNING (15 bade 27/9-15/10, median-kurver fra badets start):
+#   bad abs +6,0 → +0,9 efter 60 min; depot-temp +0,5 °C i ~75 min (dampen);
+#   depot abs +1,25 efter 15 min. Køkkenets abs stiger OGSÅ +0,8 — det er ægte
+#   vand i lejligheden og bliver i målingen.
+#   binary_sensor.bad_pavirker_lejligheden = bad_fugt_overskud > 1,0 (tørt:
+#   p50 0,32) med 30 min delay_off (overskuddet er < 1,0 efter 25-65 min,
+#   depot-temp først efter ~75). Mens den er on: badet ude, og depotet ude
+#   hvis køkkenet er der (ellers er depotet eneste kilde og bruges).
+#
+# %RH-middel af rum med forskellig temperatur giver ikke mening → luftfugtighed
+# = lejlighedens absolutte fugt ved lejlighedens middel-temperatur.
+#
+# Graferne (forbrug/status) bruger disse; bad-graferne viser stadig badet RÅT
+# (der ER bad-effekten pointen). Genvex-forsøget bruger fortsat
+# sensor.inde_absolut_fugt (modellen er fittet på køkkenet).
+# LTS 11/6 → 15/10 08:00 er importeret (recorder/import_statistics) fra
+# kildernes timestatistik med samme regler: EMA-forskydninger α 1/24 pr. time,
+# vådt = bad-max > 75 % eller spænd > 8 %RH (+ timen efter), før 1/9 (intet
+# bad-instrument) = køkken alene. min/max er tilnærmede (temp: middel af de
+# rene føleres min/max; %RH: køkkenets spænd inden for timen; abs: = middel).
+# =============================================================================
+
+template:
+  - binary_sensor:
+      - name: "Bad påvirker lejligheden"
+        unique_id: bad_paavirker_lejligheden
+        icon: mdi:shower
+        delay_off:
+          minutes: 30
+        state: "{{ states('sensor.bad_fugt_overskud') | float(0) > 1.0 }}"
+
+  - trigger:
+      - trigger: time_pattern
+        minutes: "/5"
+    action:
+      - variables:
+          r: >-
+            {% set o0 = {'dt': 3.2, 'bt': 1.45, 'da': 0.47, 'ba': 0.32} %}
+            {% set o = state_attr('sensor.lejlighed_temperatur', 'forskydning') or o0 %}
+            {% set wet = is_state('binary_sensor.bad_pavirker_lejligheden', 'on') %}
+            {% set kt = states('sensor.timmerflotte_temperature') | float(none) %}
+            {% set kh = states('sensor.timmerflotte_humidity') | float(none) %}
+            {% set dt = states('sensor.broadlink_rm4_pro_temperature') | float(none) %}
+            {% set dh = states('sensor.broadlink_rm4_pro_humidity') | float(none) %}
+            {% set bt = states('sensor.badevaerelse_timmerflotte_temperature') | float(none) %}
+            {% set bh = states('sensor.badevaerelse_timmerflotte_humidity') | float(none) %}
+            {% set ka = 216.7 * (kh / 100 * 6.112 * e ** (17.62 * kt / (243.12 + kt))) / (273.15 + kt) if kt is not none and kh is not none else none %}
+            {% set da = 216.7 * (dh / 100 * 6.112 * e ** (17.62 * dt / (243.12 + dt))) / (273.15 + dt) if dt is not none and dh is not none else none %}
+            {% set ba = 216.7 * (bh / 100 * 6.112 * e ** (17.62 * bt / (243.12 + bt))) / (273.15 + bt) if bt is not none and bh is not none else none %}
+            {% set brug_b = bt is not none and not wet %}
+            {% set brug_d = dt is not none and not (wet and kt is not none) %}
+            {% set brug_dt = dt is not none and kt is none and not brug_b %}
+            {% set n = namespace(t=[], a=[], kilder=[]) %}
+            {% if kt is not none %}{% set n.t = n.t + [kt] %}{% set n.kilder = n.kilder + ['køkken'] %}{% if ka is not none %}{% set n.a = n.a + [ka] %}{% endif %}{% endif %}
+            {% if brug_b %}{% set n.t = n.t + [bt - o.bt] %}{% set n.kilder = n.kilder + ['bad'] %}{% if ba is not none %}{% set n.a = n.a + [ba - o.ba] %}{% endif %}{% endif %}
+            {% if brug_dt %}{% set n.t = n.t + [dt - o.dt] %}{% endif %}
+            {% if brug_d and da is not none %}{% set n.a = n.a + [da - o.da] %}{% set n.kilder = n.kilder + ['depot' ~ (' (også temp)' if brug_dt else ' (fugt)')] %}{% endif %}
+            {% set ok_d = kt is not none and dt is not none and not wet %}
+            {% set ok_da = ok_d and ka is not none and da is not none %}
+            {% set ok_b = kt is not none and bt is not none and not wet %}
+            {% set ok_ba = ok_b and ka is not none and ba is not none %}
+            {% set ny = {'dt': (o.dt + (dt - kt - o.dt) / 288) | round(4) if ok_d else o.dt,
+                         'da': (o.da + (da - ka - o.da) / 288) | round(4) if ok_da else o.da,
+                         'bt': (o.bt + (bt - kt - o.bt) / 288) | round(4) if ok_b else o.bt,
+                         'ba': (o.ba + (ba - ka - o.ba) / 288) | round(4) if ok_ba else o.ba} %}
+            {% set T = (n.t | sum / n.t | length + ny.bt / 2) if n.t else none %}
+            {% set A = (n.a | sum / n.a | length + (ny.da + ny.ba) / 3) if n.a else none %}
+            {% set RH = (A * (273.15 + T) / (216.7 * 6.112 * e ** (17.62 * T / (243.12 + T))) * 100) if T is not none and A is not none else none %}
+            {{ {'t': T | round(2) if T is not none else none,
+                'a': A | round(2) if A is not none else none,
+                'rh': RH | round(1) if RH is not none else none,
+                'o': ny, 'kilder': n.kilder | join(', '), 'bad': wet} }}
+    sensor:
+      - name: "Lejlighed temperatur"
+        unique_id: lejlighed_temperatur
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        icon: mdi:home-thermometer
+        state: "{{ r.t if r.t is not none else this.state }}"
+        attributes:
+          forskydning: "{{ r.o }}"
+          kilder: "{{ r.kilder }}"
+          bad_udeladt: "{{ r.bad }}"
+      - name: "Lejlighed absolut fugt"
+        unique_id: lejlighed_absolut_fugt
+        unit_of_measurement: "g/m³"
+        state_class: measurement
+        icon: mdi:water
+        state: "{{ r.a if r.a is not none else this.state }}"
+        attributes:
+          kilder: "{{ r.kilder }}"
+      - name: "Lejlighed luftfugtighed"
+        unique_id: lejlighed_luftfugtighed
+        unit_of_measurement: "%"
+        device_class: humidity
+        state_class: measurement
+        icon: mdi:water-percent
+        state: "{{ r.rh if r.rh is not none else this.state }}"
+        attributes:
+          kilder: "{{ r.kilder }}"

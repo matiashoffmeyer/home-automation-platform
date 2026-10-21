@@ -1,0 +1,215 @@
+# =============================================================================
+# Apollo spøgelses-flap alarm → push til Parent A (user-spec 2026-07-05)
+# =============================================================================
+# User: "sæt også en Apollo ghost-flapping alert op som notifikation til Parent A's
+# tlf, når du er sikker på ghost flapping foregår."
+#
+# GHOST FLAPPING: Apollo MSR-2 LD2410-radaren kan i near-field skabe fantom-mål
+# (spøgelser) → occupancy-sensoren tænder/slukker hurtigt UDEN at nogen er til
+# stede. Signaturen er et UNATURLIGT HØJT antal 'off→on'-flanker pr. time — et
+# menneske giver typisk 5–20 occupancy-tændinger/time (og radaren HOLDER 'on' via
+# still-target når man sidder stille), mens near-field-spøgelser er set på
+# 60–175/time (jf. CLAUDE.md sove/børn-incidents).
+#
+# DETEKTION: 5 history_stats-tællere (én pr. Apollo) tæller 'til-on'-flanker i et
+# rullende 1-times vindue. Overstiger en tæller `apollo_ghost_flap_threshold` →
+# vi er "sikre" på spøgelses-flap → push. Tærsklen er bevidst høj (default 40/t)
+# så almindelig menneske-aktivitet (ind/ud af et rum) IKKE udløser falsk alarm.
+#
+# Kun de 5 ÆGTE Apollo-radarer overvåges. Badeværelset har INGEN Apollo (Matter-
+# PIR — anden fejlklasse) → ikke medtaget. Spisestue overvåges på den RÅ
+# occupancy (før ghost-filteret) så vi ser spøgelset selv når filteret skjuler det.
+#
+# Global cooldown (én samlet push pr. `apollo_ghost_alert_cooldown_minutes`, som
+# lister ALLE flappende rum) undgår spam. Kill-switch: apollo_ghost_alert_enabled.
+# =============================================================================
+
+input_boolean:
+  apollo_ghost_alert_enabled:
+    name: "Apollo spøgelses-alarm aktiveret"
+    icon: mdi:ghost
+    initial: true
+
+input_number:
+  apollo_ghost_flap_threshold:
+    name: "Apollo spøgelses-flap: tærskel (flanker/time)"
+    icon: mdi:sine-wave
+    min: 10
+    max: 200
+    step: 5
+    unit_of_measurement: "/t"
+    mode: slider
+    # Antal 'til-on'-flanker pr. time før vi kalder det spøgelses-flap. Lav =
+    # følsom (kan fange menneske-travlhed); høj = kun sikre spøgelser. Default 40.
+
+  apollo_ghost_alert_cooldown_minutes:
+    name: "Apollo spøgelses-alarm: cooldown"
+    icon: mdi:timer-lock
+    min: 5
+    max: 1440
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+    # Minimum tid mellem to spøgelses-push (samlet for alle rum).
+
+input_datetime:
+  apollo_ghost_last_alert:
+    name: "Apollo spøgelses-alarm sidst sendt"
+    icon: mdi:clock-alert-outline
+    has_date: true
+    has_time: true
+
+# ---------------------------------------------------------------------------
+# 5 history_stats-tællere: 'til-on'-flanker i rullende 1-times vindue
+# ---------------------------------------------------------------------------
+sensor:
+  - platform: history_stats
+    name: "Stue Apollo ghost flaps 1h"
+    unique_id: stue_apollo_ghost_flaps_1h
+    entity_id: binary_sensor.stue_apollo_occupancy
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      hours: 1
+
+  - platform: history_stats
+    name: "Spisestue Apollo ghost flaps 1h"
+    unique_id: spisestue_apollo_ghost_flaps_1h
+    entity_id: binary_sensor.spisestue_apollo_occupancy
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      hours: 1
+
+  - platform: history_stats
+    name: "Koekken Apollo ghost flaps 1h"
+    unique_id: koekken_apollo_ghost_flaps_1h
+    entity_id: binary_sensor.koekken_apollo_occupancy
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      hours: 1
+
+  - platform: history_stats
+    name: "Sovevaerelse Apollo ghost flaps 1h"
+    unique_id: sovevaerelse_apollo_ghost_flaps_1h
+    entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      hours: 1
+
+  - platform: history_stats
+    name: "Boernevaerelse Apollo ghost flaps 1h"
+    unique_id: boernevaerelse_apollo_ghost_flaps_1h
+    entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+    state: "on"
+    type: count
+    end: "{{ now() }}"
+    duration:
+      hours: 1
+
+automation:
+  - id: apollo_ghost_flap_alert
+    alias: "Apollo: spøgelses-flap alarm → Parent A"
+    description: >
+      Når en Apollo-occupancy tæller > tærskel 'til-on'-flanker i seneste time =
+      sikker spøgelses-flap → push til Parent A (mobile_app_phone_a). Global cooldown.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: numeric_state
+        entity_id:
+          - sensor.stue_apollo_ghost_flaps_1h
+          - sensor.spisestue_apollo_ghost_flaps_1h
+          - sensor.koekken_apollo_ghost_flaps_1h
+          - sensor.sovevaerelse_apollo_ghost_flaps_1h
+          - sensor.boernevaerelse_apollo_ghost_flaps_1h
+        # Tærskel læses fra slideren (entity-baseret above).
+        above: input_number.apollo_ghost_flap_threshold
+    condition:
+      - condition: state
+        entity_id: input_boolean.apollo_ghost_alert_enabled
+        state: "on"
+      # 2026-07-10: robot/gardin skaber legitim radar-uro (ikke spøgelser) →
+      # tæl-vinduet pustes op mens Roborock rengør. Undertryk alarmen mens
+      # suppression er aktiv (samme anker som flap-jagt, apollo_flap_hunt.yaml).
+      - condition: state
+        entity_id: binary_sensor.apollo_flap_suppress
+        state: "off"
+      # 2026-08-16f: nat-kalibreringen sænker gates i dagrummene MENS familien
+      # sover, og flere spøgelses-flap er dens forventede kvittering — ikke en
+      # nyhed der skal vække nogen kl. 03. Alarmen er diagnostik, ikke alarm:
+      # tælleren står der stadig om morgenen, og jagtens samlede push leverer
+      # listen. Gælder al godnat, ikke kun nat-vinduet — et spøgelses-varsel
+      # midt i børnenes putning er lige så uvelkomment.
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "off"
+      # Global cooldown: mindst N min siden sidste push.
+      - condition: template
+        value_template: >-
+          {% set t = states('input_datetime.apollo_ghost_last_alert') %}
+          {% set cd = states('input_number.apollo_ghost_alert_cooldown_minutes') | int(120) %}
+          {{ t in ['unknown','unavailable','none','']
+             or (now() - as_datetime(t)).total_seconds() >= cd * 60 }}
+    action:
+      - variables:
+          thr: "{{ states('input_number.apollo_ghost_flap_threshold') | float(40) }}"
+          # ÉT scan bygger BÅDE display-strengen og slug-listen til tuner-
+          # knapperne (må ikke kodes 2 steder = fejlklasse #2). '||'-split
+          # (jf. Jinja-gotcha: foldet blok = streng). Slugs = per-gate-slider-
+          # prefikser (apollo_per_gate: sovevaerelse→sove, resten fulde navne).
+          scan: >-
+            {% set rooms = [
+              ('Stue','stue','sensor.stue_apollo_ghost_flaps_1h'),
+              ('Spisestue','spisestue','sensor.spisestue_apollo_ghost_flaps_1h'),
+              ('Køkken','koekken','sensor.koekken_apollo_ghost_flaps_1h'),
+              ('Soveværelse','sove','sensor.sovevaerelse_apollo_ghost_flaps_1h'),
+              ('Børneværelse','boernevaerelse','sensor.boernevaerelse_apollo_ghost_flaps_1h')
+            ] %}
+            {% set thr = states('input_number.apollo_ghost_flap_threshold') | float(40) %}
+            {% set ns = namespace(parts=[], slugs=[]) %}
+            {% for name, slug, ent in rooms %}
+              {% set c = states(ent) | float(0) %}
+              {% if c >= thr %}
+                {% set ns.parts = ns.parts + [name ~ ' ' ~ (c | int) ~ '/t'] %}
+                {% set ns.slugs = ns.slugs + [slug] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.parts | join(', ') }}||{{ ns.slugs | join(',') }}
+          offenders: "{{ scan.split('||')[0] | trim }}"
+          slugs: "{{ scan.split('||')[1] | trim }}"
+      - service: script.push_notify
+        data:
+          notif_id: apollo
+          title: "👻 Apollo spøgelses-flap"
+          message: >-
+            {{ offenders }} (tærskel {{ thr | int }}/t). Radaren tænder/slukker
+            occupancy uden nogen til stede. Vælg et tuner-forslag: 🎯 flap-jagt
+            2t (auto-bumper præcis den flappende gate, slukker selv), 👻 nærfelt
+            +5 (hæv g0/g1-gates på synder-rummet), eller 🔕 ro 24t.
+          payload:
+            tag: apollo_ghost_flap
+            channel: "Apollo diagnostik"
+            # Håndteres af notif_action_apollo_ghost (packages/notif_actions.yaml).
+            actions:
+              - action: "APOLLO_GHOST_HUNT"
+                title: "🎯 Flap-jagt 2t"
+              - action: "APOLLO_GHOST_NEARFIELD:{{ slugs }}"
+                title: "👻 Nærfelt +5"
+              - action: "APOLLO_GHOST_SNOOZE24"
+                title: "🔕 Ro 24t"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.apollo_ghost_last_alert
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: logbook.log
+        data:
+          name: "Apollo spøgelse"
+          message: "Spøgelses-flap over tærskel: {{ offenders }} → push sendt til Parent A."

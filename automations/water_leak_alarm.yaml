@@ -1,0 +1,99 @@
+# =============================================================================
+# Vandlaek-alarm — Badring water leak sensor i badevaerelset
+# =============================================================================
+# Trigger paa binary_sensor.badevaerelse_badring. Naar IKEA Badring
+# detekterer vand paa gulvet (under bruser, vask eller toilet) gaar fuld
+# alarm-tilstand:
+#   - Persistent notification (vises i HA UI indtil dismissed)
+#   - Bad-loft pulser rodt @ 100% saa man ikke kan misse det
+#   - Mobile app push til Parent A telefon (continue_on_error hvis ikke paret)
+#
+# Dette er en KRITISK safety-automation. Manglen var det stoerste hul i
+# audit-runde 2026-04-29.
+# =============================================================================
+
+- id: water_leak_alarm
+  alias: "Sikkerhed: VANDLÆK alarm i badeværelse"
+  description: >
+    Badring detekterer vand -> rodt blinkende lys + persistent notification
+    + mobile push. Forblver aktivt indtil sensor reporter off igen.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_badring
+      to: "on"
+  action:
+    # Diagnostisk logbook entry FOR notifications fyrer. Hvis user senere
+    # ikke kan finde alarm-traces i historik, tjek dette logbook entry —
+    # hvis den er der, automation fyrede korrekt og resten skal undersoeges.
+    - service: logbook.log
+      data:
+        name: "Water leak ALARM"
+        message: >
+          DETECTED water at badevaerelse kl {{ now().strftime('%H:%M:%S') }}.
+          Activating red light + persistent notification + mobile push.
+        entity_id: binary_sensor.badevaerelse_badring
+    - service: persistent_notification.create
+      data:
+        notification_id: water_leak
+        title: "🚨 VANDLAEK I BADEVAERELSE"
+        message: >
+          Badring har detekteret vand paa gulvet kl
+          {{ now().strftime('%H:%M %d-%m-%Y') }}.
+
+          Tjek STRAKS:
+          - Bruser-omraadet
+          - Vask + toilet
+          - Vandroer under vask
+          - Vaegfuger
+    - service: light.turn_on
+      target:
+        entity_id: light.badevaerelse_all   # group: loft + 5 spots = mere alarm-attention (sprint 2026-05-10)
+      data:
+        rgb_color: [255, 0, 0]
+        brightness_pct: 100
+        transition: 1
+    # A79 fix sprint 2026-05-07: notify.mobile_app_parent_a_phone fandtes ikke.
+    # 2026-07-12: routet via script.push_notify (notif_id vandlaek); telefon-valg
+    # (Parent A+Parent B default) + master styres fra 🔔 Notifikationer-fanen.
+    - service: script.push_notify
+      data:
+        notif_id: vandlaek
+        title: "🚨 VANDLAEK"
+        message: "Badeværelse: vand detekteret. Tjek straks."
+        payload:
+          tag: vandlaek_alarm
+          actions:
+            - action: "VANDLAEK_LYS_SLUK"
+              title: "🔇 Falsk alarm — sluk rødt"
+      continue_on_error: true
+
+- id: water_leak_clear
+  alias: "Sikkerhed: Vandlæk-sensor clearet"
+  description: >
+    Naar Badring rapporterer off (vand fjernet/sensor toer), dismiss
+    notification og stop rodt lys ved at lade Auto-baseline tage over
+    (light.turn_off saa naeste presence-trigger kan tage over).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.badevaerelse_badring
+      to: "off"
+  action:
+    # Diagnostisk: log hvor laenge alarm var aktiv (hjaelper med post-mortem
+    # hvis ondaegtig udsving — fx kondens eller hand-spray fejler trigger).
+    - service: logbook.log
+      data:
+        name: "Water leak ALARM"
+        message: >
+          CLEARED at kl {{ now().strftime('%H:%M:%S') }}.
+          Sensor reporterer off — dismiss notification, fade red light off.
+        entity_id: binary_sensor.badevaerelse_badring
+    - service: persistent_notification.dismiss
+      data:
+        notification_id: water_leak
+    - service: light.turn_off
+      target:
+        entity_id: light.badevaerelse_all   # group: loft + 5 spots = mere alarm-attention (sprint 2026-05-10)
+      data:
+        transition: 2

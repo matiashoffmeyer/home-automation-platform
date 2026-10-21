@@ -1,0 +1,548 @@
+# =============================================================================
+# Alarm-Driven Wakeup — Soveværelse (Adults)
+# =============================================================================
+# Erstatter wakeup_adults.yaml's fixed 05:55 trigger med phone-alarm-driven
+# wakeup. Lys begynder 30 min før din næste alarm på telefonen.
+#
+# KRAV: HA Companion app på Android-telefon skal have "Next alarm" sensor
+# enabled. Sensor: sensor.phone_a_next_alarm (Parent A's OnePlus Nord 3).
+# Sensor returnerer ISO 8601 timestamp (fx "2026-05-04T06:00:00+02:00") for
+# næste alarm sat i alarm-app'en (Google Clock, Samsung Clock, etc).
+#
+# 2026-07-28 (item 4): automationen læser IKKE længere den sensor direkte, men
+# `sensor.wakeup_alarm_next` (packages/parent_b_alarm.yaml) — ét anker der vælger
+# hvilken alarm der må drive rummet, og indbygger "alarm-ejer skal være hjemme".
+# iOS har INGEN next-alarm-sensor (Apple lader ikke apps læse Ur-app'en), så
+# Parent B's iPhone leverer via en Genvej → input_text.parent_b_alarm_genvej
+# (klokkeslæt + gentagelses-dage; input_datetime.parent_b_next_alarm er den
+# manuelle fallback). 2026-07-30 (user-valg): ankeret er SYMMETRISK — hver voksen
+# der er hjemme bidrager med sin alarm, og den TIDLIGSTE vinder. Vil man sove
+# videre, er escapen godnat-knappens snooze (4 t, se sovevaerelse_morgen_
+# beskyttelse), ikke en gætte-regel om hvis alarm der betyder mest.
+#
+# SAFETY GATING:
+#   - Phone forbindelse: skip hvis sensor er unavailable (offline phone)
+#   - Morgen-vindue: kun 04:00-10:00 (ingen afternoon-nap wakeup)
+#   - godnat_active = on (= du sover stadig — ingen wakeup midt i dagen)
+#   - house mode = Normal (ikke AirBnB eller Vacation)
+#   - house state = Active (presence verified)
+#   - presence_sensors_available = on (Apollo paret + responsive)
+#   - lux < 80 (skip kunstig sunrise hvis naturligt lys allerede er der)
+#
+# RAMP TIMELINE (sprint 2026-05-17: slider-tunable lead time, default 15 min):
+#   T-lead:    Phase 1 — 5%  @ 2000K (very dim very warm — body deep sleep)
+#   T-lead/2:  Phase 2 — 40% @ 2500K (twilight tone, gentle increase)
+#   T-1 min:   Phase 3 — 80% (slider-tunable) @ 2700K (full daylight) +
+#              clear godnat flags
+#   T+5 min:   curtains → privacy-position (se GARDIN-RÆKKEFØLGE nedenfor)
+#   +window:   curtains fully open (privacy window efter gardinet kørte)
+#
+# GARDIN-RÆKKEFØLGE (2026-08-05, user-spec "larmen fra sove gardinet vækker os,
+# så ved vækning skal lys altid tændes før gardin"): motoren er selv en vækning,
+# og den kørte FØR alarmen — Phase 3 ligger på T-1 min, så gardinet rykkede et
+# minut før telefonen ringede (målt 08-03: lys 06:10:00, gardin 06:14:00, alarm
+# 06:15). Gardinet venter nu til BEGGE er opfyldt:
+#   (a) alarmen er gået af for `global_wakeup_curtain_after_alarm_minutes` siden
+#       (default 5) — alarmen skal være det der vækker, ikke motoren;
+#   (b) lyset har været tændt i `global_wakeup_light_before_curtain_minutes`
+#       (default 5) — rummet er lyst før der larmes.
+# (b) alene ville ikke holde: er lead-tiden stor nok, er lyset for længst tændt,
+# og gardinet ville stadig køre før alarmen. Derfor er (a) det egentlige værn og
+# (b) garantien for rækkefølgen når lead-tiden er kort/nul.
+#
+# Slider: input_number.global_wakeup_lead_minutes (0-45, default 15).
+# Transition: 30s per Phase (var 60s — user-spec 2026-05-17 "lidt hurtigere").
+#
+# NB: Hvis alarm ikke er sat på telefonen (sensor returnerer 'none' eller
+# 'unavailable'), fyrer automation IKKE. Det er bevidst — alarm-driven
+# betyder du styrer det via din alarm. Hvis du har glemt alarm, ingen lys.
+# =============================================================================
+
+- id: wakeup_alarm_driven_adults
+  alias: "Vækning: Voksne (alarm-driven, slider-tunable lead time)"
+  description: >
+    Sunrise-style ramp før din phone-alarm. Lead time slider-tunable
+    (input_number.global_wakeup_lead_minutes, default 15 min, range 0-45).
+    Erstatter fixed 05:55 hverdage-trigger. Replaceer wakeup_adults_weekday
+    i audit-runde 19. Sprint 2026-05-17: ramp 30→15 min default, 30s fade.
+  mode: single  # Forhindrer dobbelt-fyring fra snooze/multi-alarm
+  # 2026-08-05: alarm-tidspunktet fanges ÉN gang her, ved triggeren (T-lead), hvor
+  # sensoren stadig peger på DENNE alarm. Læses den igen nede i action-body'en er
+  # den enten rullet videre til næste forekomst eller `unavailable` (Androids
+  # next-alarm går unavailable sekunder efter den ringer, jf. CLAUDE.md), og
+  # gardin-forsinkelsen ville regne fra i morgen tidlig. 0 = ukendt → kun
+  # lys-før-gardin-kravet gælder (fail-open: hellere et gardin der kører for
+  # tidligt end et der aldrig kører).
+  variables:
+    wakeup_alarm_ts: >-
+      {% set a = states('sensor.wakeup_alarm_next') %}
+      {{ 0 if a in ['unknown','unavailable','none',''] else as_timestamp(a, 0) | int }}
+    # 2026-08-21: hvornår rampen begyndte, som SAMME strengformat som
+    # input_datetime'ens state ('%Y-%m-%d %H:%M:%S') — så re-checkene midt i
+    # rampen kan spørge "er der trykket på sove-knappen SIDEN vi startede?"
+    # uden timestamp-aritmetik (attributten `timestamp` læses 2 t forskudt,
+    # CLAUDE.md). Leksikografisk sammenligning er korrekt for det format.
+    ramp_start_str: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+  trigger:
+    - platform: template
+      value_template: >
+        {% set alarm = states('sensor.wakeup_alarm_next') %}
+        {% if alarm in ['unknown','unavailable','none',''] %}
+          false
+        {% else %}
+          {% set seconds_until = as_timestamp(alarm) - as_timestamp(now()) %}
+          {# Sprint 2026-05-17: lead-time slider-tunable (default 15 min, var 30) #}
+          {% set lead_min = states('input_number.global_wakeup_lead_minutes') | int(15) %}
+          {% set lead_sec = lead_min * 60 %}
+          {{ 0 < seconds_until <= lead_sec }}
+        {% endif %}
+  condition:
+    # Kill-switch (sprint 2026-05-17): toggle off ved ferie etc.
+    - condition: state
+      entity_id: input_boolean.wakeup_adults_enabled
+      state: "on"
+    # Phone forbindelse + alarm-EJER hjemme: begge dele ligger nu i
+    # sensor.wakeup_alarm_next (packages/parent_b_alarm.yaml) = ét anker, så
+    # trigger og condition ikke kan divergere (fejlklasse #2).
+    #   'none' betyder: ingen gyldig alarm, ELLER ingen alarm-ejer hjemme.
+    # 2026-05-21 fix (to-partner audit #5) lever videre INDE i ankeret: Parent A's
+    # alarm må kun fyre når han faktisk er hjemme — ellers vækkede den Parent B
+    # midt i natten mens han var på rejse (sensoren rapporterer alarmen uanset
+    # telefonens fysiske position).
+    # 2026-07-28 (item 4): ankeret lader også Parent B's iPhone-alarm drive
+    # vækningen — før fik hun slet ingen ramp når Parent A var væk.
+    # 2026-07-30 (user-valg): er BEGGE hjemme, vinder den TIDLIGSTE af de to
+    # alarmer (ikke længere Parent A's pr. definition).
+    - condition: template
+      value_template: >
+        {{ states('sensor.wakeup_alarm_next') not in
+           ['unknown','unavailable','none',''] }}
+    # Morgen-vindue (skip afternoon nap-alarmer)
+    - condition: time
+      after: "04:00:00"
+      before: "10:00:00"
+    # 2026-08-21 (user-valg "alarmen alene"): rampen hænger på ALARMEN, ikke på
+    # at ingen anden i huset er stået op først.
+    # Målt i morges: lead står på 5 min, så T-lead-triggeren faldt 06:00:00 —
+    # i SAMME sekund som `godnat_auto_clear`s 06:00-tids-trigger slukkede
+    # godnat_active fordi en anden var oppe i stuen. Betingelsen var altså
+    # falsk i det øjeblik den blev evalueret, og 06:05-alarmen fik ingen
+    # solopgang (fejlklasse #19: en gate og en handling der deler klokkeslæt).
+    # Roden er at `godnat_active` er ét HUS-flag der blander "huset er i
+    # natmode" sammen med "de sovende er ikke vækket endnu" — den der står
+    # først op slukkede dermed den andens vækning.
+    # `wakeup_alarm_imminent` er præcis det vidne der mangler (45-min preguard,
+    # bygget 2026-07-29 til denne fejl, men aldrig koblet på her). Escapen er
+    # uændret: godnat-knappens 4-timers snooze nedenfor.
+    - condition: template
+      value_template: >
+        {{ is_state('input_boolean.godnat_active', 'on')
+           or is_state('binary_sensor.wakeup_alarm_imminent', 'on') }}
+    # House conditions — ikke AirBnB, ikke Vacation
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "Normal"
+    # Sensor-gate: presence-system fungerer
+    - condition: state
+      entity_id: binary_sensor.presence_sensors_available
+      state: "on"
+    # 2026-07-29 (user-spec): ankeret er nu SNOOZE-drevet, ikke et fast tids-
+    # vindue og ikke GPS-afhængigt — "hvis en alarm er sat vækkes vi, sådan er
+    # det". Det eneste der stopper vækningen er at nogen HAR trykket godnat-
+    # knappen i soveværelset (= sov videre). Se packages/sovevaerelse_morgen_
+    # beskyttelse.yaml.
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+      state: "off"
+    # NB: house_state = Active condition fjernet pre-flyt. Den kraever
+    # parasoll_hoveddoer eller Apollo presence for at flippe fra Dormant
+    # til Active — pre-flyt mangler begge sensorer. godnat_active=on
+    # condition er sufficient gate for "vi sover, vaek os".
+    # Re-enable post-flyt naar door + Apollo paret:
+    # - condition: state
+    #   entity_id: input_select.house_state
+    #   state: "Active"
+    # Skip kunstig sunrise hvis naturligt lys allerede er der (sommer-morgen).
+    # 2026-06-23 (user-spec item 1): RE-ENABLED — sove Apollo LTR390 er live og
+    # læser reelt lux (verificeret: ~13-16 lx før daggry → 123 lx kl 05:15 i
+    # morges). Det giver ingen mening at fyre kunstig 5→80% solopgang når rummet
+    # allerede er lyst. Tærskel = 80 lx × global_lux_threshold_factor (samme
+    # slider/sensor som morning_lights_sanity_check fast-surge bruger på SAMME
+    # rum → konsistent + tunbar).
+    # 2026-06-24 (user-spec task 2): brug sove-Apolloens lux når den er
+    # tilgængelig, ELLERS open-plan-lux (sensor.open_plan_lux) som fallback —
+    # i st.f. at fail-OPEN når sove-Apolloen er offline. Kun hvis BEGGE er
+    # unavailable (-1) fyrer wakeup alligevel (phone-alarmen er den egentlige
+    # vækning; bedre blød sunrise end intet hvis vi slet ikke kan måle lyset).
+    - condition: template
+      value_template: >
+        {% set sove = states('sensor.sovevaerelse_lux_reel') | float(-1) %}
+        {% set op = states('sensor.open_plan_lux') | float(-1) %}
+        {% set lux = sove if sove >= 0 else op %}
+        {% set f = states('sensor.global_lux_threshold_factor') | float(1.0) %}
+        {{ lux < 0 or lux < ((states('input_number.morgen_dagslys_lux') | float(80)) * f) }}
+  action:
+    # ===========================================================================
+    # TIMELINE (sprint 2026-05-17 — slider-tunable lead time, default 15 min):
+    #   Phase 1 @ T-lead       (fires ved trigger, lead_min foer alarm)
+    #   Phase 2 @ T-lead/2     (delay = lead_min/2 min, = lead*30 sec)
+    #   Phase 3 @ T-1 min      (delay = lead_min/2 - 1 min, clamped 0)
+    #   Curtains @ T-1         (sammen med Phase 3)
+    #   Curtains fully open    (60 min efter Phase 3)
+    #
+    # FADE: 30s transition (var 60s — user-spec 2026-05-17 "lidt hurtigere").
+    # ===========================================================================
+    # Phase 1: T-lead — Very dim very warm (body in deep sleep)
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        brightness_pct: "{{ [[(5 * (states('sensor.global_brightness_factor') | float(1.0))) | round(0) | int, 100] | min, 2] | max }}"
+        color_temp_kelvin: 2000
+        transition: 30
+    # Delay til Phase 2: lead_min/2 minutter
+    - delay:
+        seconds: >-
+          {% set lead = states('input_number.global_wakeup_lead_minutes') | float(15) %}
+          {{ (lead * 30) | int }}
+    # H4 fix audit 2026-05-07: re-check før Phase 2.
+    # Race-scenario: user presser Somrig kort-op midt i ramp →
+    # godmorgen_forced clearer godnat-flags + kører eget 8-min ramp →
+    # alarm-driven Phase 2 fyrede tidligere uden re-check → visible
+    # dim-down. Abort gracefully hvis godmorgen overtog kontrol.
+    # 2026-08-21: checket keyer nu på KNAPPEN i stedet for på godnat_active.
+    # Det er trykket i soveværelset der er "godmorgen overtog", og
+    # godnat_active kan nu være ryddet af en helt anden person i et helt andet
+    # rum (se topbetingelsen) — den skelnede altså ikke længere mellem "den
+    # sovende sagde stop" og "nogen andre stod op". Begge Somrig-grene og
+    # RODRET stempler `styrbar_last_press_sovevaerelse`, så ethvert tryk
+    # derinde dræber rampen. Urørt helper står på dagens midnat (#5) = før
+    # rampens start = ingen maskering.
+    - condition: template
+      value_template: >
+        {{ states('input_datetime.styrbar_last_press_sovevaerelse')
+           < ramp_start_str }}
+    # 2026-07-29 (user-spec): trykkes godnat-knappen midt i rampen ("sov videre")
+    # skal rampen DØ, ikke bare få sine lys snappet af suppressoren bagefter.
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+      state: "off"
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        brightness_pct: "{{ [[(40 * (states('sensor.global_brightness_factor') | float(1.0))) | round(0) | int, 100] | min, 2] | max }}"
+        color_temp_kelvin: 2500
+        transition: 30
+    # 2026-09-23 (user-spec): pærelyskæden er med i morgenvækningen — fra fase
+    # 2, fordi den ikke kan dæmpes (fase 1's 5 % ville den overdøve). Slukker
+    # med loftet (packages/sove_lyskaede.yaml). Unavailable til parret = no-op.
+    - if:
+        - condition: state
+          entity_id: input_boolean.sove_lyskaede_enabled
+          state: "on"
+      then:
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: light.sove_lyskaede
+    # Delay til Phase 3: (lead_min/2 - 1) minutter (= lead*30 - 60 sek), min 0
+    - delay:
+        seconds: >-
+          {% set lead = states('input_number.global_wakeup_lead_minutes') | float(15) %}
+          {{ [(lead * 30) - 60, 0] | max | int }}
+    # H4 fix: re-check før Phase 3 (samme rationale som Phase 2).
+    - condition: template
+      value_template: >
+        {{ states('input_datetime.styrbar_last_press_sovevaerelse')
+           < ramp_start_str }}
+    # 2026-07-29: snooze midt i rampen dræber den (se Phase 2).
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+      state: "off"
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        # Audit-5 2026-05-12: use dedicated wakeup_brightness slider (default 80).
+        # Multiplies with global_brightness_factor for compound tuning.
+        brightness_pct: >
+          {% set base = states('input_number.global_wakeup_brightness_pct') | int(80) %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+        color_temp_kelvin: 2700
+        transition: 30
+    # Clear godnat flags eksplicit — sub-flags må ikke linger hele dagen
+    - service: input_boolean.turn_off
+      target:
+        entity_id: !include ../rosters/godnat_flag.yaml
+    # 2026-07-30 (user-spec): stempl at ALARMEN vækkede os — "der ved vi at vi
+    # begge to gerne vil op". Gardinet bliver med vilje stående på privacy
+    # bagefter, så rummet er mørkt mens vi finder tøj; stemplet åbner
+    # presence-lyset i det vindue (packages/sove_alarm_morgen.yaml).
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.wakeup_alarm_ramp_faerdig_at
+      data:
+        timestamp: "{{ as_timestamp(now()) | int }}"
+    # 2026-08-05 (user-spec): VENT med motoren til lyset har stået tændt længe nok
+    # OG alarmen faktisk er gået af. Se GARDIN-RÆKKEFØLGE i headeren.
+    - delay:
+        seconds: >-
+          {% set efter = states('input_number.global_wakeup_curtain_after_alarm_minutes') | float(5) %}
+          {% set foer = states('input_number.global_wakeup_light_before_curtain_minutes') | float(5) %}
+          {% set a = wakeup_alarm_ts | float(0) %}
+          {% set vent_alarm = (a + efter * 60 - as_timestamp(now())) if a > 0 else 0 %}
+          {{ [vent_alarm, foer * 60, 0] | max | int }}
+    # Snoozer nogen midt i ventetiden ("sov videre"), skal motoren ALDRIG køre —
+    # samme escape som Phase 2/3. Aborten tager også den fulde oprulning nedenfor
+    # med sig; morning_curtains' /5-backstop åbner når soveværelset er tomt.
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+      state: "off"
+    - service: logbook.log
+      data:
+        name: "Vækning: gardin"
+        message: >
+          Privacy-position sat {{ (((as_timestamp(now()) - (wakeup_alarm_ts | float(0))) / 60)
+            | round(1)) if (wakeup_alarm_ts | float(0)) > 0 else '?' }} min efter alarmen
+          (krav {{ states('input_number.global_wakeup_curtain_after_alarm_minutes') | int(5) }} min),
+          lyset tændt {{ states('input_number.global_wakeup_light_before_curtain_minutes') | int(5) }}
+          min før.
+    # Curtains delvist nede (privacy til naboerne) — position slider-styret
+    # 2026-07-28 (default 70 % dækket, var hardcoded 50 %). Privacy-trin +
+    # privacy-vindue (slider, default 60 min) ligger i scriptet, der siden
+    # 2026-09-23 udsætter trinnet mens det er mørkt ude (giver 0 lux, kun
+    # motorlarm) — packages/sove_gardin_privacy_moerke.yaml.
+    - service: script.sove_gardin_privacy_morgen
+    # 2026-07-29 (user-spec): AUTO-oprulning går gennem scriptet, som holder
+    # gardinet på privacy indtil badet har været tomt længe nok ("vi går nøgne
+    # rundt") og selv fuldfører oprulningen bagefter.
+    - service: script.sove_gardin_op
+
+# =============================================================================
+# A56 fix audit-3 2026-05-06 PM: HA-restart resilience for wakeup-flow
+# =============================================================================
+# Hvis HA restartes mid-wakeup (Phase 1/2/3 over 30 min), template trigger
+# fyrer ikke igen (alarm-time har passed). Sove stuck på 5%/2000K eller
+# 40%/2500K. godnat flags forblir on indtil 09:00 daily safety-clear.
+#
+# Fix: 08:00 backup time-trigger. Forces Phase 3 actions hvis godnat_active=on
+# + sove light at low brightness (= we're stuck mid-wakeup OR user back in bed).
+# =============================================================================
+- id: wakeup_alarm_driven_restart_recovery
+  alias: "Vækning: Restart-recovery 08:00 (force Phase 3 hvis stuck)"
+  description: >
+    Daglig 08:00 — forces godnat-clear + curtain open hvis godnat_active=on +
+    sove light brightness <70% + det er hverdag. Catches HA-restart-mid-wakeup
+    scenario hvor template-trigger ikke fyrede igen.
+  mode: single
+  trigger:
+    - platform: time
+      at: "08:00:00"
+    # 2026-07-17 bug hunt (fejlklasse #4): står morgen-beskyttelsens slut ≥
+    # 08:00, blokerer beskyttelses-conditionen 08:00-tjekket — og det re-fyrer
+    # aldrig (sove-lys hænger dimmet, flags til 09:00-safety). Re-arm når
+    # vinduet slutter; dækker også exact-08:00-racen (sensor re-render vs
+    # trigger). Tids-conditionen nedenfor holder nat-toggles af kill-switchen
+    # ude.
+    - platform: state
+      entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+      from: "on"
+      to: "off"
+      id: beskyttelse_slut
+  condition:
+    # Kun morgen-vinduet (gælder begge triggers; 07:59 så exact-08:00 aldrig
+    # falder på en inklusiv/eksklusiv-kant).
+    - condition: time
+      after: "07:59:00"
+      before: "12:00:00"
+    # Kill-switch mirror af main wakeup-flow (sprint 2026-05-17).
+    - condition: state
+      entity_id: input_boolean.wakeup_adults_enabled
+      state: "on"
+    # 2026-08-25 (user-spec: "alle alarmvækninger springes over, ikke bare
+    # snoozes"). Denne gren læser ALDRIG `sensor.wakeup_alarm_next` — den er en
+    # ren tids-backstop — så ankerets skip-gate dækker den ikke. Uden sin egen
+    # condition er den den u-gatede vej ind (fejlklasse #21).
+    # Værre endnu: `beskyttelse_slut`-triggeren ovenfor fyrer PRÆCIS når
+    # godnat-knappens snooze udløber (fejlklasse #19), så et tryk kl. 06:30 gav
+    # lys 80% + gardin op kl. 10:30. Det var hele grunden til at trykket føltes
+    # som en udskydelse frem for et fravalg.
+    - condition: state
+      entity_id: binary_sensor.wakeup_skip_i_dag
+      state: "off"
+    # Same conditions som main wakeup-flow.
+    # 2026-08-21 (fejlklasse #12 — søster-sti til dagens ændring): main-flowet
+    # kan nu køre MENS godnat_active er ryddet af en anden person, så et
+    # hårdt `godnat_active == on` her ville betyde at netop de morgener ikke
+    # kunne ryddes op efter en restart. Andet ben beviser "stuck mid-ramp"
+    # uden flaget: en alarm ringede i dag, men rampen nåede aldrig sit
+    # færdig-stempel. (Begge stempler er has_date; urørt = dagens midnat, #5.)
+    - condition: or
+      conditions:
+        - condition: state
+          entity_id: input_boolean.godnat_active
+          state: "on"
+        - condition: template
+          value_template: >
+            {% set g = states('input_datetime.wakeup_alarm_gaaet_af_at') %}
+            {% set f = states('input_datetime.wakeup_alarm_ramp_faerdig_at') %}
+            {% set i_dag = now().strftime('%Y-%m-%d') %}
+            {{ g[:10] == i_dag and g[11:] != '00:00:00' and f[:10] != i_dag }}
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "Normal"
+    # Workday only (matcher main wakeup_alarm_driven scope)
+    - condition: state
+      entity_id: binary_sensor.workday_sensor
+      state: "on"
+    # 2026-05-21 fix (to-partner audit #5): en alarm-ejer skal være hjemme.
+    # Samme rationale som main wakeup_alarm_driven — recovery må ikke forcere
+    # Phase 3 i et tomt hus.
+    # 2026-07-28 (item 4, fejlklasse #12 — asymmetrisk søster-sti): var
+    # parent_a_home-only. Drev Parent B's iPhone-alarm rampen (Parent A på rejse) og
+    # HA restartede midt i den, kunne recovery ikke rydde op → sove-lyset hang
+    # dimmet og gardinet delvist nede resten af dagen. Nu: en voksen hjemme.
+    # 2026-08-02: hjemme-testen udvidet med trackerens sidst kendte zone, samme
+    # grund som i sensor.wakeup_alarm_next — GPS-staleness slukker flaget kl.
+    # 08:00 i dagvinduet (målt netop 08:00:00 i dag), hvilket er PRÆCIS det
+    # minut denne gren fyrer. Uden udvidelsen kunne oprydningen blokere på en
+    # tavs iPhone og efterlade nøjagtig den hængende tilstand den findes for.
+    - condition: or
+      conditions:
+        - condition: state
+          entity_id: input_boolean.parent_a_home
+          state: "on"
+        - condition: state
+          entity_id: input_boolean.parent_b_home
+          state: "on"
+        - condition: state
+          entity_id: device_tracker.phone_a
+          state: "home"
+        - condition: state
+          entity_id: device_tracker.phone_b
+          state: "home"
+    # 2026-07-04 (user-spec): morgen-beskyttelse — force ikke Phase 3 (lys+gardin)
+    # mens beskyttelses-vinduet holder soveværelset mørkt for en sovende partner.
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+      state: "off"
+    # Sove light brightness < 70% af wakeup-target = stuck mid-wakeup
+    - condition: template
+      value_template: >
+        {% set b = state_attr('light.spisestue_pendel', 'brightness') %}
+        {% set target = states('input_number.global_wakeup_brightness_pct') | int(80) %}
+        {% set threshold = target * 2.54 * 0.875 %}
+        {{ b is not none and (b | int(0)) < threshold }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Wakeup restart-recovery"
+        message: >
+          HA restart detected mid-wakeup (sove brightness {{ state_attr('light.spisestue_pendel', 'brightness') }}/254).
+          Forcing Phase 3 + flag clear.
+    # Force Phase 3 actions
+    - service: light.turn_on
+      target:
+        entity_id: light.spisestue_pendel
+      data:
+        # Audit-5 2026-05-12: use wakeup_brightness slider.
+        # 2026-07-17: × global_brightness_factor (samme formel som main Phase 3
+        # — recovery manglede faktoren, fejlklasse #2).
+        brightness_pct: >
+          {% set base = states('input_number.global_wakeup_brightness_pct') | int(80) %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+        color_temp_kelvin: 2700
+        transition: 30
+    - service: input_boolean.turn_off
+      target:
+        entity_id: !include ../rosters/godnat_flag.yaml
+    # 2026-07-30 (fejlklasse #12 — samme stempel som main-flowet): en restart
+    # midt i rampen må ikke koste alarm-morgen-vinduet.
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.wakeup_alarm_ramp_faerdig_at
+      data:
+        timestamp: "{{ as_timestamp(now()) | int }}"
+    # 2026-08-05 (fejlklasse #12 — asymmetrisk søster-sti): lyset skal også her
+    # være tændt før motoren larmer. Denne gren fyrer 08:00 MENS godnat stadig er
+    # on, altså mens der med stor sandsynlighed bliver sovet. Alarm-kravet fra
+    # main-flowet gælder ikke her: alarmen ligger timer tilbage (og sensoren er
+    # for længst rullet videre), så kun lys-før-gardin er meningsfuldt.
+    - delay:
+        seconds: >-
+          {{ ((states('input_number.global_wakeup_light_before_curtain_minutes')
+               | float(5)) * 60) | int }}
+    # Snooze-tjekket i conditions ovenfor blev læst FØR ventetiden. Trykker nogen
+    # "sov videre" undervejs, ville motoren stadig køre — og motorlarmen er hele
+    # grunden til at ventetiden findes. Samme re-tjek som main-flowet (#12).
+    - condition: state
+      entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+      state: "off"
+    # 2026-09-23: privacy-trin + vindue via scriptet (udsat i mørke, #12 —
+    # samme regel som main-flowet).
+    # 2026-07-28 (fejlklasse #12 — asymmetrisk søster-sti): recovery satte
+    # privacy-positionen men åbnede ALDRIG bagefter → gardinet hang delvist
+    # nede resten af hverdagen (kun weekend-09:00 åbner sove-gardinet ellers).
+    - service: script.sove_gardin_privacy_morgen
+    # 2026-07-29: bad-gated auto-op (samme vej som main-flowet, fejlklasse #12).
+    - service: script.sove_gardin_op
+
+# =============================================================================
+# "Alarmen gik af"-stempel (2026-08-05)
+# =============================================================================
+# Alt der skal tidsfæstes ift. voksenalarmen (pt. børnevækningen, se
+# automations/wakeup_kids.yaml) har brug for at vide HVORNÅR den ringede — og
+# det kan man IKKE læse ud af `sensor.wakeup_alarm_next` bagefter: ankeret ruller
+# videre i selve ringe-øjeblikket ('none' ved engangs-alarmer, i morgen ved
+# gentagne — målt i history 07-28→08-05).
+#
+# Rampens eget stempel (`wakeup_alarm_ramp_faerdig_at`) duer heller ikke som
+# proxy: det skrives KUN når rampen faktisk kørte, og rampen er gated på bl.a.
+# lux < 80 — på 14 dage blev det skrevet én eneste gang (08-03). Børnene skal
+# vækkes uanset om de voksnes solopgang blev sprunget over.
+#
+# HVORFOR IMMINENT-FLANKEN: `binary_sensor.wakeup_alarm_imminent` er sand mens
+# 0 < (alarm − nu) <= preguard, og templaten re-renderes hvert minut af sin
+# `now()`. Den falder derfor til off i det minut alarmen indtræffer — uanset om
+# ankeret samtidig ruller videre. Flanken alene er dog IKKE bevis: ankeret går
+# også off hvis alarmen slettes, ejeren tager hjemmefra, eller
+# `wakeup_adults_enabled` slås fra. Derfor kræves at nedtællingen faktisk nåede
+# nul (from_state's `minutter_til_alarm` <= 1) — så en slettet alarm 30 min før
+# ikke fejlagtigt tæller som "den ringede".
+#
+# NB: `wakeup_alarm_preguard_minutes = 0` slår imminent-sensoren helt fra → intet
+# stempel. Børnevækningen falder da tilbage til sit faste klokkeslæt.
+# =============================================================================
+- id: wakeup_alarm_ringede_stempel
+  alias: "Vækning: stempl at voksenalarmen gik af"
+  description: >
+    Skriver input_datetime.wakeup_alarm_gaaet_af_at når nedtællingen til
+    voksenalarmen når nul. Anker for alt der skal ske N min efter alarmen.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.wakeup_alarm_imminent
+      from: "on"
+      to: "off"
+  condition:
+    # Nåede nedtællingen reelt nul? (Se HVORFOR IMMINENT-FLANKEN i headeren.)
+    - condition: template
+      value_template: >
+        {{ trigger.from_state is not none
+           and (trigger.from_state.attributes.minutter_til_alarm | int(99)) <= 1 }}
+  action:
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.wakeup_alarm_gaaet_af_at
+      data:
+        timestamp: "{{ as_timestamp(now()) | int }}"
+    - service: logbook.log
+      data:
+        name: "Vækning: alarm"
+        message: >
+          Voksenalarmen gik af. Børnevækning planlagt
+          {{ states('input_number.global_kids_wakeup_after_alarm_minutes') | int(15) }}
+          min senere.

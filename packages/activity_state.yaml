@@ -1,0 +1,1436 @@
+# =============================================================================
+# Activity State — intelligent klassifikation af hvad der sker i lejligheden
+# =============================================================================
+# Driver guest_mode auto-detect, bedroom-only winddown, og terrasse-detektion.
+#
+# sensor.activity_state vurderer ud fra hvilke rum der har presence:
+#
+#   idle                  — ingen presence + ingen terrasse-aktivitet
+#   bedroom_only          — kun sove/boern, INTET stue/koekken/spisestue/terrasse
+#   sofa_relax            — kun stue (south) → TV / laesning / hygge i sofa
+#   dining                — kun spisestue (north) → ved bord
+#   cooking               — køkken-zonen er aktiv (2026-08-13: køkken er nu et
+#                           KRAV — ≥2 subzoner uden køkken er ikke madlavning)
+#   social_dining         — ≥2 open-plan-subzoner samtidig + spisetid (17-23)
+#   social_party          — 4+ zoner samtidig aktive (incl. terrasse + depot;
+#                           open-plan bidrager max 2 uanset subzoner) OG
+#                           people_estimate ≥ 4 (2026-07-29, træner-facit)
+#   hjemmearbejde         — dagen er markeret som hjemmearbejdsdag (målt
+#                           spisestue-ophold, se maaltid_detektion.yaml) OG
+#                           spisestuen er aktiv nu, i vinduet 06:30–17:00
+#   nightwalk             — bedroom→bath aktivitet uden stue
+#   bath_visit            — kun bad presence → brusebad/grooming
+#   transit               — kun entre eller entre+bad → ankommer/forlader
+#   terrasse_only         — terrasse aktiv, ingen indenfor presence
+#   terrasse_with_indoor  — terrasse aktiv + folk inde i open-plan (in/out)
+#   godnat                — godnat_active flag er on
+#   active                — fallback (uklassificeret aktivitet)
+#
+# TERRASSE-DETEKTION uden sensor:
+#   binary_sensor.terrasse_active er ON hvis ENTEN:
+#     a) terrasse-lys er taendt (lyskaede eller paerelyskaede on)
+#     b) "Sherlock Holmes"-deduktion: open-plan blev tom <10 min siden
+#        OG ingen indoor-rum (boern/sove/bad/entre) blev aktiv siden →
+#        eneste anden udgang er terrassen, sa de er der.
+#     c) terrassedøren står ÅBEN (parasoll_terrassedoer on) — 2026-07-09
+#        user-spec: åben dør = vi er på terrassen → aldrig 'idle'.
+#
+#   Heuristikken kan vaere forkert hvis:
+#   - Apollo missede transit gennem entre/bath (mmWave er ret robust dog)
+#   2026-07-17b (dørene ER paret nu, integreret som lovet):
+#   - hoveddørs-SUPPRESSION: brugt ≤180s før tømning (eller senere) = folk
+#     FORLOD hjemmet → false (dræber falsk terrasse ved afgang; radar-
+#     trailing gjorde at t_emptied landede efter entré/dør-aktiviteten).
+#   - terrassedørs-KRAV: IKKE brugt omkring tømningen = ingen gik derud →
+#     false (dræber ghost-flap-armering: ét radar-flap i tomt open-plan
+#     gav ellers 10 min falsk "på terrassen").
+#
+# input_boolean.guest_mode auto-saettes ON ved social_* activity i 30+ min,
+# auto-clears ved skift til idle/bedroom_only/godnat i 15+ min.
+# =============================================================================
+
+input_boolean:
+  guest_mode:
+    name: "Gaeste-mode aktiv"
+    icon: mdi:account-group
+
+  bedroom_only_winddown:
+    name: "Bedroom-only winddown aktiv"
+    icon: mdi:bed-clock
+
+input_number:
+  # 2026-08-13: hvor meget af presence-bevismaterialet der skal være i live
+  # før binary_sensor.activity_state_confident melder ON. 85 = én blind
+  # Apollo (89) er stadig OK, men en blind terrassedør (83) eller to blinde
+  # Apolloer (78) er ikke. Se konfidens-afsnittet i template-blokken.
+  activity_confidence_min_pct:
+    name: "Activity: konfidens-krav (%)"
+    min: 0
+    max: 100
+    step: 5
+    icon: mdi:check-decagram-outline
+    unit_of_measurement: "%"
+
+template:
+  - binary_sensor:
+      # Battery critical aggregate (sprint 2026-05-20):
+      # ON hvis MINDST ÉN tracked battery <5%. Bruges som trigger for Apollo
+      # RGB rød-indikator (battery_alerts.yaml::battery_rgb_*). Mirror af
+      # battery_critical_alert's entity-liste — hold dem i sync ved tilføjelse.
+      # Ignorerer unknown/unavailable (forekommer pre-first-press på Styrbars).
+      - name: "Battery critical any"
+        unique_id: battery_critical_any
+        icon: mdi:battery-alert
+        state: >
+          {% set sensors = [
+            'sensor.stue_styrbar_battery',
+            'sensor.sovevaerelse_styrbar_battery',
+            'sensor.boernevaerelse_styrbar_battery',
+            'sensor.terrasse_styrbar_battery',
+            'sensor.badevaerelse_styrbar_battery',
+            'sensor.entre_somrig_battery',
+            'sensor.badevaerelse_badring_battery',
+            'sensor.depot_valhorn_battery',
+          ] %}
+          {% set ns = namespace(critical=false) %}
+          {% for s in sensors %}
+            {% set v = states(s) %}
+            {% if v not in ['unknown','unavailable','none'] and (v | float(100)) < 5 %}
+              {% set ns.critical = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.critical }}
+        attributes:
+          critical_devices: >
+            {% set sensors = [
+              'sensor.stue_styrbar_battery',
+              'sensor.sovevaerelse_styrbar_battery',
+              'sensor.boernevaerelse_styrbar_battery',
+              'sensor.terrasse_styrbar_battery',
+              'sensor.badevaerelse_styrbar_battery',
+              'sensor.entre_somrig_battery',
+              'sensor.badevaerelse_badring_battery',
+              'sensor.depot_valhorn_battery',
+            ] %}
+            {% set ns = namespace(items=[]) %}
+            {% for s in sensors %}
+              {% set v = states(s) %}
+              {% if v not in ['unknown','unavailable','none'] and (v | float(100)) < 5 %}
+                {% set ns.items = ns.items + [(state_attr(s,'friendly_name') or s) ~ ' (' ~ v ~ '%)'] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.items | join(', ') }}
+
+      # M10 fix sprint 2026-05-06: smarter persistence. Tidligere var dette bare
+      # "lys er taendt" hvilket fejlagtigt sagde "nogen er paa terrassen" hvis
+      # Styrbar var blevet brugt manuelt til mood-light og personerne gik ind.
+      # Nu: kun ON hvis lys ER paa OG (recent Styrbar press <30 min ELLER
+      # likely_on_terrasse Sherlock-evidence). Otherwise mood-light = stale.
+      - name: "Terrasse lights on"
+        unique_id: terrasse_lights_on
+        icon: mdi:string-lights
+        state: >
+          {# 2026-06-23: koekken_lyskaede FJERNET fra OR'et — den er nu køkken-
+             accent (flyttet fra terrasse 2026-06-15), så dens on-state gav falsk
+             "terrasse optaget" i hus-tilstanden (forurenede activity_state /
+             people_estimate / Sherlock-deduktion). Kun terrasse_paerelyskaede tæller. #}
+          {% set lights_on = is_state('light.terrasse_paerelyskaede', 'on') %}
+          {% if not lights_on %}
+            false
+          {% else %}
+            {# Secondary signal #1: Recent Styrbar press (<30 min siden) #}
+            {% set last_press = states('input_datetime.styrbar_last_press_terrasse') %}
+            {% set recent_press = false %}
+            {% if last_press not in ['unknown','unavailable','none'] %}
+              {% set since_press = (now() - strptime(last_press, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() %}
+              {% set recent_press = since_press < 1800 %}
+            {% endif %}
+            {# Secondary signal #2: Sherlock evidence (folk gik ud nyligt) #}
+            {% set sherlock = is_state('binary_sensor.likely_on_terrasse', 'on') %}
+            {{ recent_press or sherlock }}
+          {% endif %}
+
+      # Sherlock-deduktion (skærpet 2026-07-17b): open-plan blev tom for <10
+      # min siden, ingen indoor-rum aktiverede sig siden, hoveddøren blev IKKE
+      # brugt omkring tømningen (= de forlod ikke hjemmet), OG terrassedøren
+      # BLEV brugt omkring tømningen (= de gik faktisk derud).
+      - name: "Likely on terrasse"
+        unique_id: likely_on_terrasse
+        icon: mdi:flower-outline
+        state: >
+          {# M2 fix (audit-runde 5): skip helt hvis ingen sensors er online.
+             Pre-flyt er ALLE sensors unavailable, og as_timestamp paa
+             unavailable last_changed kan give edge cases. Gate paa
+             presence_sensors_available foer Sherlock-logik koeres. #}
+          {% if not is_state('binary_sensor.presence_sensors_available', 'on') %}
+            false
+          {% else %}
+          {% set st_off = is_state('binary_sensor.stue_apollo_occupancy_filtered', 'off') %}
+          {% set sp_off = is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'off') %}
+          {# 2026-07-17 (fejlklasse #16): koekken-Apollo er del af open-plan —
+             står nogen i køkkenet er de INDE, ikke på terrassen. unavailable
+             tæller som off (mirror af open_plan_empty_for_20m-mønstret). #}
+          {% set ko = states['binary_sensor.koekken_apollo_occupancy_filtered'] %}
+          {% set ko_on = ko is not none and ko.state == 'on' %}
+          {% if not (st_off and sp_off) or ko_on %}
+            false
+          {% else %}
+            {# Hvornaar blev open-plan fuldt tom? max(stue.last_changed, spisestue.last_changed) #}
+            {% set t_st = as_timestamp(states.binary_sensor.stue_apollo_occupancy_filtered.last_changed) | default(0) %}
+            {% set t_sp = as_timestamp(states.binary_sensor.spisestue_apollo_occupancy_filtered.last_changed) | default(0) %}
+            {% set times = [t_st, t_sp] %}
+            {% if ko is not none and ko.state == 'off' %}
+              {% set times = times + [as_timestamp(ko.last_changed) | default(0)] %}
+            {% endif %}
+            {% set t_emptied = times | max %}
+            {% set since_emptied = (as_timestamp(now()) - t_emptied) | int %}
+            {% if since_emptied > 600 %}
+              false
+            {% else %}
+            {# 2026-07-17b: hoveddørs-suppression (lovet i header-kommentaren
+               siden pre-flyt — sensoren ER paret nu). Blev hoveddøren brugt
+               omkring tømningen, forlod folk sandsynligvis HJEMMET, ikke til
+               terrassen. 180s-margin: radar-trailing i open-plan overlever
+               entré-PIR'ens clear, så t_emptied lander EFTER dør-brugen
+               (live-observeret 2026-07-17: gæster gik, Sherlock fyrede falsk).
+               Bruger dør-sensorens last_changed direkte — IKKE input_datetime.
+               hoveddoer_last_open (2026-07-18: stemplet er nu altid-tændt via
+               hoveddoer_stamp_altid, men last_changed er stadig fint her —
+               vi måler sekunder, ikke dage). Fail-retning: suppression → "ikke på
+               terrassen" → huset KAN gå Dormant = korrekt når folk gik ud. #}
+            {% set hd = states['binary_sensor.parasoll_hoveddoer'] %}
+            {% if hd is not none and hd.state in ['on', 'off']
+               and (as_timestamp(hd.last_changed) | default(0)) >= t_emptied - 180 %}
+              false
+            {% else %}
+            {# 2026-07-17b: terrassedørs-KRAV — man kan ikke komme på terrassen
+               uden at bruge terrassedøren. Er den IKKE brugt (last_changed)
+               inden for 180s før tømningen eller senere, gik ingen derud →
+               false. Dræber ghost-flap-falsk-positiver (live-observeret: ét
+               kort spisestue-radar-flap i tomt hus armerede Sherlock i 10
+               min). Står døren åben, dækker dør-åben-grenen i terrasse_active
+               alligevel. Defensivt: sensor død/mangler → kravet skippes
+               (gammel adfærd bevares). #}
+            {% set td = states['binary_sensor.parasoll_terrassedoer'] %}
+            {% if td is not none and td.state in ['on', 'off']
+               and (as_timestamp(td.last_changed) | default(0)) < t_emptied - 180 %}
+              false
+            {% else %}
+              {# Tjek at ingen indoor-rum blev aktiveret SIDEN open-plan blev tomt.
+                 Audit-runde 6: defensiv access via states[s] der returnerer
+                 None hvis entity ikke findes (partial pairing scenarie hvor
+                 fx kun bath-Apollo er paret men ikke andre). Tidligere kode
+                 brugte .X.last_changed direkte hvilket crasher pa missing
+                 entities. #}
+              {% set indoor_sensors = [
+                'binary_sensor.sovevaerelse_apollo_occupancy',
+                'binary_sensor.boernevaerelse_apollo_occupancy',
+                'binary_sensor.badevaerelse_inde_occupancy',
+                'binary_sensor.entre_valhorn_occupancy'
+              ] %}
+              {% set ns2 = namespace(latest=0) %}
+              {% for s in indoor_sensors %}
+                {% set obj = states[s] %}
+                {% if obj %}
+                  {% set t = as_timestamp(obj.last_changed) | default(0) %}
+                  {% if t > ns2.latest %}{% set ns2.latest = t %}{% endif %}
+                {% endif %}
+              {% endfor %}
+              {{ ns2.latest < t_emptied }}
+            {% endif %}
+            {% endif %}
+            {% endif %}
+          {% endif %}
+          {% endif %}
+
+      # Combined: terrasse er aktiv hvis lys er paa ELLER Sherlock siger sa
+      # ELLER terrassedøren står ÅBEN (2026-07-09 user-spec: "åben terrassedør
+      # = vi er på terrassen" — activity_state må ALDRIG erklære 'idle' mens
+      # døren er åben; man forlader ikke hjemmet med terrassedøren åben).
+      # Fail-safe retning: stuck dør-sensor holder huset "aktivt", aldrig omvendt.
+      - name: "Terrasse active"
+        unique_id: terrasse_active
+        icon: mdi:flower-poppy
+        state: >
+          {{ is_state('binary_sensor.terrasse_lights_on', 'on')
+             or is_state('binary_sensor.likely_on_terrasse', 'on')
+             or is_state('binary_sensor.parasoll_terrassedoer', 'on') }}
+
+      # Open-plan empty for X minutes (audit-runde 13, O9 fix)
+      # Stue+koekken absence-off triggerer per sensor for 20 min uafhaengigt.
+      # Hvis sensor A gar tom kl 20:00 og sensor B kl 20:05, vil A's trigger
+      # fyre kl 20:20 mens B kun har vaeret tom 15 min. Denne sensor ER kun
+      # ON hvis BEGGE har vaeret continuously off i 20+ min — bruges som
+      # condition i presence_light_stue_off + presence_light_koekken_off.
+      # Sprint B.5 fix audit 2026-05-07: tidligere returnerede false hvis
+      # state != 'off' (= unavailable). Med 3 Apollos unplugged → permanent
+      # false → presence_light_stue_off + koekken_off fyrede aldrig → stuck on.
+      # NY: behandler unavailable som "tom" (ingen detection = empty). Bruger
+      # last_changed af state-attribut (= last transition) for varighed.
+      # Phase 4 sprint 2026-05-07 sen-PM: 1200s × global_absence_wait_factor.
+      # slider=50 → factor=1.0 → 20min. slider=100 → factor=0.2 → 4min.
+      - name: "Open-plan empty for 20m"
+        unique_id: openplan_empty_for_20m
+        icon: mdi:sofa-outline
+        state: >
+          {% set st = states.binary_sensor.stue_apollo_occupancy_filtered %}
+          {% set sp = states.binary_sensor.spisestue_apollo_occupancy_filtered %}
+          {# 2026-06-15: køkken-Apollo (ex-bad) tilføjet — open-plan er kun tom
+             hvis stue + spisestue + køkken alle er off. #}
+          {% set ko = states.binary_sensor.koekken_apollo_occupancy_filtered %}
+          {% if st is none or sp is none %}
+            false
+          {% elif st.state == 'on' or sp.state == 'on' or (ko is not none and ko.state == 'on') %}
+            false
+          {% else %}
+            {% set times = [as_timestamp(st.last_changed), as_timestamp(sp.last_changed)] %}
+            {% if ko is not none and ko.state == 'off' %}{% set times = times + [as_timestamp(ko.last_changed)] %}{% endif %}
+            {% set last_emptied = times | max %}
+            {% set f = states('sensor.global_absence_wait_factor') | float(1.0) %}
+            {{ (as_timestamp(now()) - last_emptied) >= (1200 * f) }}
+          {% endif %}
+
+      # Master-gate for alle presence-drevne automations.
+      # ON hvis MINDST 1 presence-sensor er online (state on/off, ikke
+      # unavailable). OFF hvis ALLE er unavailable — det betyder at vi ikke
+      # er flyttet endnu og ingen sensorer er paret/deployed.
+      #
+      # Alle presence_lights, entre_motion, depot_harry_potter, terrace_presence,
+      # light_power_recovery automations conditioner paa denne — saa pre-flyt
+      # er der INGEN auto-light-fyringer baseret pa fantom-sensorer.
+      #
+      # Post-flyt: saa snart bare 1 Apollo eller Vallhorn er online, returneres
+      # ON og automations fungerer normalt.
+      - name: "Presence sensors available"
+        unique_id: presence_sensors_available
+        icon: mdi:motion-sensor
+        state: >
+          {% from 'rosters.jinja' import husets_occupancy %}{% set sensors = husets_occupancy
+          %}
+          {% set ns = namespace(any_online=false) %}
+          {% for s in sensors %}
+            {% if states(s) in ['on', 'off'] %}
+              {% set ns.any_online = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.any_online }}
+
+      # =======================================================================
+      # KONFIDENS (2026-08-13, user-spec "vi skal bruge Activity til nye
+      # features — fejlmarginen er stadig høj")
+      # =======================================================================
+      # Målt over 14 døgn: de 6 Apolloer (netdrevne) er 0,0 % blinde, mens de
+      # batteridrevne Matter/Thread-enheder er det 10-18 % af tiden
+      # (entre_valhorn 10,2 % / hoveddør 10,5 % / terrassedør 17,6 %; længste
+      # udfald 59,2 t da badets KAJPLATS-spots — dengang husets eneste Thread-routere —
+      # faldt 07-31). `unavailable` læses som `off` overalt i klassifikationen
+      # (fejlklasse #9), så et blindt instrument bliver til et SELVSIKKERT
+      # forkert svar: begge de forkerte `sofa_relax`-gæt (07-31, 08-02) faldt
+      # inde i terrassedørens 59-timers udfald.
+      #
+      # `presence_sensors_available` kan ikke fange det — den er ON hvis bare
+      # ÉN sensor er online (pre-flyt-gate, bevidst uændret). Denne sensor er
+      # det modsatte: hvor stor en andel af det bevismateriale klassifikationen
+      # FAKTISK hviler på, er i live lige nu.
+      #
+      # Vægtene = hvor meget en klasse afhænger af instrumentet:
+      #   3 = terrassedøren. Terrasse-klasserne har ingen anden levende kilde
+      #       (terrasse-lyset er ikke tændt i 58 dage, og Sherlock kræver et
+      #       TOMT open-plan → dør-signalet er reelt enerådende).
+      #   2 = de 6 open-plan-/rum-Apolloer. Bærer selve zone-tællingen.
+      #   1 = entré/depot-VALLHORN (transit) + hoveddøren (people-gulvet).
+      # Fejlretning: en blind sensor SÆNKER konfidensen — den påvirker ikke
+      # klassifikationen selv. Forbrugere gater, de omklassificerer ikke.
+      # Selve tallet: sensor.presence_signal_confidence (i sensor-blokken
+      # nederst i filen). Dette er den binære gate nye Activity-afhængige
+      # features skal conditione på i stedet for at læse tallet hver for sig
+      # (del RESULTATET, ikke reglen — læring 2026-08-12).
+      - name: "Activity state confident"
+        unique_id: activity_state_confident
+        icon: mdi:check-decagram-outline
+        state: >
+          {{ states('sensor.presence_signal_confidence') | int(0)
+             >= states('input_number.activity_confidence_min_pct') | int(85) }}
+        attributes:
+          konfidens: "{{ states('sensor.presence_signal_confidence') }}"
+          blinde: "{{ state_attr('sensor.presence_signal_confidence', 'blinde') }}"
+
+      # =============================================================================
+      # Godnat any active — UNION of all godnat-related flags
+      # =============================================================================
+      # KRITISK FIX 2026-05-05 (efter user-bug-rapport):
+      # godnat_active sættes KUN ON når BÅDE voksne+boern_active er ON OG
+      # godnat_pending er off (dvs hele huset sover). Hvis user trykker
+      # somrig kort-ned (= "godnat" i deres mental model), sætter det kun
+      # godnat_voksne_active=on. godnat_active forbliver OFF.
+      #
+      # Resultat: alle presence-automations der gateder på `godnat_active=off`
+      # FYRER alligevel — fx sove-light tænder hvis user kommer tilbage til
+      # seng efter nattur. Dette vækker partner!
+      #
+      # Fix: alle presence-automations skal nu gate på godnat_any_active=off,
+      # som er ON hvis NOGEN godnat-flag er ON (voksne, boern, full, pending).
+      - name: "Godnat any active"
+        unique_id: godnat_any_active
+        icon: mdi:weather-night
+        state: >
+          {{ is_state('input_boolean.godnat_active', 'on')
+             or is_state('input_boolean.godnat_voksne_active', 'on')
+             or is_state('input_boolean.godnat_boern_active', 'on')
+             or is_state('input_boolean.godnat_pending', 'on')
+             or is_state('input_boolean.kalde_active', 'on') }}
+
+      # =============================================================================
+      # Godnat COMMON active — union UDEN børne-putning (2026-06-06)
+      # =============================================================================
+      # Som godnat_any_active, men UDELADER godnat_boern_active. Gater FÆLLES-RUM
+      # (stue, køkken, spisestue) og fra 2026-07-02 OGSÅ de voksnes soveværelse
+      # (alle 5 sove-tænd/fade-kilder: presence-START, lux-fald, gang-early-detect,
+      # settle-hygge-fade, sengelys 22–24). BØRNE-presence beholder strict
+      # godnat_any_active (= respekterer børne-søvn).
+      #
+      # Rationale (user-bug 2026-06-06): når børnene puttes sætter putningen
+      # godnat_boern_active=on, hvilket trak godnat_any_active on og BLOKEREDE
+      # stuens læsehygge for de VOKSNE der stadig er oppe. At børnene sover bør
+      # ikke slukke fælles-rummene. Voksen-/fuld-godnat + pending + kalde skal
+      # stadig blokere. Samme bug ramte sove 2026-07-02: putning ~19:30 dræbte
+      # ALT sove-auto-lys resten af aftenen (og sengelys 22–24 kunne aldrig fyre).
+      - name: "Godnat common active"
+        unique_id: godnat_common_active
+        icon: mdi:sofa
+        state: >
+          {{ is_state('input_boolean.godnat_active', 'on')
+             or is_state('input_boolean.godnat_voksne_active', 'on')
+             or is_state('input_boolean.godnat_pending', 'on')
+             or is_state('input_boolean.kalde_active', 'on') }}
+
+      # =======================================================================
+      # Fælles-rummenes morgen-undtagelse (2026-08-21) — ÉT anker.
+      # =======================================================================
+      # Var indtil i dag et bart `(6 <= now().hour < 12)` kopieret ELLEVE steder
+      # i presence_lights.yaml, presence_stue.yaml og presence_koekken.yaml —
+      # både som gate ("må lyset tænde?") og som brightness/kelvin-valg
+      # ("nattur-niveau eller dagsniveau?"). Fejlklasse #2 i ren form: reglen
+      # skulle flyttes elleve steder for at flytte ét klokkeslæt.
+      #
+      # 2026-08-21 (user-spec): "efter kl 05.00 skal den sekvens køre til vågent
+      # hus i openplan, men de andre soveværelser skal holdes i godnat indtil en
+      # anden automation ændrer det." Undtagelsen starter derfor 05:00 — men KUN
+      # når en voksen beviseligt ER stået op (stempel, se
+      # packages/openplan_tidlig_morgen.yaml). Uden det beviskrav ville en nattur
+      # kl. 05:15 tænde hele fælles-rummet.
+      #
+      # NB det er MED vilje at intet godnat-flag ryddes: `godnat_common_active`
+      # gater også soveværelsets eget auto-lys (presence_sovevaerelse.yaml), og
+      # sove-Apolloen taber jævnligt en sovende krop i 5-15 min (CLAUDE.md) →
+      # en still_target-flanke over en sovende Parent B ville tænde loftet.
+      # Fælles-rummene slippes fri, soveværelset og børneværelset bliver i
+      # godnat til godnat_auto_clear rydder op 06:00.
+      #
+      # `now()` i en STATE (ikke en attribut) er gratis: værdien skifter to gange
+      # i døgnet, så der skrives to DB-rækker — ikke én i minuttet (#24).
+      - name: "Godnat faelles morgen fri"
+        unique_id: godnat_faelles_morgen_fri
+        icon: mdi:weather-sunset-up
+        state: >
+          {% set h = now().hour %}
+          {% if 6 <= h < 12 %}
+            true
+          {% elif h == 5 %}
+            {% set v = states('input_datetime.voksen_oppe_at') %}
+            {{ v[:10] == now().strftime('%Y-%m-%d') and v[11:] != '00:00:00' }}
+          {% else %}
+            false
+          {% endif %}
+
+      # =============================================================================
+      # Kids home — auto-derived "børn er hjemme" flag (sprint 2026-05-07 sen-PM)
+      # =============================================================================
+      # User-spec: combination C (auto motion+time) + D (manual override).
+      #   - Manual override: input_boolean.kids_home_manual=on → forceres true
+      #   - Auto: time-window AND boern Apollo motion seen recently (4h)
+      #   - AirBnB → forceret false (gæster, ingen kids)
+      #
+      # Time windows:
+      #   - Workday (arbejdsdag=on):  14:00-22:00 (efter daycare/school)
+      #   - Weekend/ferie:            09:00-22:00 (kids er typisk hjemme)
+      #
+      # Boern Apollo unavailable handling: hvis sensor er offline >1 time, vi
+      # kan ikke verificere motion. Falder tilbage til "time-window er nok"
+      # (= antag kids er hjemme i windows) — defensivt valg så putning auto-
+      # detect ikke siler under sensor-outage.
+      # =============================================================================
+      # =============================================================================
+      # Kids home v2 — Sherlock detection (sprint 2026-05-08)
+      # =============================================================================
+      # User-spec: "Det vil jo også ofte være sådan at der mindst er 3 mennesker
+      # i huset når der er børn (men ikke altid!)" + "gør det mere intelligent".
+      #
+      # OLD (v1): boern motion seen i sidste 4h → kids_home=true.
+      # PROBLEM: voksen passing-through boern (rengøring, hente noget) i 1-3 min
+      # → motion fyrer → kids_home=true falsely i 4h.
+      #
+      # NEW (v2): kombiner 4 signaler, OR-logic. Skelner adult-flicker fra
+      # kid-real-activity via SUSTAINED + CUMULATIVE patterns.
+      # Time-window DROPPED — signaler er selv-gating (kid-aktivitet = kids hjemme,
+      # uanset tidspunkt). Kid sleeping i bed = S1 sustained ON i flere timer →
+      # kids_home=true overnight + morning. Kid på daycare 08-15 → S1/S2/S4 false,
+      # S3 still true hvis kid var her i morges.
+      #
+      # Signaler (any-of-4):
+      #   S1: SUSTAINED current motion (boern on for 5+ min — ekskl. brief flicker)
+      #   S2: CUMULATIVE 30+ min i sidste 4h (real kid activity period)
+      #   S3: CUMULATIVE 60+ min i dag siden midnight (kid activity earlier today)
+      #   S4: ZONES > adults_home (= ≥1 ekstra person — Sherlock-deduktion)
+      #
+      # NB (fejlklasse #3): listen ovenfor er v2 fra 05-08 og er HISTORIK.
+      # 06-18 erstattede S1-S4 med latch/overnight/today (se templaten nedenfor),
+      # og 07-30 tilføjede ankomst-signalet. Templaten er facit, ikke denne liste.
+      #
+      # Backlog B16: Apollo MSR-2 radar height detection (post-flyt) — definitive.
+      #
+      # Override hierarchy:
+      #   - AirBnB → false (lockdown)
+      #   - Manual override (input_boolean.kids_home_manual) → true (force,
+      #     slår "ingen voksne hjemme"-guarden når physical_presence_recent=on)
+      #   - Apollo offline → false (kan ikke detektere; brug manual override)
+      #   - Else → auto-detect via 4 signaler (any-of-4)
+      #
+      # Diagnostic attributes synlig i HA UI for debugging.
+      # =============================================================================
+      - name: "Kids home"
+        unique_id: kids_home
+        icon: mdi:account-child
+        state: >
+          {# CRITICAL GUARD #1 (sprint 2026-05-10): kids kan IKKE være home
+             alene (Child A + Child B). Hvis ingen voksen via phone-tracking,
+             kids_home MUST be false — MEN kun når huset ikke kan bevise at der
+             ER et menneske til stede (se 2026-08-13h nedenfor).
+             Override-rækkefølge:
+               1. AirBnB → false (lockdown)
+               2. Manual FORCE-OFF on → false (user "børn er IKKE hjemme",
+                  2026-06-13 — vinder over auto OG force-on)
+               2b. EFTERMIDDAGS-SPÆRRE on → false (2026-09-16, user-spec: "hvis
+                  en eftermiddag/aften ikke har børne detection så skal børn
+                  hjemme slås fra før puttelys tænder"). Sættes af
+                  packages/boern_eftermiddag_tjek.yaml når INGEN af de tre
+                  børne-kanaler har set noget siden eftermiddags-skæringen.
+                  Taber bevidst for en manuel force-on: siger user "de ER
+                  hjemme", er sensor-tavshed ikke et modargument.
+               3. NO adults home OG (ingen manuel force-on ELLER intet fysisk
+                  hus-vidne) → false (kids alone = invalid)
+               4. Manual override on → true (user force)
+               5. Else → 4 signal any-of (auto-detect)
+
+             2026-08-13h: guard 3 stod UBETINGET over den manuelle override.
+             Begge forældre var GPS-væk en aften mens en anden voksen
+             puttede børnene → kids_home = false hele putte-vinduet, selvom user
+             EKSPLICIT havde sat force-on kl. 16:51. Dermed var putning_vindue_
+             aktivt off og Trigger A/B/C gated fra = ingen nedtrapning.
+             Guarden gælder derfor nu kun uden et vidne: physical_presence_recent
+             (sensor-/knap-aktivitet sidste 3t, latch-maskeret) er husets
+             suveræne "der ER nogen her"-signal — samme som blokerer Dormant.
+             Auto-udløb af en glemt override: fredags-clear +
+             physical_presence_recent falder når huset står tomt + (2026-10-07)
+             en TOM NAT (06:30-latchen) eller et tomt eftermiddags-tjek på en
+             senere dag end den blev sat (input_text.kids_home_manual_dato) —
+             begge slår force-on fra og pusher "De ER hjemme".
+          #}
+          {% set ingen_voksne = (is_state('input_boolean.parent_a_home', 'off') or states('input_boolean.parent_a_home') in ['unavailable','unknown']) and (is_state('input_boolean.parent_b_home', 'off') or states('input_boolean.parent_b_home') in ['unavailable','unknown']) %}
+          {% set force_on = is_state('input_boolean.kids_home_manual', 'on') %}
+          {% set hus_vidne = is_state('binary_sensor.physical_presence_recent', 'on') %}
+          {% if is_state('input_select.house_mode', 'AirBnB') %}
+            false
+          {% elif is_state('input_boolean.kids_home_manual_off', 'on') %}
+            false
+          {% elif is_state('input_boolean.boern_ikke_set_i_eftermiddag', 'on')
+                  and not force_on %}
+            false
+          {# 2c. "❌ NEJ"-PAUSE (2026-09-25, user-spec: "alle nye børnebesøg-
+             perioder skal bekræftes af mig"). Svarer user nej til "Børn
+             hjemme?", er auto-signalerne afvist i suppress-timeren (6 t) —
+             også 4 t-akkumulatorerne, som ellers ikke kan ryddes af et svar.
+             Taber for manuel force-on, som 2b. #}
+          {% elif not force_on
+                  and (state_attr('input_datetime.boern_ankomst_suppress_until', 'timestamp') | float(0))
+                      > now().timestamp() %}
+            false
+          {% elif ingen_voksne and not (force_on and hus_vidne) %}
+            false
+          {% elif force_on %}
+            true
+          {% else %}
+            {% set adults_home = (1 if is_state('input_boolean.parent_a_home', 'on') else 0)
+                               + (1 if is_state('input_boolean.parent_b_home', 'on') else 0) %}
+            {% if adults_home == 0 %}
+              false
+            {% else %}
+              {% set apollo_state = states('binary_sensor.boernevaerelse_apollo_occupancy') %}
+              {% if apollo_state in ['unavailable','unknown','none'] %}
+                {# Apollo offline — kan ikke detektere; brug manual override #}
+                false
+              {% else %}
+                {# STUCK-APOLLO GUARD: hvis sensor har været stuck "on" >24h
+                   (= ingen ægte presence, mesh-disconnect eller false target),
+                   ignorer signalet. Sprint 2026-05-10 fix. #}
+                {% set lc = states.binary_sensor.boernevaerelse_apollo_occupancy.last_changed %}
+                {% set lc_sec = (now() - lc).total_seconds() if lc is not none else 99999 %}
+                {% set apollo_stuck = (apollo_state == 'on' and lc_sec > 86400) %}
+                {% if apollo_stuck %}
+                  false
+                {% else %}
+                  {# 2026-06-18 (user-spec "kræv stærkt signal"): kids_home auto
+                     bygger nu på STABILE stærke signaler i stedet for de svage
+                     motion-signaler (gamle S1 15min / S2 60min/4h) der falsk-
+                     fyrede på 30-40 min tilfældig VOKSEN-aktivitet om aftenen →
+                     natlys tændte 4 dage i træk uden børn. I har altid børnene
+                     OVERNATTENDE, så det pålidelige signal er "sov her i nat":
+                       - boern_sov_her_i_nat: latch sat 06:30 ud fra sidste nats
+                         søvn (+ ankomst-putning/manuel). Stabilt hele døgnet,
+                         intet midnat-reset-hul. PRIMÆRT signal.
+                       - overnight >= 4t: barn sover lige nu og accumulerer —
+                         backup hvis latch'en mangler (fx fsk efter restart).
+                       - today >= 4t: barn klart aktivt i dag (høj tærskel, så
+                         30-40 min voksen-aktivitet IKKE længere tæller).
+                     De gamle S1/S2/S4 (motion-baserede) er fjernet — de var
+                     præcis false-positive-kilden. #}
+                  {# 2026-07-30 (user-spec): 4. signal = ANKOMST. De tre ovenfor
+                     forudsætter alle at børnene har været her længe (latch fra
+                     sidste nat, 4t overnight, 4t i dag) → på en ankomst-dag var
+                     kids_home off fra de kom til de skulle puttes. Det nye flag
+                     sættes af SAMMENHÆNGENDE ophold (12 min, kalibreret mod 14
+                     dage: voksen-dage maks 7,0 min, børne-dage ≥ 15 min) og
+                     selv-rydder ved ro. Kumulativ tid duer IKKE — det var
+                     præcis 06-18's false-positive-kilde. Se
+                     packages/boern_ankomst.yaml. #}
+                  {% set slept_latch = is_state('input_boolean.boern_sov_her_i_nat', 'on') %}
+                  {% set overnight_now = (states('sensor.boern_occupancy_overnight') | float(0)) >= 4.0 %}
+                  {% set today_high = (states('sensor.boern_occupancy_today') | float(0)) >= 4.0 %}
+                  {% set ankomst = is_state('input_boolean.boern_aktivitet_detekteret', 'on') %}
+                  {{ slept_latch or overnight_now or today_high or ankomst }}
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endif %}
+        attributes:
+          # Diagnostiske attributes for debug — hover over tile på dashboard.
+          # 2026-06-18 ("kræv stærkt signal"): auto = latch ELLER overnight≥4t
+          # ELLER today≥4t. De gamle S1/S2/S4 motion-signaler er fjernet.
+          # 2026-07-30: + ankomst-signalet (sammenhængende ophold, se
+          # packages/boern_ankomst.yaml) — dækker hullet fra ankomst til putning.
+          signal_latch_slept: "{{ is_state('input_boolean.boern_sov_her_i_nat', 'on') }}"
+          signal_overnight_hours: "{{ (states('sensor.boern_occupancy_overnight') | float(0)) | round(2) }}"
+          signal_overnight_now_4t: "{{ (states('sensor.boern_occupancy_overnight') | float(0)) >= 4.0 }}"
+          signal_today_hours: "{{ (states('sensor.boern_occupancy_today') | float(0)) | round(2) }}"
+          signal_today_high_4t: "{{ (states('sensor.boern_occupancy_today') | float(0)) >= 4.0 }}"
+          signal_ankomst_aktivitet: "{{ is_state('input_boolean.boern_aktivitet_detekteret', 'on') }}"
+          override_airbnb: "{{ is_state('input_select.house_mode', 'AirBnB') }}"
+          override_manual_off: "{{ is_state('input_boolean.kids_home_manual_off', 'on') }}"
+          override_manual_on: "{{ is_state('input_boolean.kids_home_manual', 'on') }}"
+          override_eftermiddag_spaerre: "{{ is_state('input_boolean.boern_ikke_set_i_eftermiddag', 'on') }}"
+          override_nej_pause: >-
+            {{ (state_attr('input_datetime.boern_ankomst_suppress_until', 'timestamp') | float(0))
+               > now().timestamp() }}
+          # 2026-08-13h: force-on slår "ingen voksne hjemme"-guarden, men KUN
+          # med et fysisk hus-vidne (en anden voksen der putter mens begge
+          # forældres GPS er væk).
+          hus_vidne_fysisk: "{{ is_state('binary_sensor.physical_presence_recent', 'on') }}"
+          adults_home: >-
+            {{ (1 if is_state('input_boolean.parent_a_home','on') else 0)
+               + (1 if is_state('input_boolean.parent_b_home','on') else 0) }}
+
+      # =======================================================================
+      # Putning-vindue aktivt (2026-06-12, user-spec) — SINGLE SOURCE OF TRUTH
+      # =======================================================================
+      # "Alt efter 18:30 når vi har børn skal betragtes som putningsorienteret
+      # lys" — manuel justering i børneværelset i dette vindue er hjælp til
+      # auto (hybrid), IKKE et skift til Manual mode.
+      #
+      # ON når: kids_home + efter input_datetime.putning_vindue_start (default
+      # 18:30, tunable) + IKKE "vildt lys" (= strip på høj brightness med
+      # saturerede farver → pigerne leger, normal Manual-semantik gælder).
+      #
+      # Forbrugere: styrbar_stamp_press putning-guard, putning Trigger C,
+      # styrbar putning-trappe.
+      - name: "Putning vindue aktivt"
+        unique_id: putning_vindue_aktivt
+        icon: mdi:human-male-child
+        state: >
+          {% if not is_state('binary_sensor.kids_home', 'on') %}
+            false
+          {% else %}
+            {% set start = states('input_datetime.putning_vindue_start') %}
+            {% set start = '18:30:00' if start in ['unknown', 'unavailable', 'none', '00:00:00'] else start %}
+            {% if now().time() < today_at(start).time() %}
+              false
+            {% else %}
+              {# Vildt-lys undtagelse: strip ≥60% brightness + saturation ≥60
+                 = farve-leg, ikke putning. Loft alene tæller ikke som vildt. #}
+              {% set b = state_attr('light.boernevaerelse_hygge_strip', 'brightness') | int(0) %}
+              {% set hs = state_attr('light.boernevaerelse_hygge_strip', 'hs_color') %}
+              {% set wild = is_state('light.boernevaerelse_hygge_strip', 'on')
+                    and b >= 153 and hs is not none and (hs[1] | float(0)) >= 60 %}
+              {{ not wild }}
+            {% endif %}
+          {% endif %}
+        attributes:
+          vindue_start: >-
+            {% set s = states('input_datetime.putning_vindue_start') %}
+            {{ '18:30:00 (default)' if s in ['unknown', 'unavailable', 'none', '00:00:00'] else s }}
+          vildt_lys: >-
+            {% set b = state_attr('light.boernevaerelse_hygge_strip', 'brightness') | int(0) %}
+            {% set hs = state_attr('light.boernevaerelse_hygge_strip', 'hs_color') %}
+            {{ is_state('light.boernevaerelse_hygge_strip', 'on')
+               and b >= 153 and hs is not none and (hs[1] | float(0)) >= 60 }}
+
+      # 2026-06-18 (user-spec): presence i LÆGGE-zonen ≥ N cm fra Apollo'en
+      # (sengen ~294 cm; 150 cm = minimum, dvs. IKKE ved døren/sensoren). still
+      # ELLER moving target på ≥ min-afstand. Bruges af Styrbar-OP-putning
+      # (puttelys_styrbar_start) — robust mod nær-dør-passage, fanger "ligger og
+      # putter". min-afstand = input_number.puttelys_styrbar_zone_min_cm (150).
+      - name: "Boern putte zone aktiv"
+        unique_id: boern_putte_zone_aktiv
+        icon: mdi:bed
+        state: >
+          {# occupancy (radar-timeout-glattet) + den større af still/moving-
+             afstand ≥ min. max() vælger den gyldige: ligger man stille er
+             still_distance valid (moving→unknown→0) og omvendt. Mere robust end
+             detection_distance, der ofte går 'unknown' midt i et ophold. #}
+          {% set min_cm = states('input_number.puttelys_styrbar_zone_min_cm') | float(150) %}
+          {% set sd = states('sensor.boernevaerelse_apollo_radar_still_distance') | float(0) %}
+          {% set md = states('sensor.boernevaerelse_apollo_radar_moving_distance') | float(0) %}
+          {{ is_state('binary_sensor.boernevaerelse_apollo_occupancy','on')
+             and ([sd, md] | max) >= min_cm }}
+        attributes:
+          min_cm: "{{ states('input_number.puttelys_styrbar_zone_min_cm') }}"
+          still_distance: "{{ states('sensor.boernevaerelse_apollo_radar_still_distance') }}"
+          moving_distance: "{{ states('sensor.boernevaerelse_apollo_radar_moving_distance') }}"
+
+  - sensor:
+      # Hvor stor en andel af presence-bevismaterialet der er i live lige nu.
+      # Fuld baggrund + vægt-begrundelse: se binary_sensor.activity_state_
+      # confident ovenfor. 100 = alt online; terrassedør blind alene = 83.
+      - name: "Presence signal confidence"
+        unique_id: presence_signal_confidence
+        icon: mdi:signal-cellular-outline
+        unit_of_measurement: "%"
+        state: >
+          {% set vaegte = [
+            ['binary_sensor.stue_apollo_occupancy_filtered', 2],
+            ['binary_sensor.spisestue_apollo_occupancy_filtered', 2],
+            ['binary_sensor.koekken_apollo_occupancy_filtered', 2],
+            ['binary_sensor.sovevaerelse_apollo_occupancy', 2],
+            ['binary_sensor.boernevaerelse_apollo_occupancy', 2],
+            ['binary_sensor.badevaerelse_inde_occupancy', 2],
+            ['binary_sensor.parasoll_terrassedoer', 3],
+            ['binary_sensor.entre_valhorn_occupancy', 1],
+            ['binary_sensor.depot_valhorn_occupancy', 1],
+            ['binary_sensor.parasoll_hoveddoer', 1]
+          ] %}
+          {% set ns = namespace(live=0, total=0) %}
+          {% for r in vaegte %}
+            {% set ns.total = ns.total + r[1] %}
+            {% if states(r[0]) in ['on', 'off'] %}{% set ns.live = ns.live + r[1] %}{% endif %}
+          {% endfor %}
+          {{ (100 * ns.live / ns.total) | round(0) | int if ns.total > 0 else 0 }}
+        attributes:
+          blinde: >-
+            {% set d = [
+              'binary_sensor.stue_apollo_occupancy_filtered',
+              'binary_sensor.spisestue_apollo_occupancy_filtered',
+              'binary_sensor.koekken_apollo_occupancy_filtered',
+              'binary_sensor.sovevaerelse_apollo_occupancy',
+              'binary_sensor.boernevaerelse_apollo_occupancy',
+              'binary_sensor.badevaerelse_inde_occupancy',
+              'binary_sensor.parasoll_terrassedoer',
+              'binary_sensor.entre_valhorn_occupancy',
+              'binary_sensor.depot_valhorn_occupancy',
+              'binary_sensor.parasoll_hoveddoer'
+            ] | reject('is_state', 'on') | reject('is_state', 'off')
+              | map('replace', 'binary_sensor.', '') | list %}
+            {{ d | join(', ') if d | length > 0 else '-' }}
+          blinde_antal: >-
+            {{ [
+              'binary_sensor.stue_apollo_occupancy_filtered',
+              'binary_sensor.spisestue_apollo_occupancy_filtered',
+              'binary_sensor.koekken_apollo_occupancy_filtered',
+              'binary_sensor.sovevaerelse_apollo_occupancy',
+              'binary_sensor.boernevaerelse_apollo_occupancy',
+              'binary_sensor.badevaerelse_inde_occupancy',
+              'binary_sensor.parasoll_terrassedoer',
+              'binary_sensor.entre_valhorn_occupancy',
+              'binary_sensor.depot_valhorn_occupancy',
+              'binary_sensor.parasoll_hoveddoer'
+            ] | reject('is_state', 'on') | reject('is_state', 'off') | list | length }}
+
+      # Open-plan lux abstraction — picks first available lux value fra
+      # spisestue → sovevaerelse → stue → entré-Myggspray (fallback).
+      #
+      # WHY: 2026-05-05 PM stue_apollo's LTR390 chip blev defekt (DPS310 +
+      # radar virker stadig, kun lux + UV channel dead). Vi bruger spisestue
+      # som primary fordi den staar i open-plan og har sun-exposure. sove er
+      # sekundær backup. stue beholdes i kæden for hvis chippen fixes.
+      # 2026-06-12 (user-spec): entre_valhorn (entré-Myggspray) som sidste
+      # fallback — den får IKKE direkte lys og repræsenterer derfor open-plan
+      # ambient godt. (Første forsøg brugte badevaerelse_valhorn, men dén
+      # ligger u-deployeret i en æske og læser konstant 1.0 lux — ville fake
+      # permanent mørke.) Pre-tilslutning af de 3 offline Apollos var kæden
+      # ellers HELT tom (alle lux-gates kørte på float-defaults).
+      #
+      # Bruges af: entre_motion, presence_lights (alle rum med lux gating),
+      # arrival, godmorgen_godnat, terrace_presence, winter/summer_defense,
+      # entre_somrig, airbnb_mode, scripts.yaml lux-lookup. + boernevaerelse
+      # (har ingen egen brugt lux-måler — bruger denne, 2026-06-15).
+      # 2026-06-15: spisestue-Apollo FØRST i kæden (sidder nær vindue → bedst
+      # proxy for rummets oplevede lysniveau, user-spec); køkken-Apollo er fallback.
+      - name: "Open plan lux"
+        unique_id: open_plan_lux
+        icon: mdi:brightness-5
+        unit_of_measurement: "lx"
+        device_class: illuminance
+        state_class: measurement
+        # 2026-07-08 (#9, user-spec): open_plan_lux = GENNEMSNIT af køkken- +
+        # spisestue-Apollo lux (de tilgængelige af de to), IKKE bare spisestue.
+        # De to Apollos dækker open-plan-arealet fra hver sin ende → gennemsnittet
+        # er et mere retvisende "oplevet lysniveau" end ét enkelt punkt. Falder én
+        # ud bruges den anden alene; er BEGGE offline bruges fallback-kæden
+        # (sove → stue → entré) så gates ikke kører på float-defaults.
+        state: >
+          {# 2026-07-30: køkken-Apolloens EGEN varsel-LED lagde ~486 lx oven i
+             sin måling (målt) → open_plan_lux blev 359 i stedet for ~116 hver
+             varsel-morgen. Læser nu de kompenserede kilder (packages/
+             apollo_led_lux_kompensation.yaml). ALLE fem Apollos har den samme
+             SK6812 ved siden af LTR390'en, så ALLE kilder er kompenserede —
+             også dem der ikke bærer et varsel i dag (rosteret drifter,
+             fejlklasse #16). #}
+          {# 2026-08-16h: en kilde hvor LED-fradraget har ÆDT hele den rå måling
+             er ikke et mørkt rum — det er en sensor der måler sig selv, og dens
+             0,0 må ikke trækkes ind i gennemsnittet. Målt samme dag: dug-LED'en
+             blev skruet 30 % → 80 %, køkkenets fradrag (488,9) oversteg dens rå
+             lux (487,3), `koekken_lux_reel` clampede til 0,0 og halverede dette
+             gennemsnit (3,8 → 1,9) — hvilket entréens lys-kurve arvede direkte.
+             Styrken er skruet ned igen, men gaten bliver her: den gør at en
+             fremtidig skruen-op degraderer GRACIØST (den anden Apollo bærer
+             alene) i stedet for at lyve stille. #}
+          {# 2026-09-03: denne sensor hedder "lux" men LÆSES som "er der dagslys
+             nok?" i hele huset — og de to kilder så husets EGNE lamper. Målt
+             06:28 med lyskæden tændt og reelt mørke ude: koekken_lux_reel 76,8
+             (raa_lux 76,8, led_fradrag 0,0 = intet lyskæde-fradrag) og
+             spisestue_lux_reel 56,0 → snit 66,4 lx, mens den immune
+             entré-VALLHORN (får intet direkte lys) stod på 3,0 og den
+             lyskæde-fradragne sensor.koekken_dagslys_lx på 0,0.
+             Konsekvens den morgen: stuens tænd-gate (< 55,5) var blokeret, og
+             sluk-vejen (> 66,6) dræbte spisestue-loftet 06:15 og 06:24 — lyset
+             tændte hver gang og døde et for-vindue senere.
+             Derfor: en kilde tæller kun som DAGSLYS-vidne hvis vores eget lys
+             ikke kan lyse ind i den. Se det permanente faktum om at rummets
+             egne lamper lyser ind i Apolloens LTR390. #}
+          {# 2026-09-03b (user-spec): kilden er nu et FASTHOLDT RENT SAMPLE fra
+             hver af open-plannets to Apolloer — den værdi de målte sidst hele
+             open-plannet var mørkt — hvis samplet er yngre end
+             input_number.open_plan_dagslys_hold_minutter. Ingen fradrags-
+             matematik: et fradrag skal kende lampens bidrag, og det bidrag er
+             ikke en konstant (hvid lyskæde +78 lx, samme strip i mættet orange
+             +1 lx, og under et 300 s fade følger det en kvadratisk kurve mens
+             entity'en allerede står 'off'). Se "Open-plan dagslys-anker" i
+             packages/room_lux_tuning.yaml for målingerne. #}
+          {% set hold = states('input_number.open_plan_dagslys_hold_minutter')
+                        | float(45) * 60 %}
+          {# 2026-09-04e: hvert sample er et LOFT, ikke et facit. Vores eget lys
+             kan kun lægge lux TIL, så den rå Apollo-måling er altid en øvre
+             grænse for dagslyset — er den lavere end samplet, er samplet
+             beviseligt forældet. Rammer aftenens hurtige lysfald: målt 04/9
+             18:55 stod spisestue-samplet på 217,9 (taget 18:17) mens dens rå
+             Apollo sagde 10,0. Er den rå derimod HØJERE (= vores lys lyser ind,
+             eller dagslyset er steget siden samplet), vinder samplet præcis som
+             før — morgen-retningen er altså uændret.
+             Rå = *_apollo_lux, IKKE *_lux_reel: sidstnævnte er LED-fradraget og
+             kan clampe til 0,0 (2026-08-16h) og dermed lyve om et mørkt rum. #}
+          {% set nu = now().timestamp() %}
+          {# 2026-09-30b AFTEN-FREMSKRIVNING (user: "rum holdes mørke trods
+             bevægelse pga lux målinger som er forældede"). Audit over 14 døgn:
+             stuens tænd-vej (open_plan_lux < stue_lux_gate) blev blokeret af
+             lux alene ved 7 flanker i tusmørket — 21/9 18:51, 22/9 18:58,
+             19:04 og 19:22 (sol −2,8°), 28/9 18:15, 30/9 18:32 og 18:56 —
+             fordi et rent sample HOLDES 45 min mens solen går ned, og dets
+             loft (den rå Apollo) løftes af vores egne lamper. User tændte selv
+             22/9 19:24 (app) og 30/9 18:59 (Styrbar). Spisestuens kanal har
+             haft svaret siden 2026-09-28 (sensor.spisestue_dagslys_lx i
+             packages/room_lux_tuning.yaml): om aftenen fremskrives samplet ad
+             solhøjden med max(bånd-rate, dagens k_idag), og den falder ALDRIG
+             tilbage til den kontaminerede fallback. Samme model her — SAMME
+             bånd-tabel og k_idag-loft; ret begge steder (fejlklasse #2).
+             Begge samples tages i samme minut (samme trigger), så spisestue-
+             samplets sol_elev/k_idag gælder også køkken-samplet — kun når
+             deres maalt_ts ligger < 120 s fra hinanden.
+             Valideret 16-30/9 på 137.412 par af RENE samples samme eftermiddag
+             (fremskriv det første, sammenlign med det senere målte): 0 × falsk
+             mørke i dagtimerne (frem < 30 mens målt > 40, sol ≥ 8°); 18 par i
+             tusmørket lige under gaten (53-58 mod målt 76-97) = stuen tænder
+             ~et kvarter tidligere, den ufarlige retning. Median frem/målt 0,84.
+             Simuleret på de 7 blokerede flanker: 5 passerer med dagens gate;
+             de 2 der ikke gjorde, havde den gamle gate 18,8.
+             BEVIDST AFVIGELSE fra spisestue-modellen: kun under 11° sol (alle
+             7 fejl lå ved 0-5°). open_plan_lux fodrer også vinter/sommer-
+             forsvarets gardiner med 200/500 lx-gates om eftermiddagen, og dér
+             er fremskrivningen ikke valideret — over 11° er adfærden uændret. #}
+          {% set ss = 'sensor.spisestue_dagslys_sample' %}
+          {% set ss_ts = state_attr(ss, 'maalt_ts') | float(0) %}
+          {% set el_nu = state_attr('sun.sun', 'elevation') %}
+          {% set el_s = state_attr(ss, 'sol_elev') %}
+          {% set aften = ss_ts >= today_at('00:00').timestamp()
+                         and state_attr(ss, 'sol_stiger') == 'nej'
+                         and state_attr('sun.sun', 'rising') == false
+                         and el_s | is_number and el_nu is number
+                         and el_nu < 11 %}
+          {% set nf = namespace(f=0) %}
+          {% if aften %}
+            {% set ki = state_attr(ss, 'k_idag') %}
+            {% set ki = [[ki | float(0), 0] | max, 0.55] | min if ki | is_number else 0 %}
+            {% for b in [[-90, 3, 0.55], [3, 5, 0.30], [5, 7, 0.20],
+                         [7, 9, 0.15], [9, 11, 0.05], [11, 90, 0]] %}
+              {% set ov = [0, ([b[1], el_s | float] | min) - ([b[0], el_nu | float] | max)] | max %}
+              {% set nf.f = nf.f + ov * ([b[2], ki] | max) %}
+            {% endfor %}
+          {% endif %}
+          {% set ns = namespace(vals=[], gamle=[]) %}
+          {% for s, raa_id in [
+               ('sensor.koekken_dagslys_sample', 'sensor.koekken_apollo_lux'),
+               ('sensor.spisestue_dagslys_sample', 'sensor.spisestue_apollo_lux')] %}
+            {% set v = states(s) %}
+            {% set ts = state_attr(s, 'maalt_ts') | float(0) %}
+            {% set raa = states(raa_id) %}
+            {% set frem = aften and ts > 0 and ((ts - ss_ts) | abs) < 120 %}
+            {% if v | is_number and ts > 0 and ((nu - ts) < hold or frem) %}
+              {% set vv = (v | float(0)) * (e ** (-nf.f) if frem else 1) %}
+              {% if raa | is_number %}
+                {% set ns.vals = ns.vals + [[vv, raa | float(0)] | min] %}
+              {% else %}
+                {% set ns.vals = ns.vals + [vv] %}
+              {% endif %}
+            {% elif v | is_number and ts >= today_at('00:00').timestamp() %}
+              {% set ns.gamle = ns.gamle + [v | float(0)] %}
+            {% endif %}
+          {% endfor %}
+          {# 2026-09-30 (user: "fix at sofa stuen ikke tændte. måtte tænde
+             manuelt"): SOL-LOFTET gælder nu BEGGE grene, ikke kun fallbacken.
+             Køkken-samplet fra 18:18 (88,7 lx) var "frisk" til 19:03 (hold
+             45 min), og dets eneste loft var den rå Apollo — som køkken-spotsene
+             løftede til ~65 lx fra 18:49. Solen gik ned 18:53; open_plan_lux
+             stod på 63,5 da stuen blev optaget 18:56:53 → over stue_lux_gate
+             (60,2) → sofa-stuen tændte ikke. Loftet her havde sagt ~5 lx.
+             Målt 16-30/9 på de RENE samples (samme kurver som fallbacken):
+             aften 666+666 samples med sol < 8°, 0 over loftet med ≥ 10 lx;
+             morgen 1784+1783 med sol < 12°, ét — det kontaminerede 20/9 06:58
+             (220 lx ved 0,6°), som loftet så også fanger. #}
+          {% set el_loft = state_attr('sun.sun', 'elevation') %}
+          {% set sol_loft = ((14.3 * e ** (0.35 * el_loft)) if state_attr('sun.sun', 'rising')
+                             else (6.5 * e ** (el_loft + 1))) if el_loft is number else none %}
+          {% if ns.vals | length > 0 %}
+            {% set v = ns.vals | sum / (ns.vals | length) %}
+            {{ ([v, sol_loft] | min if sol_loft is not none else v) | round(1) }}
+          {% else %}
+            {# 2026-09-03: fallback-kæden er nu BÆRENDE — den rammes hver aften
+               hvor open-plan-lyset er tændt — så rækkefølgen er rettet efter
+               IMMUNITET: entré-VALLHORN får intet direkte lys og er husets
+               bedste ambient-vidne (målt 3,0 lx samtidig med køkkenets falske
+               76,8), mens sove-Apolloen kan stå bag et nedrullet gardin og
+               lyve kunstigt lavt. Entré tæller kun når entréens eget lys er
+               slukket — også den lyser ind i sin egen VALLHORN. #}
+            {# 2026-09-13b (user-bug "lyset bør ikke være tændt i open plan, det
+               er meget lyst"): entréen er immun, men den måler et ANDET rum på
+               en anden SKALA — og fallbacken skrev dens tal direkte ind som om
+               det var open-plannets. Målt i dag 09:45: entré 25 lx mens
+               spisestue-Apolloen (lys slukket) stod på 170 → husets tænd-gate
+               (27,8) læste "mørkt" og tændte open-plan-lyset i fuldt dagslys.
+               Fallbacken skaleres derfor nu; kun entré-kilden, da de to andre
+               er rigtige rum-målere. Kalibrering + hvorfor p25: se sliderens
+               kommentar i packages/room_lux_tuning.yaml. #}
+            {% set ef = states('input_number.open_plan_entre_fallback_faktor')
+                        | float(1.75) %}
+            {# 2026-09-20 (user-bug "køkkenlyset har hængt i dag"): entréen blev
+               SPRUNGET HELT OVER når dens egen lampe var tændt — og det er
+               præcis morgenen, altså netop når fallbacken er bærende. Så faldt
+               autoriteten til sove-Apolloen med faktor 1,0, som filen selv
+               kalder en løgner ("kan stå bag et nedrullet gardin og lyve
+               kunstigt lavt"). Målt i dag 08:26: sove 26,4 blev husets
+               open-plan-dagslys, mens entré-VALLHORN læste 30-42 og
+               spisestue-Apolloen 124-135. Alt under sluk-tærsklen 60 ⇒ hele
+               open-plannet brændte i dagslys.
+               Rettelsen dengang var at BRUGE den rå VALLHORN også mens lampen
+               var tændt ("en lampe kan kun lægge lux TIL, så tallet er et
+               konservativt gulv"). 2026-09-23: den retning er forkert. For et
+               DAGSLYS-estimat er kontaminering en OPAD-bias, og "for lyst" er
+               den farlige retning. Og kanalen er slet ikke immun: målt i
+               morges faldt entre_valhorn_illuminance 54 → 1,0 lx i det sekund
+               køkken-LYSKÆDEN slukkede, mens entre_lys_on_effektiv stadig stod
+               'on'. VALLHORN'en ser open-plannets lamper, ikke kun entréens.
+               Nu står VINDUES-enden forrest i stedet: spisestue-Apolloen måler
+               der hvor dagslyset kommer IND, og dens opad-bias er
+               selvkorrigerende — fallbacken rammes kun når lamper er tændt,
+               altså når rummene alligevel er oplyste og kun SLUK-veje læser
+               tallet. Faktor 0,65: open_plan_lux er middelværdien af køkken-
+               og spisestue-samplet, og spisestuen er målt 3,37× køkkenet på
+               129 rene par ⇒ middel ≈ 0,65 × spisestue.
+               Entréen beholder sin plads når dens eget lys er slukket.
+               Sove-Apolloen er sidst: et gardin gør den til husets dårligste
+               vidne, ikke dets næstbedste. #}
+            {% set fb = [['sensor.spisestue_lux_reel', 0.65]]
+                        + ([] if is_state('binary_sensor.entre_lys_on_effektiv', 'on')
+                           else [['sensor.entre_valhorn_illuminance', ef]])
+                        + [['sensor.stue_lux_reel', 1.0],
+                           ['sensor.sovevaerelse_lux_reel', 1.0]] %}
+            {% set nf = namespace(value=none) %}
+            {% for s, k in fb %}
+              {% if nf.value is none %}
+                {% set raw = states(s) %}
+                {% if raw | is_number %}
+                  {% set nf.value = (raw | float(0) * k) | round(1) %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {# 2026-09-28 (B167, user: "nu mangler gang og soveværelse lys"):
+               fallbacken er spisestue_lux_reel × 0,65 = MÅLT MED open-plannets
+               egne lamper. 07:15 stod den på 31,5 lx med solen på 0,9° (entré-
+               VALLHORN 3,0) → soveværelsets morgen-regel ("open-plan lyst → tænd
+               ikke") blokerede lyset; i går aftes 42,3 lx ved −12°. Et SOL-LOFT
+               kan kun sænke: målt 14 døgn, 1240 rene open-plan-par (snit af de
+               to samples) — morgen 14,3·e^(0,35·elev) (spisestue-max × 0,65 ×
+               1,5 margin), aften 6,5·e^(elev+1) (spisestue-kurven fra 27/9 ×
+               0,65). Ét par over loftet ≥ 10 lx: 20/9 06:58, 114 lx ved 0,2° =
+               kontamineret sample fra "køkkenlyset har hængt"-dagen. #}
+            {% if nf.value is not none and sol_loft is not none %}
+              {% set nf.value = [nf.value, sol_loft | round(1)] | min %}
+            {% endif %}
+            {# 2026-10-09 (user: "fix at openplan bliver mørkt … selvom vi er i
+               køkkenet skal stuerne holdes lyse"): EFTERMIDDAGS-LOFT. Fallbacken
+               rammes præcis hold-minutterne efter at open-plannets lamper tændte
+               (samplene fryser når lys_rent går off) — og dens første kilde er
+               spisestue-Apolloen, som spisestue-loftet lyser direkte ind i. Målt:
+               8/10 lamper on 16:11:57 → 16:56 fallback 26,1 → 60,6 lx → dagslys-
+               sluk 17:00; 9/10 lamper on 15:51:49 → 16:47:54 11,6 → 46,3 lx
+               (samples 12,8 + 55,2) → sluk 16:54:55 mens familien var i køkkenet.
+               Begge gange over sluk-tærsklen (40) på vores EGET lys, ved sol 12-13°
+               — over aften-fremskrivningens 11°. Efter middag falder dagslyset,
+               så dagens sidste rene sample er et loft: fallbacken må gerne sige
+               MØRKERE (tænd-vejene), aldrig LYSERE end da lamperne tændte. En sky
+               der letter fejler mod "bliv tændt" — husets sluk-retning. #}
+            {% if nf.value is not none and ns.gamle | length > 0
+                  and state_attr('sun.sun', 'rising') == false %}
+              {% set nf.value = [nf.value, (ns.gamle | sum / (ns.gamle | length)) | round(1)] | min %}
+            {% endif %}
+            {{ nf.value if nf.value is not none else 'unavailable' }}
+          {% endif %}
+        availability: >
+          {% set sources = [
+            'sensor.koekken_dagslys_sample',
+            'sensor.spisestue_dagslys_sample',
+            'sensor.sovevaerelse_lux_reel',
+            'sensor.stue_lux_reel',
+            'sensor.entre_valhorn_illuminance'
+          ] %}
+          {{ sources | select('is_state', 'on') | list | length > 0
+             or sources | map('states') | reject('in', ['unknown','unavailable','none','']) | list | length > 0 }}
+
+      # 2026-07-17 (assessment-opgradering, user-spec "vi har mere data nu"):
+      # køkken-Apollo (paret 2026-06-15) er nu med i klassifikationen — den
+      # manglede helt (fejlklasse #16: activity_state-rosteret driftede da
+      # køkkenet blev tilføjet i house_modes/dormant-rosterne).
+      #   - cooking er nu KØKKEN-drevet (køkken-zone aktiv), ikke det gamle
+      #     "stue+spisestue samtidig" (som reelt bare var 2 personer i open-plan).
+      #   - social_dining = ≥2 open-plan-subzoner samtidig + spisetid 17-23.
+      #   - depot-Valhorn tæller med som indendørs zone (manglede også).
+      #   - social_party: open-plan bidrager max 2 zoner (3 subzoner = stadig
+      #     samme fysiske rum) så madlavning+sofa+bad ikke fejl-klassificeres.
+      # Alle eksisterende state-NAVNE er bevaret (forbrugere: activity_aware
+      # guest_mode, room_drift_back, dormant_idle, entre_ned_dormant m.fl.).
+      - name: "Activity state"
+        unique_id: activity_state
+        icon: mdi:home-search
+        state: >
+          {% set stue = is_state('binary_sensor.stue_apollo_occupancy_filtered', 'on') %}
+          {% set spisestue = is_state('binary_sensor.spisestue_apollo_occupancy_filtered', 'on') %}
+          {% set koekken = is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'on') %}
+          {% set sove = is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'on') %}
+          {% set boern = is_state('binary_sensor.boernevaerelse_apollo_occupancy', 'on') %}
+          {# 2026-07-22 (user-bug): PIR'erne clearer under stillesiddende badning
+             (fysik-præmis fra visit_quality: PIR ser ikke stilstand) → med åben
+             terrassedør (terrasse_active on) faldt træet til terrasse_only midt
+             i et bad. Wasp hjælper kun ved LUKKET dør — børne-badning sker m.
+             åben. visit_serious (committet besøg, Medium/Fuld) + badets lys
+             stadig tændt = besøget er i gang, uanset PIR-dyk. Lys-kravet
+             hindrer sticky bath ved stage-rester (stage nulstilles først når
+             lyset slukker). #}
+          {% set bad = is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+             or (is_state('binary_sensor.badevaerelse_visit_serious', 'on')
+                 and is_state('light.badevaerelse_all', 'on')) %}
+          {% set entre = is_state('binary_sensor.entre_valhorn_occupancy', 'on') %}
+          {% set depot = is_state('binary_sensor.depot_valhorn_occupancy', 'on') %}
+          {% set terrasse = is_state('binary_sensor.terrasse_active', 'on') %}
+          {# F5 fix audit Phase 1 2026-05-07 PM: tidligere bare `godnat_active`
+             missede voksen-only godnat (sub-flag union). Same bug-class A1-A10. #}
+          {% set godnat = is_state('binary_sensor.godnat_any_active', 'on') %}
+          {% set hour = now().hour %}
+          {# 2026-07-29 (user-spec): hjemmearbejdsdag = dagen er markeret af
+             hjemmearbejde_dag_detekter (målt spisestue-ophold på hverdag) OG
+             bordet er i brug lige nu. User-valg: "kun mens du sidder der" —
+             går man på terrassen eller i sofaen, skifter activity tilbage.
+             Bundet til arbejdsdags-vinduet så aftensmaden ved samme bord ikke
+             fejl-mærkes som arbejde. #}
+          {% set hjemmearbejde = is_state('input_boolean.maaltid_hjemmearbejde_dag', 'on')
+             and spisestue and (6.5 <= (hour + now().minute / 60) < 17) %}
+          {% set op_count = (1 if stue else 0) + (1 if spisestue else 0) + (1 if koekken else 0) %}
+          {% set op_any = op_count >= 1 %}
+          {% set op_multi = op_count >= 2 %}
+          {# Open-plan capped til 2 zone-bidrag: subzonerne er ét fysisk rum,
+             så 3 samtidige subzoner må ikke alene kunne udløse social_party. #}
+          {% set indoor_count = ([op_count, 2] | min)
+                              + (1 if sove else 0) + (1 if boern else 0)
+                              + (1 if bad else 0) + (1 if entre else 0)
+                              + (1 if depot else 0) %}
+          {% set total_zones = indoor_count + (1 if terrasse else 0) %}
+          {# 2026-07-29 (træner-facit): social_party stod for 3 af 4 forkerte
+             aktivitets-gæt — 4 zoner alene rammer også "1 person går rundt +
+             åben terrassedør". Kræver nu OGSÅ et people_estimate på 4+.
+             people_estimate læser IKKE activity_state (kun dens træner-payload
+             gør) → ingen cirkulær template-afhængighed. #}
+          {% set people = states('sensor.people_estimate') | int(0) %}
+          {% set bedroom_only = (sove or boern) and not (op_any or bad or entre or depot or terrasse) %}
+          {% set indoor_active = op_any or sove or boern or bad or entre or depot %}
+          {% set bath_only = bad and not (op_any or sove or boern or entre or terrasse) %}
+          {# F4 fix audit Phase 1 2026-05-07 PM: tidligere `(entre or (entre and bad))`
+             redundant — `entre and bad` er subset af `entre`. Simplificeret. #}
+          {% set transit = entre and not (op_any or sove or boern or terrasse) %}
+
+          {# 2026-05-21 fix: Dormant dominerer alt andet activity-state.
+             Tidligere viste activity "bedroom_only" hvis sove_apollo stuck
+             "on" (stuck siden HA restart) selv om house er Dormant og
+             ingen reelt hjemme. Forhindrer downstream-automations i at
+             agere på falsk presence-signal. #}
+          {% if is_state('input_select.house_state', 'Dormant') %}away
+          {% elif godnat %}godnat
+          {% elif total_zones == 0 %}idle
+          {# 2026-10-03 (AI-facit): 0 af 7 social_party-gæt blev besvaret rigtige, og de to
+             efter 07-29-fixet (08-15, 09-01) havde begge people = 4 = familien. Kræver nu
+             5+ (mindst ét ekstra hoved). Eneste effekt downstream: færre falske
+             guest_mode (activity_aware). #}
+          {% elif total_zones >= 4 and people >= 5 %}social_party
+          {% elif terrasse and not indoor_active %}terrasse_only
+          {% elif terrasse and op_any %}terrasse_with_indoor
+          {% elif hjemmearbejde %}hjemmearbejde
+          {% elif bedroom_only %}bedroom_only
+          {% elif op_multi and 17 <= hour < 23 %}social_dining
+          {# 2026-08-13 (træner-facit, 2 af 8 forkerte aktivitets-gæt): cooking
+             accepterede `op_multi` UDEN at køkken-zonen var aktiv — stue+
+             spisestue kl. 09:42 (morgenmad ved bordet + radar-trailing ind i
+             stue-zonen) blev "cooking" og blev afvist begge gange (07-29,
+             08-10). Køkken-zonen er nu et KRAV, og de resterende open-plan-
+             kombinationer rangeres efter det mest specifikke bord-/sofa-signal
+             i stedet for at kræve gensidig eksklusivitet: uden det krav faldt
+             stue+spisestue igennem hele kæden til det intetsigende `active`.
+             Spisestue vinder over stue (bordet er en aktivitet, sofaen er en
+             restklasse) — bekræftet af 08-08 + 08-12 hvor spisestue-only →
+             dining blev besvaret "rigtig". #}
+          {% elif koekken %}cooking
+          {% elif spisestue %}dining
+          {% elif stue %}sofa_relax
+          {% elif (sove or boern) and bad and not op_any %}nightwalk
+          {% elif bath_only %}bath_visit
+          {% elif transit %}transit
+          {% else %}active
+          {% endif %}
+        attributes:
+          konfidens_pct: "{{ states('sensor.presence_signal_confidence') | int(0) }}"
+          blinde_sensorer: "{{ state_attr('sensor.presence_signal_confidence', 'blinde') }}"
+          paalidelig: "{{ is_state('binary_sensor.activity_state_confident', 'on') }}"
+
+      # sensor.people_estimate + sensor.people_zones_now: FLYTTET 2026-07-17 til
+      # packages/people_estimate.yaml (v3-omskrivning — numerisk state, sustained
+      # zone-tælling, køkken/entré/depot-zoner, kids-bonus, feedback-træning).
+
+      # =============================================================================
+      # Indoor temperature resilient — TIMMERFLOTTE, depot-reserve (2026-10-15)
+      # =============================================================================
+      # 2026-07-16 (user-spec): Apollo-temp duer ikke som fallback (B12/B17 —
+      # ESP-chippen varmer dem op; en falsk læsning er værre end 'unavailable').
+      # 2026-10-15 (user: "hvis den har fugt måler så skal den med overalt"):
+      # depotets Broadlink RM4 Pro sidder højt oppe ved NUC'en (opvarmet, ikke en
+      # rumtemperatur) men følger køkkenet stabilt nok som RESERVE, målt 27/9-15/10
+      # (1532 kvarterer): depot − køkken median 3,14 °C, p5-p95 2,80-3,66, sd
+      # 0,26, max-fejl 0,93; uændret efter fyringen 12/10 (3,18). Døgnprofil
+      # 3,03 (nat) → 3,44 (kl. 7). Depotet manglede 0 af 1747 kvarterer,
+      # køkkenet 215 (B234). Alle temp-drevne automations (summer_defense,
+      # climate_control, security kulde-dør) og radiator-effekten læser HER.
+      - name: "Indoor temperature resilient"
+        unique_id: indoor_temp_resilient
+        icon: mdi:thermometer
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        availability: >-
+          {{ states('sensor.timmerflotte_temperature') | is_number
+             or states('sensor.broadlink_rm4_pro_temperature') | is_number }}
+        state: >-
+          {% if states('sensor.timmerflotte_temperature') | is_number %}
+            {{ states('sensor.timmerflotte_temperature') | float | round(2) }}
+          {% else %}
+            {{ (states('sensor.broadlink_rm4_pro_temperature') | float - 3.15) | round(2) }}
+          {% endif %}
+        attributes:
+          kilde: "{{ 'køkken' if states('sensor.timmerflotte_temperature') | is_number else 'depot' }}"
+
+      # =============================================================================
+      # Indoor humidity resilient — TIMMERFLOTTE, depot-reserve (2026-10-15)
+      # =============================================================================
+      # Køkkenets TIMMERFLOTTE (Matter node 434) er den kalibrerede kilde —
+      # Apollo MSR-2 har ingen humidity-sensor. Er den væk (13-15/10: ~40 af
+      # 75 t, Thread-øen B234), regnes %RH ud fra sensor.inde_absolut_fugt (som
+      # så kommer fra depotets Broadlink, 30-min-middel − 0,52 g/m³) ved
+      # køkkenets temperatur fra indoor_temperature_resilient (depot − 3,15,
+      # sd 0,26 °C — slår udetemp-modellen, sd 0,33 og −0,2 skævt efter
+      # fyringen). Fejl ≈ ±1-1,5 %RH. Depotets egen RH duer ikke: det står ~26 °C.
+      - name: "Indoor humidity resilient"
+        unique_id: indoor_humidity_resilient
+        icon: mdi:water-percent
+        unit_of_measurement: "%"
+        device_class: humidity
+        state_class: measurement
+        availability: >-
+          {{ states('sensor.timmerflotte_humidity') | is_number
+             or states('sensor.inde_absolut_fugt') | is_number }}
+        state: >-
+          {% set v = states('sensor.timmerflotte_humidity') %}
+          {% if v | is_number %}{{ v | float | round(2) }}
+          {% else %}
+            {% set t = states('sensor.indoor_temperature_resilient') | float(21.26 + 0.157 * states('sensor.udetemp_24_t') | float(8)) %}
+            {% set sat = 216.7 * 6.112 * (e ** (17.62 * t / (243.12 + t))) / (273.15 + t) %}
+            {{ (states('sensor.inde_absolut_fugt') | float / sat * 100) | round(1) }}
+          {% endif %}
+        attributes:
+          kilde: "{{ 'køkken' if states('sensor.timmerflotte_humidity') | is_number else 'depot' }}"
+
+      # Boern bedtime hour decimal (audit-runde 14, O16 fix). Tidligere hardcoded
+      # som inline-template i 5 places (presence_light_boernevaerelse_on
+      # condition+brightness+CT, presence_lux_boernevaerelse_on condition,
+      # presence_boern_aftendaempning condition — pensioneret 2026-06-12/B20).
+      # Nu single source of truth.
+      # Sprint 2026-05-17: slider-tunable via:
+      #   input_number.global_boern_bedtime_weekday (default 19.5 = 19:30)
+      #   input_number.global_boern_bedtime_weekend (default 20.5 = 20:30)
+      # Weekend bruges ogsaa under Home Vacation mode.
+      - name: "Boern bedtime hour"
+        unique_id: boern_bedtime_hour
+        icon: mdi:bed-clock
+        unit_of_measurement: "h"
+        state: >
+          {% set weekend = now().isoweekday() > 5
+             or is_state('input_select.house_mode', 'Home Vacation') %}
+          {% if weekend %}
+            {{ states('input_number.global_boern_bedtime_weekend') | float(20.5) }}
+          {% else %}
+            {{ states('input_number.global_boern_bedtime_weekday') | float(19.5) }}
+          {% endif %}
+
+      # Sun-elevation baseret evening warmth — smooth color_temp gradient.
+      # Audit-5 wiring 2026-05-12: tunable via input_number.global_evening_warmth
+      # (slider 0-100 → factor 0.0-2.0 fra sensor.global_evening_warmth_factor).
+      #
+      # MATH:
+      #   baseline = current 4-bracket value (2326-2850 afhaengig af elev)
+      #   shift    = 2850 - baseline  (= hvor meget bracket dipper fra dagstid)
+      #   final    = 2850 - shift × factor
+      #   clamp    = max(final, 2000)  (safe LED range)
+      #
+      # GUARANTEE: factor=1.0 (slider=50) → bit-identisk output som pre-wiring.
+      # factor=0 → stays at 2850K (no evening shift uanset bracket).
+      # factor=2 → night-bracket goes til 2000K (clamped). Daytime stays 2850
+      #            fordi shift=0 ved elev>10 (ingen jolt mid-day).
+      - name: "Auto color temp evening"
+        unique_id: auto_color_temp_evening
+        icon: mdi:white-balance-sunny
+        unit_of_measurement: "K"
+        state: >
+          {% set elev = state_attr('sun.sun', 'elevation') | float(0) %}
+          {% set factor = states('sensor.global_evening_warmth_factor') | float(1.0) %}
+          {% set baseline = 2850 if elev > 10 else 2700 if elev > 0 else 2500 if elev > -6 else 2326 %}
+          {% set shift = 2850 - baseline %}
+          {% set raw = 2850 - shift * factor %}
+          {{ [raw | round(0) | int, 2000] | max }}
+
+      # Sun bracket — diskret klassifikation af elevation til adaptiv
+      # firmware-default (start_up_current_level + start_up_color_temperature)
+      # for bath/sove bulbs. Driver automations/bulb_firmware_defaults.yaml.
+      #
+      # Eliminerer "blink" ved wall-switch power-cycle: bulb wake'r direkte
+      # paa target-niveau i stedet for 30% firmware-default.
+      #
+      # Tre brackets matcher light_power_recovery brightness-logik:
+      #   day      = elev > 0   (bath 70%, sove 60%, CT 2850K)
+      #   twilight = -6 to 0    (bath 50%, sove 40%, CT 2700K)
+      #   night    = elev < -6  (bath 30%, sove 25%, CT 2326K)
+      - name: "Sun bracket"
+        unique_id: sun_bracket
+        icon: mdi:weather-sunset
+        state: >
+          {# 2026-06-23: "dag"-grænsen følger nu sæsonen via sensor.sun_day_
+             elevation_effective (sommer ~0° = uændret, vinter ~8°, + per-måned
+             læring). float(0)-fallback = nuværende adfærd hvis sensoren mangler.
+             Se packages/seasonal_daylight.yaml. Twilight-grænsen er uændret (-6). #}
+          {% set elev = state_attr('sun.sun', 'elevation') | float(0) %}
+          {% set day_cut = states('sensor.sun_day_elevation_effective') | float(0) %}
+          {% if elev > day_cut %}day
+          {% elif elev > -6 %}twilight
+          {% else %}night
+          {% endif %}
+
+      # =============================================================================
+      # Diagnostik: "tid siden sidste Styrbar-tryk" per rum (sprint 2026-05-06)
+      # =============================================================================
+      # Konverter input_datetime.styrbar_last_press_X til kompakt læselig tekst
+      # ("5 min", "2 t", "3 d") for diagnostik dashboard. Forhindrer overflow
+      # af lang timestamp på mobile narrow columns.
+      # =============================================================================
+      - name: "Sove sidste tryk"
+        unique_id: styrbar_sove_since_press
+        icon: mdi:gesture-tap-button
+        state: >
+          {% set lp = states('input_datetime.styrbar_last_press_sovevaerelse') %}
+          {% if lp in ['unknown','unavailable','none'] %}Aldrig
+          {% else %}
+            {% set s = (now() - strptime(lp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() | int %}
+            {% if s < 60 %}{{ s }}s
+            {% elif s < 3600 %}{{ (s/60) | int }} min
+            {% elif s < 86400 %}{{ (s/3600) | int }} t
+            {% else %}{{ (s/86400) | int }} d
+            {% endif %}
+          {% endif %}
+
+      - name: "Stue sidste tryk"
+        unique_id: styrbar_stue_since_press
+        icon: mdi:gesture-tap-button
+        state: >
+          {% set lp = states('input_datetime.styrbar_last_press_stue') %}
+          {% if lp in ['unknown','unavailable','none'] %}Aldrig
+          {% else %}
+            {% set s = (now() - strptime(lp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() | int %}
+            {% if s < 60 %}{{ s }}s
+            {% elif s < 3600 %}{{ (s/60) | int }} min
+            {% elif s < 86400 %}{{ (s/3600) | int }} t
+            {% else %}{{ (s/86400) | int }} d
+            {% endif %}
+          {% endif %}
+
+      - name: "Bad sidste tryk"
+        unique_id: styrbar_bad_since_press
+        icon: mdi:gesture-tap-button
+        state: >
+          {% set lp = states('input_datetime.styrbar_last_press_badevaerelse') %}
+          {% if lp in ['unknown','unavailable','none'] %}Aldrig
+          {% else %}
+            {% set s = (now() - strptime(lp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() | int %}
+            {% if s < 60 %}{{ s }}s
+            {% elif s < 3600 %}{{ (s/60) | int }} min
+            {% elif s < 86400 %}{{ (s/3600) | int }} t
+            {% else %}{{ (s/86400) | int }} d
+            {% endif %}
+          {% endif %}
+
+      - name: "Boern sidste tryk"
+        unique_id: styrbar_boern_since_press
+        icon: mdi:gesture-tap-button
+        state: >
+          {% set lp = states('input_datetime.styrbar_last_press_boernevaerelse') %}
+          {% if lp in ['unknown','unavailable','none'] %}Aldrig
+          {% else %}
+            {% set s = (now() - strptime(lp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() | int %}
+            {% if s < 60 %}{{ s }}s
+            {% elif s < 3600 %}{{ (s/60) | int }} min
+            {% elif s < 86400 %}{{ (s/3600) | int }} t
+            {% else %}{{ (s/86400) | int }} d
+            {% endif %}
+          {% endif %}
+
+      - name: "Terrasse sidste tryk"
+        unique_id: styrbar_terrasse_since_press
+        icon: mdi:gesture-tap-button
+        state: >
+          {% set lp = states('input_datetime.styrbar_last_press_terrasse') %}
+          {% if lp in ['unknown','unavailable','none'] %}Aldrig
+          {% else %}
+            {% set s = (now() - strptime(lp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() | int %}
+            {% if s < 60 %}{{ s }}s
+            {% elif s < 3600 %}{{ (s/60) | int }} min
+            {% elif s < 86400 %}{{ (s/3600) | int }} t
+            {% else %}{{ (s/86400) | int }} d
+            {% endif %}
+          {% endif %}
+
+      - name: "Depot sidste tryk"
+        unique_id: styrbar_depot_since_press
+        icon: mdi:gesture-tap-button
+        state: >
+          {% set lp = states('input_datetime.styrbar_last_press_depot') %}
+          {% if lp in ['unknown','unavailable','none'] %}Aldrig
+          {% else %}
+            {% set s = (now() - strptime(lp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() | int %}
+            {% if s < 60 %}{{ s }}s
+            {% elif s < 3600 %}{{ (s/60) | int }} min
+            {% elif s < 86400 %}{{ (s/3600) | int }} t
+            {% else %}{{ (s/86400) | int }} d
+            {% endif %}
+          {% endif %}
+
+
+# =============================================================================
+# History stats — boern occupancy duration (sprint 2026-05-08)
+# =============================================================================
+# Smartere kids_home detection: skelner mellem voksen-passing-through (1-3 min
+# brief motion) og kid-real-activity (30+ min sustained).
+#
+# Bruges af binary_sensor.kids_home som signal S2 (4h cumulative) + S3 (today
+# cumulative). Kombineret med S1 (sustained current) + S4 (zones>adults) i
+# kids_home template — any-of-4 → kids hjemme.
+# =============================================================================
+sensor:
+  - platform: history_stats
+    name: "Boern occupancy 4h"
+    unique_id: boern_occupancy_4h
+    entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+    state: 'on'
+    type: time
+    end: '{{ now() }}'
+    duration:
+      hours: 4
+
+  - platform: history_stats
+    name: "Boern occupancy today"
+    unique_id: boern_occupancy_today
+    entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+    state: 'on'
+    type: time
+    start: '{{ now().replace(hour=0, minute=0, second=0) }}'
+    end: '{{ now() }}'
+
+  # Sprint 2026-05-28: overnight window (yesterday 22:00 → today 06:00).
+  # Definitive signal for kids_home: kid der sover i bed → Apollo on through
+  # most of night → >=4h overnight occupancy = "kid slept here". Modsat
+  # <15min overnight = "definitivt ingen kid her i nat".
+  # Window-skift kl 22:00 (start ny natlig overnight-track).
+  - platform: history_stats
+    name: "Boern occupancy overnight"
+    unique_id: boern_occupancy_overnight
+    entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+    state: 'on'
+    type: time
+    start: >
+      {% if now().hour < 22 %}
+        {{ (now().replace(hour=22, minute=0, second=0) - timedelta(days=1)).isoformat() }}
+      {% else %}
+        {{ now().replace(hour=22, minute=0, second=0).isoformat() }}
+      {% endif %}
+    end: >
+      {% if now().hour < 22 %}
+        {{ now().replace(hour=6, minute=0, second=0).isoformat() }}
+      {% else %}
+        {{ (now().replace(hour=6, minute=0, second=0) + timedelta(days=1)).isoformat() }}
+      {% endif %}

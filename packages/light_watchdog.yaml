@@ -1,0 +1,208 @@
+# =============================================================================
+# Lys super-watchdog — sluk lys der har brændt uafbrudt for længe (2026-06-15)
+# =============================================================================
+# Sidste forsvarslinje mod fastlåst hardware: hvis en pære/strip har stået ON
+# uafbrudt i mere end N timer (slider, default 6t), antager vi at noget har låst
+# sig fast (Zigbee/Matter/relæ hænger, mistet off-kommando) og slukker den.
+# last_changed = sidste on/off-transition (brightness/farve-skift nulstiller den
+# IKKE) → måler ægte sammenhængende on-tid.
+#
+# Kill-switch: input_boolean.global_light_watchdog_enabled (default on).
+# Skipper under cinema/cirkus/dance (intentionelt langt-tændt lys).
+# Ekskluderer ALLE lys-grupper (detekteres via 'entity_id'-attr: alle_lys,
+# alle_indvendige, *_all, depot_loft …) + Apollo-RGB-indikatorer. At slukke en
+# gruppe ville kaskadere til alle medlemmer (slukkede natlys 04:00 2026-06-18).
+# Undtager desuden børnenes 1% natlys-strip mens godnat er aktiv, så den
+# overlever til morgen. Bad-lyset er IKKE undtaget — et nat-toilet (nightwalk)
+# er kortvarigt; hænger bad-spots reelt for længe skal de stadig dræbes
+# (user-spec 2026-06-18).
+# Automatik: automations/light_watchdog.yaml (/30-min scan).
+# Defaults sættes via API ved deploy (init_user_preferences fyrer ikke på
+# eksisterende install — run-once-markør er sat).
+# =============================================================================
+input_number:
+  global_max_light_hours:
+    name: "Lys-watchdog: max uafbrudt lys-tid (timer)"
+    icon: mdi:timer-alert
+    min: 1
+    max: 24
+    step: 1
+    unit_of_measurement: "h"
+    mode: slider
+
+  # NAT-VAGTEN (2026-08-26e). Super-watchdog'en ovenfor måler 6 TIMER og var
+  # derfor blind for nattens 3t41m-hæng. Nat-vagten måler LYSETS egen alder,
+  # ikke presence-timere — netop fordi et radar-spøgelse kan nulstille en
+  # presence-timer, men aldrig en pæres `last_changed`. Se automations/
+  # light_watchdog.yaml for hele argumentet.
+  nat_lysvagt_minutter:
+    name: "Nat-vagt: sluk open-plan-lys efter (min) i tomt rum"
+    icon: mdi:home-lightbulb-outline
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # Hvor længe en pære skal stå unavailable EFTER at have været tændt, før den
+  # regnes som spøgelse (se afsnittet nederst). 14 døgns historik: HA-restarts
+  # giver 0,3-0,4 min udfald på alt (33 stk.) → alt under ~5 min er støj; de
+  # ægte hængere varede 60-1544 min. NB trigger-`for:` binder ved load →
+  # restart kræves før en ny værdi virker.
+  lys_spoegelse_varsel_minutter:
+    name: "Spøgelses-lys: varsel efter (min)"
+    icon: mdi:ghost-outline
+    min: 2
+    max: 120
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+input_boolean:
+  global_light_watchdog_enabled:
+    name: "Lys super-watchdog aktiv"
+    icon: mdi:shield-sync
+
+# =============================================================================
+# Uopnåelige lys ved godnat (2026-08-12, user-bug: "depot lys hænger, vi sover")
+# =============================================================================
+# Super-watchdog'en ovenfor kan pr. konstruktion IKKE se dette: den kræver
+# state == 'on', og en pære der falder af mesh'et MENS den lyser står
+# 'unavailable' (fejlklasse #9) — fysisk tændt, digitalt usynlig, og godnat's
+# light.turn_off når den aldrig. Facit 08-12: light.depot_strip mistede radioen
+# 07:06 mens den var ON og lyste 15 timer; godnat kl. 21:49 kunne intet gøre.
+# Godnat stempler derfor de uopnåelige lys her, så (a) de slukkes i SEKUNDET de
+# kommer tilbage på nettet, og (b) brugeren får ét varsel om at et lys kan stå
+# tændt uden at HA kan gøre noget ved det — dét er den eneste handling der
+# findes når radioen er væk.
+# =============================================================================
+input_text:
+  godnat_uopnaaelige_lys:
+    name: "Godnat: lys der ikke kunne nås"
+    icon: mdi:lightbulb-question
+    min: 0
+    max: 255
+
+  # Spøgelses-latch: pærer der stod ON i det sekund radioen forsvandt.
+  # input_text overlever restart → latchen er stadig kendt efter et core-restart
+  # (hvor selve on→unavailable-flanken ikke findes længere).
+  lys_spoegelser:
+    name: "Lys der lyser uden radio (spøgelser)"
+    icon: mdi:ghost-outline
+    min: 0
+    max: 255
+
+# =============================================================================
+# 👻 Spøgelses-lys — tændt da radioen forsvandt (2026-08-13, user-spec)
+# =============================================================================
+# "når et lys går fra on til unavailable som depotet i går, så skal det give
+#  varsel efter noget tid og tælle med som on-lys i statistikken".
+#
+# Godnat-stemplet (ovenfor) opdager først hullet kl. 21:49. Depot-facit 08-12:
+# strippen faldt af nettet 07:06 og lyste 15 timer uden at nogen del af huset
+# kunne se det — hverken watchdog (kræver state == 'on'), statistik eller
+# energi-estimat. Historik-tjek 14 døgn viser at det IKKE var en engangsting:
+# boernevaerelse_loft gjorde det samme 07-31 (25,7 t) og 08-06 (12,5 t).
+#
+# Latch-mekanik: automations/light_watchdog.yaml armerer på flanken
+# on → unavailable (efter slideren) og rydder når pæren er tilbage. ALLE
+# forbrugere læser ÉT delt resultat — sensor.lys_spoegelser (attribut
+# `entities`) — i stedet for at gentage reglen (fejlklasse #2):
+#   • sensor.hus_paerer_taendt_antal + rummenes *_lys_on_effektiv (lys_kpi)
+#   • sensor.lys_estimat_effekt (energy_estimate)
+# Sensoren filtrerer selv entities der er tilbage på nettet, så et stale latch
+# aldrig kan puste tallene op mens ryd-automationen venter på næste tick.
+#
+# GRÆNSE FOR HVAD VI KAN VIDE: on → unavailable er tvetydigt. En Zigbee-pære
+# hvis strøm slås fra ved kontakten går også unavailable — og tænder som 'on'
+# når strømmen kommer igen, så retur-værdien beviser intet (for Matter er
+# retur-'on' desuden altid et ekko af sidste kendte værdi). Vi antager derfor
+# "lyser videre", hvilket over-tæller i kontakt-tilfældet. User-valg 2026-08-13:
+# tæl med, uden cap, indtil pæren er tilbage. Badet er den ENESTE undtagelse
+# hvor vi har et ægte vidne: bad_strom_ok = off ⇒ spots er fysisk mørke ⇒
+# ingen latch.
+# =============================================================================
+template:
+  - sensor:
+      # =====================================================================
+      # KONTAKT-SLUKKEDE (B125, 2026-09-09e) — EJER vidne-kortet ALENE.
+      # =====================================================================
+      # Et `on → unavailable` er tvetydigt (se blokken ovenfor), MEN i to
+      # tilfælde har vi et ægte vidne: pæren deler vægkontakt med en NETDREVEN
+      # ESPHome-node, så nodens `unavailable` beviser at strømmen er væk og
+      # pæren derfor er fysisk MØRK — samme logik som badets `bad_strom_ok`.
+      #
+      # KOBLINGEN ER MÅLT, IKKE ANTAGET (recorder, 30 døgn, alle `on →
+      # unavailable` pr. pære matchet mod nærmeste Apollo-udfald i [-5, +15] min):
+      #   light.koekken_lyskaede   → køkken/spisestue-Apollo   3/4
+      #   light.spisestue_pendel   → SOVEVÆRELSETS Apollo      2/2
+      #   stue_plug, stue_laesehygge, entre_loft,
+      #   terrasse_paerelyskaede, boernevaerelse_hyggelys → INGEN (0/10)
+      # Derfor er kortet kort. Udvid det KUN med en ny måling — en gætter
+      # kobling gør et ægte spøgelse usynligt, hvilket er den dyre fejlretning.
+      #
+      # FÆLDEN: `light.spisestue_pendel` er FYSISK soveværelsets loft
+      # (alias-slug fra 2026-06-05) — dens vidne er sove-Apolloen, ikke
+      # spisestuens. Et rosters rum kan ikke læses af entity_id'et.
+      #
+      # Selv-korrigerende: kommer Apolloen tilbage mens pæren stadig er væk,
+      # falder pæren automatisk tilbage til at være et ægte spøgelse.
+      # Staten er en CSV (aldrig over ~45 tegn — kortet har to poster), og
+      # `entities` udleder listen af DEN. Så renderes vidne-kortet ÉN gang, og
+      # sensoren refererer aldrig sin egen attribut (det ville læse forrige
+      # render og give KPI'en et cyklus-lag).
+      - name: "Lys kontakt slukkede"
+        unique_id: lys_kontakt_slukkede
+        icon: mdi:toggle-switch-off-outline
+        state: >-
+          {% set raw = states('input_text.lys_spoegelser') %}
+          {% set lst = raw.split(',') if raw not in
+             ['', 'unknown', 'unavailable'] else [] %}
+          {% set vidner = {
+               'light.koekken_lyskaede': [
+                 'binary_sensor.koekken_apollo_occupancy',
+                 'binary_sensor.spisestue_apollo_occupancy'],
+               'light.spisestue_pendel': [
+                 'binary_sensor.sovevaerelse_apollo_occupancy'] } %}
+          {% set ns = namespace(ude=[]) %}
+          {% for e in lst | reject('eq', '') | reject('is_state', 'on')
+                          | reject('is_state', 'off') %}
+            {% set w = vidner.get(e, []) %}
+            {% if w | reject('is_state', 'on') | reject('is_state', 'off')
+                    | list | count > 0 %}
+              {% set ns.ude = ns.ude + [e] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.ude | join(',') if ns.ude | count > 0 else '-' }}
+
+      - name: "Lys spoegelser"
+        unique_id: lys_spoegelser
+        unit_of_measurement: "lys"
+        state_class: measurement
+        icon: mdi:ghost-outline
+        # B125: pærer hvis vægkontakt bevisligt er slukket trækkes fra — de er
+        # fysisk mørke, ikke spøgelser. `sensor.lys_kontakt_slukkede` ejer
+        # vidne-kortet, så reglen står ÉT sted (fejlklasse #2).
+        state: >-
+          {% set raw = states('input_text.lys_spoegelser') %}
+          {% set lst = raw.split(',') if raw not in
+             ['', 'unknown', 'unavailable'] else [] %}
+          {% set k = states('sensor.lys_kontakt_slukkede') %}
+          {% set ude = k.split(',') if k not in
+             ['-', '', 'unknown', 'unavailable'] else [] %}
+          {{ lst | reject('eq', '') | reject('is_state', 'on')
+             | reject('is_state', 'off') | reject('in', ude) | list | count }}
+        attributes:
+          entities: >-
+            {% set raw = states('input_text.lys_spoegelser') %}
+            {% set lst = raw.split(',') if raw not in
+               ['', 'unknown', 'unavailable'] else [] %}
+            {% set k = states('sensor.lys_kontakt_slukkede') %}
+            {% set ude = k.split(',') if k not in
+               ['-', '', 'unknown', 'unavailable'] else [] %}
+            {{ lst | reject('eq', '') | reject('is_state', 'on')
+               | reject('is_state', 'off') | reject('in', ude) | list }}
+          kontakt_slukkede: >-
+            {% set k = states('sensor.lys_kontakt_slukkede') %}
+            {{ k.split(',') if k not in
+               ['-', '', 'unknown', 'unavailable'] else [] }}

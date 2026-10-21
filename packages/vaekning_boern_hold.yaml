@@ -1,0 +1,220 @@
+# =============================================================================
+# Børnevækning: HOLD — rampen skal have lov at køre færdig (2026-09-02)
+# =============================================================================
+# MÅLT ÅRSAG (02-09, recorder, context_id-opslag):
+#   06:23:00  automation.vaekning_pigerne_* tændte loftet (Phase 1, 5 %)
+#   06:25:00  automation.lysnet_bornevaerelse_gradvis_sluk slukkede det igen
+#   06:25:57  Phase 2's inter-fase-recheck så "ingen dimbar lampe tændt"
+#             → rampen ABORTEREDE. Vækningen var altså både "for kort" OG
+#             "virkede ikke" — samme årsag.
+#
+# HVORFOR gradvis-sluk vandt: den har en `/5`-time_pattern-backstop, og dens
+# krav er "occupancy off i ≥ 5 min". Et SOVENDE barn giver ikke occupancy —
+# det er præcis pointen med at vække det. Kravet var altså opfyldt hele natten,
+# og det første tick efter rampens start slukkede. Vækningen kan ikke vinde et
+# kapløb den taber pr. konstruktion.
+#
+# HVORFOR DET IKKE VAR FANGET: morning_lights_sanity_check.yaml har en condition
+# kommenteret "Skip aktiv wakeup", men den tester
+# `binary_sensor.godnat_any_active == off` — og godnat er netop RYDDET (06:07)
+# når vækningen kører. Guarden er sand under hele vækningen og beskytter intet
+# (fejlklasse #3: kommentar-påstand ≠ kode). Huset havde ingen anker for
+# "en vækning kører lige nu".
+#
+# DESIGN — ét delt hold, som badets brusebad-session:
+#   binary_sensor.boernevaerelse_vaekning_hold læses som veto af ALLE fem
+#   sluk-veje der kan ramme børneværelset (fejlklasse #21 — et kill-switch der
+#   ikke er en condition på hver vej ind, er pynt). Reglen står ÉT sted; ingen
+#   af sluk-vejene gentager den (fejlklasse #2).
+#
+# TRE UDGANGE, alle automatiske — holdet kan ikke hænge:
+#   1. Bruger tager over: room_mode → Manual (Styrbar-tryk sætter selv rummet
+#      i Manual) eller et sluk med bruger-kontekst fra app'en.
+#   2. Hård levetid: slideren nedenfor, målt fra rampens start på et SKREVET
+#      stempel (last_changed nulstilles ved restart — permanent faktum).
+#   3. Holdet slukker aldrig noget selv; når det slipper, får rummets normale
+#      presence-/dagslys-logik styringen tilbage og slukker efter sine EGNE
+#      vinduer. Samme princip som brusebad-sessionen ("ikke lige når det sker").
+#
+# AIRBNB: wakeup_kids kører ikke i AirBnB, så holdet sættes aldrig dér. Flaget
+# ryddes alligevel ved AirBnB entry og exit (automations/airbnb_mode.yaml), så
+# gæst og familie ikke arver hinandens tilstand.
+# =============================================================================
+
+input_number:
+  # SLIDEREN user bad om ("tror jeg mangler en slider til det også"). Hvor længe
+  # efter rampens START er børneværelsets lys fredet mod automatisk sluk.
+  # Default 30 min: rampen selv er 10 min × duration_factor (0,4-2,0 ⇒ 4-20 min),
+  # og derefter skal barnet nå at stå op og få tøj på uden at rummet slukker
+  # under det. Aldrig kortere end rampen — se sensor.vaekning_boern_hold_effektiv.
+  global_kids_wakeup_hold_minutter:
+    name: "Børn vækning: hold-tid (fredet mod auto-sluk)"
+    icon: mdi:lock-clock
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+input_boolean:
+  # INGEN `initial:` — den PÅTVINGER ved hver HA-start i stedet for at restore
+  # (permanent faktum). En restart midt i en vækning må ikke frigive holdet.
+  wakeup_kids_hold_active:
+    name: "Børn: vækning kører"
+    icon: mdi:weather-sunset-up
+
+input_datetime:
+  # SKREVET stempel. Sensorens/flagets egen last_changed nulstilles ved restart
+  # og duer ikke som aldersmål (fejlklasse #5/#23).
+  wakeup_kids_hold_stempel:
+    name: "Børn: vækning startet kl."
+    icon: mdi:timer-outline
+    has_date: true
+    has_time: true
+
+template:
+  - sensor:
+      # Effektiv hold-tid. Slideren må aldrig kunne stilles KORTERE end rampen
+      # selv, ellers slukker holdet midt i sin egen Phase 3. Rampen er
+      # 10 min × duration_factor + 2 min luft til fade/transition.
+      # ÉT ejerskab: backstoppen, logbogen og dashboard-tilen læser DENNE
+      # (fejlklasse #2). Ingen now() → ingen DB-churn (fejlklasse #24).
+      # Navnet er ASCII med vilje: HA-slugify laver ø→o (ikke oe), så
+      # "Vækning børn …" ville give entity_id …_born_… mens unique_id og alle
+      # forbrugere siger …_boern_…. Ret ALDRIG navnet tilbage til dansk.
+      - name: "Vaekning boern hold effektiv"
+        unique_id: vaekning_boern_hold_effektiv
+        unit_of_measurement: "min"
+        icon: mdi:lock-clock
+        state: >-
+          {% set slider = states('input_number.global_kids_wakeup_hold_minutter') | float(30) %}
+          {% set rampe = (states('sensor.global_kids_wakeup_duration_factor') | float(1.0)) * 10 + 2 %}
+          {{ [slider, rampe] | max | round(0) | int }}
+
+      # Holdets alder i minutter. Gated på flaget: uden for en vækning
+      # returneres en KONSTANT, så now()-templaten ikke skriver en DB-række
+      # hvert minut for evigt (fejlklasse #24).
+      - name: "Vaekning boern hold alder"
+        unique_id: vaekning_boern_hold_alder
+        unit_of_measurement: "min"
+        icon: mdi:timer-sand
+        state: >-
+          {% if not is_state('input_boolean.wakeup_kids_hold_active', 'on') %}
+            0
+          {% else %}
+            {% set stempel = states('input_datetime.wakeup_kids_hold_stempel') %}
+            {# 'timestamp'-attributten er lokal-bevidst pr. stempel; en
+               utcoffset()-korrektion bruger offsettet NU og bliver 1 t forkert
+               hen over DST (permanent faktum; B127). #}
+            {% set t = state_attr('input_datetime.wakeup_kids_hold_stempel',
+                                  'timestamp') | float(0) %}
+            {{ 0 if t <= 0 else ((as_timestamp(now()) - t) / 60) | round(0) | int }}
+          {% endif %}
+
+  - binary_sensor:
+      # DET DELTE VETO. Alle børneværelsets sluk-veje læser DENNE ene sensor.
+      - name: "Boernevaerelse vaekning-hold"
+        unique_id: boernevaerelse_vaekning_hold
+        device_class: running
+        icon: mdi:shield-sun
+        # 2026-09-29: også mens morgen-nedtoningen ramper (packages/
+        # boern_morgen_nedtoning.yaml) — ellers kunne "gradvis sluk" skære
+        # rampen over med sin 30 s fade.
+        state: >-
+          {{ is_state('input_boolean.wakeup_kids_hold_active', 'on')
+             or is_state('input_boolean.boern_morgen_nedtoning_aktiv', 'on') }}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # UDGANG 1: brugeren tager over.
+  # ---------------------------------------------------------------------------
+  - id: vaekning_boern_hold_slip_manuel
+    alias: "Vækning børn: slip hold ved manuel overtagelse"
+    description: >
+      Et fysisk tryk må aldrig blive en no-op. Styrbar/RODRET sætter SELV rummet
+      i Manual (permanent faktum), så room_mode er husets kanoniske
+      "brugeren tog over"-signal og dækker både knap og app. Sluk fra app'en
+      bærer desuden en user_id — knap-tryk gør IKKE (fejlklasse #3), derfor
+      begge triggers.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.room_mode_boernevaerelse
+        to: "Manual"
+      - platform: state
+        entity_id: !include ../rosters/boern_alle_lys.yaml
+        to: "off"
+        id: manuel_sluk
+    condition:
+      - condition: state
+        entity_id: input_boolean.wakeup_kids_hold_active
+        state: "on"
+      # Kun det manuelle sluk skal bevise bruger-kontekst; room_mode → Manual er
+      # allerede beviset i sig selv.
+      - condition: template
+        value_template: >-
+          {{ trigger.id != 'manuel_sluk'
+             or trigger.to_state.context.user_id is not none }}
+    action:
+      # 2026-09-29: manuel vinder også over morgen-nedtoningen — stop rampen
+      # FØR flaget ryddes, så den ikke når at sende ét trin mere.
+      - service: script.turn_off
+        target:
+          entity_id: script.boern_morgen_nedtoning_rampe
+      - service: input_boolean.turn_off
+        target:
+          entity_id: !include ../rosters/boern_morgen_flag.yaml
+      - service: logbook.log
+        data:
+          name: "Vækning børn"
+          message: >-
+            Hold SLUPPET efter {{ states('sensor.vaekning_boern_hold_alder') }} min —
+            brugeren tog over ({{ 'manuelt sluk' if trigger.id == 'manuel_sluk'
+            else 'rummet sat i Manual' }}). Normal sluk-logik har styringen igen.
+          entity_id: input_boolean.wakeup_kids_hold_active
+
+  # ---------------------------------------------------------------------------
+  # UDGANG 2: hård levetid. Tick, ikke kant.
+  # ---------------------------------------------------------------------------
+  - id: vaekning_boern_hold_backstop
+    alias: "Vækning børn: slip hold efter hold-tiden"
+    description: >
+      /1-tick i stedet for en `for:`-kant: en HA-restart dræber ethvert ventende
+      `to: X for: N`, og denne udgang måler netop TID (permanent faktum).
+      Betingelsen læser det SKREVNE stempel, så den svarer korrekt efter en
+      restart midt i en vækning.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: state
+        entity_id: input_boolean.wakeup_kids_hold_active
+        state: "on"
+      # 2026-09-29 (user-spec, packages/boern_morgen_nedtoning.yaml): er barnet
+      # stået op, eller ramper nedtoningen, slipper holdet IKKE ved hold-tiden —
+      # udgangen er rampen, ellers bliver den "gradvis sluk" (5 min + 30 s,
+      # målt 28/9). Hårdt loft: nedtoningens vindue fra vækningens start.
+      - condition: template
+        value_template: >-
+          {% set alder = states('sensor.vaekning_boern_hold_alder') | int(0) %}
+          {% set venter = is_state('input_boolean.boern_morgen_bevaeget', 'on')
+                          or is_state('input_boolean.boern_morgen_nedtoning_aktiv', 'on') %}
+          {{ alder >= (states('input_number.boern_morgen_nedtoning_vindue_min') | int(180))
+             or (alder >= (states('sensor.vaekning_boern_hold_effektiv') | int(30)) and not venter) }}
+    action:
+      - service: script.turn_off
+        target:
+          entity_id: script.boern_morgen_nedtoning_rampe
+      - service: input_boolean.turn_off
+        target:
+          entity_id: !include ../rosters/boern_morgen_flag.yaml
+      - service: logbook.log
+        data:
+          name: "Vækning børn"
+          message: >-
+            Hold SLUPPET — hold-tiden på
+            {{ states('sensor.vaekning_boern_hold_effektiv') }} min er udløbet.
+            Rummets normale presence-/dagslys-logik slukker nu efter sine egne
+            vinduer.
+          entity_id: input_boolean.wakeup_kids_hold_active

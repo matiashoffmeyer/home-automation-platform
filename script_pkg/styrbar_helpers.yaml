@@ -1,0 +1,789 @@
+# =============================================================================
+# script_pkg/styrbar_helpers.yaml — helper scripts for Styrbar button handling
+# =============================================================================
+# 6 scripts der kaldes af automations/styrbar_rooms.yaml (universal handler).
+#
+# CALLED-FROM:
+#   automations/styrbar_rooms.yaml::styrbar_universal_instant
+#     - L/R click  → script.styrbar_color_cycle
+#     - OP click   → script.styrbar_brightness_step (direction: up)
+#     - NED click  → script.styrbar_brightness_step (direction: down)
+#     - OP hold    → script.styrbar_snap_full + (after 2s) styrbar_reset_warm_white
+#     - NED hold   → script.styrbar_snap_off
+#   automations/styrbar_rooms.yaml::styrbar_universal_lr_hold
+#     - L/R hold   → loop med 80-color palette scroll (own logic, ikke via helper)
+#
+# CROSS-CUTTING REFS (⚠️ se docs/cross_cutting_map.md #1):
+#   - light.{{ room }}_all (light groups) — TARGETS for color_cycle, brightness_step,
+#     snap_full, snap_off, reset_warm_white. Templated ref MISSED af validators!
+#   - input_number.styrbar_color_idx_{room} — cursor for L/R color cycle (0-15)
+#   - input_select.room_mode_{room} — set til "Manual" af stamp_press (= triggers
+#     drift_back ceiling)
+#   - input_datetime.styrbar_last_press_{room} — sat af stamp_press (drift-back
+#     timer kalibrerer fra denne)
+#
+# 6 scripts:
+#   1. styrbar_stamp_press   — Helper: marker last-press + sæt rum til Manual.
+#                              Kaldes af alle andre helpers som sidste step.
+#   2. styrbar_color_cycle   — L/R click: avancere idx i 16-color palette.
+#                              Filter til color-capable lights kun (N1 fix audit-14).
+#   3. styrbar_brightness_step — OP/NED click: ladder-step mellem [0,5,10,20,...,100].
+#                              Time-aware: off+OP fyrer 50% (day) eller 10% (night).
+#   4. styrbar_snap_full     — OP hold ~1s: snap til 100% (preserve color).
+#   5. styrbar_snap_off      — NED hold: snap til off (preserve color).
+#   6. styrbar_reset_warm_white — OP hold ~3s: reset til warm 2700K (color reset).
+#
+# All scripts: mode: parallel max: 9 (= max 9 rum samtidig, dækker alle).
+# Hævet fra 7 → 9 den 2026-09-03d da spisestue+køkken fik egne room_modes.
+#
+# Splittet fra scripts.yaml 2026-05-05 (Phase 2.1 refactor).
+# =============================================================================
+
+styrbar_stamp_press:
+  alias: "Styrbar: stamp last_press + saet Manual mode"
+  description: >
+    Stamper last_press (drift-back timer) og sætter rummet i Manual.
+
+    set_manual: false: stamper KUN timeren uden at flippe rummet til Manual
+    (bruges af putning-flowet nedenfor).
+
+    PUTNING-GUARD (2026-06-12, user-spec): under putning er manuelle
+    lysjusteringer i børneværelset en DEL af auto-flowet (man hjælper auto med
+    at vide hvor langt putningen er) — de må ALDRIG flippe rummet til Manual.
+    Gælder uanset kilde (app via manual_override, Styrbar).
+  mode: parallel
+  max: 9
+  fields:
+    room:
+      description: "Room id"
+    set_manual:
+      description: "false = stamp kun timer, sæt IKKE Manual mode. Default true."
+      default: true
+    stamp:
+      description: >-
+        false = sæt KUN Manual mode, stampl IKKE last_press. Bruges når kilden
+        ikke er en finger i huset (app-overstyring udefra). Default true.
+      default: true
+  sequence:
+    # last_press er husets "en finger rørte noget INDENDØRS"-vidne: den fodrer
+    # sensor.last_physical_activity (3t Dormant-veto) og afvæbner wasp-udgangen.
+    # Et app-kald fra en telefon i byen er ikke en krop i huset — se
+    # automations/manual_override.yaml (2026-08-17).
+    - if:
+        - condition: template
+          value_template: "{{ stamp | default(true) }}"
+      then:
+        - service: input_datetime.set_datetime
+          target:
+            entity_id: "input_datetime.styrbar_last_press_{{ room }}"
+          data:
+            datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - condition: template
+      value_template: "{{ set_manual | default(true) }}"
+    # Putning-guard: boernevaerelse + putning-kontekst → aldrig Manual.
+    # Kontekst = godnat_boern aktiv ELLER descent kører ELLER putning-vinduet
+    # (binary_sensor.putning_vindue_aktivt: kids_home + efter 18:30 tunable +
+    # ikke vildt farve-leg — single source of truth, activity_state.yaml).
+    - condition: template
+      value_template: >-
+        {% if room != 'boernevaerelse' %}true
+        {% else %}
+          {{ not (is_state('input_boolean.godnat_boern_active', 'on')
+                  or is_state('input_boolean.puttelys_descent_active', 'on')
+                  or is_state('binary_sensor.putning_vindue_aktivt', 'on')) }}
+        {% endif %}
+    - service: input_select.select_option
+      target:
+        entity_id: "input_select.room_mode_{{ room }}"
+      data:
+        option: "Manual"
+
+styrbar_color_cycle:
+  alias: "Styrbar: cycle gennem 16 farver (bevar brightness)"
+  description: >
+    Avancerer styrbar_color_idx_{room} med +1 (right) eller -1 (left) (mod 16),
+    anvender den nye palette-entry paa rummets target lights. Brightness
+    preserveret fra nuvaerende state (default 80% hvis off). Stamper last_press.
+
+    direction: 'right' (default) = forward i palette
+               'left'           = backward i palette
+    L+R = tilbage til oprindelig farve (samme idx).
+
+    Palette: index 0 = warm peach, 1-15 = 15 hues spread evenly.
+  mode: parallel
+  max: 9
+  fields:
+    room:
+      description: "Room id"
+    direction:
+      description: "right (forward) eller left (backward). Default right."
+      example: right
+      default: right
+  variables:
+    # C1: target er rum-group fra packages/light_groups.yaml
+    targets: "light.{{ room }}_all"
+    probe: "{{ targets }}"  # C1: targets er nu en group, brugt som probe ogsaa
+    # N1 fix (audit-runde 14): filter til color-capable lights kun, undgaa at
+    # sende hs_color til color_temp-only bulbs der ignorerer det. Cursor
+    # tracker faktisk requested color saa stadig konsistent — men sparer
+    # spurious zha-commands til non-color devices.
+    color_targets: >-
+      {% set ns = namespace(t=[]) %}
+      {% for l in expand(targets) %}
+        {% set modes = l.attributes.supported_color_modes or [] %}
+        {% if 'hs' in modes or 'xy' in modes or 'rgb' in modes
+           or 'rgbw' in modes or 'rgbww' in modes %}
+          {% set ns.t = ns.t + [l.entity_id] %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.t }}
+    palette: >-
+      {{ [[25, 50],
+          [0, 100], [24, 100], [48, 100], [72, 100],
+          [96, 100], [120, 100], [144, 100], [168, 100],
+          [192, 100], [216, 100], [240, 100], [264, 100],
+          [288, 100], [312, 100], [336, 100]] }}
+    current_idx: "{{ states('input_number.styrbar_color_idx_' ~ room) | int(0) }}"
+    # Direction param: 'left' decrement, 'right' (default) increment.
+    # Python-modulo haandterer negative tal: -1 % 16 = 15.
+    delta: "{{ -1 if direction == 'left' else 1 }}"
+    next_idx: "{{ (current_idx + delta) % (palette | length) }}"
+    next_color: "{{ palette[next_idx] }}"
+    current_brightness_raw: "{{ state_attr(probe, 'brightness') }}"
+    target_brightness: >-
+      {% if current_brightness_raw %}
+        {{ (current_brightness_raw / 2.55) | round(0) | int }}
+      {% else %}
+        80
+      {% endif %}
+  sequence:
+    - service: input_number.set_value
+      target:
+        entity_id: "input_number.styrbar_color_idx_{{ room }}"
+      data:
+        value: "{{ next_idx }}"
+    # Skip helt hvis ingen color-capable lights i rummet
+    - condition: template
+      value_template: "{{ color_targets | length > 0 }}"
+    - service: light.turn_on
+      target:
+        entity_id: "{{ color_targets }}"
+      data:
+        hs_color: "{{ next_color }}"
+        brightness_pct: "{{ target_brightness }}"
+        transition: 0.5
+    - service: script.styrbar_stamp_press
+      data:
+        room: "{{ room }}"
+
+styrbar_brightness_step:
+  alias: "Styrbar: ladder-baseret brightness step (preserve color)"
+  description: >
+    Audit-runde 20 (2026-05-05): refactor fra brightness_step_pct delta til
+    ladder-baseret stepping. Tilfojer 5% trin nederst i Normal + AirBnB
+    ladders så bruger kan ramme nat-niveau direkte fra off.
+    Ladder pattern:
+      Normal:  [0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+      AirBnB:  [0, 5, 25, 50, 75, 100]
+    OP: hop til naeste vaerdi > current.
+    NED: hop til prev vaerdi < current. 0 = sluk lys.
+  mode: parallel
+  max: 9
+  fields:
+    room:
+      description: "Room id"
+    direction:
+      description: "'up' eller 'down'"
+      example: up
+    ladder:
+      description: "Liste af brightness pct (sorteret stigende, inkl. 0 for off)"
+      example: "[0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]"
+  variables:
+    targets: "light.{{ room }}_all"
+    # Current brightness pct (0 hvis off)
+    # 2026-09-09 (B122): HØJESTE niveau blandt de TÆNDTE medlemmer — ikke
+    # gruppens egen `brightness`, som er et gennemsnit over KUN de tændte
+    # (permanent faktum). En delvist tændt gruppe rapporterede derfor et
+    # niveau ingen lampe havde, og NED-trinnet blev regnet fra et tal der løj.
+    current_pct: >-
+      {% set ns = namespace(m=0) %}
+      {% for e in expand(targets) if e.state == 'on' %}
+        {% set b = (e.attributes.brightness | default(0)) | int(0) %}
+        {% if b > ns.m %}{% set ns.m = b %}{% endif %}
+      {% endfor %}
+      {% if ns.m == 0 and states(targets) == 'on' %}
+        {{ ((state_attr(targets, 'brightness') | float(0)) / 2.55) | round(0) | int }}
+      {% else %}
+        {{ (ns.m / 2.55) | round(0) | int }}
+      {% endif %}
+    # Find next ladder value baseret paa direction
+    # Audit-runde 20.2 (2026-05-05): off + OP er time-aware via sun.elevation:
+    #   - sun > 0° (day): 50% (komfortabelt dagsniveau)
+    #   - sun ≤ 0° (twilight + night): 10% (mørke-tilpasset, ikke for blendende)
+    # Brugt som manuel override når presence_lights ikke fanger context (fx
+    # person sidder stille uden motion-detection, eller AirBnB-mode).
+    # 5% nat-niveau stadig reachable via NED-chain (10 → 5 → off).
+    # 2026-08-19 (user-spec): i STUEN er det første korte OP-tryk fra alt-slukket
+    # ikke en dæmpning men et "tænd open-plan" — fast 70 % på hele gruppen
+    # (step_targets falder selv tilbage til gruppen når intet er tændt).
+    # AirBnB beholder den sol-bevidste værdi: en gæst der trykker op om natten
+    # skal ikke blændes af 70 %.
+    next_pct: >-
+      {% if direction == 'up' %}
+        {% if current_pct == 0 %}
+          {% if room == 'stue' and not is_state('input_select.house_mode', 'AirBnB') %}
+            70
+          {% else %}
+            {% set elev = state_attr('sun.sun', 'elevation') | float(0) %}
+            {{ 50 if elev > 0 else 10 }}
+          {% endif %}
+        {% else %}
+          {% set ns = namespace(found=ladder | max) %}
+          {% for val in ladder %}
+            {% if val > current_pct and ns.found_set is not defined %}
+              {% set ns.found = val %}
+              {% set ns.found_set = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.found }}
+        {% endif %}
+      {% else %}
+        {% set ns = namespace(found=0) %}
+        {% for val in ladder %}
+          {% if val < current_pct %}
+            {% set ns.found = val %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.found }}
+      {% endif %}
+    # 2026-06-12 (user-spec): i STUEN justerer OP/NED-klik kun de lamper der
+    # allerede er tændt — kort klik må ikke gen-tænde zoner brugeren netop
+    # har slukket via L/R zone-toggles. Undtagelse: ALT i open plan er
+    # slukket + OP → tænd hele gruppen (time-aware 50%/10%-niveau, uændret).
+    # Andre rum beholder gruppe-target (off+OP fra dørken er en feature dér).
+    # 2026-09-09 (B122): et NED-klik narrower nu i ALLE rum — og kun til de
+    # lamper der er LYSERE end trinnet. Et NED-tryk må aldrig tænde en slukket
+    # lampe eller løfte en der allerede er under målet (samme monotont
+    # krympende mønster som godnat_fuld). Målt 09-07 18:40:14: gæstens NED-tryk
+    # i badet TÆNDTE spot_4 + spot_5, fordi gruppe-targetet ramte alle fem.
+    # OP-adfærden er uændret: off + OP fra dørken er stadig en feature.
+    step_targets: >-
+      {% if direction == 'down' %}
+        {% set ns = namespace(t=[], on=[]) %}
+        {% for e in expand(targets) if e.state == 'on' %}
+          {% set ns.on = ns.on + [e.entity_id] %}
+          {% set p = ((((e.attributes.brightness | default(0)) | int(0)) / 2.55)
+                      | round(0) | int) %}
+          {% if p > (next_pct | int(0)) %}{% set ns.t = ns.t + [e.entity_id] %}{% endif %}
+        {% endfor %}
+        {{ ns.t if ns.t | length > 0 else (ns.on if ns.on | length > 0 else targets) }}
+      {% elif room == 'stue' %}
+        {% set on_lights = expand(targets) | selectattr('state', 'eq', 'on')
+                           | map(attribute='entity_id') | list %}
+        {{ on_lights if on_lights | length > 0 else targets }}
+      {% else %}
+        {{ targets }}
+      {% endif %}
+  sequence:
+    # PUTNING-TRAPPE (2026-06-12, user-spec hybrid): NED-klik på boern-
+    # Styrbaren i putning-vinduet = "vi er ét trin tættere på 1% natlys".
+    # Håndteres af script.putning_trappe_ned (lys slukker i rækkefølge →
+    # strip-trappe → bund = godnat_boern_active on). Normal ladder bruges
+    # ikke. Når godnat_boern allerede er on → normal adfærd (forælder
+    # slukker natlys manuelt). OP-klik i putte-kontekst = fase 1 (blok
+    # nedenfor, 2026-06-12); udenfor putte-kontekst normal ladder.
+    - if:
+        - condition: template
+          value_template: >-
+            {{ room == 'boernevaerelse' and direction == 'down'
+               and is_state('binary_sensor.putning_vindue_aktivt', 'on')
+               and is_state('input_boolean.godnat_boern_active', 'off') }}
+      then:
+        - service: script.putning_trappe_ned
+        - service: script.styrbar_stamp_press
+          data:
+            room: boernevaerelse
+            set_manual: false
+        - stop: "Putning-trappe håndterede NED-klik"
+    # PUTTE-FASE-1 OP (2026-06-12, user-spec): OP-klik på boern-Styrbaren i
+    # putte-kontekst = "tænd fase 1-scenen" (loft hvid 30% + strip lyserød
+    # 40% + plug) i stedet for normal ladder — manuel fallback hvis
+    # automations fejlede eller putningen sker på et skævt tidspunkt.
+    # Putte-kontekst = putning-vinduet aktivt ELLER rummet i nat-mode.
+    # I nat-mode GENÅBNER klikket putningen (clear godnat_boern_active +
+    # dræb evt. kørende descent) — flaget var fx sat for tidligt (incident
+    # 2026-06-12: bath-trigger låste rummet 18:49, OP gav kun ladder-lys).
+    # Gardinet forbliver lukket. Putningen afsluttes igen af de normale
+    # detektorer (descent/still/dim/trappe/natlys-bagkant).
+    # OP-hold (snap full) bevarer normal adfærd som escape til fuldt lys.
+    - if:
+        - condition: template
+          value_template: >-
+            {{ room == 'boernevaerelse' and direction == 'up'
+               and (is_state('binary_sensor.putning_vindue_aktivt', 'on')
+                    or is_state('input_boolean.godnat_boern_active', 'on')) }}
+      then:
+        - if:
+            - condition: state
+              entity_id: input_boolean.godnat_boern_active
+              state: "on"
+          then:
+            # Dræb evt. kørende descent-run (lange fades med delays) før
+            # genåbning — manuel styring vinder. Samme pattern som
+            # putning_trappe_ned's bund-trin.
+            - service: automation.turn_off
+              continue_on_error: true
+              data:
+                stop_actions: true
+              target:
+                entity_id: automation.puttelys_apollo_nedtrapning_fase_1_natlys_over_slider_tid
+            - service: automation.turn_on
+              continue_on_error: true
+              target:
+                entity_id: automation.puttelys_apollo_nedtrapning_fase_1_natlys_over_slider_tid
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.puttelys_descent_active
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.godnat_boern_active
+            - service: logbook.log
+              data:
+                name: "Putning genåbnet (Styrbar OP)"
+                message: >-
+                  OP-klik i nat-mode → godnat_boern_active cleared, fase 1
+                  tændes (gardin forbliver lukket).
+        - service: script.puttelys_phase1_apply
+        - service: script.styrbar_stamp_press
+          data:
+            room: boernevaerelse
+            set_manual: false
+        - stop: "Putte-fase-1 håndterede OP-klik"
+    - choose:
+        # next_pct = 0 -> sluk lys
+        - conditions:
+            - condition: template
+              value_template: "{{ next_pct | int == 0 }}"
+          sequence:
+            - choose:
+                # BOERN: trinvis sluk — én lampe per NED-klik i fast rækkefølge
+                # hyggeplug → loft → strip (helt mørkt). Per user 2026-06-04: de
+                # tre må IKKE slukke samtidig; hvert ekstra NED-klik (når man er
+                # i bunden) slukker den næste der stadig er tændt. NED-HOLD
+                # (styrbar_snap_off) slukker stadig alt på én gang som hurtig
+                # kill-switch. is_state==on springer allerede-slukkede over.
+                - conditions:
+                    - condition: template
+                      value_template: "{{ room == 'boernevaerelse' }}"
+                  sequence:
+                    - variables:
+                        next_off: >-
+                          {% set order = ['light.boernevaerelse_hyggelys', 'light.boernevaerelse_loft', 'light.boernevaerelse_hygge_strip'] %}
+                          {% set ns = namespace(pick='') %}
+                          {% for e in order %}{% if ns.pick == '' and is_state(e, 'on') %}{% set ns.pick = e %}{% endif %}{% endfor %}
+                          {{ ns.pick }}
+                    - if:
+                        - condition: template
+                          value_template: "{{ (next_off | trim) != '' }}"
+                      then:
+                        - service: light.turn_off
+                          target:
+                            entity_id: "{{ next_off | trim }}"
+                          data:
+                            transition: 0.3
+              # Alle andre rum: sluk hele gruppen som før
+              default:
+                - service: light.turn_off
+                  target:
+                    entity_id: "{{ targets }}"
+                  data:
+                    transition: 0.3
+      # Default: turn_on med ny brightness (stue: kun allerede-tændte lamper,
+      # se step_targets — fra alt-slukket dækker gruppe-fallbacken)
+      default:
+        - service: light.turn_on
+          target:
+            entity_id: "{{ step_targets }}"
+          data:
+            brightness_pct: "{{ next_pct | int }}"
+            transition: 0.3
+    # Et OP/NED- eller L/R-klik er en manuel justering → markér rummet Manual
+    # straks (stamp timer + set_manual). Det holder din værdi indtil drift-back
+    # returnerer rummet til Auto.
+    - service: script.styrbar_stamp_press
+      data:
+        room: "{{ room }}"
+        set_manual: true
+
+putning_trappe_ned:
+  alias: "Putning: trappe ét trin ned (Styrbar NED i putning-vindue)"
+  description: >
+    2026-06-12 (user-spec hybrid): hvert NED-klik på boern-Styrbaren i
+    putning-vinduet tolkes som "ok, vi er lidt tættere på 1% natlys".
+    Trin-rækkefølge (følger den user-godkendte off-rækkefølge fra
+    2026-06-04): hyggeplug af → loft af → strip 30% → 15% → 5% → BUND:
+    godnat_boern_active=on, hvorefter den kanoniske natlys-automation
+    (puttelys_natlys_strip) fader strippen til 1% blå-hvid og on_actions
+    lukker gardinet. En evt. kørende Apollo-nedtrapning stoppes ved bunden
+    (manuel styring vinder). Trinene er state-baserede — scriptet læser
+    FAKTISK lys-state, så det er robust uanset hvilken fase putningen er i.
+    2026-10-11: også måne-knappen på Lys-siden (spejl: putning_trappe_op).
+  mode: queued
+  max: 4
+  sequence:
+    # Kun i putte-kontekst (Styrbar-vejen gater selv; måne-knappen gør ikke).
+    - condition: template
+      value_template: >-
+        {{ states('input_select.house_mode') in ['Normal', 'Home Vacation']
+           and (is_state('binary_sensor.putning_vindue_aktivt', 'on')
+                or is_state('input_boolean.godnat_boern_active', 'on')
+                or is_state('input_boolean.puttelys_descent_active', 'on')) }}
+    - variables:
+        strip_pct: >-
+          {% if is_state('light.boernevaerelse_hygge_strip', 'on') %}
+            {{ ((state_attr('light.boernevaerelse_hygge_strip', 'brightness') | int(0)) / 2.55) | round(0) | int }}
+          {% else %}
+            0
+          {% endif %}
+        # Strip-trin under natlys-niveauet springes over (natlys 6 % 10-11:
+        # et 5 %-trin ville være MØRKERE end bunden).
+        natlys_pct: "{{ states('input_number.global_putte_natlys_brightness') | int(1) }}"
+    - choose:
+        # Trin 1: hyggeplug (non-dimmable) slukkes først
+        - conditions: "{{ is_state('light.boernevaerelse_hyggelys', 'on') }}"
+          sequence:
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_hyggelys
+        # Trin 2: loft
+        - conditions: "{{ is_state('light.boernevaerelse_loft', 'on') }}"
+          sequence:
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_loft
+              data:
+                transition: 1
+        # Trin 3-5: strip-trappe ned (40% fase-1 → 30 → 15 → 5)
+        - conditions: "{{ strip_pct | int > 30 }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_hygge_strip
+              data:
+                brightness_pct: 30
+                transition: 1
+        - conditions: "{{ strip_pct | int > 15 and 15 > natlys_pct | int }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_hygge_strip
+              data:
+                brightness_pct: 15
+                transition: 1
+        - conditions: "{{ strip_pct | int > 5 and 5 > natlys_pct | int }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_hygge_strip
+              data:
+                brightness_pct: 5
+                transition: 1
+      # BUND: konvergér med det kanoniske natlys-flow.
+      default:
+        # Stop evt. kørende Apollo-nedtrapning (lange fades med delays) —
+        # manuel styring vinder. turn_off med stop_actions dræber den
+        # kørende run; turn_on re-enabler til i morgen.
+        - service: automation.turn_off
+          continue_on_error: true
+          data:
+            stop_actions: true
+          target:
+            entity_id: automation.puttelys_apollo_nedtrapning_fase_1_natlys_over_slider_tid
+        - service: automation.turn_on
+          continue_on_error: true
+          target:
+            entity_id: automation.puttelys_apollo_nedtrapning_fase_1_natlys_over_slider_tid
+        # Descent-flag af FØR godnat-flip, så puttelys_natlys_strip's
+        # descent-gate er åben når flag-flippet trigger den.
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.puttelys_descent_active
+        # 2026-10-11: bunden er et eksplicit "natlys NU". Et aften-niveau-hold
+        # (user satte strippen i hånden tidligere) ville ellers vetoe natlyset
+        # i boern_natlys_set — målt 10-11: alt slukket + strip tændt igen 19:39
+        # → hold → natlyset kom aldrig. Natlyset sættes selv med kort fade FØR
+        # godnat-flippet, så knappen ses straks (natlys-automationens 180 s-fade
+        # mod samme mål bliver usynlig), og så den også virker når godnat
+        # allerede står on (ingen flanke → automationen fyrer ikke).
+        - if:
+            - condition: template
+              value_template: "{{ states('input_text.boern_aften_niveau_hold').startswith('hold') }}"
+          then:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.boern_aften_niveau_hold
+              data:
+                value: "off"
+        - service: script.boern_natlys_set
+          data:
+            transition: 2
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.godnat_boern_active
+        - service: logbook.log
+          data:
+            name: "Putning-trappe"
+            message: >-
+              NED/måne i bunden af trappen → natlys
+              ({{ natlys_pct }} %) + godnat_boern_active=on.
+
+# 2026-10-11 (user-spec: "en sol der omvendt skruer faserne en gang lysere
+# op"): sol-knappen på Lys-siden = putning_trappe_ned baglæns. Trin (læser
+# FAKTISK state): strip slukket/under natlys → natlys · strip → 15 → 30 % (farven
+# beholdes) → 40 % lyserød (fase 1-strippen) → loft 30 % putte-kelvin → plug.
+# Et tryk er manuel styring: en kørende nedtrapning dræbes, og står rummet i
+# nat-mode, genåbnes putningen (samme sekvens som Styrbar OP i putte-kontekst),
+# ellers ville nedtrapningen/natlyset køre trinnet ned igen. Manuel-sluk-låsen
+# og et aften-niveau-hold slippes — knappen ER den nye beslutning.
+putning_trappe_op:
+  alias: "Putning: trappe ét trin op (sol-knap)"
+  mode: queued
+  max: 4
+  sequence:
+    - condition: template
+      value_template: >-
+        {{ states('input_select.house_mode') in ['Normal', 'Home Vacation']
+           and (is_state('binary_sensor.putning_vindue_aktivt', 'on')
+                or is_state('input_boolean.godnat_boern_active', 'on')
+                or is_state('input_boolean.puttelys_descent_active', 'on')) }}
+    - variables:
+        strip_pct: >-
+          {% if is_state('light.boernevaerelse_hygge_strip', 'on') %}
+            {{ ((state_attr('light.boernevaerelse_hygge_strip', 'brightness') | int(0)) / 2.55) | round(0) | int }}
+          {% else %}
+            0
+          {% endif %}
+        natlys_pct: "{{ states('input_number.global_putte_natlys_brightness') | int(1) }}"
+    - if:
+        - condition: template
+          value_template: >-
+            {{ is_state('input_boolean.godnat_boern_active', 'on')
+               or is_state('input_boolean.puttelys_descent_active', 'on') }}
+      then:
+        - service: automation.turn_off
+          continue_on_error: true
+          data:
+            stop_actions: true
+          target:
+            entity_id: automation.puttelys_apollo_nedtrapning_fase_1_natlys_over_slider_tid
+        - service: automation.turn_on
+          continue_on_error: true
+          target:
+            entity_id: automation.puttelys_apollo_nedtrapning_fase_1_natlys_over_slider_tid
+        - service: input_boolean.turn_off
+          target:
+            entity_id:
+              - input_boolean.puttelys_descent_active
+              - input_boolean.godnat_boern_active
+    # Fredningen af strippen mod gradvis-sluk (strip_fredet) hviler på dette
+    # flag om aftenen, når godnat/descent ikke længere står on.
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.puttelys_phase1_fired
+    - if:
+        - condition: state
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+          state: "on"
+      then:
+        - service: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.boernevaerelse_manual_off_lock
+    - if:
+        - condition: template
+          value_template: "{{ states('input_text.boern_aften_niveau_hold').startswith('hold') }}"
+      then:
+        - service: input_text.set_value
+          target:
+            entity_id: input_text.boern_aften_niveau_hold
+          data:
+            value: "off"
+    - choose:
+        - conditions: "{{ strip_pct | int < natlys_pct | int }}"
+          sequence:
+            - service: script.boern_natlys_set
+              data:
+                transition: 2
+        - conditions: "{{ strip_pct | int < 15 }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_hygge_strip
+              data:
+                brightness_pct: 15
+                transition: 1
+        - conditions: "{{ strip_pct | int < 30 }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_hygge_strip
+              data:
+                brightness_pct: 30
+                transition: 1
+        # 40 % lyserød = fase 1-strippen (puttelys_phase1_apply).
+        - conditions: "{{ strip_pct | int < 39 }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_hygge_strip
+              data:
+                rgb_color: [255, 150, 200]
+                brightness_pct: 40
+                transition: 1
+        - conditions: "{{ not is_state('light.boernevaerelse_loft', 'on') }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_loft
+              data:
+                color_temp_kelvin: "{{ states('input_number.global_putte_loft_kelvin') | int(2700) }}"
+                brightness_pct: 30
+                transition: 2
+        - conditions: "{{ not is_state('light.boernevaerelse_hyggelys', 'on') }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: light.boernevaerelse_hyggelys
+    - service: logbook.log
+      data:
+        name: "Putning-trappe"
+        message: >-
+          Sol: ét trin op (strip var {{ strip_pct }} %, loft
+          {{ states('light.boernevaerelse_loft') }}, plug
+          {{ states('light.boernevaerelse_hyggelys') }}).
+
+styrbar_snap_full:
+  alias: "Styrbar: snap til 100% (instant fuldt taendt)"
+  mode: parallel
+  max: 9
+  fields:
+    room:
+      description: "Room id"
+  variables:
+    # C1: target er rum-group fra packages/light_groups.yaml
+    targets: "light.{{ room }}_all"
+  sequence:
+    - service: light.turn_on
+      target:
+        entity_id: "{{ targets }}"
+      data:
+        brightness_pct: 100
+        transition: 0.3
+    # 2026-08-19 (user-spec): OP-HOLD i stuen betyder "alt lys, fuldt op".
+    # Køkkenspottene er en SWITCH og dermed ikke medlem af light.stue_all —
+    # de skal tændes eksplicit. (De cykles ellers via L/R-kombinationen i
+    # styrbar_universal_instant.)
+    - if:
+        - condition: template
+          value_template: "{{ room == 'stue' }}"
+      then:
+        - service: switch.turn_on
+          continue_on_error: true
+          target:
+            entity_id: switch.koekken_spots
+    - service: script.styrbar_stamp_press
+      data:
+        room: "{{ room }}"
+
+styrbar_snap_off:
+  alias: "Styrbar: snap til off (instant slukket)"
+  mode: parallel
+  max: 9
+  fields:
+    room:
+      description: "Room id"
+  variables:
+    # C1: target er rum-group fra packages/light_groups.yaml
+    targets: "light.{{ room }}_all"
+  sequence:
+    - service: light.turn_off
+      target:
+        entity_id: "{{ targets }}"
+      data:
+        transition: 0.3
+    # Spejler snap_full: tænder OP-hold spottene, skal NED-hold kunne slukke dem
+    # igen — ellers efterlader "sluk alt i rummet" en tændt spotrække som kun
+    # godnat fanger (#12).
+    - if:
+        - condition: template
+          value_template: "{{ room == 'stue' }}"
+      then:
+        - service: switch.turn_off
+          continue_on_error: true
+          target:
+            entity_id: switch.koekken_spots
+    # 2026-10-06 (user-bug "styrbar ned slukkede ikke hyggeplug"): NED-hold i
+    # børneværelset er "sluk alt" (user-spec 2026-06-04, se den trinvise
+    # NED-klik-gren), men teddy-pluggen er IKKE medlem af boernevaerelse_all og
+    # følger kun strippens on→off-flanke (boernevaerelse_hyggelys_mirror).
+    # Tænder vækningen loft + plug uden strip, kommer flanken aldrig: målt
+    # 10-06 06:34:35, NED-hold slukkede loftet, pluggen brændte til 07:13.
+    - if:
+        - condition: template
+          value_template: "{{ room == 'boernevaerelse' }}"
+      then:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id: light.boernevaerelse_hyggelys
+    - service: script.styrbar_stamp_press
+      data:
+        room: "{{ room }}"
+
+styrbar_reset_warm_white:
+  alias: "Styrbar: dobbeltklik OP -> reset til warm hvid"
+  description: >
+    Saetter rummets targets til color_temp 370 mireds (warm hvid ~2700K)
+    paa nuvaerende brightness (eller 80% hvis off). Resetter color_idx
+    til 0 saa naeste L/R click starter forfra paa palette.
+  mode: parallel
+  max: 9
+  fields:
+    room:
+      description: "Room id"
+  variables:
+    # C1: target er rum-group fra packages/light_groups.yaml
+    targets: "light.{{ room }}_all"
+    probe: "{{ targets }}"  # C1: targets er nu en group, brugt som probe ogsaa
+    current_brightness_raw: "{{ state_attr(probe, 'brightness') }}"
+    target_brightness: >-
+      {% if current_brightness_raw %}
+        {{ (current_brightness_raw / 2.55) | round(0) | int }}
+      {% else %}
+        80
+      {% endif %}
+  sequence:
+    - service: light.turn_on
+      target:
+        entity_id: "{{ targets }}"
+      data:
+        color_temp_kelvin: 2700
+        brightness_pct: "{{ target_brightness }}"
+        transition: 0.5
+    - service: input_number.set_value
+      target:
+        entity_id: "input_number.styrbar_color_idx_{{ room }}"
+      data:
+        value: 0
+    - service: script.styrbar_stamp_press
+      data:
+        room: "{{ room }}"

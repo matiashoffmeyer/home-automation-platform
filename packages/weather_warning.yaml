@@ -1,0 +1,363 @@
+# =============================================================================
+# Vejr-varsel i dag — INTELLIGENT single-source brain for alle vejrvarsler
+# =============================================================================
+# User-spec 2026-06-07 (v2, "gør det mere intelligent"):
+#   - TIMEVIS forecast (ikke dagligt) → fanger intraday-regn dagstallet runder væk.
+#   - UV SKYDÆKKE-JUSTERET: met.no's uv_index er KLAR-HIMMEL UV (ignorerer skyer).
+#     Effektiv UV = klar-himmel-UV × skyfaktor pr. time, max over dagens timer:
+#       skydække <50% → ×0.95 · 50–90% → ×0.70 · >90% → ×0.30
+#     Varsl kun hvis max effektiv UV ≥4 (overskyede dage → intet UV-varsel).
+#   - REGN: ≥2mm timesum ELLER (våd-symbol: rain/pouring/lightning-rainy/lightning/
+#     snowy-rainy/hail) MED ≥25% byge-sandsynlighed. Fanger "ser regnfuldt ud"-dage
+#     selv ved 0mm (fx tordenbyger).
+#   - VIND: hourly max gust ≥50 ELLER middel ≥36 km/h.
+#   - SNE: 'snow' i en times condition.
+#
+# DENNE SENSOR ER SINGLE SOURCE OF TRUTH. Lys-blink (rain_warning.yaml's
+# vejr_morgen_*), Apollo-blå (regn_advarsel_apollo_rgb_on) og 06:30-push læser
+# is_rain/is_snow/is_wind/is_uv/rain_blinks herfra — ÉN definition, ingen drift.
+#
+# Opdaterer: HA-start, kl HH:25 + HH:55 (5 min før blink-automationernes /30 +
+# før 06:05 Apollo + 06:30 push), samt straks ved template.reload.
+#
+# TÆRSKEL-SLIDERE (2026-07-05, user-spec): de 5 numeriske trigger-tærskler er nu
+# bruger-tunbare (input_number nedenfor). DELT mellem i_dag + i_nat (single
+# definition, ingen drift — samme intent som resten af filen). Sensorerne er
+# trigger-baserede → jeg tilføjede slider-state-triggers så de re-renderer straks
+# ved justering (live-preview; weather.get_forecasts læser HA's cache, billigt).
+# Sne = condition-baseret (ingen magnitude) → ingen tærskel; mut via ingen slider.
+# =============================================================================
+
+input_number:
+  # Regn: mm-timesum (met.no + DMI) ELLER våd-symbol + byge-%. Default 2 mm / 25%.
+  vejr_regn_mm_threshold:
+    name: "Vejr: regn mm-tærskel"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 20
+    step: 0.5
+    unit_of_measurement: "mm"
+    mode: slider
+  vejr_regn_prob_threshold:
+    name: "Vejr: regn byge-sandsynlighed"
+    icon: mdi:weather-partly-rainy
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+  # Vind: hourly max gust ELLER middel. Default gust 50 / middel 36 km/h.
+  vejr_vind_gust_threshold:
+    name: "Vejr: vind gust-tærskel"
+    icon: mdi:weather-windy
+    min: 20
+    max: 120
+    step: 1
+    unit_of_measurement: "km/h"
+    mode: slider
+  vejr_vind_middel_threshold:
+    name: "Vejr: vind middel-tærskel"
+    icon: mdi:weather-windy-variant
+    min: 10
+    max: 100
+    step: 1
+    unit_of_measurement: "km/h"
+    mode: slider
+  # UV: skydække-justeret effektiv UV (klar-himmel × skyfaktor). Default 4.
+  vejr_uv_threshold:
+    name: "Vejr: UV-tærskel (effektiv)"
+    icon: mdi:weather-sunny-alert
+    min: 0
+    max: 11
+    step: 0.5
+    mode: slider
+
+template:
+  - trigger:
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: 25
+      - platform: time_pattern
+        minutes: 55
+      - platform: event
+        event_type: event_template_reloaded
+      # Live-preview: re-render straks når en tærskel-slider justeres.
+      - platform: state
+        entity_id:
+          - input_number.vejr_regn_mm_threshold
+          - input_number.vejr_regn_prob_threshold
+          - input_number.vejr_vind_gust_threshold
+          - input_number.vejr_vind_middel_threshold
+          - input_number.vejr_uv_threshold
+    action:
+      - service: weather.get_forecasts
+        data:
+          type: hourly
+        target:
+          entity_id: weather.forecast_home
+        response_variable: fc
+      # Aggregér dagens timer til ét dict (namespace-loop). parse_result gør
+      # output-literalet til en rigtig dict så agg.precip osv. virker nedenfor.
+      - variables:
+          agg: >-
+            {% set hrs = fc.get('weather.forecast_home', {}).get('forecast', []) %}
+            {% set today = now().strftime('%Y-%m-%d') %}
+            {% set ns = namespace(precip=0, pprob=0, wmean=0, wgust=0,
+                                  uveff=0, uvcs=0, wet=false, snow=false,
+                                  thunder=false, mincloud=100) %}
+            {% for h in hrs if (h.datetime | string)[:10] == today %}
+              {% set ns.precip = ns.precip + (h.precipitation | float(0)) %}
+              {% set ns.pprob = [ns.pprob, h.precipitation_probability | float(0)] | max %}
+              {% set ns.wmean = [ns.wmean, h.wind_speed | float(0)] | max %}
+              {% set ns.wgust = [ns.wgust, h.wind_gust_speed | float(0)] | max %}
+              {% set cc = h.cloud_coverage | float(100) %}
+              {% set ns.mincloud = [ns.mincloud, cc] | min %}
+              {% set f = 0.95 if cc < 50 else (0.70 if cc <= 90 else 0.30) %}
+              {% set ns.uveff = [ns.uveff, (h.uv_index | float(0)) * f] | max %}
+              {% set ns.uvcs = [ns.uvcs, h.uv_index | float(0)] | max %}
+              {% set c = h.condition | string %}
+              {% if c in ['rainy','pouring','lightning-rainy','lightning','snowy-rainy','hail'] %}
+                {% set ns.wet = true %}
+              {% endif %}
+              {% if c in ['lightning-rainy','lightning'] %}{% set ns.thunder = true %}{% endif %}
+              {% if 'snow' in c %}{% set ns.snow = true %}{% endif %}
+            {% endfor %}
+            {{ {'precip': ns.precip | round(2),
+                'pprob': ns.pprob | round(0) | int,
+                'wmean': ns.wmean | round(0) | int,
+                'wgust': ns.wgust | round(0) | int,
+                'uveff': ns.uveff | round(1),
+                'uvcs': ns.uvcs | round(1),
+                'wet': ns.wet, 'snow': ns.snow, 'thunder': ns.thunder,
+                'mincloud': ns.mincloud | round(0) | int} }}
+      # B34 (2026-06-11): DMI HARMONIE som anden regn-kilde — varsl hvis BARE
+      # ÉN kilde ser regn. packages/dmi_weather.yaml. Unavailable/none → 0
+      # (= met.no alene, graceful fallback).
+      - variables:
+          # Bruger-tunbare tærskler (2026-07-05). float-default = de gamle
+          # hardcodede værdier (graceful ved unavailable slider).
+          rain_mm_thr: "{{ states('input_number.vejr_regn_mm_threshold') | float(2) }}"
+          rain_prob_thr: "{{ states('input_number.vejr_regn_prob_threshold') | float(25) }}"
+          wind_gust_thr: "{{ states('input_number.vejr_vind_gust_threshold') | float(50) }}"
+          wind_mean_thr: "{{ states('input_number.vejr_vind_middel_threshold') | float(36) }}"
+          uv_thr: "{{ states('input_number.vejr_uv_threshold') | float(4) }}"
+          dmi_today: >-
+            {% set v = state_attr('sensor.dmi_regn_forecast', 'mm_today') %}
+            {{ v | float(0) if v is not none and v | float(-1) >= 0 else 0 }}
+          metno_rain: "{{ agg.precip >= rain_mm_thr or (agg.wet and agg.pprob >= rain_prob_thr) }}"
+          dmi_rain: "{{ dmi_today >= rain_mm_thr }}"
+          is_rain: "{{ metno_rain or dmi_rain }}"
+          is_snow: "{{ agg.snow }}"
+          is_wind: "{{ agg.wgust >= wind_gust_thr or agg.wmean >= wind_mean_thr }}"
+          is_uv: "{{ agg.uveff >= uv_thr }}"
+          # Antal blå blink = slider (normal) + auto-boost +3 ved kraftig regn
+          # (≥10mm). 2026-07-03: slider input_number.alert_regn_blinks (default 2)
+          # erstatter det hardcodede normal-tal; boost-adfærden (2→5) bevaret.
+          rain_blinks: >-
+            {% set base = states('input_number.alert_regn_blinks') | int(2) %}
+            {{ base + 3 if ([agg.precip, dmi_today] | max) >= 10 else base }}
+    sensor:
+      - name: "Vejr-varsel i dag"
+        unique_id: vejr_varsel_i_dag
+        icon: >-
+          {% if is_rain %}mdi:weather-pouring
+          {% elif is_snow %}mdi:weather-snowy-heavy
+          {% elif is_wind %}mdi:weather-windy
+          {% elif is_uv %}mdi:weather-sunny-alert
+          {% else %}mdi:weather-partly-cloudy{% endif %}
+        state: >-
+          {% set p = [] %}
+          {% if is_rain %}{% set p = p + ['Regn'] %}{% endif %}
+          {% if is_snow %}{% set p = p + ['Sne'] %}{% endif %}
+          {% if is_wind %}{% set p = p + ['Vind'] %}{% endif %}
+          {% if is_uv %}{% set p = p + ['UV'] %}{% endif %}
+          {{ p | join(' + ') if p else 'Ingen' }}
+        attributes:
+          # 2026-10-20: teksten er PUSHENS brødtekst (06:30 + sen-dag) og
+          # Status-sidens "Hvorfor" → kun hvad vejret gør og hvad man skal gøre.
+          # Blink-sproget ("4× blå blink + Apollo blå sove/bad") og tærsklerne
+          # ("gust 53 km/h (≥53.0)") var til os; tærsklerne står på Status-siden.
+          # Viser den STØRSTE mm af met.no og DMI; "(kun DMI)" når met.no intet
+          # ser — så kan man selv veje varslet.
+          forklaring: >-
+            {% from 'tekst.jinja' import tal %}
+            {% set msg = [] %}
+            {% if is_rain %}
+              {% set mm = [agg.precip, dmi_today] | max %}
+              {% if mm >= rain_mm_thr %}
+                {% set why = ('Kraftig regn' if mm >= 10 else 'Regn')
+                             ~ (' og torden' if agg.thunder else '')
+                             ~ ', ca. ' ~ tal(mm) ~ ' mm'
+                             ~ (' (kun DMI)' if not metno_rain else '') %}
+              {% else %}
+                {% set why = ('Tordenbyger' if agg.thunder else 'Byger')
+                             ~ ', ' ~ agg.pprob ~ ' % risiko' %}
+              {% endif %}
+              {% set msg = msg + ['☔ ' ~ why ~ ' — tag regntøj med.'] %}
+            {% endif %}
+            {% if is_snow %}
+              {% set msg = msg + ['❄️ Sne i dag — pas på glat føre.'] %}
+            {% endif %}
+            {% if is_wind %}
+              {% set msg = msg + ['💨 Vindstød op til ' ~ agg.wgust ~ ' km/t (middel '
+                                  ~ agg.wmean ~ ') — fortøj løse ting på terrassen.'] %}
+            {% endif %}
+            {% if is_uv %}
+              {% set msg = msg + ['🟠 UV-indeks op til ' ~ tal(agg.uveff) ~ ' — solcreme på.'] %}
+            {% endif %}
+            {% if msg | length == 0 %}
+              {% set msg = ['Intet varsel i dag: regn ' ~ tal(agg.precip) ~ ' mm ('
+                            ~ agg.pprob ~ ' %), vindstød ' ~ agg.wgust ~ ' km/t, UV '
+                            ~ tal(agg.uveff) ~ '.'] %}
+            {% endif %}
+            {{ msg | join('\n') }}
+          precip_mm: "{{ agg.precip }}"
+          dmi_mm_today: "{{ dmi_today }}"
+          rain_source: >-
+            {{ 'met.no+DMI' if metno_rain and dmi_rain
+               else ('DMI' if dmi_rain else ('met.no' if metno_rain else 'ingen')) }}
+          precip_prob_pct: "{{ agg.pprob }}"
+          wind_mean_kmh: "{{ agg.wmean }}"
+          wind_gust_kmh: "{{ agg.wgust }}"
+          uv_effective: "{{ agg.uveff }}"
+          uv_clearsky: "{{ agg.uvcs }}"
+          min_cloud_pct: "{{ agg.mincloud }}"
+          thunder: "{{ agg.thunder }}"
+          is_rain: "{{ is_rain }}"
+          is_snow: "{{ is_snow }}"
+          is_wind: "{{ is_wind }}"
+          is_uv: "{{ is_uv }}"
+          rain_blinks: "{{ rain_blinks }}"
+          any_warning: "{{ is_rain or is_snow or is_wind or is_uv }}"
+
+  # ===========================================================================
+  # Vejr-varsel i nat — aften-brain for nattens vejr (user-spec 2026-06-10)
+  # ===========================================================================
+  # KUN regn + vind (ingen UV/sne — natten handler om terrasse-nedlukning:
+  # "skal terrassen lukkes ned og gøres klar til vildt/vådt vejr?").
+  # Vindue: i dag 16:00 → i morgen 09:00 (dækker aften + hele natten).
+  # Samme tærskler som dag-sensoren (≥2mm sum / våd+≥25%, gust ≥50 / middel ≥36).
+  # Opdateres HH:25 + HH:55 (som i_dag) → altid <30 min frisk. Aften-fyringerne
+  # er nu bruger-styrede klokkeslæt (input_datetime.varsel_aften_1/2/3) → derfor
+  # periodisk /30 opdatering i st.f. faste pre-warms bundet til 16:30/17:00/18:30.
+  # ===========================================================================
+  - trigger:
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: 25
+      - platform: time_pattern
+        minutes: 55
+      - platform: event
+        event_type: event_template_reloaded
+      # Live-preview: kun regn+vind-tærskler (natten bruger ikke UV/sne).
+      - platform: state
+        entity_id:
+          - input_number.vejr_regn_mm_threshold
+          - input_number.vejr_regn_prob_threshold
+          - input_number.vejr_vind_gust_threshold
+          - input_number.vejr_vind_middel_threshold
+    action:
+      - service: weather.get_forecasts
+        data:
+          type: hourly
+        target:
+          entity_id: weather.forecast_home
+        response_variable: fc
+      - variables:
+          agg: >-
+            {% set hrs = fc.get('weather.forecast_home', {}).get('forecast', []) %}
+            {% set t0 = as_timestamp(today_at('16:00')) %}
+            {# timedelta, ikke +86400: DST-natten har 25/23 t (H1) #}
+            {% set t1 = as_timestamp(today_at('09:00') + timedelta(days=1)) %}
+            {% set ns = namespace(precip=0, pprob=0, wmean=0, wgust=0,
+                                  wet=false, thunder=false) %}
+            {% for h in hrs %}
+              {% set ts = as_timestamp(h.datetime) %}
+              {% if ts >= t0 and ts < t1 %}
+                {% set ns.precip = ns.precip + (h.precipitation | float(0)) %}
+                {% set ns.pprob = [ns.pprob, h.precipitation_probability | float(0)] | max %}
+                {% set ns.wmean = [ns.wmean, h.wind_speed | float(0)] | max %}
+                {% set ns.wgust = [ns.wgust, h.wind_gust_speed | float(0)] | max %}
+                {% set c = h.condition | string %}
+                {% if c in ['rainy','pouring','lightning-rainy','lightning','snowy-rainy','hail'] %}
+                  {% set ns.wet = true %}
+                {% endif %}
+                {% if c in ['lightning-rainy','lightning'] %}{% set ns.thunder = true %}{% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ {'precip': ns.precip | round(2),
+                'pprob': ns.pprob | round(0) | int,
+                'wmean': ns.wmean | round(0) | int,
+                'wgust': ns.wgust | round(0) | int,
+                'wet': ns.wet, 'thunder': ns.thunder} }}
+      # B34: DMI som anden kilde — samme vindue (16:00 → 09:00) via mm_tonight.
+      - variables:
+          # Samme bruger-tunbare tærskler som i_dag (delt definition, ingen drift).
+          rain_mm_thr: "{{ states('input_number.vejr_regn_mm_threshold') | float(2) }}"
+          rain_prob_thr: "{{ states('input_number.vejr_regn_prob_threshold') | float(25) }}"
+          wind_gust_thr: "{{ states('input_number.vejr_vind_gust_threshold') | float(50) }}"
+          wind_mean_thr: "{{ states('input_number.vejr_vind_middel_threshold') | float(36) }}"
+          dmi_tonight: >-
+            {% set v = state_attr('sensor.dmi_regn_forecast', 'mm_tonight') %}
+            {{ v | float(0) if v is not none and v | float(-1) >= 0 else 0 }}
+          metno_rain: "{{ agg.precip >= rain_mm_thr or (agg.wet and agg.pprob >= rain_prob_thr) }}"
+          dmi_rain: "{{ dmi_tonight >= rain_mm_thr }}"
+          is_rain: "{{ metno_rain or dmi_rain }}"
+          is_wind: "{{ agg.wgust >= wind_gust_thr or agg.wmean >= wind_mean_thr }}"
+          # Samme slider + auto-boost som i_dag, på nattens nedbør (2026-07-03).
+          rain_blinks: >-
+            {% set base = states('input_number.alert_regn_blinks') | int(2) %}
+            {{ base + 3 if ([agg.precip, dmi_tonight] | max) >= 10 else base }}
+    sensor:
+      - name: "Vejr-varsel i nat"
+        unique_id: vejr_varsel_i_nat
+        icon: >-
+          {% if is_rain %}mdi:weather-night-partly-cloudy
+          {% elif is_wind %}mdi:weather-windy
+          {% else %}mdi:weather-night{% endif %}
+        state: >-
+          {% set p = [] %}
+          {% if is_rain %}{% set p = p + ['Regn'] %}{% endif %}
+          {% if is_wind %}{% set p = p + ['Vind'] %}{% endif %}
+          {{ p | join(' + ') if p else 'Ingen' }}
+        attributes:
+          # 2026-10-20: samme sprog som i_dag. Regn-linjen nævner hynder og
+          # madrasser EKSPLICIT — dug-pushen kl. 19 springer regn-aftener over
+          # når denne push allerede har sagt det (packages/dug_varsel.yaml).
+          forklaring: >-
+            {% from 'tekst.jinja' import tal %}
+            {% set msg = [] %}
+            {% if is_rain %}
+              {% set mm = [agg.precip, dmi_tonight] | max %}
+              {% if mm >= rain_mm_thr %}
+                {% set why = ('Kraftig regn' if mm >= 10 else 'Regn')
+                             ~ (' og torden' if agg.thunder else '')
+                             ~ ' i nat, ca. ' ~ tal(mm) ~ ' mm'
+                             ~ (' (kun DMI)' if not metno_rain else '') %}
+              {% else %}
+                {% set why = ('Tordenbyger' if agg.thunder else 'Byger')
+                             ~ ' i nat, ' ~ agg.pprob ~ ' % risiko' %}
+              {% endif %}
+              {% set msg = msg + ['☔ ' ~ why ~ ' — tag hynder og madrasser ind og luk terrassen.'] %}
+            {% endif %}
+            {% if is_wind %}
+              {% set msg = msg + ['💨 Vindstød op til ' ~ agg.wgust ~ ' km/t i nat (middel '
+                                  ~ agg.wmean ~ ') — fortøj eller tag løse ting ind.'] %}
+            {% endif %}
+            {{ msg | join('\n') if msg else 'Rolig nat: regn ' ~ tal(agg.precip) ~ ' mm ('
+               ~ agg.pprob ~ ' %), vindstød ' ~ agg.wgust ~ ' km/t.' }}
+          precip_mm: "{{ agg.precip }}"
+          dmi_mm_tonight: "{{ dmi_tonight }}"
+          rain_source: >-
+            {{ 'met.no+DMI' if metno_rain and dmi_rain
+               else ('DMI' if dmi_rain else ('met.no' if metno_rain else 'ingen')) }}
+          precip_prob_pct: "{{ agg.pprob }}"
+          wind_mean_kmh: "{{ agg.wmean }}"
+          wind_gust_kmh: "{{ agg.wgust }}"
+          thunder: "{{ agg.thunder }}"
+          is_rain: "{{ is_rain }}"
+          is_wind: "{{ is_wind }}"
+          rain_blinks: "{{ rain_blinks }}"
+          any_warning: "{{ is_rain or is_wind }}"

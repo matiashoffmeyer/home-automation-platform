@@ -1,0 +1,715 @@
+# =============================================================================
+# Terrasse Plug — controller + Styrbar + dusk-rytme
+# =============================================================================
+# switch.terrasse_plug = udeområdets ENESTE strøm-udtag (pærelyskæde får strøm
+# GENNEM pluggen + luftpumpe/redskaber). light.terrasse_paerelyskaede er
+# downstream → "unavailable" når pluggen er off.
+#
+# MODEL (user-spec 2026-06-22):
+#   Pluggen er ALTID ON. Eneste OFF: huset Dormant, det regner NU, eller
+#   vinter-kill-switch (terrace_presence_enabled off). Ingen manuel-override
+#   længere — pluggen er en ren funktion af de tre gates (user valgte
+#   "regn/Dormant blokerer" → Styrbar OP tænder IKKE pluggen i de tilfælde).
+#
+#   Pærelyskæden har sin egen rytme: dusk-auto-on + Styrbar. Den tænder ALDRIG
+#   når solen er oppe (kan ikke ses) — gated på input_number.terrasse_lys_sol_
+#   max_elevation (Styrbar) / -4° (dusk).
+#
+# AUTOMATIONS:
+#   A) controller       — håndhæver plug-tilstand (altid on undtagen gates)
+#   B) Styrbar top/bund — styrer KUN pærelyskæden (standard-ladder + sol-regel)
+#   C) dusk auto-on     — tænder pærelyskæden ved dusk til godnat
+#   D/E/F) regn-hold    — manuel plug-sluk holdes til regnen er forbi
+#   G) nat-auto-sluk    — kæden slukkes fra nat-sluk-tid (open-plan-ro-krav);
+#                         dækker AirBnB (ingen godnat) + glemt godnat i Normal
+#   H/I) nat-manuel-hold — manuel tænd i nat-vinduet vinder resten af natten
+#   Morgenlys (mørkt + open plan, 20 %) → packages/terrasse_morgenlys.yaml
+#
+# Helpers (packages/terrasse_plug.yaml): binary_sensor.terrasse_regn_aktiv,
+# input_number.terrasse_skumring_elevation (dusk-gaten), script.terrasse_paerelys_til,
+# input_datetime.terrasse_styrbar_last_cmd (debounce).
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# A) Controller — plug ALTID on undtagen Dormant / regn / kill-switch
+# ----------------------------------------------------------------------------
+- id: terrasse_plug_controller
+  alias: "Terrasse Plug: power controller (altid ON undtagen Dormant/regn)"
+  description: >
+    Single source of truth for plug-tilstand. ON medmindre huset er Dormant,
+    det regner nu, eller vinter-kill-switch er off. Idempotent.
+  mode: restart
+  trigger:
+    - platform: homeassistant
+      event: start
+    - platform: state
+      entity_id:
+        - input_select.house_state
+        - binary_sensor.terrasse_regn_aktiv
+        - input_boolean.terrace_presence_enabled
+        - input_boolean.terrasse_plug_manual_off_hold
+        - input_datetime.terrasse_force_on_until
+    - platform: time_pattern
+      minutes: "/15"
+  action:
+    - variables:
+        # Fail-safe: regn-sensor unknown ⇒ ikke 'on' ⇒ pluggen forbliver PÅ
+        # (regn er undtagelsen). Dormant + kill-switch er hårde off-gates.
+        # manuel sluk-hold (user slukkede selv under regn) = blød off-gate der
+        # holder pluggen slukket indtil regnen sikkert er forbi (se automation D/E/F).
+        desired_on: >-
+          {{ is_state('input_boolean.terrace_presence_enabled', 'on')
+             and not is_state('input_select.house_state', 'Dormant')
+             and not is_state('binary_sensor.terrasse_regn_aktiv', 'on')
+             and not is_state('input_boolean.terrasse_plug_manual_off_hold', 'on') }}
+        # Styrbar-OP force-on (user-spec 2026-08-23): et tryk skal tænde plug +
+        # kæde LIGE MEGET HVAD → controlleren må ikke slukke igen mens stemplet
+        # løber. Urørt input_datetime står på DAGENS midnat → tidsdel-guard.
+        # ÉT `{{ }}`-udtryk: en foldet {% if %}-blok returnerer strengen "false",
+        # som er truthy i `not force_on` → BEGGE choose-grene blev falske og
+        # controlleren var en no-op (plug frøs 3 døgn). `and` short-circuiter,
+        # så strptime aldrig ser en usat værdi.
+        force_on: >-
+          {% set u = states('input_datetime.terrasse_force_on_until') %}
+          {{ u not in ['unknown','unavailable','none','']
+             and u[11:] != '00:00:00'
+             and strptime(u, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo) > now() }}
+    - choose:
+        - conditions:
+            - "{{ desired_on or force_on }}"
+            - condition: state
+              entity_id: switch.terrasse_plug
+              state: "off"
+          sequence:
+            - service: switch.turn_on
+              target:
+                entity_id: switch.terrasse_plug
+        - conditions:
+            - "{{ not desired_on and not force_on }}"
+            - condition: state
+              entity_id: switch.terrasse_plug
+              state: "on"
+          sequence:
+            # Sluk pærelyskæden pænt (fade FÆRDIG) før strømmen ryger, så den
+            # ikke bliver hård-killed midt i en fade. delay ≈ transition: uden
+            # den returnerer light.turn_off straks og switch.turn_off kapper
+            # strømmen midt i faden (fejlklasse #3: kommentar lovede fade uden
+            # at levere).
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: light.terrasse_paerelyskaede
+              data:
+                transition: 2
+            - delay: "00:00:02"
+            - service: switch.turn_off
+              target:
+                entity_id: switch.terrasse_plug
+
+# ----------------------------------------------------------------------------
+# B) Terrasse Styrbar — top/bund (kort+langt)
+# ----------------------------------------------------------------------------
+# Pluggen ejes normalt af controlleren (A), men et TOP-tryk overtrumfer den:
+# user-spec 2026-08-23 "styrbar terasse skal tænde både plug og terasselys lige
+# meget hvad". Tændingen går gennem script.terrasse_force_on, som slipper
+# manual-off-holdet og sætter input_datetime.terrasse_force_on_until (3 t) så
+# A ikke slukker igen. L/R-pilene er bevidst no-op (guard i styrbar_rooms.yaml).
+#
+#   TOP kort 'on'  + lys SLUKKET  → force-on: plug + kæde på sol-tilpasset
+#                                   styrke, uanset regn/Dormant/sol/hold
+#   TOP kort 'on'  + lys TÆNDT    → skru OP ét trin (standard-ladder)
+#   BUND kort 'off' + lys TÆNDT   → skru NED ét trin (0 = sluk)
+#   BUND kort 'off' + lys slukket → no-op
+#   TOP langt 'move_with_on_off'  → force-on på 100 % (samme, uden gates)
+#   BUND langt 'move'             → sluk KUN pærelyskæden (pluggen bliver på!)
+- id: styrbar_terrasse_plug
+  alias: "Styrbar Terrasse: top/bund styrer pærelyskæde"
+  mode: queued
+  max: 5
+  trigger:
+    - platform: event
+      event_type: zha_event
+      event_data:
+        device_ieee: "f7:11:9c:56:41:50:32:6b"
+  condition:
+    - condition: template
+      value_template: >
+        {{ trigger.event.data.command in ['on', 'off', 'move', 'move_with_on_off'] }}
+  action:
+    - variables:
+        cmd: "{{ trigger.event.data.command }}"
+        bulb: light.terrasse_paerelyskaede
+        bulb_on: "{{ is_state('light.terrasse_paerelyskaede', 'on') }}"
+        # 2026-08-23: OP er IKKE længere gatet på regn/Dormant/kill-switch eller
+        # sol — user-spec "tænd lige meget hvad". Gatene lever kun i controller
+        # (A) og dusk-auto-on (C), som stadig ejer den automatiske rytme.
+        # Standard Styrbar-ladder (samme intervaller som alle andre rum,
+        # script_pkg/styrbar_helpers.yaml::styrbar_brightness_step).
+        ladder: "{{ [0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100] }}"
+        cur_pct: >-
+          {% set b = state_attr('light.terrasse_paerelyskaede', 'brightness') %}
+          {% if is_state('light.terrasse_paerelyskaede', 'on') and b is not none %}
+            {{ (b / 2.55) | round(0) | int }}
+          {% else %}0{% endif %}
+        since_last: >-
+          {% set lp = states('input_datetime.terrasse_styrbar_last_cmd') %}
+          {% if lp in ['unknown','unavailable','none',''] %}999
+          {% else %}{{ (now() - strptime(lp,'%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() }}{% endif %}
+        # Min-gap KUN mod ZHA dobbelt-fire (sub-300ms). Korte klik (on/off) =
+        # 0.5s; lange hold (move/move_with_on_off) er bevidste enkelt-fires →
+        # ingen gap, så en sluk-/100%-gestus lige efter et klik ALDRIG droppes.
+        # (Den gamle 5s plug-relæ-beskyttelse er irrelevant nu — Styrbar rører
+        # ikke længere pluggen; værst tænkelige spam = bulb-flicker, ikke relæ-
+        # slid. En reelt defekt fjernbetjening skal stadig udskiftes.)
+        debounce_gap: "{{ 0 if cmd in ['move', 'move_with_on_off'] else 0.5 }}"
+    # DEBOUNCE — stempl KUN når en kommando accepteres (efter stoppet), så
+    # vinduet måles fra sidste HÅNDTEREDE kommando (ikke sticky på droppede).
+    - if:
+        - "{{ since_last | float(999) < debounce_gap | float(0.5) }}"
+      then:
+        - stop: "Debounce — terrasse Styrbar for tæt på forrige (anti dobbelt-fire)"
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.terrasse_styrbar_last_cmd
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - choose:
+        # ---- TOP kort klik mens lys TÆNDT → skru OP (standard-ladder) ----
+        - conditions: "{{ cmd == 'on' and bulb_on }}"
+          sequence:
+            - variables:
+                next_pct: >-
+                  {% set ns = namespace(found=ladder | max) %}
+                  {% for val in ladder %}
+                    {% if val > cur_pct | int and ns.found_set is not defined %}
+                      {% set ns.found = val %}
+                      {% set ns.found_set = true %}
+                    {% endif %}
+                  {% endfor %}
+                  {{ ns.found }}
+            - service: light.turn_on
+              target:
+                entity_id: "{{ bulb }}"
+              data:
+                brightness_pct: "{{ next_pct | int }}"
+                transition: 0.3
+        # ---- TOP kort klik mens lys SLUKKET → første aktivering ----
+        # User-spec 2026-08-23: "skal tænde både plug og terasselys lige meget
+        # hvad." Ingen gates her længere — hverken regn/Dormant/kill-switch
+        # (power_allowed) eller sol. 2026-08-23 21:33 fejlede trykket fordi
+        # manual_off_hold hang fra en manuel plug-sluk kl. 19:20; user måtte
+        # tænde pluggen i appen. force_on-stemplet holder controlleren (A) væk.
+        - conditions: "{{ cmd == 'on' and not bulb_on }}"
+          sequence:
+            - service: script.terrasse_force_on
+        # ---- BUND kort klik mens lys TÆNDT → skru NED (standard-ladder) ----
+        - conditions: "{{ cmd == 'off' and bulb_on }}"
+          sequence:
+            - variables:
+                next_pct: >-
+                  {% set ns = namespace(found=0) %}
+                  {% for val in ladder %}
+                    {% if val < cur_pct | int %}{% set ns.found = val %}{% endif %}
+                  {% endfor %}
+                  {{ ns.found }}
+            - choose:
+                - conditions: "{{ next_pct | int == 0 }}"
+                  sequence:
+                    - service: light.turn_off
+                      target:
+                        entity_id: "{{ bulb }}"
+                      data:
+                        transition: 0.3
+              default:
+                - service: light.turn_on
+                  target:
+                    entity_id: "{{ bulb }}"
+                  data:
+                    brightness_pct: "{{ next_pct | int }}"
+                    transition: 0.3
+        # ---- BUND kort klik mens SLUKKET → no-op (intet at dæmpe) ----
+        # ---- TOP langt hold → snap 100% (bevidst fuld-on, ingen gates) ----
+        - conditions: "{{ cmd == 'move_with_on_off' }}"
+          sequence:
+            - service: script.terrasse_force_on
+              data:
+                pct: 100
+        # ---- BUND langt hold → sluk KUN pærelyskæden (pluggen bliver på!) ----
+        - conditions: "{{ cmd == 'move' }}"
+          sequence:
+            - service: light.turn_off
+              continue_on_error: true
+              target:
+                entity_id: "{{ bulb }}"
+              data:
+                transition: 0.5
+    # Nat-manuel-hold (2026-07-14): Styrbar-tænd/justering INDE i nat-sluk-
+    # vinduet er et bevidst nat-valg → nat-auto-slukket (G) skal holde fingrene
+    # væk resten af natten. Styrbar går GENNEM denne automation (parent_id sat)
+    # → fanges ikke af H's parent_id-none-detektion, derfor sættes flaget her.
+    # Light-on-condition = kun hvis tændingen faktisk lykkedes (pæren kan være
+    # væk fra Zigbee-nettet — force_on venter, men giver op efter 20 s).
+    - if:
+        - "{{ cmd in ['on', 'move_with_on_off'] }}"
+        - condition: state
+          entity_id: binary_sensor.terrasse_nat_sluk_vindue
+          state: "on"
+      then:
+        # 1s: Zigbee-on-rapporten skal nå at lande i HA-state først.
+        - delay:
+            seconds: 1
+        - if:
+            - condition: state
+              entity_id: light.terrasse_paerelyskaede
+              state: "on"
+          then:
+            - service: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.terrasse_nat_manuel_hold
+
+# ----------------------------------------------------------------------------
+# C) Dusk auto-on — tænd pærelyskæden automatisk når det bliver mørkt
+# ----------------------------------------------------------------------------
+# User-spec: "terasse lys skal tændes automatisk ved dusk indtil vi slukker det
+# med godnat knappen." Dusk = sol-elevation < input_number.terrasse_skumring_elevation
+# (default -4°, mørkt nok til at kæden ses; slider siden 2026-10-10).
+# Pluggen er allerede on (controller); vi tænder bare kæden på sol-styrke.
+# Gates: kill-switch on, ikke godnat, huset Active, Normal mode, ikke cirkus,
+# ikke regn, ikke allerede tændt.
+#
+# RE-ARM (2026-07-19, user-valg "tænd når blokering forsvinder"): dusk-elevations-
+# triggeren fyrer KUN i det ene øjeblik solen krydser -4°. Var noget blokerende
+# lige der (regn = plug off, eller huset Dormant), tændte kæden ALDRIG den aften
+# selv når blokeringen forsvandt senere (fejlklasse #4: edge-trigger uden re-arm).
+# Fix: re-arm på regn-ophør + hjemkomst (Dormant→Active). De to re-arm-triggers
+# kan fyre når som helst, så to guard-conditions holder tændingen i det rigtige
+# vindue: stadig dusk-mørkt (elev < -4) OG før nat-sluk-vinduet (så vi aldrig
+# auto-tænder i dagslys eller midt om natten — nat-sluk (G) ejer natten).
+- id: terrasse_dusk_auto_on
+  alias: "Terrasse: auto-tænd pærelyskæde ved dusk (indtil godnat)"
+  description: >
+    Ved dusk (sol < -4°) tændes pærelyskæden automatisk på sol-tilpasset styrke
+    og bliver tændt indtil godnat-knappen (eller bund-Styrbar) slukker den.
+    Re-armes hvis regn ophører eller nogen kommer hjem senere samme aften.
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sun.sun
+      attribute: elevation
+      below: input_number.terrasse_skumring_elevation
+    # Re-arm: blokeringen (regn / Dormant) forsvinder senere på aftenen.
+    - platform: state
+      entity_id: binary_sensor.terrasse_regn_aktiv
+      from: "on"
+      to: "off"
+    - platform: state
+      entity_id: input_select.house_state
+      to: "Active"
+  condition:
+    # 2026-09-27 (user-spec: "hvis en gæst sover i open plan skal hjemkomst og
+    # andre automations heller ikke tænde lys i openplan, terrasse og entré").
+    - condition: state
+      entity_id: binary_sensor.sleepover_openplan_moerkt
+      state: "off"
+    # Re-arm-guard (gælder ALLE triggers): kun når det er dusk-mørkt OG før
+    # nat-sluk-vinduet. Elevations-triggeren opfylder dem per definition; de to
+    # re-arm-triggers (regn-ophør/hjemkomst) må ikke kunne tænde i dagslys eller
+    # efter nat-sluk-tid.
+    - condition: numeric_state
+      entity_id: sun.sun
+      attribute: elevation
+      below: input_number.terrasse_skumring_elevation
+    - condition: state
+      entity_id: binary_sensor.terrasse_nat_sluk_vindue
+      state: "off"
+    # 2026-10-02: aldrig om MORGENEN. Efter 06:00 er nat-vinduet slut mens solen
+    # stadig er under −4°, så re-arm-triggerne (regn ophører / huset Active)
+    # tændte kæden dekorativt om morgenen (18/9 06:24). Morgenen ejes af
+    # packages/terrasse_morgenlys.yaml (20 %). 04-12 og ikke "kl. ≥ 12", så en
+    # nat-sluk-tid efter midnat opfører sig som før.
+    - condition: template
+      value_template: "{{ not (4 <= now().hour < 12) }}"
+    - condition: state
+      entity_id: input_boolean.terrace_presence_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.godnat_active
+      state: "off"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "Normal"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_terrasse
+      state: "off"
+    # Ikke regn (ellers er pluggen off og pærerne uden strøm).
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.terrasse_regn_aktiv', 'on') }}"
+    # Ikke manuel sluk-hold (2026-06-27): brugeren slukkede pluggen under regn
+    # met.no/DMI ikke fangede → dusk må IKKE re-power pluggen og omgå holdet.
+    # Pærelyskæden får strøm via pluggen, så plug-on = lys-on bagvejen.
+    - condition: state
+      entity_id: input_boolean.terrasse_plug_manual_off_hold
+      state: "off"
+    # Ikke allerede tændt (off ELLER unavailable → fyr; on → skip).
+    - condition: template
+      value_template: "{{ not is_state('light.terrasse_paerelyskaede', 'on') }}"
+    # 2026-06-24 (user-spec): luksus-lys-gate — dusk-auto-tænd springes over når
+    # el-prisen er høj (binary_sensor.luksus_lys_elpris_block) OG pærelyskæden er
+    # i luksus-listen (light.luksus_lys). Manuel Styrbar-OP er en SEPARAT branch
+    # (ikke denne automation) → manuel tænding virker altid. Se packages/luksus_lys.yaml.
+    #
+    # ⚠️ 2026-07-30: betingelses-listen OVENFOR er spejlet i sensor.luksus_
+    # blokeret_effekt (packages/luksus_besparelse.yaml) — den regner ud hvad de
+    # oversprungne tændinger sparer i kroner, og counterfactualet ER netop disse
+    # betingelser. Tilføjer/ændrer/fjerner du en condition her, så ret spejlet
+    # samme sted (fejlklasse #2), ellers bogføres en besparelse der ikke findes.
+    - condition: template
+      value_template: >-
+        {{ not (is_state('binary_sensor.luksus_lys_elpris_block', 'on')
+                and 'light.terrasse_paerelyskaede'
+                    in (state_attr('light.luksus_lys', 'entity_id') or [])) }}
+  action:
+    # Pluggen er normalt allerede on (controller); sikr strøm + vent på boot
+    # hvis pærerne lige har fået strøm.
+    - service: switch.turn_on
+      target:
+        entity_id: switch.terrasse_plug
+    - wait_template: >-
+        {{ states('light.terrasse_paerelyskaede') not in ['unavailable', 'unknown'] }}
+      timeout: "00:00:08"
+      continue_on_timeout: true
+    # 2026-07-18 (user-spec): flagermus-venlig auto-tænd. Er flagermus-mode ON,
+    # tændes kæden på den lave flagermus-dusk-styrke (ikke skaleret) i stedet for
+    # den dekorative sol-tilpassede 40-90 %. Styrbar/app-tænd bruger fortsat
+    # scriptet direkte (manuel = fri, går uden om denne branch). Se
+    # packages/flagermus_terrasse.yaml.
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.flagermus_enabled
+              state: "on"
+            # 2026-07-25 (user-spec): gæste-aften → dekorativ styrke i stedet
+            # for flagermus-dæmp. Se packages/gaesteaften.yaml.
+            - condition: state
+              entity_id: binary_sensor.gaester_for_nylig
+              state: "off"
+          sequence:
+            - service: light.turn_on
+              target:
+                entity_id: light.terrasse_paerelyskaede
+              data:
+                brightness_pct: >-
+                  {{ states('input_number.flagermus_dusk_dim_pct') | int(20) }}
+                transition: 3
+      default:
+        - service: script.terrasse_paerelys_til
+
+# ----------------------------------------------------------------------------
+# D) Manuel sluk → sæt hold (regn er måske ikke fanget af sensoren endnu)
+# ----------------------------------------------------------------------------
+# Når brugeren SELV slukker switch.terrasse_plug (fx fordi det regner men
+# met.no/DMI ikke har fanget det endnu) skal pluggen BLIVE slukket — ellers
+# tænder controlleren (A) den igen ved næste /15-tick. Vi sætter et hold-flag
+# + stempler hvornår. Holdet frigives først når regnen sikkert er forbi
+# (tør-streak) eller max-cap nås (automation F). KUN manuel sluk (UI ELLER
+# fysisk knap = parent_id none) → auto-sluk (regn/Dormant = automation,
+# parent_id sat) sætter IKKE flaget.
+- id: terrasse_plug_manual_off_set_hold
+  alias: "Terrasse Plug: manuel sluk → hold (til regn er forbi)"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: switch.terrasse_plug
+      to: "off"
+  condition:
+    # Kun ægte bruger-handling — ikke automation. parent_id=none dækker BÅDE
+    # UI (user_id sat) og fysisk knap på pluggen (helt tom context);
+    # automation-drevne skift har altid parent_id sat.
+    - condition: template
+      value_template: "{{ trigger.to_state.context.parent_id is none }}"
+    # Ikke allerede holdt.
+    - condition: state
+      entity_id: input_boolean.terrasse_plug_manual_off_hold
+      state: "off"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.terrasse_plug_manual_off_hold
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.terrasse_plug_manual_off_since
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - service: logbook.log
+      data:
+        name: "Terrasse Plug"
+        message: >-
+          Manuel sluk → hold sat. Pluggen forbliver slukket indtil regnen er
+          sikkert forbi (tør-streak {{ states('input_number.terrasse_regn_dry_release_hours') }}t)
+          eller max-cap ({{ states('input_number.terrasse_regn_hold_max_hours') }}t).
+
+# ----------------------------------------------------------------------------
+# E) Manuel tænd → ryd hold-FLAGET straks (F2-note: dette rydder kun holdet;
+#    selve pluggen kan controller A stadig slukke igen ved regn/Dormant —
+#    user-valg 2026-07-01: regn/Dormant blokerer også manuel/Styrbar tænd)
+# ----------------------------------------------------------------------------
+- id: terrasse_plug_manual_on_clear_hold
+  alias: "Terrasse Plug: manuel tænd → ryd hold"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: switch.terrasse_plug
+      to: "on"
+  condition:
+    # Samme manuel-detektion som hold-set: parent_id=none = UI ELLER fysisk knap.
+    - condition: template
+      value_template: "{{ trigger.to_state.context.parent_id is none }}"
+    - condition: state
+      entity_id: input_boolean.terrasse_plug_manual_off_hold
+      state: "on"
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.terrasse_plug_manual_off_hold
+
+# ----------------------------------------------------------------------------
+# F) Hold-release evaluator + tør-streak-stempel
+# ----------------------------------------------------------------------------
+# (1) Stempl 'tørt siden' når regn_aktiv går on→off (start på tør-streak).
+# (2) Frigiv manuel sluk-hold når ENTEN:
+#       - regn_aktiv er off OG der er gået ≥ tør-streak-timer siden sidst vådt
+#         ("regnen er helt sikkert forbi"), ELLER
+#       - der er gået ≥ max-cap-timer siden holdet blev sat (safety backstop
+#         så pluggen aldrig hænger slukket for evigt hvis et signal sidder fast).
+#     Når holdet ryddes tænder controller (A) pluggen igen ved næste evaluering
+#     (state-trigger på hold-flaget fyrer A med det samme).
+- id: terrasse_plug_hold_release_evaluator
+  alias: "Terrasse Plug: regn-hold release-evaluator"
+  mode: single
+  trigger:
+    # KUN ægte regn→tørt (from: on) — så en reload/unknown→off IKKE spuriøst
+    # starter tør-streak-uret midt under reel regn sensoren ikke har fanget.
+    # (Hvis vi aldrig SÅ regn forbliver dry_since unset → tør-streak-release
+    # fyrer ikke → holdet falder tilbage på max-cap = mere konservativt.)
+    - platform: state
+      entity_id: binary_sensor.terrasse_regn_aktiv
+      from: "on"
+      to: "off"
+      id: became_dry
+    - platform: time_pattern
+      minutes: "/5"
+      id: tick
+  action:
+    # (1) Stempl tør-start ved on→off.
+    - if:
+        - "{{ trigger.id == 'became_dry' }}"
+      then:
+        - service: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.terrasse_regn_dry_since
+          data:
+            datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    # (2) Evaluér release (kun hvis holdet faktisk er aktivt).
+    - condition: state
+      entity_id: input_boolean.terrasse_plug_manual_off_hold
+      state: "on"
+    - variables:
+        dry_hours: "{{ states('input_number.terrasse_regn_dry_release_hours') | float(2) }}"
+        cap_hours: "{{ states('input_number.terrasse_regn_hold_max_hours') | float(12) }}"
+        dry_since: "{{ states('input_datetime.terrasse_regn_dry_since') }}"
+        off_since: "{{ states('input_datetime.terrasse_plug_manual_off_since') }}"
+        dry_since_ts: >-
+          {% if dry_since in ['unknown','unavailable','none',''] %}0
+          {% else %}{{ as_timestamp(strptime(dry_since,'%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)) }}{% endif %}
+        off_since_ts: >-
+          {% if off_since in ['unknown','unavailable','none',''] %}0
+          {% else %}{{ as_timestamp(strptime(off_since,'%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)) }}{% endif %}
+        dry_streak_h: "{{ (as_timestamp(now()) - (dry_since_ts | float(0))) / 3600 }}"
+        hold_age_h: >-
+          {% if off_since in ['unknown','unavailable','none',''] %}999
+          {% else %}{{ (as_timestamp(now()) - (off_since_ts | float(0))) / 3600 }}{% endif %}
+        # Primær release: tørt NU + en ÆGTE regn→tørt-overgang skete EFTER holdet
+        # blev sat (dry_since > off_since) + tør-streak lang nok. Kravet om
+        # "dry_since efter off_since" sikrer at vi kun frigiver hvis vi FAKTISK
+        # så regnen stoppe siden brugeren slukkede — ikke pga. en gammel/blind
+        # tør-tilstand. Så vi aldrig pretender "tørt" midt under reel regn.
+        dry_release: >-
+          {{ is_state('binary_sensor.terrasse_regn_aktiv', 'off')
+             and (dry_since_ts | float(0)) > (off_since_ts | float(0))
+             and (dry_streak_h | float(-1)) >= dry_hours }}
+        # Safety backstop: holdet har siddet for længe.
+        cap_release: "{{ (hold_age_h | float(999)) >= cap_hours }}"
+    - condition: template
+      value_template: "{{ dry_release or cap_release }}"
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.terrasse_plug_manual_off_hold
+    - service: logbook.log
+      data:
+        name: "Terrasse Plug"
+        message: >-
+          Regn-hold frigivet ({{ 'tør-streak' if dry_release else 'max-cap' }}).
+          Pluggen må tænde igen.
+
+# ----------------------------------------------------------------------------
+# G) Nat-auto-sluk — kæden må ikke brænde natten igennem (2026-07-14)
+# ----------------------------------------------------------------------------
+# ROD-ÅRSAG (natten 13→14/7, AirBnB): zen-lyset tændte ved mørke 22:10, men i
+# AirBnB fyrer godnat ALDRIG, zen-off (2t kun-soveværelse-presence) var de facto
+# død (sove-Apollo strømløs = unavailable + stue-Apollo flappede hele natten →
+# 2h-for-template holdt aldrig), og terrassedøren stod ÅBEN hele natten (juli-
+# udluftning) så al dør-baseret logik også ville have holdt lyset. Eneste sluk
+# = super-watchdoggen kl 03:30.
+#
+# DESIGN: fra input_datetime.terrasse_lys_nat_sluk_tid (default 23:30) til
+# 06:00 (binary_sensor.terrasse_nat_sluk_vindue = én autoritet) slukkes kæden
+# når OPEN-PLAN har været i RO: stue+spisestue+køkken Apollo-occupancy alle
+# 'off' og uændrede i terrasse_lys_nat_ro_minutter. 2026-07-14 user-fix:
+# dør-ro erstattet — terrassedøren holdes ofte åben (sommer), så dør-state er
+# et dårligt aktivitetssignal; er nogen oppe, ses de i open-plan i stedet.
+# Occupancy 'on' ELLER nyligt skiftet = uro → udskyd til næste /15-tick.
+# Unavailable/manglende Apollo = ro for DEN sensor (fejlklasse #9: fail mod
+# sluk — det er nat-burnet vi beskytter mod). NB B54: flapper stue-Apolloen
+# (spøgelser) udskydes slukket — super-watchdoggen (6t) er fortsat backstop.
+# Manuel tænd i vinduet (app/fysisk via H, Styrbar via B-append) sætter
+# terrasse_nat_manuel_hold → G rører ikke kæden resten af natten (ryddes af I).
+# Dance/cirkus = bevidst festlys, undtaget (samme som super-watchdoggen).
+# Gæste-aften (gaester_for_nylig) undtaget 2026-07-25 — open-plan-ro er falsk
+# nat-signal når alle sidder ude (se packages/gaesteaften.yaml).
+# Virker i ALLE house_modes — dækker også glemt godnat i Normal.
+# /15-backstoppen re-armer efter dør-uro, HA-restart mid-vindue og relights
+# (fejlklasse #4). Sidste backstop er fortsat super-watchdoggen (6t).
+- id: terrasse_nat_auto_sluk
+  alias: "Terrasse: nat-auto-sluk af pærelyskæden (fra sluk-tid, open-plan-ro)"
+  description: >
+    Slukker pærelyskæden i nat-vinduet (sluk-tid-slider → 06:00) når open-plan
+    (stue/spisestue/køkken) har været i ro. Manuel nat-tænd (hold-flag) +
+    dance/cirkus undtaget.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.terrasse_nat_sluk_vindue
+      from: "off"
+      to: "on"
+    - platform: time_pattern
+      minutes: "/15"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.terrasse_nat_sluk_vindue
+      state: "on"
+    - condition: state
+      entity_id: light.terrasse_paerelyskaede
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.terrasse_nat_manuel_hold
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.dance_mode
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.mood_pause_terrasse
+      state: "off"
+    # 2026-07-25 (user-spec, fejlklasse #12): gæste-aften → open-plan-ro er et
+    # FALSK nat-signal (alle sidder UDE på terrassen, 07-24-incident). Vinduet
+    # udløber efter gaester_suppression_timer → /15-ticket her fyrer derefter
+    # (fejlklasse #4 dækket); super-watchdoggen står fortsat bagved.
+    - condition: state
+      entity_id: binary_sensor.gaester_for_nylig
+      state: "off"
+    # Open-plan-ro: alle 3 Apollo-occupancy 'off' OG uændrede i ≥ ro-minutter
+    # (0 = spring tjekket over = hård sluk). Manglende/unavailable Apollo = ro
+    # for den sensor (fail mod sluk — det er nat-burnet vi beskytter mod).
+    - condition: template
+      value_template: >-
+        {% set ro = states('input_number.terrasse_lys_nat_ro_minutter') | float(0) %}
+        {% if ro <= 0 %}
+          true
+        {% else %}
+          {% set ns = namespace(quiet=true) %}
+          {% from 'rosters.jinja' import open_plan_occupancy %}{% for e in open_plan_occupancy
+                       %}
+            {% set s = states[e] %}
+            {% if s is not none and s.state in ['on', 'off']
+               and (s.state == 'on'
+                    or (now() - s.last_changed).total_seconds() < ro * 60) %}
+              {% set ns.quiet = false %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.quiet }}
+        {% endif %}
+  action:
+    - service: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: light.terrasse_paerelyskaede
+      data:
+        transition: 5
+    - service: logbook.log
+      data:
+        name: "Terrasse nat-sluk"
+        message: >-
+          Pærelyskæden slukket (nat-vindue, open-plan i ro). Manuel tænd
+          (Styrbar/app) vinder resten af natten.
+
+# ----------------------------------------------------------------------------
+# H) Nat-manuel-hold — app/fysisk tænd i vinduet vinder resten af natten
+# ----------------------------------------------------------------------------
+# parent_id none = UI/app ELLER direkte device-handling (ikke automation).
+# Styrbar-tænd går GENNEM automation B (parent_id sat) → fanges af B's egen
+# hold-append i stedet. Auto-tænd (dusk/zen) sker FØR vinduet → intet hold.
+- id: terrasse_nat_manuel_hold_set
+  alias: "Terrasse: manuel nat-tænd sætter hold (auto-sluk viger)"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: light.terrasse_paerelyskaede
+      from: "off"
+      to: "on"
+  condition:
+    - condition: template
+      value_template: "{{ trigger.to_state.context.parent_id is none }}"
+    - condition: state
+      entity_id: binary_sensor.terrasse_nat_sluk_vindue
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.terrasse_nat_manuel_hold
+      state: "off"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.terrasse_nat_manuel_hold
+    - service: logbook.log
+      data:
+        name: "Terrasse nat-sluk"
+        message: "Manuel nat-tænd → auto-sluk holder pause resten af natten."
+
+# ----------------------------------------------------------------------------
+# I) Nat-manuel-hold clear — når nat-vinduet lukker (06:00:30) + HA-start-backstop
+# ----------------------------------------------------------------------------
+# HA-start-triggeren er #4-backstop: HAOS nat-opdaterer, og en restart hen over
+# 06:00:30 ville ellers springe den faste tid over → holdet stuck-on → G
+# (nat-auto-sluk) suppset næste nat = kæden brænder til super-watchdoggen.
+# Window-off-condition sikrer at en restart MIDT i nat-vinduet (hvor holdet kan
+# være legitimt sat tidligere samme nat) ikke rydder det for tidligt.
+- id: terrasse_nat_manuel_hold_clear
+  alias: "Terrasse: ryd nat-manuel-hold om morgenen"
+  mode: single
+  trigger:
+    - platform: time
+      at: "06:00:30"
+    - platform: homeassistant
+      event: start
+  condition:
+    - condition: state
+      entity_id: input_boolean.terrasse_nat_manuel_hold
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.terrasse_nat_sluk_vindue
+      state: "off"
+  action:
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.terrasse_nat_manuel_hold

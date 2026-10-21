@@ -1,0 +1,553 @@
+# =============================================================================
+# Børneværelse manuel-sluk lås — "slukket = bliv slukket til Styrbar OP"
+# =============================================================================
+# User-spec 2026-06-19 (FULD LÅS): "Vi så fjernsyn i børneværelset og slukkede
+# lyset, men det bouncede tilbage. Det skal det ikke. Det må gerne hoppe tilbage
+# på auto hvis vi trykker Styrbar OP — men ikke bare fordi der er bevægelse."
+#
+# Incident-diagnose 2026-06-19 19:00: brugeren slukkede (snap_off 18:54), men
+# putning Trigger D (puttelys_styrbar_start) var armeret af et tidligere OP-tryk
+# og tændte fase-1 igen 19:00:42 da familiens presence i lægge-zonen blev set i
+# 5 min. = "lyset kom tilbage pga. bevægelse". room_mode var allerede Manual, så
+# den normale presence-tænd var korrekt blokeret — men putte-automatikken tjekker
+# IKKE room_mode, så den slap igennem.
+#
+# FULD LÅS (brugerens valg): efter en MANUEL sluk hvor nogen ER i rummet, holdes
+# ALT bevægelses- OG tids-drevet lys/putning slukket indtil:
+#   - Styrbar OP trykkes (gen-engagerer → room_mode = Auto), ELLER
+#   - rummet har stået tomt længe nok (drift-back-tid), ELLER
+#   - genuin sengetid erklæres andetsteds (godnat_boern_active → on), ELLER
+#   - morgen-safety (05:45) som backstop.
+#
+# Brugeren accepterede risikoen: en rigtig sengetid lige efter en TV-sluk vil
+# ikke auto-natlyse af sig selv — man trykker OP (eller "Boern i seng").
+#
+# ARM 2 (2026-08-07): tv tændt i børneværelset armerer låsen DIREKTE og slukker
+# rummet — se automationen længere nede. Den kan ikke gå gennem ARM 1, fordi den
+# skal kunne afbryde en igangværende putning (hvor godnat/descent er on).
+#
+# ARM-design (selvstændig state-trigger, ingen script-edits):
+#   loft → off  MENS  occupancy = on  (= nogen slukkede mens de var i rummet,
+#   IKKE en auto-sluk når rummet er tomt)  OG  IKKE i en aktiv putning
+#   (godnat_boern off + descent off — gælder KUN occupancy-vejen, se ARM-VEJ B
+#   og 2026-09-28 i condition'en). Auto-sluk (tomt rum) armer aldrig fordi
+#   occupancy=off dér. Putte-trappens loft-sluk kan kortvarigt arme, men ryddes
+#   straks når trappen når bunden (godnat_boern → on clearer låsen).
+#   2026-08-06: dertil et 180 s frisk-vindue efter puttelys_phase1_fired — se
+#   condition'en nedenfor. Fase 1 og nedtrapningens start er ikke samtidige.
+#
+# ARM-VEJ B (user-spec 2026-08-26, "alle knapper og app tryk både fysiske og
+# digitale"): i aften-vinduet (binary_sensor.boern_aften_laasevindue, default
+# 18:30 — se packages/aften_manual_off_lock.yaml) armerer låsen OGSÅ uden
+# occupancy, hvis slukningen bar et HÅRDT finger-bevis (context.user_id eller et
+# friskt Styrbar-stempel). Occupancy var kun en proxy for "en finger gjorde det",
+# og den proxy fejler for et app-tryk fra sofaen. Samme vindue gater CLEAR 2:
+# 20 min "tomt" må ikke frigive låsen om aftenen, for et barn der ligger stille
+# ER tomt for Apolloen.
+#
+# Gates der tjekker input_boolean.boernevaerelse_manual_off_lock = off:
+#   - presence_light_boernevaerelse_on        (presence_boernevaerelse.yaml)
+#   - presence_light_boernevaerelse_adult_wakeup (presence_boernevaerelse.yaml)
+#   - presence_lux_boernevaerelse_on          (presence_lights.yaml)
+#   - putning_auto_detect_via_bath_visit (A)  (putning_auto_detect.yaml)
+#   - putning_auto_detect_via_boern_still (B) (putning_auto_detect.yaml)
+#   - puttelys_styrbar_start (D)              (putning_auto_detect.yaml)
+#   - puttelys_phase1_scene (19:10 bagkant)   (godnat_night.yaml)
+#   - puttelys_natlys_strip (20:30 backstop)  (godnat_night.yaml, kun tids-grenen)
+#   - boernelys_power_recovery (2026-08-23)   (light_power_recovery.yaml)
+#
+# Veje der RYDDER låsen (skal alle respektere gæste-holdet, fejlklasse #21):
+#   CLEAR 1-5 nedenfor + morning_boern_auto_off_when_bright's efter-sluk-clear
+#   (morning_lights_sanity_check.yaml) + AirBnB entry/exit (airbnb_mode.yaml)
+#   + aften_manual_off_lock_morgen_clear (packages/aften_manual_off_lock.yaml,
+#   /15 i 05:00-12:00, samme gæste-gate). NB den er DEN der rydder om morgenen:
+#   målt 10-04..10-06 kom alle 3 clears derfra (05:00/10:15/06:45), og 05:45 er
+#   selv et /15-tick — CLEAR 4 er kun en tvilling i samme sekund (#2).
+# =============================================================================
+
+input_boolean:
+  boernevaerelse_manual_off_lock:
+    name: "Børneværelse manuel-sluk lås"
+    icon: mdi:lock-alert
+
+  # 2026-08-23 (user-spec): "vi har en gæst sovende i børneværelset, der skal
+  # være helt mørkt derinde i nat." Låsen ovenfor holder KUN til 05:45 (CLEAR 4)
+  # og slipper desuden hvis Apolloen taber en stilliggende krop i 30 min
+  # (CLEAR 2) eller nogen erklærer sengetid (CLEAR 3) — alle tre er skrevet til
+  # husets EGNE børn, hvor et morgen-slip er ønsket. En gæst skal sove ud.
+  #
+  # Flaget gør låsen HOLDBAR: CLEAR 2/3/4 springer over mens det er on, så den
+  # eneste vej ud er Styrbar børn OP (CLEAR 1 = brugerens beskrevne udgang,
+  # rydder begge) plus en 10:00-backstop så rummet aldrig er dødt for altid.
+  # Ingen NYE gates: låsen er allerede condition på alle tænd-veje i rummet.
+  # Bevidst UDEN initial: — den skal kunne overleve en HA-restart midt om
+  # natten (et initial: ville PÅTVINGE off ved hver boot, se CLAUDE.md).
+  boernevaerelse_gaest_sover:
+    name: "Gæst sover i børneværelset"
+    icon: mdi:sleep
+
+automation:
+  # ---------------------------------------------------------------------------
+  # ARM — manuel sluk mens nogen er i rummet
+  # ---------------------------------------------------------------------------
+  - id: boernevaerelse_manual_off_lock_arm
+    alias: "Børn lås: arm ved manuel sluk (loft off mens optaget)"
+    description: >
+      Loft slukkes mens occupancy=on (= nogen slukkede bevidst mens de var i
+      rummet) uden for en aktiv putning → lås rummet mod bevægelses-/tids-tænd
+      indtil Styrbar OP / tomt rum / sengetid / morgen.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: light.boernevaerelse_loft
+        to: "off"
+        # 2s debounce mod sluk-fade-transienter.
+        for:
+          seconds: 2
+    condition:
+      # To veje ind (user-spec 2026-08-26: "alle knapper og app tryk både fysiske
+      # og digitale"):
+      #   A) Nogen ER i rummet — den oprindelige vej. Occupancy bruges her som
+      #      PROXY for "en finger slukkede": rummet er optaget, så slukningen kom
+      #      ikke fra en tomheds-automation.
+      #   B) Aften-vinduet (binary_sensor.boern_aften_laasevindue, default 18:30)
+      #      + HÅRDT bevis på en finger. Denne vej kræver ikke occupancy, fordi et
+      #      app-tryk sker fra sofaen — og Apolloen ser alligevel ikke et barn der
+      #      ligger stille. Beviset er derfor strengere end i vej A:
+      #      context.user_id (app/UI/tile/stemme — ALDRIG parent_id, fejlklasse #3)
+      #      eller et friskt Styrbar-stempel (knap-tryk bærer intet user_id).
+      #      20 s dækker knap → manual_override-stempel → lysets 2 s debounce.
+      #
+      # 2026-09-28 (user-spec: "Parent B slukker manuelt loft lyset i
+      # børneværelset … det tænder igen. du skal respektere hendes valg natten
+      # over når det er i forbindelse med putning"): putnings-undtagelsen
+      # herunder gjaldt før BEGGE veje. Målt 28/9: Parent B slukkede 19:22:18
+      # (user_id) mens puttelys_descent_active stod on → ingen lås → presence
+      # tændte loftet igen 19:35:48. Undtagelsen findes kun fordi vej A's
+      # proxy (occupancy) ikke kan skelne nedtrapningens/dagslys-slukkets EGEN
+      # loft-sluk fra en finger. Vej B har hårdt bevis: automationer bærer
+      # aldrig user_id, og putte-scriptene startes af automationer. Derfor
+      # gælder undtagelsen nu KUN vej A. Nedtrapningen kører videre (strip →
+      # natlys, godnat_boern → on); den tænder aldrig loftet igen, og alle
+      # andre tænd-veje læser låsen eller godnat_any_active.
+      - condition: or
+        conditions:
+          - condition: and
+            conditions:
+              - condition: state
+                entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+                state: "on"
+              # IKKE en aktiv putning (sengetids-nedtrapning ejer rummet selv).
+              - condition: state
+                entity_id: input_boolean.godnat_boern_active
+                state: "off"
+              - condition: state
+                entity_id: input_boolean.puttelys_descent_active
+                state: "off"
+              # 2026-08-06: hullet MELLEM fase 1 og nedtrapningens start. Målt
+              # samme aften: fase 1 kl 19:29:55, dagslys-sluk slukkede loftet
+              # 19:30:00, låsen armerede 19:30:02 — og nedtrapningen startede
+              # først 19:30:51 (scriptet blokerer på et loft der svarer
+              # langsomt), så descent_active var stadig off. Låsen læste altså
+              # en AUTOMATIONS sluk som en finger og spærrede resten af aftenens
+              # bevægelses-/tids-tænd i børneværelset. 180 s dækker den målte
+              # 56-sekunders forsinkelse med rigelig margin, uden at æde det
+              # rigtige tilfælde (fase 1 kl 18:50 → familien slukker for at se
+              # TV kl 19:30 skal fortsat kunne låse rummet).
+              - condition: template
+                value_template: >-
+                  {% set f = states.input_boolean.puttelys_phase1_fired %}
+                  {{ f is none or f.state != 'on'
+                     or (now() - f.last_changed).total_seconds() > 180 }}
+          - condition: and
+            conditions:
+              - condition: state
+                entity_id: binary_sensor.boern_aften_laasevindue
+                state: "on"
+              - condition: template
+                value_template: >-
+                  {% set c = trigger.to_state.context %}
+                  {% set raw = states('input_datetime.styrbar_last_press_boernevaerelse') %}
+                  {% set since = 99999 if raw in ['unknown','unavailable','none','']
+                                 else (now() - strptime(raw, '%Y-%m-%d %H:%M:%S')
+                                       .replace(tzinfo=now().tzinfo)).total_seconds() %}
+                  {{ (c is not none and c.user_id is not none) or since < 20 }}
+      # Loftet er reelt slukket nu (race/restart-safe).
+      - condition: state
+        entity_id: light.boernevaerelse_loft
+        state: "off"
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+      # 2026-07-17 bug hunt: låsen er et Normal-familie-koncept. I AirBnB
+      # slukker block-suppressoren loftet STRAKS ved enhver tænding (mens
+      # gæst er i rummet) → ARM ville armere ved hver gæste-tænding og
+      # efterlade en stale lås til efter mode-exit. (Auto-sluk-hullet i
+      # Normal — morgen-sanity's bright-gren — ryddes af sanity-automationen
+      # selv, se morning_lights_sanity_check.yaml.)
+      # 2026-08-26h: Home Vacation ER familien hjemme (bare uden hverdags-rutiner)
+      # og har ingen block-suppressor — kun AirBnB skal udelukkes.
+      - condition: template
+        value_template: >-
+          {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+      # Undgå redundant write.
+      - condition: state
+        entity_id: input_boolean.boernevaerelse_manual_off_lock
+        state: "off"
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+      - service: logbook.log
+        data:
+          name: "Børn manuel-sluk lås"
+          message: >-
+            Armeret — loft slukket mens nogen var i rummet. Bevægelses-/tids-tænd
+            blokeret indtil Styrbar OP / tomt rum / sengetid / morgen.
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+
+  # ---------------------------------------------------------------------------
+  # ARM 2 — tv tændt i børneværelset (user-spec 2026-08-07)
+  # ---------------------------------------------------------------------------
+  # "nu tændte vi tv på børneværelset og den situation burde jo føre til dark
+  #  mode herinde … dark mode på børneværelset om aftenen skal slukke lys, selv
+  #  puttelys. når tv så slukker skal lyset forblive slukket og hvis jeg så
+  #  trykker styrbar børne op, så starter vi en puttesession."
+  #
+  # RUM-LOKALT, IKKE dark_mode (user-valg "Frigiv stuen", 2026-08-07): første
+  # udkast tændte input_boolean.dark_mode, men den sætter cinema_active =
+  # husdækkende suppression som ~10 automations gater på → stue/køkken/
+  # spisestue ville miste alt auto-lys mens børnene så tv. Her slukkes KUN
+  # børneværelset, og låsen holder det slukket bagefter — hvilket er præcis
+  # den kontrakt filen her allerede implementerer. Ingen "tv slut"-automation
+  # er nødvendig: låsen består af sig selv, og CLEAR 1 (Styrbar OP) ER
+  # brugerens beskrevne udgang → Trigger D i putning_auto_detect starter den
+  # nye putte-session.
+  #
+  # HVORFOR "NYESTE RUM" OG IKKE BARE PRESENCE (user: "nej, den flyttes
+  # rundt"): der er ÉN media_player i huset, og projektoren flytter rum. Et
+  # rent `boern in rum_med_nylig_presence` ville mørklægge børneværelset hver
+  # gang projektoren kørte i stuen mens et barn stadig lå i sengen. Kravet er
+  # derfor at børneværelset er det ENESTE af de tre kandidat-rum med aktivitet.
+  # Kalibreret mod aftenens ægte hændelse (08-07, tv on 19:49:09): boern
+  # occupancy on siden 19:47:11, stue off siden 19:47:07, sove off siden
+  # 19:48:21 → gaten ville have passeret. Fejler den, sker der INTET nyt
+  # (= dagens adfærd), så en falsk negativ er gratis.
+  - id: boernevaerelse_manual_off_lock_arm_tv
+    alias: "Børn lås: arm ved tv i børneværelset (sluk rummet)"
+    description: >
+      Projektoren tænder i aften-vinduet og børneværelset er det eneste rum med
+      aktivitet → afbryd en igangværende putning, sluk børneværelset og lås det
+      slukket. Rum-lokalt: stue/køkken/spisestue rører vi ikke (user-valg
+      2026-08-07 "frigiv stuen"), og der lukkes ingen gardiner.
+      AirBnB: Normal-only — en tvungen sluk er ikke en gæste-rutine.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.projektor_aktiv
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "Normal"
+      # Aften-vindue: putningens forkant (18:45) → dark-mode-cutover (03:00).
+      # condition:time håndterer selv midnats-wrappet.
+      - condition: time
+        after: input_datetime.putning_vindue_start
+        before: input_datetime.dark_mode_godnat_cutover
+      - condition: state
+        entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+        state: "on"
+      # ... og INGEN af de øvrige kandidat-rum. Se "nyeste rum" ovenfor.
+      - condition: state
+        entity_id: binary_sensor.stue_apollo_occupancy_filtered
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+        state: "off"
+      # Idempotens: er låsen allerede armeret, er rummet allerede slukket-låst.
+      - condition: state
+        entity_id: input_boolean.boernevaerelse_manual_off_lock
+        state: "off"
+    action:
+      # RÆKKEFØLGE: låsen FØRST. Alle otte tænd-gates (se listen i headeren)
+      # læser den, så slukket nedenfor ikke kan bounce tilbage på presence.
+      # Den sætter samtidig ARM 1 ud af spil (dens sidste condition er
+      # lås == off), så loft-slukket herunder ikke giver en dobbelt-skrivning.
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+      # Stop en igangværende putning FØR slukket — ellers kører nedtrapningen
+      # videre i baggrunden og tænder natlys ind i et rum vi lige har slukket.
+      # script.turn_off på et script der ikke kører er et no-op.
+      - service: script.turn_off
+        target:
+          entity_id:
+            - script.puttelys_descent_run
+            - script.puttelys_phase1_when_present
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.puttelys_descent_active
+      - service: light.turn_off
+        target:
+          entity_id: light.boernevaerelse_all
+        data:
+          transition: 2
+        continue_on_error: true
+      # 2026-10-06 (bug-hunt, #12): teddy-pluggen er ikke i boernevaerelse_all og
+      # følger kun strippens on→off-flanke — samme hul som ARM 3 nedenfor lukker.
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.boernevaerelse_hyggelys
+      - service: logbook.log
+        data:
+          name: "Børn manuel-sluk lås"
+          message: >-
+            Tv tændt i børneværelset {{ now().strftime('%H:%M') }} → rummet
+            slukket og låst{{ ' (igangværende putning afbrudt)'
+              if is_state('input_boolean.puttelys_phase1_fired', 'on') else '' }}.
+            Styrbar børn OP starter en ny putte-session.
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+
+  # ---------------------------------------------------------------------------
+  # ARM 3 — gæste-hold slået til (user-spec 2026-08-23)
+  # ---------------------------------------------------------------------------
+  # Flaget alene er kun "hold låsen". Den der slår det til mener "der skal være
+  # mørkt derinde", så vi armerer låsen OG slukker rummet i samme greb — ellers
+  # skal man huske to handlinger, og et tændt loft ville stå og brænde bag en
+  # lås der forbyder alle andre at røre det.
+  #
+  # Slukket dækker loft + strip via gruppen; teddy-pluggen er IKKE med i
+  # boernevaerelse_all og følger strippens on→off-flanke (hyggelys-mirror'en).
+  # Er strippen allerede off, kommer den flanke aldrig → pluggen slukkes
+  # eksplicit her.
+  - id: boernevaerelse_gaest_sover_arm
+    alias: "Børn lås: gæste-hold on → sluk rummet + armér låsen"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.boernevaerelse_gaest_sover
+        to: "on"
+    action:
+      # Låsen FØRST: alle tænd-gates læser den, så slukket nedenfor ikke kan
+      # bounce tilbage på presence (samme rækkefølge som ARM 2).
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+      # En igangværende putning ville rampe natlys ind i rummet bagefter.
+      - service: script.turn_off
+        target:
+          entity_id:
+            - script.puttelys_descent_run
+            - script.puttelys_phase1_when_present
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.puttelys_descent_active
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.boernevaerelse_all
+        data:
+          transition: 2
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.boernevaerelse_hyggelys
+      - service: logbook.log
+        data:
+          name: "Børn gæste-hold"
+          message: >-
+            Gæste-hold ON {{ now().strftime('%H:%M') }} — rummet slukket og
+            låst. Ingen auto-tænd før Styrbar børn OP (backstop 10:00).
+          entity_id: input_boolean.boernevaerelse_gaest_sover
+
+  # ---------------------------------------------------------------------------
+  # CLEAR 1 — Styrbar OP (gen-engager → Auto)
+  # ---------------------------------------------------------------------------
+  - id: boernevaerelse_manual_off_lock_clear_op
+    alias: "Børn lås: clear ved Styrbar OP (+ room_mode Auto)"
+    description: >
+      Styrbar OP (klik 'on' eller hold 'move_with_on_off') på børne-Styrbaren
+      frigiver låsen OG sætter room_mode = Auto, så presence/auto styrer rummet
+      igen (user-spec: "hoppe tilbage på auto hvis vi trykker Styrbar OP").
+    mode: single
+    trigger:
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "66:19:44:cc:2c:41:57:fe"
+          command: "on"
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "66:19:44:cc:2c:41:57:fe"
+          command: "move_with_on_off"
+    condition:
+      # Gæste-holdet tæller med: står låsen (fejlagtigt) off mens holdet er on,
+      # skal OP stadig kunne rydde holdet — ellers er der ingen vej ud.
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.boernevaerelse_manual_off_lock', 'on')
+             or is_state('input_boolean.boernevaerelse_gaest_sover', 'on') }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.boernevaerelse_manual_off_lock
+            - input_boolean.boernevaerelse_gaest_sover
+      # SAMME tryk kører styrbar_brightness_step → styrbar_stamp_press, som
+      # sætter rummet i Manual. Uden delayen er rækkefølgen en lodtrækning og
+      # "OP = tilbage på Auto" holder kun nogle gange (2026-08-23, spejler
+      # sleepover_gaest_op_clear).
+      - delay:
+          seconds: 2
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('input_select.room_mode_boernevaerelse', 'Auto') }}"
+        then:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.room_mode_boernevaerelse
+            data:
+              option: "Auto"
+      - service: logbook.log
+        data:
+          name: "Børn manuel-sluk lås"
+          message: "Frigivet — Styrbar OP (room_mode → Auto, auto-lys gen-engageret)."
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+
+  # ---------------------------------------------------------------------------
+  # CLEAR 2 — rummet tomt længe nok (drift-back-semantik)
+  # ---------------------------------------------------------------------------
+  - id: boernevaerelse_manual_off_lock_clear_empty
+    alias: "Børn lås: clear når rummet har stået tomt"
+    description: >
+      Occupancy off i drift-back-tiden → rummet er forladt → frigiv låsen, så
+      næste ankomst får normal auto-lys igen.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+        to: "off"
+        for:
+          minutes: "{{ states('input_number.global_drift_back_empty_minutes') | int(20) }}"
+    condition:
+      - condition: state
+        entity_id: input_boolean.boernevaerelse_manual_off_lock
+        state: "on"
+      # Gæste-hold: en sovende krop er præcis dét Apolloen taber i 5-15 min ad
+      # gangen, så "tomt i 30 min" er ikke fraværs-bevis om natten.
+      - condition: state
+        entity_id: input_boolean.boernevaerelse_gaest_sover
+        state: "off"
+      # 2026-08-26h (user-spec "resten af aftenen"): samme argument som gæste-
+      # holdet, men for husets egne børn. Slukker nogen lyset efter 18:30, må
+      # 20 min "tomt" ikke frigive låsen — et barn der ligger stille ER tomt for
+      # Apolloen. Udveje i vinduet: Styrbar OP, sengetid, 05:45-clear + /15-backstop.
+      - condition: state
+        entity_id: binary_sensor.boern_aften_laasevindue
+        state: "off"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+      - service: logbook.log
+        data:
+          name: "Børn manuel-sluk lås"
+          message: "Frigivet — rummet stod tomt (drift-back)."
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+
+  # ---------------------------------------------------------------------------
+  # CLEAR 3 — genuin sengetid erklæret (godnat_boern → on)
+  # ---------------------------------------------------------------------------
+  - id: boernevaerelse_manual_off_lock_clear_godnat
+    alias: "Børn lås: clear når sengetid erklæres (godnat_boern on)"
+    description: >
+      Hvis sengetid erklæres af en ikke-blokeret vej (manuel natlys-dim Trigger C
+      / "Boern i seng"-toggle / putte-trappens bund) skal nat-mode eje rummet —
+      frigiv låsen så natlys-flowet kan køre.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.godnat_boern_active
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.boernevaerelse_manual_off_lock
+        state: "on"
+      # Gæste-hold: natlys-flowet skal IKKE overtage rummet — en gæst får ikke
+      # husets putte-rutine påtvunget, og natlyset er lys.
+      - condition: state
+        entity_id: input_boolean.boernevaerelse_gaest_sover
+        state: "off"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+      - service: logbook.log
+        data:
+          name: "Børn manuel-sluk lås"
+          message: "Frigivet — sengetid (godnat_boern) erklæret, nat-mode ejer rummet."
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+
+  # ---------------------------------------------------------------------------
+  # CLEAR 4 — morgen-safety backstop (før vækning)
+  # ---------------------------------------------------------------------------
+  - id: boernevaerelse_manual_off_lock_clear_morning
+    alias: "Børn lås: morgen-safety clear (05:45)"
+    description: >
+      Backstop: ryd en evt. hængende lås før morgen-vækningen, så natten over en
+      armeret lås aldrig blokerer dagens auto-lys/vækning.
+    mode: single
+    trigger:
+      - platform: time
+        at: "05:45:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.boernevaerelse_manual_off_lock
+        state: "on"
+      # Gæste-hold: 05:45 findes for at husets egne børn kan vækkes. En gæst
+      # skal sove ud — holdet slippes af CLEAR 5 (10:00) eller Styrbar OP.
+      - condition: state
+        entity_id: input_boolean.boernevaerelse_gaest_sover
+        state: "off"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+      - service: logbook.log
+        data:
+          name: "Børn manuel-sluk lås"
+          message: "Frigivet — morgen-safety (05:45 backstop)."
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+
+  # ---------------------------------------------------------------------------
+  # CLEAR 5 — gæste-holdets egen backstop (10:00)
+  # ---------------------------------------------------------------------------
+  # Holdet er en NAT-tilstand. Uden en tids-udgang ville et glemt flag gøre
+  # børneværelset dødt for al automatik på ubestemt tid — og den der glemmer
+  # det, opdager det først næste aften. 10:00 er efter enhver rimelig
+  # gæste-morgen og længe efter husets egne rutiner.
+  - id: boernevaerelse_gaest_sover_clear_morning
+    alias: "Børn gæste-hold: backstop-clear (10:00)"
+    mode: single
+    trigger:
+      - platform: time
+        at: "10:00:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.boernevaerelse_gaest_sover
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.boernevaerelse_gaest_sover
+            - input_boolean.boernevaerelse_manual_off_lock
+      - service: logbook.log
+        data:
+          name: "Børn gæste-hold"
+          message: "Frigivet — 10:00 backstop. Rummet er tilbage på normal automatik."
+          entity_id: input_boolean.boernevaerelse_gaest_sover

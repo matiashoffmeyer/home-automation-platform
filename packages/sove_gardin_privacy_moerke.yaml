@@ -1,0 +1,87 @@
+# =============================================================================
+# Sove-gardin: spring privacy-trinnet over når det er mørkt ude (2026-09-23)
+# =============================================================================
+# User-spec 2026-09-23: "sovegardinet skal springe closed til privat length over
+# (ved alarm vækning) når det er mørkt udenfor for det giver intet lys, giver
+# kun motorlarm."
+#
+# MÅLT (7 alarm-morgener 14-23/09, sovevaerelse_apollo_lux før → +15 min efter
+# privacy-flytningen, solhøjde beregnet for 55,66°N):
+#   elev −8,6 · −7,5 · −5,9 · −5,7°  →  +0,0 · +0,3 · +0,0 · +0,2 lx
+#   elev −3,7°                        →  +2,8 lx
+#   elev +0,4 · +1,4°                 →  +4,0 · +5,0 lx
+# Under ~−4° giver trinnet nul lys. Default −3° = lige over det svageste
+# målbare udbytte; slideren flytter grænsen.
+#
+# DESIGN: trinnet springes ikke bare over — det UDSÆTTES inden for det
+# eksisterende privacy-vindue. Kommer solen over grænsen mens vinduet løber,
+# tager gardinet privacy-trinnet DÉR (nu giver det lys). Nås grænsen aldrig,
+# bliver gardinet nede til `script.sove_gardin_op` tager over efter vinduet,
+# præcis som før. Vinduets samlede længde er uændret (ventetiden trækkes fra).
+# Et gardin nogen allerede har kørt længere op end privacy, røres ikke.
+#
+# MED-EJER (2026-10-05, user-spec "godmorgen-knappen: ingen grund til at køre
+# gardinet op hvis der er mørkt udenfor. det larmer bare."): godmorgen-knappens
+# KORTE tryk (godmorgen_forced, automations/godmorgen_godnat.yaml) læser SAMME
+# slider og rører slet ikke gardinet under grænsen — ingen udsættelse dér, et
+# senere tryk eller morgen-backstoppen tager det. Langt op er bevidst ugatet.
+# =============================================================================
+
+input_number:
+  sove_gardin_privacy_min_sol_elevation:
+    name: "Sove-gardin: vækning + godmorgen-knap kun når sol over (°)"
+    icon: mdi:weather-sunset-up
+    min: -18
+    max: 10
+    step: 0.5
+    unit_of_measurement: "°"
+    mode: slider
+    # Ingen `initial:` → persisterer. Live-default (−3) sat via API + snapshot.
+
+script:
+  sove_gardin_privacy_morgen:
+    alias: "Sove-gardin: privacy-trin ved vækning (springes over i mørke)"
+    icon: mdi:blinds
+    mode: single
+    sequence:
+      - variables:
+          graense: "{{ states('input_number.sove_gardin_privacy_min_sol_elevation') | float(-3) }}"
+          vindue_s: "{{ (states('input_number.global_wakeup_curtain_window_minutes') | float(60)) * 60 }}"
+          t0: "{{ as_timestamp(now()) }}"
+          privacy_pos: "{{ 100 - (states('input_number.global_wakeup_curtain_privacy_pct') | int(70)) }}"
+      - if:
+          - condition: template
+            value_template: "{{ (state_attr('sun.sun', 'elevation') | float(90)) < graense }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Vækning: gardin"
+              message: >
+                Privacy-trin udsat — mørkt ude (sol {{ state_attr('sun.sun', 'elevation') | round(1) }}°
+                < {{ graense }}°), motoren ville kun larme. Tages hvis solen når op
+                inden for vinduet ({{ (vindue_s / 60) | int }} min).
+              entity_id: cover.gardin_sovevaerelse
+          - wait_template: "{{ (state_attr('sun.sun', 'elevation') | float(-90)) >= graense }}"
+            timeout:
+              seconds: "{{ vindue_s | int }}"
+            continue_on_timeout: true
+      # Stadig mørkt (vinduet udløb) → ingen privacy; kalderen går videre til
+      # script.sove_gardin_op som før.
+      - condition: template
+        value_template: "{{ (state_attr('sun.sun', 'elevation') | float(-90)) >= graense }}"
+      # Snooze midt i ventetiden = ingen motor (samme escape som kalderen).
+      - condition: state
+        entity_id: binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv
+        state: "off"
+      # Rør ikke et gardin nogen allerede har kørt længere op end privacy.
+      - condition: template
+        value_template: >-
+          {% set p = state_attr('cover.gardin_sovevaerelse', 'current_position') %}
+          {{ p is none or (p | float(0)) < (privacy_pos | float(30)) }}
+      - service: cover.set_cover_position
+        target:
+          entity_id: cover.gardin_sovevaerelse
+        data:
+          position: "{{ privacy_pos }}"
+      - delay:
+          seconds: "{{ [vindue_s - (as_timestamp(now()) - t0), 0] | max | int }}"

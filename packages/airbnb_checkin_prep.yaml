@@ -1,0 +1,229 @@
+# =============================================================================
+# AirBnB CHECK-IN: "Aktiver AirBnB Mode"-knappen (Sprint 2026-09-09d, B116b)
+# =============================================================================
+# User-spec: ét tryk skal gøre huset gæsteklart. Spejl af `script.airbnb_checkout`
+# (packages/airbnb_checkout.yaml), men den anden vej.
+#
+# FLOW
+#   1. Grundig-indstillinger: mop_mode deep + mop_intensity intense + fan max
+#      (user-spec 2026-09-09d: check-in skal rengøre præcis som check-ud).
+#      Rækkefølgen er ikke valgfri — sug + mop er ÉN tilstand på robotten, og
+#      enhver mop-skrivning sætter sugestyrken NED, så fan skal skrives sidst.
+#   2. Stempl manuel-start → session_type=full → session_active → vacuum.start
+#      (også check-ud'ens rækkefølge: stemplet SKAL ligge før `vacuum.start`,
+#      ellers klassificerer de tre robot-guards kørslen som auto-startet).
+#   3. house_mode → AirBnB **med det samme**. Det er sikkert nu: B116(a) gav
+#      `roborock_dormant_interrupt` en intentions-gate (mode-skiftets flanke er
+#      barn af `house_mode`-contexten), og `roborock_manuel_session_stamp` +
+#      dette scripts eget stempel gør sessionen menneske-startet for alle tre
+#      guards. Præcis den kombination der klippede rengøringen over 09-05 08:30.
+#   4. Nedtællingen starter ved KNAPTRYKKET (user-spec 2026-09-09d) og løber
+#      `dormant_min` minutter → house_state → Dormant + sluk-sweep.
+#
+# HVORFOR NEDTÆLLINGEN LØBER FRA TRYKKET, IKKE FRA "RENGØRINGEN ER FÆRDIG"
+#   Første version ventede på robottens færdig-melding. Det er robust, men
+#   sluttidspunktet er ukendt på forhånd, og user skal kunne regne baglæns fra
+#   gæstens ankomst: trykker han 12:00 med slideren på 60, er huset klart 13:00.
+#   Prisen er at Dormant kan indtræffe MENS robotten stadig kører, hvis
+#   rengøringen tager længere end `dormant_min`. Det er ufarligt: intet stopper
+#   robotten på vej IND i Dormant (`roborock_dormant_interrupt` hænger på vejen
+#   UD), sluk-sweep'en rører kun lys, og den auto-clean som Dormant ellers ville
+#   starte er en no-op så længe `roborock_session_active` står on. Vil man have
+#   begge dele, sættes slideren højere end en fuld rengøring tager.
+#
+# HVORFOR ET input_text SOM TILSTANDSBÆRER
+#   Et script må ikke holde en time: en HA-restart dræber det, og huset ville
+#   stå i limbo (fejlklasse #4/#15). Tilstanden skrives derfor ned.
+#   `input_text` er valgt frem for `input_datetime`/`input_boolean` af en helt
+#   konkret grund: en NY YAML-helper kræver et reload af sit domæne, og
+#   `input_boolean.reload` gen-påtvinger ALLE 41 `initial:` i huset, mens
+#   `input_datetime.reload` ville nulstille `parent_a_gps_sidst_rapport` +
+#   `parent_b_gps_sidst_rapport` til 2000-01-01 og dermed lyve om GPS-friskhed.
+#   Målt 09-09: huset har **nul** input_text med `initial:` → `input_text.reload`
+#   er den eneste helper-reload der er gratis. (Nyt permanent faktum.)
+#
+#   Kodningen er `<fase>:<epoch>`:
+#     ''  / 'unknown'  = inaktiv. NB: en urørt input_text står på 'unknown',
+#                        som er TRUTHY — der testes derfor eksplicit på præfiks,
+#                        aldrig på "er der noget i feltet".
+#     'klar:<epoch>'   = nedtælling; epoch = hvornår huset skal gå Dormant.
+#                        Skrives ÉN gang, af knappen selv — der findes ingen
+#                        mellemfase, fordi sluttidspunktet er kendt ved trykket.
+#
+# HVORFOR IKKE `input_boolean.manual_dormant_override`
+#   Den ville være den oplagte "tving Dormant"-knap, men `house_manual_dormant`
+#   hænger på dens flanke og LUKKER alle fire gardiner + slukker `entity_id: all`.
+#   Gardin-lukning er ikke en del af check-in-forberedelsen (og AirBnB's
+#   gardin-regime er sit eget kapitel, B123), og en latch der bliver stående ON
+#   er et stuck-flag `ha_health.sh flags` med rette brokker sig over. Vi sætter
+#   derfor `house_state` DIREKTE og kalder den delte sluk-sweep — hvilket også
+#   opfylder user-kravet *"hvis jeg er hjemme når jeg sætter den igang skal det
+#   også virke"*: sensor-vejen `house_airbnb_to_dormant` kan aldrig opfyldes
+#   mens han selv går rundt i huset.
+# =============================================================================
+
+input_text:
+  airbnb_checkin_prep_fase:
+    name: "AirBnB check-in-forberedelse: fase"
+    icon: mdi:home-clock
+    max: 32
+
+input_number:
+  airbnb_checkin_dormant_min:
+    name: "AirBnB check-in: minutter fra knaptryk til Dormant"
+    icon: mdi:timer-sand
+    min: 0
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: box
+
+script:
+  airbnb_checkin_prep:
+    alias: "AirBnB: AKTIVER (rengøring + AirBnB-mode + Dormant bagefter)"
+    icon: mdi:home-import-outline
+    mode: single
+    description: >
+      Starter en grundig rengøring (deep mop + intense + max fan), sætter huset i
+      AirBnB med det samme, og lægger huset i Dormant `dormant_min` minutter
+      efter KNAPTRYKKET.
+    sequence:
+      # Pushen skal ud FØR mode-flippet — bagefter er huset AirBnB og
+      # AirBnB = SILENT (user-spec 2026-07-13: telefonen kan være i gæstens
+      # hænder). Derfor også gaten på den nuværende mode: trykkes knappen mens
+      # huset ALLEREDE er AirBnB, sendes intet.
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+        then:
+          # B215: via push_notify (notif_airbnb-toggles + master) — var direkte.
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: airbnb
+              title: "🏡 AirBnB check-in-forberedelse"
+              message: >-
+                {% set dock_err = states('sensor.s8_maxv_ultra_dock_dock_error') %}
+                {% set water = is_state('binary_sensor.s8_maxv_ultra_water_shortage', 'on') %}
+                {% set m = states('input_number.airbnb_checkin_dormant_min')
+                           | float(60) | round(0) | int %}
+                Grundig rengøring startet (deep mop + intense + max fan), huset
+                skifter til AirBnB nu. Går i Dormant om {{ m }} min —
+                kl. {{ (now() + timedelta(minutes=m)).strftime('%H:%M') }}.
+                Dette er den sidste push før stilhed.
+                {%- if dock_err not in ['ok', 'none', 'unknown', 'unavailable'] or water %}
+                ⚠️ DOKKEN MELDER VANDPROBLEM ({{ dock_err }}) — fyld rent vand på.
+                {%- endif %}
+              payload:
+                tag: airbnb_checkin_prep
+      # --- Robot: grundig-indstillinger FØR stempel og start ---
+      # Sug + mop er ÉN tilstand på robotten: enhver mop-skrivning sætter
+      # sugestyrken NED, så `set_fan_speed` skal være SIDST. Samme rækkefølge
+      # som check-ud (packages/airbnb_checkout.yaml) — kopieret bevidst, fordi
+      # den er en hardware-sandhed, ikke en parameter.
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_mode}
+        data: {option: deep}
+        continue_on_error: true
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+        data: {option: intense}
+        continue_on_error: true
+      - service: vacuum.set_fan_speed
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data: {fan_speed: max}
+        continue_on_error: true
+      # --- Robot: stempel FØR start (samme rækkefølge som check-ud) ---
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_manual_start_at}
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_select.select_option
+        target: {entity_id: input_select.roborock_session_type}
+        data: {option: full}
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.roborock_session_active}
+      - service: vacuum.start
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        continue_on_error: true
+      # Fasen sættes FØR mode-flippet, så der ikke findes et vindue hvor huset
+      # er AirBnB uden en nedtælling. Sluttidspunktet regnes ud HER, af
+      # knaptrykket — ikke af en senere automation.
+      - service: input_text.set_value
+        target: {entity_id: input_text.airbnb_checkin_prep_fase}
+        data:
+          value: >-
+            klar:{{ (now().timestamp()
+                     + (states('input_number.airbnb_checkin_dormant_min')
+                        | float(60) * 60)) | round(0) | int }}
+      - service: input_select.select_option
+        target: {entity_id: input_select.house_mode}
+        data: {option: AirBnB}
+      - service: logbook.log
+        data:
+          name: "AirBnB"
+          message: >-
+            {% set m = states('input_number.airbnb_checkin_dormant_min')
+                       | float(60) | round(0) | int %}
+            CHECK-IN: grundig rengøring startet (deep mop + intense + max fan)
+            og house_mode → AirBnB. Huset går Dormant om {{ m }} min, kl.
+            {{ (now() + timedelta(minutes=m)).strftime('%H:%M') }}.
+          entity_id: input_select.house_mode
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Nedtællingen er udløbet → tving Dormant
+  # ---------------------------------------------------------------------------
+  - id: airbnb_checkin_prep_dormant
+    alias: "AirBnB check-in: nedtælling udløbet → Dormant + sluk"
+    description: >
+      2026-09-09d (B116b). Ren time_pattern-vej med condition-template, ikke en
+      `for:`-trigger: en HA-restart dræber ethvert ventende `for:` (permanent
+      faktum), og hele pointen med nedtællingen er at den skal overleve.
+      Handlingen sætter `house_state` DIREKTE i stedet for at gå via
+      `input_boolean.manual_dormant_override` — se filhovedet.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: template
+        value_template: >-
+          {% set f = states('input_text.airbnb_checkin_prep_fase') %}
+          {{ f is string and f.startswith('klar:')
+             and now().timestamp() >= (f.split(':')[1] | float(0)) }}
+    action:
+      # Ryd fasen FØRST — sluk-sweep'en tager op mod 15 s, og en `mode: single`
+      # der stadig kører er ikke en garanti hvis nogen reloader midt i det.
+      - service: input_text.set_value
+        target: {entity_id: input_text.airbnb_checkin_prep_fase}
+        data: {value: ""}
+      - if:
+          - condition: state
+            entity_id: input_select.house_mode
+            state: "AirBnB"
+        then:
+          - service: input_select.select_option
+            target: {entity_id: input_select.house_state}
+            data: {option: "Dormant"}
+          # Samme regel som sensor-vejen — fred rum med blind occupancy-kanal
+          # (B124). Delt script, ikke en kopi (fejlklasse #2).
+          - service: script.airbnb_dormant_lys_sweep
+            data:
+              transition: 15
+          - service: logbook.log
+            data:
+              name: "AirBnB"
+              message: >-
+                CHECK-IN: nedtællingen er udløbet — huset er sat i Dormant og
+                lyset slukket. Klar til gæsten.
+              entity_id: input_select.house_state
+        else:
+          - service: logbook.log
+            data:
+              name: "AirBnB"
+              message: >-
+                CHECK-IN: nedtællingen udløb, men huset er ikke længere i
+                AirBnB ({{ states('input_select.house_mode') }}) — Dormant
+                sprunget over, fasen ryddet.
+              entity_id: input_select.house_mode

@@ -1,0 +1,406 @@
+# =============================================================================
+# "Er børnene overhovedet her i eftermiddag?" — kids_home-spærre før puttelys
+# =============================================================================
+# user-spec 2026-09-16: "Hvis en eftermiddag/aften ikke har børne detection så
+# skal børn hjemme slås fra før puttelys tænder."
+#
+# HVORFOR DET ER ET PROBLEM: binary_sensor.kids_home er en OR af fire signaler,
+# og det stærkeste af dem — boern_sov_her_i_nat — er en LATCH der sættes 06:30
+# ud fra sidste nats søvn og holder hele døgnet. Tager børnene et andet sted hen
+# efter skole, står latch'en stadig på "hjemme" kl. 18:30, putte-vinduet åbner,
+# og puttelyset kører en nedtrapning i et tomt værelse. Ingen af de fire
+# signaler kan opdage at børnene FORLOD huset — de er alle beviser for at nogen
+# HAR været her, aldrig for at nogen er her nu.
+#
+# HVAD DER BLEV MÅLT 16/9 (recorder 09-02 → 09-16):
+# Kumulativ occupancy i børneværelset kl. 14:00-18:30, pr. døgn hvor børnene
+# beviseligt sov hjemme (input_boolean.boern_sov_her_i_nat):
+#     09-02  33,5 min      09-12  11,2 min
+#     09-03  16,6 min      09-13  40,0 min
+#     09-04   3,5 min      09-14   1,6 min
+#                          09-15   3,7 min
+# Laveste BØRN-HJEMME-eftermiddag er 1,6 min. Og de dage børnene var VÆK
+# (09-05 → 09-11, AirBnB) har slet ingen målinger — Apolloen var offline, fordi
+# gæster slukker vægkontakter. Der findes altså INGEN målt "børn væk"-population
+# at adskille fra.
+#
+# KONSEKVENSEN FOR TÆRSKLEN: man kan ikke sætte "under X minutter = ingen børn",
+# for X skulle ligge under 1,6 min og over en population vi aldrig har set.
+# Derfor er kravet **nul** — enhver occupancy i børneværelset siden skæringen
+# tæller som bevis. Det er bevidst det mest konservative valg der stadig gør
+# noget: over de 7 målte døgn ville spærren ikke være udløst én eneste gang.
+# Slideren findes så tærsklen kan hæves når der ER data på børn-væk-dage.
+#
+# 2026-10-02 — FØRSTE MÅLTE BØRN-VÆK-DAG (user: "har været alene hjemme siden
+# parent_b tog afsted i morges"): spærren fyrede IKKE. Børneværelset havde
+# 3,3 min efter 14:00 — mere end børne-dagen 1/10 (1,9 min) — fordelt på 11
+# udslag ≤ 27 s, alle samtidig med køkken/spisestue (user der går forbi; rummets
+# Apollo ser også ud i open plan). Minutter kan altså ikke skille; LÆNGSTE
+# ophold kan: børne-eftermiddagene 28/9-1/10 havde 82-4120 s. → k1 kræver nu
+# også ét ophold der har holdt boern_ophold_bevis_sekunder (60). 18/9
+# (afleveringsdag, 183 s kl. 17:56) havde ikke fyret heller — tvetydig, børnene
+# kan være taget af sted om aftenen. Spærren åbner nu også people-gulvets
+# vindue (people_gulv_genmaal_boern_off), så antallet kan falde uden en dør.
+#
+# RETNINGEN PÅ FEJLEN er ikke symmetrisk. Spærrer vi forkert, står et barn uden
+# natlys — det er den dyre fejl. Spærrer vi ikke, brænder et lys i et tomt rum.
+# Derfor: (a) nul-tærskel, (b) tre uafhængige bevis-kanaler i OR, (c) spærren
+# ophæves i det SEKUND et bevis dukker op — også midt i putningen, (d) brugerens
+# egen kids_home_manual slår altid spærren, (e) push med fortryd-knap.
+#
+# BEMÆRK at børneværelsets egen Apollo er et svagt eftermiddags-vidne: børnene
+# er i køkkenet og stuen indtil sengetid, ikke på værelset (derfor 1,6 min den
+# 14/9). Det er præcis DERFOR køkkenets lave-krop-detektor er den tredje kanal
+# her — se packages/koekken_kamera_krop.yaml.
+# =============================================================================
+
+input_boolean:
+  # Fejlklasse #21: kill-switchen skal være en condition på hver vej ind.
+  # Læses af tjekket herunder OG af oprydningen.
+  boern_eftermiddag_tjek_enabled:
+    name: "Børn: tjek om de er set i eftermiddag"
+    icon: mdi:calendar-question
+
+  # Spærren selv. Læses af binary_sensor.kids_home (packages/activity_state.yaml).
+  # INTET `initial:` — den skal overleve en restart, ellers ville et HA-genstart
+  # midt i putte-vinduet lydløst give børn-hjemme tilbage (fejlklasse: initial
+  # RESTORER ikke, den PÅTVINGER).
+  boern_ikke_set_i_eftermiddag:
+    name: "Børn: ikke set i eftermiddag (spærre)"
+    icon: mdi:account-child-outline
+
+input_text:
+  # 2026-10-07 (user-bug "der er ingen børn hjemme heller. jeg troede jeg nu
+  # bliver spurgt"): DATOEN for hvornår kids_home_manual sidst blev sat
+  # (YYYY-MM-DD). En force-on fra en tidligere dag er en påstand om DEN dag,
+  # ikke om i dag — se boern_eftermiddag_spaer. input_text fordi det er husets
+  # gratis helper-reload; last_changed duer ikke (nulstilles ved genstart).
+  # Urørt = 'unknown' ≠ dagens dato = "ikke sat i dag" (den sikre læsning).
+  kids_home_manual_dato:
+    name: "Børn hjemme (manuel): sat dato"
+    icon: mdi:calendar-account
+    max: 10
+
+input_number:
+  # Skæringen. Før dette klokkeslæt er børnene i skole/institution, så
+  # fraværende bevis betyder ingenting.
+  boern_eftermiddag_fra_time:
+    name: "Børn: eftermiddags-tjek måler fra (time)"
+    icon: mdi:clock-start
+    min: 10
+    max: 18
+    step: 1
+    unit_of_measurement: "t"
+    mode: slider
+
+  # Hvor lang tid FØR putte-vinduet der tjekkes. Skal være stort nok til at
+  # pushen når frem og kan fortrydes, før lyset gør noget.
+  boern_eftermiddag_tjek_min_foer:
+    name: "Børn: tjek så mange minutter før putte-vinduet"
+    icon: mdi:timer-alert
+    min: 5
+    max: 60
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 0 = enhver occupancy tæller som bevis. Se måle-tabellen i headeren for
+  # hvorfor det ikke er et gæt.
+  boern_eftermiddag_bevis_min:
+    name: "Børn: minutter på værelset der tæller som bevis"
+    icon: mdi:timer-check
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # 2026-10-02 (user: "du burde ku se at de ikke er hjemme. people count burde
+  # være 1"): et ENKELT ophold på værelset skal have holdt så mange sekunder før
+  # det er bevis — her for spærren (siden skæringen) og i people-kæden før
+  # skæringen (packages/people_estimate.yaml → people_boern_set). Målt 14 døgn:
+  # afleverings-dagen 2/10 (user alene fra 07:19) havde 11 udslag efter 14:00,
+  # længste 27 s, alle samtidig med køkken/spisestue = user der går forbi; de
+  # fire børne-eftermiddage med latch 28/9-1/10 havde længste ophold 243 /
+  # 4120 / 198 / 82 s. 60 ligger midt imellem; 120 ville have spærret 1/10.
+  # NB: voksne laver også lange ophold derinde (børnefri uge: 26 af 105 dag-
+  # udslag ≥ 60 s) — kravet skiller et forbi-gå, ikke en voksen der rydder op.
+  # 0 = enhver occupancy tæller (adfærden før 2/10).
+  # 2026-10-07: people-kæden bruger den IKKE længere — den tæller på
+  # binary_sensor.boernevaerelse_solo_bevis (input_number.people_boern_solo_
+  # sekunder), fordi et 60-s hold også fanger en voksen ved spisebordet gennem
+  # væggen (og under 900-s-natte-timeouten holder ethvert blip 15 min).
+  boern_ophold_bevis_sekunder:
+    name: "Børn: ét ophold på værelset der tæller som bevis"
+    icon: mdi:timer-check-outline
+    min: 0
+    max: 600
+    step: 10
+    unit_of_measurement: "s"
+    mode: box
+sensor:
+  # Kumulativ occupancy siden skæringen. history_stats og IKKE et
+  # condition-template: en analog/binær sensors last_changed nulstilles ved
+  # hvert report og kan aldrig bevise "sammenlagt N minutter" (fejlklasse #14).
+  #
+  # NB: `type: time` rapporterer i TIMER, ikke minutter — navnet siger derfor
+  # timer, og hver forbruger ganger selv med 60. Et "minutter"-navn på en
+  # time-værdi ville gøre en tærskel på 5 til 300 uden at nogen opdagede det.
+  - platform: history_stats
+    name: "Boern vaerelse eftermiddag timer"
+    unique_id: boern_vaerelse_eftermiddag_timer
+    entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+    state: "on"
+    type: time
+    start: >-
+      {{ today_at('%02d:00' | format(
+           states('input_number.boern_eftermiddag_fra_time') | int(14))) }}
+    end: "{{ now() }}"
+
+template:
+  # Stempel for SENESTE ophold i børneværelset der har holdt
+  # boern_ophold_bevis_sekunder. Trigger-baseret = restaureres ved genstart.
+  # Læses af boern_set_i_eftermiddag (k1) herunder; people-kæden har sin egen
+  # `for:`-trigger på samme slider.
+  - trigger:
+      - platform: state
+        entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+        from: "off"
+        to: "on"
+        for:
+          seconds: "{{ states('input_number.boern_ophold_bevis_sekunder') | int(60) }}"
+    sensor:
+      - name: "Boern vaerelse ophold holdt"
+        unique_id: boern_vaerelse_ophold_holdt
+        icon: mdi:timer-check
+        device_class: timestamp
+        state: "{{ now().isoformat() }}"
+  - binary_sensor:
+      # Har vi set et barn siden skæringen? Tre uafhængige kanaler i OR.
+      - name: "Boern set i eftermiddag"
+        unique_id: boern_set_i_eftermiddag
+        icon: mdi:account-child
+        state: >-
+          {% set fra = today_at('%02d:00' | format(
+               states('input_number.boern_eftermiddag_fra_time') | int(14))) %}
+          {% set krav = states('input_number.boern_eftermiddag_bevis_min') | float(0) %}
+          {# history_stats leverer TIMER — ganges til minutter her. #}
+          {% set timer = states('sensor.boern_vaerelse_eftermiddag_timer') | float(-1) %}
+          {% set vaerelse = -1 if timer < 0 else (timer * 60) %}
+          {# Kanal 1: tid på børneværelset. -1 = sensoren svarer ikke endnu;
+             det er IKKE nul minutter, og må derfor læses som bevis (fejl-åbent
+             — en tavs kanal må ikke kunne slukke et barns natlys). #}
+          {# 2026-10-02: + ét ophold der har HOLDT boern_ophold_bevis_sekunder
+             siden skæringen. Forbi-gående voksne giver mange korte udslag og
+             fyldte minut-kravet alene (2/10: 11 udslag, længste 27 s).
+             'unavailable' = fejl-åbent som ovenfor; 'unknown' = aldrig set. #}
+          {% set n = states('input_number.boern_ophold_bevis_sekunder') | float(0) %}
+          {% set hs = states('sensor.boern_vaerelse_ophold_holdt') %}
+          {% set holdt = hs == 'unavailable' or as_timestamp(hs, 0) >= fra.timestamp() %}
+          {% set k1 = vaerelse < 0 or (vaerelse > krav and (n <= 0 or holdt)) %}
+          {# Kanal 2: ankomst-detektoren (sammenhængende ophold på værelset). #}
+          {% set k2 = is_state('input_boolean.boern_aktivitet_detekteret', 'on') %}
+          {# Kanal 3: køkkenets lave passager. Sporet er "<antal>:<start>:<sidst>";
+             det tæller kun hvis FØRSTE passage ligger efter skæringen, ellers
+             ville formiddagens spor bevise eftermiddagen. #}
+          {% set spor = states('input_text.koekken_lav_krop_spor') %}
+          {% set dele = spor.split(':') if ':' in spor else [] %}
+          {% set k3 = dele | length >= 2
+                      and (dele[0] | int(0)) > 0
+                      and (dele[1] | int(0)) >= fra.timestamp() %}
+          {{ k1 or k2 or k3 }}
+        attributes:
+          vaerelse_minutter: >-
+            {% set timer = states('sensor.boern_vaerelse_eftermiddag_timer') | float(-1) %}
+            {{ -1 if timer < 0 else (timer * 60) | round(1) }}
+          ophold_holdt: "{{ states('sensor.boern_vaerelse_ophold_holdt') }}"
+          kanal_ankomst: >-
+            {{ is_state('input_boolean.boern_aktivitet_detekteret', 'on') }}
+          kanal_koekken: >-
+            {% set spor = states('input_text.koekken_lav_krop_spor') %}
+            {{ spor.split(':')[0] | int(0) if ':' in spor else 0 }}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Spær kids_home hvis ingen af kanalerne har set et barn
+  # ---------------------------------------------------------------------------
+  - id: boern_eftermiddag_spaer
+    alias: "Børn: ingen børne-detektion i eftermiddag → spær børn hjemme"
+    description: >
+      Fyrer én gang, et stykke før putte-vinduet åbner. Ser ingen af de tre
+      kanaler et barn siden skæringen, sættes spærren så puttelyset ikke kører
+      en nedtrapning i et tomt værelse.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      # Template-trigger frem for time_pattern: den fyrer PÅ overgangen til
+      # sand i stedet for at vågne 288 gange i døgnet for at finde ud af at der
+      # ikke er noget at lave (fejlklasse #7).
+      - platform: template
+        value_template: >-
+          {% set s = states('input_datetime.putning_vindue_start') %}
+          {% set s = '18:30:00' if s in ['unknown','unavailable','none','00:00:00'] else s %}
+          {% set foer = states('input_number.boern_eftermiddag_tjek_min_foer') | int(15) %}
+          {% set tjek = today_at(s) - timedelta(minutes=foer) %}
+          {{ now() >= tjek and now() < (tjek + timedelta(minutes=5)) }}
+    condition:
+      - condition: state
+        entity_id: input_boolean.boern_eftermiddag_tjek_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.boern_set_i_eftermiddag
+        state: "off"
+      # Spærren giver kun mening hvis huset i forvejen tror børnene er hjemme.
+      - condition: state
+        entity_id: binary_sensor.kids_home
+        state: "on"
+      # Brugerens eget "børnene ER hjemme" slår maskinen — men kun den dag det
+      # blev sagt. 2026-10-07: en force-on fra mandag 5/10 12:51 stod stadig
+      # tirsdag og onsdag, hvor børnene var væk; tjekket så intet barn begge
+      # eftermiddage og sprang over begge gange (og kids_home-templaten lader
+      # force-on slå spærren). Fredags-clearet var eneste udløb.
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.kids_home_manual', 'off')
+             or states('input_text.kids_home_manual_dato') != now().strftime('%Y-%m-%d') }}
+      # Ikke i AirBnB: kids_home er allerede tvunget false dér, og der må ikke
+      # sendes push med gæstens telefon i huset.
+      - condition: template
+        value_template: >-
+          {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.boern_ikke_set_i_eftermiddag
+      # En force-on fra en tidligere dag ville vinde over spærren i kids_home →
+      # slå den fra. "De ER hjemme" i pushen sætter den igen (med dagens dato).
+      - variables:
+          gammel_manuel: "{{ is_state('input_boolean.kids_home_manual', 'on') }}"
+      - if:
+          - condition: template
+            value_template: "{{ gammel_manuel }}"
+        then:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.kids_home_manual
+      - service: logbook.log
+        data:
+          name: "Børn eftermiddag"
+          message: >-
+            {{ 'Manuel "børn hjemme" fra '
+               ~ states('input_text.kids_home_manual_dato') ~ ' slået fra. '
+               if gammel_manuel else '' }}Ingen børne-detektion siden kl.
+            {{ states('input_number.boern_eftermiddag_fra_time') | int(14) }} —
+            børneværelset
+            {{ state_attr('binary_sensor.boern_set_i_eftermiddag', 'vaerelse_minutter') }}
+            min, ankomst-flag
+            {{ state_attr('binary_sensor.boern_set_i_eftermiddag', 'kanal_ankomst') }},
+            køkken-passager
+            {{ state_attr('binary_sensor.boern_set_i_eftermiddag', 'kanal_koekken') }}.
+            Børn hjemme spærret før putte-vinduet.
+      # Master-toggle (user 2026-10-11: "master toggle skal også slå dem fra").
+      - if:
+          - condition: state
+            entity_id: input_boolean.notifikationer_master_enabled
+            state: "on"
+        then:
+          - service: notify.mobile_app_phone_a
+            data:
+              title: "🧒 Ingen børn set i eftermiddag"
+              message: >-
+                Børn-hjemme er slået fra{{ ' (også din manuelle fra '
+                ~ states('input_text.kids_home_manual_dato') ~ ')' if gammel_manuel else '' }},
+                så puttelyset ikke kører i et tomt værelse. Børneværelset har haft
+                {{ state_attr('binary_sensor.boern_set_i_eftermiddag', 'vaerelse_minutter') }}
+                min aktivitet siden kl.
+                {{ states('input_number.boern_eftermiddag_fra_time') | int(14) }}.
+                Spærren ophæves af sig selv hvis nogen af kanalerne ser et barn.
+              data:
+                actions:
+                  - action: "BOERN_ER_HJEMME"
+                    title: "De ER hjemme"
+
+  # ---------------------------------------------------------------------------
+  # Ophæv spærren i det sekund et bevis dukker op
+  # ---------------------------------------------------------------------------
+  - id: boern_eftermiddag_ophaev
+    alias: "Børn: bevis dukkede op → ophæv spærren"
+    description: >
+      Spærren må aldrig overleve sit eget grundlag. Går en af kanalerne varm —
+      også midt i putningen — skal børn-hjemme tilbage med det samme, og
+      puttelyset skal kunne køre. Fejlklasse #4: uden denne vej ville flanken
+      være tabt for altid, fordi tjekket kun fyrer én gang i døgnet.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.boern_set_i_eftermiddag
+        from: "off"
+        to: "on"
+        id: bevis
+      - platform: state
+        entity_id: input_boolean.kids_home_manual
+        from: "off"
+        to: "on"
+        id: manuel
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "BOERN_ER_HJEMME"
+        id: knap
+      # Ny dag: spærren må ikke bære over. Samme klokkeslæt som køkken-sporets
+      # natlige rydning, så de to ikke kan komme i utakt.
+      - platform: time
+        at: "03:30:00"
+        id: nat
+    # 2026-10-07: knappen sendes nu også af 06:30-latchen (tom nat → manuel
+    # "børn hjemme" slået fra), hvor der ingen spærre er — den skal stadig
+    # sætte force-on.
+    condition:
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.boern_ikke_set_i_eftermiddag', 'on')
+             or (trigger is defined and trigger.id == 'knap') }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.boern_ikke_set_i_eftermiddag
+      # Trykker brugeren "De ER hjemme", er det en påstand om virkeligheden, ikke
+      # bare en fortrydelse — så sættes force-on, ellers ville spærren kunne
+      # sætte sig selv igen i morgen uden at have lært noget.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ trigger is defined and trigger.id == 'knap' }}
+        then:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.kids_home_manual
+      - service: logbook.log
+        data:
+          name: "Børn eftermiddag"
+          message: >-
+            Spærren ophævet
+            ({{ trigger.id if trigger is defined else 'ukendt' }}) — børn hjemme
+            er tilbage.
+
+  # ---------------------------------------------------------------------------
+  # Stempl datoen når force-on sættes — uanset kilde (app, "De ER hjemme",
+  # dashboard). `from: "off"`: en genstart restaurerer `on` uden off-flanke,
+  # så den skriver ikke en falsk "i dag".
+  # ---------------------------------------------------------------------------
+  - id: kids_home_manual_stempl_dato
+    alias: "Børn: manuel 'børn hjemme' sat → stempl dato"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_boolean.kids_home_manual
+        from: "off"
+        to: "on"
+    action:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.kids_home_manual_dato
+        data:
+          value: "{{ now().strftime('%Y-%m-%d') }}"

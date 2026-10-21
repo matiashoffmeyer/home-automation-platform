@@ -1,0 +1,395 @@
+# =============================================================================
+# TAPO-KAMERAET: JUSTERBARE TÆRSKLER FOR STEMME- OG GESTUS-KOMMANDOER
+# =============================================================================
+# User-spec 2026-09-16: "giv mig først sliders til at justere voice og gesture
+# commands og læg alle sliders og knapper der har med tapo at gøre på en ha
+# side for sig". Siden er fanen 📷 Tapo i `dashboards/settings.yaml` (flyttet
+# ind fra eget dashboard 2026-09-30).
+#
+# HVER default herunder er en MÅLT værdi, ikke et gæt — og målingerne står i
+# koden de kom fra:
+#   · stemme-tærsklerne   → docstring i /config/addons/gesture_frame_shim/shim.py
+#                            (`class VoiceWatcher`) + B145 i BACKLOG.md
+#   · gestus-tærsklerne   → automations/gestus_koekken.yaml linje ~100-145
+# Sliderne er der for at kunne NUDGE dem i hverdagen. Skal en værdi flyttes
+# permanent, hører begrundelsen samme sted som den oprindelige måling, og
+# defaulten herunder skal følge med (📏-reglen: ellers nedarves en fejl og
+# vokser, fordi slider og note siger to forskellige ting).
+#
+# HVORDAN DE NÅR FREM:
+#   · GESTUS læses direkte i `automations/gestus_koekken.yaml` (`variables:`)
+#     → virker i samme sekund du slipper slideren.
+#   · STEMME læses af SHIMMEN selv, som poller HA hvert 20. sekund via
+#     /api/template (ét kald for alle seks, ikke seks kald). Add-on'ets egne
+#     `voice_*`-options er dermed kun et GULV: de bruges ved opstart og hvis HA
+#     ikke svarer. Det er med vilje — ellers ville hver justering koste en
+#     add-on-genstart, og en genstart river RTSP-sessionen ned.
+#
+# ⚠️ AirBnB: mikrofonen er under samme forbud som linsen (user-spec: kameraet
+# er hevet ud og pakket væk). Sliderne her ændrer INTET ved det — gaten sidder
+# i `GuestModeGate` i shimmen og i stemme-automationens condition. Skru man
+# tærsklen helt i bund, står forbuddet stadig.
+# =============================================================================
+
+input_boolean:
+  # --- KILL-SWITCHES PR. KOMMANDO-ORD (user-spec 2026-09-16) ---------------
+  # `input_boolean.voice_kommandoer_enabled` (packages/voice_commands.yaml) er
+  # HOVEDAFBRYDEREN og bliver ved med at være det: står den off, er der ingen
+  # stemme-vej overhovedet. Disse tre sidder UNDER den og slår ét ord fra ad
+  # gangen — fx hvis "timer" fanger for meget under madlavning, mens man stadig
+  # vil kunne sige "party time".
+  #
+  # Fejlklasse #21: et kill-switch der ikke er en `condition` på HVER vej ind
+  # er pynt. Hvert ord har to veje — Assist-sætningen og køkken-mikrofonen — og
+  # begge er gatet. Vejene står i `packages/voice_commands.yaml`; tilføjer du en
+  # tredje (fx en knap på et wall-panel), skal den have samme condition.
+  #
+  # DE RØRER IKKE KNAPPERNE. `script.party_time` og `script.auto_mode` kaldes
+  # også fra dashboards og scener, og et bevidst tryk er ikke et talt ord — så
+  # gaten sidder på STEMME-vejene, ikke inde i scriptet. Undtagelsen er timeren:
+  # `script.koekken_timer_stemme` har KUN stemme-veje ind (gestus-timeren fyrer
+  # `koekken_gestus_start` direkte), så dér er scriptet selv chokepunktet.
+  voice_cmd_party_time:
+    name: "🎙️ Kommando: 'Party Time'"
+    icon: mdi:party-popper
+  voice_cmd_auto_mode:
+    name: "🎙️ Kommando: 'Auto Mode'"
+    icon: mdi:home-automation
+  voice_cmd_timer:
+    name: "🎙️ Kommando: 'Timer N minutes'"
+    icon: mdi:timer-outline
+
+  # Gestus-halvdelen havde INGEN afbryder før nu — kun house_mode kunne stoppe
+  # den, og det er en tilstand man ikke flipper for at slippe for et kamera i et
+  # par timer. Den er en condition både på MQTT-oversætteren OG på scan-løkkens
+  # `while:`, så et flip midt i en madlavning stopper bygerne med det samme
+  # (samme mønster som AirBnB-gaten dér — #21).
+  gestus_kommandoer_enabled:
+    name: "✋ Gestus-kommandoer aktive"
+    icon: mdi:hand-wave
+
+input_number:
+  # --- STEMME ------------------------------------------------------------
+  # Hvor kraftig lyden skal være før shimmen overhovedet betragter den som en
+  # mulig ytring. For LAVT = hver gryde bliver en kandidat og STT'en kommer
+  # bagud (målt: 21 regioner på 45 s kostede 51 s STT — den indhenter aldrig
+  # sig selv igen). For HØJT = man skal råbe.
+  stemme_taerskel_dbfs:
+    name: "🎙️ Stemme: lydtærskel"
+    min: -60
+    max: -10
+    step: 1
+    unit_of_measurement: "dBFS"
+    icon: mdi:volume-high
+
+  # Zero-crossing rate — husets skarpeste tale/støj-skel. MÅLT over 150 s tomt
+  # køkken (76 regioner) mod seks kendte kommandoer: alle seks lå på ≤ 95,
+  # al støj i samme varighedsbånd lå på ≥ 118. 110 er lagt tæt på støj-siden
+  # med vilje: en misset kommando opdager man og gentager, mens støj der
+  # slipper igennem kun koster CPU — allowlisten nægter stadig at handle.
+  stemme_zcr_max:
+    name: "🎙️ Stemme: max zero-crossings (tale vs. støj)"
+    min: 20
+    max: 400
+    step: 5
+    unit_of_measurement: "zcr"
+    icon: mdi:waveform
+
+  # Ytringens længde. STT'en returnerer TOM streng for alt meget længere end
+  # en sætning (9-14 s vinduer genkendte intet, med sætningen midt i), så
+  # udklipningen er en forudsætning, ikke en finpudsning.
+  stemme_min_laengde_sek:
+    name: "🎙️ Stemme: korteste ytring"
+    min: 0.3
+    max: 3.0
+    step: 0.1
+    unit_of_measurement: "s"
+    icon: mdi:arrow-collapse-horizontal
+  stemme_max_laengde_sek:
+    name: "🎙️ Stemme: længste ytring"
+    min: 1.0
+    max: 10.0
+    step: 0.5
+    unit_of_measurement: "s"
+    icon: mdi:arrow-expand-horizontal
+
+  # Pause efter en ACCEPTERET kommando, pr. kommando. Beskytter mod at én
+  # sætning bliver til to handlinger.
+  stemme_cooldown_sek:
+    name: "🎙️ Stemme: pause efter accepteret kommando"
+    min: 0
+    max: 120
+    step: 1
+    unit_of_measurement: "s"
+    icon: mdi:timer-sand
+
+  # Krops-gaten: hvor længe siden der senest skal være set en krop (kamera
+  # ELLER radar) for at en ytring må tælle. Findes fordi STT'en IKKE har nogen
+  # confidence-score — `transcript`-eventen bærer kun tekst — så afvisningen
+  # skal komme fra et ANDET instrument. Målt 2026-09-16: et tomt køkken
+  # transskriberede 'timer eight minute', en komplet kommando, af ren klirren.
+  # Kamera og radar er blinde hver sin vej (kameraet melder BEVÆGELSE og ser
+  # ikke en der står stille; radaren holder et stille mål), så gaten er deres
+  # ELLER. Sænkes den under ~30 s, rammer den den der står stille og taler.
+  stemme_krop_vindue_sek:
+    name: "🎙️ Stemme: krop set inden for"
+    min: 5
+    max: 600
+    step: 5
+    unit_of_measurement: "s"
+    icon: mdi:motion-sensor
+
+  # Hvor længe kameraet skal BLIVE ved med at kigge efter det sidste livstegn
+  # (user-spec 2026-09-17). Gaten der starter og holder scannings-løkken kørende
+  # læste før kun `binary_sensor.koekken_apollo_radar_moving_target` == on, uden
+  # hale — og det er præcis den forkerte kanal at læse øjebliksbilledet af:
+  # BÅDE en hånd der holdes stille foran kameraet OG en person der står stille
+  # og taler er pr. definition uden bevægelse. Man beder altså om at blive set i
+  # det sekund instrumentet holder op med at se én.
+  #
+  # Halen gælder begge kanaler (radar ELLER kamera-krop), fordi de er blinde
+  # hver sin vej — samme ELLER som stemme-gaten inde i add-on'et bruger. Kamera-
+  # halvdelen er bevidst kun en FORLÆNGER, aldrig en starter: kameraet kan pr.
+  # konstruktion ikke se en krop når løkken ikke kører, så radaren er den eneste
+  # der kan åbne døren. Og krop-kanalen er målt til kun at være `on` 19 % af
+  # tiden med folk i køkkenet — den duer som "her er nogen", aldrig som "her er
+  # ingen".
+  #
+  # Prisen er CPU: 60 s hale efter hver passage på en 2-kernet Broadwell der
+  # også bærer Matter, OTBR, ZHA og recorder. Sæt den ned hvis add-on'et begynder
+  # at hakke; 0 giver den gamle adfærd tilbage.
+  kamera_kigge_haleslaeb_sek:
+    name: "🎥 Kamera: kig videre efter sidste livstegn"
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "s"
+    icon: mdi:motion-play-outline
+
+  # 2026-09-24 (user-spec: "hold kameraet igang når der er nogen i open plan,
+  # hold det tændt 5min efter tomt open plan"). Målt samme dag: kommer man ind
+  # i et køkken hvor kameraet har sovet, går der ~17 s (RTSP-koldstart) før
+  # hånd-add-on'et ser første billede — den første fagt tabes. Denne hale
+  # holder scan-løkken (og dermed streamen) varm så længe
+  # binary_sensor.open_plan_occupied er on + N min efter. 0 = kun den gamle
+  # radar/krop-hale ovenfor. Prisen er CPU; stue-Apolloen latcher i timevis.
+  kamera_openplan_hale_min:
+    name: "🎥 Kamera: hold varm efter tomt open plan"
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:sofa-outline
+
+  # --- GESTUS ------------------------------------------------------------
+  # Hvor mange frames i træk det samme fingertal skal stå. Kadencen er MÅLT
+  # til 1,05 s/frame, så 4 frames ≈ 4,2 s bevidst hold.
+  # Tallet er ikke et gæt: 15/9 fyrede to utilsigtede timere (Parent B bevægede
+  # sig bare i køkkenet), begge ramte præcis 3 frames. Over 93 striber samme
+  # dag lå HVER eneste stribe på ≥ 4 frames inde i en kontrolleret kalibrering
+  # — alle tilfældige køkken-hænder toppede ved 3.
+  # 2026-09-17 (user-spec): sænket 6 → 4. 4 er toppen af den utilsigtede
+  # population plus ét frame, altså den LAVESTE værdi der stadig ligger over
+  # hver eneste målte falske hånd. 6 var en ekstra margen oven i målingen og
+  # kostede to sekunders hold hver gang. Marginen er nu ét frame: kommer de
+  # falske timere igen, er 5 næste skridt — 3 er målt farligt.
+  # 2026-09-24 (user: "skal stå med hånden oppe i evigheder"): 4 → 3, og
+  # knytnæven 3 → 2. "3 er farligt" blev målt FØR størrelses-gaten
+  # (gestus_haand_skala_pct 65): de tilfældige 3-frames-hænder var de FJERNE,
+  # og krukke-testen gav 0 detektioner ved 65 %. Kommer falske timere igen,
+  # så sænk skalaen (60) før du hæver holdet.
+  # 2026-10-04: 3 → 2 (user, fra appen).
+  # 2026-10-05 (user: "utilsigtet på 1.5m afstand"): HOLDET KAN IKKE SKILLE
+  # DEM. Add-on-loggen ec:09:9b-6a:c0:11 viser en fjern venstre hånd læst som
+  # `four_fingers` i SEKS frames i træk (score 0,90-0,94, håndfladen mod
+  # linsen) — den ville have fyret ved ethvert hold op til 6. Afstanden
+  # afgøres nu af `gestus_min_haand_px` nedenfor; holdet er kun værn mod en
+  # hånd der PASSERER et fingertal.
+  # 2026-09-24 (user: "den ser min hånd på lang afstand når jeg tager
+  # krukker … den burde kun tage fagter ind som er tæt på"). Shimmen
+  # formindsker billedet hånd-add-on'et får til denne procent (centreret på
+  # sort), så fjerne hænder bliver for små til MediaPipes palme-detektor.
+  # Målt på add-on'ets egne snapshots: tæt, bevidst hånd ~400 px høj i
+  # 1280x720, krukke-greb ~100 px. 100 = uændret billede. KALIBRERET 65
+  # (24/9): 50 tabte bevidste fagter, 65 fangede dem (~450 px) og intet
+  # krukke-greb på ~1 min. Kommer fjerne hænder igen: 60. Læses live af
+  # shimmen (v0.12.0) hvert 20. sek — ingen genstart.
+  # 2026-09-28 (user: "knytnæve virker når jeg tager hånden 5cm fra kameraet
+  # … skal virke på 50cm afstand også. men ikke længere"): 65 → 100.
+  # Kalibreringen 24/9 var på ÅBNE hænder; en knytnæve er langt mindre og
+  # skulle helt op til linsen ved 65. Sweep med knytnæve på 50 cm, 15 s pr.
+  # trin: 70 % 0/14 frames, 80 % 1/14, 90 % 1/13, 100 % 3/14 — og timeren blev
+  # først annulleret ved 100. User: "brug den info til alle håndfagter, laver
+  # ikke fagter længere væk". PRISEN: 100 er det billede der så krukke-greb
+  # 24/9; værnet er nu kun hold-kravet (3 frames / knytnæve 2). Samme sweep
+  # læste knytnæven på 50 cm som `four_fingers` (score 1,0) og `call_me` i
+  # enkelte frames — et enkelt frame kan ikke starte en timer.
+  # 2026-10-05: skalaen kan IKKE holde grænsen. Det der afgør om palme-
+  # detektoren ser en hånd er dens FORM, ikke størrelsen: en knytnæve på
+  # 50 cm kræver fuldt billede (3/14), en åben hånd på 1,5 m ses i 6 frames i
+  # træk ved 100 %. Lad den stå på 100; afstanden ejes nu af
+  # `gestus_min_haand_px`.
+  gestus_haand_skala_pct:
+    name: "✋ Gestus: billed-størrelse til hånd-genkendelsen"
+    min: 30
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    icon: mdi:hand-back-right-off-outline
+
+  # 2026-10-05 (user: "tapo registrerer igen finger gestures på alt for lang
+  # afstand … utilsigtet på 1.5m afstand"; 28/9: "skal virke på 50cm afstand
+  # også. men ikke længere"). Tre timere fyrede 15:02-15:06 fra én venstre
+  # hånd ved køkkenbordet (træner-svar: utilsigtet). Hverken holdet eller
+  # skalaen kan skille en fjern ÅBEN hånd fra en nær KNYTNÆVE — se
+  # kommentarerne ovenfor. Shimmen (v0.16.0, `PalmGate`) måler derfor selve
+  # størrelsen: add-on'ets EGEN palme-detektor (palm_detection_full.tflite fra
+  # mediapipe 0.10.14, samme sha256) kører på billedet, og hver palme hvis
+  # boks er SMALLERE end denne værdi (kameraets egne pixels, 1280x720) males
+  # sort før add-on'et ser billedet. Fejler ÅBEN: uden model/ved fejl går
+  # billedet uændret igennem. 0 = slået fra (gammel adfærd).
+  # Offline-bevis 5/10 (add-on'ets præcise kode som orakel, 209 hænder i 507
+  # kompositter i køkken-billedet): palme-boks = 1,07-1,12 × håndled→langfinger-
+  # knoe for åben hånd OG knytnæve; ved 60/100/120/150 forsvandt 0 af de små
+  # hænder ikke og 0 store blev tabt eller fik ny fagt; gaten fandt 207/209.
+  # Startværdi 120 er GEOMETRI, ikke måling af ægte fagter endnu: 24/9 målte en
+  # bevidst nær hånd ~400 px høj (→ boks ~230) og krukke-greb ~100 px (→ ~58);
+  # med f ≈ 1000 px (køleskab 60 cm = 290 px, krukker ~10 cm = 55 px) er en
+  # hånd på 1,5 m ~70 px, en knytnæve på 50 cm ~210 px, og 120 ≈ 85 cm. Holder
+  # for f mellem 800 og 1200. Hver palme logges til
+  # /share/gesture_frame_shim/palms.jsonl (+ live på shimmens /haand) —
+  # kalibrér mod den fordeling + træner-svarene, ikke mod noten (B194).
+  gestus_min_haand_px:
+    name: "✋ Gestus: mindste hånd (palme-boks i px)"
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "px"
+    icon: mdi:hand-back-right-outline
+
+  # 2026-10-15 (user: "jeg havde ikke sat en timer"): knivmagneten blev læst
+  # som `four_fingers`, facing away, rotation −112…−116° stabilt i 6 min →
+  # 4-min-timer 20:42. Ingen tæller med fingrene pegende nedad. Målt: hænder
+  # (også de utilsigtede 5/10) lå −58…+48°, knivene −112…−116°. 0 = fra.
+  gestus_max_rotation_grader:
+    name: "✋ Gestus: max hældning for et fingertal"
+    min: 0
+    max: 180
+    step: 5
+    unit_of_measurement: "°"
+    icon: mdi:angle-acute
+
+  gestus_hold_frames:
+    name: "✋ Gestus: frames et fingertal skal holdes"
+    min: 2
+    max: 12
+    step: 1
+    unit_of_measurement: "frames"
+    icon: mdi:hand-back-right-outline
+
+  # Knytnæven (= annullér/stop) holdes kortere med vilje: den skal kunne
+  # stoppe en alarm der kun varer 15 s, så 6 frames ville bruge en tredjedel
+  # af alarmen på at blive genkendt. 2 frames ≈ 2,1 s — stadig bevidst, men
+  # en hånd der PASSERER gennem en knytnæve på vej op bruger kun ét frame.
+  # 2026-10-11: frames kommer nu hver ~0,62 s (bygen 7 × 0,5 s), så 3 frames
+  # ≈ 1,2 s er den nye ækvivalent — begge krav står på 3.
+  gestus_hold_knytnaeve:
+    name: "✊ Gestus: frames en knytnæve skal holdes"
+    min: 1
+    max: 8
+    step: 1
+    unit_of_measurement: "frames"
+    icon: mdi:hand-back-left-outline
+
+  # Et tabt frame midt i et hold må ikke koste hele holdet. Bygerne er målt
+  # til 4,25 s med ~1,75 s mellemrum (2026-10-11: ~3,8 s med ~1,2 s, se
+  # scan-løkken i automations/gestus_koekken.yaml), så et hold der begynder sidst i én byge
+  # skal kunne overleve til den næste. Under ~3 s bliver holdet uopfyldeligt
+  # for alle andre end den der rammer midt i en byge — og fejlen ville ligne
+  # "kameraet ser mig ikke".
+  gestus_frisk_sek:
+    name: "✋ Gestus: hold overlever hul på"
+    min: 3
+    max: 30
+    step: 1
+    unit_of_measurement: "s"
+    icon: mdi:timer-sync-outline
+
+  # Gentagelses-beskyttelse for det SAMME fingertal. Et NYT tal skal virke
+  # med det samme ("3 minutter … nej, 8"), så denne rammer kun gentagelser.
+  gestus_gentag_cooldown_sek:
+    name: "✋ Gestus: pause før samme fingertal igen"
+    min: 10
+    max: 300
+    step: 5
+    unit_of_measurement: "s"
+    icon: mdi:repeat-off
+
+# =============================================================================
+# TRIGGER-LOG — "hvem startede den nedtælling?"
+#
+# Recorderen KAN svare på det, men kun via en context-kæde man skal grave tre
+# led ned i (nedtael → start-automation → fingre/stemme), og et dashboard kan
+# slet ikke: Lovelace læser kun NUVÆRENDE state, aldrig historik. Derfor bærer
+# hver producent af `koekken_gestus_start` nu sin egen `kilde` + `bevis` med i
+# eventet, og denne trigger-baserede sensor gemmer de sidste 10 i en attribut.
+#
+# Kilden sættes ved AFSENDEREN, ikke gættes her: tre steder fyrer eventet
+# (automations/gestus_koekken.yaml = fingre, packages/voice_commands.yaml =
+# stemme, script.koekken_gestus_saet = knap/widget), og kun de tre VED hvad der
+# skete. En context-baseret gætte-regel her ville blive forkert den dag en
+# fjerde kilde kommer til (#2).
+#
+# `bevis` er det der gør loggen diagnostisk frem for dekorativ: for fingre er
+# det antal frames + fingertal (så en artefakt kan kendes fra et bevidst hold),
+# for stemmen er det selve ytringen — en misset stemme-kommando står i loggen
+# som en ANDEN ægte sætning, så minuttallet alene afslører intet.
+# =============================================================================
+template:
+  - trigger:
+      - trigger: event
+        event_type: koekken_gestus_start
+        id: nedtael
+      - trigger: state
+        entity_id: script.party_time
+        to: "on"
+        id: party
+    sensor:
+      # ASCII-navn: name-slug SKAL matche unique_id (repo-gotcha).
+      - name: "Koekken trigger log"
+        unique_id: koekken_trigger_log
+        icon: mdi:format-list-bulleted-square
+        state: >-
+          {%- if trigger.id == 'nedtael' -%}
+            ⏲️ {{ trigger.event.data.get('minutter', 0) | int(0) }} min · {{ trigger.event.data.get('kilde', 'ukendt') }}
+          {%- else -%}
+            🎉 Party · {{ 'knap/app' if trigger.to_state.context.user_id else 'stemme/automatik' }}
+          {%- endif -%}
+        attributes:
+          # Nyeste først. `this.attributes` er tom ved allerførste render og
+          # restoreres efter en genstart, så loggen overlever en deploy.
+          log: >-
+            {%- set nu = now().strftime('%d/%m %H:%M:%S') -%}
+            {%- if trigger.id == 'nedtael' -%}
+              {%- set ny = nu ~ '  ⏲️ ' ~ (trigger.event.data.get('minutter', 0) | int(0)) ~ ' min  ·  '
+                           ~ trigger.event.data.get('kilde', 'ukendt') ~ '  ·  '
+                           ~ trigger.event.data.get('bevis', '—') -%}
+            {%- else -%}
+              {%- set ny = nu ~ '  🎉 Party  ·  '
+                           ~ ('knap/app' if trigger.to_state.context.user_id else 'stemme/automatik')
+                           ~ '  ·  sidst hørt: ' ~ states('sensor.koekken_stemme_sidst') -%}
+            {%- endif -%}
+            {{ ([ny] + (this.attributes.get('log', []) | list))[:10] }}
+          sidste_kilde: >-
+            {{ trigger.event.data.get('kilde', 'ukendt') if trigger.id == 'nedtael' else 'party' }}
+          # De tre herunder er STRUKTUREREDE felter til timer-træneren
+          # (packages/ai_trainer.yaml): den spørger først NÅR nedtællingen er
+          # ovre, og skal kunne beskrive starten uden at grave i history.
+          # `sidste_ts` er et SKREVET stempel — `last_changed` duer ikke, den
+          # nulstilles ved restart (permanent faktum).
+          sidste_minutter: >-
+            {{ trigger.event.data.get('minutter', 0) | int(0) if trigger.id == 'nedtael' else 0 }}
+          sidste_bevis: >-
+            {{ trigger.event.data.get('bevis', '—') if trigger.id == 'nedtael'
+               else states('sensor.koekken_stemme_sidst') }}
+          sidste_ts: "{{ now().isoformat() }}"

@@ -1,0 +1,345 @@
+# =============================================================================
+# Badeværelse Wasp-in-a-Box — ROBUST REWRITE (2026-06-18)
+# =============================================================================
+# Baggrund: den gamle 3-arm-stis model (instant-arm + entry-timer + hurtig-bad-
+# dør-luk) brændte bad-lyset KONSTANT. Analyse 2026-06-18 fandt at "hurtig-bad"-
+# stien (arm når døren lukkes mens inde-PIR stadig lyser) fyrede 42 gange på ét
+# døgn: IKEA-PIR'en (Myggspray, node 263) har ~20-30 s clear-delay, så når man
+# går UD og lukker døren bag sig lyser PIR'en stadig → FALSK arm i tomt bad. Og
+# disarm skete KUN på en dør-åbnings-edge → en falsk arm sad fast til næste
+# døråbning (op til 8 timer natten over). Wasp stod armeret 65, 71, 74, 110 og
+# 492 min i træk; lyset var tændt 10-12 t/dag.
+#
+# NY MODEL — ÉN event-drevet arm-sti + symmetriske, selv-helbredende exits:
+#
+#   ARM:  Frisk inde-PIR off→on MENS døren er lukket (parasoll=off) OG ikke
+#         godnat. = nogen bevæger sig inde i en lukket boks → garanteret til
+#         stede. Robust mod udgang: når man går ud + lukker døren, lyser PIR'en
+#         kun sin lingering-hale (ingen NY off→on bag lukket dør) → ingen arm.
+#         Robust mod brusebad: man tager tøj af / vender sig EFTER døren er
+#         lukket → en off→on-edge → arm; PIR'en blind bag glasset bagefter
+#         betyder ikke noget, fordi vetoet holder lyset til døren åbnes.
+#         Aldrig under godnat (user-spec 2026-06-18): om natten er det
+#         toiletbesøg, ikke brusebad — så låsen giver ingen mening.
+#
+#   DISARM (selvstændige veje, defense-in-depth):
+#     1. Døren åbnes ELLER godnat starter → frigiv straks (godnat: wasp må
+#        aldrig være on om natten).
+#     2. SAFETY auto-clear: wasp armeret > input_number.badevaerelse_max_on_
+#        minutes (default 40, "max besøgs-tid") → tving disarm. DETTE er den
+#        manglende brik der fjerner den 8-timers-stuck. Et reelt bad varer ≤30
+#        min (user 2026-06-18), så 40 min armeret = hængende lås → ryd.
+#     3. Vetoet i presence_light_badevaerelse_off kræver wasp=on OG dør=off, så
+#        en dør-sensor der udfalder (unavailable ≠ off) selv-neutraliserer.
+#
+#   BACKSTOP: max-on watchdog (presence_badevaerelse.yaml) slukker lyset hvis
+#   det har hængt > max_on min UANSET sensorer, og rydder samtidig wasp-flaget.
+#
+# 2026-09-01 — REST-HULLET ER LUKKET FOR DAGENS FØRSTE BAD-BESØG (user-spec:
+# "bad slukkede på mig, der burde ha været wasp on, men den så mig ikke. hvis
+# døren lukkes under første badbesøg på en dag så assume at der er en derinde og
+# gør den fuld og wasp on, selv hvis wasp misser mig inden jeg forsvinder
+# usynligt ind i badet"). Hullet var beskrevet som "accepteret" nedenfor: går man
+# lige i bruseren bag glasset uden ÉN off→on efter dør-luk, armerer wasp aldrig.
+#
+# DØR-LUKNINGEN ER SELV HANDLINGEN. Man lukker ikke badedøren udefra på vej væk
+# fra et bad der allerede er i gang — så under dagens FØRSTE ægte besøg er en
+# dør der går fra åben til lukket bevis nok i sig selv. Se
+# `badevaerelse_wasp_arm_doerluk` nedenfor.
+#
+# Hvorfor netop det besøg: det er brusebadet (huset stempler det allerede som
+# "dagens billet", `input_boolean.sove_gardin_bad_foerste_besoeg_ovre`), og
+# afgrænsningen holder en evt. falsk arm nede på maks ÉN om dagen. Resten af
+# dagens besøg er toiletbesøg hvor den gamle, strengere arm-sti er den rigtige.
+# Tradeoff'et er bevidst det samme som bruser-vagten allerede valgte: en falsk
+# arm koster lys i et tomt bad indtil døren åbnes (eller safety-clear efter
+# `badevaerelse_max_on_minutes`); en manglende arm koster mørke midt i et
+# brusebad — det er sket 08-13 og igen 09-01.
+#
+# Parasoll-semantik: on = åben, off = lukket.
+# =============================================================================
+
+# =============================================================================
+# Indre-bad SAMLET occupancy (2026-06-21, user-spec: "den 4. PIR skal opføre sig
+# som indre-bad-sensoren, som var de 1 sensor")
+# =============================================================================
+# Vi har nu TO indre-bad PIR'er i forskellig vinkel:
+#   - binary_sensor.badevaerelse_inde_1_occupancy  (oprindelig inde-PIR; entity
+#     omdøbt fra .._inde_occupancy → .._inde_1_occupancy via entity-registry)
+#   - binary_sensor.badevaerelse_inde_2_occupancy  (ny PIR, anden vinkel;
+#     Matter node 435, commissioned via NUC-BLE 2026-06-21)
+#
+# I stedet for at re-pointe ~45 forbrugere (presence_badevaerelse, house_modes,
+# activity_state, terrace_presence, dormant, airbnb, wasp-arm her, …) ARVER denne
+# template-sensor det kanoniske navn `binary_sensor.badevaerelse_inde_occupancy`
+# som ALLE forbrugere allerede refererer. = de to fysiske PIR'er ER nu én logisk
+# sensor (OR-union). last_changed semantik bevaret: off-grenen (begge fysiske
+# clear) = korrekt "sidste bevægelse slut"-tid for off-wait-loops.
+#
+# inde_2 unavailable/uncommissioned → behandles som off → union == inde_1 alene
+# → 100% samme adfærd som før indtil den nye PIR dukker op (selv-aktiverende).
+#
+# 2026-08-01 STUCK-ON-MASKE (user-bug "ting hænger i bad og entré"):
+# En Matter sleepy end-device der mister sin Thread-forælder MENS den melder
+# `on` får aldrig sendt sin `off` — HA holder `on` indtil enheden endelig
+# markeres unavailable (målt: ~40 min). 08-01 sad inde_1 stuck `on`
+# 16:11:50→16:51:41, hvilket samtidig blokerede (a) gradvis-sluk (kræver
+# occupancy off i 300 s × faktorer) OG (b) max-on-watchdoggen, hvis sidste
+# condition er `not is_state(union,'on')` → bad-lyset brændte 64,3 min mod en
+# median på 1,4. Masken skæres HER ved kilden, ikke hos de ~45 forbrugere
+# (fejlklasse #2): et `on` hvis last_changed er ældre end
+# input_number.occupancy_stuck_on_minutes tælles ikke som tilstedeværelse.
+# `now()` i templaten tvinger re-render hvert minut, så masken slår til af sig
+# selv uden at sensoren rører sig. Kalibrering: se sliderens header i
+# packages/global_tuning.yaml (ægte forløb ≤ 11,9 min, stuck-on ≥ 30,8 min).
+template:
+  - binary_sensor:
+      - name: "Badevaerelse Inde Occupancy"
+        unique_id: badevaerelse_inde_occupancy_combined
+        device_class: occupancy
+        icon: mdi:motion-sensor
+        state: >
+          {% set m = states('input_number.occupancy_stuck_on_minutes') | float(0) %}
+          {% set maks = (m if m > 0 else 18) * 60 %}
+          {% set ns = namespace(live=false) %}
+          {% for e in ['binary_sensor.badevaerelse_inde_1_occupancy',
+                       'binary_sensor.badevaerelse_inde_2_occupancy'] %}
+            {% set s = states[e] %}
+            {% if s is not none and s.state == 'on'
+                  and (now() - s.last_changed).total_seconds() < maks %}
+              {% set ns.live = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.live }}
+        attributes:
+          stuck: >
+            {% set m = states('input_number.occupancy_stuck_on_minutes') | float(0) %}
+            {% set maks = (m if m > 0 else 18) * 60 %}
+            {% set ns = namespace(v=[]) %}
+            {% for e in ['binary_sensor.badevaerelse_inde_1_occupancy',
+                         'binary_sensor.badevaerelse_inde_2_occupancy'] %}
+              {% set s = states[e] %}
+              {% if s is not none and s.state == 'on'
+                    and (now() - s.last_changed).total_seconds() >= maks %}
+                {% set ns.v = ns.v + [e.split('.')[1]] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.v | join(', ') }}
+
+input_boolean:
+  badevaerelse_wasp_active:
+    name: "Bad wasp-in-a-box aktiv"
+    icon: mdi:shield-lock
+
+  # 2026-06-13 (user-spec approach-brightness): on = bad-lyset blev tændt af
+  # en APPROACH-trigger (entré/valhorn early-detect) på approach-niveau.
+  # Tillader presence_light_badevaerelse at opgradere til normalniveau når
+  # man faktisk går ind (dør/inde-motion) — uden flag ville light-on gaten
+  # blokere, og uden gaten ville manual dim blive overskrevet. Cleares ved
+  # opgradering og når lyset slukker (uanset sluk-kilde).
+  badevaerelse_approach_lit:
+    name: "Bad approach-lys aktivt (pre-niveau)"
+    icon: mdi:lightbulb-on-30
+
+automation:
+  - id: badevaerelse_wasp_arm
+    alias: "Bad: Wasp arm (ny bevægelse bag lukket dør)"
+    description: >
+      ENESTE arm-sti (2026-06-18 rewrite). Frisk inde-PIR off→on MENS døren er
+      lukket = nogen bevæger sig inde i en lukket boks → garanteret til stede.
+      Lås auto-sluk indtil en af de tre disarm-veje frigiver. Robust mod udgang:
+      lukker man døren bag sig efterlader exit-bevægelsen kun PIR'ens lingering-
+      hale (ingen NY off→on bag lukket dør) → ingen falsk arm.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.badevaerelse_inde_occupancy
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.parasoll_badevaerelse
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.badevaerelse_wasp_active
+        state: "off"
+      # 2026-06-21 (user-spec): wasp armerer nu OGSÅ under godnat. Et nat-toilet-
+      # besøg bag lukket dør skal holdes (PIR ser ikke én der sidder stille) og
+      # først slukke når man åbner døren (leave-off, 25 s). Den gamle "aldrig om
+      # natten"-regel (2026-06-18) er nu sikker: leave-off + safety-clear (max
+      # besøgs-tid) + watchdog grænser holdet, så natlyset ikke hænger for længe.
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.badevaerelse_wasp_active
+      - service: logbook.log
+        data:
+          name: "Bad wasp"
+          message: "Armeret — bevægelse bag lukket dør, auto-sluk låst"
+          entity_id: input_boolean.badevaerelse_wasp_active
+
+  # ---------------------------------------------------------------------------
+  # ARM-STI 2 (2026-09-01, user-spec): dør LUKKET under dagens første bad-besøg.
+  # ---------------------------------------------------------------------------
+  - id: badevaerelse_wasp_arm_doerluk
+    alias: "Bad: Wasp arm (dør lukket under dagens første badbesøg)"
+    description: >
+      Dør-lukningen er selv handlingen. Under dagens første ÆGTE bad-besøg
+      (= brusebadet) betyder en dør der går fra åben til lukket at den der
+      lukkede den bliver derinde — man lukker ikke badedøren udefra på vej væk
+      fra et besøg der allerede er i gang. Armér wasp UDEN at kræve en frisk
+      inde-PIR-flanke bagefter, så et brusebad bag glasset ikke kan dø af
+      PIR-tavshed (arm-sti 1's kendte hul; ramte user 08-13 og 09-01).
+
+      Wasp-arm løfter selv stadiet til Fuld via `badevaerelse_stage_full` —
+      derfor sættes stadiet ikke her (ét ejerskab, fejlklasse #2). Af samme
+      grund kræves `badevaerelse_visit_serious` (stadie Medium/Fuld): så er
+      stadiet enten allerede Fuld eller kan løftes dertil, og en dør der lukkes
+      under et Quick-blip (fx nogen der lukker døren i forbifarten) kan ikke
+      armere.
+
+      AFGRÆNSNING: kun mens dagens billet er ubrugt
+      (`sove_gardin_bad_foerste_besoeg_ovre` = off) og uden for godnat — et
+      nat-toiletbesøg må ikke bruge dagens arm, præcis som det ikke må bruge
+      dagens gardin-billet. Udgange er uændrede og automatiske: døren åbnes →
+      disarm, safety-clear efter max besøgs-tid, max-on watchdog. Derfor ingen
+      house_mode-gate: en gæst der går i bad skal have samme beskyttelse, og
+      der er ingen tilstand han kan blive fanget i.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_badevaerelse
+        from: "on"
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_wasp_active
+        state: "off"
+      # Dagens billet ubrugt = det ER dagens første ægte bad-besøg. Samme anker
+      # som sove-gardinet bruger (fejlklasse #2) — ikke en kopieret regel.
+      - condition: state
+        entity_id: input_boolean.sove_gardin_bad_foerste_besoeg_ovre
+        state: "off"
+      # Nat-toilet under godnat bruger ikke dagens arm. Samme afgrænsning som
+      # billet-stemplingen i packages/sove_gardin_bad_gate.yaml.
+      - condition: state
+        entity_id: input_boolean.godnat_active
+        state: "off"
+      # Der SKAL være et besøg i gang. Stadie Medium/Fuld = huset har allerede
+      # konkluderet et ægte besøg; dagens første morgenbesøg går direkte til
+      # Medium (`badevaerelse_stage_first_morning_deep`).
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_visit_serious
+        state: "on"
+      - condition: state
+        entity_id: light.badevaerelse_all
+        state: "on"
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.badevaerelse_wasp_active
+      - service: logbook.log
+        data:
+          name: "Bad wasp"
+          message: >-
+            Armeret — døren blev LUKKET under dagens første bad-besøg (stadie
+            {{ states('input_select.badevaerelse_visit_stage') }}); antaget
+            optaget uden krav om ny PIR-flanke. Auto-sluk låst til døren åbnes.
+          entity_id: input_boolean.badevaerelse_wasp_active
+
+  - id: badevaerelse_wasp_disarm
+    alias: "Bad: Wasp disarm (dør åbnet)"
+    description: >
+      Frigiver wasp-låsen når døren åbnes → normal sluk-logik igen (leave-off).
+      2026-06-21: godnat-start-triggeren fjernet — wasp må nu gerne være on om
+      natten (smart system gælder også under godnat), så den skal ikke ryddes
+      ved sengetid.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_badevaerelse
+        to: "on"
+        id: door
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_wasp_active
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.badevaerelse_wasp_active
+      - service: logbook.log
+        data:
+          name: "Bad wasp"
+          message: "Frigivet — dør åbnet"
+          entity_id: input_boolean.badevaerelse_wasp_active
+
+  # 2026-06-18 (robust rewrite): SAFETY auto-clear. Den gamle model disarmede
+  # KUN på dør-åbning → en falsk arm sad fast til næste døråbning (8 t natten
+  # over). Denne backstop tvinger disarm når wasp har stået armeret længere end
+  # et reelt bad kan vare (input_number.badevaerelse_max_on_minutes, "max
+  # besøgs-tid", default 40 min). Måles fra arm-tidspunktet (state on for:).
+  # Gælder uanset om lyset er tændt eller slukket → fjerner også den latente
+  # "armeret men lys slukket"-fælde der ellers ville veto'e næste tænd.
+  - id: badevaerelse_wasp_safety_clear
+    alias: "Bad: Wasp safety auto-clear (armeret for længe)"
+    description: >
+      Wasp armeret > max besøgs-tid → tving disarm (selv-helbredende net mod
+      hængende lås). Et reelt bad/toiletbesøg varer ≤30 min (user 2026-06-18),
+      så når flaget har stået armeret længere end max_on-loftet er det med
+      sikkerhed en falsk/hængende arm.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.badevaerelse_wasp_active
+        to: "on"
+        for:
+          seconds: >-
+            {{ ((states('input_number.badevaerelse_max_on_minutes') | float(40))
+                * 60) | int }}
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_wasp_active
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.badevaerelse_wasp_active
+      - service: logbook.log
+        data:
+          name: "Bad wasp"
+          message: >-
+            Safety auto-clear — armeret >
+            {{ states('input_number.badevaerelse_max_on_minutes') }} min
+            (hængende lås ryddet)
+          entity_id: input_boolean.badevaerelse_wasp_active
+
+  # Approach-flag ryddes når bad-lyset slukker — uanset kilde (off-automation,
+  # godnat, sluk_alt, manuelt). Forhindrer stale flag: ellers ville et senere
+  # manuelt tændt+dæmpet lys blive "opgraderet" over brugerens dim ved næste
+  # inde-motion. Condition på flag=on undgår no-op writes.
+  - id: badevaerelse_approach_lit_clear
+    alias: "Bad: approach-flag clear (lys slukket)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: light.badevaerelse_all
+        to: "off"
+      # B50-fix 2026-07-14 (fejlklasse #9): strømkap (vægkontakt) gør gruppen
+      # 'unavailable' (IKKE 'off') → flaget ville hænge. 5 min 'for' skåner
+      # korte Thread/Zigbee-flaps.
+      - platform: state
+        entity_id: light.badevaerelse_all
+        to:
+          - "unavailable"
+          - "unknown"
+        for:
+          minutes: 5
+    condition:
+      - condition: state
+        entity_id: input_boolean.badevaerelse_approach_lit
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.badevaerelse_approach_lit

@@ -1,0 +1,448 @@
+# =============================================================================
+# Apollo LATCH-detektor — en radar der hænger "on" må ikke låse huset i Active
+# =============================================================================
+# INCIDENT 2026-08-06 (user: "huset er stuck active pga stue apollo … fix!"):
+# `binary_sensor.stue_apollo_occupancy` stod `on` uafbrudt fra 08-04 20:20 til
+# 08-06, mens BEGGE telefoner havde været væk siden 08-06 07:50. Huset havde
+# stået `Active` siden 07-31 15:02 = 6 døgn.
+#
+# ÅRSAG: stue g2_still stod på 10, men rummets TOMGANGS-STØJ måles til 13-14
+# (`sensor.stue_apollo_radar_still_energy`, still_distance 214 cm → gate 2).
+# Tærsklen lå altså UNDER støjgulvet → radaren ser permanent et "stille mål"
+# der ikke findes. Det er ikke et flap (flap = off→on-flanke); det er en LÅS,
+# og derfor er den usynlig for BÅDE flap-jagten (flanke-trigget) og
+# spøgelses-alarmen (tæller flanker/time — en lås har nul flanker).
+#
+# HVORFOR DET LÅSTE HELE HUSET: `binary_sensor.physical_presence_recent` gren
+# (a) tæller enhver occupancy der ER `on` som tilstedeværelse, og den er hård
+# veto-condition på ALLE fire Dormant-veje. Grenens eneste værn var
+# `last_changed < 24 t` — og **`last_changed` nulstilles ved hver HA-restart**
+# (samme rod som fejlklasse #5/#18-familien). Restarts sker oftere end hver
+# 24. time (målt 08-05 06:21, 08-06 08:49, 08-06 12:16), så værnet kunne
+# ALDRIG udløse. Låsen var dermed permanent.
+#
+# 💡 DØDVANDET: Dormant er den ENESTE tilstand hvor flap-jagten og gate-decay
+# kører. En lås spærrer Dormant → træneren kan aldrig reparere den gate der
+# skabte låsen → låsen består. Derfor er detektoren nødt til at leve UDEN FOR
+# trænerens Dormant-gate.
+#
+# ---------------------------------------------------------------------------
+# DISKRIMINATOR: varighed + alle ude. Ikke varighed alene.
+# ---------------------------------------------------------------------------
+# En stille/sovende person holder legitimt occupancy `on` i timevis — det er
+# præcis derfor gren (a) findes. Varighed alene kan altså ikke skelne. Målt
+# over 21 dages recorder-historik, længste sammenhængende occupancy-`on` mens
+# BEGGE trackere stod `not_home`:
+#     stue    5,67 t · 3,42 t · 2,17 t · 1,83 t · 1,75 t · 1,33 t · 1,17 t · 1,00 t
+#     spisestue  0,83 t (max)   køkken 0,17 t   sove 0,25 t   børn 0,08 t
+# De fire øvrige rum kommer aldrig over 50 min; stue ligger konsekvent over 1 t.
+# `apollo_latch_minutter` = 120 er 2,4× det målte legitime maksimum og midt i
+# stue-låsenes bånd.
+#
+# 💡 FRISKHED MÅLES PÅ ET SKREVET STEMPEL, ALDRIG PÅ `last_changed` — det er
+# hele grunden til at det gamle 24-timers værn var dødt. `<slug>_apollo_occ_since`
+# er et `input_datetime` (overlever restart via restore) sat på off→on og ryddet
+# til 1970 på on→off. En restart MIDT i et ophold bevarer derfor den ægte
+# start-tid i stedet for at nulstille den.
+#
+# ---------------------------------------------------------------------------
+# TO UDGANGE
+# ---------------------------------------------------------------------------
+# (1) MASKE: `physical_presence_recent` springer de låste sensorer over, så
+#     huset kan nå Dormant. Kun gren (a) maskeres — gren (b)
+#     (`last_physical_activity`, transitions-baseret) er allerede lås-immun og
+#     røres ikke. Sover nogen reelt i et andet rum, holder DEN sensor gren (a)
+#     oppe; masken er per-sensor, ikke husdækkende.
+# (2) REPARATION: gaten hæves til den MÅLTE energi + margin — ikke et blindt
+#     "+2". `radar_still_energy`/`radar_move_energy` er energien på præcis det
+#     mål radaren har låst sig på, og gaten udledes af mål-afstanden på samme
+#     måde som flap-jagten (`min(8, afstand_cm/75)`). Låsen forsvinder derfor
+#     typisk på ÉT trin. Værdien skrives også som GULV
+#     (`script.apollo_gate_floor_set`), så gate-decay aldrig går ned i støjen
+#     igen — det er den spærhage der gør sløjfen lukket.
+#
+# ---------------------------------------------------------------------------
+# LOFT OVER DET PERMANENTE (B80, 2026-08-17)
+# ---------------------------------------------------------------------------
+# REPARATIONEN og PERMANENSEN er to forskellige beslutninger, og kun den anden
+# er farlig. Slideren rulles tilbage af decay; et gulv kan kun sænkes i hånden
+# (♻️ på Indstillinger → 👁️ Sensorer & lux). Prisen for én fejlbedømmelse er
+# derfor asymmetrisk — og flap-jagten fik samme dag et krav om GENTAGET bevis
+# før den låser et gulv, mens denne vej låser på ÉT skridt.
+#
+# Samme gentagelses-krav duer ikke her: decay bruger ~en uge om at rulle en
+# reparation tilbage, så to latches på samme gate inden for et døgn kan ikke
+# forekomme — kravet ville aldrig blive opfyldt, intet gulv ville nogensinde
+# låses, og latchen ville svinge frem og tilbage for evigt.
+#
+# I stedet et LOFT på hvor højt detektoren selv må gøre noget permanent:
+# `apollo_latch_floor_max` (default 50). Målt i et beviseligt tomt hus
+# 2026-08-17 er still-energien køkken 7 · spisestue 12 · stue 14 ·
+# soveværelse 41 (eftermiddagssols-fantomet), move-energi 0,0 overalt. Værste
+# observerede reparation er altså 41 + margin 4 = 45 → loftet dækker al målt
+# støj med luft, men blokerer de 99'ere der gør et rum permanent døvt.
+#
+# Over loftet: gaten repareres ALLIGEVEL (dødlåsen skal brydes), gulvet
+# skrives ikke, og brugeren får en push med rum/gate/energi. Sikkert fordi
+# MASKEN bygges uafhængigt af reparations-planen — huset kan altid nå Dormant,
+# også når gulvet udebliver.
+#
+# Chip-wear (2 døde Apollo-chips maj 2026): max ÉT gate-skrift pr. tick for
+# HELE huset, value-compare før skrivning, aldrig over 99 (100 = brugerens
+# manuelle FRA-sentinel).
+# =============================================================================
+
+input_boolean:
+  # Bevidst UDEN `initial:` — samme grund som apollo_flap_hunt_enabled: et
+  # `initial: on` gen-tænder detektoren ved hver restart og æder brugerens
+  # manuelle FRA. Fresh install får ON via init_user_preferences.
+  apollo_latch_enabled:
+    name: "Apollo lås-detektor aktiveret"
+    icon: mdi:lock-alert
+
+input_number:
+  apollo_latch_minutter:
+    name: "Apollo lås: varighed før en occupancy kaldes låst"
+    icon: mdi:timer-lock-outline
+    min: 15
+    max: 720
+    step: 5
+    unit_of_measurement: min
+    mode: box
+    # Sammenhængende occupancy-'on' MENS alle er ude. Målt legitimt maksimum
+    # over 21 dage = 50 min (spisestue); stue-låsene starter ved 60 min.
+
+  apollo_latch_margin:
+    name: "Apollo lås: margin over målt støj"
+    icon: mdi:arrow-expand-up
+    min: 1
+    max: 30
+    step: 1
+    mode: slider
+    # Gaten sættes til (målt energi + denne margin). For lav = låsen vender
+    # tilbage ved næste støjtop; for høj = rummet bliver unødigt dødt.
+
+  apollo_latch_floor_max:
+    name: "Apollo lås: højeste gulv detektoren selv må låse"
+    icon: mdi:lock-open-alert
+    min: 15
+    max: 99
+    step: 1
+    mode: box
+    # Se LOFT OVER DET PERMANENTE i headeren. Default 50 = husets målte
+    # tomgangs-støj (7-41) + margin, med luft. Reparationen af selve gaten
+    # rammes IKKE af loftet — kun spærhagen.
+
+input_datetime:
+  stue_apollo_occ_since:
+    name: "Stue Apollo occupancy on siden"
+    icon: mdi:clock-start
+    has_date: true
+    has_time: true
+  spisestue_apollo_occ_since:
+    name: "Spisestue Apollo occupancy on siden"
+    icon: mdi:clock-start
+    has_date: true
+    has_time: true
+  koekken_apollo_occ_since:
+    name: "Koekken Apollo occupancy on siden"
+    icon: mdi:clock-start
+    has_date: true
+    has_time: true
+  sove_apollo_occ_since:
+    name: "Sove Apollo occupancy on siden"
+    icon: mdi:clock-start
+    has_date: true
+    has_time: true
+  boernevaerelse_apollo_occ_since:
+    name: "Boernevaerelse Apollo occupancy on siden"
+    icon: mdi:clock-start
+    has_date: true
+    has_time: true
+
+template:
+  # ÉNVEJS-KÆDE (fejlklasse: en attribut må ikke læse sin EGEN entity): ÉN løkke
+  # pakker både maske-listen og reparations-planen i én streng, næste led parser
+  # den. `now()` tvinger re-render hvert minut, så en lås opdages af sig selv
+  # uden at sensoren rører sig.
+  #
+  # Format: `<låste-rum-csv>||<plan-csv>` hvor plan-token = `slug|slot|mål|navn`.
+  # Rum-feltet er ROM-PRÆFIKSET (ikke entity_id), fordi spisestuen konsumeres
+  # under to forskellige entities (rå + `_filtered`) alt efter forbruger.
+  - sensor:
+      - name: "Apollo latch data"
+        unique_id: apollo_latch_data
+        icon: mdi:lock-alert
+        state: >-
+          {% set rooms = [
+            ('stue','stue','Stue'), ('spisestue','spisestue','Spisestue'),
+            ('koekken','koekken','Køkken'), ('sovevaerelse','sove','Soveværelse'),
+            ('boernevaerelse','boernevaerelse','Børneværelse')] %}
+          {% set lim = states('input_number.apollo_latch_minutter') | float(120) * 60 %}
+          {% set mgn = states('input_number.apollo_latch_margin') | float(4) %}
+          {# ALLE ude = ingen af de to voksne er i home-zonen OG børnene er ikke
+             hjemme. For Parent A er TRACKEREN (ikke input_boolean.<person>_home)
+             det ærlige signal: `*_home`-flagene slukkes også af ren
+             GPS-staleness, mens trackeren kun står 'not_home' ved en
+             registreret afgang. For Parent B findes den ærlighed ikke længere —
+             hendes tracker er permanent frossen på 'home' efter iOS-migrationen
+             08-15, hvilket gjorde HELE latch-detektoren død (= ingen nødudgang
+             for en hængende radar). Hun læses derfor via ankeret. #}
+          {% set ude = is_state('person.parent_a', 'not_home')
+                       and is_state('binary_sensor.parent_b_hjemme_anker', 'off')
+                       and not is_state('binary_sensor.kids_home', 'on') %}
+          {% set bad = ['unknown', 'unavailable', 'none', ''] %}
+          {% set ns = namespace(laaste=[], plan=[]) %}
+          {% if is_state('input_boolean.apollo_latch_enabled', 'on') and ude %}
+            {% for room, slug, navn in rooms %}
+              {# 💡 `ts > 0` er IKKE nok: et URØRT input_datetime med has_date
+                 står på DAGENS midnat (ikke 1970), og dets timestamp læses 2 t
+                 forskudt → "aldrig sat" ser ud som et stempel fra kl. 02:00 i
+                 dag, og enhver on-occupancy ville se låst ud fra kl. 04:00 og
+                 dagen ud. Vi tester derfor TIDSDELEN: 00:00:00 = ikke sat.
+                 Både det urørte midnat og vores egen 1970-rydning rammes af
+                 samme test, og et ægte now()-stempel kan ikke forveksles.
+                 Fejler LUKKET (ikke låst) = vi maskerer aldrig i blinde. #}
+              {% set raw = states('input_datetime.' ~ slug ~ '_apollo_occ_since') %}
+              {% set sat = raw not in bad and raw[11:] != '00:00:00' %}
+              {% set ts = state_attr('input_datetime.' ~ slug ~ '_apollo_occ_since',
+                                     'timestamp') | float(0) %}
+              {% if is_state('binary_sensor.' ~ room ~ '_apollo_occupancy', 'on')
+                    and sat and (now().timestamp() - ts) >= lim %}
+                {% set ns.laaste = ns.laaste + [room] %}
+                {% set md = states('sensor.' ~ room ~ '_apollo_radar_moving_distance') %}
+                {% set sd = states('sensor.' ~ room ~ '_apollo_radar_still_distance') %}
+                {% set dd = states('sensor.' ~ room ~ '_apollo_radar_detection_distance') %}
+                {# AFSTANDS-GUARD (2026-08-17, samme fix som flap-jagten): 0 cm
+                   betyder "intet mål", ikke "målet står på sensoren". Med den
+                   gamle `>= 0`-test blev både 0 og unknown til dist = 0 → gate 0,
+                   så en latch uden brugbar afstand hævede near-field-gulvet til
+                   energi+margin i ét spring. Uden afstand: masker, reparér ikke. #}
+                {% set mv = md not in bad and md | float(0) > 0 %}
+                {% set sv = sd not in bad and sd | float(0) > 0 %}
+                {% set dv = dd not in bad and dd | float(0) > 0 %}
+                {% set dist = (md | float(0)) if mv
+                              else ((sd | float(0)) if sv
+                              else ((dd | float(0)) if dv else 0)) %}
+                {% set gate = [8, (dist / 75) | int] | min %}
+                {# Slot 0-8 = g0-g8 still, 9-17 = g0-g8 move (samme kodning som
+                   flap-jagten og script.apollo_gate_floor_set). #}
+                {% set slot = gate + (9 if mv else 0) %}
+                {% set e = states('sensor.' ~ room ~ '_apollo_radar_' ~
+                                  ('move' if mv else 'still') ~ '_energy') %}
+                {# Energien er BEVISET for hvor højt gaten skal ligge. Uden den
+                   er der intet at regne på → rummet maskeres, men repareres ikke. #}
+                {% if e not in bad and dist > 0 %}
+                  {% set ns.plan = ns.plan + [
+                       slug ~ '|' ~ slot ~ '|'
+                       ~ ([99, (e | float(0) + mgn) | round(0) | int] | min) ~ '|' ~ navn] %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+          {% endif %}
+          {{ ns.laaste | join(',') }}||{{ ns.plan | join(',') }}
+
+  - binary_sensor:
+      # Kort, læsbart anker til conditions. Parser strengen — regner intet selv.
+      - name: "Apollo occupancy laast"
+        unique_id: apollo_occupancy_laast
+        icon: mdi:lock-alert
+        state: >-
+          {{ (states('sensor.apollo_latch_data') ~ '||').split('||')[0] | trim != '' }}
+        attributes:
+          laaste_rum: >-
+            {{ (states('sensor.apollo_latch_data') ~ '||').split('||')[0] | trim }}
+          plan: >-
+            {{ (states('sensor.apollo_latch_data') ~ '||').split('||')[1] | trim }}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # STEMPEL: skriv starten på hvert occupancy-ophold. Dette er den restart-sikre
+  # erstatning for `last_changed` — uden den kan ingen lås måles pålideligt.
+  # ---------------------------------------------------------------------------
+  - id: apollo_occ_since_stamp
+    alias: "Apollo: stempl occupancy-opholdets start"
+    description: >-
+      off→on sætter stemplet, on→off rydder det til 1970. Restart midt i et
+      ophold bevarer stemplet (input_datetime restore) = ægte start-tid.
+    mode: queued
+    max: 20
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.stue_apollo_occupancy
+        to: ["on", "off"]
+        id: stue
+      - platform: state
+        entity_id: binary_sensor.spisestue_apollo_occupancy
+        to: ["on", "off"]
+        id: spisestue
+      - platform: state
+        entity_id: binary_sensor.koekken_apollo_occupancy
+        to: ["on", "off"]
+        id: koekken
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+        to: ["on", "off"]
+        id: sove
+      - platform: state
+        entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+        to: ["on", "off"]
+        id: boernevaerelse
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: "input_datetime.{{ trigger.id }}_apollo_occ_since"
+        data:
+          datetime: >-
+            {{ now().strftime('%Y-%m-%d %H:%M:%S')
+               if trigger.to_state.state == 'on' else '1970-01-01 00:00:00' }}
+
+  # ---------------------------------------------------------------------------
+  # BACKSTOP: et ophold der var i gang da denne pakke blev deployet (eller da
+  # helperen blev oprettet) har intet stempel og ville aldrig kunne måles.
+  # Sætter stemplet til NU — konservativt: låsen skal så bevises forfra.
+  # ---------------------------------------------------------------------------
+  - id: apollo_occ_since_backstop
+    alias: "Apollo: backstop — stempl igangværende ophold uden stempel"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/15"
+      - platform: homeassistant
+        event: start
+    action:
+      - repeat:
+          for_each:
+            - stue|stue
+            - spisestue|spisestue
+            - koekken|koekken
+            - sovevaerelse|sove
+            - boernevaerelse|boernevaerelse
+          sequence:
+            - variables:
+                room: "{{ repeat.item.split('|')[0] }}"
+                slug: "{{ repeat.item.split('|')[1] }}"
+            # if/then — IKKE `condition:`. En falsk `condition` inde i en repeat
+            # stopper HELE løkken, så rum nr. 2-5 ville aldrig blive tjekket når
+            # rum nr. 1 var i orden (= næsten altid).
+            - if:
+                - condition: template
+                  # Samme "ikke sat"-test som sensoren: urørt = dagens midnat,
+                  # ryddet = 1970 — begge har tidsdel 00:00:00.
+                  value_template: >-
+                    {% set raw = states('input_datetime.' ~ slug ~ '_apollo_occ_since') %}
+                    {{ is_state('binary_sensor.' ~ room ~ '_apollo_occupancy', 'on')
+                       and (raw in ['unknown', 'unavailable', 'none', '']
+                            or raw[11:] == '00:00:00') }}
+              then:
+                - service: input_datetime.set_datetime
+                  target:
+                    entity_id: "input_datetime.{{ slug }}_apollo_occ_since"
+                  data:
+                    datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ---------------------------------------------------------------------------
+  # REPARATION: hæv den låste gate over den MÅLTE støj og lås værdien som gulv.
+  # Kører UAFHÆNGIGT af house_state — det er hele pointen: en lås spærrer
+  # Dormant, så en Dormant-gate ville gøre reparationen uopnåelig (dødvandet).
+  # Max ét gate-skrift pr. tick for hele huset (chip-wear).
+  # ---------------------------------------------------------------------------
+  - id: apollo_latch_repair
+    alias: "Apollo lås: hæv gaten over støjen + lås gulvet"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/10"
+    condition:
+      - condition: state
+        entity_id: input_boolean.apollo_latch_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.apollo_occupancy_laast
+        state: "on"
+      # Gæstens bevægelse må ikke tune radaren.
+      - condition: template
+        value_template: >-
+          {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+      # Robot/gardin skaber legitim radar-uro → ikke en lås at reparere.
+      - condition: state
+        entity_id: binary_sensor.apollo_flap_suppress
+        state: "off"
+      - condition: template
+        value_template: >-
+          {{ state_attr('binary_sensor.apollo_occupancy_laast', 'plan')
+             not in [none, ''] }}
+    action:
+      - variables:
+          # Kun FØRSTE token: ét NVRAM-skrift pr. tick, husdækkende.
+          p: >-
+            {{ state_attr('binary_sensor.apollo_occupancy_laast', 'plan')
+               .split(',')[0].split('|') }}
+      - variables:
+          slug: "{{ p[0] }}"
+          slot: "{{ p[1] | int(0) }}"
+          maal: "{{ p[2] | int(0) }}"
+          navn: "{{ p[3] }}"
+          gate: "{{ (p[1] | int(0)) % 9 }}"
+          typ: "{{ 'still' if (p[1] | int(0)) < 9 else 'move' }}"
+      - variables:
+          slider: "input_number.{{ slug }}_g{{ gate }}_{{ typ }}"
+          cur: "{{ states('input_number.' ~ slug ~ '_g' ~ gate ~ '_' ~ typ) | float(0) }}"
+      # Value-compare før skrivning (ESPHome chip-wear). 100 = brugerens
+      # manuelle FRA-knap og røres aldrig.
+      - condition: template
+        value_template: "{{ maal | int > cur | int and cur | int < 99 }}"
+      - service: input_number.set_value
+        target:
+          entity_id: "{{ slider }}"
+        data:
+          value: "{{ [99, maal | int] | min }}"
+      # GULV: decay må aldrig gå ned i støjen igen (spærhage) — men kun op til
+      # brugerens loft. Reparationen ovenfor er allerede sket, så dødlåsen
+      # brydes uanset; loftet begrænser kun det PERMANENTE. Se headeren.
+      - variables:
+          ny: "{{ [99, maal | int] | min }}"
+          gulv_loft: "{{ states('input_number.apollo_latch_floor_max') | int(50) }}"
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ ny | int <= gulv_loft | int }}"
+            sequence:
+              - service: script.apollo_gate_floor_set
+                data:
+                  slug: "{{ slug }}"
+                  slot: "{{ slot }}"
+                  value: "{{ ny }}"
+              - service: logbook.log
+                data:
+                  name: "Apollo lås"
+                  message: >-
+                    {{ navn }} g{{ gate }} {{ typ }} hang på occupancy mens alle
+                    var ude → tærskel {{ cur | int }} → {{ ny }} (målt støj +
+                    margin), gulv låst.
+        default:
+          # Over loftet = ikke almindelig støj. Gaten repareres, men decay får
+          # lov at rulle den tilbage, så én mærkelig måling ikke gør et rum
+          # permanent døvt. Mennesket får beskeden — huset gætter ikke.
+          - service: logbook.log
+            data:
+              name: "Apollo lås"
+              message: >-
+                {{ navn }} g{{ gate }} {{ typ }} hang på occupancy mens alle var
+                ude → tærskel {{ cur | int }} → {{ ny }} (målt støj + margin).
+                Gulv IKKE låst: over auto-grænsen {{ gulv_loft }}.
+          # B215: via push_notify (notif_apollo-familien: master, toggle,
+          # vindue, AirBnB-stilhed) — var et direkte kald uden om dem.
+          - service: script.push_notify
+            data:
+              notif_id: apollo
+              title: "📡 Apollo-lås over auto-grænsen"
+              message: >-
+                {{ navn }} g{{ gate }} {{ typ }} hang låst med energi
+                {{ ny | int - (states('input_number.apollo_latch_margin') | int(4)) }}
+                → tærskel hævet {{ cur | int }} → {{ ny }}, men gulvet blev IKKE
+                låst ({{ gulv_loft }} er loftet). Decay ruller den tilbage —
+                låser rummet sig fast igen, er der noget fysisk galt.

@@ -1,0 +1,422 @@
+# =============================================================================
+# Børn morgen-nedtoning — rolig rampe til sluk når barnet har forladt rummet
+# =============================================================================
+# User-spec 2026-09-29: "om morgenen når barnet er blevet vækket og der har
+# været bevægelse i børneværelset efterfulgt af fuldstændig apollo stilhed kan
+# du godt rampe lyset derinde langsomt og roligt nedad indtil det slukker. over
+# 5 min. derfra gælder auto lys derinde og også hvis der kommer bevægelse
+# derinde under rampen, så skal der fades blødt over til auto lys."
+#
+# FØR (målt 28/9): vækning 06:15, bevægelse 06:37-06:49, holdet udløb 06:46 →
+# "gradvis sluk" slukkede ALT 06:56:31 med 30 s fade, fem minutter efter at
+# rummet blev tomt. Ingen rolig nedtoning, og udgangen hang på hold-tiden i
+# stedet for på barnet.
+#
+# FORLØB (én tilstand ad gangen, alle udgange automatiske):
+#   1. Vækningen sætter wakeup_kids_hold_active → vi nulstiller morgenens flag.
+#   2. BEVÆGET: ≥ `boern_morgen_bevaegelse_sekunder` (samme slider som morgen-
+#      beskyttelsens "ægte bevægelse", default 45 s) moving_target inden for
+#      15 min, talt KUN mens holdet står. Ét udslag er ikke nok: sovende børn
+#      giver isolerede 1-3 s blips (målt 15/9 06:07, 16/9 06:16-06:24,
+#      18/9 06:18), et barn der står op 89-475 s (28/9, 29/9, 16-18/9).
+#   3. STILHED: Apollo-occupancy off i `boern_morgen_nedtoning_stilhed_sek`
+#      (default 60). Målt 15-29/9 06-09: 25 af 78 off-huller er < 60 s — det er
+#      radar-huller med barnet i rummet, ikke udgange.
+#   4. RAMPE: alle tændte dæmpbare lys geometrisk ned (perceptuelt jævnt, HA
+#      driver trinene — en lang firmware-transition er lineær og hakker,
+#      permanent faktum) over `boern_morgen_nedtoning_minutter` (default 5) og
+#      så sluk. Plug-lampen (non-dimmable) slukker når de dæmpbare passerer
+#      26 raw (~10 %) — samme tærskel som mirror'en tænder den ved.
+#   5. SLUT: holdet slippes → rummets normale auto-lys gælder.
+#   5b. BEVÆGELSE UNDER RAMPEN: rampen stoppes, holdet slippes, og de tændte
+#      dæmpbare lys fader blødt (4 s) til auto-lysets niveau
+#      (sensor.boernevaerelse_auto_lys_pct — SAMME tal som "Lysnet: Børneværelse
+#      tænd" bruger, fejlklasse #2).
+#
+# HOLDET forlænges: bevæget barn eller igangværende rampe → hold-backstoppen
+# slipper IKKE ved hold-tiden, men venter på rampen — dog aldrig længere end
+# `boern_morgen_nedtoning_vindue_min` efter vækningens start (hårdt loft).
+# Uden det ville holdet udløbe mens barnet stadig er derinde, og udgangen blev
+# igen "gradvis sluk" (5 min + 30 s), præcis som 28/9.
+#
+# MANUEL VINDER: Styrbar/app-sluk slipper holdet (vaekning_boern_hold_slip_
+# manuel), og den rydder også disse flag og stopper rampen.
+#
+# AIRBNB: vækningen kører ikke i AirBnB, så intet her armeres dér. Flagene
+# ryddes alligevel ved AirBnB entry/exit (automations/airbnb_mode.yaml).
+# =============================================================================
+
+input_number:
+  boern_morgen_nedtoning_stilhed_sek:
+    name: "Børn morgen-nedtoning: stilhed før rampe"
+    icon: mdi:timer-sand
+    min: 10
+    max: 300
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+  boern_morgen_nedtoning_minutter:
+    name: "Børn morgen-nedtoning: rampe-længde"
+    icon: mdi:transition
+    min: 1
+    max: 20
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+  boern_morgen_nedtoning_vindue_min:
+    name: "Børn morgen-nedtoning: maks vindue efter vækning"
+    icon: mdi:clock-end
+    min: 30
+    max: 240
+    step: 15
+    unit_of_measurement: "min"
+    mode: slider
+
+input_boolean:
+  # INGEN `initial:` — skal overleve en restart midt i en morgen.
+  boern_morgen_bevaeget:
+    name: "Børn: stået op efter vækning"
+    icon: mdi:run
+  boern_morgen_nedtoning_aktiv:
+    name: "Børn: morgen-nedtoning kører"
+    icon: mdi:weather-sunset-down
+
+template:
+  - binary_sensor:
+      # RECORDER-SPEJL af moving_target (rå-entity'en er ekskluderet fra
+      # recorderen, og history_stats kan kun læse recorded historik). Scopet til
+      # vækningens hold → skriver kun den ½-1 time det bruges, også i weekend-
+      # vækningen 07:30 (morgen-beskyttelsens spejl slutter ved dens vindue).
+      - name: "Boernevaerelse vaekning bevaegelse"
+        unique_id: boernevaerelse_vaekning_bevaegelse
+        icon: mdi:run
+        device_class: motion
+        state: >-
+          {{ is_state('input_boolean.wakeup_kids_hold_active', 'on')
+             and is_state('binary_sensor.boernevaerelse_apollo_radar_moving_target', 'on') }}
+
+  - sensor:
+      # AUTO-LYSETS NIVEAU i børneværelset (Path 1 i "Lysnet: Børneværelse
+      # tænd"). Én kilde: tænd-reglen og nedtoningens overdragelse læser begge
+      # denne (fejlklasse #2). Formlen er flyttet uændret.
+      - name: "Boernevaerelse auto lys pct"
+        unique_id: boernevaerelse_auto_lys_pct
+        unit_of_measurement: "%"
+        icon: mdi:brightness-auto
+        state: >-
+          {% set lux = states('sensor.boernevaerelse_lux_reel') | float(50) %}
+          {% if lux < (states('input_number.lux_trin_moerkt') | float(5)) %}{% set base = 80 %}
+          {% elif lux < 15 %}{% set base = 55 %}
+          {% else %}{% set base = 30 %}{% endif %}
+          {% set f = states('sensor.global_brightness_factor') | float(1.0) %}
+          {{ [[(base * f) | round(0) | int, 100] | min, 2] | max }}
+
+sensor:
+  # Sekunder ægte bevægelse (timer → ×3600) de sidste 15 min, kun under holdet.
+  - platform: history_stats
+    name: "Boernevaerelse vaekning bevaegelse recent"
+    unique_id: boernevaerelse_vaekning_bevaegelse_recent
+    entity_id: binary_sensor.boernevaerelse_vaekning_bevaegelse
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      minutes: 15
+
+script:
+  boern_morgen_nedtoning_rampe:
+    alias: "Børn morgen: nedtoning (rolig rampe til sluk)"
+    description: >
+      Geometrisk rampe fra hvert tændt dæmpbart lys' nuværende niveau ned til
+      ~1 % over slider-tiden, derefter sluk + slip vækningens hold. Stopper
+      straks hvis input_boolean.boern_morgen_nedtoning_aktiv ryddes.
+    mode: restart
+    sequence:
+      - variables:
+          varighed: "{{ ((states('input_number.boern_morgen_nedtoning_minutter') | float(5)) * 60) | round(0) }}"
+          trin: 10
+          gulv: 3
+          t0: "{{ as_timestamp(now()) }}"
+          start: >-
+            {% set ns = namespace(l=[]) %}
+            {% from 'rosters.jinja' import boern_morgenlys %}{% for e in boern_morgenlys %}
+              {% if is_state(e, 'on') %}
+                {% set ns.l = ns.l + [[e, [state_attr(e, 'brightness') | int(0), 1] | max]] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.l }}
+      - repeat:
+          sequence:
+            - if: "{{ is_state('input_boolean.boern_morgen_nedtoning_aktiv', 'off') }}"
+              then:
+                - stop: "Nedtoning afbrudt (bevægelse eller manuel)"
+            - variables:
+                frac: "{{ [(as_timestamp(now()) - t0) / varighed, 1] | min }}"
+                maks: >-
+                  {% set ns = namespace(m=0) %}
+                  {% for it in start %}
+                    {% set g = [gulv, it[1]] | min %}
+                    {% set ns.m = [ns.m, it[1] * ((g / it[1]) ** frac)] | max %}
+                  {% endfor %}
+                  {{ ns.m }}
+            - repeat:
+                for_each: "{{ start }}"
+                sequence:
+                  - if: "{{ is_state(repeat.item[0], 'on') }}"
+                    then:
+                      - service: light.turn_on
+                        continue_on_error: true
+                        target:
+                          entity_id: "{{ repeat.item[0] }}"
+                        data:
+                          brightness: >-
+                            {% set b0 = repeat.item[1] %}
+                            {% set g = [gulv, b0] | min %}
+                            {{ [(b0 * ((g / b0) ** frac)) | round(0) | int, 1] | max }}
+                          transition: "{{ trin }}"
+            # Plug-lampen kan ikke dæmpes: den går ud når de dæmpbare passerer
+            # ~10 % (mirror'ens egen tænd-tærskel). Uden dæmpbare lys (loft +
+            # strip på slukket vægkontakt) står den til rampens slutning.
+            - if: >-
+                {{ start | count > 0 and maks < 26
+                   and is_state('light.boernevaerelse_hyggelys', 'on') }}
+              then:
+                - service: light.turn_off
+                  continue_on_error: true
+                  target:
+                    entity_id: light.boernevaerelse_hyggelys
+            - delay:
+                seconds: "{{ trin }}"
+          until:
+            - condition: template
+              value_template: >-
+                {{ as_timestamp(now()) - t0 >= varighed
+                   or is_state('input_boolean.boern_morgen_nedtoning_aktiv', 'off') }}
+      - condition: state
+        entity_id: input_boolean.boern_morgen_nedtoning_aktiv
+        state: "on"
+      # Sluk mens holdet stadig står (vetoet dækker os), slip det bagefter.
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: !include ../rosters/boern_morgenlys.yaml
+        data:
+          transition: 3
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.boernevaerelse_hyggelys
+      # Samme stempel som "gradvis sluk" sætter (re-entry-grace).
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.boernevaerelse_last_off
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_boolean.turn_off
+        target:
+          entity_id: !include ../rosters/boern_morgen_flag.yaml
+      - service: logbook.log
+        data:
+          name: "Børn morgen-nedtoning"
+          message: >-
+            Rampe færdig ({{ (varighed / 60) | round(0) | int }} min) — lyset er
+            slukket og vækningens hold sluppet. Auto-lys har rummet igen.
+          entity_id: input_boolean.boern_morgen_nedtoning_aktiv
+
+automation:
+  # 1. Ny vækning → frisk morgen.
+  - id: boern_morgen_nedtoning_nulstil
+    alias: "Børn morgen-nedtoning: nulstil ved vækning"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.wakeup_kids_hold_active
+        from: "off"
+        to: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.boern_morgen_bevaeget
+            - input_boolean.boern_morgen_nedtoning_aktiv
+
+  # 2. Barnet er stået op: nok ÆGTE bevægelse under holdet.
+  - id: boern_morgen_nedtoning_bevaeget
+    alias: "Børn morgen-nedtoning: barnet er stået op"
+    mode: single
+    trigger:
+      # Gulv 10 s: slideren 0 slår morgen-beskyttelsen fra, men må ikke gøre
+      # ét sovende blip til "stået op" her.
+      - platform: template
+        value_template: >-
+          {% set krav = [states('input_number.boern_morgen_bevaegelse_sekunder') | float(45), 10] | max %}
+          {{ (states('sensor.boernevaerelse_vaekning_bevaegelse_recent') | float(0)) * 3600 >= krav }}
+    condition:
+      - condition: state
+        entity_id: input_boolean.wakeup_kids_hold_active
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.boern_morgen_bevaeget
+        state: "off"
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.boern_morgen_bevaeget
+      - service: logbook.log
+        data:
+          name: "Børn morgen-nedtoning"
+          message: >-
+            Barnet er stået op
+            ({{ ((states('sensor.boernevaerelse_vaekning_bevaegelse_recent') | float(0)) * 3600) | round(0) | int }} s
+            bevægelse) — lyset rampes ned når rummet har været stille i
+            {{ states('input_number.boern_morgen_nedtoning_stilhed_sek') | int(60) }} s.
+          entity_id: input_boolean.boern_morgen_bevaeget
+
+  # 3. Stilhed → start rampen.
+  - id: boern_morgen_nedtoning_start
+    alias: "Børn morgen-nedtoning: start rampe ved stilhed"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+        from: "on"
+        to: "off"
+        for:
+          seconds: "{{ states('input_number.boern_morgen_nedtoning_stilhed_sek') | int(60) }}"
+      # Latch'en kan lande EFTER at barnet gik (history_stats-opdatering).
+      - platform: state
+        entity_id: input_boolean.boern_morgen_bevaeget
+        from: "off"
+        to: "on"
+      # Restart dræber et ventende `for:` (permanent faktum) → /1-backstop der
+      # måler stilheden selv. last_changed = boot efter restart ⇒ venter bare
+      # stilhedstiden efter boot (konservativt).
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      - condition: state
+        entity_id: input_boolean.wakeup_kids_hold_active
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.boern_morgen_bevaeget
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.boern_morgen_nedtoning_aktiv
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.presence_sensors_available
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set o = states.binary_sensor.boernevaerelse_apollo_occupancy %}
+          {{ o is not none and o.state == 'off'
+             and (now() - o.last_changed).total_seconds()
+                 >= (states('input_number.boern_morgen_nedtoning_stilhed_sek') | int(60)) }}
+      - condition: template
+        value_template: "{{ not is_state('input_select.room_mode_boernevaerelse', 'Manual') }}"
+    action:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {% from 'rosters.jinja' import boern_alle_lys %}{{ boern_alle_lys
+                     | select('is_state', 'on') | list | count > 0 }}
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.boern_morgen_nedtoning_aktiv
+              - service: script.turn_on
+                target:
+                  entity_id: script.boern_morgen_nedtoning_rampe
+              - service: logbook.log
+                data:
+                  name: "Børn morgen-nedtoning"
+                  message: >-
+                    Rummet stille i {{ states('input_number.boern_morgen_nedtoning_stilhed_sek') | int(60) }} s —
+                    rampe til sluk over {{ states('input_number.boern_morgen_nedtoning_minutter') | int(5) }} min.
+                  entity_id: input_boolean.boern_morgen_nedtoning_aktiv
+        # Intet tændt (fx vægkontakten slået fra) → intet at rampe; slip bare.
+        default:
+          - service: input_boolean.turn_off
+            target:
+              entity_id:
+                - input_boolean.boern_morgen_bevaeget
+                - input_boolean.wakeup_kids_hold_active
+
+  # 4. Bevægelse under rampen → blødt over til auto-lys.
+  - id: boern_morgen_nedtoning_bevaegelse
+    alias: "Børn morgen-nedtoning: bevægelse → fade til auto-lys"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.boern_morgen_nedtoning_aktiv
+        state: "on"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.boern_morgen_nedtoning_aktiv
+      - service: script.turn_off
+        target:
+          entity_id: script.boern_morgen_nedtoning_rampe
+      - variables:
+          pct: "{{ states('sensor.boernevaerelse_auto_lys_pct') | int(30) }}"
+          taendte: >-
+            {% from 'rosters.jinja' import boern_morgenlys %}{{ boern_morgenlys
+                | select('is_state', 'on') | list }}
+      - repeat:
+          for_each: "{{ taendte }}"
+          sequence:
+            - service: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: "{{ repeat.item }}"
+              data:
+                brightness_pct: "{{ pct }}"
+                transition: 4
+      # Plug-lampen tilbage hvis rampen tog den, og strippen igen er "rigtigt
+      # hyggelys" (mirror-reglen: ≥ ~10 %, ikke under godnat).
+      - if: >-
+          {{ 'light.boernevaerelse_hygge_strip' in taendte and pct >= 10
+             and is_state('light.boernevaerelse_hyggelys', 'off')
+             and is_state('input_boolean.godnat_boern_active', 'off') }}
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: light.boernevaerelse_hyggelys
+      - service: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.boern_morgen_bevaeget
+            - input_boolean.wakeup_kids_hold_active
+      - service: logbook.log
+        data:
+          name: "Børn morgen-nedtoning"
+          message: >-
+            Bevægelse under rampen — fader til auto-lys ({{ pct }} %) og slipper
+            vækningens hold. Auto-lys har rummet.
+          entity_id: input_boolean.boern_morgen_nedtoning_aktiv
+
+  # 5. Restart midt i rampen → genoptag fra nuværende niveau.
+  - id: boern_morgen_nedtoning_genoptag
+    alias: "Børn morgen-nedtoning: genoptag efter restart"
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - delay: "00:00:30"
+      - condition: state
+        entity_id: input_boolean.boern_morgen_nedtoning_aktiv
+        state: "on"
+      - condition: state
+        entity_id: script.boern_morgen_nedtoning_rampe
+        state: "off"
+      - service: script.turn_on
+        target:
+          entity_id: script.boern_morgen_nedtoning_rampe

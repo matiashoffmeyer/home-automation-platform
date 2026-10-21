@@ -1,0 +1,1160 @@
+# =============================================================================
+# Sleep Over — open-plan holdes MØRKT når godnat er på (user-spec 2026-08-13)
+# =============================================================================
+# User: "Lav en feature for Sleep Over hvor openplan holdes mørkt når godnat er
+# på. med kill switch. og on i nat. så min mor ikke vækkes hvis hun bevæger sig."
+#
+# Scenariet: en overnattende gæst sover i open-plan (sofa/spisestue). Huset
+# tænder normalt dæmpet lys på bevægelse UNDER godnat — nattur-lyset
+# (godnat_night), spisestuens 1 % natlys (presence_stue), sofa-zonen,
+# køkkenet og velkomstlyset. Alle de veje ser en gæst der vender sig på sofaen
+# som "nogen er oppe" → lyset tænder i det rum hun sover i. Er hun oppe og
+# går på toilet, tænder det ligeledes ved hendes egen bevægelse.
+#
+# DESIGN — ét delt anker, ikke en kopieret regel (fejlklasse #2):
+#   binary_sensor.sleepover_openplan_moerkt = kill-switch ON
+#                                           + "i nat" ON
+#                                           + (godnat_common_active ON
+#                                              ELLER klokken < morgen-slut)
+# Alle open-plan tænd-veje får ÉN condition på den sensor. Ingen af dem
+# gentager reglen.
+#
+# HVORFOR godnat_COMMON og ikke _any: godnat_boern (putning ~19:30) betyder
+# kun at BØRNENE sover — de voksne (og gæsten) er stadig oppe i stuen. Ville
+# vi gate på _any, blev open-plan mørkt hver aften kl. 19:30.
+#
+# HVORFOR en morgen-slut oveni: godnat-flagene ryddes 06:00 (godnat_auto_clear
+# / godmorgen-auto-detect), og de eksisterende tænd-veje har alle en
+# `binary_sensor.godnat_faelles_morgen_fri`-undtagelse (2026-08-21: var elleve
+# kopier af et bart `6 <= now().hour < 12`). Uden morgen-slut ville præcis
+# 06:00:00 være det sekund hvor hele open-plan igen må tænde på bevægelse —
+# på en gæst der stadig sover (fejlklasse #19: en handling der arver en anden
+# gates udløb rammer det værst tænkelige tidspunkt). Default 07:30.
+#
+# VAGTEN (sleepover_moerke_vagt): et kill-switch der ikke sidder på hver vej
+# ind er pynt (fejlklasse #21), og der er tænd-veje vi ikke kender (Matter-ekko,
+# scener, fremtidige automations). Vagten slukker derfor open-plan lys der
+# tændes MENS mørket er aktivt — men KUN når tændingen kom fra automatik
+# (`context.parent_id is not none`), rummet ikke står i Manual, og der ikke har
+# været et Styrbar-/app-tryk indenfor 120 s. Tænder gæsten eller familien selv
+# lys, vinder de altid. Restart-triggeren dækker fejlklasse #4/#15: står et
+# open-plan lys tændt når HA genstarter midt i natten, kommer der aldrig en ny
+# flanke, og vagten ville være stum.
+#
+# HVAD RØRES IKKE: badeværelset, soveværelset og børneværelset kører uændret —
+# gæsten skal kunne komme på toilettet, og familien skal kunne bruge resten af
+# huset. Manuel tænding (app, Styrbar, kontakt) er aldrig blokeret.
+# ⚠️ 2026-09-27 (user-spec): ENTRÉ og TERRASSE er nu MED — "hvis en gæst sover i
+# open plan skal hjemkomst og andre automations heller ikke tænde lys i
+# openplan, terrasse og entré". Entréen lyser ind i stuen; familien der går på
+# toilet om natten må tænde manuelt.
+#
+# GARDINERNE (2026-08-23, user-spec: "alle gardiner i open plan skal blive ned
+# indtil styrbar op"): mørket dækker nu også dagslyset. Når ankeret tænder,
+# LUKKES de tre open-plan-gardiner, og `sensor.gardiner_manual_hold` holder dem
+# nede så længe ankeret er on (det var allerede sådan siden 08-14; det nye er at
+# de aktivt lukkes, og at holdet varer til gæsten selv slipper det).
+#   ⚠️ Dette overtrumfer nat-cyklus-knapperne (`gardin_syd/vest_natcyklus_
+#   enabled`, begge default OFF = "flyt mig ikke om natten") og VEST-NATREGEL
+#   2026-06-12. De regler findes for familiens skyld; en gæst der sover i rummet
+#   vejer tungere. Manuel betjening (Somrig/RODRET/app) læser ikke 'held' og
+#   vinder stadig altid.
+#
+# UDGANGEN ER ET MENNESKE, IKKE ET KLOKKESLÆT (2026-08-23, user-spec — spejler
+# børneværelsets gæste-hold, `packages/boernevaerelse_manual_off_lock.yaml`):
+# holdet slippes af **stue-Styrbar OP**, hvorefter alle tre open-plan
+# room_modes → Auto (stue+spisestue+køkken, jf. splittet 2026-09-03d) og
+# "i nat" ryddes. `sleepover_morgen_slut` er dermed degraderet fra primær
+# udgang til BACKSTOP (sat 10:00, ikke 07:30) — et fast klokkeslæt ramte
+# fejlklasse #19: gardinerne rullede op og lyset måtte tænde igen i det sekund
+# gaten slap, uanset om gæsten stadig sov.
+#
+# NB: OP midt om natten (gæsten skal på toilet) rydder holdet — som i
+# børneværelset er ét menneskeligt tryk hele udgangen. Gardinerne åbnes dog kun
+# hvis solen er oppe, så et natligt tryk ikke starter motorerne.
+#
+# =============================================================================
+# AUTO-ARMERING (2026-09-04, user-spec: "det er tydeligt at der sover en gæst i
+# open plan ... så det skal slå til automatisk")
+# =============================================================================
+# Featuren virkede, men INGEN havde trykket "i nat" — og kill-switchen stod
+# oven i købet OFF, så natten til 4/9 sov en gæst i stuen uden at huset vidste
+# det. En feature der kræver at man husker en knap aftenen før, er slået fra.
+#
+# MÅLT SIGNATUR (`binary_sensor.stue_apollo_occupancy_filtered`, kl. 01-05,
+# 12 nætter) — en sovende krop taber radaren i 5-15 min ad gangen og fanges
+# igen, så mønsteret er mange korte udslag spredt jævnt over hele natten:
+#
+#   nat     on-min 01-05   max 60-min rullende   10-min-buckets m. aktivitet
+#   08-24…09-03  0,0-0,3          0,0-0,3                0-2  (af 24)
+#   09-04       46,4             21,7                   18   ← gæsten
+#
+# Separationen er ~70×, ikke 2×. Tærsklen (10 min i et rullende 60-min-vindue)
+# ligger 33× over støjen og 2,2× under gæstens signal — der er ingen grund til
+# at finpudse den. At det IKKE er ghost presence er dobbelt-bevist: spisestuen
+# havde et 551-min hul samme nat (altså intet felt-læk fra samme krop), og
+# `stue_apollo_frossen_ghost` (møbel-detektoren) er med som condition.
+#
+# VINDUET 00:30-05:00, og BEVIDST ingen godnat-condition:
+#   • 00:30 fordi familiens sene tv-aftener slutter før — og målingerne ovenfor
+#     er taget fra 01:00, så 00:30 er en beskeden udvidelse, ikke et gæt.
+#   • 05:00 fordi familien selv begynder at stå op derefter; 05-06 er præcis
+#     hvor den værste normal-nat (08-30) havde sine 17 minutter.
+#   • Ingen godnat-gate, fordi det ville binde auto-armeringen til HVORDAN hver
+#     house_mode sætter godnat-flagene (AirBnB sætter dem direkte, ikke via
+#     script.godnat) — user-spec'en er "gælder både i Airbnb og normal mode",
+#     og et rent tidsvindue er ens i alle tre.
+#   • MEN at armere for tidligt er IKKE ufarligt (rettet 2026-09-28, AirBnB-
+#     audit): mørke-ankeret er `godnat OR nu < morgen_slut`, og morgen_slut
+#     (10:00) ligger EFTER 00:30 — et flag sat 00:40 mørklægger open-plan +
+#     entré med det samme. En AirBnB-gæst der ser film efter 00:30 blev læst
+#     som en sovende og fik mørk køkken/entré til kl. 10. Diskriminatoren er
+#     derfor LYSET: `binary_sensor.open_plan_lys_rent` (alle tre open-plan-rum
+#     slukket i ≥ 6 min). Ingen sover med lyset tændt; den der er oppe har
+#     det tændt. Slukker de senere, flipper sensoren → ny flanke (+ 10-min-
+#     backstoppen) → armering. (User-valg.)
+#   • FØRSTE MÅLTE SOFA-NAT EFTER KRAVET (27→28/9, Normal, armeret med gæste-
+#     knap O 21:16): lys-kravet var opfyldt HELE natten (lys_rent on 21:17 →
+#     06:09), men gæsten lå BAG EN PUDE (user) — stue-radaren så 0,0-0,4
+#     min/t fra 00 til 05 (filtered), max 0,4 min i det rullende vindue.
+#     Normale nætter ligger på 0,0-0,3. Der er INGEN tærskel der skiller en
+#     skærmet sovende fra en tom stue, så auto-detektionen er en BONUS der
+#     kun fanger en synlig krop (09-04: 21,7 min) — gæsteknappen O er den
+#     pålidelige vej. Sænk ikke `sleepover_auto_minutter` for at fange puden:
+#     støjgulvet er det samme.
+#
+# ⚠️ GARDINERNE MÅ IKKE KØRE OM NATTEN. Auto-armering kan ramme kl. 00:40, og
+# `ned`-grenen ville da starte tre Somfy-motorer 2 m fra en sovende gæst —
+# motorlarmen ER vækningen. `ned` er derfor gated på
+# `binary_sensor.time_window_active_hours` (05-23); uden for det holdes
+# gardinerne blot hvor de står (`sensor.gardiner_manual_hold` gør det allerede
+# gratis, så beskyttelsen mod morgensolen er intakt hvis de er nede).
+#
+# =============================================================================
+# UDGANG 3 — MORGEN-BEVÆGELSE (2026-09-04, user-spec: "move aktivitet i
+# spisestuen eller køkkenet efter kl 06 burde bryde mørke beskyttelsen og
+# gardin beskyttelsen af open plan rummene")
+# =============================================================================
+# Auto-armering uden en automatisk udgang ville bryde 🏡-reglen: en gæst der
+# ikke kender Styrbar'en sad ellers i mørke til backstoppen kl. 10.
+# Udgangen kalder SAMME `script.sleepover_slip_hold` som OP-trykket, så
+# gardin-oprydningen arves gratis (fejlklasse #2 — reglen står ét sted).
+#
+# HVORFOR moving_target og ikke occupancy: gæsten der sover i stuen giver
+# still-targets, og et 6 m felt læker ind i nabo-rummene. Kun ÆGTE bevægelse
+# gennem spisestue/køkken beviser at nogen er OPPE (samme diskriminator som
+# børneværelsets morgen-beskyttelse). `for: 3 s` filtrerer de sub-sekund-blip
+# der er radarens normale støj — samme mål som
+# `koekken_menneske_bevist_min_sekunder`, kalibreret 3/9 på 614 episoder hvor
+# 81 % varede ≤ 1 s. NB de to moving_target-sensorer er ude af recorderen; det
+# er ligegyldigt for en trigger, som læser live state.
+#
+# "Efter kl 06" er `binary_sensor.godnat_faelles_morgen_fri` — husets ÉNE anker
+# for "det er morgen" (6-12, eller kl. 5 hvis en voksen beviseligt er oppe),
+# i stedet for endnu en kopi af `6 <= now().hour`.
+#
+# UDGANG 4 — LANGT NED UDEN GÆST (B240, 2026-10-19): stue-Styrbar langt NED er
+# også familiens "alt fra". Armerer DET natten, og ser STUE-radaren ikke mere
+# end `sleepover_ned_bevis_sekunder` (30) akkumuleret inden for
+# `sleepover_ned_bevis_minutter` (5) efter trykket, slippes holdet igen.
+# Måling og regel: ved automationen sleepover_ned_uden_bevis_slip.
+# =============================================================================
+
+input_boolean:
+  # KILL-SWITCH: slår hele featuren fra uanset "i nat"-toggle.
+  sleepover_enabled:
+    name: "Sleep Over: funktion aktiv"
+    icon: mdi:sleep
+
+  # ARMERING PR. NAT (= husets "gæst sover i open plan"-knap, søster til
+  # input_boolean.boernevaerelse_gaest_sover). Tændes om aftenen; mørket træder
+  # først i kraft ved godnat, så familien kan leve videre i stuen imens.
+  # Ryddes af stue-Styrbar OP — eller af backstoppen nedenfor, så en glemt
+  # toggle ikke mørklægger huset resten af dagen.
+  sleepover_i_nat:
+    name: "Sleep Over: gæst sover i open plan i nat"
+    icon: mdi:bed-clock
+
+input_number:
+  # Hvor mange minutters stue-ophold (rullende 60-min-vindue) der skal til før
+  # huset selv armerer "i nat". 0 = auto-detektion HELT fra (samme konvention
+  # som boern_morgen_bevaegelse_sekunder), så featuren kan køre manuelt-kun
+  # uden en ekstra kill-switch.
+  # Default 10: målt støjgulv på 11 normale nætter er 0,0-0,3 min, gæstenatten
+  # 4/9 gav 21,7 → 10 ligger 33× over støjen og 2,2× under signalet.
+  # 2026-09-19 genmålt, 14 døgn: støjgulvet INDE i vinduet holder (6 af de
+  # seneste nætter står på 0,0), men tærsklen er ikke problemet — VINDUES-KANTEN
+  # var. Det rullende 60-min-vindue så tilbage FØR 00:30, så to af tre
+  # auto-armeringer fyrede kl. 00:30:00 på ren aften-tilstedeværelse (40,9 og
+  # 60,0 min i 23:30-00:30, derefter ~0 resten af natten), mens den ægte
+  # gæstenat gav 154,8 min efter 01:30. Kanten er lukket 2026-10-04 (B154):
+  # kun tid siden 00:30 tæller (`sensor.sleepover_stue_siden_0030`). Hæv IKKE
+  # denne slider for at dæmpe falske armeringer.
+  sleepover_auto_minutter:
+    name: "Sleep Over: krævet stue-ophold for auto-armering"
+    icon: mdi:motion-sensor
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+  # B240 (2026-10-19, user-spec): et armerende stue-Styrbar langt NED kræver
+  # mere end `sleepover_ned_bevis_sekunder` akkumuleret STUE-radar inden for
+  # `sleepover_ned_bevis_minutter` efter trykket — ellers var det bare nogen
+  # der gik tidligt eller slukkede lyset, og holdet slippes. 0 min = aldrig
+  # (NED holder til morgen som før 19/10). Målt 30 døgn, 0-5 min efter armering:
+  # gæste-nætterne 89-300 s (én re-armering 8 min efter en anden: 6 s — gæste-O,
+  # ikke NED, rammes ikke), Parent A's afgang 19/10: 0 s.
+  sleepover_ned_bevis_minutter:
+    name: "Sleep Over: langt NED bevis-vindue"
+    icon: mdi:timer-sand
+    min: 0
+    max: 15
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+  sleepover_ned_bevis_sekunder:
+    name: "Sleep Over: langt NED krævet stue-radar"
+    icon: mdi:radar
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+input_datetime:
+  # KONFIG (skal med i snapshot/DATETIME_CONFIG): BACKSTOP — seneste tidspunkt
+  # holdet slippes automatisk, hvis ingen har trykket Styrbar OP. Den ægte
+  # udgang er OP-trykket; dette tal er kun sikkerhedsnettet mod et glemt flag.
+  # 10:00 = samme backstop som børneværelsets gæste-hold.
+  sleepover_morgen_slut:
+    name: "Sleep Over: backstop-slip (hvis ingen trykker OP)"
+    icon: mdi:timer-sand-complete
+    has_date: false
+    has_time: true
+  # 2026-09-27 (user-spec, gæste-RODRET): sat af O-trykket på gæsteknappen
+  # (automations/somrig_buttons.yaml). Frisk (< 14 t) + "i nat" = mørket gælder
+  # STRAKS (ikke først ved godnat/midnat), og entréen holdes også mørk.
+  # Urørt står den på dagens midnat → læses via state_attr timestamp + guard.
+  sleepover_gaesteknap_at:
+    name: "Sleep Over: gæsteknap O trykket"
+    icon: mdi:gesture-tap-button
+    has_date: true
+    has_time: true
+  # B240 (2026-10-19), RUNTIME (ikke i DATETIME_CONFIG): tidspunktet hvor et
+  # stue-Styrbar langt NED SELV armerede "i nat" og endnu venter på radar-bevis
+  # for en gæst. 1970 = intet vindue (bevist, sluppet, gæste-O eller i_nat off).
+  # Et skrevet stempel, ikke i_nat's last_changed (nulstilles ved restart).
+  sleepover_ned_uden_bevis_siden:
+    name: "Sleep Over: langt NED venter på radar-bevis siden"
+    icon: mdi:radar
+    has_date: true
+    has_time: true
+
+template:
+  - binary_sensor:
+      # ASCII-navn med vilje: name-slug SKAL matche unique_id (repo-gotcha).
+      - name: "Sleepover openplan moerkt"
+        unique_id: sleepover_openplan_moerkt
+        icon: mdi:weather-night
+        state: >-
+          {% if is_state('input_boolean.sleepover_enabled', 'on')
+                and is_state('input_boolean.sleepover_i_nat', 'on') %}
+            {# has_time-only input_datetime → timestamp = sekunder siden midnat #}
+            {% set slut = state_attr('input_datetime.sleepover_morgen_slut', 'timestamp') | float(27000) %}
+            {% set nu = now().hour * 3600 + now().minute * 60 + now().second %}
+            {# 2026-09-27: gæste-RODRET O = "vi sover nu" → mørkt med det samme. #}
+            {% set g = states('input_datetime.sleepover_gaesteknap_at') %}
+            {% set gts = state_attr('input_datetime.sleepover_gaesteknap_at', 'timestamp') | float(0) %}
+            {% set gaest = g not in ['unknown', 'unavailable', ''] and g[11:] != '00:00:00'
+                           and (now().timestamp() - gts) < 14 * 3600 %}
+            {{ is_state('binary_sensor.godnat_common_active', 'on') or nu < slut or gaest }}
+          {% else %}
+            false
+          {% endif %}
+        attributes:
+          aarsag: >-
+            {% if is_state('input_boolean.sleepover_enabled', 'off') %}
+              kill-switch fra
+            {% elif is_state('input_boolean.sleepover_i_nat', 'off') %}
+              ikke armeret i nat
+            {% elif is_state('binary_sensor.godnat_common_active', 'on') %}
+              godnat aktiv
+            {% else %}
+              {% set slut = state_attr('input_datetime.sleepover_morgen_slut', 'timestamp') | float(27000) %}
+              {% set nu = now().hour * 3600 + now().minute * 60 + now().second %}
+              {% set gts = state_attr('input_datetime.sleepover_gaesteknap_at', 'timestamp') | float(0) %}
+              {% if nu < slut %}
+                {{ 'holder til Styrbar OP (backstop ' ~ states('input_datetime.sleepover_morgen_slut') ~ ')' }}
+              {% elif states('input_datetime.sleepover_gaesteknap_at')[11:] != '00:00:00'
+                      and (now().timestamp() - gts) < 14 * 3600 %}
+                gæsteknap O {{ states('input_datetime.sleepover_gaesteknap_at')[11:16] }} — mørkt til I / Styrbar OP
+              {% else %}
+                armeret, men uden for nat/morgen-vindue
+              {% endif %}
+            {% endif %}
+          morgen_slut: "{{ states('input_datetime.sleepover_morgen_slut') }}"
+
+      # 2026-09-27 (user-spec: "hvis en gæst sover i open plan skal hjemkomst
+      # og andre automations heller ikke tænde lys i openplan, terrasse og
+      # entré"): ankeret ovenfor gater nu OGSÅ entré (entre_motion_on/_night,
+      # arrival_entre_light) og terrasse (terrasse_dusk_auto_on,
+      # airbnb_outdoor_zen_on), og vagten nedenfor dækker begge. Et kortvarigt
+      # separat entré-anker (kun ved gæsteknap-armering) er fjernet igen.
+
+      # AUTO-DETEKTION: "der ligger nogen og sover i stuen lige nu".
+      # Ren observation — den armerer ingenting selv (det gør automationen
+      # nedenfor), så sensoren kan aflæses på dashboardet uden bivirkninger.
+      - name: "Sleepover gaest sporet"
+        unique_id: sleepover_gaest_sporet
+        icon: mdi:sleep
+        state: >-
+          {% set krav = states('input_number.sleepover_auto_minutter') | float(10) %}
+          {# B154 (2026-10-04): kun tid INDE i vinduet tæller. Det rullende vindue
+             alene så 60 min tilbage FØR 00:30, så aften-tilstedeværelse armerede
+             i vinduets første sekund (09-09/09-10 kl. 00:30:00). #}
+          {% set haves = ([states('sensor.sleepover_stue_nat_minutter') | float(0),
+                           states('sensor.sleepover_stue_siden_0030') | float(0)] | min) * 60 %}
+          {% set nu = now().hour * 3600 + now().minute * 60 + now().second %}
+          {{ is_state('input_boolean.sleepover_enabled', 'on')
+             and krav > 0
+             and 1800 <= nu < 18000
+             and haves >= krav
+             and is_state('binary_sensor.stue_apollo_frossen_ghost', 'off')
+             and is_state('binary_sensor.open_plan_lys_rent', 'on') }}
+        attributes:
+          ophold_minutter: >-
+            {{ (([states('sensor.sleepover_stue_nat_minutter') | float(0),
+                  states('sensor.sleepover_stue_siden_0030') | float(0)] | min) * 60) | round(1) }}
+          kraevet_minutter: "{{ states('input_number.sleepover_auto_minutter') | int(10) }}"
+          aarsag: >-
+            {% set krav = states('input_number.sleepover_auto_minutter') | float(10) %}
+            {% set haves = ([states('sensor.sleepover_stue_nat_minutter') | float(0),
+                             states('sensor.sleepover_stue_siden_0030') | float(0)] | min) * 60 %}
+            {% set nu = now().hour * 3600 + now().minute * 60 + now().second %}
+            {% if is_state('input_boolean.sleepover_enabled', 'off') %}
+              kill-switch fra
+            {% elif krav <= 0 %}
+              auto-detektion slået fra (slider = 0)
+            {% elif not (1800 <= nu < 18000) %}
+              uden for detektions-vinduet (00:30-05:00)
+            {% elif is_state('binary_sensor.stue_apollo_frossen_ghost', 'on') %}
+              frossen ghost — ser ud som et møbel, ikke en krop
+            {% elif is_state('binary_sensor.open_plan_lys_rent', 'off') %}
+              open-plan-lys tændt (eller slukket < 6 min) — nogen er oppe
+            {% else %}
+              {{ (haves | round(1)) ~ '/' ~ (krav | round(0) | int) ~ ' min stue-ophold' }}
+            {% endif %}
+
+sensor:
+  # Rullende 60-min-vindue på stuens occupancy. En sovende krop taber radaren i
+  # 5-15 min ad gangen, så det er den AKKUMULEREDE tid der bærer signalet — ikke
+  # ét langt ubrudt udslag. Rullende (ikke "siden 00:30"), så en gæst der først
+  # lægger sig kl. 02 også fanges.
+  - platform: history_stats
+    name: "Sleepover stue nat minutter"
+    unique_id: sleepover_stue_nat_minutter
+    entity_id: binary_sensor.stue_apollo_occupancy_filtered
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      minutes: 60
+
+  # B154 (2026-10-04): samme kanal, men kun tiden SIDEN 00:30. Detektionen
+  # kræver min(rullende 60, siden 00:30) ≥ krav: det rullende vindue fanger
+  # stadig en gæst der først lægger sig kl. 02, og dette led sørger for at
+  # tiden FØR vinduet (familiens aften i stuen) aldrig tæller med. Koster
+  # højst krav-minutter (10) ekstra ventetid for en gæst der sov fra før 00:30
+  # — målt 09-04: 21,7 min i timen efter 01:00, så armeringen kommer stadig.
+  # Før 00:30 er start = nu (varighed 0); efter 05:00 er vinduet ligegyldigt
+  # (detektionen er gatet på 00:30-05:00). `today_at` er DST-sikker.
+  - platform: history_stats
+    name: "Sleepover stue siden 0030"
+    unique_id: sleepover_stue_siden_0030
+    entity_id: binary_sensor.stue_apollo_occupancy_filtered
+    state: "on"
+    type: time
+    start: "{{ [today_at('00:30'), now()] | min }}"
+    end: "{{ now() }}"
+
+  # B240 (2026-10-19): stue-radarens akkumulerede tid i bevis-vinduet efter et
+  # armerende langt NED (t0 = sleepover_ned_uden_bevis_siden → t0 + vindue).
+  # Intet vindue (1970) → start = slut = nu → 0. Læses kun af
+  # sleepover_ned_uden_bevis_slip, som selv kalder update_entity først.
+  - platform: history_stats
+    name: "Sleepover stue efter langt NED"
+    unique_id: sleepover_stue_efter_langt_ned
+    entity_id: binary_sensor.stue_apollo_occupancy_filtered
+    state: "on"
+    type: time
+    start: >-
+      {% set t0 = state_attr('input_datetime.sleepover_ned_uden_bevis_siden', 'timestamp') | float(0) %}
+      {{ t0 if t0 > 86400 else now().timestamp() }}
+    end: >-
+      {% set t0 = state_attr('input_datetime.sleepover_ned_uden_bevis_siden', 'timestamp') | float(0) %}
+      {% set v = states('input_number.sleepover_ned_bevis_minutter') | float(0) %}
+      {{ t0 + v * 60 if t0 > 86400 else now().timestamp() }}
+
+script:
+  # ÉN udgang, tre kaldere (Styrbar OP, morgen-bevægelse, fremtidige veje).
+  # Gardinerne rydder op af sig selv, fordi sleepover_gardiner_foelger_moerket
+  # hænger på ankerets on→off-flanke — ingen kalder skal huske dem.
+  sleepover_slip_hold:
+    alias: "Sleep Over: slip gæste-holdet"
+    mode: single
+    fields:
+      grund:
+        description: "Hvad slap holdet (vises i logbogen)"
+        example: "Styrbar stue OP"
+    sequence:
+      - condition: state
+        entity_id: input_boolean.sleepover_i_nat
+        state: "on"
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.sleepover_i_nat
+      # 2 s: kommer slippet fra et Styrbar-tryk, kører SAMME tryk
+      # styrbar_stamp_press → Manual. Uden delayen er rækkefølgen en lodtrækning.
+      - delay:
+          seconds: 2
+      # 2026-09-03d: holdet er OPEN-PLAN-bredt, så udgangen skal også være det.
+      - repeat:
+          for_each: !include ../rosters/open_plan_rum_mode.yaml
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ not is_state(repeat.item, 'Auto') }}"
+              then:
+                - service: input_select.select_option
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                  data:
+                    option: "Auto"
+      - service: logbook.log
+        data:
+          name: "Sleep Over"
+          message: >-
+            Gæste-holdet sluppet {{ now().strftime('%H:%M') }} —
+            {{ grund | default('ukendt kilde', true) }}
+            (room_mode → Auto, gardin-holdet frigivet).
+          entity_id: input_boolean.sleepover_i_nat
+
+  # ÉN indgang, to kaldere (#2): gæste-RODRET O (somrig_buttons.yaml, armerer
+  # 18-06) og stue-Styrbar langt NED (styrbar_rooms.yaml, armerer 20-06 —
+  # user-spec 2026-10-17: "det skal svare til at trykke ned på gæst knappen").
+  # Selve vinduet afgør kalderen via `armer`; resten er ens.
+  #
+  # MED-EJERE (#1): tænd/sluk kommer fra en automation → parent_id sat, så
+  # Sleep Over-vagten og presence-sluk ville ellers behandle trykket som
+  # automatik. Derfor stemples FØR lys-kaldet: last_press (vagten respekterer
+  # 120 s) + room_mode Manual for stue/spisestue/køkken. Entré sættes ALDRIG i
+  # Manual (kun timer-stempel): i Manual er entré-bevægelses-tænd spærret mens
+  # entré-sluk kører videre → mørk gang (målt 28/9). Udgangen (Styrbar OP /
+  # gæste-I / morgen-bevægelse) sætter alle tre rum tilbage i Auto.
+  gaest_sover_sluk:
+    alias: "Sleep Over: sluk open-plan + entré + terrasse (gæsteknap O)"
+    mode: queued
+    max: 3
+    fields:
+      kilde:
+        description: "Hvad trykkede (vises i logbogen)"
+        example: "Gæste-RODRET O"
+      armer:
+        description: "true = armér Sleep Over ('gæst i nat') med det samme"
+        example: true
+      radar_bevis:
+        description: >-
+          true = armeringen skal bekræftes af stue-radaren (stue-Styrbar langt
+          NED, der også er familiens "alt fra"). Se sleepover_ned_uden_bevis_slip.
+        example: true
+    sequence:
+      - variables:
+          arm: "{{ armer | default(false) | bool }}"
+          # Læst FØR armeringen: kun en NED der SELV armerer, skal bevises. Står
+          # "i nat" allerede on (gæste-O, app, auto-armering), er natten allerede
+          # troværdig — et NED oveni må aldrig gøre den slip-bar.
+          # Bevis-vindue 0 min = featuren slået fra (NED holder til morgen).
+          kraev_bevis: >-
+            {{ (radar_bevis | default(false) | bool)
+               and is_state('input_boolean.sleepover_i_nat', 'off')
+               and states('input_number.sleepover_ned_bevis_minutter') | int(0) > 0 }}
+      - repeat:
+          for_each: [stue, spisestue, koekken]
+          sequence:
+            - service: script.styrbar_stamp_press
+              data:
+                room: "{{ repeat.item }}"
+      - service: script.styrbar_stamp_press
+        data:
+          room: entre
+          set_manual: false
+      - service: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id:
+            - light.stue_all
+            - light.entre_loft
+            # 2026-09-27 (user-spec): "terrasselys skal også slukkes af gæste-
+            # knappen" — kun SLUK (I tænder den ikke). Pærelyskæden, IKKE
+            # switch.terrasse_plug: pluggen er udeområdets strøm (altid on,
+            # terrace_plug_control.yaml). Dusk-auto-on er en flanke og fyrer
+            # ikke igen samme aften.
+            - light.terrasse_paerelyskaede
+        data:
+          transition: 1
+      # B153: grupperne rummer ikke switch.*
+      - service: switch.turn_off
+        continue_on_error: true
+        target:
+          entity_id: switch.koekken_spots
+      # Kill-switchen sleepover_enabled respekteres (anker-sensoren kræver den).
+      - if:
+          - condition: template
+            value_template: "{{ arm }}"
+        then:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.sleepover_gaesteknap_at
+            data:
+              timestamp: "{{ now().timestamp() | round(0) }}"
+          # Bevis-vinduet (B240) FØR i_nat tændes: gæste-O nulstiller et
+          # ventende NED-vindue (O er gæstens egen knap = bevis nok); et NED
+          # der arvede en allerede armeret nat rører det ikke.
+          - if:
+              - condition: template
+                value_template: "{{ kraev_bevis }}"
+            then:
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.sleepover_ned_uden_bevis_siden
+                data:
+                  timestamp: "{{ now().timestamp() | round(0) }}"
+            else:
+              - if:
+                  - condition: template
+                    value_template: "{{ not (radar_bevis | default(false) | bool) }}"
+                then:
+                  - service: input_datetime.set_datetime
+                    target:
+                      entity_id: input_datetime.sleepover_ned_uden_bevis_siden
+                    data:
+                      timestamp: 0
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.sleepover_i_nat
+      - service: logbook.log
+        data:
+          name: "Sleep Over"
+          message: >-
+            {{ kilde | default('ukendt kilde', true) }}: open-plan + entré +
+            køkken-spots + terrasse slukket, open-plan i Manual{{
+            ' · Sleep Over armeret (open-plan + entré mørkt natten over)'
+            if arm else '' }}{{
+            ' — slippes igen medmindre stue-radaren ser over '
+            ~ states('input_number.sleepover_ned_bevis_sekunder') | int(0)
+            ~ ' s inden for ' ~ states('input_number.sleepover_ned_bevis_minutter') | int(0)
+            ~ ' min' if arm and kraev_bevis else '' }}.
+          entity_id: input_boolean.sleepover_i_nat
+
+automation:
+  # ---------------------------------------------------------------------------
+  # UDGANG 1 (den ægte): stue-Styrbar OP → slip holdet + room_mode Auto.
+  # Spejler boernevaerelse_manual_off_lock_clear_op. 2 s delay før Auto, fordi
+  # SAMME tryk kører styrbar_brightness_step → styrbar_stamp_press, der sætter
+  # rummet i Manual; uden delayen er rækkefølgen en lodtrækning, og user-spec er
+  # eksplicit: "hvorefter rummet går på auto".
+  #
+  # 2026-09-19d: OP rydder KUN holdet når mørket faktisk er i kraft (ankeret on).
+  # Flaget armeres om aftenen, men mørket træder først ind ved godnat — og målt
+  # over 14 døgn ligger 16 af 49 stue-Styrbar-tryk i 20-21, altså præcis i det
+  # vindue hvor man armerer manuelt. Uden denne gate slettede et helt almindeligt
+  # aften-tryk det gæste-hold man lige havde sat, tavst, hver tredje aften.
+  # Asymmetrien mod børneværelset (#12) er MED vilje: DÉR slukker armeringen
+  # rummet med det samme, så et OP-tryk bagefter utvetydigt betyder "jeg vil have
+  # lys her" — i open plan lever familien videre i stuen imens, så samme tryk
+  # betyder ingenting om gæsten. Er ankeret aldrig on, holder flaget intet, og
+  # sleepover_i_nat_auto_clear rydder det (= gæstens automatiske udgang, #🏡2).
+  # ---------------------------------------------------------------------------
+  - id: sleepover_gaest_op_clear
+    alias: "Sleep Over: stue-Styrbar OP slipper gæste-holdet (+ room_mode Auto)"
+    mode: single
+    trigger:
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "7e:44:f6:62:8e:f4:b1:23"
+          command: "on"
+      - platform: event
+        event_type: zha_event
+        event_data:
+          device_ieee: "7e:44:f6:62:8e:f4:b1:23"
+          command: "move_with_on_off"
+    condition:
+      - condition: state
+        entity_id: input_boolean.sleepover_i_nat
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.sleepover_openplan_moerkt
+        state: "on"
+      # 2026-10-05 (B193): OP er radio-volumen mens radioen spiller.
+      - condition: template
+        value_template: "{{ not is_state('binary_sensor.styrbar_stue_radio', 'on') }}"
+    action:
+      # 2026-09-04: selve oprydningen bor nu i script.sleepover_slip_hold, så
+      # morgen-bevægelses-udgangen deler den frem for at kopiere den (#2).
+      - service: script.sleepover_slip_hold
+        data:
+          grund: "Styrbar stue OP"
+      # 2026-10-17 (user-spec: "det skal ikke blive til manuel mode"): SAMME
+      # tryk tænder lyset via styrbar_brightness_step, som stempler stuen
+      # Manual EFTER lys-kaldet. Normalt sker det før slip-scriptets 2 s
+      # (målt 17/10 05:39: Manual :40, Auto :41), men en langsom Matter-pære
+      # skubber stemplet forbi Auto → rummet blev hængende i Manual. Kommer
+      # stemplet sent, sættes Auto igen. 8 s dækker et CHIP-timeout-kald.
+      - wait_for_trigger:
+          - platform: state
+            entity_id: !include ../rosters/open_plan_rum_mode.yaml
+            to: "Manual"
+        timeout:
+          seconds: 8
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ wait.trigger is not none }}"
+        then:
+          - repeat:
+              for_each: !include ../rosters/open_plan_rum_mode.yaml
+              sequence:
+                - if:
+                    - condition: template
+                      value_template: "{{ not is_state(repeat.item, 'Auto') }}"
+                  then:
+                    - service: input_select.select_option
+                      target:
+                        entity_id: "{{ repeat.item }}"
+                      data:
+                        option: "Auto"
+
+  # ---------------------------------------------------------------------------
+  # APP-TRYK DER GØR MØRKET AKTIVT → sluk som gæste-O (2026-10-18, user-spec:
+  # "hvis der bliver trykket guest sover i open plan om morgenen så skal lyset
+  # jo slukkes, ikke bare gardinerne rulles ned"). Målt 18/10: kontakten tændt
+  # i appen 06:05:03 → mørket on samme sekund (nu < morgen_slut) → kun
+  # gardin-grenen reagerede; køkken-lyskæden (automatik-tændt 05:55) stod, for
+  # mørke-vagten fanger kun NYE off→on-flanker (fejlklasse #4).
+  # Kun MENNESKE-tryk (user_id): gæste-O og Styrbar-langt-NED armerer via
+  # gaest_sover_sluk selv og har allerede slukket. Et aften-tryk før godnat
+  # gør ikke mørket aktivt → intet slukkes (familien lever videre i stuen);
+  # godnat rydder lyset som altid.
+  # ---------------------------------------------------------------------------
+  - id: sleepover_app_tryk_sluk
+    alias: "Sleep Over: app-tryk 'gæst sover' i mørke-vinduet slukker open-plan"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.sleepover_i_nat
+        from: "off"
+        to: "on"
+    condition:
+      - condition: template
+        value_template: "{{ trigger.to_state.context.user_id is not none }}"
+    action:
+      - wait_template: "{{ is_state('binary_sensor.sleepover_openplan_moerkt', 'on') }}"
+        timeout:
+          seconds: 5
+        continue_on_timeout: false
+      - service: script.gaest_sover_sluk
+        data:
+          kilde: "App-kontakten 'gæst sover i open plan'"
+          armer: false
+
+  # ---------------------------------------------------------------------------
+  # AUTO-ARMERING: huset opdager selv at der sover nogen i open-plan.
+  # Eksplicit `from: "off"` — uden den er `unavailable → on` efter et
+  # template.reload en gyldig flanke (permanent faktum). /10-min-backstoppen
+  # dækker fejlklasse #4/#15: sker flanken mens HA genstarter, findes den aldrig
+  # igen, og en gæst ville sove natten igennem uden beskyttelse.
+  # INGEN push: det sker kl. 00:30-05:00, og en notifikation ville vække dem
+  # featuren beskytter. Logbogen bærer sporet.
+  # ---------------------------------------------------------------------------
+  - id: sleepover_auto_arm
+    alias: "Sleep Over: auto-armér når nogen sover i open-plan"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.sleepover_gaest_sporet
+        from: "off"
+        to: "on"
+      - platform: time_pattern
+        minutes: "/10"
+        id: backstop
+    condition:
+      - condition: state
+        entity_id: binary_sensor.sleepover_gaest_sporet
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.sleepover_i_nat
+        state: "off"
+    action:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.sleepover_i_nat
+      - service: logbook.log
+        data:
+          name: "Sleep Over"
+          message: >-
+            Auto-armeret {{ now().strftime('%H:%M') }} —
+            {{ state_attr('binary_sensor.sleepover_gaest_sporet', 'ophold_minutter') }}
+            min stue-ophold i den seneste time (krav
+            {{ states('input_number.sleepover_auto_minutter') | int(10) }}).
+            Open-plan holdes mørkt til Styrbar OP, morgen-bevægelse i
+            spisestue/køkken, eller backstoppen
+            {{ states('input_datetime.sleepover_morgen_slut') }}.
+          entity_id: input_boolean.sleepover_i_nat
+
+  # ---------------------------------------------------------------------------
+  # UDGANG 3: ægte bevægelse gennem spisestue eller køkken om morgenen.
+  # Se hoved-kommentaren for hvorfor moving_target og ikke occupancy.
+  # ---------------------------------------------------------------------------
+  - id: sleepover_morgen_bevaegelse_slip
+    alias: "Sleep Over: morgen-bevægelse i spisestue/køkken slipper holdet"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.spisestue_apollo_radar_moving_target
+          - binary_sensor.koekken_apollo_radar_moving_target
+        from: "off"
+        to: "on"
+        for:
+          seconds: 3
+    condition:
+      - condition: state
+        entity_id: input_boolean.sleepover_i_nat
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.godnat_faelles_morgen_fri
+        state: "on"
+    action:
+      - service: script.sleepover_slip_hold
+        data:
+          grund: >-
+            ægte bevægelse i
+            {{ 'spisestuen' if 'spisestue' in trigger.entity_id else 'køkkenet' }}
+            efter kl. 06
+
+  # ---------------------------------------------------------------------------
+  # Gardinerne følger ankeret — ÉN ejer for begge retninger, så hver clear-vej
+  # (Styrbar OP, backstop, kill-switch, AirBnB-rydning) arver den samme
+  # oprydning gratis (fejlklasse #1/#21). At holde dem nede sker i
+  # sensor.gardiner_manual_hold; her sker selve bevægelsen.
+  # Åbningen kræver sol over horisonten: et OP-tryk kl. 03 må ikke starte tre
+  # motorer (motorlarmen ER vækningen). Er det stadig mørkt, overtager husets
+  # normale morgen-åbnere når det bliver lyst.
+  # ---------------------------------------------------------------------------
+  - id: sleepover_gardiner_foelger_moerket
+    alias: "Sleep Over: luk/åbn open-plan-gardiner med mørket"
+    # 2026-09-27: queued, ikke single. close_cover over RF blokerer ~26 s (målt
+    # 21:08:02 → 21:08:28), og gæste-RODRET'ens I 23 s efter O slap mørket MENS
+    # ned-grenen kørte → op-flanken blev tabt (fejlklasse #4). Kø = op kører
+    # bagefter (og åbner kun hvis solen er oppe, som før).
+    mode: queued
+    max: 3
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.sleepover_openplan_moerkt
+        from: "off"
+        to: "on"
+        id: ned
+      - platform: state
+        entity_id: binary_sensor.sleepover_openplan_moerkt
+        from: "on"
+        to: "off"
+        id: op
+    action:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: ned
+            sequence:
+              # 2026-09-04: auto-armeringen kan ramme kl. 00:40, og tre Somfy-
+              # motorer 2 m fra en sovende gæst ER vækningen. Uden for
+              # 05:00-23:00 flyttes de derfor ikke — gardiner der allerede er
+              # nede holdes stadig nede af sensor.gardiner_manual_hold, så
+              # beskyttelsen mod morgensolen er intakt.
+              - if:
+                  - condition: state
+                    entity_id: binary_sensor.time_window_active_hours
+                    state: "on"
+                then:
+                  - service: cover.close_cover
+                    continue_on_error: true
+                    target:
+                      entity_id:
+                        - cover.gardin_stue_syd
+                        - cover.gardin_stue_vest_1
+                        - cover.gardin_spisestue_vest
+                  - service: logbook.log
+                    data:
+                      name: "Sleep Over"
+                      message: >-
+                        Mørket aktivt — de tre open-plan-gardiner lukket og holdt
+                        nede til Styrbar stue OP.
+                else:
+                  - service: logbook.log
+                    data:
+                      name: "Sleep Over"
+                      message: >-
+                        Mørket aktivt midt om natten — gardinerne holdes hvor de
+                        står (ingen motorlarm ved en sovende gæst).
+          - conditions:
+              - condition: trigger
+                id: op
+              - condition: state
+                entity_id: sun.sun
+                state: "above_horizon"
+              # B240: et langt NED der aldrig så en gæst åbner IKKE gardinerne —
+              # husets normale gardin-logik tager over, som om armeringen ikke
+              # var sket (en sommermorgen ville de ellers rulle op kl. 5 i et
+              # tomt hus). Stemplet nulstilles først EFTER slip-scriptet; samme
+              # vindues-udtryk som sleepover_ned_uden_bevis_slip (#2).
+              - condition: template
+                value_template: >-
+                  {% set s = states('input_datetime.sleepover_ned_uden_bevis_siden') %}
+                  {% set ts = state_attr('input_datetime.sleepover_ned_uden_bevis_siden', 'timestamp') | float(0) %}
+                  {{ not (s not in ['unknown', 'unavailable', ''] and s[11:] != '00:00:00' and ts > 86400) }}
+            sequence:
+              # Spring gardiner over der er manuelt rullet ned indenfor grace —
+              # holdet fra sleepover er allerede ude af 'held' på dette punkt.
+              - service: cover.open_cover
+                continue_on_error: true
+                target:
+                  entity_id: >-
+                    {% from 'rosters.jinja' import open_plan_gardiner %}{{ open_plan_gardiner
+                       | reject('in', state_attr('sensor.gardiner_manual_hold', 'held') | default([], true))
+                       | list }}
+              - service: logbook.log
+                data:
+                  name: "Sleep Over"
+                  message: "Holdet sluppet — open-plan-gardinerne rullet op igen."
+
+  # ---------------------------------------------------------------------------
+  # UDGANG 2 (backstop): ryd "i nat" hvis ingen har trykket OP.
+  # ---------------------------------------------------------------------------
+  - id: sleepover_i_nat_auto_clear
+    alias: "Sleep Over: backstop-ryd 'i nat' (hvis ingen trykker OP)"
+    description: >
+      Sikkerhedsnet bag Styrbar OP: slukker sleepover_i_nat når backstop-tiden
+      passeres, så et glemt flag ikke mørklægger huset resten af dagen.
+      /1t-backstop fordi en HA-restart hen over tidspunktet ellers ville lade
+      flaget stå (fejlklasse #4/#15) — den fyrer kun mellem backstop-tiden og
+      18:00, så en gen-armering til aftenens gæst ikke ryddes.
+    mode: single
+    trigger:
+      - platform: time
+        at: input_datetime.sleepover_morgen_slut
+        id: tid
+      - platform: time_pattern
+        hours: "/1"
+        id: backstop
+    condition:
+      - condition: state
+        entity_id: input_boolean.sleepover_i_nat
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set slut = state_attr('input_datetime.sleepover_morgen_slut', 'timestamp') | float(27000) %}
+          {% set nu = now().hour * 3600 + now().minute * 60 + now().second %}
+          {{ trigger.id == 'tid' or (nu >= slut and nu < 64800) }}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.sleepover_i_nat
+      - service: logbook.log
+        data:
+          name: "Sleep Over"
+          message: >-
+            "I nat" ryddet af backstoppen
+            ({{ states('input_datetime.sleepover_morgen_slut') }}) — ingen
+            trykkede Styrbar OP. Open-plan følger normal presence igen.
+
+  # ---------------------------------------------------------------------------
+  # UDGANG 4 — LANGT NED UDEN GÆST (B240, 2026-10-19)
+  # ---------------------------------------------------------------------------
+  # Stue-Styrbar langt NED er BÅDE familiens "alt fra" og (siden 17/10)
+  # gæsteknap O. 19/10 04:24 gik Parent A ud ad døren med et langt NED → holdet
+  # mørklagde open plan til Parent B's morgen-bevægelse slap det 06:00:15;
+  # velkomstlyset 05:57:44 blev afvist på mørke-ankeret, og radioen kom først
+  # 06:13:47. Open plan var radar-tom fra 04:22 til 05:58.
+  #
+  # REGLEN (user-spec 19/10): "der kræves bevægelse i stuen specifikt efter
+  # styrbar ned og der kræves mere end 30 sek akkumuleret bevægelse inden for
+  # 5 min. ellers er det umuligt at der sover en gæst i stuen". Mere end
+  # `sleepover_ned_bevis_sekunder` stue-radar (sensor.sleepover_stue_efter_langt_ned)
+  # i [t0, t0 + `sleepover_ned_bevis_minutter`] → gæst, vinduet lukkes og natten
+  # holdes som før. Ellers samme slip som Styrbar OP, ved vinduets slutning.
+  # Spisestue/køkken tæller IKKE: en gæst sover i stuen.
+  #
+  # MÅLT (30 døgn, stue-radar 0-5 min efter armering): 27/9 21:08 183 s,
+  # 12/10 300 s, 17/10 89 s, 18/10 151 s; 19/10 (afgangen) 0 s. 27/9 21:16
+  # (re-armering 8 min efter den første) kun 6 s — gæste-O, ikke NED.
+  #   • Kun et NED der SELV armerede (i_nat var off). Gæste-O, app og auto-
+  #     armering røres aldrig; et NED oven i en armeret nat heller ikke.
+  #   • Værste fejl = holdet slippes over en gæst der lå stille uden for
+  #     radaren i 5 min → huset opfører sig som før 17/10.
+  #   • Den der trykker, tæller med mens personen står i stuen (vinduet starter
+  #     ved trykket) → et "alt fra" fra sofaen kan holde natten = adfærden før.
+  #   • Sensoren ulæselig → læses som bevis → holdet bevares (sikker retning).
+  #   • Gardinerne åbnes ikke ved dette slip (op-grenen ovenfor).
+  # ---------------------------------------------------------------------------
+  - id: sleepover_ned_uden_bevis_slip
+    alias: "Sleep Over: slip langt NED når open plan er tom (ingen gæst)"
+    description: >-
+      Et stue-Styrbar langt NED der selv armerede Sleep Over, slippes igen hvis
+      stue-radaren ikke ser mere end sleepover_ned_bevis_sekunder akkumuleret
+      inden for sleepover_ned_bevis_minutter efter trykket.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      # Minut-tick: handlingen sker ≤ 1 min efter vinduets slutning. Uden for
+      # et åbent vindue er det kun condition-templaten (#7).
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      # Samme vindues-udtryk som gardin-op-grenen (#2).
+      - condition: template
+        value_template: >-
+          {% set s = states('input_datetime.sleepover_ned_uden_bevis_siden') %}
+          {% set ts = state_attr('input_datetime.sleepover_ned_uden_bevis_siden', 'timestamp') | float(0) %}
+          {{ s not in ['unknown', 'unavailable', ''] and s[11:] != '00:00:00' and ts > 86400 }}
+    action:
+      - variables:
+          t0: "{{ state_attr('input_datetime.sleepover_ned_uden_bevis_siden', 'timestamp') | float(0) }}"
+          vindue_min: "{{ states('input_number.sleepover_ned_bevis_minutter') | int(0) }}"
+          krav_s: "{{ states('input_number.sleepover_ned_bevis_sekunder') | int(0) }}"
+      - choose:
+          # "I nat" slukket af en anden udgang (OP, morgen, backstop, AirBnB).
+          # Først efter 60 s, så gardin-op-grenen nåede at læse vinduet.
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.sleepover_i_nat
+                state: "off"
+                for:
+                  seconds: 60
+            sequence:
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.sleepover_ned_uden_bevis_siden
+                data:
+                  timestamp: 0
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.sleepover_i_nat
+                state: "on"
+            sequence:
+              # history_stats genberegnes ikke nødvendigvis i dette sekund.
+              - service: homeassistant.update_entity
+                continue_on_error: true
+                target:
+                  entity_id: sensor.sleepover_stue_efter_langt_ned
+              - variables:
+                  # -1 = ulæselig → behandles som bevis (holdet bevares).
+                  stue_s: >-
+                    {% set h = states('sensor.sleepover_stue_efter_langt_ned') %}
+                    {{ (h | float * 3600) | round(0) if h | is_number else -1 }}
+              - choose:
+                  # Bevis: mere end kravet i stuen → troværdig nat. Lukkes så
+                  # snart det er nået, også før vinduets slutning.
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ stue_s < 0 or stue_s > krav_s }}"
+                    sequence:
+                      - service: input_datetime.set_datetime
+                        target:
+                          entity_id: input_datetime.sleepover_ned_uden_bevis_siden
+                        data:
+                          timestamp: 0
+                      - service: logbook.log
+                        data:
+                          name: "Sleep Over"
+                          message: >-
+                            {% if stue_s < 0 %}Stue-radar-tiden kunne ikke læses efter langt NED
+                            kl. {{ t0 | timestamp_custom('%H:%M') }} — holdet bevares til OP/morgen.
+                            {%- else %}Stue-radaren så {{ stue_s | int }} s efter langt NED kl.
+                            {{ t0 | timestamp_custom('%H:%M') }} — gæst, holdet bevares til OP/morgen.
+                            {%- endif %}
+                          entity_id: input_boolean.sleepover_i_nat
+                  # Vinduet er slut uden nok stue-radar → ingen gæst.
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ vindue_min > 0 and now().timestamp() >= t0 + vindue_min * 60 }}"
+                    sequence:
+                      # Slip FØR nulstilling: gardin-op-grenen skal se vinduet åbent.
+                      - service: script.sleepover_slip_hold
+                        data:
+                          grund: >-
+                            langt NED kl. {{ t0 | timestamp_custom('%H:%M') }} uden gæst —
+                            stue-radaren så kun {{ stue_s | int }} s på {{ vindue_min }} min
+                      - service: input_datetime.set_datetime
+                        target:
+                          entity_id: input_datetime.sleepover_ned_uden_bevis_siden
+                        data:
+                          timestamp: 0
+
+  # ---------------------------------------------------------------------------
+  # Vagten: sluk automatik-tændt lys i open-plan, ENTRÉ og TERRASSE mens mørket
+  # er aktivt. Manuel tænding vinder ALTID (rummets Manual-mode / friskt
+  # Styrbar-tryk i DET rum / tænding uden automation-context).
+  # 2026-09-27 (user-spec: "hvis en gæst sover i open plan skal hjemkomst og
+  # andre automations heller ikke tænde lys i openplan, terrasse og entré"):
+  # entré-loftet + terrassens pærelyskæde er med, og manuel-tjekket er nu PR.
+  # RUM (et Styrbar-tryk i entréen må ikke fritage open-plan og omvendt).
+  # Stue-spottene manglede i rosteret (fejlklasse #16) — tilføjet.
+  # RØGALARM vinder: blinker den, rører vagten intet (roegalarm.yaml).
+  # ---------------------------------------------------------------------------
+  - id: sleepover_moerke_vagt
+    alias: "Sleep Over: sluk automatik-tændt open-plan/entré/terrasse-lys"
+    description: >
+      Backstop bag gates'ne i presence_stue/_koekken/_lights, godnat_night,
+      arrival, entre_motion, terrasse-dusk og godmorgen_godnat. Fanger tænd-veje
+      vi ikke kender (scener, Matter-ekko, nye automations) uden at røre lys som
+      et menneske har tændt.
+    mode: queued
+    max: 10
+    variables:
+      # entity → de rum hvis Manual/Styrbar-tryk fritager den.
+      rum_for:
+        light.spisestue_loft: [stue, spisestue, koekken]
+        light.koekken_lyskaede: [stue, spisestue, koekken]
+        light.stue_sofa_lampe: [stue, spisestue, koekken]
+        light.stue_sofa_lampe_2: [stue, spisestue, koekken]
+        light.stue_hjoernelampe: [stue, spisestue, koekken]
+        light.stue_plug: [stue, spisestue, koekken]
+        light.stue_laesehygge: [stue, spisestue, koekken]
+        light.stue_spot_1: [stue, spisestue, koekken]
+        light.stue_spot_2: [stue, spisestue, koekken]
+        switch.koekken_spots: [stue, spisestue, koekken]
+        light.entre_loft: [entre]
+        light.terrasse_paerelyskaede: [terrasse]
+    trigger:
+      - platform: state
+        entity_id:
+          - light.spisestue_loft
+          - light.koekken_lyskaede
+          - light.stue_sofa_lampe
+          - light.stue_sofa_lampe_2
+          - light.stue_hjoernelampe
+          - light.stue_plug
+          - light.stue_laesehygge
+          - light.stue_spot_1
+          - light.stue_spot_2
+          - switch.koekken_spots
+          - light.entre_loft
+          - light.terrasse_paerelyskaede
+        from: "off"
+        to: "on"
+        id: flanke
+      # Fejlklasse #4/#15: en restart med lyset tændt giver aldrig en ny flanke.
+      - platform: homeassistant
+        event: start
+        id: start
+    condition:
+      - condition: state
+        entity_id: binary_sensor.sleepover_openplan_moerkt
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.roegalarm_blink_active
+        state: "off"
+      # Kun automatik-tændinger: et servicekald fra en automation/script bærer
+      # parent_id. Et tryk i appen har user_id og INGEN parent_id.
+      - condition: template
+        value_template: >-
+          {{ trigger.id == 'start'
+             or (trigger.to_state.context.parent_id is not none) }}
+      # Har mennesket selv sat lyset (app eller Styrbar), står rummet i Manual —
+      # eller trykket er så frisk at Manual ikke er landet endnu (120 s).
+      # [11:] == '00:00:00' = URØRT stempel (has_date står på dagens midnat).
+      # Terrassens Styrbar stempler sin egen debounce-helper, ikke last_press.
+      - condition: template
+        value_template: >-
+          {% if trigger.id == 'start' %}true{% else %}
+            {% set ns = namespace(fri = false) %}
+            {% for r in rum_for[trigger.entity_id] %}
+              {% if is_state('input_select.room_mode_' ~ r, 'Manual') %}{% set ns.fri = true %}{% endif %}
+              {% set stempler = ['input_datetime.styrbar_last_press_' ~ r]
+                 + (['input_datetime.terrasse_styrbar_last_cmd'] if r == 'terrasse' else []) %}
+              {% for d in stempler %}
+                {% set lp = states(d) %}
+                {% if lp not in ['unknown', 'unavailable', 'none', ''] and lp[11:] != '00:00:00'
+                      and (as_timestamp(now()) - (state_attr(d, 'timestamp') | float(0))) <= 120 %}
+                  {% set ns.fri = true %}
+                {% endif %}
+              {% endfor %}
+            {% endfor %}
+            {{ not ns.fri }}
+          {% endif %}
+    action:
+      - choose:
+          # Restart-recovery: lad sensorerne settle, tjek igen, ryd alt tændt
+          # — undtagen i rum et menneske har sat i Manual.
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.id == 'start' }}"
+            sequence:
+              - delay:
+                  minutes: 2
+              - condition: state
+                entity_id: binary_sensor.sleepover_openplan_moerkt
+                state: "on"
+              - variables:
+                  taendte: >-
+                    {% set ns = namespace(l = []) %}
+                    {% for e, rum in rum_for.items() %}
+                      {% if is_state(e, 'on')
+                            and rum | map('regex_replace', '^', 'input_select.room_mode_')
+                                    | select('is_state', 'Manual') | list | count == 0 %}
+                        {% set ns.l = ns.l + [e] %}
+                      {% endif %}
+                    {% endfor %}
+                    {{ ns.l }}
+              - condition: template
+                value_template: "{{ taendte | count > 0 }}"
+              - service: light.turn_off
+                continue_on_error: true
+                target:
+                  entity_id: "{{ taendte | select('match', 'light\\.') | list }}"
+                data:
+                  transition: 2
+              - service: switch.turn_off
+                continue_on_error: true
+                target:
+                  entity_id: "{{ taendte | select('match', 'switch\\.') | list }}"
+              - service: logbook.log
+                data:
+                  name: "Sleep Over"
+                  message: >-
+                    HA-start: {{ taendte | count }} lys stod tændt under
+                    sleepover-mørke → slukket ({{ taendte | join(', ') }}).
+        default:
+          - if:
+              - condition: template
+                value_template: "{{ trigger.entity_id.startswith('light.') }}"
+            then:
+              - service: light.turn_off
+                continue_on_error: true
+                target:
+                  entity_id: "{{ trigger.entity_id }}"
+                data:
+                  transition: 2
+            else:
+              - service: switch.turn_off
+                continue_on_error: true
+                target:
+                  entity_id: "{{ trigger.entity_id }}"
+          - service: logbook.log
+            data:
+              name: "Sleep Over"
+              message: >-
+                {{ trigger.entity_id }} tændt af automatik under sleepover-mørke
+                → slukket igen (gæst sover i open-plan).

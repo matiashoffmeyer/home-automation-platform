@@ -1,0 +1,105 @@
+# =============================================================================
+# godnat_auto_declare.yaml — kandidat-vidnet bag auto-godnat (2026-08-26e)
+# =============================================================================
+# Automationen: automations/godnat_auto_declare.yaml
+#
+# HVORFOR DEN HER FINDES: auto-godnat havde ikke fyret siden 2026-05-27, og
+# natten 25→26/8 var konsekvensen dyr — uden godnat-flaget manglede køkkenets
+# tænd-vej sin nat-spærre, og lyskæden brændte 3t41m i et tomt hus.
+#
+# Automationen hang på ÉN template-trigger med `for: 90 min`, altså et krav om
+# at et sammensat udtryk var sandt UAFBRUDT i halvanden time. To halvdele, to
+# forskellige svagheder — og et `for:` tilgiver ingen af dem:
+#
+#   1. SENGE-halvdelen læste RÅ `sovevaerelse_apollo_occupancy`. Sove-Apolloen
+#      taber en person der ligger stille i 5-15 min ad gangen (CLAUDE.md), så
+#      den længste ubrudte strækning natten 25→26/8 var 26,8 min mod et krav
+#      på 90. Kravet var matematisk uopnåeligt, ikke bare svært.
+#      → `binary_sensor.sovevaerelse_dvale_vidne` findes præcis for det hul
+#        (150 s hold-krav ind, 16 min bro ud). Replay af samme nat med vidnet:
+#        tre kørsler på 97,5 / 95,5 / 92,2 min — auto-godnat ville have fyret
+#        23:24 lokal.
+#
+#   2. RESTEN-halvdelen læste rå occupancy i syv rum. Ét sub-sekunds
+#      radar-spøgelse nulstiller `for:`-timeren, og køkkenet leverede 100 af
+#      husets 145 falske flanker (sprint 08-26c).
+#      → `delay_off` på 120 s. Køkkenets spøgelser varer under 11 s, så broen
+#        sluger dem — men et menneske der rejser sig får kun 2 minutters kredit,
+#        og automationen gen-tjekker rå tomhed i det sekund den fyrer.
+#
+# Broen ligger BEVIDST i to lag med hver sin længde: senge-halvdelen skal tåle
+# kvarters-huller (en sovende krop), resten-halvdelen kun sekund-blip (et
+# spøgelse). Én fælles bro ville enten være for kort til den ene eller så lang
+# at et rigtigt menneske i køkkenet blev overset.
+# =============================================================================
+
+template:
+  - binary_sensor:
+      # ON = "alle er i seng, resten af huset er tomt" — soak-kandidaten.
+      # Bruges KUN af automation godnat_auto_declare.
+      - name: "Godnat auto kandidat"
+        unique_id: godnat_auto_kandidat
+        icon: mdi:sleep
+        # Fejlklasse #9: er senge-vidnet blindt, ved vi ingenting. Uden denne
+        # ville `unavailable` blive læst som "ingen i seng" = kandidaten falsk,
+        # hvilket er ufarligt — men den ville også nulstille soaken hver gang
+        # mesh'et hikker, og det er præcis den fejl filen findes for at rette.
+        availability: >-
+          {{ states('binary_sensor.sovevaerelse_dvale_vidne')
+             not in ['unknown', 'unavailable'] }}
+        delay_off:
+          seconds: 120
+        state: >-
+          {% set seng = is_state('binary_sensor.sovevaerelse_dvale_vidne', 'on')
+                        or is_state('binary_sensor.boernevaerelse_apollo_occupancy', 'on') %}
+          {# Rosteret er de rum hvor et menneske MODBEVISER godnat. Terrassen
+             havde ingen occupancy-sensor (entity'en i det gamle roster fandtes
+             ikke og blev tavst læst som 'unknown' != 'on') — den er fjernet
+             frem for at lade som om den vogter noget. #}
+          {% set rest = [
+            'binary_sensor.stue_apollo_occupancy_filtered',
+            'binary_sensor.spisestue_apollo_occupancy_filtered',
+            'binary_sensor.koekken_apollo_occupancy_filtered',
+            'binary_sensor.badevaerelse_inde_occupancy',
+            'binary_sensor.entre_valhorn_occupancy',
+            'binary_sensor.depot_valhorn_occupancy',
+          ] %}
+          {{ seng and (rest | map('states') | reject('eq', 'on') | list | count
+                       == rest | count) }}
+
+      # 2026-10-04 (user-spec, KRITISK): "hvis det er aften og mørkt i
+      # soveværelset og vi selv har slukket for lyset eller en automation har
+      # ... så skal mørket bare blive til godnat mode af sig selv."
+      # ON = aften-låsen er armeret (loftet slukket i aften-vinduet, af hvem som
+      # helst — packages/aften_manual_off_lock.yaml), alle er i seng og resten
+      # af huset er tomt (godnat_auto_kandidat), ingen film kører i
+      # soveværelset, og intet sove-lys er tændt. Automationen
+      # godnat_auto_declare (trigger `moerke`) erklærer godnat når den har
+      # holdt i input_number.sove_moerke_godnat_minutter.
+      # Ingen now() → skriver kun en række når en af kilderne skifter (#24).
+      - name: "Sove moerke godnat kandidat"
+        unique_id: sove_moerke_godnat_kandidat
+        icon: mdi:weather-night
+        availability: >-
+          {{ states('binary_sensor.godnat_auto_kandidat')
+             not in ['unknown', 'unavailable'] }}
+        state: >-
+          {{ is_state('input_boolean.sovevaerelse_manual_off_lock', 'on')
+             and is_state('binary_sensor.godnat_auto_kandidat', 'on')
+             and is_state('binary_sensor.filmmoerke_sove', 'off')
+             and states('light.spisestue_pendel') != 'on'
+             and states('light.sove_lyskaede') != 'on' }}
+
+input_number:
+  # 2026-10-04: hvor længe soveværelset skal have været mørkt (aften-låsen
+  # armeret, alle i seng, resten tomt, ingen film) før godnat erklæres af sig
+  # selv. Den lange vej (global_auto_godnat_minutes) gælder stadig når låsen
+  # ikke er armeret.
+  sove_moerke_godnat_minutter:
+    name: "Mørkt soveværelse → godnat efter (min)"
+    icon: mdi:weather-night
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider

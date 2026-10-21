@@ -1,0 +1,91 @@
+# =============================================================================
+# Boern Loft Manual Cycle → BRIGHT signal
+# =============================================================================
+# User-spec 2026-05-13:
+#   "naar der manuelt taendes eller slukkes og saa taendes paa boernesove-
+#    vaerelsets loft, saa er det et signal om at der skal vaere kraftigt lys.
+#    mest relevant her paa frb, men skader ikke paa amager heller."
+#
+# Mønster: light.boernevaerelse_loft gaar fra ON → (off ELLER unavailable) →
+# ON inden for 2-15 sek, UDEN at det er en automation der gjorde det.
+# Det fanger:
+#   - Wall-switch power-cycle (FRB pre-flyt boern har mekanisk kontakt)
+#   - Hurtige manual toggles via UI / Styrbar long-press (post-flyt)
+#
+# Action: tving lyset til 100% / 3000K (= "kraftigt lys" = visible, bright).
+#
+# DESIGN GATES (= filtrer false positives):
+#   - to_state.context.parent_id IS NONE (= ikke automation-driven). Wall-switch
+#     bulb-report har empty parent_id. Automation light.turn_on har parent_id sat.
+#   - last_off stamp eksisterer og er 2-15 sek gammel (mesh-flicker er <2 sek;
+#     ægte user-cycle er typisk 3-8 sek; over 15 sek = ikke længere "cycle")
+#   - input_select.house_mode != "AirBnB" (gæster må ikke trigge override)
+# =============================================================================
+
+# --- TRACKER: stamp tidspunkt naar boern_loft forlader ON state ---
+- id: boern_loft_track_left_on
+  alias: "Børn loft: stamp last-off timestamp (cycle tracker)"
+  description: >
+    Stamps input_datetime.boern_loft_left_on_at hver gang lyset forlader
+    on-state (uanset hvor — bruges af boern_loft_manual_cycle_bright).
+  mode: queued
+  max: 5
+  trigger:
+    - platform: state
+      entity_id: light.boernevaerelse_loft
+      from: "on"
+  action:
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.boern_loft_left_on_at
+      data:
+        timestamp: "{{ now().timestamp() }}"
+
+# --- DETECTOR: manual off→on inden for 2-15 sek → tving BRIGHT ---
+- id: boern_loft_manual_cycle_bright
+  alias: "Børn loft: manuel cycle → kraftigt lys (100%/3000K)"
+  description: >
+    Når lyset går til on uden automation-context og last-off var 2-15 sek
+    siden, tvinges 100% / 3000K. Signal: bruger vil have kraftigt lys NU.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: light.boernevaerelse_loft
+      to: "on"
+  condition:
+    # Gate 1: ikke automation-driven (wall-switch / direct user action).
+    # Wall-switch bulb-report fra Zigbee har parent_id=None. Automation
+    # light.turn_on har parent_id sat → vi springer over.
+    - condition: template
+      value_template: >
+        {{ trigger.to_state.context.parent_id is none }}
+    # Gate 2: last-off stamp findes og er inden for 2-15 sek
+    # (under 2 sek = mesh-flicker; over 15 sek = ikke cycle længere)
+    - condition: template
+      value_template: >
+        {% set last_off = states('input_datetime.boern_loft_left_on_at') %}
+        {% if last_off in ['unknown','unavailable','none',''] %}
+          false
+        {% else %}
+          {% set delta = (now() - strptime(last_off, '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() %}
+          {{ 2 <= delta <= 15 }}
+        {% endif %}
+    # Gate 3: ikke AirBnB-gaester (eget house_mode)
+    - condition: state
+      entity_id: input_select.house_mode
+      state: "Normal"
+  action:
+    - service: logbook.log
+      data:
+        name: "Børn loft manual cycle"
+        message: >-
+          Off→on inden for cycle-vindue (manuel context, last_off
+          {{ (now() - strptime(states('input_datetime.boern_loft_left_on_at'), '%Y-%m-%d %H:%M:%S').replace(tzinfo=now().tzinfo)).total_seconds() | round(1) }} sek siden).
+          Tvinger 100% / 3000K = kraftigt lys.
+    - service: light.turn_on
+      target:
+        entity_id: light.boernevaerelse_loft
+      data:
+        brightness_pct: 100
+        color_temp_kelvin: 3000
+        transition: 1

@@ -1,0 +1,149 @@
+# =============================================================================
+# Festlys i børneværelset startet fra børne-Styrbar — selv-sluk (2026-10-17)
+# =============================================================================
+# User 17/10: "når festlys i børneværelset startes af børne styrbar skal det
+# altså slukke selv ved tomt rum 3 min … og det skal også slukke ved styrbar
+# long ned eller op i børneværelset."
+#
+# 1. Pilene (automations/styrbar_rooms.yaml, B211) stempler
+#    input_boolean.festlys_boern_styrbar når de starter festen ELLER føjer
+#    børn til en kørende fest. Stemplet ryddes når børn forlader festen
+#    (dance_room_boern off) eller festen slutter (dance_mode off).
+# 2. Stemplet + børne-radaren off i festlys_boern_tomt_minutter → børn ud af
+#    festen via script.festlys_boern_slut: eneste rum = hele festen slut
+#    (fest_smooth_stop), ellers fester de andre rum videre. En fest startet
+#    fra appen eller stuen slukker IKKE af et tomt børneværelse.
+# 3. Langt OP/NED på børne-Styrbar mens børn danser → samme script, uanset hvem
+#    der startede festen (styrbar_rooms.yaml). Tryk-handlingen (fuld/sluk)
+#    springes over: dance_restore_auto giver rummet Auto + looket, og et snap
+#    oven i ville race mod den.
+#
+# Kendt begrænsning: børne-Apolloen ser folk ved spisebordet gennem væggen
+# (.claude/rules/presence_radar.md) — et måltid udsætter tomheds-sluk. Om natten
+# er radar-timeouten 15 min, så "tomt" kommer tilsvarende senere.
+# AirBnB: pilene starter ikke festlys for en gæst, og stemplet er med i
+# airbnb_mode.yaml's flag-lister.
+# =============================================================================
+
+input_boolean:
+  # Ingen `initial:` — skal overleve en restart midt i festen.
+  festlys_boern_styrbar:
+    name: "Festlys: startet fra børne-Styrbar"
+    icon: mdi:remote
+
+input_number:
+  festlys_boern_tomt_minutter:
+    name: "Festlys børn: sluk efter tomt rum"
+    icon: mdi:timer-sand
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+script:
+  # Børneværelset ud af festen. Eneste festrum → hele festen slut.
+  festlys_boern_slut:
+    alias: "Festlys: børneværelset ud af festen"
+    icon: mdi:party-popper
+    mode: single
+    max_exceeded: silent
+    fields:
+      kilde:
+        description: "Hvad der afsluttede (logbog)"
+    sequence:
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.dance_mode', 'on')
+             and is_state('input_boolean.dance_room_boern', 'on') }}
+      - variables:
+          k: "{{ kilde | default('?') }}"
+          # Generisk over dance_room_* — ingen rum-liste at holde i takt (#16).
+          andre_rum: >-
+            {{ states.input_boolean
+               | selectattr('object_id', 'match', 'dance_room_')
+               | rejectattr('object_id', 'eq', 'dance_room_boern')
+               | selectattr('state', 'eq', 'on')
+               | map(attribute='entity_id') | list }}
+      - if:
+          - condition: template
+            value_template: "{{ andre_rum | count == 0 }}"
+        then:
+          - service: script.fest_smooth_stop
+        else:
+          - service: input_boolean.turn_off
+            target: {entity_id: input_boolean.dance_room_boern}
+      - service: logbook.log
+        data:
+          name: "Festlys børn"
+          message: >-
+            {{ k }}: festlys i børneværelset
+            {{ 'slut' if andre_rum | count == 0 else 'fra (resten fester videre)' }}.
+
+automation:
+  - id: festlys_boern_styrbar_tomt_sluk
+    alias: "Festlys børn (Styrbar-startet): tomt rum → slut"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      # Dækker begge rækkefølger (stempel før/efter radaren faldt).
+      - platform: template
+        value_template: >-
+          {{ is_state('input_boolean.festlys_boern_styrbar', 'on')
+             and is_state('binary_sensor.boernevaerelse_apollo_occupancy', 'off') }}
+        for:
+          minutes: "{{ states('input_number.festlys_boern_tomt_minutter') | int(3) }}"
+        id: tomt
+      # En restart dræber `for:`-ventetiden (permanente fakta) → backstop der
+      # måler tiden selv. last_changed nulstilles ved restart = højst N min
+      # forsinkelse, aldrig en for tidlig sluk.
+      - platform: time_pattern
+        minutes: "/5"
+        id: backstop
+    condition:
+      - condition: state
+        entity_id: input_boolean.festlys_boern_styrbar
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.dance_mode
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.dance_room_boern
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set o = states.binary_sensor.boernevaerelse_apollo_occupancy %}
+          {% set n = states('input_number.festlys_boern_tomt_minutter') | int(3) %}
+          {{ o is not none and o.state == 'off'
+             and (now() - o.last_changed).total_seconds() >= n * 60 - 5 }}
+    action:
+      - service: script.festlys_boern_slut
+        data:
+          kilde: >-
+            Tomt børneværelse i {{ states('input_number.festlys_boern_tomt_minutter') | int(3) }} min
+
+  - id: festlys_boern_styrbar_ryd
+    alias: "Festlys børn: ryd Styrbar-stempel når børn forlader festen"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: input_boolean.dance_room_boern
+        from: "on"
+        to: "off"
+      - platform: state
+        entity_id: input_boolean.dance_mode
+        from: "on"
+        to: "off"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: state
+        entity_id: input_boolean.festlys_boern_styrbar
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ not (is_state('input_boolean.dance_mode', 'on')
+                  and is_state('input_boolean.dance_room_boern', 'on')) }}
+    action:
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.festlys_boern_styrbar}

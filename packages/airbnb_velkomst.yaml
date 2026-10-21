@@ -1,0 +1,457 @@
+# =============================================================================
+# AirBnB velkomst-ceremoni — husets første møde med gæsten
+# =============================================================================
+# User-spec 2026-09-04: "første gang airbnbs åbner hoveddøren tændes entre,
+# soveværelse og open plan og bad med en langsom fade in som byder velkommen og
+# går så over på auto efter 10 min velkomst ceremoni. super vigtigt at det
+# spiller. det er første møde med systemet."
+#
+# HVAD DER FANDTES FØR: kun to almindelige hjemkomst-automations —
+# `arrival_entre_light` (entré) og `arrival_welcome` (KUN light.spisestue_loft,
+# transition 3 s, og lux-gated under ~18 lx). Ankom gæsterne i dagslys skete der
+# altså ingenting, og soveværelse + bad blev aldrig rørt. Selve check-in-filen
+# (packages/airbnb_checkin.yaml) siger eksplicit "INTET andet (ingen lys/
+# handling)" — ceremonien fandtes ikke.
+#
+# ARMERING genbruges fra check-in-varslet: `airbnb_velkomst_pending` sættes af
+# `airbnb_checkin_arm` (1 t efter AirBnB-entry, kun efter 24 t Normal) og
+# ryddes ved exit. Det betyder at ejerens egen klargøring lige efter mode-skift
+# ikke kan udløse ceremonien — kun en ankomst mindst en time senere.
+#
+# HVORFOR room_mode → Manual under ceremonien: presence-logikken gater på
+# Manual/Off, så de 10 minutter kan ikke afbrydes af at et rum står tomt eller
+# af en dagslys-sluk. Den bounded failure-mode er bevidst: afslutningen bor i et
+# SKREVET stempel (`airbnb_velkomst_slut_at`) læst af en /1-min backstop, så den
+# overlever en HA-restart (fejlklasse #4/#15 — et `delay` ville ikke), og
+# room_drift_back trækker under alle omstændigheder rum ud af Manual efter ~3 t.
+#
+# AIRBNB-REGEL 2 (CLAUDE.md): gæsten skal kunne slippe ud uden at kende
+# systemet — ceremonien slipper SELV alle rum til Auto, og kill-switchen
+# `airbnb_velkomst_enabled` slår hele featuren fra uden kode-ændring.
+#
+# AFSLUTNINGEN (user-spec 2026-09-04b: "velkomsten skal altså slukke lys igen i
+# de rum som ikke har haft move activity overhovedet. derefter skal normal auto
+# presence lys tage over og slukke når det skal slukkes"):
+# ceremonien viser hele huset frem, men efterlader det ikke tændt. Ved slut
+# slukkes de zoner der ALDRIG blev rørt i vinduet — målt med latche der
+# opsamles i realtid (`airbnb_velkomst_move_*`), fordi Apolloernes
+# `moving_target` er recorder-ekskluderet og ikke kan slås op bagefter.
+# Zoner MED bevægelse forbliver tændt og overlades til den normale
+# presence-logik, som slukker dem når rummet reelt er tomt.
+# Rækkefølgen er bevidst: sluk sker MENS rummene er i Manual, og først derefter
+# sættes de til Auto — ellers kunne presence nå at tænde i mellemrummet.
+# =============================================================================
+
+input_boolean:
+  airbnb_velkomst_enabled:
+    name: "AirBnB: velkomst-ceremoni aktiv"
+    icon: mdi:hand-wave
+  # Kører ceremonien lige nu? Læses af slut-backstoppen. Bevidst UDEN
+  # `initial:` — den PÅTVINGER ved hver HA-start (CLAUDE.md) og ville rydde en
+  # igangværende ceremoni-tilstand ved en restart midt i de 10 minutter.
+  airbnb_velkomst_active:
+    name: "AirBnB: velkomst kører"
+    icon: mdi:party-popper
+  # ---------------------------------------------------------------------------
+  # BEVÆGELSES-LATCHE (user-spec 2026-09-04b: "velkomsten skal altså slukke lys
+  # igen i de rum som ikke har haft move activity overhovedet. derefter skal
+  # normal auto presence lys tage over").
+  #
+  # Hvorfor LATCHE og ikke bare et opslag til sidst: spørgsmålet er "har rummet
+  # haft bevægelse på noget tidspunkt i de 10 minutter?", ikke "er der nogen
+  # lige nu?". Et øjebliksopslag ville slukke på en gæst der pakker ud i
+  # soveværelset — sove-Apolloen taber en stilliggende krop i 5-15 min
+  # (CLAUDE.md). Latchen kan ikke tabe ham: han skulle bevæge sig for at komme
+  # derind. Apolloernes `moving_target` er RECORDER-EKSKLUDEREDE, så historik
+  # er heller ikke en mulighed — beviset SKAL opsamles mens det sker.
+  #
+  # Bevidst UDEN `initial:` (den PÅTVINGER ved hver HA-start, CLAUDE.md), så en
+  # restart midt i ceremonien ikke kaster de indsamlede beviser væk.
+  # ---------------------------------------------------------------------------
+  airbnb_velkomst_move_entre:
+    name: "AirBnB velkomst: bevægelse i entré"
+    icon: mdi:motion-sensor
+  airbnb_velkomst_move_openplan:
+    name: "AirBnB velkomst: bevægelse i open plan"
+    icon: mdi:motion-sensor
+  airbnb_velkomst_move_bad:
+    name: "AirBnB velkomst: bevægelse i bad"
+    icon: mdi:motion-sensor
+  airbnb_velkomst_move_sove:
+    name: "AirBnB velkomst: bevægelse i soveværelse"
+    icon: mdi:motion-sensor
+
+input_datetime:
+  # SKREVET sluttidspunkt — ikke last_changed, som nulstilles ved restart.
+  airbnb_velkomst_slut_at:
+    name: "AirBnB: velkomst slutter kl."
+    icon: mdi:clock-end
+    has_date: true
+    has_time: true
+
+input_number:
+  airbnb_velkomst_fade_sekunder:
+    name: "AirBnB velkomst: fade-tid"
+    icon: mdi:transition
+    min: 2
+    max: 120
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+  airbnb_velkomst_minutter:
+    name: "AirBnB velkomst: ceremoni-længde"
+    icon: mdi:timer-outline
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+  airbnb_velkomst_brightness:
+    name: "AirBnB velkomst: lysstyrke"
+    icon: mdi:brightness-6
+    min: 5
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+script:
+  # ---------------------------------------------------------------------------
+  # Selve ceremonien — ét sted, så start-automationen ikke kan divergere fra en
+  # evt. manuel test-kørsel (fejlklasse #2).
+  # ---------------------------------------------------------------------------
+  airbnb_velkomst_ceremoni:
+    alias: "AirBnB: kør velkomst-ceremoni"
+    icon: mdi:hand-wave
+    mode: single
+    sequence:
+      - variables:
+          fade: "{{ states('input_number.airbnb_velkomst_fade_sekunder') | int(20) }}"
+          bri: "{{ states('input_number.airbnb_velkomst_brightness') | int(55) }}"
+          # Varm velkomst. 2500 K er bevidst hardcodet: det er en æstetisk
+          # konstant, ikke en driftsparameter der skal tunes pr. ophold.
+          kelvin: 2500
+      # Frys rummene så presence/dagslys ikke afbryder de 10 minutter.
+      - service: input_select.select_option
+        target:
+          entity_id:
+            - input_select.room_mode_entre
+            - input_select.room_mode_sovevaerelse
+            - input_select.room_mode_stue
+            - input_select.room_mode_spisestue
+            - input_select.room_mode_koekken
+            - input_select.room_mode_badevaerelse
+        data:
+          option: "Manual"
+      # Nulstil bevægelses-latchene FØR active sættes, så latch-automationen
+      # ikke kan nå at rydde et bevis den lige har opsamlet. Vinduet skal måle
+      # DENNE ceremoni, ikke arve noget fra et tidligere ophold.
+      - service: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.airbnb_velkomst_move_entre
+            - input_boolean.airbnb_velkomst_move_openplan
+            - input_boolean.airbnb_velkomst_move_bad
+            - input_boolean.airbnb_velkomst_move_sove
+      # Stempl sluttidspunktet FØR lyset tændes — så en fejl midt i lys-kaldene
+      # ikke efterlader rummene i Manual uden en planlagt udgang.
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.airbnb_velkomst_active
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_velkomst_slut_at
+        data:
+          datetime: >-
+            {{ (now() + timedelta(minutes=
+                 states('input_number.airbnb_velkomst_minutter') | int(10)))
+               .strftime('%Y-%m-%d %H:%M:%S') }}
+      # --- Sekvensen: entréen først (dér står de), så indad i huset. ----------
+      # `continue_on_error` overalt: bad-spottene er Matter, og CHIP-timeout
+      # (0x32) aborterer ellers HELE scriptet og efterlader rummene i Manual.
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.entre_all
+        data:
+          brightness_pct: "{{ bri }}"
+          color_temp_kelvin: "{{ kelvin }}"
+          transition: "{{ fade }}"
+      - delay:
+          seconds: 2
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.stue_all
+        data:
+          brightness_pct: "{{ bri }}"
+          color_temp_kelvin: "{{ kelvin }}"
+          transition: "{{ fade }}"
+      - delay:
+          seconds: 2
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.badevaerelse_all
+        data:
+          brightness_pct: "{{ bri }}"
+          color_temp_kelvin: "{{ kelvin }}"
+          transition: "{{ fade }}"
+      - delay:
+          seconds: 2
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.sovevaerelse_all
+        data:
+          brightness_pct: "{{ bri }}"
+          color_temp_kelvin: "{{ kelvin }}"
+          transition: "{{ fade }}"
+      - service: logbook.log
+        data:
+          name: "AirBnB velkomst"
+          message: >-
+            Velkomst-ceremoni startet ({{ bri }} %, {{ fade }} s fade) —
+            entré, open-plan, bad og soveværelse. Slipper til Auto om
+            {{ states('input_number.airbnb_velkomst_minutter') | int(10) }} min.
+
+  # ---------------------------------------------------------------------------
+  # Afslutning — ÉN skriver af oprydningen, kaldt både af backstoppen og af en
+  # evt. manuel afbrydelse (fejlklasse #1).
+  # ---------------------------------------------------------------------------
+  airbnb_velkomst_slip:
+    alias: "AirBnB: slip velkomst-holdet (→ Auto)"
+    icon: mdi:auto-fix
+    mode: single
+    sequence:
+      # -----------------------------------------------------------------------
+      # Hvilke zoner skal slukkes? (user-spec 2026-09-04b)
+      #
+      # Et rum slukkes kun hvis det HVERKEN har haft en bevægelses-flanke i
+      # ceremoni-vinduet (latchen) ELLER har sit vidne stående `on` lige nu.
+      # Begge led er nødvendige og dækker hver sin fælde:
+      #   - LATCHEN fanger den der var her tidligere i vinduet og siden er gået
+      #     videre (gæsten der lagde kufferten i soveværelset kl. 0).
+      #   - NU-TILSTANDEN fanger det modsatte hul: entré-VALLHORN'en står typisk
+      #     allerede `on` når ceremonien starter (gæsten åbnede jo lige døren),
+      #     så der kommer aldrig en off→on-flanke inde i vinduet.
+      # Er begge falske, har rummet været urørt hele vejen igennem = slukkes.
+      #
+      # Vidnerne er bevidst forskellige pr. rum, fordi hardwaren er det:
+      # open plan + soveværelse har Apollo-radar (`moving_target` = en KROP der
+      # bevæger sig, ikke et still-ekko), mens entré og bad er husets to rum
+      # uden Apollo og derfor må klare sig med VALLHORN/PIR-occupancy.
+      #
+      # BADET har desuden husets eksisterende sluk-alt-undtagelse som veto
+      # (`sensor.badevaerelse_sluk_alt_undtagelse`, 0 = badet er frit). Den
+      # dækker præcis den person ingen PIR kan se: én der står stille i
+      # bruseren bag en lukket dør. Vi genbruger ankeret frem for at gen-kode
+      # reglen (fejlklasse #2/#12).
+      # -----------------------------------------------------------------------
+      - variables:
+          sluk: >-
+            {% set ns = namespace(z=[]) %}
+            {% if is_state('input_boolean.airbnb_velkomst_move_entre', 'off')
+                  and not is_state('binary_sensor.entre_valhorn_occupancy', 'on') %}
+              {% set ns.z = ns.z + ['light.entre_all'] %}
+            {% endif %}
+            {% if is_state('input_boolean.airbnb_velkomst_move_openplan', 'off')
+                  and not is_state('binary_sensor.stue_apollo_radar_moving_target', 'on')
+                  and not is_state('binary_sensor.koekken_apollo_radar_moving_target', 'on')
+                  and not is_state('binary_sensor.spisestue_apollo_radar_moving_target', 'on') %}
+              {% set ns.z = ns.z + ['light.stue_all'] %}
+            {% endif %}
+            {% if is_state('input_boolean.airbnb_velkomst_move_bad', 'off')
+                  and not is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+                  and not is_state('binary_sensor.badevaerelse_optaget_lukket_doer', 'on')
+                  and (states('sensor.badevaerelse_sluk_alt_undtagelse') | int(0)) == 0 %}
+              {% set ns.z = ns.z + ['light.badevaerelse_all'] %}
+            {% endif %}
+            {% if is_state('input_boolean.airbnb_velkomst_move_sove', 'off')
+                  and not is_state('binary_sensor.sovevaerelse_apollo_radar_moving_target', 'on') %}
+              {% set ns.z = ns.z + ['light.sovevaerelse_all'] %}
+            {% endif %}
+            {{ ns.z | join(',') }}
+      # Sluk MENS rummene stadig er i Manual — så presence-vejene ikke kan nå at
+      # tænde igen i mellemrummet. Auto sættes først bagefter, og husets normale
+      # logik overtager derfra fra en kendt slukket tilstand.
+      - if:
+          - condition: template
+            value_template: "{{ sluk | length > 0 }}"
+        then:
+          - service: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: "{{ sluk }}"
+            data:
+              transition: 5
+      - service: input_select.select_option
+        target:
+          entity_id:
+            - input_select.room_mode_entre
+            - input_select.room_mode_sovevaerelse
+            - input_select.room_mode_stue
+            - input_select.room_mode_spisestue
+            - input_select.room_mode_koekken
+            - input_select.room_mode_badevaerelse
+        data:
+          option: "Auto"
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.airbnb_velkomst_active
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_velkomst_slut_at
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: logbook.log
+        data:
+          name: "AirBnB velkomst"
+          message: >-
+            Velkomst-ceremoni slut — alle rum sluppet til Auto.
+            {% if sluk | length > 0 %}
+              Slukket (ingen bevægelse i vinduet): {{ sluk }}.
+            {% else %}
+              Alle fire zoner havde bevægelse — intet slukket.
+            {% endif %}
+
+automation:
+  # ---------------------------------------------------------------------------
+  # START — første hoveddør-åbning efter armering
+  # ---------------------------------------------------------------------------
+  - id: airbnb_velkomst_start
+    alias: "AirBnB velkomst: ceremoni ved første hoveddør-åbning"
+    description: >
+      Hoveddøren åbnes i AirBnB mens velkomsten er armeret (1 t efter mode-skift,
+      jf. packages/airbnb_checkin.yaml) → kør velkomst-ceremonien én gang.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_hoveddoer
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.airbnb_velkomst_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_select.house_mode
+        state: "AirBnB"
+      - condition: state
+        entity_id: input_boolean.airbnb_velkomst_pending
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ now().timestamp()
+             >= (state_attr('input_datetime.airbnb_checkin_arm_at', 'timestamp') | float(0)) }}
+    action:
+      # Ryd pending FØRST — ceremonien må kun køre én gang pr. ophold, også
+      # hvis døren åbnes igen mens scriptet stadig kører.
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.airbnb_velkomst_pending
+      - service: script.airbnb_velkomst_ceremoni
+
+  # ---------------------------------------------------------------------------
+  # BEVÆGELSES-LATCH — opsamler beviset mens ceremonien kører
+  # ---------------------------------------------------------------------------
+  # Apolloernes `moving_target` er recorder-ekskluderede, så der findes ingen
+  # historik at slå op bagefter — beviset skal fanges i realtid. Latchen sættes
+  # kun, aldrig ryddet her; nulstillingen sker ved ceremoni-start, så et rum ikke
+  # kan "miste" bevægelse fordi gæsten gik videre.
+  - id: airbnb_velkomst_move_latch
+    alias: "AirBnB velkomst: latch bevægelse pr. zone"
+    description: >
+      Mens velkomst-ceremonien kører: markér hvilke af de fire zoner der har haft
+      bevægelse. Slut-oprydningen slukker kun de zoner der aldrig blev rørt.
+    mode: queued
+    max: 12
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.entre_valhorn_occupancy
+        from: "off"
+        to: "on"
+        id: entre
+      - platform: state
+        entity_id: !include ../rosters/open_plan_bevaegelse.yaml
+        from: "off"
+        to: "on"
+        id: openplan
+      - platform: state
+        entity_id:
+          - binary_sensor.badevaerelse_inde_occupancy
+          - binary_sensor.badevaerelse_optaget_lukket_doer
+        from: "off"
+        to: "on"
+        id: bad
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_apollo_radar_moving_target
+        from: "off"
+        to: "on"
+        id: sove
+    condition:
+      - condition: state
+        entity_id: input_boolean.airbnb_velkomst_active
+        state: "on"
+    action:
+      # Eksplicit `from: "off"` på alle triggers (ikke bare `to:`): et
+      # template.reload/availability-blip sender entities gennem `unavailable`,
+      # og `unavailable → on` ville ellers latche en zone der aldrig blev rørt
+      # (permanent faktum om template.reload).
+      - service: input_boolean.turn_on
+        target:
+          entity_id: "input_boolean.airbnb_velkomst_move_{{ trigger.id }}"
+
+  # ---------------------------------------------------------------------------
+  # SLUT — restart-robust backstop
+  # ---------------------------------------------------------------------------
+  # Måler mod et SKREVET stempel i stedet for et `delay`/`for:`, som en
+  # HA-restart midt i ceremonien ville sluge (fejlklasse #4/#15). Fanger
+  # samtidig et stempel der er ugyldigt/urørt: står `slut_at` på dagens midnat
+  # (= aldrig sat, CLAUDE.md) mens ceremonien er markeret aktiv, slippes
+  # rummene med det samme frem for at hænge i Manual.
+  - id: airbnb_velkomst_slut_backstop
+    alias: "AirBnB velkomst: slip rum til Auto når ceremonien er udløbet"
+    description: >
+      Tjekker hvert minut om velkomst-ceremonien er udløbet og slipper i så fald
+      alle seks rum tilbage til Auto.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/1"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: state
+        entity_id: input_boolean.airbnb_velkomst_active
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set s = states('input_datetime.airbnb_velkomst_slut_at') %}
+          {{ s[11:] == '00:00:00'
+             or now().timestamp() >= (state_attr('input_datetime.airbnb_velkomst_slut_at', 'timestamp') | float(0)) }}
+    action:
+      - service: script.airbnb_velkomst_slip
+
+  # ---------------------------------------------------------------------------
+  # SIKKERHEDSNET — forlader vi AirBnB midt i en ceremoni, slip rummene
+  # ---------------------------------------------------------------------------
+  - id: airbnb_velkomst_afbryd_ved_mode_skift
+    alias: "AirBnB velkomst: afbryd ved skift væk fra AirBnB"
+    description: >
+      Skiftes house_mode væk fra AirBnB mens ceremonien kører, slippes rummene
+      til Auto med det samme — familien må ikke arve gæstens Manual-hold
+      (CLAUDE.md AirBnB-regel 3).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.house_mode
+        from: "AirBnB"
+    condition:
+      - condition: state
+        entity_id: input_boolean.airbnb_velkomst_active
+        state: "on"
+    action:
+      - service: script.airbnb_velkomst_slip

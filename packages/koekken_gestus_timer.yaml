@@ -1,0 +1,1882 @@
+# =============================================================================
+# Køkken: gestus-styret timer + husdækkende alarm (user-spec 2026-09-11,
+# omskrevet 2026-09-14)
+# =============================================================================
+# User 11/9: "antallet af fingre vist til kameraet tydeligt (op til 10) starter
+# en timer og når tiden er gået blinker køkken lyskæden rødt indtil man viser
+# tommel op. det lys ligger over alt andet (undtagen brandvarsel) på
+# køkkenlyskæden."
+#
+# User 14/9 (afløser ovenstående på fire punkter):
+#   • "En knyttet hånd skal aflyse timeren" — tommel op er pensioneret, og den
+#     samme knytnæve stopper også alarmen mens den ringer.
+#   • "Et nyt antal fingre skal starte en timer på så mange minutter" — uden
+#     ventetid; cooldownen deduplikerer kun det SAMME tal.
+#   • "Køkkenlyskæden skal blinke bursts af hurtige blink med højere
+#     lysstyrke. Antallet af blink i en burst svarer til det antal minutter den
+#     er i gang med at tælle ned."
+#   • "Når timeren løber ud skal der blinke bright … lys i alle rum med
+#     bevægelse (recent, 30 sek) … i hurtige bursts af det antal minutter der
+#     blev talt ned og de blink skal køre i 15 sek med 2 sek pause mellem
+#     bursts." Plus: "Return to auto mode after timers."
+#
+# FARVEN ER IKKE RØD. User bad om "hvidt og rødt"; hvidt+rødt husdækkende er
+# præcis røgalarmens signatur (packages/roegalarm.yaml), og en pasta-timer der
+# ikke kan skelnes fra en brand er farligere end ingen timer. Forelagt valget
+# 14/9: "Timer bliver ravgul i stedet".
+#
+# ⚠️ DENNE FIL INDEHOLDER IKKE GESTUS-AFLÆSNINGEN. Den er delt bevidst:
+# huset har hverken MQTT-broker eller mqtt-integration (målt 11/9: ingen
+# mosquitto-addon, `mqtt`-domænet findes ikke i /api/services). En automation
+# med en `trigger: mqtt` kan derfor ikke valideres og ville gå `unavailable` =
+# fuldstændig stum (fejlklasse #22). Kamera-broen står i
+# docs/gesture_recognition.md og aktiveres når MQTT + shim + kamera er oppe.
+#
+# GRÆNSEFLADEN er to events, ikke MQTT. Alt herunder er derfor live og
+# testbart I DAG, og virker uændret den dag kameraet kommer:
+#
+#   event: koekken_gestus_start    data: {minutter: 1..60}
+#   event: koekken_gestus_kvitter  (ingen data)
+#
+# Det gør også featuren brugbar fra andre kilder end et kamera (dashboard-knap,
+# Styrbar, en Genvej) — hvilket er hele pointen, eftersom kameraet er blokeret
+# på hardware der endnu ikke er købt.
+#
+# HVORFOR `input_text` OG `timer` — OG IKKE `input_number`/`input_boolean`:
+# der er AirBnB-gæster i lejligheden, så en HA-restart er udelukket, og en ny
+# helper skal derfor kunne reloades gratis. Målt 11/9 på hele repoet:
+#   input_text     50 helpers,   0 med `initial:`  → gratis reload
+#   timer           2 helpers,   0 med `initial:`  → gratis reload (begge idle)
+#   input_number  560 helpers,  17 med `initial:`  → IKKE gratis
+#   input_boolean 402 helpers,  41 med `initial:`  → IKKE gratis
+# `initial:` RESTORER ikke, den PÅTVINGER ved reload — et `input_number.reload`
+# ville nulstille 17 sliders, heriblandt `vandventil_max_sekunder`. CLAUDE.md's
+# note nævner kun input_boolean/input_datetime; input_number er lige så farlig.
+# Konsekvens: de to tunables er HARDCODEDE indtil næste restart, hvor de kan
+# blive rigtige sliders (B133): blink-intervallet (`delay: seconds: 4` i
+# blink-løkken) og alarm-cappen (`cap = 15` i koekken_gestus_alarm_cap).
+#
+# ⚠️ NUANCE MÅLT 12/9 (puls-slideren nedenfor er en input_number alligevel):
+# "17 sliders med `initial:`" er faren, ikke skaden. Skaden opstår kun hvis en
+# af dem STÅR på noget andet end sin `initial:`-værdi. Målt lige før deploy:
+# alle 17 stod præcis på deres initial ⇒ reloaden var beviseligt en no-op, og
+# en ægte slider kunne shippes uden restart. Reglen er altså: TÆL afvigelserne
+# før du kalder `input_number.reload` — ikke "aldrig". NB de 15 af de 17 er
+# Styrbar-markører (`styrbar_color_idx_*`) der flytter sig ved et knaptryk, så
+# målingen holder kun i minutter — mål igen umiddelbart før reloaden.
+#
+# PRIORITET (user-spec "over alt andet undtagen brandvarsel"): alarmen gates
+# IKKE ind i 29 med-ejere af lyskæden — det ville være samme regel kodet 29
+# gange (#2/#16). I stedet:
+#   1. Blink-løkken RE-ASSERTER rødt hvert 5. sekund (målt 12/9 på recorderen:
+#      0,84 s fuld rød + 4,15 s dæmpet). En med-ejer der handler ÉN gang taber
+#      mod en løkke der handler vedvarende — selv-helende, nul fremmede filer.
+#   2. Kun ÉN med-ejer kan vinde VEDVARENDE, og den er eksplicit gatet:
+#      lyskæde-enforceren (packages/koekken_lyskaede.yaml). Bemærk at note 3
+#      nedenfor ikke redder os dér: alarmen tænder ofte en SLUKKET lyskæde, og
+#      DEN off→on-flanke er ægte. Målt 12/9 i første live-test: enforceren
+#      svarede med orange 255,121,5 @ bri 102 ti sekunder inde i alarmen.
+#      De to blinkere (rain_warning, legetoejsdag) er bevidst IKKE gatet: de
+#      snapshotter og restorer selv, varer få sekunder og er sjældne, så et
+#      interleave er kosmetisk og hentes hjem af løkken inden for ét interval.
+#   3. Røgalarmen vinder over os — ikke omvendt. Se `while`-betingelsen.
+#
+# BLINKET GÅR ALDRIG HELT MØRKT (fuld rød ↔ dæmpet rød), præcis som
+# packages/roegalarm.yaml. To grunde: man skal kunne se, OG enforceren trigger
+# på `to: "on"` — en off→on-puls pr. blink ville vække den ved hvert eneste
+# blink. Med on↔dim findes der kun ÉN on-flanke i hele alarmen.
+# =============================================================================
+
+input_text:
+  # `<kode>:<epoch>:<frames>:<sidst_fyret_epoch>:<sidst_fyret_kode>` —
+  # hold-to-confirm-bufferen. En hånd der føres op i billedet passerer gennem
+  # 1, 2, 3 fingre, og add-on'et publicerer for HVER behandlet frame. Uden en
+  # hold-periode ville en hånd på vej op starte en 1-minuts-timer.
+  # Kode -1 = knyttet hånd (annullér), 1-10 = fingertal. Det femte felt gør
+  # cooldownen tal-specifik, så "3 … nej, 8" virker uden ventetid.
+  # Tom/ukendt = ingen tælling i gang.
+  koekken_gestus_pending:
+    name: "Køkken gestus: afventende tælling"
+    icon: mdi:hand-back-right-outline
+    max: 48
+
+  # `off` | `aktiv:<epoch>:<minutter>:<on|off>`. Sidste felt er lyskædens
+  # tilstand FØR alarmen, så den kan afleveres tilbage som den blev lånt.
+  # `<minutter>` er IKKE pynt længere: det er antallet af blink pr. burst
+  # (user-spec 2026-09-14 "det antal minutter der blev talt ned").
+  koekken_gestus_alarm:
+    name: "Køkken gestus: alarm-tilstand"
+    icon: mdi:alarm-light
+    max: 40
+
+  # `off` | `<rum>=<on|off>,<rum>=<on|off>,…` — de rum alarmen LÅNTE, og hvad
+  # deres lys stod på da vi lånte det. Alarmen blinker i alle rum med bevægelse
+  # inden for 30 s (user-spec 2026-09-14), og rum-sættet er derfor forskelligt
+  # fra gang til gang; det kan ikke udledes bagefter, fordi bevægelsen for
+  # længst er ovre når alarmen slutter. Egen helper frem for et sjette felt i
+  # `koekken_gestus_alarm`: fem rum + tilstand fylder mere end de 40 tegn dér,
+  # og en overløben input_text fejler TAVST ved at trunkere.
+  koekken_gestus_alarm_rum:
+    name: "Køkken gestus: lånte alarm-rum"
+    icon: mdi:home-flood
+    max: 255
+
+  # `off` | `aktiv:<epoch>:<kædens tilstand FØR nedtællingen>:<base-styrke i %>`
+  #
+  # BASE FRYSES VED START og læses ikke live: pulsen skriver selv brightness, så
+  # en løkke der aflæste den aktuelle værdi ville måle sit eget forrige slag og
+  # vandre nedad indtil kæden stod på 1 %.
+  #
+  # `pre` SKAL ligge her og må IKKE aflæses når alarmen starter: vi holder kæden
+  # tændt hele nedtællingen (user-spec), så en live-aflæsning på det tidspunkt
+  # ville altid svare `on` — og alarmen ville aflevere en kæde tilbage TÆNDT som
+  # var slukket før timeren blev sat.
+  koekken_gestus_nedtael:
+    name: "Køkken gestus: nedtælling i gang"
+    icon: mdi:timer-outline
+    max: 40
+
+input_number:
+  # INTET `initial:` på nogen af de tre — det RESTORER ikke, det PÅTVINGER ved
+  # hver reload/start. Værdierne sættes live + i init_user_preferences +
+  # snapshottes (#5).
+
+  # ⚠️ OMDEFINERET 2026-09-14. Var "puls-dybde" for den bløde 10 %-pulseren
+  # (user-spec 2026-09-12b). Pulsen er afløst af BURSTS — N hurtige blink hvor
+  # N er minutterne der tælles ned — så sliderens betydning er nu BUNDEN:
+  # hvor lavt hvert blink dykker ned, i procent af fuld styrke. Toppen er
+  # altid 100 % ("højere lysstyrke", user-spec), for det er den eneste top der
+  # er synlig uanset om kæden i forvejen står på 2 % natlys eller 100 %
+  # madlavningslys. Bunden klampes desuden til kædens egen styrke, så et blink
+  # aldrig LØFTER en næsten-slukket kæde mellem sine slag.
+  #
+  # 0 slår IKKE bursts fra — den gør dem bare så dybe som muligt (gulv 1 %, så
+  # der aldrig kommer en off→on-flanke der vækker lyskæde-enforceren).
+  # ⚠️ OMDEFINERET IGEN 2026-09-24 (user: "de blink der kommer mens timeren
+  # kører er for voldsomme. forstyrrer"). 100 %-toppen og 10 %-bunden er
+  # væk: sliderens tal er nu UDSVINGET i %-point omkring kædens eget niveau
+  # (op fra niveauet; står kæden så højt at toppen rammer 100, dykker slaget
+  # i stedet). Entity_id'et beholder den gamle slug.
+  koekken_gestus_puls_pct:
+    name: "⏲️ Køkken-timer: burst-udsving"
+    icon: mdi:sine-wave
+    min: 5
+    max: 60
+    step: 1
+    unit_of_measurement: "%"
+    mode: slider
+
+  # Hvor ofte lyskæden viser en burst under nedtællingen (user-spec
+  # 2026-09-14, valgt: hvert 20. sekund). Lavere = mere nærværende, men også
+  # mere radiotid og mere flimmer i et køkken man opholder sig i.
+  koekken_gestus_burst_interval_s:
+    name: "⏲️ Køkken-timer: sekunder mellem bursts"
+    icon: mdi:timer-sync-outline
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # Hvor længe alarmen kører når tiden er gået. Oprindelig user-spec 2026-09-14
+  # var 15 s, men slideren ER autoriteten og user har selv tunet den siden:
+  # 15 (09-15 09:36) → 5 (09-15 13:05) → 10 (09-16 06:23), alle tre med
+  # context_user_id sat = menneske. LÆS SLIDEREN, skriv ikke 15 i en ny
+  # kommentar. Alarmen er selv-afsluttende og har derfor ingen 15-minutters cap
+  # længere — den her slider ER udgangen (🏡 #2).
+  koekken_gestus_alarm_sek:
+    name: "⏲️ Køkken-timer: alarmens længde"
+    icon: mdi:alarm-light-outline
+    min: 5
+    max: 60
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+
+timer:
+  koekken_gestus:
+    name: "Køkken: gestus-timer"
+    icon: mdi:timer-sand
+    # Overskrives ved hvert `timer.start`; værdien her er kun en formalitet.
+    duration: "00:03:00"
+    # Overlever en restart — ellers ville en 10-minutters timer dø tavst ved
+    # et deploy, og det er præcis den slags tavshed #4 handler om.
+    restore: true
+
+# =============================================================================
+# Resterende tid som LÆSBART TAL (2026-09-17, user-spec: "så jeg kan lave en
+# widget og se hvor lang tid der er tilbage")
+# =============================================================================
+# timer.koekken_gestus kan IKKE bruges til det alene: en timer-entitys state er
+# 'active'/'idle'/'paused' — aldrig tiden. Lovelace regner selv nedtællingen ud
+# fra attributten finishes_at, så et tile-kort viser den fint, men en
+# telefon-widget viser kun ordet "active". Derfor denne sensor.
+#
+# TRIGGER-baseret, ikke en almindelig template-sensor, af to grunde:
+#   • en almindelig template-sensor med now() ville skrive en DB-række i
+#     ubegrænset tid — fejlklasse #24. Her er tikket gatet på at timeren
+#     faktisk kører, så rækkerne stopper i samme sekund timeren gør.
+#   • finishes_at ændrer sig ikke undervejs, så uden et tik ville sensoren
+#     stå stille på det tal den fik ved start.
+#
+# 2 s opløsning: et ur der springer 5 s ad gangen ser i stykker ud, og
+# omkostningen er ~90 rækker for en 3-minutters timer — kun mens den kører.
+# =============================================================================
+template:
+  - trigger:
+      - platform: time_pattern
+        seconds: "/2"
+      # Uden denne ville sensoren hænge på sit sidste tal i op til 2 s efter
+      # start/stop — og ved annullering er det netop det gamle tal der ser ud
+      # som om timeren stadig løber.
+      - platform: state
+        entity_id: timer.koekken_gestus
+      # En trigger-baseret sensor har INGEN værdi før dens første trigger, og
+      # tik-conditionen nedenfor blokerer netop mens timeren er idle. Uden
+      # denne stod sensoren 'unknown' fra restart og indtil timeren var brugt
+      # én gang — målt efter første deploy. En widget viser da "unknown", ikke
+      # den "—" den er designet til.
+      - platform: homeassistant
+        event: start
+    condition:
+      # Tik kun mens den kører. Alt ANDET end det periodiske tik (state-flanke,
+      # HA-start) slipper altid igennem, så både nulstillingen til "—" og
+      # startværdien efter boot faktisk bliver skrevet.
+      - condition: template
+        value_template: >-
+          {{ is_state('timer.koekken_gestus', 'active')
+             or trigger.platform != 'time_pattern' }}
+    sensor:
+      # mm:ss som state (ikke sekunder): det er formatet et menneske aflæser på
+      # en widget uden at regne. Rå sekunder ligger i attributten til
+      # automatiseringer og grafer.
+      - name: "Koekken gestus resterende"
+        unique_id: koekken_gestus_resterende
+        icon: mdi:timer-outline
+        state: >-
+          {% set f = state_attr('timer.koekken_gestus', 'finishes_at') %}
+          {% if is_state('timer.koekken_gestus', 'active') and f not in [none, ''] %}
+            {% set r = (as_timestamp(f) - as_timestamp(now())) | round(0) | int %}
+            {% set r = [r, 0] | max %}
+            {{ '%d:%02d' % (r // 60, r % 60) }}
+          {% else %}
+            —
+          {% endif %}
+        attributes:
+          # Gatet på 'active' (#24): står timeren idle, er et resterende-tal
+          # meningsløst, og en attribut der skriver 0 hvert andet sekund i
+          # døgndrift er præcis den fælde klassen beskriver.
+          resterende_sekunder: >-
+            {% set f = state_attr('timer.koekken_gestus', 'finishes_at') %}
+            {% if is_state('timer.koekken_gestus', 'active') and f not in [none, ''] %}
+              {{ [(as_timestamp(f) - as_timestamp(now())) | round(0) | int, 0] | max }}
+            {% else %}
+              0
+            {% endif %}
+
+script:
+  # ---------------------------------------------------------------------------
+  # INDGANGEN indtil kameraet findes. Et Lovelace-kort kan KUN kalde en service,
+  # aldrig fyre et event — så uden disse to er hele featuren utilgængelig for et
+  # menneske. De er med vilje tynde: de oversætter et tryk til præcis det event
+  # kameraet en dag kommer til at sende, så de to kilder deler al validering,
+  # alle gates og hele alarm-kæden (ét anker, ikke to — #2).
+  # ---------------------------------------------------------------------------
+  koekken_gestus_saet:
+    alias: "Køkken gestus: start timer på N minutter"
+    icon: mdi:timer-play-outline
+    mode: parallel
+    fields:
+      minutter:
+        name: Minutter
+        description: >-
+          1-60. Fingre kan kun vise 1-10, men stemmen kan sige op til tres, og
+          kæden er den samme uanset længden (user-spec 2026-09-17).
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 60
+            mode: slider
+    sequence:
+      # `| default(0)` er ikke pynt: et script-felt der ikke sendes med i kaldet
+      # er UDEFINERET, og `| int(0)` alene redder det ikke — hele scriptet ville
+      # abortere med UndefinedError. 0 falder igennem automationens 1-60-gate.
+      - event: koekken_gestus_start
+        event_data:
+          minutter: "{{ minutter | default(0) | int(0) }}"
+          kilde: knap
+          bevis: "dashboard-knap eller telefon-widget"
+
+  # Event-NAVNET er stadig `koekken_gestus_kvitter`, selvom gestussen er skiftet
+  # fra tommel op til knyttet hånd (user-spec 2026-09-14). Navnet er husets
+  # grænseflade og bruges af dashboards/lights.yaml; et omdøbt event ville
+  # kræve at alle kilder blev rettet samtidig, uden at ændre en eneste adfærd.
+  koekken_gestus_kvittering:
+    alias: "✊ Køkken-timer: annullér (knyttet hånd)"
+    icon: mdi:hand-back-right-off-outline
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - event: koekken_gestus_kvitter
+
+  # ---------------------------------------------------------------------------
+  # "JEG SER DIG" — ét svagt ravgult blink i Apollo-ringen i det øjeblik
+  # kameraet genkender et fingertal eller en knytnæve FØRSTE gang, længe før
+  # holdet er opfyldt (user 2026-10-11: "det tog længere tid end jeg kan lide
+  # at holde hånden oppe"). Målt på det forsøg: ~10 s af ~15 gik med at
+  # MediaPipe slet ikke fandt hånden — uden et tegn kunne man ikke vide om man
+  # skulle holde stille eller dreje håndfladen. Ravgul, så det ikke forveksles
+  # med start-kvitteringens grønne eller varslernes blå/røde.
+  #
+  # Kaldes med `script.turn_on` fra gestus-oversætteren, så frame-køen aldrig
+  # venter på et lys. `flash: short` = ÉN write, ESP'en slukker selv efter
+  # ~2 s og vender tilbage til den FORRIGE tilstand — så et start-kvitterings-
+  # blink eller et varsel-flash i luften overlever (ingen sluk-flanke fra os,
+  # #27). `single` + den afsluttende delay er rate-loftet: en køkken-hånd der
+  # flimrer mellem tal giver højst ét blink pr. 6 s.
+  # ---------------------------------------------------------------------------
+  koekken_gestus_set_signal:
+    alias: "✋ Køkken gestus: hånd set (svagt blink)"
+    icon: mdi:hand-wave-outline
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - if:
+          - condition: state
+            entity_id: light.koekken_apollo_rgb_light
+            state: "off"
+        then:
+          - action: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: light.koekken_apollo_rgb_light
+            data:
+              brightness_pct: 20
+              rgb_color: [255, 150, 0]
+              flash: short
+      - delay:
+          seconds: 6
+
+  # ---------------------------------------------------------------------------
+  # TELEFON-WIDGETS: ét script pr. minuttal. Android-companion'ens widget kan
+  # kun pege på ÉN handling, og et felt-bærende script tvinger tallet ind i
+  # widget-konfigurationen — ti faste genveje er det eneste der giver ÉT tryk
+  # fra hjemmeskærmen. De er rene viderestillinger til `koekken_gestus_saet`,
+  # så validering, gates og hele alarm-kæden stadig bor ét sted (#2).
+  # Aliaserne er præfikset med ⏲️ så de står samlet i widget-vælgeren.
+  # ---------------------------------------------------------------------------
+  koekken_timer_1_min:
+    alias: "⏲️ Køkken-timer 1 min"
+    icon: mdi:numeric-1-circle-outline
+    mode: parallel
+    sequence:
+      - action: script.koekken_gestus_saet
+        data:
+          minutter: 1
+
+  koekken_timer_2_min:
+    alias: "⏲️ Køkken-timer 2 min"
+    icon: mdi:numeric-2-circle-outline
+    mode: parallel
+    sequence:
+      - action: script.koekken_gestus_saet
+        data:
+          minutter: 2
+
+  koekken_timer_3_min:
+    alias: "⏲️ Køkken-timer 3 min"
+    icon: mdi:numeric-3-circle-outline
+    mode: parallel
+    sequence:
+      - action: script.koekken_gestus_saet
+        data:
+          minutter: 3
+
+  koekken_timer_4_min:
+    alias: "⏲️ Køkken-timer 4 min"
+    icon: mdi:numeric-4-circle-outline
+    mode: parallel
+    sequence:
+      - action: script.koekken_gestus_saet
+        data:
+          minutter: 4
+
+  koekken_timer_5_min:
+    alias: "⏲️ Køkken-timer 5 min"
+    icon: mdi:numeric-5-circle-outline
+    mode: parallel
+    sequence:
+      - action: script.koekken_gestus_saet
+        data:
+          minutter: 5
+
+  koekken_timer_6_min:
+    alias: "⏲️ Køkken-timer 6 min"
+    icon: mdi:numeric-6-circle-outline
+    mode: parallel
+    sequence:
+      - action: script.koekken_gestus_saet
+        data:
+          minutter: 6
+
+  koekken_timer_7_min:
+    alias: "⏲️ Køkken-timer 7 min"
+    icon: mdi:numeric-7-circle-outline
+    mode: parallel
+    sequence:
+      - action: script.koekken_gestus_saet
+        data:
+          minutter: 7
+
+  koekken_timer_8_min:
+    alias: "⏲️ Køkken-timer 8 min"
+    icon: mdi:numeric-8-circle-outline
+    mode: parallel
+    sequence:
+      - action: script.koekken_gestus_saet
+        data:
+          minutter: 8
+
+  koekken_timer_9_min:
+    alias: "⏲️ Køkken-timer 9 min"
+    icon: mdi:numeric-9-circle-outline
+    mode: parallel
+    sequence:
+      - action: script.koekken_gestus_saet
+        data:
+          minutter: 9
+
+  koekken_timer_10_min:
+    alias: "⏲️ Køkken-timer 10 min"
+    icon: mdi:numeric-10-circle-outline
+    mode: parallel
+    sequence:
+      - action: script.koekken_gestus_saet
+        data:
+          minutter: 10
+
+  # ---------------------------------------------------------------------------
+  # ÉN ALARM-BURST: N hurtige blink i alle lånte rum, hvor N = det antal
+  # minutter der blev talt ned (user-spec 2026-09-14).
+  #
+  # HVORFOR RAVGUL OG HVID — OG IKKE RØDT. User bad oprindeligt om "bright
+  # hvidt og rødt lys i alle rum". Hvidt+rødt husdækkende er præcis
+  # røgalarmens signatur (packages/roegalarm.yaml: alt lys fuldt hvidt som
+  # flugtvej + rødt blink), og en pasta-timer der ikke kan skelnes fra en brand
+  # er farligere end ingen timer. Forelagt valget: "Timer bliver ravgul i
+  # stedet". Rød er reserveret til røg/vand.
+  #
+  # FARVEN SÆTTES ÉN GANG PR. BURST, resten er rene niveau-kald. Et farvet
+  # `light.turn_on` er to zigbee-frames pr. pære, et niveau-kald ét (målt 2:1),
+  # og bursten rammer op til fem rum på tre forskellige radioer. Ved N=10 ville
+  # farve på hvert slag være 200 frames på 5 sekunder.
+  #
+  # BLINKET GÅR ALDRIG HELT MØRKT (fuld ↔ 5 %), præcis som roegalarm.yaml. To
+  # grunde: man skal kunne se hvor man går, OG rummenes enforcere trigger på
+  # `to: "on"` — en off→on-puls pr. blink ville vække dem ved hvert eneste slag.
+  # ---------------------------------------------------------------------------
+  koekken_gestus_alarm_burst:
+    alias: "Køkken gestus: én alarm-burst i de lånte rum"
+    icon: mdi:alarm-light
+    mode: single
+    max_exceeded: silent
+    fields:
+      farve:
+        name: Farve
+        description: "hvid eller ravgul. Skiftes pr. burst, så signalet pulserer i to farver."
+        required: false
+        selector:
+          select:
+            options: ["hvid", "ravgul"]
+    sequence:
+      - variables:
+          # `<rum>|<lys>|<tilstand før>` pr. rum. Kortet rum→lampe bygges ÉT
+          # sted (koekken_gestus_timer_slut) og bæres med her — ellers ville
+          # samme opslagstabel stå i tre filer og drifte fra hinanden (#2/#16).
+          lys: >-
+            {% set ns = namespace(l=[]) %}
+            {% for p in states('input_text.koekken_gestus_alarm_rum').split(',') %}
+              {% set d = p.split('|') %}
+              {% if d | length == 3 and d[1].startswith('light.') %}
+                {% set ns.l = ns.l + [d[1]] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.l }}
+          antal: >-
+            {{ [ [ states('input_text.koekken_gestus_alarm').split(':')[2] | int(1),
+                   1 ] | max, 10 ] | min }}
+          rgb: "{{ [255, 255, 255] if farve | default('hvid') == 'hvid' else [255, 150, 0] }}"
+      - repeat:
+          count: "{{ antal }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ repeat.first }}"
+              then:
+                - action: light.turn_on
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ lys }}"
+                  data:
+                    rgb_color: "{{ rgb }}"
+                    brightness: 255
+                    transition: 0
+              else:
+                - action: light.turn_on
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ lys }}"
+                  data:
+                    brightness: 255
+                    transition: 0
+            - delay:
+                milliseconds: 250
+            - action: light.turn_on
+              continue_on_error: true
+              target:
+                entity_id: "{{ lys }}"
+              data:
+                brightness: 13
+                transition: 0
+            - delay:
+                milliseconds: 250
+
+  # ---------------------------------------------------------------------------
+  # ÉN NEDTÆLLINGS-BURST på lyskæden: N hurtige blink, hvor N = minutterne der
+  # er tilbage (user-spec 2026-09-14: "Antallet af blink i en burst svarer til
+  # det antal minutter den er i gang med at tælle ned").
+  #
+  # ⚠️ TILBAGE, ikke totalen. Ordlyden er nutid ("er i gang med"), mens
+  # alarmens tilsvarende krav står i datid ("det antal minutter der BLEV talt
+  # ned") — så de to tal er bevidst forskellige. Det gør kæden til et ur: man
+  # kommer ind i køkkenet, tæller tre blink og ved at der er tre minutter
+  # tilbage. Totalen ville gentage det samme tal 45 gange og fortælle
+  # ingenting man ikke vidste i forvejen.
+  #
+  # ERSTATTER den bløde 10 %-pulseren fra 12/9. User: "Køkkenlyskæden skal
+  # blinke bursts af hurtige blink med højere lysstyrke."
+  #
+  # RENE NIVEAU-KALD — farven røres aldrig. Et farvet `turn_on` er to
+  # zigbee-frames pr. pære, et niveau-kald er ét, og kæden skal beholde den
+  # farve enforceren (eller natturen, eller dance mode) har givet den. Det er
+  # samtidig dét der gør nedtællingen umulig at forveksle med alarmen, som
+  # netop ER farvet.
+  #
+  # Det sidste kald er OGSÅ re-asserten der holder kæden tændt (user-spec "hold
+  # den tændt under hele nedtællingen"): har en med-ejer slukket den i
+  # mellemtiden, tænder denne burst den igen. Selv-helende, uden at gate 29
+  # fremmede filer (#2).
+  # ---------------------------------------------------------------------------
+  koekken_gestus_burst_once:
+    alias: "Køkken gestus: én nedtællings-burst"
+    icon: mdi:flash
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - variables:
+          # Minutter tilbage, rundet OP: en 5-minutters timer viser 5 blink i
+          # sin første burst og 1 blink i det sidste minut. `finishes_at` er
+          # timerens egen slutning i UTC og er kun sat mens den er `active`.
+          # Loftet på 10 er ikke en feature-grænse (timere går til 60 siden
+          # 2026-09-17) — det er en AFLÆSELIGHEDS-grænse: ingen tæller 23 blink,
+          # og 10 blink à 0,44 s fylder allerede 4,4 s af et 20-sekunders
+          # interval. 10 blink betyder derfor "ti eller flere", og tallet bliver
+          # præcist igen i det sidste kvarter, hvor det er relevant.
+          antal: >-
+            {% set fa = state_attr('timer.koekken_gestus', 'finishes_at') %}
+            {% if fa %}
+              {{ [ [ (((as_datetime(fa).timestamp() - now().timestamp()) / 60)
+                       | round(0, 'ceil') | int(1)), 1 ] | max, 10 ] | min }}
+            {% else %}
+              1
+            {% endif %}
+      # 2026-09-18e: slagene og afleveringen ligger nu i køkkenets fælles
+      # signal-kanal (`script.koekken_lyskaede_signal`,
+      # packages/koekken_lyskaede.yaml), så bursten ikke kan køre samtidig med
+      # mikrofon-kvitteringen eller den grønne annullerings-kvittering. Kanalen
+      # aflæser selv kædens styrke når den får turen og sætter den tilbage
+      # bagefter — bunden klampes derinde til den aflæsning, så et slag aldrig
+      # LØFTER lyset mellem sine dyk.
+      #
+      # `base` hentes derfor ikke længere ud af nedtællings-flaget: mellem to
+      # bursts STÅR kæden på det lånte niveau, så kanalens egen aflæsning er
+      # det samme tal — og den er robust over for at nogen har dæmpet kæden i
+      # hånden midt i nedtællingen, hvad flaget ikke er.
+      - action: script.koekken_lyskaede_signal
+        continue_on_error: true
+        data:
+          moenster: burst
+          antal: "{{ antal }}"
+          udsving_pct: "{{ states('input_number.koekken_gestus_puls_pct') | int(20) }}"
+
+  # ---------------------------------------------------------------------------
+  # Stop alarmen og aflevér HVERT lånt rum tilbage i den tilstand det blev lånt
+  # i — plus tilbage til Auto (user-spec 2026-09-14: "Return to auto mode after
+  # timers").
+  #
+  # HVORFOR room_mode overhovedet skal røres: kaldes annulleringen fra et
+  # Lovelace-kort i stedet for med en knytnæve, arver scriptets `light.turn_on`
+  # brugerens `context.user_id` — og husets manual-override-tracker stempler
+  # netop `user_id is not none` som "mennesket har taget over" (#3/#11). Fem rum
+  # ville stå i Manual bagefter, og deres presence-lys ville være dødt indtil
+  # nogen opdagede det. Vi retter KUN `Manual` tilbage: rum i Manual/Off blev
+  # aldrig lånt (se koekken_gestus_timer_slut), så står et lånt rum i Manual nu,
+  # er det beviseligt vores eget kald der satte det — og et rum der står i
+  # Off har mennesket valgt bevidst og skal ikke stomps.
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # TELEFONEN — featurens LYD-halvdel.
+  #
+  # Køkkenet har ingen højttaler: kamera-højttaleren sidder bag et kontrol-API
+  # som firmwaren har lukket, og den kan heller ikke nås via RTSP (B146, lukket
+  # som umulig 2026-09-16). Lyden kommer derfor fra telefonen.
+  #
+  # Historik: 16/9-4/10 var det en NATIV timer i Ur-appen (SET_TIMER). Fordelen
+  # var at den ringede uafhængigt af HA/wifi i udløbs-øjeblikket; prisen var at
+  # den aldrig kunne fjernes igen (ingen kvittering, DISMISS_TIMER virker ikke
+  # på OnePlus). Den nye løkke kræver forbindelse ved udløbet — en bevidst pris
+  # for at HA kan stoppe lyden.
+  # ---------------------------------------------------------------------------
+  # B149 (2026-10-04, user-valg "HA-ejet alarmlyd"): telefonens Ur-app er
+  # UDE. OnePlus' Ur reagerer ikke på DISMISS_TIMER (user bekræftede 4/10: "den
+  # fortsætter ufortrødent"), og en Android-timer har ingen kvittering — så en
+  # timer HA ikke kan stoppe ringede til nogen swipede den. Nu ejer HA lyden:
+  # ved udløb siger telefonen "Kitchen timer is done" på ALARM-kanalen
+  # (spiller også på lydløs) og gentager hvert 10. sekund, så længe lysalarmen
+  # varer (slideren koekken_gestus_alarm_sek) — eller kortere hvis nogen
+  # kvitterer (knytnæve / "stop timer"), en ny timer startes, godnat/AirBnB.
+  # 5-min-loftet i løkken er kun en backstop. (Første version ringede videre
+  # til en kvittering; i ægte brug kom kvitteringen aldrig igennem, 4/10.)
+  # Grænsefladen (minutter/sekunder) er bevaret, så de to kaldesteder er urørte:
+  # længde > 0 = start lyden, 0 = stop den.
+  koekken_gestus_telefon_timer:
+    alias: "Køkken gestus: telefonens alarmlyd (start/stop)"
+    icon: mdi:cellphone-sound
+    mode: queued
+    max: 3
+    fields:
+      minutter:
+        description: >-
+          > 0 = start telefonens alarmlyd. 0 = stop den igen.
+        example: 0
+      sekunder:
+        description: >-
+          > 0 = start telefonens alarmlyd (bruges ved udløb). Vinder over
+          `minutter`.
+        example: 1
+    sequence:
+      # Et script-felt der ikke sendes med i kaldet er UDEFINERET, og `| int(0)`
+      # redder det ikke — derfor `| default()` før `| int()`.
+      - variables:
+          laengde: >-
+            {{ (sekunder | default(0) | int(0))
+               if (sekunder | default(0) | int(0)) > 0
+               else (minutter | default(0) | int(0)) * 60 }}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ laengde | int(0) > 0 }}"
+              # Master-toggle (user 2026-10-11): slukket = ingen alarmlyd på
+              # telefonen; lyset på køkken-kæden blinker stadig.
+              - condition: state
+                entity_id: input_boolean.notifikationer_master_enabled
+                state: "on"
+            sequence:
+              # turn_on (ikke et blokerende kald): løkken lever i minutter, og
+              # timer_slut skal videre til lyset med det samme.
+              - action: script.turn_on
+                target:
+                  entity_id: script.koekken_gestus_telefon_alarm
+        default:
+          - action: script.turn_off
+            target:
+              entity_id: script.koekken_gestus_telefon_alarm
+          # Stopper en sætning der er midt i afspilningen.
+          - action: notify.mobile_app_phone_a
+            continue_on_error: true
+            data:
+              message: "command_stop_tts"
+              data:
+                priority: high
+                ttl: 0
+
+  # Selve løkken. mode: restart = en ny udløb starter forfra i stedet for at
+  # stable to løkker. wait_for_trigger lytter SELV på stop-signalerne, så en
+  # kvittering virker også når lysalarmen allerede er slut (alarm_stop er da en
+  # no-op, fordi flaget er ryddet). Ingen kvittering fra telefonen (TTS er
+  # fire-and-forget via FCM) — men stoppet er HA's eget, og logbogen bærer det.
+  koekken_gestus_telefon_alarm:
+    alias: "Køkken gestus: telefonen siger timeren til (til stop)"
+    icon: mdi:alarm
+    mode: restart
+    sequence:
+      - repeat:
+          sequence:
+            - action: notify.mobile_app_phone_a
+              continue_on_error: true
+              data:
+                message: "TTS"
+                data:
+                  # Engelsk med vilje: telefonens TTS-motor er ikke dansk, og
+                  # "Køkkentimeren er færdig" blev uforståelig (user-test 4/10).
+                  tts_text: "Kitchen timer is done"
+                  media_stream: "alarm_stream"
+                  # Uden high/ttl 0 må FCM batche beskeden i Doze (24/9: "min
+                  # tlf timer kommer forsinket ift lyset").
+                  priority: high
+                  ttl: 0
+            - wait_for_trigger:
+                - trigger: event
+                  event_type: koekken_gestus_kvitter
+                - trigger: event
+                  event_type: koekken_gestus_start
+                - trigger: state
+                  entity_id: binary_sensor.godnat_common_active
+                  to: "on"
+                - trigger: state
+                  entity_id: input_select.house_mode
+                  to: "AirBnB"
+              timeout:
+                seconds: 10
+              continue_on_timeout: true
+          # 30 runder ≈ 5 min: ingen hjemme = ingen grund til at ringe i timevis.
+          until:
+            - condition: template
+              value_template: "{{ wait.trigger is not none or repeat.index >= 30 }}"
+      - action: notify.mobile_app_phone_a
+        continue_on_error: true
+        data:
+          message: "command_stop_tts"
+          data:
+            priority: high
+            ttl: 0
+      - action: logbook.log
+        data:
+          name: "Køkken-timer"
+          message: >-
+            Telefonens alarmlyd stoppet {{ 'af kvittering, ny timer, godnat eller AirBnB'
+            if wait.trigger is not none else 'af 5-min-loftet (ingen kvitterede)' }}.
+
+  koekken_gestus_alarm_stop:
+    alias: "Køkken gestus: stop alarm og aflevér lyset"
+    icon: mdi:alarm-light-off
+    mode: single
+    sequence:
+      # Stopper man alarmen, skal ALT stoppe — også telefonens alarmlyd. Hooket
+      # sidder her og ikke på de fem kaldesteder, fordi dette script er den
+      # ENESTE vej ud af alarmen (#2) — også lysalarmens egen slutning.
+      - action: script.koekken_gestus_telefon_timer
+        continue_on_error: true
+        data:
+          minutter: 0
+
+      - variables:
+          # Læs FØR flagene ryddes — bagefter er listen væk.
+          laante: "{{ states('input_text.koekken_gestus_alarm_rum') }}"
+
+      # Flaget ryddes FØRST. Rummenes enforcere er gatet på det, så de skal
+      # være fri igen INDEN on-flankerne nedenfor, ellers maler de ikke farven
+      # tilbage.
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_gestus_alarm
+        data:
+          value: "off"
+
+      # Dræb en burst der er I LUFTEN. Bursten holder lyset i 250 ms mellem
+      # sine kald, så en burst der startede lige før flaget blev ryddet, lander
+      # sit næste `turn_on` EFTER afleveringen nedenfor — og så bliver rummet
+      # stående tændt for evigt. Målt 12/9 på forgængeren: første kvittering
+      # efterlod præcis det (flag=off, lys=on bri 26 rgb 255,0,0), selvom
+      # pre-tilstanden var `off`. Løkkens eget re-tjek er ikke nok: det læser
+      # flaget FØR bursten starter. To kald med et ophold imellem dækker begge
+      # vinduer — det første tager bursten der allerede kørte, det andet tager
+      # en burst der nåede at starte i millisekunderne efter flag-skiftet.
+      - action: script.turn_off
+        target:
+          entity_id: script.koekken_gestus_alarm_burst
+      - delay:
+          milliseconds: 600
+      - action: script.turn_off
+        target:
+          entity_id: script.koekken_gestus_alarm_burst
+
+      - repeat:
+          for_each: "{{ laante.split(',') }}"
+          sequence:
+            - variables:
+                d: "{{ repeat.item.split('|') }}"
+                rum: "{{ d[0] | default('', true) }}"
+                # `+ ['','','']` er ikke pynt: en tom eller `off`-streng giver
+                # en liste med ét element, og `d[1]` ville abortere HELE
+                # scriptet med en IndexError — midt i afleveringen, så
+                # resterende rum aldrig blev leveret tilbage.
+                lys: "{{ (d + ['', '', ''])[1] }}"
+                pre: "{{ (d + ['', '', 'off'])[2] | default('off', true) }}"
+                # KØKKEN-SESSIONEN VEJER TUNGERE END SNAPSHOTTET (user-spec
+                # 2026-09-19: "køkkensession skal veje tungere end
+                # nedtællingslyset ... og så tilbage på køkkensession lys").
+                #
+                # `pre` er aflæst FØR nedtællingen. Begyndte madlavningen imens,
+                # beskriver snapshottet en verden der ikke findes længere — og
+                # afleveringen VINDER over sessionen, fordi den er det sidste
+                # kald. Målt 15/9: sessionen startede 12:53:21, nedtællingen
+                # lånte kæden på `pre=off` 12:55:34, og dette script slukkede
+                # kæden 12:57:48 med `switch.koekken_spots` tændt. Kæden blev
+                # SLUKKET, så der kom ingen on-flanke enforceren kunne rette
+                # den på; først presence-tænd-vejen hentede den hjem 2 min
+                # senere. 3 af 35 nedtællinger på 14 døgn endte sådan.
+                #
+                # SESSIONS-FLAGET er med som selvstændigt led, ikke kun
+                # madlavnings-ankeret: køkkenets Apollo flapper, så
+                # `switch.koekken_spots` (og dermed ankeret) har huller på
+                # sekunder-til-minutter midt i en session — et sluk der ramte
+                # ned i et hul ville se helt lovligt ud.
+                session: >-
+                  {{ lys == 'light.koekken_lyskaede'
+                     and (is_state('input_boolean.koekken_session_active', 'on')
+                          or is_state('binary_sensor.koekken_madlavningslys', 'on')) }}
+                # Pr. LAMPE, ikke pr. rum (2026-10-03): bursten tændte ALLE en
+                # gruppes medlemmer, så hvert medlem skal tilbage til sin egen
+                # før-tilstand. Snapshottet rummer kun dem der lyste.
+                medlemmer: >-
+                  {{ (state_attr(lys, 'entity_id') | default([lys], true) | list)
+                     if lys.startswith('light.') else [] }}
+                snap: >-
+                  {{ state_attr('scene.koekken_gestus_alarm_foer', 'entity_id')
+                     | default([], true) | list }}
+                foer_taendt: "{{ medlemmer | select('in', snap) | list }}"
+                foer_slukket: "{{ medlemmer | reject('in', snap) | list }}"
+            - if:
+                - condition: template
+                  value_template: "{{ lys.startswith('light.') }}"
+              then:
+                - choose:
+                    # Madlavning i gang: aflevér til HUSETS MÅL i stedet for til
+                    # snapshottet. Maleren ejer cooking-farve og -styrke ét sted
+                    # (#2), så vi gengiver ikke reglen her — og vi slukker
+                    # aldrig en kæde sessionen har brug for.
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ session }}"
+                      sequence:
+                        - action: script.koekken_lyskaede_maal
+                          continue_on_error: true
+                          data:
+                            transition: 1
+                    # 2026-09-24: ANDRE rum end køkkenet har INGEN enforcer der
+                    # retter farven på en on-flanke (#3 — påstanden nedenfor
+                    # gjaldt kun kæden). Spisestue-loftet blev stående ravgult
+                    # på 5 % midt i aftensmaden. → gengiv snapshottet fra
+                    # alarm-starten (scene.koekken_gestus_alarm_foer).
+                    - conditions:
+                        - condition: template
+                          value_template: >-
+                            {{ pre == 'on' and lys != 'light.koekken_lyskaede'
+                               and foer_taendt | count > 0 }}
+                      sequence:
+                        - if:
+                            - condition: template
+                              value_template: "{{ foer_slukket | count > 0 }}"
+                          then:
+                            - action: light.turn_off
+                              continue_on_error: true
+                              target:
+                                entity_id: "{{ foer_slukket }}"
+                              data:
+                                transition: 0
+                        - action: scene.turn_on
+                          continue_on_error: true
+                          target:
+                            entity_id: scene.koekken_gestus_alarm_foer
+                          data:
+                            transition: 1
+                    # Lyset var TÆNDT før alarmen: giv det en ren off→on-flanke.
+                    # Køkken-kædens enforcer ejer farve og styrke og retter den
+                    # ~2 s efter. Vi gengiver IKKE dens regel her — ét anker,
+                    # ikke to (#2). Prisen er et glimt på ~100 ms, som samtidig
+                    # aflæses som "alarmen er slut".
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ pre == 'on' }}"
+                      sequence:
+                        - action: light.turn_off
+                          continue_on_error: true
+                          target:
+                            entity_id: "{{ lys }}"
+                          data:
+                            transition: 0
+                        - delay:
+                            milliseconds: 100
+                        - action: light.turn_on
+                          continue_on_error: true
+                          target:
+                            entity_id: "{{ lys }}"
+                          data:
+                            transition: 0
+                  default:
+                    # Var det slukket, skal det være slukket igen.
+                    - action: light.turn_off
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ lys }}"
+                      data:
+                        transition: 0
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {{ is_state('input_select.room_mode_' ~ rum, 'Manual') }}
+                  then:
+                    - action: input_select.select_option
+                      continue_on_error: true
+                      target:
+                        entity_id: "input_select.room_mode_{{ rum }}"
+                      data:
+                        option: "Auto"
+
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_gestus_alarm_rum
+        data:
+          value: "off"
+
+automation:
+  # ===========================================================================
+  # 1) TÆLLINGEN → TIMER. Grænsefladen er et event, ikke MQTT (se header).
+  # ===========================================================================
+  - id: koekken_gestus_start_timer
+    alias: "Køkken gestus: start timer på N minutter"
+    description: >-
+      N fingre = N minutter. Et nyt gyldigt tal MENS timeren kører overskriver
+      den bevidst — man skal kunne fortryde 3 og sige 8 uden at vente.
+    mode: single
+    max_exceeded: silent
+
+    triggers:
+      - trigger: event
+        event_type: koekken_gestus_start
+
+    conditions:
+      # Kameraet er fysisk afmonteret i AirBnB (juridisk krav, se
+      # packages/kamera_airbnb_vagt.yaml), men gaten står her alligevel: en
+      # gæst må ikke kunne starte husets lysalarm fra en dashboard-knap eller
+      # en Genvej. Home Vacation er familien hjemme = skal virke (🏡 #1).
+      - condition: state
+        entity_id: input_select.house_mode
+        state:
+          - "Normal"
+          - "Home Vacation"
+      # 1-60. Loftet var 10 indtil 2026-09-17, hvor lange timere kun var en
+      # telefon-timer uden nedtælling, uden lysalarm og uden mulighed for at
+      # annullere. User-spec: "der skal ikke være forskel på timere over 10 min
+      # og under 10 min". 60 er ikke et valg men stemmens ordforråd —
+      # speech-to-phrase kender `one…sixty`, så en længere timer kan ikke siges.
+      - condition: template
+        value_template: >-
+          {{ trigger.event.data.minutter | default(0) | int(0) >= 1
+             and trigger.event.data.minutter | default(0) | int(0) <= 60 }}
+
+    actions:
+      - variables:
+          minutter: "{{ trigger.event.data.minutter | default(0) | int(0) }}"
+
+      # Et fingertal MENS alarmen ringer betyder "jeg har set den — og her er
+      # den næste timer" (user-spec 2026-09-14). Uden dette ville den gamle
+      # alarm blinke husdækkende videre oven i den nye nedtælling, og de lånte
+      # rum ville aldrig blive afleveret tilbage, fordi stop-scriptet er den
+      # eneste vej der rydder rum-listen.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_text.koekken_gestus_alarm').startswith('aktiv') }}
+        then:
+          - action: script.koekken_gestus_alarm_stop
+
+      # 2026-09-17: her stod en dismiss af "en telefon-timer fra en FORRIGE
+      # nedtælling". Den er væk sammen med selve spejlingen — der findes ikke
+      # længere en telefon-timer at arve. Overskriv-problemet ("fortryd 3 og
+      # sig 8") løses nu af HA-timeren alene: `timer.start` sætter bare en ny
+      # varighed.
+      - action: timer.start
+        target:
+          entity_id: timer.koekken_gestus
+        data:
+          duration: "{{ '%02d:%02d:00' | format(minutter // 60, minutter % 60) }}"
+
+      # Kvittering: man skal kunne SE at huset forstod tallet rigtigt, før man
+      # går fra køkkenet. Miscount er featurens mest sandsynlige fejl, og en
+      # timer man ikke kan aflæse er værre end ingen timer.
+      # Apollo-ringen, ikke lyskæden: lyskæden har 29 med-ejere og en enforcer
+      # der ville rette farven 2 s efter.
+      # GRØN, fuld styrke (2026-10-11, var blå 60 %): user "der plejer ikke at
+      # komme blå blink". Ringen var fin (live-test: tændt 0,35 s efter kaldet),
+      # men regn-/dug-varslet blinker BLÅT i SAMME ring 06:30-08:00 og 19-22 —
+      # netop madlavnings-tiderne (07:39-timeren i dag lå midt i Regn). En
+      # kvittering i varslets farve kan ikke skelnes fra varslet. Ringens
+      # sprog nu: ravgul = hånd set, grøn = timer startet, blå/rød = varsel.
+      # apollo_rgb_varsel_blink springer køkken-ringen over mens dette kører.
+      - action: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: light.koekken_apollo_rgb_light
+        data:
+          brightness_pct: 100
+          rgb_color: [0, 255, 60]
+      - delay:
+          seconds: 2
+      - action: light.turn_off
+        continue_on_error: true
+        target:
+          entity_id: light.koekken_apollo_rgb_light
+
+      # 2026-09-17 (user-spec): HER sad spejlingen — telefonen fik en timer på
+      # hele varigheden i samme øjeblik nedtællingen startede. Den er FLYTTET
+      # til slutningen (RINGE-TIL-SIDST, se koekken_gestus_timer_slut).
+      #
+      # HVORFOR: en telefon-timer kan kun fjernes af et DISMISS_TIMER-intent,
+      # og der findes ingen kvittering på det. Målt 16-17/9: tre annullerede
+      # køkken-timere blev ved med at tælle ned på telefonen, og fire
+      # forskellige dismiss-varianter ændrede det ikke. Så længe telefonen fik
+      # timeren ved STARTEN, var hvert eneste "stop" afhængigt af netop den
+      # kanal vi ikke kan stole på — og annullering er featurens hyppigste
+      # handling.
+      #
+      # Løsningen (user-spec): HA ejer nedtællingen alene, og telefonen får
+      # først en timer på ÉT SEKUND når tiden er gået. Så eksisterer der
+      # aldrig en telefon-timer der KAN blive hængende: annullerer man
+      # undervejs, er der bogstavelig talt intet at annullere på telefonen.
+      # Prisen er at en HA-nedtælling ikke længere kan aflæses på telefonen,
+      # og at et HA-nedbrud midt i nedtællingen nu også tager lyden.
+
+  # ===========================================================================
+  # 1b) NEDTÆLLINGEN ER GÅET I GANG (user-spec 2026-09-12b: "giv køkkenlyskæden
+  # en let 10% pulseren når nedtællingsalarmer kører og et signal fra den om at
+  # nedtællingen er gået i gang. hold den derfor tændt under hele nedtællingen.
+  # skal ikke påvirke spots").
+  #
+  # Lyskæden LÅNES: tilstanden før nedtællingen skrives ned, og den afleveres
+  # tilbage præcis sådan — enten her (annullering) eller via alarmens stop-script
+  # (tiden løb ud). `switch.koekken_spots` røres ikke ét eneste sted i filen.
+  # ===========================================================================
+  - id: koekken_gestus_nedtael_start
+    alias: "Køkken gestus: nedtælling startet → hold kæden tændt og puls"
+    description: >-
+      Låner lyskæden i hele nedtællingen: holder den tændt, pulser let, og
+      afleverer den i den tilstand den blev lånt i.
+    mode: single
+    max_exceeded: silent
+
+    triggers:
+      - trigger: state
+        entity_id: timer.koekken_gestus
+        to: "active"
+
+    conditions:
+      # Et nyt fingertal MENS timeren kører genstarter den uden en
+      # active→active-flanke, så vi kan normalt ikke nå hertil midt i en
+      # nedtælling. En `timer.start` på en PAUSED timer kan — og så må `pre`
+      # ikke overskrives med det `on` vi selv har sat.
+      - condition: template
+        value_template: >-
+          {{ not states('input_text.koekken_gestus_nedtael').startswith('aktiv') }}
+      # Røgalarmen ejer lyset (user-spec "over alt andet"). Timeren løber
+      # uforstyrret videre; puls-løkken samler kæden op på sit /1-tick når
+      # branden er kvitteret. Pause, ikke annullering — som blink-løkken.
+      - condition: state
+        entity_id: input_boolean.roegalarm_blink_active
+        state: "off"
+
+    actions:
+      - variables:
+          pre: "{{ 'on' if is_state('light.koekken_lyskaede', 'on') else 'off' }}"
+          # Lux-dommen der afgør om en ANNULLERING skal tænde køkkenlyset,
+          # fanges HER — før vi rører kæden overhovedet — og bæres med i flaget.
+          #
+          # MÅLT 2026-09-17 kl. 11:53 (annulleret 45-min timer, tal fra
+          # sensor.koekken_dagslys_lx, tærskel 60): kanalen lå 124-127 lx under
+          # HELE nedtællingen med kæden tændt — en tændt kæde forurener den
+          # altså ikke nævneværdigt. Men i det sekund annulleringen SLUKKEDE
+          # kæden (11:53:34) faldt den til **47,6**, gaten flippede `on`, og
+          # køkkenlyset tændte i 125 lx dagslys. Fire sekunder senere: 124,8.
+          # Fradraget følger ikke pærens fade ned (CLAUDE.md: HA sætter state
+          # til `off` i samme sekund et transition-sluk sendes), så det trækker
+          # et lys fra der ikke længere er der.
+          #
+          # Konsekvensen er generel: kanalen er ubrugelig i sekunderne EFTER
+          # ethvert skift på kæden — og annulleringen består netop af et skift.
+          # Derfor er den eneste rene aflæsning den der ligger før timeren
+          # begyndte. Var kæden allerede tændt (`pre == 'on'`), slukker vi den
+          # ikke ved annulleringen, og feltet bruges aldrig.
+          lux_ok: >-
+            {{ 'lux' if is_state('binary_sensor.koekken_lyskaede_lux_ok', 'on')
+               else 'nolux' }}
+
+      # Var kæden slukket, tændes den FØRST og får 3 s ro. Enforceren svarer på
+      # off→on-flanken med sin kurvede fade ~2 s efter, og først DÉR ved vi hvad
+      # "kædens egen styrke" er. Måler vi base før, fryser vi et tal enforceren
+      # er i gang med at lave om, og pulsen ville slås med den resten af
+      # nedtællingen. Vi gengiver bevidst ikke enforcerens regel her (#2).
+      - if:
+          - condition: template
+            value_template: "{{ pre == 'off' }}"
+        then:
+          - action: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: light.koekken_lyskaede
+          - delay:
+              seconds: 3
+
+      - variables:
+          base: >-
+            {{ [ [ ((state_attr('light.koekken_lyskaede', 'brightness') | float(0)) / 2.54)
+                   | round(0) | int, 100 ] | min, 1 ] | max }}
+
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_gestus_nedtael
+        data:
+          value: "aktiv:{{ now().timestamp() | int }}:{{ pre }}:{{ base }}:{{ lux_ok }}"
+
+      # Første burst kommer EFTER flaget, så scriptet kan læse base dér (ét
+      # anker, ikke to) — og burst-løkken er armeret i samme øjeblik.
+      # Den er samtidig kvitteringen: bursten har N blink, så man kan TÆLLE
+      # efter at huset forstod tallet rigtigt, før man går fra køkkenet.
+      # Erstatter det separate `nedtael_signal` (to faste slag), som fortalte
+      # at noget var startet, men ikke hvad.
+      - action: script.koekken_gestus_burst_once
+
+  # ===========================================================================
+  # 1c) BURST-LØKKEN. En `repeat: while` der genstartes af en /1-time_pattern,
+  # så den overlever en HA-restart (fejlklasse #4 — en ren flanke-trigger er
+  # død efter boot, og timeren er `restore: true` netop for at en
+  # 10-minutters nedtælling ikke dør ved deploy).
+  # ===========================================================================
+  - id: koekken_gestus_puls_loop
+    alias: "Køkken gestus: burst lyskæden under nedtællingen"
+    description: >-
+      Viser hvert `koekken_gestus_burst_interval_s` sekund hvor mange minutter
+      der er tilbage, som antal hurtige blink på lyskæden.
+    mode: single
+    max_exceeded: silent
+
+    triggers:
+      - trigger: state
+        entity_id: input_text.koekken_gestus_nedtael
+        # INGEN not_from — samme B103-undtagelse som blink-løkken: her er
+        # flanken BEVISET, ikke artefaktet. En urørt input_text står på
+        # `unknown`, og `unavailable → aktiv:…` efter et reload er en ægte
+        # re-armering (værdien restorer, og timeren gør det samme).
+      - trigger: time_pattern
+        minutes: "/1"
+
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ states('input_text.koekken_gestus_nedtael').startswith('aktiv') }}
+      - condition: state
+        entity_id: timer.koekken_gestus
+        state: "active"
+      - condition: state
+        entity_id: input_boolean.roegalarm_blink_active
+        state: "off"
+
+    actions:
+      - repeat:
+          sequence:
+            # Ventetiden ligger FØRST: den allerførste burst er allerede
+            # afgivet af koekken_gestus_nedtael_start som kvittering på tallet.
+            # Uden det ville nedtællingen åbne med to bursts oven i hinanden.
+            - delay:
+                seconds: >-
+                  {{ states('input_number.koekken_gestus_burst_interval_s') | int(20) }}
+            # Re-tjek INDE i løkken, så en annullering slår igennem inden for
+            # ét interval i stedet for at vente på at `while` evalueres.
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ states('input_text.koekken_gestus_nedtael').startswith('aktiv') }}
+                - condition: state
+                  entity_id: timer.koekken_gestus
+                  state: "active"
+                - condition: state
+                  entity_id: input_boolean.roegalarm_blink_active
+                  state: "off"
+              then:
+                - action: script.koekken_gestus_burst_once
+          while:
+            - condition: template
+              value_template: >-
+                {{ states('input_text.koekken_gestus_nedtael').startswith('aktiv') }}
+            - condition: state
+              entity_id: timer.koekken_gestus
+              state: "active"
+            - condition: state
+              entity_id: input_boolean.roegalarm_blink_active
+              state: "off"
+
+  # ===========================================================================
+  # 1d) NEDTÆLLING ANNULLERET → aflevér lyskæden.
+  # Kun ANNULLERING. Løber timeren ud, ejer den røde alarm afleveringen
+  # (koekken_gestus_timer_slut rydder selv flaget) — derfor gaten på
+  # alarm-flaget, så de to veje aldrig afleverer den samme kæde to gange.
+  # ===========================================================================
+  - id: koekken_gestus_nedtael_slut
+    alias: "Køkken gestus: nedtælling annulleret → aflevér lyskæden"
+    mode: single
+    max_exceeded: silent
+
+    triggers:
+      - trigger: event
+        event_type: timer.cancelled
+        event_data:
+          entity_id: timer.koekken_gestus
+        id: cancelled
+      # Backstop: flaget må ikke kunne hænge og holde kæden tændt for evigt
+      # (🏡 #2 — enhver holder skal have en automatisk udgang). Fanger fx en
+      # timer der forsvandt under et reload uden at sende sit event.
+      - trigger: time_pattern
+        minutes: "/1"
+        id: backstop
+
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ states('input_text.koekken_gestus_nedtael').startswith('aktiv') }}
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: timer.koekken_gestus
+            state: "active"
+      - condition: template
+        value_template: >-
+          {{ not states('input_text.koekken_gestus_alarm').startswith('aktiv') }}
+
+    actions:
+      - variables:
+          pre: "{{ states('input_text.koekken_gestus_nedtael').split(':')[2] | default('off', true) }}"
+          base: "{{ states('input_text.koekken_gestus_nedtael').split(':')[3] | default(40) | int(40) }}"
+          # Kvitteringen (grønt blink + auto-lys) må KUN følge en rigtig
+          # annullering. Backstoppen er en fejemand: den rydder op efter en
+          # timer der forsvandt under et reload, og dér er der intet menneske
+          # at kvittere over for — et grønt blink ville bare være en spøgelses-
+          # besked. `trigger is defined` fordi et manuelt "kør" fra UI'et ikke
+          # har nogen trigger, og en bar `trigger.id` dér aborterer HELE
+          # scriptet med UndefinedError.
+          kvitteret: >-
+            {{ trigger is defined and (trigger.id | default('', true)) == 'cancelled' }}
+          # Lux-dommen kommer fra FLAGET, sat da timeren startede og før vi
+          # rørte kæden — ALDRIG fra en live-aflæsning her. Et sluk på kæden
+          # sender sensor.koekken_dagslys_lx i bund i nogle sekunder (målt 17/9:
+          # 125,6 → 47,6 lx i sekundet efter slukket, tilbage på 124,8 fire
+          # sekunder senere), og annulleringen ER et sluk. Gaten stod derfor
+          # åben hver eneste gang. Begrundelsen i fuld længde står i
+          # `koekken_gestus_nedtael_start`, hvor målingen hører hjemme.
+          # Femte felt mangler på flag sat FØR 2026-09-17 — de falder til
+          # 'nolux' = lad være at tænde, den billige af de to fejl.
+          lux_foer: >-
+            {{ (states('input_text.koekken_gestus_nedtael').split(':') + ['nolux'])[4]
+               == 'lux' }}
+
+      # Her lå et DISMISS_TIMER til telefonen. Det er væk med vilje: siden
+      # ringe-til-sidst (user-spec 2026-09-17) findes der INGEN telefon-timer
+      # under nedtællingen — den sættes først når tiden er gået, på ét sekund.
+      # En annullering har altså ingenting at annullere derovre, og et intent
+      # der ikke kan ramme andet end brugerens egne timere er ikke en
+      # oprydning, det er en risiko. Stoppet lever kun ét sted nu:
+      # `koekken_gestus_alarm_stop`, hvor telefonen FAKTISK ringer (siden
+      # 2026-10-04 en HA-ejet TTS-løkke, B149).
+
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_gestus_nedtael
+        data:
+          value: "off"
+
+      # Dræb en burst der er I LUFTEN — nøjagtig samme fælde som i
+      # koekken_gestus_alarm_stop: bursten kan køre i op mod 5 sekunder (10
+      # blink), så en burst der startede lige før flaget blev ryddet, ville
+      # skrive base tilbage EFTER afleveringen og efterlade en slukket kæde
+      # tændt.
+      - action: script.turn_off
+        target:
+          entity_id:
+            # Selve blinket lever i signal-kanalen siden 2026-09-18e — dræber
+            # man kun wrapperen, blinker kæden videre efter afleveringen og
+            # efterlader en slukket kæde tændt.
+            - script.koekken_gestus_burst_once
+            - script.koekken_lyskaede_signal
+
+      # Tilbage til Auto (user-spec 2026-09-14). Kun fra Manual: kom
+      # annulleringen fra et Lovelace-kort, arvede burstens `light.turn_on`
+      # brugerens user_id og stemplede køkkenet som manuelt betjent (#3/#11).
+      # Et bevidst Off røres ikke.
+      - if:
+          - condition: state
+            entity_id: input_select.room_mode_koekken
+            state: "Manual"
+        then:
+          - action: input_select.select_option
+            continue_on_error: true
+            target:
+              entity_id: input_select.room_mode_koekken
+            data:
+              option: "Auto"
+
+      - choose:
+          # KØKKEN-SESSIONEN VEJER TUNGERE END SNAPSHOTTET (user-spec
+          # 2026-09-19). Samme regel som i `script.koekken_gestus_alarm_stop`,
+          # hvor begrundelsen og målingen står — her rammer den BEGGE frosne
+          # felter: `pre='off'` ville slukke en kæde sessionen lige har tændt,
+          # og `base` er hygge-niveauet fra før madlavningen, altså et sluk og
+          # en dæmpning af det samme lys man står og arbejder i.
+          # Afleveringen går til husets mål, som ER cooking-lyset.
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ is_state('input_boolean.koekken_session_active', 'on')
+                     or is_state('binary_sensor.koekken_madlavningslys', 'on') }}
+            sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ kvitteret }}"
+                  - condition: state
+                    entity_id: light.koekken_lyskaede
+                    state: "on"
+                then:
+                  # Grøn kvittering UDEN `styrke_pct`: kanalen afleverer selv til
+                  # husets mål bagefter, og målet er cooking-lyset. Sender vi
+                  # base med, dæmper kvitteringen sessionen — præcis den fejl vi
+                  # er her for at rette.
+                  - action: script.koekken_lyskaede_signal
+                    continue_on_error: true
+                    data:
+                      moenster: groen
+                else:
+                  # Backstop-vejen (og en slukket kæde, hvor grøn-mønsteret
+                  # alligevel ikke kører): mal direkte til målet.
+                  - action: script.koekken_lyskaede_maal
+                    continue_on_error: true
+                    data:
+                      transition: 1
+
+          # Kæden var tændt før: ret pulsen op til det niveau vi lånte den på.
+          - conditions:
+              - condition: template
+                value_template: "{{ pre == 'on' }}"
+            sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ kvitteret }}"
+                then:
+                  # GRØN KVITTERING (user-spec 2026-09-17). Nedtællingens egne
+                  # blink er rene niveau-kald netop for ikke at kunne
+                  # forveksles med den røde alarm; kvitteringen er den tredje
+                  # besked og skal derfor være sin egen farve. Grøn =
+                  # "stoppet", rød = "tiden er gået".
+                  #
+                  # 2026-09-18e: blinket OG afleveringen ligger nu i køkkenets
+                  # fælles signal-kanal. To ting blev rigtige på én gang:
+                  #
+                  # 1) Blinket kan ikke længere køre samtidig med et burst
+                  #    eller en mikrofon-kvittering — kanalen er `queued`.
+                  # 2) Afleveringen er ét kald til script.koekken_lyskaede_maal
+                  #    i stedet for en KOPI af husets farveregel. Kopien stod
+                  #    her med en ⚠️-kommentar om at den skulle ændres i takt
+                  #    med enforcerens tune-gren — præcis den aftale der ikke
+                  #    holder (#2/#12). Den holdt heller ikke: målt 17/9 17:20
+                  #    afleverede annulleringen kæden i hygge-orange (hs
+                  #    27,84/98,0 @ bri 254) MIDT i madlavningen, hvor målet
+                  #    var 3050 K, og fordi kæden blev stående `on` kom der
+                  #    ingen flanke der kunne rette den.
+                  #
+                  # `styrke_pct: base` fordi vi afleverer FARVEN til huset,
+                  # men beholder det NIVEAU kæden blev lånt på — brugeren kan
+                  # selv have dæmpet den undervejs.
+                  - action: script.koekken_lyskaede_signal
+                    continue_on_error: true
+                    data:
+                      moenster: groen
+                      styrke_pct: "{{ [base, 1] | max }}"
+                else:
+                  # Backstop-vejen har aldrig rørt farven, så her er et rent
+                  # niveau-kald både billigere og mere korrekt: kæden beholder
+                  # den farve natturen eller dance mode gav den.
+                  - action: light.turn_on
+                    continue_on_error: true
+                    target:
+                      entity_id: light.koekken_lyskaede
+                    data:
+                      brightness_pct: "{{ [base, 1] | max }}"
+                      transition: 1
+        default:
+          # Samme grønne kvittering som ovenfor — man skal se at huset
+          # forstod stoppet, også når kæden var slukket før nedtællingen.
+          # `aflever: false`: den skal SLUKKES om et øjeblik, og en
+          # aflevering til husets farve lige inden ville være et synligt
+          # spring på vej mod sort.
+          - if:
+              - condition: template
+                value_template: "{{ kvitteret }}"
+            then:
+              - action: script.koekken_lyskaede_signal
+                continue_on_error: true
+                data:
+                  moenster: groen
+                  aflever: false
+
+          # Var den slukket før nedtællingen, skal den være slukket igen.
+          - action: light.turn_off
+            continue_on_error: true
+            target:
+              entity_id: light.koekken_lyskaede
+            data:
+              transition: 1
+
+          # AUTO-LYS (user-spec 2026-09-17): "og så auto lys hvis lux kræver
+          # det". Man stopper en timer ved at stå ved bordpladen — står man i
+          # mørke bagefter, er den korrekte afslutning lys, ikke sort.
+          #
+          # Vi RE-ARMER husets egen tænd-vej i stedet for at kopiere dens
+          # `light.turn_on` (#2/#4): så arver vi lux-gaten
+          # (binary_sensor.koekken_lyskaede_lux_ok), bevægelses-kravet,
+          # godnat-/sleepover-gatesne og manuel-sluk-gracen gratis, og der
+          # findes stadig kun ét sted hvor køkkenlyset tændes af presence.
+          # `skip_condition: false` er hele pointen — uden den springer
+          # automation.trigger netop de gates over.
+          # Sikkert fordi automationen ikke læser `trigger.` nogen steder
+          # (verificeret 2026-09-17); gjorde den det, ville et fremmed kald
+          # abortere hele dens script med UndefinedError.
+          - if:
+              - condition: template
+                value_template: "{{ kvitteret and lux_foer }}"
+            then:
+              # Tre sekunder, ikke nul: kæden er slukket med transition 1, og
+              # dagslys-kanalen skal nå at komme tilbage til sin rigtige værdi
+              # efter blinket (målt: den var tilbage på 86 lx ~2 s efter). Uden
+              # opholdet ville tænd-vejens EGEN lux-condition læse den samme
+              # forurenede aflæsning som `lux_foer` er sat for at undgå — og
+              # begge to skal være enige, før der tændes.
+              - delay:
+                  seconds: 3
+              - action: automation.trigger
+                continue_on_error: true
+                target:
+                  entity_id: automation.lysnet_kokken_taend
+                data:
+                  skip_condition: false
+
+  # ===========================================================================
+  # 2) TIMEREN LØB UD → start alarmen.
+  # ===========================================================================
+  - id: koekken_gestus_timer_slut
+    alias: "Køkken gestus: timer slut → alarm i rum med bevægelse"
+    description: >-
+      Blinker ravgult og hvidt i alle rum der har set bevægelse inden for 30 s,
+      i bursts af det antal minutter der blev talt ned, i 15 sekunder.
+      `timer.finished` fyrer ikke ved `timer.cancel` — en annulleret timer må
+      netop ikke give alarm.
+    mode: single
+    max_exceeded: silent
+
+    triggers:
+      - trigger: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.koekken_gestus
+
+    actions:
+      # -----------------------------------------------------------------
+      # RINGE-TIL-SIDST (user-spec 2026-09-17). Telefonens alarmlyd starter
+      # HER, ikke da nedtællingen startede. Køkkenet har ingen anden lydkanal
+      # (kameraets højttaler kan ikke nås), så lyden skal komme fra telefonen.
+      # Siden 2026-10-04 (B149) er det en HA-ejet TTS-løkke på alarm-kanalen,
+      # ikke en Android-timer: den kunne ikke fjernes igen (DISMISS_TIMER virker
+      # ikke på OnePlus' Ur), så den ringede til nogen swipede den.
+      #
+      # FØRSTE handling i automationen, fordi FCM-leveringen er den
+      # langsomste del af kæden: lyset når at blinke mens beskeden er
+      # undervejs.
+      # -----------------------------------------------------------------
+      - action: script.koekken_gestus_telefon_timer
+        continue_on_error: true
+        data:
+          sekunder: 1
+
+      # `pre` kommer fra NEDTÆLLINGEN hvis der var en. Vi holder kæden tændt
+      # under hele nedtællingen (user-spec 2026-09-12b), så en live-aflæsning
+      # her ville ALTID svare `on`, og alarmen ville aflevere en kæde tilbage
+      # tændt som var slukket før timeren blev sat. Fallback til live-aflæsning
+      # dækker en timer der blev sat FØR denne feature blev deployet.
+      - variables:
+          pre_koekken: >-
+            {{ states('input_text.koekken_gestus_nedtael').split(':')[2] | default('', true)
+               or ('on' if is_state('light.koekken_lyskaede', 'on') else 'off') }}
+          # Minutterne der BLEV talt ned (datid — user-spec). Timerens
+          # `duration` står på den sidst satte varighed også efter den er løbet
+          # ud. **TIME-FELTET SKAL MED:** siden loftet blev hævet til 60
+          # (2026-09-17) er en time-timer `"1:00:00"`, og en aflæsning af minut-
+          # feltet alene ville melde 0 → klampet til 1 → "1 minut" i beskeden og
+          # ét enkelt alarm-blink for husets længste timer.
+          minutter: >-
+            {% set d = (state_attr('timer.koekken_gestus', 'duration')
+                        | default('0:01:00', true)).split(':') %}
+            {{ [ [ (d[0] | int(0)) * 60 + (d[1] | int(1)), 1 ] | max, 60 ] | min }}
+
+      # Nedtællings-flaget ryddes FØRST — det stopper burst-løkken, så den ikke
+      # skriver et base-niveau ind mellem alarmens blink. `script.turn_off`
+      # tager den burst der allerede er i luften; uden det ville dens
+      # afsluttende "tilbage til base"-kald lande oven på den første alarm-burst.
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_gestus_nedtael
+        data:
+          value: "off"
+      - action: script.turn_off
+        target:
+          entity_id:
+            # Selve blinket lever i signal-kanalen siden 2026-09-18e — dræber
+            # man kun wrapperen, blinker kæden videre efter afleveringen og
+            # efterlader en slukket kæde tændt.
+            - script.koekken_gestus_burst_once
+            - script.koekken_lyskaede_signal
+
+      # -----------------------------------------------------------------
+      # HVILKE RUM. User-spec 2026-09-14: "alle rum med bevægelse (recent,
+      # 30 sek)". Kortet rum→lampe bygges HER og kun her; resten af kæden
+      # bærer entity_id'et med sig i `koekken_gestus_alarm_rum` (#2/#16).
+      #
+      # `moving_target`, ikke `occupancy_filtered`: occupancy holder i
+      # minutter efter at nogen er gået, og en alarm der blinker i et tomt
+      # soveværelse er præcis den slags larm der får featuren slået fra.
+      # Kanalerne er recorder-ekskluderede, men live-læsning er upåvirket.
+      #
+      # `off` PLUS frisk `last_changed` er dét der gør 30-sekunders-vinduet
+      # muligt: vi kan ikke spørge historikken om en kanal der ikke gemmes,
+      # men et `off` der er yngre end 30 s ER beviset for at den var `on`
+      # inden for vinduet. (`last_changed` nulstilles ved HA-restart, så et
+      # boot inden for 30 s kan tage et rum for meget med — prisen er ét
+      # ekstra rum der blinker, aldrig et rum der tier.)
+      #
+      # TO SPÆRRINGER OVEN I:
+      #  • room_mode Manual/Off = mennesket har taget rummet, eller det skal
+      #    være mørkt. Det er samtidig dét der gør Manual→Auto-oprydningen i
+      #    stop-scriptet beviseligt sikker: et lånt rum kan ikke HAVE stået i
+      #    Manual, så står det der bagefter, er det vores eget kald.
+      #  • putning_sove_active = børn puttes/sover i voksen-værelset. Bright
+      #    hvidt blink ind over et barn der lige er faldet i søvn er husets
+      #    dyreste fejl, og en pasta-timer er ikke grund nok.
+      # Køkkenet er ALTID med: det er timerens hjem, og lyskæden er allerede
+      # lånt af nedtællingen.
+      #
+      # STUE = `light.stue_room`, ALDRIG `light.stue_all` (2026-10-03, user:
+      # "timer lysene hænger efter endt alarm"). stue_all rummer OGSÅ
+      # køkken-lyskæden og spisestue-loftet. Kæden holdes tændt hele
+      # nedtællingen, så stue_all stod ALTID som `on` → stuens `pre` var altid
+      # `on`, bursten tændte spisestue-loftet, og afleveringen gengav et
+      # gruppe-snapshot der tændte kæden igen 0,3 s efter at køkken-afleveringen
+      # havde slukket den. Målt 03/10: kæden hang 2 min, spisestue-loftet 2,5 min,
+      # til rummenes egne sluk-veje tog dem. Samme rum-liste 20/9 og 1/10.
+      # -----------------------------------------------------------------
+      - variables:
+          rum_liste: >-
+            {% set ns = namespace(l=[]) %}
+            {% set kort = [ ('koekken', 'light.koekken_lyskaede'),
+                            ('stue', 'light.stue_room'),
+                            ('spisestue', 'light.spisestue_loft'),
+                            ('sovevaerelse', 'light.sovevaerelse_apollo_rgb_light'),
+                            ('boernevaerelse', 'light.boernevaerelse_loft') ] %}
+            {% set nu = now().timestamp() %}
+            {% for rum, lys in kort %}
+              {% set mt = 'binary_sensor.' ~ rum ~ '_apollo_radar_moving_target' %}
+              {% set st = states(mt) %}
+              {% set lc = as_timestamp(states[mt].last_changed, nu)
+                          if st in ['on', 'off'] else 0 %}
+              {% set frisk = st == 'on' or (st == 'off' and nu - lc <= 30) %}
+              {% set rm = states('input_select.room_mode_' ~ rum) %}
+              {# 2026-10-15: også børne-godnat (børneværelset) og fælles
+                 godnat (begge). Før gjaldt kun putning i soveværelset, så
+                 børneværelset blev kun skånet hvis radaren dér var stille. #}
+              {% set sover = (rum in ['sovevaerelse', 'boernevaerelse']
+                              and (is_state('input_boolean.putning_sove_active', 'on')
+                                   or is_state('binary_sensor.godnat_common_active', 'on')))
+                             or (rum == 'boernevaerelse'
+                                 and is_state('input_boolean.godnat_boern_active', 'on')) %}
+              {% if rum == 'koekken'
+                    or (frisk and rm not in ['Manual', 'Off'] and not sover) %}
+                {% set ns.l = ns.l + [ rum ~ '|' ~ lys ~ '|'
+                                       ~ ('on' if is_state(lys, 'on') else 'off') ] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.l | join(',') }}
+
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_gestus_alarm_rum
+        data:
+          value: "{{ rum_liste }}"
+
+      # Køkkenets `pre` skal komme fra nedtællingen, ikke fra en live-aflæsning
+      # (se ovenfor). Rum-listen aflæste det live, så det rettes her.
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_gestus_alarm_rum
+        data:
+          value: >-
+            {{ rum_liste | replace('koekken|light.koekken_lyskaede|on',
+                                   'koekken|light.koekken_lyskaede|' ~ pre_koekken)
+                         | replace('koekken|light.koekken_lyskaede|off',
+                                   'koekken|light.koekken_lyskaede|' ~ pre_koekken) }}
+
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_gestus_alarm
+        data:
+          value: "aktiv:{{ now().timestamp() | int }}:{{ minutter }}:{{ pre_koekken }}"
+
+      # 2026-09-24 (user: "spisestuen er alt for mørk nu! vi skal spise!"):
+      # snapshot af de TÆNDTE lys i de lånte rum (undtagen køkken-kæden, som
+      # har sin egen enforcer), så afleveringen kan gengive farve + styrke.
+      # Før lå spisestue-loftet tilbage på alarmens sidste frame: ravgul 5 %.
+      # Alarmen varer ~15 s, så snapshottet kan ikke blive forældet (#27).
+      #
+      # En GRUPPE (stue_room) gemmes som de MEDLEMMER der lyser, aldrig som
+      # gruppen: et gruppe-snapshot gengiver gruppens samlede tilstand på ALLE
+      # medlemmer, så én tændt lampe ville tænde hele rummet ved afleveringen.
+      # Stop-scriptet slukker de medlemmer der ikke står i snapshottet.
+      - variables:
+          foer_lys: >-
+            {% set ns = namespace(l=[]) %}
+            {% for r in rum_liste.split(',') if r.count('|') == 2 %}
+              {% set p = r.split('|') %}
+              {% if p[1] != 'light.koekken_lyskaede' and p[2] == 'on' %}
+                {% set medlemmer = state_attr(p[1], 'entity_id')
+                                   | default([p[1]], true) | list %}
+                {% set ns.l = ns.l + (medlemmer | select('is_state', 'on') | list) %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.l }}
+      - if:
+          - condition: template
+            value_template: "{{ foer_lys | count > 0 }}"
+        then:
+          - action: scene.create
+            continue_on_error: true
+            data:
+              scene_id: koekken_gestus_alarm_foer
+              snapshot_entities: "{{ foer_lys }}"
+        # Intet tændt = intet snapshot. Et snapshot fra en TIDLIGERE alarm må
+        # ikke overleve til denne afleveringen, ellers gengiver den lys der
+        # lyste for timer siden (#27).
+        else:
+          - action: scene.delete
+            continue_on_error: true
+            target:
+              entity_id: scene.koekken_gestus_alarm_foer
+
+      # -----------------------------------------------------------------
+      # SELVE ALARMEN. Bursts af `minutter` hurtige blink, 2 sekunders pause
+      # imellem, i `koekken_gestus_alarm_sek` sekunder — slideren er
+      # autoriteten, ikke tallet i denne kommentar.
+      # Farven skifter pr. burst mellem hvid og ravgul.
+      #
+      # ⚠️ BEVIDST BUNDET, ikke en løkke der kører til nogen kvitterer. Det
+      # var forgængerens model, og den krævede en 15-MINUTTERS cap plus en
+      # /1-backstop plus en push om at ingen havde kvitteret. En alarm der
+      # slutter af sig selv efter få sekunder har ingen af de tre behov —
+      # udgangen ER handlingen (🏡 #2). Knytnæven kan stadig afbryde den.
+      # -----------------------------------------------------------------
+      - variables:
+          start: "{{ now().timestamp() | int }}"
+          varighed: "{{ states('input_number.koekken_gestus_alarm_sek') | int(15) }}"
+          saa_nogen: >-
+            {{ rum_liste.split(',') | length > 1
+               or is_state('binary_sensor.koekken_apollo_radar_moving_target', 'on') }}
+
+      - repeat:
+          sequence:
+            - action: script.koekken_gestus_alarm_burst
+              data:
+                farve: "{{ 'hvid' if repeat.index % 2 == 1 else 'ravgul' }}"
+            - delay:
+                seconds: 2
+          while:
+            - condition: template
+              value_template: >-
+                {{ states('input_text.koekken_gestus_alarm').startswith('aktiv')
+                   and (now().timestamp() | int) - (start | int(0))
+                       < (varighed | int(15)) }}
+            # Brandvarslet vinder (user-spec "over alt andet undtagen
+            # brandvarsel"). Her ANNULLERES vores alarm, den sættes ikke på
+            # pause som forgængeren: en 15-sekunders timer-alarm der genoptages
+            # efter en brand er ikke en påmindelse, den er støj oven i en
+            # situation hvor huset skal være entydigt.
+            - condition: state
+              entity_id: input_boolean.roegalarm_blink_active
+              state: "off"
+
+      # Aflevér lyset. No-op hvis en knytnæve allerede har gjort det.
+      # Stopper OGSÅ telefonens lyd (B149, 2026-10-04): første live-timer ringede
+      # videre i 2½ min efter lysalarmen, fordi hverken knytnæve eller "stop
+      # timer" blev opfanget (0 kvitteringer i loggen) — user: "den stopper ikke".
+      # Telefonens lyd varer derfor præcis som lysalarmen (slideren
+      # koekken_gestus_alarm_sek); kvittering stopper den stadig tidligere.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_text.koekken_gestus_alarm').startswith('aktiv') }}
+        then:
+          - action: script.koekken_gestus_alarm_stop
+
+          # Så ingen alarmen? Så er maden færdig uden at nogen ved det.
+          # Pushen er den ENESTE modtager der er tilbage (🔔 et varsel kræver
+          # en modtager) — og den sendes netop KUN når blinket beviseligt ikke
+          # havde nogen. AirBnB-tjek er unødvendigt: hele featuren er gatet til
+          # Normal/Home Vacation, så vi kan ikke nå hertil med en gæst i huset.
+          - if:
+              - condition: template
+                value_template: "{{ not saa_nogen }}"
+              - condition: state
+                entity_id: input_boolean.notifikationer_master_enabled
+                state: "on"
+            then:
+              - action: notify.mobile_app_phone_a
+                data:
+                  title: "⏲️ Køkken-timeren er løbet ud"
+                  message: >-
+                    {{ minutter }} minutter er gået. Der var ingen bevægelse i
+                    huset, så alarmen blinkede kun på køkken-lyskæden.
+                  data:
+                    tag: koekken_gestus
+                    channel: Koekken
+
+  # ===========================================================================
+  # 4) KVITTERING — "tommel op" (eller dashboard/anden kilde).
+  # ===========================================================================
+  - id: koekken_gestus_kvitter
+    alias: "Køkken gestus: kvittér alarmen"
+    description: >-
+      Annullerer OGSÅ en timer der stadig kører: viser man en knyttet hånd mens
+      man venter, betyder det "glem det", ikke "ignorér alarmen der ikke er
+      kommet endnu".
+    mode: single
+    max_exceeded: silent
+
+    triggers:
+      - trigger: event
+        event_type: koekken_gestus_kvitter
+
+    actions:
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_text.koekken_gestus_alarm').startswith('aktiv') }}
+        then:
+          - action: script.koekken_gestus_alarm_stop
+
+      - if:
+          - condition: state
+            entity_id: timer.koekken_gestus
+            state: "active"
+        then:
+          - action: timer.cancel
+            target:
+              entity_id: timer.koekken_gestus
+
+  # ===========================================================================
+  # 5) AUTOMATISK UDGANG. Et blink uden en modtager skal stoppe af sig selv
+  # (🏡 #2: enhver suppressor/enforcer SKAL have en udgang). Røgalarmen bruger
+  # samme konstruktion med 30 min.
+  # ===========================================================================
+  - id: koekken_gestus_alarm_cap
+    alias: "Køkken gestus: ryd et hængende alarm-flag"
+    description: >-
+      Alarmen afslutter og afleverer selv efter ~15 sekunder, så dette er ikke
+      længere en cap — det er en backstop mod ÉN ting: at HA genstarter midt i
+      alarmen. Så dør `repeat`-løkken der ejede afleveringen, og flaget
+      restorer som `aktiv:…` uden nogen til at rydde det. Uden denne ville de
+      lånte rum stå tændt i alarmfarve indtil nogen opdagede det.
+    mode: single
+    max_exceeded: silent
+
+    triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+
+    conditions:
+      # 2 minutter: alarmen varer sekunder, så alt over et par minutter ER
+      # per definition et forladt flag. Lavere ville kunne ramme en alarm der
+      # holder pause mens røgalarmen ejer lyset.
+      - condition: template
+        value_template: >-
+          {% set s = states('input_text.koekken_gestus_alarm') %}
+          {{ s.startswith('aktiv')
+             and (now().timestamp() | int) - (s.split(':')[1] | int(0)) > 120 }}
+
+    actions:
+      - action: script.koekken_gestus_alarm_stop
+
+  # ===========================================================================
+  # 6) AFBRYD ved godnat / AirBnB. En alarm der blinker videre efter sengetid
+  # er en fejl, ikke en påmindelse — og 🏡 #3 kræver at nye flag ryddes ved
+  # AirBnB-entry, så en gæst ikke arver familiens tilstand.
+  # ===========================================================================
+  - id: koekken_gestus_afbryd
+    alias: "Køkken gestus: afbryd ved godnat eller AirBnB"
+    mode: single
+    max_exceeded: silent
+
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.godnat_common_active
+        from: "off"
+        to: "on"
+      - trigger: state
+        entity_id: input_select.house_mode
+        to: "AirBnB"
+        not_from:
+          - "unknown"
+          - "unavailable"
+
+    actions:
+      # Nedtællings-flaget ryddes FØR timeren annulleres. Ellers ville
+      # koekken_gestus_nedtael_slut svare på `timer.cancelled` med at TÆNDE
+      # kæden tilbage til sit lånte niveau — midt i godnat. Ryddes flaget
+      # først, findes der ingen aflevering, og godnats egen sluk-vej ejer kæden
+      # uimodsagt. Lys der lyser mens de sover er husets dyreste fejl.
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_gestus_nedtael
+        data:
+          value: "off"
+      - action: script.turn_off
+        target:
+          entity_id:
+            # Selve blinket lever i signal-kanalen siden 2026-09-18e — dræber
+            # man kun wrapperen, blinker kæden videre efter afleveringen og
+            # efterlader en slukket kæde tændt.
+            - script.koekken_gestus_burst_once
+            - script.koekken_lyskaede_signal
+
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_text.koekken_gestus_alarm').startswith('aktiv') }}
+        then:
+          - action: script.koekken_gestus_alarm_stop
+
+      - if:
+          - condition: state
+            entity_id: timer.koekken_gestus
+            state: "active"
+        then:
+          - action: timer.cancel
+            target:
+              entity_id: timer.koekken_gestus
+
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.koekken_gestus_pending
+        data:
+          value: ""

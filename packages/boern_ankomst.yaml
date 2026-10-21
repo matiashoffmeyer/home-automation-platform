@@ -1,0 +1,248 @@
+# =============================================================================
+# Børn ankommet — aktivitets-detektion (2026-07-30, user-spec)
+# =============================================================================
+# User 2026-07-30 19:54: "børne detection burde være gået af. der har været
+# tegn, især den seneste halve time, på at der var børn pga meget børneværelses-
+# aktivitet. det burde ha triggered børn hjemme i ha."
+#
+# HULLET: 06-18's "kræv stærkt signal"-omskrivning gjorde kids_home afhængig af
+# tre signaler der alle forudsætter at børnene ALLEREDE har været her længe:
+# latch'en (sat 06:30 ud fra sidste NATS søvn), overnight ≥ 4t og today ≥ 4t.
+# På en ANKOMST-dag er alle tre falske i timevis. Den eneste ankomst-vej var
+# putning-trigger D (Styrbar OP + lægge-presence efter 18:45) — altså først når
+# børnene skal i seng. Fra ankomst til sengetid var kids_home = off, så natlys,
+# putte-vinduet og people_estimate-bonussen manglede hele eftermiddagen/aftenen.
+#
+# HVORFOR IKKE BARE RULLE 06-18 TILBAGE: de gamle signaler var KUMULATIVE
+# (S1 15 min, S2 30-60 min pr. 4t) og fyrede falsk på voksen-aktivitet der går
+# ind og ud af rummet (oprydning, vasketøj) → natlys tændte 4 dage i træk uden
+# børn. Kalibrering mod recorderens 14 dage (07-16 → 07-30) viser at det er
+# SAMMENHÆNGENDE ophold — ikke summen — der skiller:
+#
+#   dag     længste sammenhængende ophold      facit
+#   07-17    0,3 min                           ingen børn
+#   07-18    0,8 min                           ingen børn
+#   07-19    0,4 min                           ingen børn
+#   07-22    7,0 min                           ingen børn (people_estimate 1)
+#   07-23   35,5 min                           BØRN (putning 22:45)
+#   07-24  682,1 min                           BØRN (overnattede)
+#   07-25    4,6 min                           børn rejste om morgenen
+#   07-26   15,2 min                           5 personer (user-bekræftet)
+#   07-27    2,0 min                           ingen børn
+#   07-28    2,7 min                           ingen børn
+#   07-29    0,7 min                           ingen børn
+#   07-30   20,7 min (19:28→19:49)             BØRN (denne sprint)
+#
+# Voksen-dagenes maksimum er 7,0 min; alle børne-dage ligger ≥ 15 min. Tærsklen
+# 12 min rammer midt i kløften (1,7× over værste voksen-dag). Til sammenligning
+# separerer den KUMULATIVE måling IKKE: i et rullende 30-min vindue nåede
+# 07-22 19,0 min og 07-26 20,5 min mod i dag 21,0 — præcis derfor fejlede den
+# gamle model. En voksen der rydder op går ud og ind; et barn BLIVER i rummet.
+#
+# Flaget er MED VILJE ikke boern_sov_her_i_nat: den latch styrer morgen-
+# vækningen kl. 06:05 og ryddes først 06:30, så et fejl-sat latch ville køre
+# en vækningsrampe på et tomt børneværelse. Dette flag selv-rydder i stedet
+# efter `boern_ankomst_ro_minutter` uden aktivitet — besøgsbørn der tager hjem
+# kl. 20 efterlader intet. Sover barnet her, overtager de normale veje
+# (putning sætter latch'en, og 06:30-jobbet bekræfter ud fra nattens ophold).
+#
+# RUNDE 2 (samme dag, user: "2. ja, 3. ja"):
+#  (2) Et BEKRÆFTET "✅ Ja" sætter nu OGSÅ latch'en — men kun efter putte-
+#      vinduets start. Automatikken må stadig ikke sætte den selv; det er
+#      brugerens svar der bærer den, præcis som et putte-tryk gør det i
+#      godnat_night.yaml ("man putter kun et barn der ER hjemme"). Et "Ja"
+#      midt på dagen siger intet om natten og sætter derfor ingen latch —
+#      dér er det selv-ryddende flag stadig det rigtige. Sikkerhedsnettet er
+#      uændret: wakeup_kids kræver SELV `boern_occupancy_overnight >= 2,0 t`,
+#      så en forkert latch kan ikke køre en rampe i et tomt rum, og
+#      06:30-jobbet rydder den igen efter en tom nat.
+#  (3) Efter et "Ja" i dag er detektoren TAVS resten af dagen
+#      (boern_ankomst_stille_until) — den sætter stadig flaget, den spørger
+#      bare ikke igen.
+#
+# Se automations/boern_ankomst_detekter.yaml + kids_home i activity_state.yaml.
+# =============================================================================
+
+input_boolean:
+  boern_ankomst_detekt_enabled:
+    name: "Børn: ankomst-detektion (aktivitet)"
+    icon: mdi:account-child-circle
+    initial: true
+    # Kill-switch. OFF = kun de gamle signaler (latch/overnight/today) + manuel.
+
+  boern_aktivitet_detekteret:
+    name: "Børn detekteret via aktivitet"
+    icon: mdi:motion-sensor
+    # Runtime-flag (IKKE i helper-snapshot). Sættes af ankomst-detektoren,
+    # ryddes ved ro i børneværelset, ved "nej"-svar og ved AirBnB-entry/exit.
+
+input_number:
+  boern_ankomst_ophold_minutter:
+    name: "Børn: sammenhængende ophold før 'børn hjemme' (min)"
+    icon: mdi:timer-account
+    min: 5
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+    # 12 = midt i kløften mellem voksen-dage (maks 7,0 min) og børne-dage
+    # (≥ 15 min) målt over 14 dage. Skru OP hvis en voksen der rydder op
+    # udløser den; skru NED hvis børnene registreres for sent.
+
+  boern_ankomst_ro_minutter:
+    name: "Børn: ro i børneværelset før flaget ryddes (min)"
+    icon: mdi:timer-sand-empty
+    min: 30
+    max: 360
+    step: 10
+    unit_of_measurement: "min"
+    mode: slider
+    # 120 = besøgsbørn der tager hjem kl. 20 er ryddet ~22, længe før
+    # morgen-vækningen kl. 06:05. Et sovende barn blinker på radaren
+    # oftere end hver 2. time, så natten holder flaget i live.
+
+  # 2026-09-25 (user-spec: "du må også gerne spørge mig hvis du kommer op på 3
+  # i people count (igen kun hvis det er i en periode uden børn)"). Hvor længe
+  # sensor.people_estimate skal stå på ≥ 3 før spørgsmålet. MÅLT 24/9 (ingen
+  # børn, user bekræftede 2 personer kl. 20): 7 episoder ≥ 3 på 3-94 min —
+  # tallet er klistret (high-water-gulv), så en kort tærskel spørger på
+  # hver køkkentur. 10 min tager 5 af de 7; et "❌ Nej" dæmper derefter ALLE
+  # børne-spørgsmål i suppress-timeren (6 t), så en dårlig dag koster ~2 push.
+  boern_people_spoerg_minutter:
+    name: "Børn: people count ≥ 3 i så længe før 'børn hjemme?' (min)"
+    icon: mdi:account-multiple-check
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+input_datetime:
+  boern_ankomst_suppress_until:
+    name: "Børn: ankomst-detektion undertrykt til"
+    has_date: true
+    has_time: true
+    # Sættes af "❌ Nej"-svaret (nu + boern_ankomst_suppress_timer) så
+    # detektoren ikke fyrer + spørger igen resten af aftenen. Runtime.
+
+  boern_ankomst_suppress_timer:
+    name: "Børn: undertrykkelse efter 'nej' (timer)"
+    has_date: false
+    has_time: true
+    # Varighed, ikke et klokkeslæt. Default 06:00 = 6 timer.
+
+  boern_ankomst_stille_until:
+    name: "Børn: ankomst-spørgsmål tavst til"
+    has_date: true
+    has_time: true
+    # 2026-07-30 runde 2 (user: "3. ja"). Sættes af et "✅ Ja" til NÆSTE
+    # midnat = tavs resten af dagen. Detektoren SÆTTER stadig flaget, den
+    # spørger bare ikke igen. Runtime (ikke i helper-snapshot).
+    #
+    # Samme "until"-form som suppress_until — og det er ikke kosmetik: en
+    # frisk has_date-helper starter på dagens midnat, og dens `timestamp`-
+    # attribut læses 2 t forskudt (UTC-fortolkning af den naive værdi; en
+    # SAT værdi er derimod korrekt). En "er datoen i dag?"-test ville derfor
+    # være SAND uden at nogen havde svaret, og gøre detektoren tavs hele
+    # fødselsdagen. Med "until" fejler defaulten ÅBENT: fra ~02:00 er
+    # nu > den skæve default → spørg. (00-02 på en aldrig-sat helper er
+    # tavs; flaget sættes stadig.) Fail-open er den rigtige retning —
+    # et spørgsmål for meget er billigere end et tabt facit.
+
+input_text:
+  boern_ankomst_pending:
+    name: "Børn: ankomst-spørgsmål afventer svar"
+    max: 32
+    # Join-nøgle mellem push-spørgsmål og svar (samme mønster som ai_trainer).
+
+script:
+  # ===========================================================================
+  # ÉT spørgsmål, fire afsendere (2026-09-25, user-spec: "alle nye
+  # 'børnebesøg'-perioder skal bekræftes af mig med tlf-notifikation og
+  # svar-mulighed"). Før i dag stod push-blokken kun i boern_ankomst_detekter,
+  # og tre andre veje kunne starte en børneperiode helt uden at spørge:
+  #   · morgen-latchen 06:30 (boern_sov_her_i_nat fra ≥ 2,9 t nat-ophold)
+  #   · kids_home's egne 4 t-akkumulatorer (overnight/today)
+  #   · people count ≥ 3 blev slet ikke brugt som anledning
+  # Alle fire kalder nu DENNE, så ask-loggen, join-nøglen, tavsheden efter et
+  # "✅ Ja" og knapperne er ét sted (#2). Svaret håndteres uændret af
+  # boern_ankomst_svar (automations/boern_ankomst_detekter.yaml).
+  # AirBnB/house_mode gates hos AFSENDEREN (de kender hver deres kontekst).
+  # ===========================================================================
+  boern_ankomst_spoerg:
+    alias: "🧒 Børn hjemme? — spørg user (fælles push)"
+    icon: mdi:account-child-circle
+    mode: queued
+    max: 3
+    fields:
+      kilde:
+        description: "Hvem spørger: flanke / backstop / lav_krop / latch / people / akkumulator"
+        example: people
+      besked:
+        description: "Brødtekst i pushen — hvad huset så, og hvad det har gjort."
+        example: "People count har stået på 3 i 10 min."
+    sequence:
+      # Samme to porte som detektoren altid har haft: notifikations-master og
+      # "✅ Ja i dag = spørg ikke igen" (stille_until).
+      # Runde 2 (user: "3. ja"): har du allerede bekræftet i dag, er
+      # spørgsmålet besvaret. Flaget sættes stadig — vi spørger bare ikke igen
+      # (fx når børnene har været ude i to timer og kommer tilbage, så
+      # ro-rydningen nåede at fyre imellem). Fail-open som suppress-gaten: en
+      # frisk has_date-helper starter på dagens midnat (og læses 2 t forskudt),
+      # så en "er datoen i dag?"-test ville tie uden at nogen havde svaret.
+      - condition: state
+        entity_id: input_boolean.notifikationer_master_enabled
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set u = state_attr('input_datetime.boern_ankomst_stille_until', 'timestamp') %}
+          {{ u is none or u == 0 or now().timestamp() > u }}
+      # NB: payloaden er ÉT Jinja-udtryk — et `#` derinde er ikke en
+      # kommentar, det er en syntaksfejl der disabler hele scriptet.
+      # 'kilde' lader træneren score hver afsender for sig.
+      - variables:
+          fb_id: "{{ now().strftime('%Y%m%d%H%M%S') }}"
+          payload_b64: >-
+            {% set occ = states.binary_sensor.boernevaerelse_apollo_occupancy %}
+            {{ {
+              'type': 'ask',
+              'id': fb_id,
+              'ts': now().isoformat(),
+              'guess': 'boern_hjemme',
+              'hour': now().hour,
+              'signals': {
+                'kilde': kilde | default('ukendt'),
+                'lav_krop_antal': state_attr('binary_sensor.koekken_lav_krop_bevist', 'antal') | int(0),
+                'ophold_min': (((now() - occ.last_changed).total_seconds() / 60) | round(1)) if occ is not none else -1,
+                'taerskel_min': states('input_number.boern_ankomst_ophold_minutter') | float(-1),
+                'occupancy_today_h': states('sensor.boern_occupancy_today') | float(-1),
+                'occupancy_overnight_h': states('sensor.boern_occupancy_overnight') | float(-1),
+                'occupancy_4h': states('sensor.boern_occupancy_4h') | float(-1),
+                'putte_zone': states('binary_sensor.boern_putte_zone_aktiv'),
+                'people_estimate': states('sensor.people_estimate') | int(-1),
+                'zones_now': states('sensor.people_zones_now') | int(-1),
+                'parent_a_home': states('input_boolean.parent_a_home'),
+                'parent_b_home': states('input_boolean.parent_b_home')
+              }
+            } | to_json | base64_encode }}
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.boern_ankomst_pending
+        data:
+          value: "{{ fb_id }}"
+      - service: shell_command.ai_feedback_append
+        data:
+          log_slug: boern_ankomst
+          payload_b64: "{{ payload_b64 }}"
+      - service: notify.mobile_app_phone_a
+        data:
+          title: "🧒 Børn hjemme?"
+          message: "{{ besked | default('Jeg tror der er børn hjemme. Passer det?') }}"
+          data:
+            tag: boern_ankomst
+            actions:
+              - action: "BOERN_ANKOMST_JA"
+                title: "✅ Ja, børn hjemme"
+              - action: "BOERN_ANKOMST_NEJ"
+                title: "❌ Nej, ingen børn"
+
