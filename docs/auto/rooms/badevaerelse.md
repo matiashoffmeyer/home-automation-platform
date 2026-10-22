@@ -95,7 +95,7 @@ Search keywords: `badevaerelse, bad`
 - `binary_sensor.badevaerelse_fugt_frisk` — 9 refs in 2 file(s)
 - `binary_sensor.badevaerelse_inde_1_occupancy` — 24 refs in 9 file(s)
 - `binary_sensor.badevaerelse_inde_2_occupancy` — 23 refs in 8 file(s)
-- `binary_sensor.badevaerelse_inde_occupancy` — 127 refs in 37 file(s)
+- `binary_sensor.badevaerelse_inde_occupancy` — 131 refs in 37 file(s)
 - `binary_sensor.badevaerelse_lys_on_effektiv` — 1 refs in 1 file(s)
 - `binary_sensor.badevaerelse_matter_spots_ok` — 12 refs in 5 file(s)
 - `binary_sensor.badevaerelse_natlys_aktiv` — 10 refs in 3 file(s)
@@ -103,7 +103,7 @@ Search keywords: `badevaerelse, bad`
 - `binary_sensor.badevaerelse_thread_lys_nede` — 8 refs in 2 file(s)
 - `binary_sensor.badevaerelse_tumbler_mistanke` — 2 refs in 2 file(s)
 - `binary_sensor.badevaerelse_visit_serious` — 15 refs in 6 file(s)
-- `binary_sensor.parasoll_badevaerelse` — 23 refs in 5 file(s)
+- `binary_sensor.parasoll_badevaerelse` — 30 refs in 6 file(s)
 - `binary_sensor.sove_gardin_bad_klar` — 13 refs in 4 file(s)
 
 ### `button.*`

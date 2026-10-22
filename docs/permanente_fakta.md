@@ -2084,6 +2084,10 @@ stille (genvex-forsøget, badets tørretid, fugt-varslet).
   om natten → 3,44 kl. 7). Depotet manglede 0 kvarterer, køkkenet 215. →
   `sensor.indoor_temperature_resilient` = TIMMERFLOTTE, ellers Broadlink − 3,15;
   summer_defense, climate_control, security kulde-dør og radiator-effekt køkken
-  læser den. Apollo-temperaturen er stadig udelukket (ESP-varme, B12/B17).
+  læser den. Apollo-temperaturen er stadig udelukket — IKKE pga. støj eller
+  ESP-varme (målt 22/10: σ 0,06 °C, gain 1,0 mod køkkenet, sove-offset
+  uafhængigt af ESP-temp), men pga. placering (køleskab, radiatorskjuler/træk),
+  ukendt nulpunkt og døde DPS310 i børne + spisestue. Mod køkkenet kan den ikke
+  kalibreres: sove − køkken driver −2,5 (jun) → −4,6 °C (okt) med årstiden (B247).
 - Alle tre sensorer har attributten `kilde` (køkken/depot).
 

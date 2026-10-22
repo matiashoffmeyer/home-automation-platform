@@ -22,8 +22,8 @@ Search keywords: `terrasse`
 
 ### `automations/security.yaml`
 
-- **Sikkerhed: Gulvvarmen brænder for spurvene (terrassedør åben)** (line 219, mode=single)
-- **Sikkerhed: Terrassedør åben i regn** (line 333, mode=single)
+- **Sikkerhed: Gulvvarmen brænder for spurvene (terrassedør åben)** (line 226, mode=single)
+- **Sikkerhed: Terrassedør åben i regn** (line 340, mode=single)
   - Terrassedøren står åben ≥ slider min mens terrasse_regn_aktiv er on —
 
 ### `automations/styrbar_rooms.yaml`
@@ -63,7 +63,7 @@ Search keywords: `terrasse`
 
 - `binary_sensor.likely_on_terrasse` — 8 refs in 6 file(s)
 - `binary_sensor.mood_pause_terrasse` — 6 refs in 4 file(s)
-- `binary_sensor.parasoll_terrassedoer` — 53 refs in 17 file(s)
+- `binary_sensor.parasoll_terrassedoer` — 55 refs in 17 file(s)
 - `binary_sensor.terrasse_active` — 14 refs in 10 file(s)
 - `binary_sensor.terrasse_lights_on` — 5 refs in 5 file(s)
 - `binary_sensor.terrasse_lys_on_effektiv` — 1 refs in 1 file(s)

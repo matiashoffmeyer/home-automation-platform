@@ -71,6 +71,28 @@
 # døgn mod 23. Resten: 16/9 (Parent B's gamle GPS-flag), 18/9 (afleveringsdag —
 # nogen var i børneværelset 19-20), 27/9 (gæster ved ét bord = ét rum).
 #
+# v6 (2026-10-21, user: "again and again it comes back that the people count
+# decreases without the main door opening … guess and then stick to that guess
+# until the main door opens … or change your guess upwards if you're certain"):
+# ÉT HOLDT TAL. sensor.people_estimate viser input_number.people_gulv (eller
+# brugerens manuelle tal); modellen er kun et BUD. Tallet stiger når buddet har
+# holdt zone-sustain, og falder KUN i vinduet efter HOVEDDØREN (+ brugerens egne
+# rettelser: +/-, "For mange", børn-off-knappen). Undersøgelsen 21/10 (14 døgn,
+# 113 fald, 51 uden for et dør-vindue) fandt hvorfor reglen blev ved med at
+# lække: v5 låste DELE af formlen, aldrig tallet; "hoveddør" var vokset til
+# seks vindue-åbnere (geofence-exit, familie-vækst, eftermiddags-børn, "For
+# mange", Dormant, start); Dormant tvang 0 og nulstillede gulvet (19 fald);
+# familie-0-grenen læste rå zoner (7 fald 21/10); manuel-udløb hoppede (3).
+# Fjernet: people_floor_reset_afgang, people_floor_reset_dormant og stemplet
+# fra familie-vækst, eftermiddags-børn og "For mange".
+# Invariant-tjek på det viste tal: ./scripts/ha_health.sh people.
+#
+# v6.1 (2026-10-22, user: "hvorfor people count ikke er sat til 0 efter
+# dormant"): husets tom-dom efter døren tæller som dørens konklusion — Dormant
+# senest people_afgang_dom_minutter (120) efter hoveddøren sætter tallet til 0
+# og rydder ekstra-gulvet (people_gulv_foelg). Et Dormant uden en dør foran sig
+# sænker stadig intet.
+#
 # v5 (2026-10-01, user: "people count bør ikke gå ned uden hoveddøren åbnes.
 # systemet skal stole på sig selv … feks er vi 3 hjemme i dag"): v4 gav kun
 # EKSTRA-delen et gulv. Familie-delen faldt uden dør: barnet talte kun mens
@@ -136,14 +158,15 @@ input_number:
   # v5 (2026-10-01): gulv-decay'en (people_floor_decay_minutes, 2026-07-28) er
   # FJERNET — den sænkede tallet uden at hoveddøren havde åbnet, præcis det
   # user har bedt om aldrig sker. Et for højt mærke forhindres nu ved KILDEN
-  # (people_ekstra_hold_sekunder 900) og ryddes af døren, Dormant eller et
-  # "For mange"-svar. Genindføres den, skal den også ramme people_gulv.
+  # (people_ekstra_hold_sekunder 900) og ryddes af døren eller et "For mange"-
+  # svar. Genindføres den, bryder den v6-reglen (kun ned efter hoveddøren).
 
-  # v5: DØR-LÅST gulv på hele tallet (runtime, ikke config → udeladt af
-  # helpers-snapshot). Kun people_gulv_foelg skriver det op; døren/afgangen
-  # åbner vinduet hvor det må følge tallet ned. Dormant → 0.
+  # v6: DET HOLDTE TAL — sensor.people_estimate viser det når intet manuelt
+  # tal står (runtime, ikke config → udeladt af helpers-snapshot). Skrives af
+  # people_gulv_foelg (op på et bud der har holdt, ned kun i dør-vinduet),
+  # people_manuel_juster og "For mange"-svaret. Dormant rører det ikke.
   people_gulv:
-    name: "People: bekræftet antal siden hoveddør (runtime)"
+    name: "People: holdt antal (runtime)"
     min: 0
     max: 6
     step: 1
@@ -152,9 +175,11 @@ input_number:
 
   # 2026-10-12 (user: "plus og minus knap … manuelt ændre tallet … så vi kan
   # bruge det til træning"): brugerens tal vinder over modellen, til næste
-  # gen-måling (people_doer_haendelse: hoveddør, afgang, familie-vækst, børn
-  # force-off), Dormant eller house_mode-skift — så påstanden kan ikke overleve
+  # gen-måling (people_doer_haendelse: hoveddør, HA-start med åben dør, børn-
+  # off-knappen), Dormant eller house_mode-skift — så påstanden kan ikke overleve
   # sit første modbevis (sprint 2026-10-07b). -1 = ingen manuel værdi.
+  # v6: people_manuel_juster sætter også det holdte tal, så udløbet ikke flytter
+  # tallet.
   # Runtime, ikke config → udeladt af helpers-snapshot.
   people_manuel:
     name: "People: manuelt antal (runtime, -1 = model)"
@@ -164,16 +189,33 @@ input_number:
     icon: mdi:account-edit
     mode: box
 
-  # v5: hvor længe efter en hoveddør-åbning / geofence-exit tallet må falde.
-  # Skal dække flag-forsinkelsen (målt 14 døgn): Parent B's anker 2,7-12,2 min
-  # efter døren (én gang 48,7), Parent A's flag ~5 min (maks 12) efter person.*.
+  # v6: hvor længe efter en HOVEDDØR-åbning tallet må falde (eneste vindue).
+  # Skal dække voksen-flagenes forsinkelse: målt 21/10 (14 døgn) halter GPS'en
+  # 0,9-20,2 min efter døren og flaget 5 min mere → op til 25,2 min; 7 af 20
+  # afgange lå uden for 15 min. Et fald efter vinduet venter til næste dør.
   people_afgang_vindue_minutter:
-    name: "People: tallet kan falde i (min) efter hoveddør/afgang"
+    name: "People: tallet kan falde i (min) efter hoveddøren"
     min: 0
     max: 60
     step: 1
     unit_of_measurement: "min"
     icon: mdi:door-closed-lock
+    mode: slider
+
+  # v6.1 (2026-10-22, B246): husets TOM-DOM efter døren. Går huset Dormant
+  # senest så længe efter sidste hoveddør, falder tallet til 0 og ekstra-gulvet
+  # ryddes — dørens egen konklusion, bare målt når huset når frem til den.
+  # Målt 30 døgn: dommen lander 35-104 min efter døren (22/10: 30,0 min — 27 s
+  # før vinduet lukkede), og hver Dormant 30-135 min efter en dør endte som et
+  # tomt hus; det tidligste FORKERTE Dormant (nogen hjemme) lå 284 min efter
+  # døren (natten 22/10). 0 = slået fra (kun dør-vinduet).
+  people_afgang_dom_minutter:
+    name: "People: tomt hus efter hoveddøren tæller i (min)"
+    min: 0
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    icon: mdi:home-export-outline
     mode: slider
 
   # Runtime high-water-mark (2026-07-22, user-spec: "så længe main door ikke
@@ -322,13 +364,13 @@ input_datetime:
     has_time: true
     icon: mdi:clock-outline
 
-  # v5 (runtime): sidste hoveddør-åbning / geofence-exit / anden gen-måling.
-  # Afgangs-vinduet regnes herfra. Et SKREVET stempel, fordi dørens
+  # v6 (runtime): sidste hoveddør-åbning (eller brugerens børn-off-knap / HA-
+  # start med åben dør). Dør-vinduet regnes herfra. Et SKREVET stempel, fordi dørens
   # last_changed nulstilles ved genstart — så ville hver genstart åbne et
   # vindue og lade tallet falde uden dør (permanent faktum).
   # (Erstatter v4's people_floor_below_since — decay-uret er fjernet.)
   people_doer_haendelse:
-    name: "People: sidste hoveddør eller afgang (runtime)"
+    name: "People: sidste hoveddør (runtime)"
     has_date: true
     has_time: true
     icon: mdi:door-open
@@ -665,15 +707,21 @@ template:
         unique_id: people_estimate_model
         icon: mdi:account-multiple-outline
         state: >
-          {# Dormant dominerer (2026-05-21-mønster): stuck sensor må ikke
-             overtrumfe "ingen hjemme"-signalet. #}
+          {# v6: et BUD. Det viste tal er people_gulv, som følger buddet op
+             når det har holdt og ned kun i dør-vinduet (people_gulv_foelg).
+             Dormant dominerer buddet (2026-05-21-mønster): stuck sensor må
+             ikke overtrumfe "ingen hjemme"-signalet — tallet venter på døren. #}
           {% if is_state('input_select.house_state', 'Dormant') %}0
           {% else %}
-            {% set familie = states('sensor.people_familie') | int(0) %}
+            {# Børnene på et frisk bevis ELLER fordi de er set siden sidste dør
+               (v5's to veje — gulvet læste flaget, modellen beviset). #}
+            {% set flag = (states('input_number.people_boern_antal') | int(0))
+                 if (is_state('binary_sensor.kids_home', 'on')
+                     and is_state('input_boolean.people_boern_set_efter_doer', 'on'))
+                 else 0 %}
+            {% set familie = (states('sensor.people_voksne') | int(0))
+                 + [states('sensor.people_boern') | int(0), flag] | max %}
             {% set gulv = states('input_number.people_ekstra_gulv') | int(0) %}
-            {# v5: det dør-låste gulv på hele tallet — hvad der er bekræftet
-               siden sidste hoveddør. Tallet falder aldrig under det. #}
-            {% set laast = states('input_number.people_gulv') | int(0) %}
             {# v4: familien + de ekstra der har HOLDT sig (gulvet). Et øjebliks-
                udslag i zonerne over familien flytter ikke tallet — målt var det
                næsten altid trailing, terrassedøren eller et bad-lys, sjældent en
@@ -681,9 +729,9 @@ template:
                er zonerne det eneste bevis → brug dem straks, som v3.
                v2: loft på 6 (user-spec "people count skal gå op til 6"). #}
             {% if familie > 0 %}
-              {{ [[familie + gulv, laast] | max, 6] | min }}
+              {{ [familie + gulv, 6] | min }}
             {% else %}
-              {{ [[states('sensor.people_zones_now') | int(0), gulv, laast] | max, 6] | min }}
+              {{ [[states('sensor.people_zones_now') | int(0), gulv] | max, 6] | min }}
             {% endif %}
           {% endif %}
 
@@ -692,12 +740,14 @@ template:
         icon: mdi:account-multiple
         # Manuelt tal (+/- på Status) vinder; det ryddes ved gen-måling,
         # Dormant og mode-skift (people_manuel_udloeb), ikke her.
+        # v6: ellers det HOLDTE tal (people_gulv), ikke modellens bud — så
+        # reglen "kun ned efter hoveddøren" gælder det tal forbrugerne læser.
         state: >
           {% set m = states('input_number.people_manuel') | int(-1) %}
-          {{ m if m >= 0 else states('sensor.people_estimate_model') | int(0) }}
+          {{ m if m >= 0 else states('input_number.people_gulv') | int(0) }}
         availability: >-
           {{ (states('input_number.people_manuel') | int(-1)) >= 0
-             or states('sensor.people_estimate_model') | is_number }}
+             or states('input_number.people_gulv') | is_number }}
         # v4: kun attributter der skifter sjældent. `zoner`, `boern_zone`,
         # `gulv_falder_om_min` og `hoveddoer_lukket_min` (now()) gav 2.400
         # rækker/24 t på en sensor hvis state skifter ~30 gange i døgnet (#24);
@@ -743,7 +793,7 @@ script:
           kontekst: >-
             {{ {
               'ts': now().isoformat(),
-              'model': 'v5',
+              'model': 'v6',
               'model_gaet': states('sensor.people_estimate_model') | int(0),
               'manuel': states('input_number.people_manuel') | int(-1),
               'gulv_siden_doer': states('input_number.people_gulv') | int(0),
@@ -823,6 +873,18 @@ script:
             fra: "{{ foer }}"
             til: "{{ til }}"
             manuel_foer: "{{ manuel_foer }}"
+      # v6: brugerens tal ER det holdte tal, så udløbet (dør, Dormant, mode)
+      # ikke flytter tallet; "tilbage til modellen" tager husets bud. Før
+      # manuel-skrivningen, så facaden kun skifter én gang.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ til >= 0 or states('sensor.people_estimate_model') | is_number }}
+        then:
+          - service: input_number.set_value
+            target: {entity_id: input_number.people_gulv}
+            data:
+              value: "{{ til if til >= 0 else states('sensor.people_estimate_model') | int(0) }}"
       - service: input_number.set_value
         target: {entity_id: input_number.people_manuel}
         data: {value: "{{ til }}"}
@@ -830,11 +892,12 @@ script:
 automation:
   # ===========================================================================
   # MANUELT ANTAL UDLØBER (2026-10-12). Brugerens tal gælder til huset
-  # GEN-MÅLER: alle gen-målings-veje (hoveddør, afgang, familie-vækst, børn
-  # force-off, "For mange", HA-start med åben dør) stempler
-  # people_doer_haendelse, så det ene anker fanger dem alle. Dormant og
-  # mode-skift (AirBnB ind/ud) rydder også. manuel_slut-linjen giver
-  # kalibreringen periodens facit-vindue + modellens tal ved slut.
+  # GEN-MÅLER: gen-målings-vejene (v6: hoveddør, HA-start med åben dør, børn-
+  # off-knappen) stempler people_doer_haendelse, så det ene anker fanger dem
+  # alle. Dormant og mode-skift (AirBnB ind/ud) rydder også — v6: uden at
+  # tallet flytter sig, for people_manuel_juster satte det holdte tal samtidig.
+  # manuel_slut-linjen giver kalibreringen periodens facit-vindue + modellens
+  # tal ved slut.
   # ===========================================================================
   - id: people_manuel_udloeb
     alias: "People: manuelt antal udløber ved gen-måling"
@@ -877,9 +940,10 @@ automation:
   # High-water-mark-gulv (2026-07-22, user-spec). Så længe hoveddøren ikke har
   # åbnet, kan ingen være gået → estimatet må ikke falde under det højeste antal
   # vi har set. Siden v4 (2026-09-30) holder gulvet KUN de ekstra personer ud
-  # over familien (people_ekstra_nu); familien er bevist af flagene. Én hæver,
-  # fem nulstillere. v5 (2026-10-01): decay'en er væk, og people_gulv holder
-  # HELE tallet til næste dør (people_gulv_foelg nedenfor).
+  # over familien (people_ekstra_nu); familien er bevist af flagene. To hævere
+  # (holdt ekstra-tal + bad-boksen 2026-10-21), fem nulstillere (familie-
+  # væksten TRÆKKER FRA siden 2026-10-21). v5 (2026-10-01): decay'en er væk, og
+  # people_gulv holder HELE tallet til næste dør (people_gulv_foelg nedenfor).
   # ===========================================================================
 
   # HÆV: ekstra-tallet har HOLDT sig over gulvet → løft gulvet. Settle-guard =
@@ -957,53 +1021,223 @@ automation:
         target: {entity_id: input_number.people_ekstra_gulv}
         data: {value: "{{ states('sensor.people_ekstra_nu') | int(0) }}"}
 
-  # DØR-LÅST GULV (v5, 2026-10-01, user: "people count bør ikke gå ned uden
-  # hoveddøren åbnes … systemet skal stole på sig selv"). Erstatter v4's
-  # ekstra-gulv-decay, som sænkede tallet uden dør.
-  # Målet er det BEKRÆFTEDE antal: voksen-flagene + børnene hvis børneværelset
-  # er set SIDEN sidste dør + ekstra-gulvet (som selv kræver 900 s hold).
-  #   - I afgangs-vinduet (people_afgang_vindue_minutter efter dør/afgang)
-  #     følger gulvet målet begge veje: flagene halter efter døren.
-  #   - Ellers kun OP. Et flag der falder af GPS-staleness, et barn der ikke
-  #     ses i 4 t, en zone der clearer — intet af det kan sænke tallet.
-  # Kun-op-reglen gør at reload-transienter (familie 3→0→unavailable→3 i samme
-  # sekund) ikke skriver noget; i vinduet retter næste render det straks.
-  # /1-tick: vinduets udløb og genstart har ingen flanke (#4); skriver kun ved
-  # faktisk ændring.
+  # HÆV 2 — BAD-BOKSEN (2026-10-21, user: "du burde kunne fornemme på huset at
+  # der er mere end en person hjemme … forbedr analysen af i aften"). 21/10:
+  # Parent B hjemme med gæster, hendes anker off (iOS-genvejen sendte "leave"
+  # 12:48 og intet "arrive") → familie 0, alle i open-plannet = ÉN zone, og
+  # zone-tallet flimrede 1↔2, så HÆV 1's 900-s-hold blev aldrig opfyldt.
+  # Estimatet stod på 1 — det tal solo_hurtig_sluk kræver for at slukke hurtigt.
+  # En LUKKET baddør er en boks: en frisk inde-flanke bag den (wasp-arm-reglen,
+  # badevaerelse_wasp.yaml) = nogen ER derinde; en flanke på en REN kanal
+  # udenfor i samme boks = nogen ANDEN. Begge = mindst 2, uanset flag og zoner.
+  # Rene kanaler, målt 30 døgn: køkkenets bevægelses-radar 0 spøgelser i 105 t
+  # Dormant, terrasse-/soveværelsesdøren 0. Radaren ser IKKE ind i badet: med
+  # lukket baddør ligger 0,8 % af dens flanker ±3 s fra en inde-flanke, mod
+  # 1,7 % ved tilfældig forskydning. Inde-PIR'en flankede 0 gange bag lukket
+  # dør i 111,7 t Dormant.
+  # Replay 21/9-21/10: 21 beviser, 0 falske. 19 lå hvor familien allerede var
+  # ≥ 2 eller ukendt; de 2 hvor huset talte 1 var begge ægte: 14/10 17:57 (en i
+  # køkkenet under badet, Parent A kom først hjem 18:21) og 21/10 18:15:18.
+  # Vagterne, hver fra replayet:
+  #   - inde-flanken ≤ 900 s efter lukningen (ægte besøg p95 424 s, max 526 s;
+  #     kontakten der hang "lukket" 8/10: 6460 s).
+  #   - udenfor tæller først 10 s efter lukningen (den der lukkede udefra er på
+  #     vej væk) og aldrig mens robotten kører (den ER bevægelsen og kan
+  #     skubbe en dør).
+  #   - den inde er der STADIG: inde-PIR'en er tændt 40 s efter udenfor-
+  #     flanken, eller flanker igen før døren åbner (replay: op til +431 s).
+  #     PIR-holdet er ~25 s (p25 af 1662 optaget-forløb: 27 s), så en der gik ud
+  #     ad en kontakt der hænger "lukket", kan ikke bære det.
+  #   - hoveddøren må ikke stå åben eller åbne før beviset: den udenfor kan
+  #     være på vej ud (15/10 18:22 det eneste replay-bevis med åben hoveddør).
+  # Skriver ekstra-gulvet så familie + ekstra = 2 (kun op); people_gulv_foelg
+  # tager det derfra, og hoveddøren nulstiller som altid. Tallene er sensor-
+  # fysik (PIR-hold, besøgs-længder), ikke smag → konstanter, ingen slidere.
+  # En genstart/reload midt i en boks taber kun den boks; næste besøg beviser.
+  - id: people_bad_to_steder
+    alias: "People: nogen i det lukkede bad + bevægelse udenfor = mindst 2"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_badevaerelse
+        from: "on"
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: input_select.house_state
+        state: "Active"
+    action:
+      - variables:
+          lukket: "{{ now().timestamp() }}"
+      # 1) Nogen ER derinde.
+      - wait_for_trigger:
+          - platform: state
+            entity_id: binary_sensor.badevaerelse_inde_occupancy
+            from: "off"
+            to: "on"
+            id: inde
+          - platform: state
+            entity_id: binary_sensor.parasoll_badevaerelse
+            from: "off"
+            to: "on"
+            id: doer
+        timeout:
+          seconds: 900
+        continue_on_timeout: false
+      - condition: template
+        value_template: "{{ wait.trigger is not none and wait.trigger.id == 'inde' }}"
+      - delay:
+          seconds: "{{ [lukket + 10 - now().timestamp(), 0] | max | round(1) }}"
+      # 2) Nogen ANDEN udenfor — én kandidat ad gangen, til baddøren åbner.
+      - repeat:
+          while:
+            - condition: state
+              entity_id: binary_sensor.parasoll_badevaerelse
+              state: "off"
+          sequence:
+            - wait_for_trigger:
+                - platform: state
+                  entity_id:
+                    - binary_sensor.koekken_apollo_bevaegelse_frisk
+                    - binary_sensor.parasoll_terrassedoer
+                    - binary_sensor.parasoll_sovedoer
+                  from: "off"
+                  to: "on"
+                  id: ude
+                - platform: state
+                  entity_id: binary_sensor.parasoll_badevaerelse
+                  from: "off"
+                  to: "on"
+                  id: doer
+              timeout:
+                hours: 4
+              continue_on_timeout: false
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ wait.trigger.id == 'ude'
+                       and not is_state('binary_sensor.roborock_koerer_nu', 'on')
+                       and not is_state('binary_sensor.parasoll_hoveddoer', 'on') }}
+              then:
+                - variables:
+                    kanal: "{{ wait.trigger.entity_id }}"
+                # 3) … og den inde er der STADIG. `doer` = baddøren (boksen
+                #    slut) eller hoveddøren (den udenfor kan gå) → ingen bevis.
+                - wait_for_trigger:
+                    - platform: state
+                      entity_id: binary_sensor.badevaerelse_inde_occupancy
+                      from: "off"
+                      to: "on"
+                      id: inde
+                    - platform: state
+                      entity_id:
+                        - binary_sensor.parasoll_badevaerelse
+                        - binary_sensor.parasoll_hoveddoer
+                      from: "off"
+                      to: "on"
+                      id: doer
+                  timeout:
+                    seconds: 40
+                - variables:
+                    efter40: >-
+                      {{ wait.trigger.id if wait.trigger is not none
+                         else ('paa' if is_state('binary_sensor.badevaerelse_inde_occupancy', 'on')
+                               else 'stille') }}
+                # Stille ved +40 s → vent på næste inde-flanke (ellers 1 s no-op).
+                - wait_for_trigger:
+                    - platform: state
+                      entity_id: binary_sensor.badevaerelse_inde_occupancy
+                      from: "off"
+                      to: "on"
+                      id: inde
+                    - platform: state
+                      entity_id:
+                        - binary_sensor.parasoll_badevaerelse
+                        - binary_sensor.parasoll_hoveddoer
+                      from: "off"
+                      to: "on"
+                      id: doer
+                  timeout:
+                    seconds: "{{ 14400 if efter40 == 'stille' else 1 }}"
+                - variables:
+                    udfald: >-
+                      {{ efter40 if efter40 != 'stille'
+                         else (wait.trigger.id if wait.trigger is not none else 'udloeb') }}
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {{ udfald in ['inde', 'paa']
+                           and is_state('binary_sensor.parasoll_badevaerelse', 'off')
+                           and not is_state('binary_sensor.parasoll_hoveddoer', 'on')
+                           and is_state('input_select.house_state', 'Active')
+                           and states('sensor.people_familie') | is_number }}
+                  then:
+                    - variables:
+                        ny: "{{ [2 - states('sensor.people_familie') | int(0), 0] | max }}"
+                    - if:
+                        - condition: template
+                          value_template: "{{ ny > states('input_number.people_ekstra_gulv') | int(0) }}"
+                      then:
+                        - service: input_number.set_value
+                          target: {entity_id: input_number.people_ekstra_gulv}
+                          data: {value: "{{ ny }}"}
+                        - service: logbook.log
+                          data:
+                            name: "People"
+                            message: >-
+                              mindst 2 hjemme: nogen i det lukkede bad +
+                              {{ {'binary_sensor.koekken_apollo_bevaegelse_frisk': 'bevægelse i køkkenet',
+                                  'binary_sensor.parasoll_terrassedoer': 'terrassedøren åbnet',
+                                  'binary_sensor.parasoll_sovedoer': 'soveværelsesdøren åbnet'}.get(kanal, kanal) }}
+                              → ekstra-gulv {{ ny }}
+                    - stop: "Bevist"
+
+  # DET HOLDTE TAL (v6, 2026-10-21; v5's dør-låste gulv 2026-10-01). Målet er
+  # modellens BUD; people_gulv er det tal sensor.people_estimate viser.
+  #   - I dør-vinduet (people_afgang_vindue_minutter efter HOVEDDØREN) følger
+  #     tallet buddet begge veje: flagene halter efter døren.
+  #   - Ellers kun OP (Active). Et flag der falder af GPS-staleness, et barn
+  #     der ikke ses i 4 t, en zone der clearer, Dormant — intet af det kan
+  #     sænke tallet.
+  #   - Begge veje kun på et bud der har HOLDT zone-sustain (150 s): rå zoner
+  #     i familie-0-grenen flimrede 1↔2 syv gange 21/10 16:51-19:39, og et
+  #     reload/en genstart nulstiller last_changed → ingen skrivning i 150 s.
+  #   - Står et manuelt tal, røres tallet ikke: people_manuel_juster satte det.
+  #   - TOM-DOMMEN (v6.1, 2026-10-22): Dormant senest people_afgang_dom_minutter
+  #     efter døren sænker tallet til 0 og rydder ekstra-gulvet. 22/10 kom
+  #     dommen 08:40:00, 27 s før vinduet lukkede; et soveværelses-spøgelse
+  #     havde holdt buddet på 1 og gen-låst ekstra-gulvet 08:24 → tallet stod
+  #     på 1 i et tomt hus resten af dagen. Rydningen er nødvendig: prel-vagten
+  #     satte Active 08:45, og buddet var da ekstra-gulvet (1) igen. Er huset
+  #     ikke tomt, prellet Dormant tilbage, og buddet stiger efter 150 s.
+  # /1-tick: vinduets udløb, hold-tiden og genstart har ingen flanke (#4).
   - id: people_gulv_foelg
-    alias: "People: dør-låst gulv følger det bekræftede antal"
+    alias: "People: holdt antal følger buddet (ned kun efter hoveddøren)"
     mode: queued
     max: 5
     max_exceeded: silent
     trigger:
       - platform: state
         entity_id:
-          - sensor.people_voksne
-          - binary_sensor.kids_home
-          - input_boolean.people_boern_set_efter_doer
-          - input_number.people_boern_antal
-          - input_number.people_ekstra_gulv
+          - sensor.people_estimate_model
           - input_datetime.people_doer_haendelse
       - platform: state
         entity_id: input_select.house_state
         to: "Active"
       - platform: time_pattern
         minutes: "/1"
-    # 2026-10-06 (DB-oprydning): målet beregnes på AUTOMATION-niveau (renderes
+  # 2026-10-06 (DB-oprydning): målet beregnes på AUTOMATION-niveau (renderes
     # før conditions), og "er der noget at skrive?" er en condition. Før lå
     # testen inde i action, så hvert /1-tick blev en kørsel: 5.508 rækker/døgn
     # (last_triggered/current) mod 5 ægte gulv-ændringer. Samme regel, samme
     # sekund — bare uden en kørsel når intet skal ændres.
     variables:
-      boern: >-
-        {{ (states('input_number.people_boern_antal') | int(0))
-           if (is_state('binary_sensor.kids_home', 'on')
-               and is_state('input_boolean.people_boern_set_efter_doer', 'on'))
-           else 0 }}
-      maal: >-
-        {{ [(states('sensor.people_voksne') | int(0)) + boern
-            + (states('input_number.people_ekstra_gulv') | int(0)), 6] | min }}
+      maal: "{{ states('sensor.people_estimate_model') | int(0) }}"
       gulv: "{{ states('input_number.people_gulv') | int(0) }}"
+      holdt: >-
+        {% set s = states.sensor.people_estimate_model %}
+        {{ s is not none and (now() - s.last_changed).total_seconds()
+           >= states('input_number.people_zone_sustain_seconds') | float(150) }}
       # state_attr(...,'timestamp'), ALDRIG as_timestamp(states(...)) (#18).
       # > 86400 = ikke 1970-sentinellen.
       stamp: >-
@@ -1011,21 +1245,38 @@ automation:
       vindue: >-
         {{ stamp > 86400 and (now().timestamp() - stamp)
            < (states('input_number.people_afgang_vindue_minutter') | float(15)) * 60 }}
+      ekstra: "{{ states('input_number.people_ekstra_gulv') | int(0) }}"
+      dom: >-
+        {{ stamp > 86400 and (now().timestamp() - stamp)
+           < (states('input_number.people_afgang_dom_minutter') | float(0)) * 60
+           and is_state('input_select.house_state', 'Dormant') and maal == 0 }}
     condition:
-      - condition: state
-        entity_id: input_select.house_state
-        state: "Active"
-      # Under et template-reload er voksne `unavailable` — intet mål at følge.
+      # Under et template-reload er buddet `unavailable` — intet mål at følge.
       - condition: template
         value_template: >-
-          {{ states('sensor.people_voksne') | is_number
-             and states('input_number.people_ekstra_gulv') | is_number }}
+          {{ states('sensor.people_estimate_model') | is_number
+             and (states('input_number.people_manuel') | int(-1)) < 0 }}
       - condition: template
-        value_template: "{{ (vindue and maal != gulv) or (not vindue and maal > gulv) }}"
+        value_template: >-
+          {{ holdt and ((vindue and maal != gulv)
+             or (dom and (gulv > 0 or ekstra > 0))
+             or (not vindue and maal > gulv
+                 and is_state('input_select.house_state', 'Active'))) }}
     action:
-      - service: input_number.set_value
-        target: {entity_id: input_number.people_gulv}
-        data: {value: "{{ maal }}"}
+      - if:
+          - condition: template
+            value_template: "{{ maal != gulv }}"
+        then:
+          - service: input_number.set_value
+            target: {entity_id: input_number.people_gulv}
+            data: {value: "{{ maal }}"}
+      - if:
+          - condition: template
+            value_template: "{{ dom and ekstra > 0 }}"
+        then:
+          - service: input_number.set_value
+            target: {entity_id: input_number.people_ekstra_gulv}
+            data: {value: 0}
 
   # BØRN SET (v5): et børne-bevis i børneværelset (se 2026-10-07 nedenfor) =
   # et barn (eller en voksen) er derinde EFTER sidste dør. Tæller kun når
@@ -1207,16 +1458,24 @@ automation:
         entity_id: input_boolean.kids_home_manual_off
         from: "off"
         to: "on"
+        id: knap
       - platform: state
         entity_id: input_boolean.boern_ikke_set_i_eftermiddag
         from: "off"
         to: "on"
+        id: eftermiddag
     action:
       - service: input_boolean.turn_off
         target: {entity_id: input_boolean.people_boern_set_efter_doer}
-      - service: input_datetime.set_datetime
-        target: {entity_id: input_datetime.people_doer_haendelse}
-        data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
+      # v6: kun brugerens knap åbner vinduet. Husets egen eftermiddags-dom
+      # sænker buddet; tallet venter til næste hoveddør.
+      - if:
+          - condition: trigger
+            id: knap
+        then:
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.people_doer_haendelse}
+            data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
 
   # NULSTIL ved hoveddør-åbning: nogen KAN være gået → mål occupancy'en forfra.
   # (user: "open main dør skal genstarte tælleren".)
@@ -1247,58 +1506,9 @@ automation:
             else 'off' }}
         target: {entity_id: input_boolean.people_boern_set_efter_doer}
 
-  # NULSTIL ved bekræftet afgang (2026-08-13d, user: "parent_b er taget på arbejde
-  # … det burde være tydeligt med gps signal og det hele"). Gulvets hele præmis er
-  # "ingen kan gå uden at bruge døren" — en geofence-exit ER beviset på at nogen
-  # gik, og så skal occupancy'en måles forfra præcis som ved en dør-åbning.
-  # Vi lytter på person.* (zone-skift = ægte exit), IKKE på input_boolean.*_home:
-  # de flag ryddes også af GPS-STALENESS-vagten efter 30 min tavshed, og en stille
-  # iPhone ville ellers nulstille gulvet på et ikke-eksisterende farvel.
-  - id: people_floor_reset_afgang
-    alias: "People: nulstil gulv ved bekræftet afgang (geofence-exit)"
-    # 2026-10-06 (bug-hunt nat): debounce i ACTION (5 min, som parent_a_home's
-    # afgangs-nåde). Målt i aften: person.* home 21:01:25 → not_home 21:01:48 →
-    # home 21:05:23 — et 3½-min GPS-flap blev læst som afgang og åbnede gulv-
-    # vinduet. Ikke en trigger-`for:`: den nulstilles hvis personen går videre
-    # fra not_home ind i en anden zone. parallel = to samtidige afgange tabes
-    # ikke. Hoveddøren stempler stadig med det samme (people_doer_haendelse).
-    mode: parallel
-    max: 4
-    trigger:
-      - platform: state
-        entity_id:
-          - person.parent_a
-          - person.parent_b
-        from: "home"
-    condition:
-      # Kun ægte zone-skift — unavailable/unknown under en integrations-hikke er
-      # ikke en afgang (fejlklasse #9).
-      - condition: template
-        value_template: >-
-          {{ trigger.to_state.state not in ['unknown', 'unavailable', 'none'] }}
-    action:
-      - delay: "00:05:00"
-      - condition: template
-        value_template: "{{ not is_state(trigger.entity_id, 'home') }}"
-      - service: input_number.set_value
-        target: {entity_id: input_number.people_ekstra_gulv}
-        data: {value: 0}
-      # v5: åbn afgangs-vinduet (people_gulv må følge tallet ned) og kræv at
-      # børnene ses igen. Står de i børneværelset lige nu, er de ikke gået.
-      # 2026-10-07: øjeblikket kan kun BEHOLDE et flag (set før + optaget nu)
-      # eller tage et frisk børne-bevis — et rå blip gennem væggen fra en der
-      # går forbi spisebordet mod døren skaber det ikke (samme regel som
-      # people_boern_set, fejlklasse #2/#21).
-      - service: input_datetime.set_datetime
-        target: {entity_id: input_datetime.people_doer_haendelse}
-        data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
-      - service: >-
-          input_boolean.turn_{{ 'on'
-            if (is_state('input_boolean.people_boern_set_efter_doer', 'on')
-                and is_state('binary_sensor.boernevaerelse_apollo_occupancy', 'on'))
-               or is_state('binary_sensor.boernevaerelse_solo_bevis', 'on')
-            else 'off' }}
-        target: {entity_id: input_boolean.people_boern_set_efter_doer}
+  # v6 (2026-10-21): people_floor_reset_afgang (geofence-exit åbnede vinduet)
+  # er FJERNET. GPS'en halter 0,9-20,2 min efter døren og flappede to gange på
+  # 14 døgn; et fald der lander efter dør-vinduet venter til næste hoveddør.
 
   # NULSTIL når familien VOKSER (v4, 2026-09-30). Et voksen-flag lander ofte
   # efter at radaren har set personen: Parent B's iOS-geofence, Parent A's GPS-proxy
@@ -1309,8 +1519,14 @@ automation:
   # Og den forrige værdi skal have STÅET i > 2 min: ved boot renderer familien
   # før kids_home er klar (børn = 0 i sekunder → "vækst" når de kommer), og
   # gulvet skal overleve en genstart (07-24-user-spec, se reset_start nedenfor).
+  # 2026-10-21: TRÆK væksten fra i stedet for at nulstille. Hver ny flagget
+  # person kan højst være ÉN af de ekstra; resten er stadig ekstra. 21/10 stod
+  # bad-boksen på ekstra 2 med familie 0 (Parent B + gæster) — et sent iOS-
+  # "arrive" ville have nulstillet til familie 1 + 0 = 1. Samme udfald som før
+  # når ekstra ≤ væksten (25/9: 1 − 1 = 0); 30 døgn havde 0 vækst-hændelser med
+  # ekstra > 0, så ændringen er historisk neutral.
   - id: people_ekstra_reset_familie
-    alias: "People: nulstil ekstra-gulv når familien vokser"
+    alias: "People: træk familie-vækst fra ekstra-gulvet"
     trigger:
       - platform: state
         entity_id: sensor.people_familie
@@ -1326,33 +1542,17 @@ automation:
     action:
       - service: input_number.set_value
         target: {entity_id: input_number.people_ekstra_gulv}
-        data: {value: 0}
-      # v5: åbn også afgangs-vinduet. Ellers har people_gulv allerede latchet
-      # familie + den "ekstra" — og den ekstra VAR den der lige blev flagget →
-      # dobbelt-tælling til næste dør (replay 25/9 19:09-07:25: 2 med én hjemme).
-      # Børne-flaget røres ikke: ingen gik ud.
-      - service: input_datetime.set_datetime
-        target: {entity_id: input_datetime.people_doer_haendelse}
-        data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
+        data:
+          value: >-
+            {{ [states('input_number.people_ekstra_gulv') | int(0)
+                - (trigger.to_state.state | int(0) - trigger.from_state.state | int(0)), 0] | max }}
+      # v6: intet vindue her (v5 åbnede det). Væksten er trukket fra ekstra,
+      # så buddet står stille — ingen gik ud, og intet skal falde.
 
-  # NULSTIL ved Dormant-entry (natten/tomt hus): et gammelt gulv må ikke lække
-  # ind i næste Active-periode.
-  - id: people_floor_reset_dormant
-    alias: "People: nulstil gulv ved Dormant"
-    trigger:
-      - platform: state
-        entity_id: input_select.house_state
-        to: "Dormant"
-    action:
-      - service: input_number.set_value
-        target: {entity_id: input_number.people_ekstra_gulv}
-        data: {value: 0}
-      # v5: tomt hus → intet at holde, og ingen børn derinde.
-      - service: input_number.set_value
-        target: {entity_id: input_number.people_gulv}
-        data: {value: 0}
-      - service: input_boolean.turn_off
-        target: {entity_id: input_boolean.people_boern_set_efter_doer}
+  # v6 (2026-10-21): people_floor_reset_dormant er FJERNET. Den tvang tallet
+  # til 0 og nulstillede gulvet uden dør (19 af 51 fald på 14 døgn; 10 flap
+  # 20/10 08:15-09:35). Dormant gør nu kun BUDDET 0 — tallet følger med i dør-
+  # vinduet. Ekstra-gulvet og børne-flaget ryddes af døren.
 
   # HA-START: gulvet lever i .storage og OVERLEVER en genstart — det er meningen.
   # (2026-07-24, user-spec: "vi mistede en person over natten uden open main door
@@ -1574,9 +1774,10 @@ automation:
             } | to_json | base64_encode }}
       - service: shell_command.people_feedback_append
         data: {payload_b64: "{{ payload_b64 }}"}
-      # v5: "For mange" = brugerens facit mod husets hold → åbn afgangs-vinduet,
-      # så people_gulv må følge tallet ned (den eneste udgang fra et falsk højt
-      # gulv uden dør, Dormant eller decay).
+      # v6: "For mange" = brugerens facit mod husets hold → delene måles
+      # forfra, og det holdte tal sættes til buddet hvis det er lavere.
+      # Brugerens rettelse er en lovlig vej ned; intet vindue, så rå zoner og
+      # GPS ikke kan tage mere end svaret bad om.
       - if:
           - condition: template
             value_template: "{{ answer == 'formange' }}"
@@ -1586,9 +1787,6 @@ automation:
           - service: input_number.set_value
             target: {entity_id: input_number.people_ekstra_gulv}
             data: {value: 0}
-          - service: input_datetime.set_datetime
-            target: {entity_id: input_datetime.people_doer_haendelse}
-            data: {datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"}
           # 2026-10-07: samme regel som dør-nulstillingerne (behold eller frisk
           # bevis — aldrig et rå blip).
           - service: >-
@@ -1598,6 +1796,18 @@ automation:
                    or is_state('binary_sensor.boernevaerelse_solo_bevis', 'on')
                 else 'off' }}
             target: {entity_id: input_boolean.people_boern_set_efter_doer}
+          # Buddet re-renderer efter de to skrivninger; sænk så tallet til det.
+          - delay: "00:00:02"
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ states('sensor.people_estimate_model') | is_number
+                     and (states('sensor.people_estimate_model') | int(0))
+                         < (states('input_number.people_gulv') | int(0)) }}
+            then:
+              - service: input_number.set_value
+                target: {entity_id: input_number.people_gulv}
+                data: {value: "{{ states('sensor.people_estimate_model') | int(0) }}"}
       # Ryd pending — svaret er brugt; næste tap uden nyt gæt logges ikke.
       - service: input_text.set_value
         target: {entity_id: input_text.people_feedback_pending_id}

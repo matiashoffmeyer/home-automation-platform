@@ -541,6 +541,30 @@ vægtet cache-read 0,1 · input 1 · cache-write 2 · output 5):
 
 ### Andre standing instructions
 
+- **People count falder KUN efter hoveddøren** (user-spec 2026-07-22, gentaget
+  2026-10-01 og 2026-10-21: "again and again it comes back that the people count
+  decreases without the main door opening … believe in yourself, guess and then
+  stick to that guess until the main door opens (people may or may not leave) or
+  change your guess upwards if you're certain you've estimated too low").
+  Hvorfor reglen lækkede i tre måneder (undersøgt 21/10, 14 døgn, 113 fald, 51
+  uden for et dør-vindue): hver rettelse lagde et gulv på en DEL af formlen
+  (v4 ekstra-delen, v5 familie + ekstra), aldrig på det viste tal; "hoveddøren"
+  voksede til seks vindue-åbnere (geofence-exit, familie-vækst, eftermiddags-
+  børn, "For mange", Dormant, start); Dormant tvang 0 (19 fald); familie-0-grenen
+  læste rå zoner (7); manuel-udløb hoppede (3); hukommelses-filen kodede
+  undtagelserne som regel; og intet tjek så på tallet selv. v6
+  (`packages/people_estimate.yaml`): `sensor.people_estimate` = manuelt tal eller
+  `input_number.people_gulv`; modellen er et bud, som tallet følger op når det
+  har holdt 150 s og ned kun i `people_afgang_vindue_minutter` efter hoveddøren.
+  v6.1 (2026-10-22, user: "hvorfor people count ikke er sat til 0 efter
+  dormant"): husets Dormant-dom senest `people_afgang_dom_minutter` (120) efter
+  døren er dørens egen konklusion → tallet 0 og ekstra-gulvet ryddet. Målt 30
+  døgn: dommen lander 35-104 min efter døren; det tidligste forkerte Dormant
+  (nogen hjemme) lå 284 min efter. Et Dormant uden dør foran sænker intet.
+  Lovlige veje ned ud over døren: brugerens +/-, "For mange", børn-off-knappen.
+  `./scripts/ha_health.sh people` (`scripts/people_invariant.py`) fejler på
+  ethvert andet fald.
+
 - **Nye problemer** → [BACKLOG.md](BACKLOG.md) i rette kategori. **Løste** →
   "Done" med dato, eller slet hvis trivielt.
 - **Permanent, nyttigt faktum** (hardware-quirk, stabilt miljø-fakta, gentaget

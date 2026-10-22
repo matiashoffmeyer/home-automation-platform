@@ -15,6 +15,8 @@
 #                                       #   when explaining presence behaviour
 #   ./scripts/ha_health.sh kamera       # guest-mode camera compliance (a legal
 #                                       #   requirement); deliberately not notified
+#   ./scripts/ha_health.sh people       # people count fell without the front door
+#                                       #   (user-spec; the rule leaked for months)
 #   ./scripts/ha_health.sh log [n]      # the last n lines of the core log (200)
 #   ./scripts/ha_health.sh flags|lights|noisy|zha|docs|backup|sys
 
@@ -239,6 +241,10 @@ check_docs() {
   if [ "$nyest" -gt 0 ]; then echo "  -> python3 scripts/gen_docs.py && git add docs/auto"; fi
 }
 
+# User-spec: people count falder KUN efter hoveddøren (eller brugerens egen
+# rettelse). Reglen lækkede i tre måneder fordi intet tjekkede det viste tal.
+check_people() { hdr "People count kun ned ved hoveddør"; python3 "$(dirname "$0")/people_invariant.py" --dage 2; }
+
 check_backup() { hdr "Backups"; ls -1t /backup/ 2>/dev/null | head -5; }
 check_sys()    { hdr "Ressourcer"; free -h | head -2; df -h /config | tail -1; uptime; }
 
@@ -246,6 +252,7 @@ case "${1:-all}" in
   deploy) check_deploy; check_blind ;;
   blind)  check_blind ;;
   kamera) check_kamera ;;
+  people) check_people ;;
   flags)  check_flags ;;
   lights) check_lights ;;
   noisy)  check_noisy ;;
@@ -254,6 +261,6 @@ case "${1:-all}" in
   backup) check_backup ;;
   sys)    check_sys ;;
   log)    curl -s -m 30 "${AUTH[@]}" "http://supervisor/core/logs?lines=${2:-200}" ;;
-  all)    check_deploy; check_blind; check_kamera; check_flags; check_lights; check_noisy; check_zha; check_docs; check_backup; check_sys ;;
+  all)    check_deploy; check_blind; check_kamera; check_people; check_flags; check_lights; check_noisy; check_zha; check_docs; check_backup; check_sys ;;
   *)      sed -n '2,18p' "$0"; exit 1 ;;
 esac

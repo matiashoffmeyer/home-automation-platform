@@ -23,7 +23,7 @@ Search keywords: `hoveddoer, parasoll_hoveddoer`
 
 ### `binary_sensor.*`
 
-- `binary_sensor.parasoll_hoveddoer` — 54 refs in 23 file(s)
+- `binary_sensor.parasoll_hoveddoer` — 58 refs in 23 file(s)
 
 ### `input_datetime.*`
 

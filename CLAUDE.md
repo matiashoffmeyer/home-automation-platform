@@ -36,22 +36,21 @@ og incident-forløb ligger i docs/ og koster kun tokens når nogen læser dem.
 måledata: `grep -n "Sprint <dato>" docs/sprint_log.md`.** Er en lærdom permanent,
 hører den i "Permanente fakta" eller som en fejlklasse — ikke i en sprint-note.
 
-- **2026-10-16 — et tal på sensorens sidste trin er ikke mørke.** Kædens
-  "første lys" tændte 15/32 gange i dagslys: kulsort (< 15 lx) er LTR390'ens
-  bund, vinduet målte 42-116 → kræver nu også `koekken_lyskaede_lux_ok`; en
-  re-arm på dens flanke ville gen-tænde kæden i ring (flankerne er vores egen
-  sluk). Sofa-vejenes sol-gate fjernet (≈ 7 min/døgn mørk stue) — ingen vej har den.
-- **2026-10-19 — en knap med to betydninger skal bevise den farlige.**
-  Stue-Styrbar langt NED er både "alt fra" og gæsteknap O (siden 17/10) →
-  Parent A's afgang 04:24 armerede Sleep Over, velkomsten 05:57 blev afvist og
-  radioen kom først 06:13. Nu slippes et NED der SELV armerede, medmindre
-  STUE-radaren ser > 30 s inden for 5 min (gæster: 89-300 s, afgangen 0 s);
-  radioen re-armes på slippet (#4). B240.
 - **2026-10-20 — et spørgsmål du kender svaret på er støj.** 699 pushes på 14
   dage: aktivitets-træneren spurgte om gæt med 8/8 rigtige, "Nattens vejr" kom 3×
   med samme tekst. Nu spørger trænerne kun når gættets seneste svar er i tvivl
   (`scripts/trainer_tvivl.py`, `trainer_sikker_*`), vejret kun igen ved ændring,
   og tekster får danske navne + decimal-komma fra `custom_templates/tekst.jinja`. B241.
+- **2026-10-21 — en regel der vogter DELE af tallet, vogter ikke tallet.**
+  "Kun ned ved hoveddøren" lækkede 51 gange på 14 døgn: v5 låste familie- og
+  ekstra-delen, mens Dormant, geofence-exit, familie-vækst, rå zoner og manuel-
+  udløb sænkede det VISTE tal. v6: ét holdt tal, ned kun i dør-vinduet; tjek
+  `ha_health.sh people`. Samme dag: bad-boksen beviser ≥ 2. B245, B246.
+- **2026-10-22 — en dom der lander efter vinduet, er stadig dørens dom.** Dør
+  08:10; et sove-spøgelse holdt buddet på 1 og gen-låste ekstra-gulvet, og
+  Dormant kom 27 s før dør-vinduet lukkede → 1 i et tomt hus hele dagen. Nu
+  sætter Dormant ≤ `people_afgang_dom_minutter` (120) efter døren 0 og rydder
+  ekstra (30 døgn: dommen 35-104 min, første forkerte Dormant 284 min). B246.
 ---
 
 ## 💡 Permanente fakta (destilleret fra arkiverede sprints)
@@ -375,6 +374,14 @@ sprint som ændringen:
 
 ### Andre standing instructions
 
+- **People count falder KUN efter hoveddøren** (user-spec 07-22, gentaget 10-01 og
+  10-21: "again and again … stick to that guess until the main door opens").
+  `sensor.people_estimate` viser ét HOLDT tal (`input_number.people_gulv`): op når
+  buddet har holdt, ned kun i dør-vinduet, ved dørens tom-dom (Dormant ≤
+  `people_afgang_dom_minutter` efter døren → 0, 22/10) eller ved brugerens egen
+  rettelse. Ingen ny vej ned (geofence, Dormant UDEN dør foran, decay, familie-
+  vækst) — for højt rettes ved KILDEN.
+  Bevis: **`./scripts/ha_health.sh people`** (tjekker det viste tal, ikke delene).
 - **Nye problemer** → [BACKLOG.md](BACKLOG.md) i rette kategori med næste ledige
   ID (`python3 scripts/backlog_ids.py --next`; genbruges aldrig). **Løste** →
   "Done" med dato, eller slet hvis trivielt.

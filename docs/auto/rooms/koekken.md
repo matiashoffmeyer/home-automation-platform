@@ -55,7 +55,7 @@ Search keywords: `koekken, kokken`
 
 - `binary_sensor.filmmoerke_koekken` — 6 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_afstand_jitter` — 1 refs in 1 file(s)
-- `binary_sensor.koekken_apollo_bevaegelse_frisk` — 1 refs in 1 file(s)
+- `binary_sensor.koekken_apollo_bevaegelse_frisk` — 3 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_central_zone` — 5 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_central_zone_filtered` — 4 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_frossen_ghost` — 5 refs in 4 file(s)

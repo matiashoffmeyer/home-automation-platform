@@ -9,13 +9,13 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | Entity | Files | Refs |
 |---|---|---|
 | `input_select.house_mode` | 118 | 282 |
-| `input_select.house_state` | 73 | 235 |
+| `input_select.house_state` | 73 | 237 |
 | `binary_sensor.stue_apollo_occupancy_filtered` | 47 | 118 |
 | `binary_sensor.entre_valhorn_occupancy` | 47 | 105 |
 | `light.spisestue_loft` | 46 | 120 |
 | `script.push_notify` | 45 | 97 |
 | `binary_sensor.sovevaerelse_apollo_occupancy` | 45 | 90 |
-| `binary_sensor.boernevaerelse_apollo_occupancy` | 44 | 118 |
+| `binary_sensor.boernevaerelse_apollo_occupancy` | 44 | 117 |
 | `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 110 |
 | `input_boolean.godnat_active` | 43 | 95 |
 | `light.koekken_lyskaede` | 42 | 187 |
@@ -23,7 +23,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `input_boolean.godnat_boern_active` | 39 | 92 |
 | `binary_sensor.spisestue_apollo_occupancy_filtered` | 39 | 111 |
 | `light.spisestue_pendel` | 38 | 135 |
-| `binary_sensor.badevaerelse_inde_occupancy` | 37 | 127 |
+| `binary_sensor.badevaerelse_inde_occupancy` | 37 | 131 |
 | `light.stue_laesehygge` | 36 | 78 |
 | `light.boernevaerelse_loft` | 36 | 93 |
 | `sensor.open_plan_lux` | 35 | 103 |

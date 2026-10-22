@@ -164,6 +164,11 @@ efter parring. Begge er isolerede sensor-chip failures (ikke ESP-failures):
 - **Boern Apollo (2026-05-19)**: DPS310 temp+pressure chip døde, bekræftet
   via ESPHome boot-log: `[E][dps310:096]: Communication failed`
 
+Senere: **Spisestue Apollo** — DPS310 temp + tryk `unknown` i alle 1 172
+udslag i udslags-loggen siden 2/10 (fundet 2026-10-22, B247; død et sted
+mellem 15/6 og 2/10, ikke tjekket i boot-loggen). DPS310 virker altså kun i sove,
+stue og køkken.
+
 **Root cause** (mistænkt — korrelation, ikke 100% bevis):
 `automation.apollo_global_radar_threshold_tuner_slider_driven` fyrede 181 gange
 på 14 dage selv om slideren aldrig ændrede sig. Hver fire skrev 20 number
