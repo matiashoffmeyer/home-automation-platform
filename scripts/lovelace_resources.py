@@ -23,8 +23,16 @@ WS = "ws://supervisor/core/websocket"
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Kort der skal være registreret. Kun filer vi selv har skrevet.
-LOCAL_CARDS = ["indstillinger-soeg.js", "thread-net-card.js", "zigbee-net-card.js"]
+# Kort der skal være registreret. Kun filer vi selv har skrevet. En fil der
+# ikke findes springes over: lejlighed-geometri.js er plantegningen og er
+# genereret (scripts/lejlighed_kort.py) — den offentlige kopi har den ikke.
+LOCAL_CARDS = [
+    "indstillinger-soeg.js",
+    "lejlighed-kort.js",
+    "lejlighed-geometri.js",
+    "thread-net-card.js",
+    "zigbee-net-card.js",
+]
 
 
 async def main() -> None:
@@ -54,6 +62,9 @@ async def main() -> None:
             return
         for fn in LOCAL_CARDS:
             path = os.path.join(ROOT, "www", fn)
+            if not os.path.exists(path):
+                print(f"mangler  www/{fn} — springes over")
+                continue
             digest = hashlib.sha256(open(path, "rb").read()).hexdigest()[:8]
             url = f"/local/{fn}?v={digest}"
             match = [r for r in existing if r["url"].split("?")[0] == f"/local/{fn}"]

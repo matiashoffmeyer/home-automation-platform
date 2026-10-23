@@ -1617,6 +1617,20 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   kørte ikke tæller som EKSTRA person — men den kan kun trække estimatet til 1,
   aldrig til 0. `roborock_blokerer_lys` duer IKKE som anker: den kræver Dormant
   og er OFF i præcis det scenarie der snyder.
+- **Roborock ser KUN forhindringer mens den gør rent — `app_goto_target` og
+  fjernstyring (`app_rc_*`) registrerer intet og tager ingen fotos** (målt live
+  2026-10-22, foto-optagelse slået til i appen: `cameraStatus` 421 → 3493, bit 10
+  = map-object-foto). Goto kørte lige ind i et par sko; en `app_zoned_clean` over
+  samme felt fandt dem straks (86 %, foto `002aSNI2zGRUF942`). En "rundtur uden
+  at støvsuge" kan derfor ikke bygges på goto/RC — kun på en rigtig rengøring
+  (evt. med sug/mop skruet ned). Under RC opdateres kortets robot-position ikke;
+  negativ `omega` = drej til HØJRE, `velocity` ≤ 0,3 m/s. `avoid_count` nulstilles
+  pr. clean. Fotoet hentes med python-roborocks `ObstaclePhotoTrait.get_photo(
+  photo_name)` (navnet fra `map_data.obstacles_with_photo[].details.photo_name`)
+  inde i `homeassistant`-containeren — HA eksponerer det ikke.
+  **`get_collision_avoid_status` = `{'status': 2}` efter at user slog forsigtig
+  kørsel til i appen** (var 1; 0 = fra; 2 er udokumenteret) → appens valg er
+  facit, `script.roborock_apply_forsigtig` skriver 2.
 
 <!-- flyttet fra CLAUDE.md 2026-09-12 under linje-budget-oprydningen -->
 - **HA Core's shell_command-subproces har en `SUPERVISOR_TOKEN`, men supervisor-proxyen

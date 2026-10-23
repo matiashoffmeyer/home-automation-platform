@@ -110,14 +110,17 @@ input_boolean:
     icon: mdi:robot-vacuum-off
 
   # 2026-07-27 (user-spec): "når robotstøvsugeren kører skal det være med max
-  # forsigtighed så den ikke kører ind i ting" — men KUN når huset er ude/Dormant
-  # (user-valg: hjemme = hurtig clean når der er ryddet op). Killswitch (default
-  # ON) for reaktiv kollisions-undgåelse (obstacle avoidance). Anvendes af
-  # script.roborock_apply_forsigtig — kaldt før hver clean-start (start_quick/
-  # full + måltids-støvsug + airbnb-checkout-restore). ON + ude/Dormant → rå
-  # kommando `set_collision_avoid_status status=1`; hjemme ELLER OFF → status=0.
-  # AirBnB check-ud tvinger status=1 uanset (egen kommando). Snapshot: fanges af
-  # helpers_export (_enabled-suffix).
+  # forsigtighed så den ikke kører ind i ting". Killswitch (default ON) for
+  # reaktiv kollisions-undgåelse (obstacle avoidance). Anvendes af
+  # script.roborock_apply_forsigtig — kaldt før HVER HA-startet clean (start_quick/
+  # full, rum-scripts, måltids-støvsug, morgen-udskyd, AirBnB check-in/-ud).
+  # ON → rå kommando `set_collision_avoid_status status=2` (appens værdi, 22/10);
+  # OFF → status=0.
+  # 2026-10-22 (user-spec "mere forsigtighed tak. på alle støvsugerkørsler som
+  # startes via ha"): hjemme-undtagelsen fra 07-27 (hjemme = hurtig clean) er
+  # FJERNET — 6 fastkørsler 09-27..10-22 (hovedbørste ×4, hjul i luften ×3),
+  # alle på HA-startede kørsler og de fleste mens nogen var hjemme (status 0).
+  # Snapshot: fanges af helpers_export (_enabled-suffix).
   roborock_forsigtig_enabled:
     name: "🤖 Roborock: altid forsigtig (undvig ting på gulvet)"
     icon: mdi:robot-vacuum-alert
@@ -130,6 +133,30 @@ input_boolean:
   roborock_let_stue_enabled:
     name: "🤖 Roborock: let stue-rengøring på mellemdage"
     icon: mdi:sofa-outline
+
+  # 2026-10-22 (user-spec): "d med kun mop, ingen støvsug … når vi er hjemme
+  # skal spejdertur droppes, der må vi hjælpe den. kun spejdertur når vi ikke
+  # er hjemme." Killswitch for spejderturen i script.roborock_start_med_spejder.
+  # OFF = Dormant-kørslen starter direkte som før.
+  # Snapshot: fanges af helpers_export (_enabled-suffix).
+  roborock_spejder_enabled:
+    name: "🤖 Roborock: spejdertur (kun mop) før kørsel i tomt hus"
+    icon: mdi:robot-vacuum-variant-alert
+
+input_text:
+  # Spejderturens tilstand: "<fase>:<epoch for spejder-start>:<hoved-script>".
+  #   spejd = spejderturen kører · fejl = den gik i fejl (hovedkørslen aflyses)
+  #   hoved = hovedkørslen er startet efter den · slut = aflyst/afsluttet
+  # Feltet ryddes ALDRIG til tomt: epoch'en er det eneste der genkender
+  # spejderturens egen rengørings-post (sensor.s8_maxv_ultra_last_clean_begin),
+  # som lander fra skyen op til ~2½ min efter at robotten er docket — efter at
+  # fasen er rykket videre. Uden den ville roborock_fremmed_clean_stamp og
+  # roborock_aktiv_timer_delvis_reduktion bogføre spejderturen som en rengøring.
+  # input_text, fordi dens reload er gratis (ingen input_text har `initial:`).
+  roborock_spejder_fase:
+    name: "Roborock: spejdertur-fase"
+    icon: mdi:map-marker-path
+    max: 120
 
 input_select:
   roborock_session_type:
@@ -180,32 +207,32 @@ input_datetime:
 
 script:
   # 2026-07-27 (user-spec): fælles "anvend forsigtig-mode"-helper. Sætter
-  # robottens reaktive kollisions-undgåelse (obstacle avoidance) status=1 KUN når
-  # killswitchen roborock_forsigtig_enabled er ON OG huset er ude/Dormant
-  # (Dormant-state ELLER ingen voksne+børn hjemme) — ellers status=0 (hurtig
-  # clean når hjemme). Kaldes FØR hver clean-start (start_quick/full + måltids-
-  # støvsug). Genbruger den beviste rå-kommando fra airbnb_checkout (literal
-  # params — ingen templatet dict, jf. fejlklasse #6). Service-kald → parent venter.
+  # robottens reaktive kollisions-undgåelse (obstacle avoidance) status=2 når
+  # killswitchen roborock_forsigtig_enabled er ON, ellers status=0. Siden
+  # 2026-10-22 uanset om nogen er hjemme (se killswitchens kommentar). Kaldes
+  # FØR hver HA-startet clean. Genbruger den beviste rå-kommando fra
+  # airbnb_checkout (literal params — ingen templatet dict, jf. fejlklasse #6).
+  # Service-kald → parent venter.
   roborock_apply_forsigtig:
     alias: "Roborock: anvend forsigtig-mode (collision avoid) efter killswitch"
     icon: mdi:robot-vacuum-alert
     sequence:
       - if:
           - condition: template
-            # Forsigtig KUN når huset er ude/Dormant (user-valg 2026-07-27):
-            # tomt hus → undvig ting på gulvet; hjemme → hurtig clean (status 0).
+            # Killswitchen alene afgør (2026-10-22) — hjemme/ude er ligegyldigt.
             value_template: >-
-              {{ is_state('input_boolean.roborock_forsigtig_enabled', 'on')
-                 and (is_state('input_select.house_state', 'Dormant')
-                      or (is_state('input_boolean.parent_a_home', 'off')
-                          and is_state('input_boolean.parent_b_home', 'off')
-                          and is_state('binary_sensor.kids_home', 'off'))) }}
+              {{ is_state('input_boolean.roborock_forsigtig_enabled', 'on') }}
         then:
+          # status 2, ikke 1: målt 22/10 (get_collision_avoid_status) efter at
+          # user slog forhindrings-foto + undvigelse til i Roborock-appen, gik
+          # robotten 1 → 2. Appens valg er facit — et 1 her ville rulle det
+          # tilbage før hver kørsel. Semantikken af 2 er udokumenteret i
+          # python-roborock; 0 = fra.
           - service: vacuum.send_command
             target: {entity_id: vacuum.s8_maxv_ultra}
             data:
               command: set_collision_avoid_status
-              params: {"status": 1}
+              params: {"status": 2}
         else:
           - service: vacuum.send_command
             target: {entity_id: vacuum.s8_maxv_ultra}
@@ -342,6 +369,18 @@ script:
     alias: "Roborock: LET rengøring af stuen (segment, kun støvsug)"
     icon: mdi:sofa-outline
     sequence:
+      # Tomt hus → spejdertur (mild mop) først; roborock_spejder_videre kalder
+      # dette script igen bagefter, og så svarer spejderen `koer`.
+      - service: script.roborock_spejdertur_rum
+        data:
+          segmenter: [16]
+          efter: script.roborock_start_let_stue
+        response_variable: spejder
+      - if:
+          - condition: template
+            value_template: "{{ spejder.handling | default('koer') != 'koer' }}"
+        then:
+          - stop: "Spejdertur først (eller en er i gang)"
       - service: select.select_option
         target: {entity_id: select.s8_maxv_ultra_mop_intensity}
         data: {option: "off"}
@@ -373,6 +412,317 @@ script:
           message: >-
             LET rengøring: Living room støvsuges (mop off, balanced) —
             mellemdag, hel-hus-rengøring er ikke forfalden endnu.
+
+  # ---------------------------------------------------------------------------
+  # Spejdertur (2026-10-22, user-spec) — kun mop, ingen sug, før en hel-hus-
+  # kørsel i et TOMT hus. Er nogen hjemme, droppes den ("der må vi hjælpe den").
+  # ---------------------------------------------------------------------------
+  # Hvorfor kun mop: robotten registrerer forhindringer (og fotograferer dem)
+  # KUN mens den gør rent — goto og fjernstyring ser intet (målt 22/10). En
+  # mop-tur er den rengøring der kommer tættest på "kør rundt uden at
+  # støvsuge". Sidder den fast under spejderturen, aflyses hovedkørslen
+  # (roborock_spejder_videre); fejl-pushen siger allerede hvor.
+  # Målt 22/10: `fan_speed: off` HOLDER efter mop-skrivningerne (fan 105,
+  # vand 202) — og en mop-tur kører først til dokken og vasker mop'pen.
+  # Batteri: en fuld kørsel bruger ~30 % (100 → 68-71, 56-59 min, 21 døgn),
+  # og hovedkørslen starter først når robotten har ladet i ≥ 1 min.
+  #
+  # Her: kun foran hel-hus-scripts. Kaldes af roborock_dormant_start og
+  # godkendelses-handleren (roborock_dormant_godkend.yaml). Rum-rengøringer
+  # (kø, let stue-tur, måltid) spejder via script.roborock_spejdertur_rum.
+  roborock_start_med_spejder:
+    alias: "Roborock: start kørsel — med spejdertur (kun mop) først hvis huset er tomt"
+    icon: mdi:map-marker-path
+    mode: single
+    fields:
+      start_script:
+        description: "Hovedkørslens script, fx script.roborock_start_full"
+        example: script.roborock_start_full
+    sequence:
+      - variables:
+          hoved: "{{ start_script | default('script.roborock_start_full') }}"
+          spejd: >-
+            {{ is_state('input_boolean.roborock_spejder_enabled', 'on')
+               and is_state('binary_sensor.roborock_ingen_hjemme', 'on')
+               and hoved in ['script.roborock_start_full',
+                             'script.roborock_start_max',
+                             'script.roborock_start_quick'] }}
+      - if:
+          - condition: template
+            value_template: "{{ spejd }}"
+        then:
+          # Fasen FØR session-flaget, så session_completed aldrig ser en
+          # spejder-session uden fase (den springer fase spejd/fejl over).
+          # Robottens profil (sug:mop-styrke:mop-mode) gemmes med, så en
+          # aflyst hovedkørsel ikke efterlader den i kun-mop til næste
+          # app-start (roborock_spejder_aflys gengiver den).
+          - service: input_text.set_value
+            target: {entity_id: input_text.roborock_spejder_fase}
+            data:
+              value: >-
+                spejd:{{ now().timestamp() | int }}:{{ hoved
+                }}:{{ state_attr('vacuum.s8_maxv_ultra', 'fan_speed') | default('balanced', true)
+                }}:{{ states('select.s8_maxv_ultra_mop_intensity')
+                }}:{{ states('select.s8_maxv_ultra_mop_mode') }}
+          - service: input_boolean.turn_on
+            target: {entity_id: input_boolean.roborock_session_active}
+          # Sug + mop er ÉN tilstand: mop først, sug (off) SIDST.
+          - service: select.select_option
+            target: {entity_id: select.s8_maxv_ultra_mop_mode}
+            data: {option: standard}
+          # Mildeste mop-styrke (user-spec 22/10) — turen skal finde ting,
+          # ikke vaske gulvet.
+          - service: select.select_option
+            target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+            data: {option: mild}
+          - service: vacuum.set_fan_speed
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data: {fan_speed: "off"}
+          - service: script.roborock_apply_forsigtig
+          - service: vacuum.start
+            target: {entity_id: vacuum.s8_maxv_ultra}
+          # app_start bruger robottens gemte profil — profilen re-sættes efter
+          # start, samme bælte-og-seler som roborock_start_max.
+          - delay: "00:00:05"
+          - service: select.select_option
+            target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+            data: {option: mild}
+          - service: vacuum.set_fan_speed
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data: {fan_speed: "off"}
+          - service: logbook.log
+            data:
+              name: "Roborock"
+              message: >-
+                Spejdertur startet (mild mop, ingen sug) — huset er tomt.
+                Bagefter: {{ hoved }}.
+        else:
+          - service: "{{ hoved }}"
+
+  # Spejdertur før RUM-rengøringer (user-spec 22/10: "spejdertur skal også
+  # ske ved rum rengøring når vi ikke er hjemme"). Kaldes FØRST af hver
+  # segment-vej — rum-køen, den lette stue-tur og måltids-støvsugningen — og
+  # svarer `handling`:
+  #   koer  = kør rengøringen nu (nogen hjemme, slået fra, eller rummene er
+  #           allerede spejdet i dette tomme hus)
+  #   spejd = spejderturen er startet; roborock_spejder_videre kalder `efter`
+  #           igen når den er hjemme uden fejl
+  #   vent  = en spejdertur er i gang; kalderen stopper (køen prøver igen)
+  # "Allerede spejdet" = fasen er `hoved` for samme `efter`, alle rum var med,
+  # og huset har været tomt UAFBRUDT siden spejderturen startede. Kom nogen
+  # hjem imellem, kan der ligge nye ting → spejd igen. ÉT sted for reglen
+  # (fejlklasse #2) — kalderne kender kun svaret.
+  # Fase: `spejd:<epoch>:<efter>:<sug>:<mop-styrke>:<mop-rute>:<seg-seg-…>`.
+  roborock_spejdertur_rum:
+    alias: "Roborock: spejdertur (mild mop) før rum-rengøring i tomt hus"
+    icon: mdi:map-marker-path
+    mode: queued
+    fields:
+      segmenter:
+        description: "Segmenterne rengøringen gælder, fx [16, 23]"
+        example: "[16]"
+      efter:
+        description: "Scriptet der kører rengøringen (kaldes igen efter spejderturen)"
+        example: script.roborock_rum_koe_kick
+    sequence:
+      - variables:
+          segs: >-
+            {% set ns = namespace(o=[]) %}
+            {% for s in (segmenter | default([], true)) %}
+              {% if s | int(0) > 0 and (s | int(0)) not in ns.o %}
+                {% set ns.o = ns.o + [s | int(0)] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.o }}
+          hvem: "{{ efter | default('', true) }}"
+          handling: >-
+            {% set d = states('input_text.roborock_spejder_fase').split(':') %}
+            {% set t0 = (d[1] | int(0)) if d | count > 1 else 0 %}
+            {% set alder = now().timestamp() - t0 %}
+            {% set ih = states.binary_sensor.roborock_ingen_hjemme %}
+            {% set spejdet = (d[6].split('-') | map('int') | list) if d | count > 6 else [] %}
+            {% set ns = namespace(alle=segs | count > 0) %}
+            {% for s in segs %}
+              {% if s not in spejdet %}{% set ns.alle = false %}{% endif %}
+            {% endfor %}
+            {% set godkendt = d[0] == 'hoved' and d | count > 6 and d[2] == hvem
+                 and ns.alle and alder < 21600
+                 and ih is not none and as_timestamp(ih.last_changed) <= t0 %}
+            {% if d[0] in ['spejd', 'fejl'] and alder < 21600 %}vent
+            {% elif not is_state('input_boolean.roborock_spejder_enabled', 'on')
+                 or not is_state('binary_sensor.roborock_ingen_hjemme', 'on')
+                 or segs | count == 0 or hvem == '' or godkendt %}koer
+            {% else %}spejd{% endif %}
+      - if:
+          - condition: template
+            value_template: "{{ handling == 'spejd' }}"
+        then:
+          # Profilen gemmes med (gengives af roborock_spejder_aflys), og
+          # fasen skrives FØR kommandoen — kalderen ser `vent` fra nu af.
+          - service: input_text.set_value
+            target: {entity_id: input_text.roborock_spejder_fase}
+            data:
+              value: >-
+                spejd:{{ now().timestamp() | int }}:{{ hvem
+                }}:{{ state_attr('vacuum.s8_maxv_ultra', 'fan_speed') | default('balanced', true)
+                }}:{{ states('select.s8_maxv_ultra_mop_intensity')
+                }}:{{ states('select.s8_maxv_ultra_mop_mode')
+                }}:{{ segs | join('-') }}
+          # Mop først, sug (off) SIDST — mildeste mop-styrke (user-spec 22/10).
+          - service: select.select_option
+            target: {entity_id: select.s8_maxv_ultra_mop_mode}
+            data: {option: standard}
+          - service: select.select_option
+            target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+            data: {option: mild}
+          - service: vacuum.set_fan_speed
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data: {fan_speed: "off"}
+          - service: script.roborock_apply_forsigtig
+          # Samme stempel som rum-køen: roborock_fremmed_clean_stamp springer
+          # en HA-startet segment-kørsel over.
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.roborock_segment_clean_at}
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - service: vacuum.send_command
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data:
+              command: app_segment_clean
+              params: "{{ [ {'segments': segs, 'repeat': 1} ] }}"
+          # app_segment_clean bruger robottens gemte profil — re-sæt.
+          - delay: "00:00:05"
+          - service: select.select_option
+            target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+            data: {option: mild}
+          - service: vacuum.set_fan_speed
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data: {fan_speed: "off"}
+          - service: logbook.log
+            data:
+              name: "Roborock"
+              message: >-
+                {% set m = state_attr('sensor.roborock_rum_kort', 'rum') | default({}, true) %}
+                {% set ns = namespace(o=[]) %}
+                {% for s in segs %}
+                  {% set ns.o = ns.o + [ m.get(s | string, 'Segment ' ~ s) ] %}
+                {% endfor %}
+                Spejdertur startet (mild mop, ingen sug): {{ ns.o | unique | join(', ') }}
+                — huset er tomt. Bagefter: {{ hvem }}.
+      - variables:
+          svar: "{{ {'handling': handling} }}"
+      - stop: "Spejder-afgørelse"
+        response_variable: svar
+
+  # Spejderturen endte uden hovedkørsel (fejl, nogen kom hjem, for sent): luk
+  # en hel-hus-session og læg robottens gemte profil tilbage. Var det rum-
+  # køens spejdertur, fjernes de spejdede rum fra køen (ellers spejdede den
+  # igen og igen) + push — de var bestilt af et tryk. Ét sted, så aflysnings-
+  # vejene i roborock_spejder_videre ikke divergerer (fejlklasse #2).
+  roborock_spejder_aflys:
+    alias: "Roborock: spejdertur — aflys hovedkørslen og ryd op"
+    icon: mdi:map-marker-remove
+    mode: queued
+    fields:
+      hvorfor:
+        description: "Kort grund til logbogen"
+        example: "nogen kom hjem"
+    sequence:
+      - variables:
+          dele: "{{ states('input_text.roborock_spejder_fase').split(':') }}"
+          gyldig: "{{ dele | count >= 6 and dele[0] in ['spejd', 'fejl'] }}"
+          fan: "{{ dele[3] if gyldig and dele[3] not in ['unknown', 'unavailable', ''] else 'balanced' }}"
+          mop_int: "{{ dele[4] if gyldig and dele[4] not in ['unknown', 'unavailable', ''] else 'standard' }}"
+          mop_mode: "{{ dele[5] if gyldig and dele[5] not in ['unknown', 'unavailable', ''] else 'standard' }}"
+          efter: "{{ dele[2] if gyldig else '' }}"
+          spejdet: >-
+            {{ (dele[6].split('-') | map('int') | list) if gyldig and dele | count > 6 else [] }}
+          grund: "{{ hvorfor | default('ukendt') }}"
+      - service: input_text.set_value
+        target: {entity_id: input_text.roborock_spejder_fase}
+        data:
+          value: >-
+            {% set f = states('input_text.roborock_spejder_fase') %}
+            slut:{{ f.split(':', 1)[1] if ':' in f else '0' }}
+      # Kun hel-hus-spejderturen åbner en session; en rum-spejdertur må ikke
+      # lukke en session den ikke ejer.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ not gyldig or efter in ['script.roborock_start_full',
+                                         'script.roborock_start_max',
+                                         'script.roborock_start_quick'] }}
+        then:
+          - service: input_boolean.turn_off
+            target: {entity_id: input_boolean.roborock_session_active}
+          - service: input_select.select_option
+            target: {entity_id: input_select.roborock_session_type}
+            data: {option: none}
+      # Mop først, sug SIDST (sug + mop er én tilstand).
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+        data: {option: "{{ mop_int }}"}
+        continue_on_error: true
+      - service: select.select_option
+        target: {entity_id: select.s8_maxv_ultra_mop_mode}
+        data: {option: "{{ mop_mode }}"}
+        continue_on_error: true
+      - service: vacuum.set_fan_speed
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data: {fan_speed: "{{ fan }}"}
+        continue_on_error: true
+      - if:
+          - condition: template
+            value_template: "{{ efter == 'script.roborock_rum_koe_kick' and spejdet | count > 0 }}"
+        then:
+          # Køen deles i det der bliver og det der fjernes, i ÉN blok
+          # (variablen er en liste, aldrig en rå kø-streng).
+          - variables:
+              deling: >-
+                {% set q = states('input_text.roborock_rum_koe') %}
+                {% set jobs = [] if q in ['unknown', 'unavailable', 'none', '', '-']
+                              else q.split(',') | reject('eq', '') | list %}
+                {% set ns = namespace(bliver=[], ud=[]) %}
+                {% for j in jobs %}
+                  {% if (j.split(':')[0] | int(0)) in spejdet %}
+                    {% set ns.ud = ns.ud + [j.split(':')[0] | int(0)] %}
+                  {% else %}
+                    {% set ns.bliver = ns.bliver + [j] %}
+                  {% endif %}
+                {% endfor %}
+                {{ {'bliver': ns.bliver, 'ud': ns.ud | unique | list} }}
+              navne: >-
+                {% set m = state_attr('sensor.roborock_rum_kort', 'rum') | default({}, true) %}
+                {% set ns = namespace(o=[]) %}
+                {% for s in deling.ud %}
+                  {% set ns.o = ns.o + [ m.get(s | string, 'Segment ' ~ s) ] %}
+                {% endfor %}
+                {{ ns.o | unique | join(', ') }}
+          - service: input_text.set_value
+            target: {entity_id: input_text.roborock_rum_koe}
+            data:
+              value: "{{ deling.bliver | join(',') }}"
+          - service: input_text.set_value
+            target: {entity_id: input_text.roborock_rum_koe_nu}
+            data: {value: ""}
+          - if:
+              - condition: template
+                value_template: "{{ deling.ud | count > 0 }}"
+            then:
+              - service: script.push_notify
+                continue_on_error: true
+                data:
+                  notif_id: roborock
+                  title: "🧹 Rum-rengøring aflyst"
+                  message: >-
+                    {{ navne }} blev ikke gjort rent: {{ grund }}. Tryk igen
+                    når robotten er fri.
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: >-
+            Spejdertur slut uden hovedkørsel ({{ grund }}) — hovedkørslen er
+            aflyst, profilen lagt tilbage ({{ fan }} / {{ mop_int }} / {{ mop_mode }}).
 
   roborock_stop_dock:
     alias: "Roborock: stop + retur til dock (tæller ikke som completed)"
@@ -688,8 +1038,17 @@ automation:
           # input_select.roborock_auto_dormant_handling, kan do_full stadig være
           # sand, og beskeden ville love en mop-tur der ikke kommer. Beskeden
           # skal love det der kører (fejlklasse #2).
+          # Spejderturen (kun mop) kører foran hel-hus-kørslerne når den er
+          # slået til — huset er per definition tomt her. Beslutningen tages
+          # igen i script.roborock_start_med_spejder (fejlklasse #27).
           valgt_plan: >-
-            {{ {'script.roborock_start_full': 'Hele huset — støvsug + mop',
+            {{ 'Spejdertur (kun mop) først, så '
+               if is_state('input_boolean.roborock_spejder_enabled', 'on')
+                  and valgt_script in ['script.roborock_start_full',
+                                       'script.roborock_start_max',
+                                       'script.roborock_start_quick',
+                                       'script.roborock_start_let_stue']
+               else '' }}{{ {'script.roborock_start_full': 'Hele huset — støvsug + mop',
                 'script.roborock_start_max': 'Hele huset — grundig (kraftigst)',
                 'script.roborock_start_quick': 'Hele huset — kun støvsug',
                 'script.roborock_start_let_stue': 'Let tur i stuen — kun støvsug'}
@@ -708,7 +1067,9 @@ automation:
                     Dormant-start (godkendelse slået fra) efter
                     {{ states('sensor.roborock_aktive_timer_siden_rengoring') }}
                     vægtede aktiv-timer → {{ valgt_script }} ({{ grund }}).
-              - service: "{{ valgt_script }}"
+              - service: script.roborock_start_med_spejder
+                data:
+                  start_script: "{{ valgt_script }}"
         default:
           - service: script.roborock_godkend_spoerg
             data:
@@ -878,6 +1239,200 @@ automation:
             Dormant — robotten sendt på plads før nogen når ind ad døren.
 
   # ---------------------------------------------------------------------------
+  # 2c) Spejderturen er slut → hovedkørslen, eller aflys (2026-10-22)
+  # ---------------------------------------------------------------------------
+  # Tilstanden bor i input_text.roborock_spejder_fase (se
+  # roborock_start_med_spejder og roborock_spejdertur_rum), ikke i en ventende
+  # `for:` — en HA-restart midt i spejderturen må ikke efterlade huset i limbo.
+  # /5-backstoppen tager alt hvad flankerne misser.
+  #
+  # "Spejderturen er færdig" = robotten har ladet i ≥ 1 min OG dens egen
+  # rengørings-post med start ≈ spejder-start er landet. Posten skrives først
+  # når kørslen slutter (målt 21-22/10: 2-17 s efter returning_home), så en
+  # opladning MIDT i spejderturen ligner ikke en færdig tur.
+  #
+  # To slags efter-kørsel (felt 3 i fasen):
+  #   • AUTO (hel-hus, let stue-tur): kører kun hvis huset stadig er tomt,
+  #     før kl. 21, ikke AirBnB, ikke pauset — ellers aflyses den.
+  #   • BESTILT (rum-køen, måltid): kører uanset hvem der er hjemme. Kom
+  #     nogen hjem, aflyser en fejl IKKE — "der må vi hjælpe den" (user-spec
+  #     22/10); rengøringen kører når robotten er hjemme igen.
+  - id: roborock_spejder_videre
+    alias: "Roborock: spejdertur slut → hovedkørsel (eller aflys)"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_status
+        to: "charging"
+        for: "00:01:00"
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_status
+        to: "error"
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_last_clean_end
+      - platform: state
+        entity_id: input_boolean.roborock_session_active
+        to: "off"
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: template
+        value_template: >-
+          {% set f = states('input_text.roborock_spejder_fase') %}
+          {{ f.startswith('spejd:') or f.startswith('fejl:') }}
+    action:
+      - variables:
+          fase: "{{ states('input_text.roborock_spejder_fase').split(':')[0] }}"
+          t0: "{{ states('input_text.roborock_spejder_fase').split(':')[1] | int(0) }}"
+          hoved: >-
+            {% set d = states('input_text.roborock_spejder_fase').split(':') %}
+            {{ d[2] if d | count > 2 else 'script.roborock_start_full' }}
+          med_session: >-
+            {{ hoved in ['script.roborock_start_full', 'script.roborock_start_max',
+                         'script.roborock_start_quick'] }}
+          bestilt: >-
+            {{ hoved in ['script.roborock_rum_koe_kick',
+                         'script.maaltid_stovsug_living_room'] }}
+          fejl_nu: >-
+            {{ is_state('sensor.s8_maxv_ultra_status', 'error')
+               or states('sensor.s8_maxv_ultra_vacuum_error')
+                  not in ['none', 'ok', 'unknown', 'unavailable'] }}
+          i_dock: >-
+            {{ is_state('sensor.s8_maxv_ultra_status', 'charging')
+               and (now() - states.sensor.s8_maxv_ultra_status.last_changed)
+                   .total_seconds() >= 60 }}
+          post_landet: >-
+            {% set b = as_timestamp(states('sensor.s8_maxv_ultra_last_clean_begin'), 0) %}
+            {% set e = as_timestamp(states('sensor.s8_maxv_ultra_last_clean_end'), 0) %}
+            {{ b > 0 and (b - t0) | abs < 300 and e >= b }}
+          # Robottens status har ikke rørt sig siden før spejder-kommandoen —
+          # den tog aldrig imod den. (last_changed nulstilles ved restart →
+          # så falder vi bare igennem til 3-timers-grenen.)
+          aldrig_startet: >-
+            {{ as_timestamp(states.sensor.s8_maxv_ultra_status.last_changed) < t0
+               and now().timestamp() - t0 > 900 }}
+          tomt: "{{ is_state('binary_sensor.roborock_ingen_hjemme', 'on') }}"
+          hjaelp: "{{ bestilt and not is_state('binary_sensor.roborock_ingen_hjemme', 'on') }}"
+          tid_ok: "{{ 8 <= now().hour < 21 }}"
+          ikke_airbnb: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+          ikke_pauset: "{{ is_state('input_boolean.roborock_auto_paused', 'off') }}"
+          batteri_ok: "{{ states('sensor.s8_maxv_ultra_battery') | int(0) >= 30 }}"
+      - choose:
+          # Hel-hus-sessionen er lukket under spejderturen — en hjemkomst-/
+          # Dormant-guard har docket robotten. Hjemme = ingen spejdertur.
+          - conditions:
+              - condition: template
+                value_template: "{{ med_session }}"
+              - condition: state
+                entity_id: input_boolean.roborock_session_active
+                state: "off"
+            sequence:
+              - service: script.roborock_spejder_aflys
+                data: {hvorfor: "afbrudt — nogen kom hjem eller den blev stoppet"}
+          # Fast under spejderturen → hovedkørslen aflyses, når den er hjemme.
+          # Fejl-pushen (roborock_varsler) siger allerede hvor den sidder.
+          - conditions:
+              - condition: template
+                value_template: "{{ fase == 'spejd' and fejl_nu }}"
+            sequence:
+              - service: input_text.set_value
+                target: {entity_id: input_text.roborock_spejder_fase}
+                data:
+                  value: >-
+                    {% set f = states('input_text.roborock_spejder_fase') %}
+                    fejl:{{ f.split(':', 1)[1] }}
+              - service: logbook.log
+                data:
+                  name: "Roborock"
+                  message: >-
+                    Spejderturen gik i fejl
+                    ({{ states('sensor.s8_maxv_ultra_vacuum_error') }}) —
+                    {{ 'nogen er hjemme og kan hjælpe den; rengøringen kører bagefter'
+                       if hjaelp else 'hovedkørslen aflyses når robotten er hjemme igen' }}.
+          - conditions:
+              - condition: template
+                value_template: "{{ fase == 'fejl' and i_dock and not hjaelp }}"
+            sequence:
+              - service: script.roborock_spejder_aflys
+                data: {hvorfor: "spejderturen sad fast"}
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ (fase == 'spejd' or (fase == 'fejl' and hjaelp))
+                     and i_dock and post_landet }}
+            sequence:
+              - variables:
+                  # Rum-køen kan være tømt under spejderturen → aflys, så
+                  # profilen ikke bliver stående på kun-mop.
+                  koe_tom: >-
+                    {{ hoved == 'script.roborock_rum_koe_kick'
+                       and states('input_text.roborock_rum_koe')
+                           in ['unknown', 'unavailable', 'none', '', '-'] }}
+                  maa_koere: >-
+                    {{ (bestilt and not koe_tom)
+                       or (not bestilt and tomt and tid_ok and ikke_airbnb and ikke_pauset) }}
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ maa_koere and batteri_ok and not fejl_nu }}"
+                    sequence:
+                      # Fasen FØR kaldet — /5-backstoppen må ikke starte to.
+                      - service: input_text.set_value
+                        target: {entity_id: input_text.roborock_spejder_fase}
+                        data:
+                          value: >-
+                            {% set f = states('input_text.roborock_spejder_fase') %}
+                            hoved:{{ f.split(':', 1)[1] }}
+                      - service: logbook.log
+                        data:
+                          name: "Roborock"
+                          message: >-
+                            Spejderturen er færdig uden fejl
+                            ({{ ((as_timestamp(states('sensor.s8_maxv_ultra_last_clean_end'), 0)
+                                  - as_timestamp(states('sensor.s8_maxv_ultra_last_clean_begin'), 0))
+                                 / 60) | round(0) | int }} min) — starter {{ hoved }}.
+                      - service: "{{ hoved }}"
+                  # Huset/tiden/mode siger nej → aflys. Mangler KUN batteri,
+                  # rammer ingen gren, og næste tick prøver igen.
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ not maa_koere }}"
+                    sequence:
+                      - service: script.roborock_spejder_aflys
+                        data:
+                          hvorfor: >-
+                            {{ 'køen blev tømt under spejderturen' if bestilt
+                               else 'nogen er hjemme' if not tomt
+                               else 'efter kl. 21' if not tid_ok
+                               else 'AirBnB' if not ikke_airbnb
+                               else 'auto-rengøring er sat på pause' }}
+          - conditions:
+              - condition: template
+                value_template: "{{ aldrig_startet }}"
+            sequence:
+              - service: script.roborock_spejder_aflys
+                data: {hvorfor: "robotten startede aldrig spejderturen"}
+          # Posten kom aldrig fra skyen → giv op efter 3 t i stedet for at
+          # holde sessionen åben for evigt.
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ i_dock and not post_landet
+                     and now().timestamp() - t0 > 10800 }}
+            sequence:
+              - service: script.roborock_spejder_aflys
+                data: {hvorfor: "ingen rengørings-post fra skyen efter 3 t"}
+          # Sidste udgang: en fase der hænger i 6 t (fx fast uden for dokken
+          # i et tomt hus) må ikke blokere rum-køen for evigt.
+          - conditions:
+              - condition: template
+                value_template: "{{ now().timestamp() - t0 > 21600 }}"
+            sequence:
+              - service: script.roborock_spejder_aflys
+                data: {hvorfor: "spejderturen hang i 6 timer"}
+
+  # ---------------------------------------------------------------------------
   # 3) Robotten færdig af sig selv → stamp completed
   # ---------------------------------------------------------------------------
   - id: roborock_session_completed
@@ -901,6 +1456,12 @@ automation:
       - condition: template
         value_template: >-
           {{ states('sensor.s8_maxv_ultra_vacuum_error') in ['none', 'ok'] }}
+      # Spejderturen (kun mop) er ikke en rengøring — dens dokning ejes af
+      # roborock_spejder_videre, som starter hovedkørslen eller aflyser.
+      - condition: template
+        value_template: >-
+          {% set f = states('input_text.roborock_spejder_fase') %}
+          {{ not (f.startswith('spejd:') or f.startswith('fejl:')) }}
     action:
       - variables:
           was_full: "{{ is_state('input_select.roborock_session_type', 'full') }}"
@@ -1027,6 +1588,14 @@ automation:
           {% else %}
             {{ ((as_timestamp(b, 0) - (seg | float(0))) | abs) >= 300 }}
           {% endif %}
+      # Ikke spejderturen (kun mop, 2026-10-22): en aflyst spejdertur lukker
+      # sessionen, og dens post lander bagefter — den er ingen rengøring.
+      - condition: template
+        value_template: >-
+          {% set t0 = states('input_text.roborock_spejder_fase').split(':')[1] | int(0)
+             if ':' in states('input_text.roborock_spejder_fase') else 0 %}
+          {% set b = as_timestamp(states('sensor.s8_maxv_ultra_last_clean_begin'), 0) %}
+          {{ t0 <= 0 or b <= 0 or (b - t0) | abs >= 300 }}
       # Kun ét stempel pr. rengøring: slut-tiden skal være nyere end stemplet.
       - condition: template
         value_template: >-

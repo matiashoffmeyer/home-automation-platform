@@ -8,12 +8,12 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 
 | Entity | Files | Refs |
 |---|---|---|
-| `input_select.house_mode` | 118 | 282 |
-| `input_select.house_state` | 73 | 237 |
+| `input_select.house_mode` | 118 | 283 |
+| `input_select.house_state` | 73 | 236 |
 | `binary_sensor.stue_apollo_occupancy_filtered` | 47 | 118 |
 | `binary_sensor.entre_valhorn_occupancy` | 47 | 105 |
 | `light.spisestue_loft` | 46 | 120 |
-| `script.push_notify` | 45 | 97 |
+| `script.push_notify` | 45 | 98 |
 | `binary_sensor.sovevaerelse_apollo_occupancy` | 45 | 90 |
 | `binary_sensor.boernevaerelse_apollo_occupancy` | 44 | 117 |
 | `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 110 |
