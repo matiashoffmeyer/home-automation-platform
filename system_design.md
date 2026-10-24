@@ -53,7 +53,8 @@ Der er **9 room_mode-ankre** (`input_select.room_mode_<rum>`, `packages/room_mod
     kaldte dem.
 - **Hvad sætter Manual:**
   1. Ethvert Styrbar-tryk via `script.styrbar_stamp_press`. Det stempler
-     `input_datetime.styrbar_last_press_<rum>`.
+     `input_datetime.styrbar_last_press_<rum>`. Undtagelse: et stue-trin op
+     der KUN ramte køkken-lyskæden stempler køkkenet, ikke stuen (2026-10-24).
   2. App-/dashboard-justeringer med `user_id` (`automations/manual_override.yaml`).
      Terrassen er udeladt, og der stemples kun når nogen er hjemme.
   3. Gæste-RODRET, entré-Styrbar og ~15 andre skrivere

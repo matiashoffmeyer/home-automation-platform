@@ -42,8 +42,8 @@ Implementeret i [packages/activity_state.yaml](../packages/activity_state.yaml).
 
 ```
               ┌─────────────┐
-              │ godnat_active│ → "godnat"
-              │   == on?     │
+              │ voksen-/fuld │ → "godnat"   (2026-10-23: børne-putning
+              │ godnat on?   │               tæller IKKE — kun active/voksne/pending)
               └──────┬───────┘
                      │ no
               ┌──────▼───────┐

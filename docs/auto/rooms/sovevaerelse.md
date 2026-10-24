@@ -6,7 +6,7 @@ Search keywords: `sovevaerelse, sove`
 
 ## Indhold
 - [Automations](sovevaerelse.md#automations) (37)
-- [Entities](sovevaerelse.md#entities) (225)
+- [Entities](sovevaerelse.md#entities) (227)
 - [Helpers](sovevaerelse.md#helpers) (83)
 
 ---
@@ -62,8 +62,8 @@ Search keywords: `sovevaerelse, sove`
 
 ### `automations/presence_lights.yaml`
 
-- **Lysnet: Soveværelse tænd ved LUX-fald** (line 462, mode=single)
-- **Lysnet: Soveværelse sluk ved LUX-stigning** (line 943, mode=single)
+- **Lysnet: Soveværelse tænd ved LUX-fald** (line 463, mode=single)
+- **Lysnet: Soveværelse sluk ved LUX-stigning** (line 944, mode=single)
   - Dagslys tilbage i soveværelset mens sove-pendlen står tændt — blid fade off.
 
 ### `automations/presence_sovevaerelse.yaml`
@@ -129,6 +129,8 @@ Search keywords: `sovevaerelse, sove`
 - `automation.godnat_auto_declare_efter_2t_kun_sovevaerelse_presence` — 3 refs in 2 file(s)
 - `automation.godnat_born_oppe_i_stuen_foraeldre_sover_stadig` — 2 refs in 1 file(s)
 - `automation.lysnet_sovevaerelse_gang_early_detect_hurtig_sluk` — 1 refs in 1 file(s)
+- `automation.lysnet_sovevaerelse_gradvis_sluk` — 1 refs in 1 file(s)
+- `automation.lysnet_sovevaerelse_no_motion_watchdog_spogelses_still` — 1 refs in 1 file(s)
 - `automation.lysnet_sovevaerelse_sluk_ved_lux_stigning` — 1 refs in 1 file(s)
 - `automation.lysnet_sovevaerelse_taend` — 1 refs in 1 file(s)
 - `automation.vaekning_sove_sluk_dim_15_min_efter_wakeup_smart_lux` — 2 refs in 1 file(s)
@@ -136,7 +138,7 @@ Search keywords: `sovevaerelse, sove`
 ### `binary_sensor.*`
 
 - `binary_sensor.dark_mode_sove` — 2 refs in 2 file(s)
-- `binary_sensor.filmmoerke_sove` — 11 refs in 6 file(s)
+- `binary_sensor.filmmoerke_sove` — 12 refs in 6 file(s)
 - `binary_sensor.mood_pause_sovevaerelse` — 3 refs in 2 file(s)
 - `binary_sensor.parasoll_sovedoer` — 15 refs in 4 file(s)
 - `binary_sensor.sove_aften_laasevindue` — 2 refs in 2 file(s)
@@ -158,7 +160,7 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sovevaerelse_apollo_radar_zone_1_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_zone_2_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_zone_3_occupancy` — 1 refs in 1 file(s)
-- `binary_sensor.sovevaerelse_dvale_vidne` — 10 refs in 6 file(s)
+- `binary_sensor.sovevaerelse_dvale_vidne` — 13 refs in 7 file(s)
 - `binary_sensor.sovevaerelse_empty_effective` — 2 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_lys_on_effektiv` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv` — 38 refs in 16 file(s)
@@ -203,7 +205,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_boolean.sove_radar_watchdog_enabled` — 2 refs in 2 file(s)
 - `input_boolean.sove_retur_enabled` — 2 refs in 2 file(s)
 - `input_boolean.sove_seng_taeller_enabled` — 4 refs in 2 file(s)
-- `input_boolean.sovevaerelse_manual_off_lock` — 19 refs in 8 file(s)
+- `input_boolean.sovevaerelse_manual_off_lock` — 24 refs in 8 file(s)
 - `input_boolean.sovevaerelse_morgen_beskyttelse_enabled` — 6 refs in 5 file(s)
 - `input_boolean.styrbar_lr_grace_sovevaerelse` — 3 refs in 2 file(s)
 - `input_boolean.styrbar_lr_holding_sovevaerelse` — 4 refs in 2 file(s)

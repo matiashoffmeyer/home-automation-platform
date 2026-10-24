@@ -613,9 +613,17 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
 - **Apollo gate-tærskler har TO lag, og SLIDEREN er autoriteten.**
   `input_number.<rum>_g<N>_<move|still>` (rum-slug `sove`/`boern`, ikke
   entity-slug) skrives af decay + jagt og pushes derfra til ESPHome-NVRAM
-  `number.<rum>_apollo_g<N>_<move|still>_threshold`. Retter du kun
-  `number.`-entity'en, ser det korrekt ud med det samme og bliver rullet tilbage
-  ved næste decay-tick. Skriv sliderne, vent ~5 s, og verificér BEGGE lag —
+  `number.<rum>_apollo_g<N>_<move|still>_threshold`. Per-gate-skriverne ser KUN
+  sliderens flanker (og aldrig fra `unknown`, så en restore skriver intet) — en
+  direkte `number.`-rettelse blev derfor IKKE rullet tilbage (decayen rører kun
+  den gate den sænker): børneværelsets g3 stod på move 50 / still 23 fra en
+  direkte skrivning 5/10 til 23/10 (sliderne 15/18), og et sovende barns bursts
+  (14-28) nåede ikke over → 0-30 min belægning på børnenætterne 12-17/10 og Child A
+  usynlig for people count 22/10. Soveværelsets g3 still stod samtidig på 25 med
+  slideren på 21 (slideren rettet til chippen, ikke omvendt). Siden 23/10
+  skriver `automation.apollo_daglig_gate_sync_chip_slider` kl. 09:05 slideren til hver gate
+  hvor chippen afviger (kun ved afvigelse; engineering mode = skip) — en direkte
+  chip-skrivning lever altså højst til næste morgen. Skriv sliderne, vent ~5 s, og verificér BEGGE lag —
   hænger en skrivning i debounce-køen, skub med
   `script.<rum>_apollo_apply_all_gates`. At de to lag er enige beviser i øvrigt
   intet om værdien: 08-23 var de enige om 23 på gates der skulle være 100.

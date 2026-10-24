@@ -38,7 +38,9 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   Sammenlign på **decimalen** — kvantisér, og en levende krop ligner et møbel.
 - **Apollo gate-tærskler har TO lag, og SLIDEREN er autoriteten**
   (`input_number.<rum>_g<N>_<move|still>` → NVRAM). At lagene er enige beviser
-  intet om værdien.
+  intet om værdien. Skriverne ser kun SLIDERENS flanker → en direkte chip-
+  skrivning drev 18 døgn (børne-g3 50/23 mod 15/18: sovende børn usynlige);
+  `apollo_daglig_gate_sync_chip_slider` retter chippen til slideren kl. 09:05.
 - **LD2410'eren leverer INGEN still-energi på gate 0 og 1**, og
   `*_radar_still_distance` **hviler på ~66-67 cm** uden mål → guard `gate_dead`.
   **MEN et "still g0"-artefakt er fixbart på MOVE-kanalen, én gate længere ude.

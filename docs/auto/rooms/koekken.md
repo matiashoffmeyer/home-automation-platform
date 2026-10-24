@@ -5,13 +5,17 @@ Auto-generated. **DON'T edit manually** — re-run `./scripts/gen_docs.py --room
 Search keywords: `koekken, kokken`
 
 ## Indhold
-- [Automations](koekken.md#automations) (8)
+- [Automations](koekken.md#automations) (9)
 - [Entities](koekken.md#entities) (242)
 - [Helpers](koekken.md#helpers) (42)
 
 ---
 
 ## Automations
+
+### `automations/boern_ankomst_detekter.yaml`
+
+- **Børn: rene skift forbi køkkenet uden kamera-bevægelse → spørg** (line 383, mode=single)
 
 ### `automations/gestus_koekken.yaml`
 
@@ -58,13 +62,13 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.koekken_apollo_bevaegelse_frisk` — 3 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_central_zone` — 5 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_central_zone_filtered` — 4 refs in 1 file(s)
-- `binary_sensor.koekken_apollo_frossen_ghost` — 5 refs in 4 file(s)
+- `binary_sensor.koekken_apollo_frossen_ghost` — 6 refs in 4 file(s)
 - `binary_sensor.koekken_apollo_naer_bekraeftet` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_naer_kandidat` — 4 refs in 1 file(s)
-- `binary_sensor.koekken_apollo_occupancy` — 27 refs in 17 file(s)
+- `binary_sensor.koekken_apollo_occupancy` — 33 refs in 18 file(s)
 - `binary_sensor.koekken_apollo_occupancy_filtered` — 110 refs in 43 file(s)
 - `binary_sensor.koekken_apollo_online` — 2 refs in 1 file(s)
-- `binary_sensor.koekken_apollo_radar_moving_target` — 21 refs in 13 file(s)
+- `binary_sensor.koekken_apollo_radar_moving_target` — 19 refs in 12 file(s)
 - `binary_sensor.koekken_apollo_radar_still_target` — 2 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_radar_zone_1_occupancy` — 2 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_radar_zone_2_occupancy` — 2 refs in 2 file(s)
@@ -75,10 +79,9 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.koekken_bevaegelse_raa` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_dvale_vidne` — 2 refs in 2 file(s)
 - `binary_sensor.koekken_hjemkomstlys` — 1 refs in 1 file(s)
-- `binary_sensor.koekken_kamera_krop` — 11 refs in 5 file(s)
-- `binary_sensor.koekken_kamera_krop_gyldig` — 3 refs in 3 file(s)
-- `binary_sensor.koekken_kamera_vaagen` — 4 refs in 3 file(s)
-- `binary_sensor.koekken_lav_krop_bevist` — 3 refs in 2 file(s)
+- `binary_sensor.koekken_kamera_krop` — 9 refs in 5 file(s)
+- `binary_sensor.koekken_kamera_krop_gyldig` — 2 refs in 2 file(s)
+- `binary_sensor.koekken_kamera_vaagen` — 6 refs in 3 file(s)
 - `binary_sensor.koekken_lys_on_effektiv` — 2 refs in 2 file(s)
 - `binary_sensor.koekken_lyskaede_laant` — 3 refs in 2 file(s)
 - `binary_sensor.koekken_lyskaede_lux_ok` — 6 refs in 4 file(s)
@@ -150,12 +153,8 @@ Search keywords: `koekken, kokken`
 - `input_number.koekken_kamera_min_lux` — 3 refs in 2 file(s)
 - `input_number.koekken_kamera_session_sekunder` — 3 refs in 3 file(s)
 - `input_number.koekken_klar_puls_pct` — 3 refs in 2 file(s)
-- `input_number.koekken_lav_krop_antal` — 4 refs in 3 file(s)
-- `input_number.koekken_lav_krop_genfyr_sek` — 2 refs in 2 file(s)
-- `input_number.koekken_lav_krop_kamera_tavs_sek` — 2 refs in 2 file(s)
-- `input_number.koekken_lav_krop_min_sekunder` — 3 refs in 2 file(s)
-- `input_number.koekken_lav_krop_transit_cm` — 2 refs in 2 file(s)
-- `input_number.koekken_lav_krop_vindue_min` — 4 refs in 3 file(s)
+- `input_number.koekken_lav_krop_antal` — 3 refs in 2 file(s)
+- `input_number.koekken_lav_krop_vindue_min` — 2 refs in 2 file(s)
 - `input_number.koekken_lyskaede_brightness` — 6 refs in 2 file(s)
 - `input_number.koekken_lyskaede_cooking_brightness` — 3 refs in 2 file(s)
 - `input_number.koekken_lyskaede_cooking_kelvin` — 2 refs in 2 file(s)
@@ -192,6 +191,9 @@ Search keywords: `koekken, kokken`
 - `input_number.koekken_session_lux_bonus_pct` — 3 refs in 2 file(s)
 - `input_number.koekken_session_relight_seconds` — 3 refs in 2 file(s)
 - `input_number.koekken_session_timeout_minutes` — 5 refs in 3 file(s)
+- `input_number.koekken_skift_min_afstand_sek` — 2 refs in 2 file(s)
+- `input_number.koekken_skift_min_lux` — 2 refs in 2 file(s)
+- `input_number.koekken_skift_min_segment_sek` — 2 refs in 2 file(s)
 - `input_number.koekken_spots_dagslys_sluk_lux` — 6 refs in 4 file(s)
 - `input_number.koekken_spots_hang_pct` — 2 refs in 2 file(s)
 - `input_number.koekken_spots_lux_threshold` — 6 refs in 4 file(s)
@@ -215,7 +217,7 @@ Search keywords: `koekken, kokken`
 - `input_text.koekken_gestus_alarm_rum` — 5 refs in 1 file(s)
 - `input_text.koekken_gestus_nedtael` — 17 refs in 4 file(s)
 - `input_text.koekken_gestus_pending` — 7 refs in 3 file(s)
-- `input_text.koekken_lav_krop_spor` — 9 refs in 2 file(s)
+- `input_text.koekken_lav_krop_spor` — 6 refs in 2 file(s)
 - `input_text.koekken_lyskaede_haand_ts` — 6 refs in 3 file(s)
 - `input_text.koekken_lyskaede_preview` — 10 refs in 3 file(s)
 - `input_text.koekken_stemme_arm_gestus` — 4 refs in 3 file(s)
@@ -226,7 +228,7 @@ Search keywords: `koekken, kokken`
 
 - `light.koekken_apollo_rgb_light` — 13 refs in 5 file(s)
 - `light.koekken_loft` — 2 refs in 2 file(s)
-- `light.koekken_lyskaede` — 187 refs in 42 file(s)
+- `light.koekken_lyskaede` — 188 refs in 43 file(s)
 - `light.koekken_room` — 11 refs in 8 file(s)
 
 ### `number.*`
@@ -264,6 +266,7 @@ Search keywords: `koekken, kokken`
 - `script.koekken_lyskaede_maal` — 12 refs in 6 file(s)
 - `script.koekken_lyskaede_preview_slut` — 2 refs in 1 file(s)
 - `script.koekken_lyskaede_signal` — 15 refs in 6 file(s)
+- `script.koekken_skift_registrer` — 1 refs in 1 file(s)
 - `script.koekken_stemme_kvittering` — 2 refs in 2 file(s)
 - `script.koekken_timer_stemme` — 2 refs in 1 file(s)
 - `script.roborock_grundig_koekken` — 1 refs in 1 file(s)
@@ -277,7 +280,7 @@ Search keywords: `koekken, kokken`
 - `sensor.koekken_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
 - `sensor.koekken_apollo_lux` — 9 refs in 6 file(s)
 - `sensor.koekken_apollo_radar_move_energy` — 1 refs in 1 file(s)
-- `sensor.koekken_apollo_radar_moving_distance` — 8 refs in 4 file(s)
+- `sensor.koekken_apollo_radar_moving_distance` — 6 refs in 3 file(s)
 - `sensor.koekken_apollo_radar_still_distance` — 4 refs in 3 file(s)
 - `sensor.koekken_apollo_radar_still_energy` — 1 refs in 1 file(s)
 - `sensor.koekken_apollo_temperature` — 2 refs in 2 file(s)
@@ -290,7 +293,7 @@ Search keywords: `koekken, kokken`
 - `sensor.koekken_felt_aktiv_30m` — 2 refs in 1 file(s)
 - `sensor.koekken_kamera_blik` — 3 refs in 1 file(s)
 - `sensor.koekken_kamera_vagt` — 2 refs in 2 file(s)
-- `sensor.koekken_lux_effektiv` — 6 refs in 3 file(s)
+- `sensor.koekken_lux_effektiv` — 7 refs in 3 file(s)
 - `sensor.koekken_lux_reel` — 9 refs in 4 file(s)
 - `sensor.koekken_lys_on_idag` — 8 refs in 2 file(s)
 - `sensor.koekken_lys_timer_dag` — 1 refs in 1 file(s)
@@ -303,6 +306,7 @@ Search keywords: `koekken, kokken`
 - `sensor.koekken_lyskaede_target_brightness` — 8 refs in 4 file(s)
 - `sensor.koekken_naer_pulser` — 1 refs in 1 file(s)
 - `sensor.koekken_occupancy_recent` — 3 refs in 1 file(s)
+- `sensor.koekken_skift_segment` — 9 refs in 2 file(s)
 - `sensor.koekken_spots_dagslys_sluk_effektiv` — 6 refs in 3 file(s)
 - `sensor.koekken_spots_lux_gate_effektiv` — 10 refs in 5 file(s)
 - `sensor.koekken_stemme_kommando` — 6 refs in 1 file(s)

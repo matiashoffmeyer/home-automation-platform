@@ -1224,3 +1224,72 @@ automation:
             data:
               name: "Børneværelse Apollo nat-timeout"
               message: "radar_timeout → {{ val }} s (godnat_boern={{ states('input_boolean.godnat_boern_active') }})."
+
+  # ===========================================================================
+  # Daglig gate-sync: chippen = slideren (2026-10-23, user: "FIX DET! er så
+  # træt af de gate problemer med apolloer")
+  # ===========================================================================
+  # Per-gate-skriverne ovenfor ser kun SLIDERENS flanker (og aldrig fra
+  # unknown, så en restore skriver intet). En direkte number.set_value på
+  # chippen, eller en slider der genoprettes efter en geninstallation, står
+  # derfor skævt for evigt — og huset logger, kalibrerer og dokumenterer mod
+  # en værdi chippen ikke kører med. 23/10 fundet: børneværelsets g3 stod på
+  # move 50 / still 23 siden en direkte skrivning 5/10 14:40 (sliderne 15/18,
+  # B163-kalibreringen) → et sovende barns bursts (14-28, B68) nåede ikke over:
+  # 0-30 min belægning på børnenætterne 12-17/10 (10/10: 7 t), og Child A var
+  # usynlig for kids_home/people count natten 22-23/10. Samme hul: soveværelsets
+  # g3 still stod på 25 med slideren på 21 (gate-decayens august-værdi).
+  # Én gang i døgnet skrives slider-værdien til de gates hvor chippen afviger.
+  # Chip-wear: KUN ved afvigelse (value-compare), højst én skrivning pr. gate pr.
+  # døgn, aldrig ved genstart/availability; et rum med engineering mode tændt
+  # (kalibrering i gang) springes over. Vil du ændre en tærskel: ret SLIDEREN —
+  # en direkte chip-skrivning rulles tilbage kl. 09:05 næste morgen.
+  - id: apollo_gate_sync_daglig
+    alias: "Apollo: daglig gate-sync (chip = slider)"
+    description: >
+      Skriver slider-værdien til de Apollo-gates hvor chippen afviger fra sin
+      input_number. Value-compare; kun ved afvigelse; engineering mode = skip.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time
+        at: "09:05:00"
+    variables:
+      afvig: >-
+        {%- set rum = {'stue': 'stue', 'spisestue': 'spisestue', 'koekken': 'koekken',
+                       'boernevaerelse': 'boernevaerelse', 'sove': 'sovevaerelse'} -%}
+        {%- set ns = namespace(ud=[]) -%}
+        {%- for slug, dev in rum.items() -%}
+          {%- if not is_state('switch.' ~ dev ~ '_apollo_radar_engineering_mode', 'on') -%}
+            {%- for g in range(9) -%}{%- for k in ['still', 'move'] -%}
+              {%- set s = states('input_number.' ~ slug ~ '_g' ~ g ~ '_' ~ k) -%}
+              {%- set c = 'number.' ~ dev ~ '_apollo_g' ~ g ~ '_' ~ k ~ '_threshold' -%}
+              {%- if s | is_number and states(c) | is_number
+                    and (s | float) | round(0) | int != (states(c) | float) | round(0) | int -%}
+                {%- set ns.ud = ns.ud + [{'entity': c,
+                                          'fra': (states(c) | float) | round(0) | int,
+                                          'til': (s | float) | round(0) | int}] -%}
+              {%- endif -%}
+            {%- endfor -%}{%- endfor -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ ns.ud }}
+    condition:
+      - condition: template
+        value_template: "{{ afvig | count > 0 }}"
+    action:
+      - repeat:
+          for_each: "{{ afvig }}"
+          sequence:
+            - service: number.set_value
+              continue_on_error: true
+              data:
+                entity_id: "{{ repeat.item.entity }}"
+                value: "{{ repeat.item.til }}"
+      - service: logbook.log
+        data:
+          name: "Apollo gate-sync"
+          message: >-
+            {% for a in afvig %}{{ a.entity | replace('number.', '') | replace('_apollo', '')
+               | replace('_threshold', '') }} {{ a.fra }}→{{ a.til }}{{ ', ' if not loop.last }}{% endfor %}
+            (chip rettet til slideren).

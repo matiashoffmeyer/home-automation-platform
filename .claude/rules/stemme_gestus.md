@@ -72,5 +72,6 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   et barn under billedet, så kamera-tavshed beviser aldrig "lav krop" (10-05: 24
   lave passager på 70 min med kun voksne hjemme; user-svar 1 ja/3 nej).
   **Signatur: "kameraet tavst i 1000+ s" mens køkken-radaren ser passager hvert
-  minut.** → featuren er slået fra (`koekken_lav_krop_boern_enabled`); et
-  barne-signal herfra ville kræve en PERSON-detektor, ikke en tærskel.
+  minut.** → tavshed tæller KUN i et rent én-krops skift (børneværelse/
+  spisestue ↔ køkken, afgangsrummet slukker, lux ≥ 40) og KUN som spørgsmål
+  (`packages/koekken_kamera_krop.yaml` v2, 23/10).

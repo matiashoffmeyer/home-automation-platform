@@ -103,6 +103,10 @@ holdt 39/39 s via radar-timeout). g4 SKAL blive på 100: tom-rums-støjen
 når 30. Et sovende (mindre) barn kan falde under 18 — det slukker lyset i
 et rum hvor der sover et barn, hvilket er den ufarlige retning. (B163)
 
+**Drift 5/10 → 23/10:** chippen kørte g3 move 50 / still 23 (direkte skrivning
+5/10 14:40, ikke via slideren) → børnenætterne 12-17/10 viste 0-30 min belægning
+mod 4,8-8 t før. Rettet tilbage til 15/18 af `apollo_daglig_gate_sync_chip_slider` 23/10.
+
 ## Re-calibration procedure
 
 **Efter en FLYTNING (2026-10-02):** (1) nulstil rummets `input_text.<rum>_gate_floors`
@@ -110,7 +114,8 @@ et rum hvor der sover et barn, hvilket er den ufarlige retning. (B163)
 geometri; (2) mål user stille på den faktiske plads med engineering mode (≤ 10
 min, sikkerheds-automationen slukker selv) → tærskel under users p10 på den
 gate; (3) sæt **slideren** `input_number.<rum>_g<N>_still` (den er autoriteten
-→ NVRAM), ikke `number.*` direkte; (4) bestil tomt-rum-baseline:
+→ NVRAM), ikke `number.*` direkte — en direkte chip-skrivning rulles tilbage af
+`apollo_daglig_gate_sync_chip_slider` kl. 09:05; (4) bestil tomt-rum-baseline:
 `input_text.apollo_kalib_bestilling` = `<rum>` → kører i nat, margin i
 `ai_feedback/apollo_kalib_feedback.jsonl`. Manuelt nu (rummet tomt):
 `python3 scripts/apollo_kalib_capture.py <rum> --sek 300`.

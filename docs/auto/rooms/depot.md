@@ -15,7 +15,7 @@ Search keywords: `depot`
 
 ### `automations/airbnb_mode.yaml`
 
-- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 935, mode=queued)
+- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 937, mode=queued)
   - Undtagelse 1 (user 2026-06-30; rev. 2026-07-08 #12): BØRNEVÆRELSE må aldrig
 
 ### `automations/depot_harry_potter.yaml`

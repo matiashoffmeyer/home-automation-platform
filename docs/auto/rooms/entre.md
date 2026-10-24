@@ -15,7 +15,7 @@ Search keywords: `entre`
 
 ### `automations/airbnb_mode.yaml`
 
-- **AirBnB: Dormant -> Active ved entré presence (comfort welcome)** (line 1081, mode=single)
+- **AirBnB: Dormant -> Active ved entré presence (comfort welcome)** (line 1083, mode=single)
   - Hvis huset er Dormant og guest entrer entré, tænd lys "behageligt"
 
 ### `automations/arrival.yaml`

@@ -6,7 +6,7 @@ Search keywords: `stue, open_plan`
 
 ## Indhold
 - [Automations](stue.md#automations) (22)
-- [Entities](stue.md#entities) (302)
+- [Entities](stue.md#entities) (303)
 - [Helpers](stue.md#helpers) (92)
 
 ---
@@ -46,9 +46,9 @@ Search keywords: `stue, open_plan`
   - Daylight fades while spisebordet er besat — spisestue-loftet kommer blidt på.
 - **Lysnet: Spisestue tænd på mørk indedag** (line 252, mode=single)
 - **Lysnet: Sofa-stue tænd ved LUX-fald** (line 320, mode=single)
-- **Lysnet: Stue sluk ved LUX-stigning** (line 739, mode=single)
+- **Lysnet: Stue sluk ved LUX-stigning** (line 740, mode=single)
   - Dagslys tilbage i open-plan mens lys står tændt — blid fade off af
-- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 844, mode=single)
+- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 845, mode=single)
   - Lux-præmissen bag dagslys-sluk faldt bort mens rummet stadig er optaget →
 
 ### `automations/presence_resync_on_start.yaml`
@@ -59,9 +59,9 @@ Search keywords: `stue, open_plan`
 
 - **Lysnet: Spisestue tænd** (line 17, mode=single)
 - **Lysnet: Sofa-stue tænd** (line 181, mode=single)
-- **Lysnet: Spisestue gradvis sluk** (line 374, mode=restart)
+- **Lysnet: Spisestue gradvis sluk** (line 376, mode=restart)
   - 2026-06-19 (user-spec): spisestue-loftet slukker når spisebords-Apolloen
-- **Lysnet: Sofa-stue gradvis sluk** (line 503, mode=restart)
+- **Lysnet: Sofa-stue gradvis sluk** (line 505, mode=restart)
   - 2026-06-19: sofa-lamperne slukker når sofa-Apolloen (stue_apollo) har været
 
 ### `automations/somrig_buttons.yaml`
@@ -102,7 +102,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.open_plan_lys_rent` — 5 refs in 2 file(s)
 - `binary_sensor.open_plan_manual` — 8 refs in 6 file(s)
 - `binary_sensor.open_plan_mork_indedag` — 5 refs in 2 file(s)
-- `binary_sensor.open_plan_mork_morgen` — 9 refs in 6 file(s)
+- `binary_sensor.open_plan_mork_morgen` — 5 refs in 3 file(s)
 - `binary_sensor.open_plan_occupied` — 11 refs in 6 file(s)
 - `binary_sensor.open_plan_occupied_frisk` — 6 refs in 3 file(s)
 - `binary_sensor.open_plan_varsel_publikum` — 5 refs in 3 file(s)
@@ -111,7 +111,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.solo_uden_for_open_plan` — 7 refs in 3 file(s)
 - `binary_sensor.spisestue_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_frossen_ghost` — 2 refs in 2 file(s)
-- `binary_sensor.spisestue_apollo_occupancy` — 26 refs in 18 file(s)
+- `binary_sensor.spisestue_apollo_occupancy` — 29 refs in 19 file(s)
 - `binary_sensor.spisestue_apollo_occupancy_filtered` — 111 refs in 39 file(s)
 - `binary_sensor.spisestue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_radar_moving_target` — 12 refs in 11 file(s)
@@ -139,6 +139,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.stue_ild_morgen_mulig` — 6 refs in 3 file(s)
 - `binary_sensor.stue_lys_on_effektiv` — 4 refs in 3 file(s)
 - `binary_sensor.stue_manuel_lys_hold` — 4 refs in 2 file(s)
+- `binary_sensor.stue_mork_morgen` — 5 refs in 5 file(s)
 - `binary_sensor.stue_spots_ild_aktiv` — 8 refs in 2 file(s)
 - `binary_sensor.stue_spots_ild_mulig` — 2 refs in 2 file(s)
 - `binary_sensor.stue_spots_ild_thread_pause` — 2 refs in 2 file(s)
@@ -203,7 +204,7 @@ Search keywords: `stue, open_plan`
 - `input_number.morgenrampe_spisestue_sekunder` — 4 refs in 3 file(s)
 - `input_number.morgenrampe_stue_kelvin` — 3 refs in 3 file(s)
 - `input_number.morgenrampe_stue_minutter` — 4 refs in 3 file(s)
-- `input_number.morgenrampe_stue_pct` — 6 refs in 6 file(s)
+- `input_number.morgenrampe_stue_pct` — 7 refs in 6 file(s)
 - `input_number.open_plan_dagslys_hold_minutter` — 9 refs in 3 file(s)
 - `input_number.open_plan_drift_back_empty_minutes` — 7 refs in 3 file(s)
 - `input_number.open_plan_entre_fallback_faktor` — 2 refs in 2 file(s)

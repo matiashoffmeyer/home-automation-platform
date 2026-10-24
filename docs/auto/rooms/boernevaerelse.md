@@ -5,9 +5,9 @@ Auto-generated. **DON'T edit manually** — re-run `./scripts/gen_docs.py --room
 Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ## Indhold
-- [Automations](boernevaerelse.md#automations) (25)
-- [Entities](boernevaerelse.md#entities) (172)
-- [Helpers](boernevaerelse.md#helpers) (51)
+- [Automations](boernevaerelse.md#automations) (26)
+- [Entities](boernevaerelse.md#entities) (173)
+- [Helpers](boernevaerelse.md#helpers) (52)
 
 ---
 
@@ -15,20 +15,21 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/airbnb_mode.yaml`
 
-- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 935, mode=queued)
+- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 937, mode=queued)
   - Undtagelse 1 (user 2026-06-30; rev. 2026-07-08 #12): BØRNEVÆRELSE må aldrig
 
 ### `automations/boern_ankomst_detekter.yaml`
 
-- **Børn: sammenhængende børneværelses-ophold → børn hjemme** (line 17, mode=single)
+- **Børn: sammenhængende børneværelses-ophold → børn hjemme** (line 20, mode=single)
   - Ophold i børneværelset i boern_ankomst_ophold_minutter (12) sammenhængende
-- **Børn: ro i børneværelset → ryd aktivitets-flaget** (line 164, mode=single)
+- **Børn: ro i børneværelset → ryd aktivitets-flaget** (line 138, mode=single)
   - Selv-rydning. boern_ankomst_ro_minutter (120) uden aktivitet → flaget off,
-- **Børn: svar på ankomst-spørgsmål → log + evt. ryd** (line 213, mode=queued)
+- **Børn: svar på ankomst-spørgsmål → log + evt. ryd** (line 187, mode=queued)
   - "❌ Nej" = falsk positiv → ryd flaget + undertryk detektionen i
-- **Børn: people count ≥ 3 i periode uden børn → spørg** (line 340, mode=single)
-- **Børn: kids_home tændt af 4 t-signal (ingen periode) → spørg** (line 395, mode=single)
-- **Børn: voksen kommer hjem → ophæv Nej-pausen (spørg igen)** (line 444, mode=single)
+- **Børn: people count ≥ 3 i periode uden børn → spørg** (line 326, mode=single)
+- **Børn: rene skift forbi køkkenet uden kamera-bevægelse → spørg** (line 383, mode=single)
+- **Børn: kids_home tændt af 4 t-signal (ingen periode) → spørg** (line 441, mode=single)
+- **Børn: voksen kommer hjem → ophæv Nej-pausen (spørg igen)** (line 490, mode=single)
 
 ### `automations/boern_loft_manual_cycle.yaml`
 
@@ -77,9 +78,9 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/presence_lights.yaml`
 
-- **Lysnet: Børneværelse tænd ved LUX-fald** (line 598, mode=single)
+- **Lysnet: Børneværelse tænd ved LUX-fald** (line 599, mode=single)
   - Daylight fades while børneværelse occupied — gentle light for kids.
-- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1014, mode=single)
+- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1015, mode=single)
   - Dagslys tilbage i børneværelset mens loftet står tændt — blid fade off.
 
 ### `automations/putning_auto_detect.yaml`
@@ -113,9 +114,9 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `binary_sensor.boern_aften_laasevindue` — 3 refs in 2 file(s)
 - `binary_sensor.boern_putte_zone_aktiv` — 4 refs in 3 file(s)
-- `binary_sensor.boern_set_i_eftermiddag` — 7 refs in 2 file(s)
+- `binary_sensor.boern_set_i_eftermiddag` — 6 refs in 2 file(s)
 - `binary_sensor.boernevaerelse_any_lys` — 1 refs in 1 file(s)
-- `binary_sensor.boernevaerelse_apollo_occupancy` — 117 refs in 44 file(s)
+- `binary_sensor.boernevaerelse_apollo_occupancy` — 120 refs in 45 file(s)
 - `binary_sensor.boernevaerelse_apollo_online` — 1 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_moving_target` — 12 refs in 10 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_still_target` — 4 refs in 3 file(s)
@@ -145,14 +146,14 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `input_boolean.*`
 
-- `input_boolean.boern_aktivitet_detekteret` — 18 refs in 7 file(s)
-- `input_boolean.boern_ankomst_detekt_enabled` — 3 refs in 2 file(s)
+- `input_boolean.boern_aktivitet_detekteret` — 19 refs in 7 file(s)
+- `input_boolean.boern_ankomst_detekt_enabled` — 4 refs in 2 file(s)
 - `input_boolean.boern_eftermiddag_tjek_enabled` — 2 refs in 2 file(s)
 - `input_boolean.boern_ikke_set_i_eftermiddag` — 7 refs in 4 file(s)
 - `input_boolean.boern_morgen_beskyttelse_enabled` — 4 refs in 3 file(s)
 - `input_boolean.boern_morgen_bevaeget` — 16 refs in 5 file(s)
 - `input_boolean.boern_morgen_nedtoning_aktiv` — 22 refs in 5 file(s)
-- `input_boolean.boern_sov_her_i_nat` — 23 refs in 9 file(s)
+- `input_boolean.boern_sov_her_i_nat` — 24 refs in 9 file(s)
 - `input_boolean.boernevaerelse_gaest_sover` — 20 refs in 7 file(s)
 - `input_boolean.boernevaerelse_manual_off_lock` — 46 refs in 14 file(s)
 - `input_boolean.dance_room_boern` — 15 refs in 7 file(s)
@@ -170,7 +171,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `input_datetime.boern_ankomst_stille_until` — 5 refs in 5 file(s)
 - `input_datetime.boern_ankomst_suppress_timer` — 6 refs in 3 file(s)
-- `input_datetime.boern_ankomst_suppress_until` — 9 refs in 4 file(s)
+- `input_datetime.boern_ankomst_suppress_until` — 10 refs in 4 file(s)
 - `input_datetime.boern_loft_left_on_at` — 4 refs in 1 file(s)
 - `input_datetime.boern_manual_off_lock_start` — 6 refs in 4 file(s)
 - `input_datetime.boern_morgen_beskyttelse_slut` — 8 refs in 4 file(s)
@@ -235,6 +236,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `input_text.boern_aften_niveau_hold` — 21 refs in 7 file(s)
 - `input_text.boern_ankomst_pending` — 4 refs in 2 file(s)
+- `input_text.boern_ankomst_pending_kilde` — 3 refs in 2 file(s)
 - `input_text.boernevaerelse_apollo_last_flap` — 1 refs in 1 file(s)
 - `input_text.boernevaerelse_gate_flapcount` — 1 refs in 1 file(s)
 - `input_text.boernevaerelse_gate_floors` — 1 refs in 1 file(s)
@@ -266,7 +268,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `script.*`
 
-- `script.boern_ankomst_spoerg` — 4 refs in 2 file(s)
+- `script.boern_ankomst_spoerg` — 5 refs in 2 file(s)
 - `script.boern_morgen_nedtoning_rampe` — 7 refs in 3 file(s)
 - `script.boern_natlys_set` — 6 refs in 4 file(s)
 - `script.boernevaerelse_apollo_apply_all_gates` — 1 refs in 1 file(s)
@@ -383,6 +385,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `input_text.boern_aften_niveau_hold` (defined in `packages/boern_aften_niveau_hold.yaml`)
 - `input_text.boern_ankomst_pending` (defined in `packages/boern_ankomst.yaml`)
+- `input_text.boern_ankomst_pending_kilde` (defined in `packages/boern_ankomst.yaml`)
 - `input_text.boernevaerelse_apollo_last_flap` (defined in `packages/apollo_flap_hunt.yaml`)
 - `input_text.boernevaerelse_gate_flapcount` (defined in `packages/apollo_flap_hunt.yaml`)
 - `input_text.boernevaerelse_gate_floors` (defined in `packages/apollo_gate_decay.yaml`)

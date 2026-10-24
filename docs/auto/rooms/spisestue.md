@@ -18,13 +18,13 @@ Search keywords: `spisestue`
 - **Lysnet: Spisestue tænd ved LUX-fald** (line 78, mode=single)
   - Daylight fades while spisebordet er besat — spisestue-loftet kommer blidt på.
 - **Lysnet: Spisestue tænd på mørk indedag** (line 252, mode=single)
-- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 844, mode=single)
+- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 845, mode=single)
   - Lux-præmissen bag dagslys-sluk faldt bort mens rummet stadig er optaget →
 
 ### `automations/presence_stue.yaml`
 
 - **Lysnet: Spisestue tænd** (line 17, mode=single)
-- **Lysnet: Spisestue gradvis sluk** (line 374, mode=restart)
+- **Lysnet: Spisestue gradvis sluk** (line 376, mode=restart)
   - 2026-06-19 (user-spec): spisestue-loftet slukker når spisebords-Apolloen
 
 ---
@@ -41,7 +41,7 @@ Search keywords: `spisestue`
 - `binary_sensor.scene_spisestue_middag_active` — 1 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_frossen_ghost` — 2 refs in 2 file(s)
-- `binary_sensor.spisestue_apollo_occupancy` — 26 refs in 18 file(s)
+- `binary_sensor.spisestue_apollo_occupancy` — 29 refs in 19 file(s)
 - `binary_sensor.spisestue_apollo_occupancy_filtered` — 111 refs in 39 file(s)
 - `binary_sensor.spisestue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_radar_moving_target` — 12 refs in 11 file(s)

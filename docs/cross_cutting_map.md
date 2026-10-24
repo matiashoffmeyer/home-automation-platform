@@ -96,6 +96,8 @@ godnat_pending          = voksen-godnat afventer commit
 kalde_active            = kid trykked kalde-knap (auto-clear ved 5-min absence)
 
 binary_sensor.godnat_any_active = ON hvis NOGEN af ovenstående er ON
+binary_sensor.godnat_common_active = som any, UDEN godnat_boern_active (voksen-rum)
+sensor.activity_state == 'godnat' = active/voksne/pending (hverken børn eller kalde, 2026-10-23)
 ```
 
 **SINGLE SOURCE OF TRUTH for actions:**

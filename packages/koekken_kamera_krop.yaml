@@ -12,77 +12,65 @@
 #      ville arve nul af dens 14 gates (fejlklasse #2/#21). Her ligger kun
 #      slideren.
 #
-#   2) BARN-DETEKTION — bygget 14/9, målt falsk 15/9, bygget om 16/9.
-#      Den bevares bevidst (user-spec 16/9: "vi skal lave live tests af et barn
-#      der går forbi i køkkenet og ikke ses af kameraet men ses af Apollo").
+#   2) BØRN VIA RENE RUM-SKIFT (v2, 2026-10-23, user-spec):
+#      "Vi bruger det faktum at tapo ikke ser bevægelse (detect movement) i
+#      køkkenet hvis det kommer fra et barn … Vi skal kun bruge
+#      børnedetektionen når den er ren, dvs: bevægelse i køkkenet lige efter
+#      eller lige før bevægelse i børneværelset eller spisestue OG bevægelse i
+#      afgangs-rummet ophører når barnet skifter rum. Så ved vi at der kun er 1
+#      krop involveret … Vi skal ikke kræve at tapo ikke detecter krop … men den
+#      burde være troværdig ift. detected movement. Vi kan kræve at det skal ske
+#      2 gange … en notifikation jeg kan svare på, og kun hvis jeg bekræfter
+#      børnetilstedeværelse, slår børn hjemme til."
 #
-# Den FØRSTE udgave sluttede fra en TAVSHED — "radaren så bevægelse, kameraet så
-# ingen ⇒ kroppen var for lav til at nå frem i billedet" — og den slutning
-# kræver at kameraet melder `on` når en VOKSEN er i køkkenet. Det gør det ikke.
+# HVORFOR v1 (14/9 → slået fra 5/10) DØDE: den sluttede "barn" fra kamera-
+# TAVSHED alene, men koekken_kamera_krop er FRAME-TIL-FRAME-bevægelse (hot
+# cells), så en voksen der står stille ved komfuret er lige så tavs som et barn
+# under billedet: 24 "lave passager" på 70 min med kun voksne hjemme, user-svar
+# 1 ja / 3 nej. Fuld historik: grep -n "Sprint 2026-10-05\|Sprint 2026-10-23"
+# docs/sprint_log.md og grep -n "kamera_krop" docs/permanente_fakta.md.
 #
-# MÅLT 15/9 over 210 state-skift (14/9 21:33 → 15/9 07:52):
-#   · Kl. 07-09, hvor hele familien beviseligt er i køkkenet, er
-#     binary_sensor.koekken_kamera_krop kun `on` 19 % af tiden.
-#   · Hullerne mellem to on-bursts — perioder hvor nogen demonstrerbart var der
-#     både før og efter — er median 7,1 s, p90 97 s, p95 182 s.
-#   · 79 % af de huller er længere end de 2 s tælleren krævede.
-#   · on-bursterne selv er median 4,8 s, p90 12,6 s, max 29 s.
+# v2 bruger tavsheden KUN hvor den kan bære: en krop der GÅR gennem køkkenet
+# (en voksen der går, bevæger sig i billedet) mellem køkkenet og børneværelset
+# eller spisestuen — og kun når skiftet beviser at det er ÉN krop:
+#   · ankomst-rummets radar går off → on efter ≥ 20 s stilhed og HOLDER ≥ 10 s,
+#   · afgangs-rummet var optaget i samme øjeblik (eller slap ≤ 20 s før), bliver
+#     tomt senest 15 s efter ankomsten og FORBLIVER tomt ≥ 30 s (ingen krop
+#     tilbage = ingen anden krop i spil),
+#   · køkken-opholdet (radar-segmentet i køkkenet) varede ≥ 10 s, og kameraet
+#     meldte INGEN bevægelse fra 3 s før segmentet til 3 s efter,
+#   · køkkenet var lyst hele segmentet (lux_effektiv ≥ 40 lx): under 10 lx er
+#     en voksen tavs for kameraet 71 % af gangene, ≥ 40 lx 6-13 %,
+#   · kameraet vågent, intet frossent køkken-spøgelse, ingen robot i 120 s.
+# To skift ≥ 120 s fra hinanden inden for 30 min → et SPØRGSMÅL med knapper
+# (boern_ankomst_koekken_spoerg → script.boern_ankomst_spoerg). Kun ✅ sætter
+# boern_aktivitet_detekteret; people count løftes via people_boern_set, som
+# tager max(tal, flag) og derfor kun går op hvis barnet ikke allerede er talt.
 #
-# Konsekvensen var målbar: tælleren tog 69 "lave passager" mellem 07:01 og 07:49
-# den 15/9. Kun `boern_sov_her_i_nat` holdt dem ude af kids_home.
+# Strukturelle konstanter (hardcodede — de DEFINERER "rent", de tunes ikke):
+#   20 s stilhed før ankomsten · 20 s afgangs-slip · 10 s ankomst-hold ·
+#   15 s til afgangen er tom · 3 s kamera-margin · 30 s afgang-forbliver-tom ·
+#   30 s spøgelses-frihed · 120 s robot-frihed · 600 s max køkken-ophold.
 #
-# Årsagen er at hot cells er FRAME-TIL-FRAME-ændring: kameraet svarer "bevæger
-# nogen sig kraftigt lige nu", ikke "står der nogen". En voksen der står stille
-# ved bordpladen er tavs på præcis samme måde som et barn der er for lavt.
-# Mismatchet mellem radar og kamera er altså FØLSOMHED, ikke HØJDE, og så kan
-# tavsheden ikke bære en højde-slutning. Tærsklen kan ikke tunes ud af det:
-# skulle falsk-positiverne under p90, skulle kravet op på ~97 s radar-udslag —
-# og et barn der løber forbi er væk efter 2-5 s (fejlklasse #25's spejlbillede).
-#
-# HVAD OMBYGNINGEN 16/9 GØR VED DET (B140): kameraet sidder bevidst højt —
-# user-spec 15/9: vippes det ned, kommer børnene i frame — så et barn er slet
-# ikke i billedet, og en top/bund-opdeling af cellerne kan derfor ikke måle
-# højde. Tavsheden er det eneste barne-signal der findes, og den er kun brugbar
-# hvis den anden halvdel af beviset gøres SKARPERE: radar-siden skal vise en
-# ægte PASSAGE (moving_distance flytter sig mærkbart), ikke en voksens
-# mikrobevægelser på stedet, og kameraet skal være tavst gennem HELE
-# bekræftelses-vinduet i stedet for i ét øjeblik. Se koekken_lav_krop_taeller.
-#
-# Kalibreringen kan IKKE køres på historik: moving_distance og moving_target er
-# recorder-ekskluderede. Derfor er live-testen (user-spec 16/9) ikke en
-# ekstra-kontrol, den er den eneste måling der findes — og indtil den er kørt,
-# er features gyldighed ubevist.
+# REPLAY (26 døgn 27/9-23/10, kendte voksen-/børne-perioder): tavse skift
+# voksen/børn 6/38 ved lux ≥ 40 + segment ≥ 10 s → 0/3 spørgsmål, og de 3 lå
+# med boern_sov_her_i_nat on (undertrykt). Permutations-estimat for falske
+# spørgsmål med kun voksne: ~0,6 pr. 8 døgn (45 lx / 15 s: ~0,2, men 0 børn).
 # =============================================================================
 
 input_boolean:
   # Fejlklasse #21: et kill-switch der ikke er en condition på hver eneste vej
   # ind, er pynt. Denne læses BÅDE af session-triggeren i presence_koekken.yaml
-  # og af barn-tælleren herunder.
+  # og af køkken-skift-detektoren herunder.
   koekken_kamera_krop_enabled:
     name: "Køkken: kamera må se kroppe"
     icon: mdi:human-male
 
-  # 2026-10-05 — Tapo-børnedetektionen er SLÅET FRA (default off; user-spec
-  # samme dag: "slå børnedetektion fra på tapo"). Kontakten gater BÅDE
-  # tælleren (ingen tælling, ingen logbog-linjer) og lav_krop-vejen i
-  # boern_ankomst_detekter (fejlklasse #21). Sporet er tomt mens den er fra, så
-  # eftermiddags-tjekkets tredje kanal bidrager intet.
-  # MÅLT samme morgen, en naturlig kontrol-gruppe: 06:13-07:23 var kun de to
-  # voksne hjemme (Parent B gik 06:55, huset Dormant 07:29-08:13) → 24 "lave
-  # passager" på 70 min, kameraet tavst 269-1733 s ad gangen mens de lavede
-  # morgenmad. Fra 08:13 med Child B hjemme: 14 på 3,5 t. Tællingen
-  # skelner altså ikke et barn fra en voksen — raten var HØJEST uden barn.
-  # User's egne svar på "Børn hjemme?" med kilde lav_krop: 1 ja, 3 nej, 1
-  # ubesvaret (ai_feedback/boern_ankomst_feedback.jsonl, 19-21/9).
-  # User 2026-10-05: "når vi står og laver mad kan tapo ikke se os men det kan
-  # apollo køkken". Årsagen er primitivet: koekken_kamera_krop er
-  # FRAME-TIL-FRAME-bevægelse (hot cells), så en voksen der står ved
-  # komfuret er lige så tavs som et barn under billedet. Tælleren kører
-  # videre og logger (det er måledata), men den eneste forbruger der kunne
-  # gøre skade — boern_ankomst_detekter's lav_krop-trigger — var gated af denne.
-  # User valgte samme dag IKKE en person-detektor (B190) → hele featuren fra.
+  # v2 2026-10-23 (user-spec). Gater BÅDE koekken_skift_transit (ingen
+  # registrering, intet spor) og spørge-vejen boern_ankomst_koekken_spoerg i
+  # automations/boern_ankomst_detekter.yaml (#21). v1 var slået fra 5/10.
   koekken_lav_krop_boern_enabled:
-    name: "Køkken: Tapo-børnedetektion (lave passager)"
+    name: "Køkken: børn via rene rum-skift"
     icon: mdi:human-child
 
 input_number:
@@ -106,6 +94,8 @@ input_number:
   # LED) — IKKE koekken_dagslys_lx, som er det fastholdte RENE sample og per
   # definition er ~0 så snart vi selv har tændt lyset. Slideren beholdes som
   # nødbremse hvis IR-billedet viser sig at være for dårligt til krops-modellen.
+  # NB: den gælder krop_gyldig; køkken-skiftene har deres EGEN lux-gate
+  # (koekken_skift_min_lux) — det er TAVSHED der kræver lys, ikke fund.
   koekken_kamera_min_lux:
     name: "Køkken: mindste lux før kameraet må afgive dom"
     icon: mdi:brightness-6
@@ -115,29 +105,18 @@ input_number:
     unit_of_measurement: "lx"
     mode: slider
 
-  # Skal være LÆNGERE end kameraets egen reaktionstid (3 frames à 0,5 s), ellers
-  # er hver eneste voksen et barn i de første 1,5 sekunder. Men jo længere den
-  # er, jo flere ægte børn løber forbi uden at blive talt — et barn er hurtigt.
-  # Placeholder: 4 s.
-  koekken_lav_krop_min_sekunder:
-    name: "Køkken: radar-udslag før 'for lav til kameraet'"
-    icon: mdi:human-child
-    min: 2
-    max: 20
-    step: 1
-    unit_of_measurement: "s"
-    mode: slider
-
+  # User-spec 23/10: "vi kan kræve at det skal ske 2 gange".
   koekken_lav_krop_antal:
-    name: "Køkken: antal lave passager før 'børn hjemme'"
+    name: "Køkken: rene skift før spørgsmålet"
     icon: mdi:counter
     min: 1
     max: 10
     step: 1
     mode: slider
 
+  # Rullende: kun skift inden for vinduet fra det NYESTE tæller med.
   koekken_lav_krop_vindue_min:
-    name: "Køkken: vindue for de lave passager (min)"
+    name: "Køkken: vindue for de rene skift (min)"
     icon: mdi:timer-sand
     min: 5
     max: 120
@@ -145,64 +124,48 @@ input_number:
     unit_of_measurement: "min"
     mode: slider
 
-  # --- De tre gates der blev bygget 16/9 ud fra MÅLT falsk population ---------
-  # Grundlaget: 289 tællinger i recorder-vinduet (14/9-16/9), og ikke ét af dem
-  # er verificeret som et barn. Hver gate er kalibreret mod netop den population.
-  #
-  # 1) KAMERA-TAVSHED. Den gamle regel var "kameraets last_changed er ældre end
-  #    radarens" — den er opfyldt af en voksen der lige er gået ud af billedet.
-  #    Målt hvor længe kameraet HAVDE været tavst ved hver af de 289:
-  #      median 14,2 s · p75 32,1 · p90 100,5
-  #    Voksen-hullerne (kameraet taber en voksen der ER til stede) blev målt 15/9
-  #    til median 7,1 s / p90 97 s / p95 182 s. 300 s ligger over hele den
-  #    fordeling og fjerner 279 af de 289 (97 %).
-  koekken_lav_krop_kamera_tavs_sek:
-    name: "Køkken: kameraet skal have været tavst i (sek)"
-    icon: mdi:camera-off
+  # Replay 27/9-23/10: voksnes kamera-tavshed i et skift er 71 % under 10 lx
+  # (IR-billedet er for groft til frame-diff) og 6-13 % ved ≥ 40-45 lx.
+  # 40 (børn 38 tavse skift → 3 spørgsmål) mod 45 (24 → 0): 40 valgt.
+  koekken_skift_min_lux:
+    name: "Køkken: mindste lux under skiftet"
+    icon: mdi:brightness-6
     min: 0
-    max: 900
-    step: 30
+    max: 200
+    step: 5
+    unit_of_measurement: "lx"
+    mode: slider
+
+  # Et kortere køkken-ophold end kameraets egen reaktionstid (3 frames + 3 s
+  # off-hold i shimmen) kan ikke bære en tavshed. Replay: 10 s → voksen/børn
+  # 6/38 tavse skift, 15 s → 2/21.
+  koekken_skift_min_segment_sek:
+    name: "Køkken: mindste tid i køkkenet under skiftet (s)"
+    icon: mdi:timer-outline
+    min: 0
+    max: 60
+    step: 1
     unit_of_measurement: "s"
     mode: slider
 
-  # 2) GENFYRING. De 10 der overlevede tavsheds-kravet er i virkeligheden 6
-  #    fysiske hændelser — de kom i klynger på 2-4 inden for 8-20 s, fordi
-  #    moving_target flimrer off/on mens den samme person går forbi. Uden dette
-  #    er "3 passager" ikke tre børn, det er én voksen talt tre gange, og hele
-  #    antal-slideren er meningsløs. 60 s kollapser klyngerne til én hver.
-  koekken_lav_krop_genfyr_sek:
-    name: "Køkken: samme passage må tidligst tælle igen efter (sek)"
-    icon: mdi:repeat-off
+  # Ét barn der går B → K → S på 30 s er ÉN gåtur, ikke to beviser.
+  koekken_skift_min_afstand_sek:
+    name: "Køkken: mindste afstand mellem to skift (s)"
+    icon: mdi:arrow-expand-horizontal
     min: 0
     max: 600
     step: 10
     unit_of_measurement: "s"
     mode: slider
 
-  # 3) TRANSIT. Et barn GÅR FORBI; en voksen ved bordpladen står stille og
-  #    mikro-bevæger sig. Forskellen er om moving_distance flytter sig.
-  #    KAN IKKE KALIBRERES MOD HISTORIK: moving_distance og moving_target er
-  #    recorder-ekskluderede, så der findes ingen fortid at måle på — live-testen
-  #    ER målingen. Derfor shippes gaten SLUKKET (0 = fra) og tælleren logger
-  #    spændet ved hver passage, så testen 16/9 leverer tallet. Sæt først en
-  #    værdi her når loggen viser hvad et barns passage og en voksens ophold
-  #    faktisk måler (fejlklasse #5: mål før du stiller).
-  koekken_lav_krop_transit_cm:
-    name: "Køkken: passagen skal flytte sig mindst (cm)"
-    icon: mdi:arrow-left-right
-    min: 0
-    max: 300
-    step: 10
-    unit_of_measurement: "cm"
-    mode: slider
-
 input_text:
-  # "<antal>:<epoch_foerste>". input_text er husets eneste GRATIS helper-reload,
-  # så tælleren kan deployes uden restart — og uden `initial:` overlever den en
-  # restart i stedet for at blive påtvunget en værdi.
+  # Komma-liste af "<epoch>:<fra>><til>:<segment-s>:<lux>", fx
+  # "1761210000:B>K:14:52". Max 10 poster à ≤ 24 tegn = 249. input_text er
+  # husets eneste GRATIS helper-reload, og uden `initial:` overlever sporet en
+  # restart. Ryddes af koekken_lav_krop_ryd og når spørgsmålet stilles.
   koekken_lav_krop_spor:
-    name: "Køkken: spor af lave passager"
-    max: 32
+    name: "Køkken: spor af rene rum-skift"
+    max: 255
     icon: mdi:shoe-print
 
 template:
@@ -239,197 +202,313 @@ template:
               gyldig
             {% endif %}
 
-      # Nok lave passager inden for vinduet. Læses som TRIGGER af
-      # boern_ankomst_detekter, så hele dens gate-pakke (kill-switch, "user sagde
-      # nej", voksen-guard, house_mode) gælder uændret — ingen parallel vej ind
-      # til flaget (fejlklasse #2/#21).
-      - name: "Koekken lav krop bevist"
-        unique_id: koekken_lav_krop_bevist
-        icon: mdi:human-child
+  # Køkken-radarens seneste OPHOLD (segment), skrevet i flankens eget event, med
+  # laveste lux undervejs. Forrige segment bæres med, fordi et skift der lander
+  # i køkkenet først kan dømmes når opholdet er slut — og så kan et nyt være
+  # startet. Kun første slut efter en start tæller; slutter opholdet i
+  # unavailable, er segmentet 'ugyldig' og lux -1 (= afvist af lux-gaten).
+  # Recorder-ekskluderet (configuration.yaml): rent mellemregnings-spor.
+  - trigger:
+      - platform: state
+        entity_id: binary_sensor.koekken_apollo_occupancy
+        from: "off"
+        to: "on"
+        id: start
+      - platform: state
+        entity_id: binary_sensor.koekken_apollo_occupancy
+        from: "on"
+        id: slut
+      - platform: state
+        entity_id: sensor.koekken_lux_effektiv
+        to: ~
+        id: lux
+    sensor:
+      - name: "Koekken skift segment"
+        unique_id: koekken_skift_segment
+        icon: mdi:transit-transfer
         state: >-
-          {% set spor = states('input_text.koekken_lav_krop_spor') %}
-          {% if spor in ['unknown', 'unavailable', ''] or ':' not in spor %}
-            false
-          {% else %}
-            {% set antal = spor.split(':')[0] | int(0) %}
-            {% set start = spor.split(':')[1] | int(0) %}
-            {% set vindue = (states('input_number.koekken_lav_krop_vindue_min') | float(30)) * 60 %}
-            {{ antal >= (states('input_number.koekken_lav_krop_antal') | int(3))
-               and start > 0 and (now().timestamp() - start) <= vindue }}
-          {% endif %}
+          {% set ny_slut = trigger.id == 'slut'
+               and (this.attributes.slut | default(0) | float(0)) == 0
+               and (this.attributes.start | default(0) | float(0)) > 0 %}
+          {% if trigger.id == 'start' %}aktiv
+          {% elif ny_slut %}{{ 'slut' if trigger.to_state.state == 'off' else 'ugyldig' }}
+          {% elif this.state in ['aktiv', 'slut', 'ugyldig'] %}{{ this.state }}
+          {% else %}ingen{% endif %}
         attributes:
-          antal: >-
-            {% set spor = states('input_text.koekken_lav_krop_spor') %}
-            {{ spor.split(':')[0] | int(0) if ':' in spor else 0 }}
+          start: >-
+            {{ as_timestamp(trigger.to_state.last_changed) if trigger.id == 'start'
+               else (this.attributes.start | default(0)) }}
+          slut: >-
+            {% set ny_slut = trigger.id == 'slut'
+                 and (this.attributes.slut | default(0) | float(0)) == 0
+                 and (this.attributes.start | default(0) | float(0)) > 0 %}
+            {% if trigger.id == 'start' %}0
+            {% elif ny_slut %}{{ as_timestamp(trigger.to_state.last_changed) }}
+            {% else %}{{ this.attributes.slut | default(0) }}{% endif %}
+          lux_min: >-
+            {% set ny_slut = trigger.id == 'slut'
+                 and (this.attributes.slut | default(0) | float(0)) == 0
+                 and (this.attributes.start | default(0) | float(0)) > 0 %}
+            {% if trigger.id == 'start' %}{{ states('sensor.koekken_lux_effektiv') | float(-1) }}
+            {% elif trigger.id == 'lux' and this.state == 'aktiv' %}{{
+                 [this.attributes.lux_min | default(-1) | float(-1),
+                  trigger.to_state.state | float(-1)] | min }}
+            {% elif ny_slut and trigger.to_state.state != 'off' %}-1
+            {% else %}{{ this.attributes.lux_min | default(-1) }}{% endif %}
+          forrige_start: >-
+            {{ (this.attributes.start | default(0)) if trigger.id == 'start'
+               else (this.attributes.forrige_start | default(0)) }}
+          forrige_slut: >-
+            {{ (this.attributes.slut | default(0)) if trigger.id == 'start'
+               else (this.attributes.forrige_slut | default(0)) }}
+          forrige_lux_min: >-
+            {{ (this.attributes.lux_min | default(-1)) if trigger.id == 'start'
+               else (this.attributes.forrige_lux_min | default(-1)) }}
 
 automation:
   # ---------------------------------------------------------------------------
-  # Tæl en lav passage
+  # Ét rent rum-skift forbi køkkenet uden kamera-bevægelse
   # ---------------------------------------------------------------------------
-  - id: koekken_lav_krop_taeller
-    alias: "Køkken: radar så en krop som kameraet ikke kunne se → tæl den"
-    description: >
-      Et radar-udslag der varer længere end kameraets reaktionstid, mens
-      kameraet er vågent, har lys nok, og har været tavst HELE vejen — også før
-      radaren fyrede. Det er signaturen på nogen der er for lav til at nå frem i
-      billedet, og i dette hus betyder det et barn.
-
-      Ombygget 16/9: triggeren venter ikke længere passivt med `for:`. Den fyrer
-      på flanken og BEVOGTER så vinduet aktivt, fordi "kameraet er tavst NU" og
-      "kameraet var tavst hele vejen" er to forskellige påstande — og kun den
-      anden udelukker en voksen der træder ind i billedet undervejs.
-    mode: single
+  # Fyrer på ANKOMST-flanken i alle tre rum. Ankommer kroppen til køkkenet,
+  # er afgangen børneværelset/spisestuen; ankommer den til B eller S, er
+  # afgangen køkkenet. Handlingen er lineær: hvert trin er en no-op for den
+  # retning det ikke gælder, fordi en `variables:` inde i en if/then ikke
+  # overlever grenen (scope).
+  - id: koekken_skift_transit
+    alias: "Køkken: rent rum-skift forbi køkkenet uden kamera-bevægelse"
+    description: >-
+      Én krop skifter rum mellem køkkenet og børneværelset/spisestuen (afgangs-
+      rummet bliver tomt og forbliver tomt), køkken-opholdet varede længe nok i
+      godt lys, og kameraet meldte ingen bevægelse hele vejen. Registreres i
+      koekken_skift_registrer, som stiller spørgsmålet ved nok skift.
+    mode: parallel
+    max: 10
     max_exceeded: silent
     trigger:
       - platform: state
-        entity_id: binary_sensor.koekken_apollo_radar_moving_target
+        entity_id:
+          - binary_sensor.koekken_apollo_occupancy
+          - binary_sensor.boernevaerelse_apollo_occupancy
+          - binary_sensor.spisestue_apollo_occupancy
         from: "off"
         to: "on"
+    variables:
+      ta: "{{ as_timestamp(trigger.to_state.last_changed) }}"
+      til_koekken: "{{ trigger.entity_id == 'binary_sensor.koekken_apollo_occupancy' }}"
+      # Afgangs-kandidater: optaget NU, eller sluppet ≤ 20 s før ankomsten.
+      kandidater: >-
+        {% set deps = ['binary_sensor.boernevaerelse_apollo_occupancy',
+                       'binary_sensor.spisestue_apollo_occupancy']
+           if til_koekken else ['binary_sensor.koekken_apollo_occupancy'] %}
+        {% set ns = namespace(l=[]) %}
+        {% for e in deps %}
+          {% set s = states[e] %}
+          {% if s is not none and (s.state == 'on'
+                or (s.state == 'off' and as_timestamp(s.last_changed) >= ta - 20)) %}
+            {% set ns.l = ns.l + [e] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.l }}
     condition:
-      # 2026-10-05: hele Tapo-børnedetektionen er en kontakt (default fra).
       - condition: state
         entity_id: input_boolean.koekken_lav_krop_boern_enabled
         state: "on"
       - condition: state
         entity_id: input_boolean.koekken_kamera_krop_enabled
         state: "on"
-      - condition: state
-        entity_id: binary_sensor.koekken_kamera_krop_gyldig
-        state: "on"
-      - condition: state
-        entity_id: binary_sensor.koekken_kamera_krop
-        state: "off"
-      # Kameraet skal have været tavst LÆNGE før radaren så noget — ikke bare
-      # "tavst sidst jeg kiggede". Den gamle regel (kameraets last_changed er
-      # ældre end radarens) blev opfyldt af hver eneste voksen der lige var gået
-      # ud af billedet: målt median-tavshed 14,2 s på de 289 tællinger.
-      # Efter en HA-restart er last_changed ~ boot-tidspunktet, og så ser alt
-      # friskt ud netop når intet er (fejlklasse #23) — derfor kræves også at
-      # kameraet er vågent (koekken_kamera_krop_gyldig ovenfor), som hviler på
-      # shimmens SKREVNE stempel og ikke på last_changed.
-      - condition: template
-        value_template: >-
-          {% set kam = states.binary_sensor.koekken_kamera_krop %}
-          {% set krav = states('input_number.koekken_lav_krop_kamera_tavs_sek') | float(300) %}
-          {{ kam is not none
-             and (now() - kam.last_changed).total_seconds() >= krav }}
-      # Samme fysiske passage må ikke tælle to gange. moving_target flimrer
-      # off/on mens én person går forbi, og uden dette blev 6 hændelser til 10
-      # tællinger i klynger på 8-20 s.
-      - condition: template
-        value_template: >-
-          {% set spor = states('input_text.koekken_lav_krop_spor') %}
-          {% set dele = spor.split(':') if ':' in spor else [] %}
-          {% set sidst = dele[2] | int(0) if dele | length >= 3 else 0 %}
-          {% set genfyr = states('input_number.koekken_lav_krop_genfyr_sek') | float(60) %}
-          {{ sidst == 0 or (now().timestamp() - sidst) >= genfyr }}
-      # Et møbel holder still_distance identisk til decimalen; et barn gør ikke.
-      - condition: state
-        entity_id: binary_sensor.koekken_apollo_frossen_ghost
-        state: "off"
-      # Robotten ER den bevægelse Apollo'erne ser, og den er også for lav til
-      # kameraet — den er præcis dette signals mest overbevisende falske barn.
-      #
-      # De to første vidner er begge afledt af Roborock-statussen, som kommer
-      # fra deres SKY og lander 18-155 s EFTER robottens egen start. I netop det
-      # hul kører robotten rundt uden at nogen af dem er `on`, og det er det
-      # eneste tidspunkt en kørsel overhovedet kan nå at blive talt som et barn
-      # (zone_maskering har delay_off 20 min og dækker hele halen).
-      # `roborock_session_active` sættes lokalt i samme sekund HA sender
-      # start-kommandoen og har ingen sky-forsinkelse.
-      #
-      # Flaget ryddes kun ved en ren afslutning, så et hængende flag kan
-      # undertrykke barn-detektionen. Det er den rigtige retning her: user-spec
-      # 15/9 er at robotten ALDRIG må tælle som barn.
-      - condition: template
-        value_template: >-
-          {{ not is_state('binary_sensor.roborock_blokerer_lys', 'on')
-             and not is_state('binary_sensor.roborock_zone_maskering', 'on')
-             and not is_state('input_boolean.roborock_session_active', 'on') }}
+      # Om natten sover børnene, og børne-flaget har sin egen nat-logik.
+      - condition: time
+        after: "06:00:00"
+        before: "22:00:00"
       - condition: template
         value_template: >-
           {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
-    action:
-      # --- BEVOGT vinduet aktivt ------------------------------------------
-      # Distancen ved passagens start. `| float(-1)` og ikke `float(0)`:
-      # moving_distance er `unknown` uden mål, og 0 ville betyde "tættest
-      # muligt" = et tal der ligner et ægte nær-mål.
-      - variables:
-          d_start: >-
-            {{ states('sensor.koekken_apollo_radar_moving_distance') | float(-1) }}
-          tavshed: >-
-            {{ (now() - states.binary_sensor.koekken_kamera_krop.last_changed)
-               .total_seconds() | round(0) }}
-      # Træder kameraet ind i billedet undervejs, er det en voksen — og så skal
-      # den IKKE tælles. Slipper radaren målet, var det ikke en passage. Begge
-      # udfald afbryder; kun en timeout betyder "tavst hele vejen".
-      - wait_for_trigger:
-          - platform: state
-            entity_id: binary_sensor.koekken_kamera_krop
-            to: "on"
-          - platform: state
-            entity_id: binary_sensor.koekken_apollo_radar_moving_target
-            to: "off"
-        timeout:
-          seconds: >-
-            {{ states('input_number.koekken_lav_krop_min_sekunder') | int(4) }}
-      - condition: template
-        value_template: "{{ wait.trigger is none }}"
-      - variables:
-          d_slut: >-
-            {{ states('sensor.koekken_apollo_radar_moving_distance') | float(-1) }}
-          # -1 = kanalen svarede ikke i mindst den ene ende. Det er IKKE nul
-          # bevægelse, og må derfor ikke afvises som "stod stille".
-          spaend: >-
-            {{ ((d_slut | float(-1)) - (d_start | float(-1))) | abs | round(0)
-               if (d_start | float(-1)) >= 0 and (d_slut | float(-1)) >= 0
-               else -1 }}
+      # En ankomst er en krop der KOMMER — rummet skal have været stille ≥ 20 s.
       - condition: template
         value_template: >-
-          {% set krav = states('input_number.koekken_lav_krop_transit_cm') | float(0) %}
-          {{ krav <= 0 or (spaend | float(-1)) < 0 or (spaend | float(-1)) >= krav }}
+          {{ trigger.from_state is not none
+             and (trigger.to_state.last_changed - trigger.from_state.last_changed)
+                 .total_seconds() >= 20 }}
+      - condition: template
+        value_template: "{{ kandidater | length > 0 }}"
+      - condition: state
+        entity_id: binary_sensor.koekken_kamera_vaagen
+        state: "on"
+      # Et møbel-spøgelse holder køkken-radaren optaget uden nogen krop.
+      - condition: template
+        value_template: >-
+          {% set g = states.binary_sensor.koekken_apollo_frossen_ghost %}
+          {{ g is not none and g.state == 'off'
+             and as_timestamp(g.last_changed) < ta - 30 }}
+      # Robotten ER den bevægelse radarerne ser, og den er for lav til kameraet
+      # (user-spec 15/9: robotten må ALDRIG tælle som barn). session_active
+      # sættes lokalt i startsekundet; de to andre kommer fra Roborock-skyen.
+      - condition: template
+        value_template: >-
+          {% set ns = namespace(ok=true) %}
+          {% for e in ['binary_sensor.roborock_blokerer_lys',
+                       'binary_sensor.roborock_zone_maskering',
+                       'input_boolean.roborock_session_active'] %}
+            {% set s = states[e] %}
+            {% if s is none or s.state != 'off'
+                  or as_timestamp(s.last_changed) >= ta - 120 %}
+              {% set ns.ok = false %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.ok }}
+    action:
+      # 1) Ankomsten HOLDER 10 s (et blip er ikke en krop der flyttede sig).
+      - wait_template: >-
+          {% set s = states[trigger.entity_id] %}
+          {{ s is none or s.state != 'on' or as_timestamp(s.last_changed) > ta + 0.5 }}
+        timeout: "{{ [ta + 10 - now().timestamp(), 0] | max }}"
+      - condition: template
+        value_template: "{{ not wait.completed }}"
+      # 2) Afgangs-rummet er tomt senest 15 s efter ankomsten.
+      - wait_template: >-
+          {% set ns = namespace(ok=true) %}
+          {% for e in kandidater %}
+            {% if is_state(e, 'on') %}{% set ns.ok = false %}{% endif %}
+          {% endfor %}
+          {{ ns.ok }}
+        timeout: "{{ [ta + 15 - now().timestamp(), 0] | max }}"
+      - condition: template
+        value_template: "{{ wait.completed }}"
+      # td = afgangs-tidspunktet (unavailable er ikke "tomt").
       - variables:
-          spor: "{{ states('input_text.koekken_lav_krop_spor') }}"
-          gyldigt: >-
-            {{ ':' in spor and spor not in ['unknown', 'unavailable'] }}
-          start: "{{ spor.split(':')[1] | int(0) if gyldigt else 0 }}"
-          vindue: >-
-            {{ (states('input_number.koekken_lav_krop_vindue_min') | float(30)) * 60 }}
-          # Vinduet er rullende fra FØRSTE passage. Er det løbet ud, starter vi
-          # forfra frem for at lade en enlig passage fra i formiddags tælle med.
-          frisk: >-
-            {{ gyldigt and start > 0
-               and (now().timestamp() - start) <= (vindue | float(1800)) }}
-          antal: >-
-            {{ (spor.split(':')[0] | int(0)) + 1 if frisk else 1 }}
-      - service: input_text.set_value
-        target:
-          entity_id: input_text.koekken_lav_krop_spor
+          td: >-
+            {% set ns = namespace(t=0, ok=true) %}
+            {% for e in kandidater %}
+              {% set s = states[e] %}
+              {% if s is none or s.state != 'off' %}{% set ns.ok = false %}
+              {% else %}{% set ns.t = [ns.t, as_timestamp(s.last_changed)] | max %}{% endif %}
+            {% endfor %}
+            {{ ns.t if ns.ok else 0 }}
+      - condition: template
+        value_template: "{{ td | float(0) > 0 }}"
+      # Afgang fra køkkenet: segment-sensoren skrives i SAMME event som
+      # afgangs-flanken — giv den 3 s, og kameraet 3 s margin efter segmentet.
+      - delay: "{{ 0 if til_koekken else [td + 3 - now().timestamp(), 0] | max }}"
+      - variables:
+          seg_ud: >-
+            {% set ns = namespace(s=0, e=0, lux=-1) %}
+            {% if not til_koekken %}
+              {% for p in ['', 'forrige_'] %}
+                {% set s = state_attr('sensor.koekken_skift_segment', p ~ 'start') | float(0) %}
+                {% set e = state_attr('sensor.koekken_skift_segment', p ~ 'slut') | float(0) %}
+                {% if ns.s == 0 and s > 0 and e > 0 and (e - td) | abs < 1.5 %}
+                  {% set ns.s = s %}{% set ns.e = e %}
+                  {% set ns.lux = state_attr('sensor.koekken_skift_segment',
+                                             p ~ 'lux_min') | float(-1) %}
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            {{ {'s': ns.s, 'e': ns.e, 'lux': ns.lux} }}
+      - condition: template
+        value_template: "{{ til_koekken or seg_ud.s > 0 }}"
+      # Kameraet tavst fra 3 s før køkken-segmentet til nu (≥ 3 s efter).
+      - condition: template
+        value_template: >-
+          {% set c = states.binary_sensor.koekken_kamera_krop %}
+          {{ til_koekken or (c is not none and c.state == 'off'
+             and as_timestamp(c.last_changed) < seg_ud.s - 3) }}
+      # 3) Afgangs-rummet FORBLIVER tomt til td + 30 s — ellers var der to kroppe.
+      - wait_template: >-
+          {% set ns = namespace(brudt=false) %}
+          {% for e in kandidater %}
+            {% set s = states[e] %}
+            {% if s is none or s.state != 'off'
+                  or as_timestamp(s.last_changed) > td + 0.5 %}
+              {% set ns.brudt = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.brudt }}
+        timeout: "{{ [td + 30 - now().timestamp(), 0] | max }}"
+      - condition: template
+        value_template: "{{ not wait.completed }}"
+      # 4) Ankomst i køkkenet: dommen kræver at køkken-opholdet er SLUT
+      #    (max 10 min — et længere ophold er ikke et skift).
+      - wait_template: >-
+          {% if not til_koekken %}true{% else %}
+            {% set ns = namespace(ok=false) %}
+            {% for p in ['', 'forrige_'] %}
+              {% set s = state_attr('sensor.koekken_skift_segment', p ~ 'start') | float(0) %}
+              {% set e = state_attr('sensor.koekken_skift_segment', p ~ 'slut') | float(0) %}
+              {% if (s - ta) | abs < 1.5 and e > 0 %}{% set ns.ok = true %}{% endif %}
+            {% endfor %}
+            {{ ns.ok }}
+          {% endif %}
+        timeout: "{{ [ta + 600 - now().timestamp(), 0] | max }}"
+      - condition: template
+        value_template: "{{ not til_koekken or wait.completed }}"
+      - variables:
+          seg_ind: >-
+            {% set ns = namespace(s=0, e=0, lux=-1) %}
+            {% if til_koekken %}
+              {% for p in ['', 'forrige_'] %}
+                {% set s = state_attr('sensor.koekken_skift_segment', p ~ 'start') | float(0) %}
+                {% set e = state_attr('sensor.koekken_skift_segment', p ~ 'slut') | float(0) %}
+                {% if ns.s == 0 and (s - ta) | abs < 1.5 and e > 0 %}
+                  {% set ns.s = s %}{% set ns.e = e %}
+                  {% set ns.lux = state_attr('sensor.koekken_skift_segment',
+                                             p ~ 'lux_min') | float(-1) %}
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            {{ {'s': ns.s, 'e': ns.e, 'lux': ns.lux} }}
+      - delay: "{{ [seg_ind.e + 3 - now().timestamp(), 0] | max if til_koekken else 0 }}"
+      # Kameraet tavst fra 3 s før ankomsten til 3 s efter køkken-segmentet.
+      - condition: template
+        value_template: >-
+          {% set c = states.binary_sensor.koekken_kamera_krop %}
+          {{ not til_koekken or (c is not none and c.state == 'off'
+             and as_timestamp(c.last_changed) < ta - 3) }}
+      - variables:
+          seg: "{{ seg_ind if til_koekken else seg_ud }}"
+      - condition: template
+        value_template: >-
+          {{ seg.s > 0
+             and (seg.e - seg.s)
+                 >= (states('input_number.koekken_skift_min_segment_sek') | float(10))
+             and seg.lux >= (states('input_number.koekken_skift_min_lux') | float(40)) }}
+      # Gen-tjek ved dommen: kameraet vågent HELE segmentet (last_changed efter
+      # en restart = boot → afvist, #23), intet spøgelse, ingen robot undervejs.
+      - condition: template
+        value_template: >-
+          {% set v = states.binary_sensor.koekken_kamera_vaagen %}
+          {% set g = states.binary_sensor.koekken_apollo_frossen_ghost %}
+          {% set ns = namespace(ok=v is not none and v.state == 'on'
+                                   and as_timestamp(v.last_changed) < seg.s
+                                   and g is not none and g.state == 'off'
+                                   and as_timestamp(g.last_changed) < ta - 30) %}
+          {% for e in ['binary_sensor.roborock_blokerer_lys',
+                       'binary_sensor.roborock_zone_maskering',
+                       'input_boolean.roborock_session_active'] %}
+            {% set s = states[e] %}
+            {% if s is none or s.state != 'off'
+                  or as_timestamp(s.last_changed) >= ta - 120 %}
+              {% set ns.ok = false %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.ok }}
+      - service: script.koekken_skift_registrer
         data:
-          value: >-
-            {{ antal }}:{{ start if frisk else now().timestamp() | int
-            }}:{{ now().timestamp() | int }}
-      # Loggen ER live-testens måleinstrument: spændet er det eneste tal vi ikke
-      # kunne hente fra historikken, fordi moving_distance er recorder-
-      # ekskluderet. Gå turen med et barn og læs spændene her bagefter.
-      - service: logbook.log
-        data:
-          name: "Køkken kamera"
-          message: >-
-            Lav passage {{ antal }}/{{ states('input_number.koekken_lav_krop_antal') | int(3) }}
-            — radar holdt
-            {{ states('input_number.koekken_lav_krop_min_sekunder') | int(4) }} s,
-            kameraet tavst i {{ tavshed }} s og hele vejen igennem,
-            {{ states('sensor.koekken_lux_effektiv') | float(0) | round(1) }} lx.
-            Afstand {{ d_start | float(-1) | round(0) }} →
-            {{ d_slut | float(-1) | round(0) }} cm, spænd
-            {{ 'ukendt' if (spaend | float(-1)) < 0 else (spaend ~ ' cm') }}.
+          ta: "{{ ta }}"
+          rum: >-
+            {% set k = {'binary_sensor.koekken_apollo_occupancy': 'K',
+                        'binary_sensor.boernevaerelse_apollo_occupancy': 'B',
+                        'binary_sensor.spisestue_apollo_occupancy': 'S'} %}
+            {% set ns = namespace(r='') %}
+            {% for e in kandidater %}{% set ns.r = ns.r ~ k[e] %}{% endfor %}
+            {{ ns.r ~ '>' ~ k[trigger.entity_id] }}
+          seg: "{{ (seg.e - seg.s) | round(0) | int }}"
+          lux: "{{ seg.lux | round(0) | int }}"
 
   # ---------------------------------------------------------------------------
-  # Nulstil sporet når en voksen er set, eller flaget allerede er sat
+  # Nulstil sporet når flaget allerede er sat, og hver nat
   # ---------------------------------------------------------------------------
   - id: koekken_lav_krop_ryd
-    alias: "Køkken: ryd sporet af lave passager"
+    alias: "Køkken: ryd sporet af rene rum-skift"
     description: >
       Sporet skal ikke kunne bære over til i morgen. Ryddes når børn-flaget
       allerede er sat (så det ikke fyrer igen i det sekund flaget selv ryddes),
@@ -456,3 +535,110 @@ automation:
           entity_id: input_text.koekken_lav_krop_spor
         data:
           value: ""
+
+script:
+  # Tæller de rene skift. `queued`, så to skift der dømmes i samme sekund ikke
+  # læser sporet før hinanden har skrevet det (fejlklasse #2's tids-variant).
+  # Skiftene dømmes UDEN for rækkefølge (et skift ind i køkkenet først når
+  # opholdet er slut), så sporet sorteres og beskæres fra det nyeste.
+  koekken_skift_registrer:
+    alias: "Køkken: registrér et rent rum-skift"
+    mode: queued
+    max: 10
+    fields:
+      ta:
+        description: "Ankomst-tidspunktet (epoch)"
+      rum:
+        description: "Afgang>ankomst, fx B>K eller K>S"
+      seg:
+        description: "Køkken-opholdets længde (s)"
+      lux:
+        description: "Laveste lux i køkkenet under opholdet"
+    sequence:
+      - variables:
+          res: >-
+            {% set t = ta | default(0) | float(0) | int %}
+            {% set W = (states('input_number.koekken_lav_krop_vindue_min') | float(30)) * 60 %}
+            {% set gap = states('input_number.koekken_skift_min_afstand_sek') | float(120) %}
+            {% set antal = states('input_number.koekken_lav_krop_antal') | int(2) %}
+            {% set raw = states('input_text.koekken_lav_krop_spor') %}
+            {% set ns = namespace(dup=false, top=t, l=[]) %}
+            {% if raw not in ['', 'unknown', 'unavailable'] %}
+              {% for x in raw.split(',') %}
+                {% set q = x.split(':')[0] | int(0) %}
+                {% if q > 0 %}
+                  {% if (q - t) | abs < 3 %}{% set ns.dup = true %}{% endif %}
+                  {% set ns.top = [ns.top, q] | max %}
+                  {% set ns.l = ns.l + [x] %}
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            {% set ny = t ~ ':' ~ (rum | default('?')) ~ ':'
+                 ~ (seg | default(0) | int(0)) ~ ':'
+                 ~ ([lux | default(0) | int(0), 9999] | min) %}
+            {% set ns2 = namespace(l=[]) %}
+            {% for x in ns.l + [ny] %}
+              {% if (x.split(':')[0] | int(0)) >= ns.top - W %}
+                {% set ns2.l = ns2.l + [x] %}
+              {% endif %}
+            {% endfor %}
+            {% set liste = (ns2.l | sort)[-10:] %}
+            {% set ns3 = namespace(n=0, sidst=0) %}
+            {% for x in liste %}
+              {% set q = x.split(':')[0] | int(0) %}
+              {% if ns3.n == 0 or q - ns3.sidst >= gap %}
+                {% set ns3.n = ns3.n + 1 %}{% set ns3.sidst = q %}
+              {% endif %}
+            {% endfor %}
+            {% set navn = {'K': 'køkken', 'B': 'børneværelse', 'S': 'spisestue'} %}
+            {% set ns4 = namespace(t=[]) %}
+            {% for x in liste %}
+              {% set d = x.split(':') %}
+              {% set r = d[1] if d | length > 1 else '' %}
+              {% set ns5 = namespace(f=[]) %}
+              {% for c in (r.split('>')[0] if '>' in r else '') %}
+                {% set ns5.f = ns5.f + [navn.get(c, c)] %}
+              {% endfor %}
+              {% set til = r.split('>')[1] if '>' in r else '' %}
+              {% set ns4.t = ns4.t + [ns5.f | join('/') ~ '→' ~ navn.get(til, til)
+                   ~ ' ' ~ (d[0] | int(0) | timestamp_custom('%H:%M'))] %}
+            {% endfor %}
+            {{ {'dup': ns.dup, 'spor': liste | join(','), 'n': ns3.n,
+                'fyr': ns3.n >= antal, 'tekst': ns4.t | join(', ')} }}
+      - condition: template
+        value_template: "{{ not res.dup and (ta | default(0) | float(0)) > 0 }}"
+      - if:
+          - condition: template
+            value_template: "{{ res.fyr }}"
+        then:
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.koekken_lav_krop_spor
+            data:
+              value: ""
+          # Spørgsmålet stilles af boern_ankomst_koekken_spoerg, som ejer hele
+          # gate-pakken (flag allerede sat, "nej i dag", AirBnB, voksen hjemme).
+          - event: koekken_skift_bevist
+            event_data:
+              antal: "{{ res.n }}"
+              spor: "{{ res.spor }}"
+              tekst: "{{ res.tekst }}"
+          - service: logbook.log
+            data:
+              name: "Køkken-skift"
+              message: >-
+                {{ res.n }} rene skift uden kamera-bevægelse ({{ res.tekst }})
+                → spørger om børn er hjemme.
+        else:
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.koekken_lav_krop_spor
+            data:
+              value: "{{ res.spor[:255] }}"
+          - service: logbook.log
+            data:
+              name: "Køkken-skift"
+              message: >-
+                Rent skift {{ rum | default('?') }} uden kamera-bevægelse
+                (køkken {{ seg | default(0) }} s, {{ lux | default(0) }} lx) —
+                {{ res.n }}/{{ states('input_number.koekken_lav_krop_antal') | int(2) }}.

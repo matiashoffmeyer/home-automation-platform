@@ -4,11 +4,14 @@
 # Baggrund, kalibrering og hvorfor flaget ikke er boern_sov_her_i_nat:
 # se headeren i packages/boern_ankomst.yaml.
 #
-# Tre automations:
+# Automations:
 #   1) detekter  — ophold ≥ slider → input_boolean.boern_aktivitet_detekteret
 #                  (= 4. auto-signal i binary_sensor.kids_home) + spørg user
 #   2) ryd       — ro i børneværelset ≥ slider → flag off (selv-rydning)
-#   3) svar      — "❌ Nej" rydder flaget + undertrykker resten af aftenen
+#   3) svar      — "❌ Nej" rydder flaget + undertrykker resten af aftenen;
+#                  "✅ Ja" sætter flaget og sender boern_ankomst_bekraeftet
+#   4) people_spoerg / koekken_spoerg / akkumulator_spoerg — SPØRGER kun;
+#                  flaget sættes først af svarets "✅ Ja"
 #
 # Begge tilstands-automations har /15-backstop (fejlklasse #4): en HA-restart
 # midt i et ophold dræber `for:`-flanken, og så ville hverken sæt eller ryd ske.
@@ -33,33 +36,14 @@
     - platform: time_pattern
       minutes: "/15"
       id: backstop
-    # 2026-09-14 (user-spec): "hvis der bevæger sig et barn forbi køkkenet vil
-    # Apollo køkken se det som movement væk fra apolloen. mens kameraet ikke vil
-    # se det. barnet er ikke højt nok. det kan hjælpe os med at sætte børn
-    # hjemme on." Child A løb frem og tilbage mellem børneværelset, køkkenet og
-    # entréen hele dagen — et barn der er hjemme går ikke ind i børneværelset og
-    # BLIVER der, og de 12 minutters ophold ovenfor er derfor det langsomme
-    # vidne. Beviset bygges i packages/koekken_kamera_krop.yaml; det kommer ind
-    # HER frem for i sin egen automation, så det arver hele gate-pakken nedenfor
-    # (kill-switch, "user sagde nej", voksen-guard, house_mode) i stedet for at
-    # åbne en parallel vej til flaget (fejlklasse #2/#21).
-    - platform: state
-      entity_id: binary_sensor.koekken_lav_krop_bevist
-      from: "off"
-      to: "on"
-      id: lav_krop
+    # Køkken-kameraets børne-vej (lav_krop, 14/9 → fra 5/10) er fjernet herfra
+    # 23/10: v2 (rene rum-skift) SPØRGER før flaget sættes, og hører derfor
+    # til hos boern_ankomst_koekken_spoerg længere nede — denne automation
+    # sætter flaget FØR den spørger.
   condition:
     - condition: state
       entity_id: input_boolean.boern_ankomst_detekt_enabled
       state: "on"
-    # 2026-10-05: lav_krop-vejen skelner ikke barn fra voksen (24 tællinger på
-    # 70 min med kun voksne hjemme; user svarede nej 3 af 4 gange) → user:
-    # "slå børnedetektion fra på tapo". Samme kontakt gater også selve
-    # tælleren. Målingen står i packages/koekken_kamera_krop.yaml.
-    - condition: template
-      value_template: >-
-        {{ (trigger.id if trigger is defined else '') != 'lav_krop'
-           or is_state('input_boolean.koekken_lav_krop_boern_enabled', 'on') }}
     - condition: state
       entity_id: input_boolean.boern_aktivitet_detekteret
       state: "off"
@@ -102,7 +86,7 @@
     # kun analoge sensorer der re-rapporterer samme værdi).
     - condition: template
       value_template: >-
-        {% if trigger.id in ['flanke', 'lav_krop'] %}
+        {% if trigger.id == 'flanke' %}
           true
         {% else %}
           {% set s = states.binary_sensor.boernevaerelse_apollo_occupancy %}
@@ -119,12 +103,10 @@
     # efterløbet (20) ≥ ophold-slideren (7), er ethvert ophold der overlapper
     # en kørsel maskeret når det når tærsklen. Re-arm (#4): backstop-grenen
     # fyrer ved første tick efter masken, hvis opholdet stadig holder. Målt 14
-    # døgn: 48 ophold ≥ 7 min, kun dette ene under masken. lav_krop er
-    # allerede robot-maskeret ved kilden (packages/koekken_kamera_krop.yaml).
+    # døgn: 48 ophold ≥ 7 min, kun dette ene under masken.
     - condition: template
       value_template: >-
-        {{ (trigger.id if trigger is defined else '') == 'lav_krop'
-           or not is_state('binary_sensor.roborock_zone_maskering', 'on') }}
+        {{ not is_state('binary_sensor.roborock_zone_maskering', 'on') }}
   action:
     - service: input_boolean.turn_on
       target:
@@ -133,18 +115,10 @@
       data:
         name: "Børn ankomst"
         message: >-
-          {% if trigger.id == 'lav_krop' %}
-            {{ state_attr('binary_sensor.koekken_lav_krop_bevist', 'antal') | int(0) }}
-            passager forbi køkkenet som radaren så og kameraet ikke
-            (tærskel {{ states('input_number.koekken_lav_krop_antal') | int(3) }}
-            på {{ states('input_number.koekken_lav_krop_vindue_min') | int(30) }} min)
-            → børn hjemme (lav_krop).
-          {% else %}
-            Sammenhængende ophold i børneværelset
-            {{ ((now() - states.binary_sensor.boernevaerelse_apollo_occupancy.last_changed).total_seconds() / 60) | round(0) | int }}
-            min (tærskel {{ states('input_number.boern_ankomst_ophold_minutter') | int(12) }})
-            → børn hjemme ({{ trigger.id }}).
-          {% endif %}
+          Sammenhængende ophold i børneværelset
+          {{ ((now() - states.binary_sensor.boernevaerelse_apollo_occupancy.last_changed).total_seconds() / 60) | round(0) | int }}
+          min (tærskel {{ states('input_number.boern_ankomst_ophold_minutter') | int(12) }})
+          → børn hjemme ({{ trigger.id }}).
     # Bekræftelses-spørgsmål: sensorerne kan ikke skelne 20 min barn fra 20 min
     # voksen der lægger tøj på plads. Svaret logges som facit til kalibrering
     # af tærsklen (ai_feedback/boern_ankomst_feedback.jsonl).
@@ -232,10 +206,13 @@
   action:
     - variables:
         answer: "{{ trigger.event.data.action | replace('BOERN_ANKOMST_', '') | lower }}"
+        # Hvem stillede spørgsmålet — læses FØR rydningen nedenfor.
+        kilde: "{{ states('input_text.boern_ankomst_pending_kilde') }}"
         payload_b64: >-
           {{ {
             'type': 'answer',
             'id': states('input_text.boern_ankomst_pending'),
+            'kilde': kilde,
             'ts': now().isoformat(),
             'answer': answer,
             'ophold_min_at_answer': states('sensor.boern_occupancy_4h') | float(-1),
@@ -247,7 +224,9 @@
         payload_b64: "{{ payload_b64 }}"
     - service: input_text.set_value
       target:
-        entity_id: input_text.boern_ankomst_pending
+        entity_id:
+          - input_text.boern_ankomst_pending
+          - input_text.boern_ankomst_pending_kilde
       data:
         value: ""
     - choose:
@@ -288,6 +267,13 @@
         - service: input_boolean.turn_on
           target:
             entity_id: input_boolean.boern_aktivitet_detekteret
+        # 2026-10-23: et bekræftet svar er et facit som andre kan bygge på —
+        # people_boern_set løfter børne-tallet på køkken-skiftenes ja (user-
+        # spec: "people counter går evt. op hvis den ikke allerede har talt
+        # barnet").
+        - event: boern_ankomst_bekraeftet
+          event_data:
+            kilde: "{{ kilde }}"
         # 2026-10-07 (fejlklasse #12, spejlet af force-on-fixet): morgen-
         # latchen spørger også mens en glemt "Børn IKKE hjemme" står on — og
         # den vinder over alle auto-signaler i kids_home. Uden dette led svarede
@@ -381,6 +367,66 @@
           Jeg har talt {{ states('sensor.people_estimate') | int(0) }} hjemme i
           {{ states('input_number.boern_people_spoerg_minutter') | int(10) }} min,
           men ingen børn. Er der børn hjemme?
+
+# ---------------------------------------------------------------------------
+# 2026-10-23 (user-spec): børn via RENE rum-skift forbi køkkenet. Beviset
+# bygges i packages/koekken_kamera_krop.yaml (koekken_skift_transit →
+# script.koekken_skift_registrer → event koekken_skift_bevist). "…dernæst
+# starter vi det op med at jeg får en notifikation jeg kan svare på, og kun
+# hvis jeg bekræfter børnetilstedeværelse, slår børn hjemme til" → denne
+# SPØRGER kun; "✅ Ja" i boern_ankomst_svar sætter flaget og sender
+# boern_ankomst_bekraeftet (kilde koekken_skift) videre til people count.
+# Egen automation frem for en trigger på detekteren: detekteren sætter flaget
+# FØR den spørger. Samme porte som people_spoerg + detekterens voksen-guard;
+# scriptets "✅ Ja i dag"-tavshed gælder også her.
+# ---------------------------------------------------------------------------
+- id: boern_ankomst_koekken_spoerg
+  alias: "Børn: rene skift forbi køkkenet uden kamera-bevægelse → spørg"
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: event
+      event_type: koekken_skift_bevist
+  condition:
+    - condition: state
+      entity_id: input_boolean.koekken_lav_krop_boern_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.boern_ankomst_detekt_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.boern_aktivitet_detekteret
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.boern_sov_her_i_nat
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.kids_home_manual
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.kids_home_manual_off
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+    # Små børn er ikke hjemme uden en voksen.
+    - condition: template
+      value_template: >-
+        {{ is_state('input_boolean.parent_a_home', 'on')
+           or is_state('input_boolean.parent_b_home', 'on') }}
+    - condition: template
+      value_template: >-
+        {% set u = state_attr('input_datetime.boern_ankomst_suppress_until', 'timestamp') %}
+        {{ u is none or u == 0 or now().timestamp() > u }}
+  action:
+    - action: script.boern_ankomst_spoerg
+      data:
+        kilde: koekken_skift
+        besked: >-
+          {{ trigger.event.data.antal | default(2) }} rene skift forbi køkkenet
+          uden at kameraet så bevægelse: {{ trigger.event.data.tekst | default('') }}.
+          Er der børn hjemme?
+        bevis: "{{ trigger.event.data.spor | default('') }}"
 
 # ---------------------------------------------------------------------------
 # 2026-09-25 (user-spec: "alle nye børnebesøg-perioder skal bekræftes af mig"):
