@@ -45,7 +45,7 @@ Search keywords: `sovevaerelse, sove`
 
 ### `automations/light_power_recovery.yaml`
 
-- **Sovelys: post-strom -> sun-aware default** (line 203, mode=single)
+- **Sovelys: post-strom -> sun-aware default** (line 216, mode=single)
   - Sove bulb wake fra wall-switch eller mesh-flicker → fader til sun-aware
 
 ### `automations/morning_curtains.yaml`
@@ -137,8 +137,8 @@ Search keywords: `sovevaerelse, sove`
 
 ### `binary_sensor.*`
 
-- `binary_sensor.dark_mode_sove` — 2 refs in 2 file(s)
-- `binary_sensor.filmmoerke_sove` — 12 refs in 6 file(s)
+- `binary_sensor.dark_mode_sove` — 3 refs in 3 file(s)
+- `binary_sensor.filmmoerke_sove` — 13 refs in 7 file(s)
 - `binary_sensor.mood_pause_sovevaerelse` — 3 refs in 2 file(s)
 - `binary_sensor.parasoll_sovedoer` — 15 refs in 4 file(s)
 - `binary_sensor.sove_aften_laasevindue` — 2 refs in 2 file(s)
@@ -153,7 +153,7 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sove_morgen_moerklagt` — 7 refs in 5 file(s)
 - `binary_sensor.sove_radar_frossen` — 3 refs in 3 file(s)
 - `binary_sensor.sove_retur_til_seng` — 7 refs in 4 file(s)
-- `binary_sensor.sovevaerelse_apollo_occupancy` — 90 refs in 45 file(s)
+- `binary_sensor.sovevaerelse_apollo_occupancy` — 91 refs in 46 file(s)
 - `binary_sensor.sovevaerelse_apollo_online` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_moving_target` — 18 refs in 10 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_still_target` — 21 refs in 9 file(s)
@@ -319,7 +319,7 @@ Search keywords: `sovevaerelse, sove`
 - `light.sove_lyskaede` — 24 refs in 11 file(s)
 - `light.sovevaerelse_all` — 17 refs in 9 file(s)
 - `light.sovevaerelse_apollo_rgb_light` — 13 refs in 8 file(s)
-- `light.sovevaerelse_loft` — 11 refs in 7 file(s)
+- `light.sovevaerelse_loft` — 12 refs in 8 file(s)
 
 ### `number.*`
 

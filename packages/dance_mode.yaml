@@ -38,9 +38,16 @@
 #   4. FEST SLUT GENGIVER AUTO (dance_restore_auto): sluk + rummets egen
 #      tænd-automation hvis presence siger optaget. Før blev disko-farverne
 #      stående i tomme rum.
-#   5. (2026-10-11, B222) MATTER-PÆRER HAR TEMPO-GULV (`inv`): de deler én
-#      flaskehals (~0,15 s × antal pr. kommando), så de spiller hvert mm'te
-#      tick på det fælles ur i stedet for et tilfældigt udsnit af dem.
+#   5. THREAD-PÆRERNE DANSER IKKE MED I KOREOGRAFIEN (2026-10-25, B260;
+#      afløser B222's tempo-gulv `inv`). Et halloween-løb sendte ~2 Matter-
+#      kommandoer/s og fældede OTBR'en 25/10 06:21 (alle Thread-enheder væk
+#      ~3 min); hvert test-løb 24/10 kostede 3-5 RCP-resets. Matter-pærerne
+#      skriver nu kun på deres plads i husets gitter (custom_templates/
+#      festlys.jinja): input_number.festlys_thread_skrivninger pr. minut for
+#      ALLE Thread-pærer tilsammen, på skift, i både events og disko-loopet,
+#      og kun når udseendet faktisk skifter. Thread-pause (binary_sensor.
+#      stue_spots_ild_thread_pause) = de sidder helt over. Gruppe-events
+#      (blackout/warm/breathe/ild-udbrændingen) rører dem ikke.
 #
 # Affected color-bulbs (verificeret xy-support 2026-05-25):
 #   spisestue_loft, stue_laesehygge, stue_sofa_lampe, stue_sofa_lampe_2, stue_hjoernelampe, koekken_lyskaede
@@ -145,6 +152,7 @@ input_select:
       - "sparkle"
       - "cascade"
       - "fire"
+      - "halloween"
 
 input_number:
   # Hastighed på AMBIENT-loopet (dance_single_bulb) = hvor hurtigt hver pære
@@ -187,6 +195,21 @@ input_number:
     step: 5
     unit_of_measurement: "min"
     mode: slider
+  # Thread-budgettet (header regel 5, B260): skrivninger pr. minut for ALLE
+  # festens Thread-pærer TILSAMMEN (entré-loftet, stue-spotsene, badets
+  # KAJPLATS), på skift i ét fælles gitter. 8 = én skrivning hvert 7,5 s i
+  # huset ≤ 16 kommandoer/min ≈ 0,27/s — trappe-testen 17/10 var ren ved
+  # 0,5/s og gik ned ved 1/s, og halloween sendte ~2/s da OTBR'en faldt
+  # 25/10. Med 3 Thread-pærer skifter hver pære højst hvert 22,5 s. 0 = de
+  # sidder helt over. Ingen initial: (restore).
+  festlys_thread_skrivninger:
+    name: "Festlys: Thread-skrivninger pr. minut"
+    icon: mdi:access-point-network
+    min: 0
+    max: 20
+    step: 1
+    unit_of_measurement: "/min"
+    mode: slider
 
 input_text:
   # Runtime-kvittering: hvilke room_modes dance FAKTISK satte til Manual ved
@@ -204,7 +227,7 @@ input_text:
 # =============================================================================
 # Den native Effects-dropdown på en rigtig Zigbee-pære kan IKKE udvides (listen
 # kommer fra pærens firmware = kun 'colorloop'/'loop'). Denne template-lampe
-# eksponerer i stedet vores 15 dance-events som effekter, så lys-dashboardet får
+# eksponerer i stedet vores 16 dance-events som effekter, så lys-dashboardet får
 # en ægte "tap → Effects → vælg event"-oplevelse:
 #   - Tap tile (on)        → auto-shuffle (dance_mode = tilfældige events).
 #   - Tap → Effects → X    → låser til event X (continuous loop, hot-swap).
@@ -226,7 +249,7 @@ template:
         effect_list: >-
           {{ ['strobe', 'blackout', 'warm', 'pulse', 'chase', 'jump',
               'chase_comet', 'split', 'heartbeat', 'police', 'lightning',
-              'breathe', 'sparkle', 'cascade', 'fire'] }}
+              'breathe', 'sparkle', 'cascade', 'fire', 'halloween'] }}
         effect: >-
           {{ states('input_select.dance_manual_event')
              if not is_state('input_select.dance_manual_event', 'off')
@@ -572,6 +595,7 @@ script:
             - script.dance_sparkle_burst
             - script.dance_cascade_burst
             - script.dance_fire_burst
+            - script.dance_halloween_burst
             - script.dance_event_run
             - script.dance_event_bulb
       - if:
@@ -672,6 +696,16 @@ script:
                           or states.script
                              | selectattr('object_id', 'search', '^(dance_.*_burst|dance_event_run|fest_gaest_ankomst)$')
                              | selectattr('state', 'eq', 'on') | list | count == 0) }}
+                # Thread-gitteret (header regel 5, B260): en Matter-pære skriver
+                # kun på sin plads i husets fælles takt — events og dette loop
+                # deler den, så budgettet holder også når de skifter.
+                thread: "{{ 1 if light_entity in integration_entities('matter') else 0 }}"
+                plads: >-
+                  {% from 'festlys.jinja' import thread_naeste %}
+                  {{ thread_naeste(light_entity, now().timestamp() - 0.2) if thread | int(0) == 1 else 0 }}
+                skriv: >-
+                  {{ 1 if fri and (thread | int(0) == 0
+                     or (plads | float(0) > 0 and plads | float(0) <= now().timestamp() + 0.3)) else 0 }}
                 smooth: "{{ is_state('binary_sensor.dance_smooth_mode','on') }}"
                 spd: "{{ [1, [100, states('input_number.dance_speed')|float(50)|round(0)|int]|min]|max }}"
                 base: "{{ 8.0 - (spd / 100.0) * 7.0 }}"
@@ -709,7 +743,7 @@ script:
                      else (range(0,360)|random) }}
             - if:
                 - condition: template
-                  value_template: "{{ fri }}"
+                  value_template: "{{ skriv | int(0) == 1 }}"
               then:
                 - service: light.turn_on
                   # Matter-pærer (entré, stue-spots) kan give CHIP-timeout, og
@@ -727,11 +761,19 @@ script:
                       {{ (range(80,101)|random) if smooth else (range(50,91)|random) }}
                     transition: "{{ trans }}"
             # Interruptibel pause: vågner straks hvis dance_mode slukkes eller
-            # pæren vælges fra, ellers dance_speed-styret rytme.
+            # pæren vælges fra, ellers dance_speed-styret rytme. En Thread-pære
+            # sover til sin næste plads (efter intervallet, hvis den skrev), og
+            # 30 s ad gangen mens Thread-pausen holder den ude.
             - wait_template: >-
                 {{ is_state('input_boolean.dance_mode','off')
                    or light_entity not in (state_attr('sensor.dance_active_bulbs', 'valgte') or []) }}
-              timeout: "{{ interval if fri else 1 }}"
+              timeout: >-
+                {% if thread | int(0) == 1 %}
+                  {% from 'festlys.jinja' import thread_naeste %}
+                  {% set nu = now().timestamp() %}
+                  {% set nxt = thread_naeste(light_entity, nu - 0.2 + ((interval | float(4)) if skriv | int(0) == 1 else 0)) | float(0) %}
+                  {{ ([1, nxt - nu] | max | round(1)) if nxt > 0 else 30 }}
+                {% else %}{{ interval if fri else 1 }}{% endif %}
               continue_on_timeout: true
 
   # ===========================================================================
@@ -756,7 +798,8 @@ script:
   # Farven sendes kun i første frame hvor den er konstant (farvet kald = 2
   # zigbee-frames, niveau-kald = 1).
   #
-  # blackout, warm og breathe er ét langsomt gruppe-kald og kører som før.
+  # blackout, warm og breathe er ét langsomt gruppe-kald på ZHA-pærerne.
+  # Thread-pærerne (Matter) danser ikke med i nogen af dem (header regel 5).
 
   # Starter løkkerne og holder til eventets slut. Kaldes BLOKERENDE af
   # event-scriptene, så deres `on` stadig betyder "eventet kører".
@@ -773,15 +816,19 @@ script:
         description: "Event-parametre (farve …)"
     sequence:
       - variables:
-          bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+          alle: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+          # Thread-budgettet (header regel 5, B260): Matter-pærerne er UDE af
+          # koreografien. Halloween sendte ~2 kommandoer/s til dem og fældede
+          # OTBR'en 25/10 06:21; nu tager de kun deres plads i husets gitter
+          # (festlys.jinja) og holder ét roligt look pr. event. `bulbs`, `n` og
+          # `idx` er derfor KUN ZHA-pærerne, så bølger og hale passer til dem
+          # der faktisk danser.
+          matter: "{{ alle | select('in', integration_entities('matter')) | list }}"
+          bulbs: "{{ alle | reject('in', matter) | list }}"
           n: "{{ bulbs | count }}"
-          # Matter-pærerne deler ÉN flaskehals (OTBR/Thread): målt 11/10 under
-          # chase med begge stue-spots: ~5,6 kommandoer/s i alt, p50 193 ms /
-          # p90 297 ms pr. kommando (solo ~95 ms) ⇒ ~0,15 s × antal Matter-
-          # pærer pr. kommando (p90). Et farvet turn_on er TO kommandoer (farve
-          # + on/niveau). ZHA-pæren ved siden af: p50 114 ms pr. kald.
-          matter: "{{ bulbs | select('in', integration_entities('matter')) | list }}"
-          inv: "{{ 0.15 * (matter | count) }}"
+          thread_med: >-
+            {% from 'festlys.jinja' import thread_takt %}
+            {{ 1 if thread_takt() | float(0) > 0 and matter | count > 0 else 0 }}
           # 150 ms frem, så alle løkker er startet før første tick.
           t0: "{{ now().timestamp() + 0.15 }}"
           slut: "{{ t0 + (varighed | default(6) | float(6)) }}"
@@ -809,9 +856,12 @@ script:
                 {% endif %}
               {% endfor %}
               {{ dict(pp, lyn=ns.l) }}
+            {% elif event == 'halloween' %}
+              {# De døende pærer vælges ÉN gang, så alle løkker er enige. #}
+              {{ dict(pp, doe=(range(0, nn) | list | shuffle)[:[1, [2, nn // 4] | min] | max]) }}
             {% else %}{{ pp }}{% endif %}
-      - condition: template
-        value_template: "{{ n > 0 }}"
+      # Ingen condition på n > 0: eventet varer ALTID sin tid (uden ZHA-pærer
+      # ville et låst event ellers spinne i dance_manual_event_runner).
       - repeat:
           for_each: "{{ bulbs }}"
           sequence:
@@ -826,7 +876,20 @@ script:
                   t0: "{{ t0 }}"
                   slut: "{{ slut }}"
                   p: "{{ pp }}"
-                  inv: "{{ inv if repeat.item in matter else 0 }}"
+      - repeat:
+          for_each: "{{ matter if thread_med | int(0) == 1 else [] }}"
+          sequence:
+            - service: script.turn_on
+              target: {entity_id: script.dance_event_bulb}
+              data:
+                variables:
+                  light_entity: "{{ repeat.item }}"
+                  event: "{{ event }}"
+                  idx: "{{ repeat.index - 1 }}"
+                  n: "{{ n }}"
+                  t0: "{{ t0 }}"
+                  slut: "{{ slut }}"
+                  p: "{{ pp }}"
       - delay:
           milliseconds: "{{ [0, ((slut | float(0) - now().timestamp()) * 1000) | round(0) | int] | max }}"
       # En pære midt i et 5 s radio-hæng må ikke holde eventet åbent.
@@ -859,8 +922,6 @@ script:
         description: "Fælles slut (unix-tid)"
       p:
         description: "Event-parametre"
-      inv:
-        description: "Sekunder pr. Matter-kommando for DENNE pære (0 = ZHA)"
     sequence:
       - repeat:
           while:
@@ -871,6 +932,7 @@ script:
           sequence:
             - variables:
                 plan: >-
+                  {% from 'festlys.jinja' import thread_naeste %}
                   {% set nu = now().timestamp() %}
                   {% set T0 = t0 | float(0) %}
                   {% set t = [0, nu - T0] | max %}
@@ -880,23 +942,55 @@ script:
                   {% set pp = p if p is mapping else {} %}
                   {% set foerste = repeat.index == 1 %}
                   {% set sort = [[nu, 'off', {'transition': 0}]] if foerste else [] %}
-                  {# Tempo-gulv (11/10): en Matter-pære spiller kun hvert mm'te
-                     tick, så den kan nå sine kommandoer (inv pr. stk). Uden
-                     det nåede stue-spotsene 42 % af chase-ticks, i tilfældig
-                     rækkefølge = ustabilt. Tiderne er stadig på det fælles ur,
-                     så alle Matter-pærer rammer de SAMME ticks. #}
-                  {% set inv = inv | default(0) | float(0) %}
-                  {% if event == 'police' %}
-                    {% set mm = [1, (inv * 2 / 0.25 - 0.01) | round(0, 'ceil') | int] | max %}
-                    {% set P = 0.25 * mm %}{% set k = (t / P) | int %}
+                  {% if light_entity in integration_entities('matter') %}
+                    {# Thread-pære (header regel 5, B260): ét roligt look pr.
+                       event, skrevet på pærens plads i husets gitter og KUN
+                       hvis pæren ikke allerede står sådan. i = pladsen blandt
+                       Thread-pærerne; nn = ZHA-antallet (cascade-halen). Hurtige
+                       blink-events (strobe, lyn, halloween …) = mørk. Ingen
+                       transition: den koster 2 RemainingTime-rapporter mere.
+                       Bagud-tolerancen 0,2 s (25/10: 0,5 s lod et nyt løb der
+                       startede 0,3 s efter en plads bruge den igen — målt
+                       skrivninger ligger 0,01-0,07 s efter pladsen). #}
+                    {% set tau = thread_naeste(light_entity, nu - 0.2) | float(0) %}
+                    {% if tau <= 0 %}
+                      {{ {'trin': [], 'naeste': slut | float(0)} }}
+                    {% elif tau > nu + 0.3 %}
+                      {{ {'trin': [], 'naeste': tau} }}
+                    {% else %}
+                      {% set tl = [0, tau - T0] | max %}
+                      {% if event == 'police' %}{% set lk = [[0, 100] if i % 2 == 0 else [240, 100], 100] %}
+                      {% elif event == 'pulse' %}{% set lk = [pp.farve | default([0, 100]), 60] %}
+                      {% elif event == 'chase' %}{% set lk = [[((tl / 0.3) | int * 36) % 360, 100], 90] %}
+                      {% elif event == 'split' %}{% set lk = [pp.a | default([0, 100]) if i % 2 == 0 else pp.b | default([240, 100]), 90] %}
+                      {% elif event == 'cascade' %}{% set lk = [pp.farve | default([0, 100]), 90] %}
+                      {% elif event == 'fire' %}{% set lk = [[12, 96], range(15, 46) | random] %}
+                      {% else %}{% set lk = none %}{% endif %}
+                      {% set taendt = is_state(light_entity, 'on') %}
+                      {% if lk is none %}
+                        {% set trin = [[nu, 'off', {'transition': 0}]] if taendt else [] %}
+                      {% else %}
+                        {% set hs = state_attr(light_entity, 'hs_color') %}
+                        {% set dh = ((hs[0] | float(0)) - (lk[0][0] | float(0))) | abs if hs else 360 %}
+                        {% set farve_ok = taendt and hs is not none and [dh, 360 - dh] | min <= 5
+                                          and ((hs[1] | float(0)) - (lk[0][1] | float(0))) | abs <= 8 %}
+                        {% set bri_ok = taendt and ((state_attr(light_entity, 'brightness') | float(0)) / 2.55 - lk[1]) | abs <= 3 %}
+                        {% if farve_ok and bri_ok %}{% set trin = [] %}
+                        {% elif farve_ok %}{% set trin = [[nu, 'on', {'brightness_pct': lk[1], 'transition': 0}]] %}
+                        {% else %}{% set trin = [[nu, 'on', {'hs_color': lk[0], 'brightness_pct': lk[1], 'transition': 0}]] %}
+                        {% endif %}
+                      {% endif %}
+                      {{ {'trin': trin, 'naeste': nu + 1.0} }}
+                    {% endif %}
+                  {% elif event == 'police' %}
+                    {% set P = 0.25 %}{% set k = (t / P) | int %}
                     {% set d = {'hs_color': ([0, 100] if (k + halv) % 2 == 0 else [240, 100]), 'transition': 0} %}
                     {% if foerste %}{% set d = dict(d, brightness_pct=100) %}{% endif %}
                     {{ {'trin': [[T0 + k * P, 'on', d]], 'naeste': T0 + (k + 1) * P} }}
                   {% elif event == 'strobe' %}
                     {# Hele rummet blitzer, så slukker `head` pærer én ad gangen
                        (ripple) og resten på én gang; ripplen vandrer pr. tick. #}
-                    {% set mm = [1, (inv * 2 / 0.35 - 0.01) | round(0, 'ceil') | int] | max %}
-                    {% set P = 0.35 * mm %}{% set k = (t / P) | int %}
+                    {% set P = 0.35 %}{% set k = (t / P) | int %}
                     {% set head = [4, nn] | min %}
                     {% set pos = (i - k * head) % nn %}
                     {% set off_s = 0.05 + (pos * 0.04 if pos < head else 0) %}
@@ -905,31 +999,27 @@ script:
                     {{ {'trin': [[T0 + k * P, 'on', d], [T0 + k * P + off_s, 'off', {'transition': 0}]],
                         'naeste': T0 + (k + 1) * P} }}
                   {% elif event == 'pulse' %}
-                    {% set mm = [1, (inv / 0.8 - 0.01) | round(0, 'ceil') | int] | max %}
-                    {% set P = 0.8 * mm %}{% set k = (t / P) | int %}
+                    {% set P = 0.8 %}{% set k = (t / P) | int %}
                     {% set d = {'brightness_pct': (100 if k % 2 == 0 else 20), 'transition': (P - 0.1) | round(2)} %}
                     {% if foerste %}{% set d = dict(d, hs_color=pp.farve | default([0, 100])) %}{% endif %}
                     {{ {'trin': [[T0 + k * P, 'on', d]], 'naeste': T0 + (k + 1) * P} }}
                   {% elif event == 'chase' %}
-                    {# Regnbue-sweep, alle i takt. 36°/0,3 s med overlappende fade. #}
-                    {# Farven følger det fælles ur (k × mm), så en langsom pære
-                       viser SAMME farve som de hurtige når den rammer. #}
-                    {% set mm = [1, (inv * 2 / 0.3 - 0.01) | round(0, 'ceil') | int] | max %}
-                    {% set P = 0.3 * mm %}{% set k = (t / P) | int %}
-                    {% set d = {'hs_color': [(k * mm * 36) % 360, 100], 'transition': P} %}
+                    {# Regnbue-sweep, alle i takt. 36°/0,3 s med overlappende fade.
+                       Farven følger det fælles ur, så en pære der har hængt
+                       viser SAMME farve som de andre når den rammer. #}
+                    {% set P = 0.3 %}{% set k = (t / P) | int %}
+                    {% set d = {'hs_color': [(k * 36) % 360, 100], 'transition': P} %}
                     {% if foerste %}{% set d = dict(d, brightness_pct=90) %}{% endif %}
                     {{ {'trin': [[T0 + k * P, 'on', d]], 'naeste': T0 + (k + 1) * P} }}
                   {% elif event == 'heartbeat' %}
-                    {% set mm = [1, (inv * 4 / 1.0 - 0.01) | round(0, 'ceil') | int] | max %}
-                    {% set P = 1.0 * mm %}{% set k = (t / P) | int %}{% set b0 = T0 + k * P %}
+                    {% set P = 1.0 %}{% set k = (t / P) | int %}{% set b0 = T0 + k * P %}
                     {% set on = {'brightness_pct': 100, 'transition': 0} %}
                     {% set on1 = dict(on, hs_color=[0, 100]) if foerste else on %}
                     {{ {'trin': [[b0, 'on', on1], [b0 + 0.1, 'off', {'transition': 0}],
                                  [b0 + 0.2, 'on', on], [b0 + 0.3, 'off', {'transition': 0}]],
                         'naeste': b0 + P} }}
                   {% elif event == 'split' %}
-                    {% set mm = [1, (inv * 2 / 0.8 - 0.01) | round(0, 'ceil') | int] | max %}
-                    {% set P = 0.8 * mm %}{% set k = (t / P) | int %}
+                    {% set P = 0.8 %}{% set k = (t / P) | int %}
                     {% set d = {'hs_color': (pp.a if (k + halv) % 2 == 0 else pp.b), 'transition': 0.3} %}
                     {% if foerste %}{% set d = dict(d, brightness_pct=90) %}{% endif %}
                     {{ {'trin': [[T0 + k * P, 'on', d]], 'naeste': T0 + (k + 1) * P} }}
@@ -1001,6 +1091,111 @@ script:
                       {{ {'trin': [[nu, 'on', {'hs_color': [hue, sat], 'brightness_pct': bri, 'transition': tr}]],
                           'naeste': nu + Pb * (range(60, 141) | random) / 100} }}
                     {% endif %}
+                  {% elif event == 'halloween' %}
+                    {# v2 (2026-10-24), kun ZHA siden 25/10 (header regel 5:
+                       Thread-pærerne er mørke hele eventet — v2's Matter-gren
+                       sendte ~2 kommandoer/s og fældede OTBR'en). Akterne på
+                       det fælles ur; pp.a / pp.b er akt-grænserne, pp.d +
+                       pp.mork strømsvigtet.
+                       1) Spøgelseslys: giftgrøn, heksel-lilla eller græskar-orange
+                          pr. pære, svag glød der driver. pp.doe (1-2 pærer) er
+                          døende pærer der hakker og falder ud.
+                          Strømsvigt midt i: de døende blusser op, HELE huset er
+                          sort i pp.mork (2,5-3,8) s, så stammer lyset tilbage.
+                       2) Spøgelset: sort hus, et blegt skær glider pære for pære
+                          gennem rummene og efterlader et svagt blodrødt spor.
+                       3) Chokket: alt slukker, stilhed, blodrødt i fuldt lys og et
+                          hjerte der slår langsommere og svagere. Ender i mørke.
+                       Ingen skrivninger i `marg` før et fælles øjeblik. Sporet
+                       sætter den røde farve, så stikket er ét niveau-kald (et
+                       farvet ZHA-kald er 2 frames og landede 0,4 s efter
+                       kaldet). Kun hs (RGBW-strip). #}
+                    {% set A = T0 + (pp.a | default(14) | float(14)) %}
+                    {% set B = T0 + (pp.b | default(24) | float(24)) %}
+                    {% set D = T0 + (pp.d | default(6) | float(6)) %}
+                    {% set R = D + (pp.mork | default(2.5) | float(2.5)) %}
+                    {% set f = [[110, 100], [278, 100], [24, 100]][(i + (pp.rot | default(0) | int(0))) % 3] %}
+                    {% set marg = 0.4 %}
+                    {% set doe = i in (pp.doe | default([])) %}
+                    {% set Pd = [2.0, nn * 0.25] | max %}
+                    {% set glod = range(8, 15) | random %}
+                    {% if nu < A - marg - 0.05 %}
+                      {% if foerste %}
+                        {{ {'trin': [[nu, 'on', {'hs_color': f, 'brightness_pct': 10, 'transition': 0.8}]],
+                            'naeste': [D - marg, nu + 1.2 + (range(0, 100) | random) / 100 * (0.8 if doe else Pd)] | min} }}
+                      {% elif nu >= D - marg - 0.05 and nu < R %}
+                        {% set rr = R + (range(80, 161) | random if doe else range(0, 61) | random) / 100 %}
+                        {% set trin = ([[D - 0.3, 'on', {'brightness_pct': range(55, 76) | random, 'transition': 0}]] if doe else [])
+                                      + [[D, 'off', {'transition': 0}],
+                                         [rr, 'on', {'brightness_pct': range(30, 46) | random, 'transition': 0}],
+                                         [rr + 0.12, 'off', {'transition': 0}],
+                                         [rr + 0.35, 'on', {'brightness_pct': glod, 'transition': 0.2}]] %}
+                        {{ {'trin': trin, 'naeste': [A - marg, rr + 0.6] | min} }}
+                      {% else %}
+                        {% set graense = D - marg if nu < D - marg else A - marg %}
+                        {% set rum = graense - nu %}
+                        {% set roll = range(1, 101) | random %}
+                        {% set trin = [] %}
+                        {% if doe %}
+                          {% set g = 0.12 %}
+                          {% set vent = (range(30, 91) | random) / 100 %}
+                          {% if roll <= 35 and rum > 4 * g + 0.4 %}
+                            {% set trin = [[nu, 'off', {'transition': 0}],
+                                           [nu + g, 'on', {'brightness_pct': range(25, 46) | random, 'transition': 0}],
+                                           [nu + 2 * g + 0.08, 'off', {'transition': 0}],
+                                           [nu + 3 * g + 0.15, 'on', {'brightness_pct': glod, 'transition': 0}]] %}
+                            {% set vent = vent + 3 * g + 0.15 %}
+                          {% elif roll <= 60 and rum > 2 * g + 1.4 %}
+                            {% set ud = [g, (range(40, 121) | random) / 100] | max %}
+                            {% set trin = [[nu, 'off', {'transition': 0}],
+                                           [nu + ud, 'on', {'brightness_pct': glod, 'transition': 0}]] %}
+                            {% set vent = vent + ud %}
+                          {% elif roll <= 80 and rum > 2 * g + 0.4 %}
+                            {% set trin = [[nu, 'on', {'brightness_pct': range(50, 71) | random, 'transition': 0}],
+                                           [nu + [0.15, g] | max, 'on', {'brightness_pct': glod, 'transition': 0.3}]] %}
+                            {% set vent = vent + ([0.15, g] | max) %}
+                          {% endif %}
+                        {% else %}
+                          {% set vent = Pd * (range(60, 141) | random) / 100 %}
+                          {% if roll <= 10 and rum > 0.5 %}
+                            {% set trin = [[nu, 'off', {'transition': 0}],
+                                           [nu + (range(8, 23) | random) / 100, 'on', {'brightness_pct': range(15, 31) | random, 'transition': 0}]] %}
+                          {% elif roll <= 18 and rum > 0.6 %}
+                            {% set trin = [[nu, 'on', {'brightness_pct': range(35, 51) | random, 'transition': 0}],
+                                           [nu + 0.3, 'on', {'brightness_pct': glod, 'transition': 0.8}]] %}
+                          {% elif rum > 0.3 %}
+                            {% set trin = [[nu, 'on', {'hs_color': [(f[0] + (range(-6, 7) | random)) % 360, range(92, 101) | random],
+                                                       'brightness_pct': range(5, 23) | random,
+                                                       'transition': (range(6, 19) | random) / 10}]] %}
+                          {% endif %}
+                        {% endif %}
+                        {{ {'trin': trin, 'naeste': [graense, nu + vent] | min} }}
+                      {% endif %}
+                    {% elif nu < B - marg - 0.05 %}
+                      {% set skridt = [0.3, (B - A - 3.5) / nn] | max %}
+                      {% set pos = i if (pp.ret | default(1) | int(1)) > 0 else nn - 1 - i %}
+                      {% set g = A + 1.5 + pos * skridt %}
+                      {{ {'trin': [[A, 'off', {'transition': 0}],
+                                   [g, 'on', {'hs_color': [185, 18], 'brightness_pct': 60, 'transition': 0.4}],
+                                   [g + skridt * 1.6, 'on', {'hs_color': [0, 100], 'brightness_pct': 1, 'transition': 0.5}]],
+                          'naeste': B - marg} }}
+                    {% else %}
+                      {% set S = B + 2.0 %}
+                      {% set E = B + 8.9 %}
+                      {% set ns = namespace(l=[[B, 'off', {'transition': 0}],
+                                               [S, 'on', {'brightness_pct': 100, 'transition': 0}],
+                                               [S + 0.4, 'off', {'transition': 0}],
+                                               [S + 0.65, 'on', {'brightness_pct': 100, 'transition': 0}],
+                                               [S + 0.9, 'off', {'transition': 0}]]) %}
+                      {% for slag in [[4.3, 60], [5.7, 40], [7.3, 22]] %}
+                        {% set hb = B + slag[0] %}
+                        {% set ns.l = ns.l + [[hb, 'on', {'brightness_pct': slag[1], 'transition': 0}],
+                                              [hb + 0.15, 'on', {'brightness_pct': 8, 'transition': 0.1}],
+                                              [hb + 0.32, 'on', {'brightness_pct': (slag[1] * 0.8) | int, 'transition': 0}],
+                                              [hb + 0.47, 'on', {'brightness_pct': 3, 'transition': 0.8}]] %}
+                      {% endfor %}
+                      {{ {'trin': ns.l + [[E, 'off', {'transition': 1}]], 'naeste': slut | float(0)} }}
+                    {% endif %}
                   {% else %}
                     {{ {'trin': [], 'naeste': slut | float(0)} }}
                   {% endif %}
@@ -1040,7 +1235,7 @@ script:
                 milliseconds: >-
                   {{ [0, (([plan.naeste | float(0), slut | float(0)] | min - now().timestamp()) * 1000) | round(0) | int] | max }}
 
-  # ===== 15 EVENT-SCRIPTS (scheduler picker random, runneren looper ét) =====
+  # ===== 16 EVENT-SCRIPTS (scheduler picker random, runneren looper ét) =====
   # Alle sætter dance_strobe_active=on ved start (= baggrunds-loops pauser)
   # og off ved slut. Varighederne er uændrede fra før 2026-09-23 — de er bare
   # nu TID i stedet for antal ticks.
@@ -1061,14 +1256,19 @@ script:
     alias: "Dance event: blackout 1-5s"
     mode: single
     variables:
-      bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+      # Kun ZHA (header regel 5): gruppe-kaldene rører ikke Thread-pærerne.
+      bulbs: "{{ (state_attr('sensor.dance_active_bulbs', 'entity_ids') or []) | reject('in', integration_entities('matter')) | list }}"
     sequence:
       - service: input_boolean.turn_on
         target: {entity_id: input_boolean.dance_strobe_active}
-      - service: light.turn_off
-        continue_on_error: true
-        target: {entity_id: "{{ bulbs }}"}
-        data: {transition: 0}
+      - if:
+          - condition: template
+            value_template: "{{ bulbs | count > 0 }}"
+        then:
+          - service: light.turn_off
+            continue_on_error: true
+            target: {entity_id: "{{ bulbs }}"}
+            data: {transition: 0}
       - delay:
           seconds: "{{ range(2, 11) | random }}"
       - service: input_boolean.turn_off
@@ -1079,17 +1279,21 @@ script:
     alias: "Dance event: varm flood 1-4s"
     mode: single
     variables:
-      bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+      bulbs: "{{ (state_attr('sensor.dance_active_bulbs', 'entity_ids') or []) | reject('in', integration_entities('matter')) | list }}"
     sequence:
       - service: input_boolean.turn_on
         target: {entity_id: input_boolean.dance_strobe_active}
-      - service: light.turn_on
-        continue_on_error: true
-        target: {entity_id: "{{ bulbs }}"}
-        data:
-          brightness_pct: 100
-          color_temp_kelvin: 2400
-          transition: 0
+      - if:
+          - condition: template
+            value_template: "{{ bulbs | count > 0 }}"
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target: {entity_id: "{{ bulbs }}"}
+            data:
+              brightness_pct: 100
+              color_temp_kelvin: 2400
+              transition: 0
       - delay:
           seconds: "{{ range(2, 9) | random }}"
       - service: input_boolean.turn_off
@@ -1210,7 +1414,9 @@ script:
     alias: "Dance event: slow breathe varm hvid 8-16s"
     mode: single
     variables:
-      bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+      # Kun ZHA (header regel 5). Delays kører også uden pærer, så eventet
+      # varer sin tid (ellers spinner et låst event i runneren).
+      bulbs: "{{ (state_attr('sensor.dance_active_bulbs', 'entity_ids') or []) | reject('in', integration_entities('matter')) | list }}"
       breath_count: "{{ range(1, 3) | random }}"  # 1-2 vejrtræk
     sequence:
       - service: input_boolean.turn_on
@@ -1218,22 +1424,34 @@ script:
       # Kuløren sættes her, hårdt, og røres ikke igen: vejrtrækningen er rene
       # niveau-kald. En RGBW-strip der får color_temp midt i en 4 s transition
       # snapper til sin hvide kanal i stedet for at fade.
-      - service: light.turn_on
-        continue_on_error: true
-        target: {entity_id: "{{ bulbs }}"}
-        data: {color_temp_kelvin: 2400, brightness_pct: 10, transition: 0}
+      - if:
+          - condition: template
+            value_template: "{{ bulbs | count > 0 }}"
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target: {entity_id: "{{ bulbs }}"}
+            data: {color_temp_kelvin: 2400, brightness_pct: 10, transition: 0}
       - repeat:
           count: "{{ breath_count }}"
           sequence:
-            - service: light.turn_on
-              continue_on_error: true
-              target: {entity_id: "{{ bulbs }}"}
-              data: {brightness_pct: 80, transition: 4}
+            - if:
+                - condition: template
+                  value_template: "{{ bulbs | count > 0 }}"
+              then:
+                - service: light.turn_on
+                  continue_on_error: true
+                  target: {entity_id: "{{ bulbs }}"}
+                  data: {brightness_pct: 80, transition: 4}
             - delay: {seconds: 4}
-            - service: light.turn_on
-              continue_on_error: true
-              target: {entity_id: "{{ bulbs }}"}
-              data: {brightness_pct: 10, transition: 4}
+            - if:
+                - condition: template
+                  value_template: "{{ bulbs | count > 0 }}"
+              then:
+                - service: light.turn_on
+                  continue_on_error: true
+                  target: {entity_id: "{{ bulbs }}"}
+                  data: {brightness_pct: 10, transition: 4}
             - delay: {seconds: 4}
       - service: input_boolean.turn_off
         target: {entity_id: input_boolean.dance_strobe_active}
@@ -1255,7 +1473,8 @@ script:
     alias: "Dance event: cascade fade-in then all-out 6-8s"
     mode: single
     variables:
-      n: "{{ [1, states('sensor.dance_active_bulbs') | int(1)] | max }}"
+      # Halen følger ZHA-pærerne — Thread-pærerne er ikke med i bølgen.
+      n: "{{ [1, (state_attr('sensor.dance_active_bulbs', 'entity_ids') or []) | reject('in', integration_entities('matter')) | list | count] | max }}"
     sequence:
       - service: input_boolean.turn_on
         target: {entity_id: input_boolean.dance_strobe_active}
@@ -1274,20 +1493,98 @@ script:
     alias: "Dance event: bål-flimmer 14-24s"
     mode: single
     variables:
-      bulbs: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+      alle: "{{ state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] }}"
+      bulbs: "{{ (state_attr('sensor.dance_active_bulbs', 'entity_ids') or []) | reject('in', integration_entities('matter')) | list }}"
     sequence:
       - condition: template
-        value_template: "{{ bulbs | count > 0 }}"
+        value_template: "{{ alle | count > 0 }}"
       - service: input_boolean.turn_on
         target: {entity_id: input_boolean.dance_strobe_active}
       - service: script.dance_event_run
         data: {event: fire, varighed: "{{ range(14, 25) | random }}"}
-      # Lad bålet dø ned i stedet for at snappe over i næste event.
-      - service: light.turn_on
-        continue_on_error: true
-        target: {entity_id: "{{ bulbs }}"}
-        data: {hs_color: [8, 100], brightness_pct: 12, transition: 2}
+      # Lad bålet dø ned i stedet for at snappe over i næste event. Kun ZHA:
+      # Thread-pærerne gløder videre på deres egen plads (header regel 5).
+      - if:
+          - condition: template
+            value_template: "{{ bulbs | count > 0 }}"
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target: {entity_id: "{{ bulbs }}"}
+            data: {hs_color: [8, 100], brightness_pct: 12, transition: 2}
       - delay: {seconds: 2}
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.dance_strobe_active}
+
+  # EVENT 16: halloween (2026-10-24, user: "lav et event i festlys som er
+  # uhyggelig haloween event!"; v2 samme dag: "mix det også med fuldt mørke et
+  # par sekunder") — spøgelseslys med døende pærer og et strømsvigt (hele huset
+  # sort 2,5-3,8 s; v2 målte kun 1,6 s helt mørkt ved mork 2,1), et spøgelse der glider gennem det sorte hus, og mørke →
+  # blodrødt chok → et hjerte der går i stå. Akt 1 er 13-17 s; spøgelsets
+  # skridt (0,35-0,9 s/pære) regnes ud fra antallet, så turen tager ~6 s uanset
+  # rum-valg; akt 3 er fast 9,5 s. Ender i mørke. Holder sig under runnerens
+  # 40 s-timeout (maks ~37 s ved 19 pærer).
+  dance_halloween_burst:
+    alias: "Dance event: halloween — spøgelseslys, strømsvigt, spøgelse og chok 28-37s"
+    mode: single
+    variables:
+      # Spøgelsets tur følger ZHA-pærerne; Thread-pærerne er mørke (regel 5).
+      n: "{{ [1, (state_attr('sensor.dance_active_bulbs', 'entity_ids') or []) | reject('in', integration_entities('matter')) | list | count] | max }}"
+      mork: "{{ (range(25, 39) | random) / 10 }}"
+      # Strømsvigtet starter tidligst svigt_min s inde og slutter senest 4,5 s
+      # før akt 2. Med lyd 8,5 s: dør-knirket spiller 6,9-9,9 s efter kaldet
+      # (målt 24/10, packages/hoejttaler_annoncering.yaml), så akt 1 strækkes
+      # til mindst 8,5 s + mørket + 4,5 s (≤ 17 s, samme loft som uden lyd).
+      svigt_min: "{{ 8.5 if states('input_number.festlys_halloween_lyd_volumen') | int(0) > 0 else 4.5 }}"
+      akt1: "{{ [range(13, 18) | random, (svigt_min | float(4.5) + mork | float(3) + 4.5) | round(0, 'ceil') | int] | max }}"
+      svigt: "{{ (svigt_min | float(4.5) + ([0, akt1 - mork - 4.5 - svigt_min | float(4.5)] | max) * (range(0, 101) | random) / 100) | round(2) }}"
+      skridt: "{{ [0.35, [0.9, 6.0 / n] | min] | max }}"
+      b: "{{ akt1 + 3.5 + n * skridt }}"
+    sequence:
+      - condition: template
+        value_template: "{{ states('sensor.dance_active_bulbs') | int(0) > 0 }}"
+      # LYD (2026-10-24, user: "uhyggelige dør lyde på højttaleren … et kort
+      # ulvehyl"): en knirkende dør i strømsvigtet og et chok (ulv, torden,
+      # latter, et smæk) i spøgelsets stik. Fire-and-forget: spil_sang venter
+      # selv til øjeblikket (dance_event_run starter sit ur 0,15 s efter kaldet)
+      # og springer over når musik spiller, i AirBnB og under godnat.
+      - if:
+          - condition: template
+            value_template: "{{ states('input_number.festlys_halloween_lyd_volumen') | int(0) > 0 }}"
+        then:
+          - service: script.turn_on
+            target:
+              entity_id: script.hoejttaler_spil_sang
+            data:
+              variables:
+                anledning: halloween-festlys
+                volumen: "{{ states('input_number.festlys_halloween_lyd_volumen') | int(35) }}"
+                klip:
+                  - uri: >-
+                      spotify://track/{{ ['5n6QIj8bkPHfyIwhQiVJfw', '1W0Pw64mQOxC65iqOQ4ScS',
+                                          '0dWju0Ikr9sTnbz5n6PNI8'] | random }}
+                    ved: "{{ (svigt + 0.15) | round(2) }}"
+                    sek: "{{ (mork + 1.5) | round(1) }}"
+                    start: -1
+                  - uri: >-
+                      spotify://track/{{ ['256Ik3RPBeRKgBYDaUGQ7R', '6L49qoFKvjHewRy2dIO3p0',
+                                          '6xyVjnVAsBVomMYyMJml0R', '7lA1I8miFe8rp29uifPH6g'] | random }}
+                    ved: "{{ (b + 2.15) | round(2) }}"
+                    sek: 4.5
+                    start: -1
+      - service: input_boolean.turn_on
+        target: {entity_id: input_boolean.dance_strobe_active}
+      - service: script.dance_event_run
+        data:
+          event: halloween
+          varighed: "{{ akt1 + 3.5 + n * skridt + 9.5 }}"
+          p:
+            a: "{{ akt1 }}"
+            b: "{{ b }}"
+            d: "{{ svigt }}"
+            mork: "{{ mork }}"
+            rot: "{{ range(0, 3) | random }}"
+            ret: "{{ [1, -1] | random }}"
       - service: input_boolean.turn_off
         target: {entity_id: input_boolean.dance_strobe_active}
 
@@ -1354,10 +1651,10 @@ automation:
                 state: "off"
               - service: script.dance_room_modes_release
 
-  # Event-scheduler: fyrer 1 random event-script ud af 15 typer med
+  # Event-scheduler: fyrer 1 random event-script ud af 16 typer med
   # random spacing 30-150 sek. While-condition exitter når dance_mode → off.
   - id: dance_event_scheduler
-    alias: "Dance Mode: random event scheduler (15 event-typer)"
+    alias: "Dance Mode: random event scheduler (16 event-typer)"
     mode: single
     trigger:
       - platform: state
@@ -1417,7 +1714,8 @@ automation:
                         'script.dance_breathe_burst',
                         'script.dance_sparkle_burst',
                         'script.dance_cascade_burst',
-                        'script.dance_fire_burst'
+                        'script.dance_fire_burst',
+                        'script.dance_halloween_burst'
                       ] | random }}
                 # continue_on_error: et event der stoppes udefra (bruger
                 # skifter til et låst event) må ikke dræbe scheduleren.

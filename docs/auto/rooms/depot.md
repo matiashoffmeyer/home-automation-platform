@@ -15,7 +15,7 @@ Search keywords: `depot`
 
 ### `automations/airbnb_mode.yaml`
 
-- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 937, mode=queued)
+- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 948, mode=queued)
   - Undtagelse 1 (user 2026-06-30; rev. 2026-07-08 #12): BØRNEVÆRELSE må aldrig
 
 ### `automations/depot_harry_potter.yaml`
@@ -37,7 +37,7 @@ Search keywords: `depot`
 
 - `binary_sensor.depot_fortryd_vindue` — 1 refs in 1 file(s)
 - `binary_sensor.depot_lys_on_effektiv` — 1 refs in 1 file(s)
-- `binary_sensor.depot_valhorn_occupancy` — 69 refs in 30 file(s)
+- `binary_sensor.depot_valhorn_occupancy` — 70 refs in 31 file(s)
 - `binary_sensor.depot_vallhorn_haengt` — 4 refs in 3 file(s)
 
 ### `button.*`
@@ -46,7 +46,7 @@ Search keywords: `depot`
 
 ### `input_boolean.*`
 
-- `input_boolean.dance_room_depot` — 4 refs in 3 file(s)
+- `input_boolean.dance_room_depot` — 8 refs in 4 file(s)
 - `input_boolean.depot_approach_lit` — 8 refs in 3 file(s)
 - `input_boolean.depot_valhorn_stuck_alerted` — 3 refs in 1 file(s)
 - `input_boolean.roborock_styrbar_kort_op_depot` — 1 refs in 1 file(s)
@@ -81,10 +81,10 @@ Search keywords: `depot`
 
 - `light.depot_all` — 27 refs in 11 file(s)
 - `light.depot_loft` — 20 refs in 13 file(s)
-- `light.depot_loft_hue_1` — 11 refs in 9 file(s)
-- `light.depot_loft_hue_2` — 11 refs in 9 file(s)
+- `light.depot_loft_hue_1` — 12 refs in 10 file(s)
+- `light.depot_loft_hue_2` — 12 refs in 10 file(s)
 - `light.depot_loft_ikea` — 12 refs in 10 file(s)
-- `light.depot_strip` — 54 refs in 21 file(s)
+- `light.depot_strip` — 55 refs in 22 file(s)
 
 ### `number.*`
 

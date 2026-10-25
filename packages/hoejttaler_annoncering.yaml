@@ -80,6 +80,9 @@ shell_command:
   # (ingen mellemrum/apostroffer → sikker efter shlex-split).
   hoejttaler_ma_spil: "python3 /config/scripts/ma_api.py play up26491670 {{ uri }}"
   hoejttaler_ma_stop: "python3 /config/scripts/ma_api.py stop up26491670"
+  # Lydklip (2026-10-24, halloween): kun `klip` s fra `start` s inde i
+  # nummeret (-1 = et tilfældigt sted) — ma_api.py play --klip.
+  hoejttaler_ma_klip: "python3 /config/scripts/ma_api.py play up26491670 {{ uri }} --klip {{ klip }} --start {{ start }} --forsoeg {{ forsoeg | default(1) }}"
 
 script:
   hoejttaler_annoncer:
@@ -234,6 +237,20 @@ script:
   # Venter først på en igangværende besked (vejr-oplæsningen startes i samme
   # sekund af vejr-blinket). Ingen kill-switch HER — den hører til anledningen
   # (input_boolean.hoejttaler_regn_sang_enabled i automations/rain_warning.yaml).
+  # LYDKLIP (2026-10-24, halloween — festlys-eventet og -stemningen): feltet
+  # `klip` = en liste af {uri, ved, sek, start} spiller kun `sek` s af hvert
+  # nummer, `ved` s efter kaldet (startes `forsink` s før, så lyden lander på
+  # øjeblikket ±1,5 s), fra `start` s inde i nummeret (-1 = tilfældigt). Samme
+  # spring-over-regler, plus: ingen besked i gang, og ingen musik der er sat
+  # på pause inden for den sidste time (et klip tømmer MA-køen). Ingen 3 s
+  # forsinkelse og ingen ventetid på en besked — et klip hører til ét øjeblik.
+  # Hvert klip fades ud (~1,2 s) før stop. Kører i DETTE script, så alle de
+  # steder der undtager "vores egen MA-afspilning" (spil_sang on) også dækker klip.
+  # Valgfrit pr. klip (2026-10-24, stemningens vind-sus): `fade` = s ind OG ud
+  # (lange stykker vind, op til 600 s), `ud` = s KUN ud, blødt i seks trin
+  # (stemningens korte lyde — MA toner selv ind over 3 s), `forsoeg` = 2 → ma_api.py starter en
+  # hængende kø én gang til (kun klip uden fast øjeblik). Feltet `stop_ved` = en
+  # entity: går den fra `on`, fades klippet ud straks (stemningen der slukker).
   # ---------------------------------------------------------------------------
   hoejttaler_spil_sang:
     alias: "Højttaler: spil en sang fra Spotify (kun når intet spiller)"
@@ -242,9 +259,13 @@ script:
     max_exceeded: silent
     fields:
       uri:
-        description: "Music Assistant-uri, fx spotify://track/55Z56AGM7ZmsNw2yu0JExG"
-        required: true
+        description: "Music Assistant-uri, fx spotify://track/55Z56AGM7ZmsNw2yu0JExG (udelades ved klip)"
+        required: false
         example: "spotify://track/55Z56AGM7ZmsNw2yu0JExG"
+      klip:
+        description: "Lydklip i stedet for en hel sang: liste af {uri, ved, sek, start} — ved = s efter kaldet, start = s inde i nummeret (-1 = tilfældigt); valgfrit fade (s ind og ud), ud (s kun ud), forsoeg"
+        required: false
+        example: '[{"uri": "spotify://track/5n6QIj8bkPHfyIwhQiVJfw", "ved": 0, "sek": 5, "start": -1}]'
       volumen:
         description: "Volumen i % (udeladt = radioens nuværende, eller start-volumen efter standby)"
         required: false
@@ -253,17 +274,37 @@ script:
         description: "Til logbogen, fx regnvarsel"
         required: false
         example: "regnvarsel"
+      stop_ved:
+        description: "Klip: fade ud og stop så snart denne entity ikke er on"
+        required: false
+        example: "binary_sensor.halloween_stemning_aktiv"
     sequence:
-      - delay:
-          seconds: 3
-      - wait_template: >-
-          {{ is_state('script.hoejttaler_vejr_oplaesning', 'off')
-             and is_state('script.hoejttaler_annoncer', 'off') }}
-        timeout:
-          seconds: 120
-        continue_on_timeout: true
       - variables:
-          sang: "{{ (uri | default('') | string) | trim }}"
+          t0: "{{ now().timestamp() }}"
+          stop_e: "{{ (stop_ved | default('', true) | string) | trim }}"
+          klipliste: >-
+            {% set k = klip | default([]) %}
+            {{ (k if k is iterable and k is not string and k is not mapping else [])
+               | select('mapping') | selectattr('uri', 'defined') | list }}
+          # Et klip spiller 6,2-9,9 s efter kaldet (målt 24/10, 8 klip, median
+          # ~7,6; scripts/ma_api.py). Klippet startes så meget før sit øjeblik.
+          forsink: 8.0
+      - if:
+          - condition: template
+            value_template: "{{ klipliste | count == 0 }}"
+        then:
+          - delay:
+              seconds: 3
+          - wait_template: >-
+              {{ is_state('script.hoejttaler_vejr_oplaesning', 'off')
+                 and is_state('script.hoejttaler_annoncer', 'off') }}
+            timeout:
+              seconds: 120
+            continue_on_timeout: true
+      - variables:
+          sang: >-
+            {{ ((klipliste[0].uri if klipliste | count > 0 else uri | default('')) | string) | trim }}
+          hvad: "{{ 'Lydklip' if klipliste | count > 0 else 'Sang' }}"
           grund: "{{ anledning | default('', true) }}"
           vol_felt: "{{ volumen | default(-1) | int(-1) }}"
           # Som script.hoejttaler_annoncer — samme anker (Volumio står STALE på
@@ -291,6 +332,11 @@ script:
             {% elif not is_state('binary_sensor.music_assistant_running', 'on') %}Music Assistant kører ikke
             {% elif stille %}godnat eller Sleep Over
             {% elif spotify or spillede %}der spiller allerede noget
+            {% elif klipliste | count > 0
+                    and (is_state('script.hoejttaler_vejr_oplaesning', 'on')
+                         or is_state('script.hoejttaler_annoncer', 'on')) %}en besked er i gang
+            {% elif klipliste | count > 0 and is_state('media_player.hoejttaler', 'paused')
+                    and (now() - states.media_player.hoejttaler.last_changed).total_seconds() < 3600 %}musik er sat på pause
             {% endif %}
       - if:
           - condition: template
@@ -299,7 +345,7 @@ script:
           - service: logbook.log
             data:
               name: "Højttaler"
-              message: "Sang{{ ' (' ~ grund ~ ')' if grund else '' }} sprunget over: {{ spring_over | trim }}."
+              message: "{{ hvad }}{{ ' (' ~ grund ~ ')' if grund else '' }} sprunget over: {{ spring_over | trim }}."
           - stop: "Sprunget over"
       - service: media_player.volume_set
         continue_on_error: true
@@ -311,6 +357,153 @@ script:
             {% elif vol_foer >= 0.05 %}{{ vol_foer }}
             {% else %}{{ (states('input_number.hoejttaler_standby_start_volumen') | float(25)) / 100 }}
             {% endif %}
+      # LYDKLIP (headeren): hvert klip startes `forsink` s før sit øjeblik,
+      # spiller `sek` s fra det øjeblik ma_api.py melder at køen spiller, og
+      # fades ud før stop. En telefon der tager
+      # over afbryder (som for en hel sang: ingen stop, ingen volumen tilbage).
+      - if:
+          - condition: template
+            value_template: "{{ klipliste | count > 0 }}"
+        then:
+          - variables:
+              vol_klip: >-
+                {% if vol_felt > 0 %}{{ ([vol_felt, 100] | min) / 100 }}
+                {% elif vol_foer >= 0.05 %}{{ vol_foer }}
+                {% else %}{{ (states('input_number.hoejttaler_standby_start_volumen') | float(25)) / 100 }}
+                {% endif %}
+          - repeat:
+              for_each: "{{ klipliste }}"
+              sequence:
+                - variables:
+                    k_ved: "{{ repeat.item.ved | default(0) | float(0) }}"
+                    k_sek: "{{ [[repeat.item.sek | default(5) | float(5), 1] | max, 600] | min }}"
+                    k_start: "{{ repeat.item.start | default(-1) | int(-1) }}"
+                    k_fade: "{{ [[repeat.item.fade | default(0) | float(0), 0] | max, 15] | min }}"
+                    k_ud: "{{ [[repeat.item.ud | default(0) | float(0), 0] | max, 15] | min }}"
+                    k_forsoeg: "{{ [[repeat.item.forsoeg | default(1) | int(1), 1] | max, 2] | min }}"
+                - delay:
+                    seconds: "{{ [t0 | float(0) + k_ved - forsink - now().timestamp(), 0] | max | round(2) }}"
+                # Forrige klip blev fadet ned → klippets volumen igen. Et klip
+                # med `fade` starter lavt og skrues op når det beviseligt spiller.
+                - if:
+                    - condition: template
+                      value_template: "{{ repeat.index > 1 or k_fade > 0 }}"
+                  then:
+                    - service: media_player.volume_set
+                      continue_on_error: true
+                      target:
+                        entity_id: media_player.hoejttaler
+                      data:
+                        volume_level: "{{ (vol_klip | float(0.2) * (0.2 if k_fade > 0 else 1)) | round(3) }}"
+                - service: shell_command.hoejttaler_ma_klip
+                  continue_on_error: true
+                  response_variable: ma
+                  data:
+                    uri: "{{ (repeat.item.uri | string) | trim }}"
+                    klip: "{{ k_sek | round(1) }}"
+                    start: "{{ k_start }}"
+                    forsoeg: "{{ k_forsoeg }}"
+                - variables:
+                    k_ok: >-
+                      {% set ud = ((ma.stdout | default('')) if ma is defined else '') | trim %}
+                      {% set j = (ud | from_json) if ud.startswith('{') else {} %}
+                      {{ j is mapping and j.ok | default(false) and j.spiller | default(true) }}
+                - if:
+                    - condition: template
+                      value_template: "{{ not k_ok }}"
+                  then:
+                    - service: logbook.log
+                      data:
+                        name: "Højttaler"
+                        message: >-
+                          Lydklip {{ repeat.index }}{{ ' (' ~ grund ~ ')' if grund else '' }} kunne ikke startes
+                          (ma_api.py rc={{ ma.returncode | default('?') if ma is defined else '?' }}:
+                          {{ ((ma.stderr | default('') ~ ' ' ~ ma.stdout | default('')) if ma is defined else 'intet svar') | trim | truncate(160) }}).
+                    - service: shell_command.hoejttaler_ma_stop
+                      continue_on_error: true
+                    - if:
+                        - condition: template
+                          value_template: "{{ vol_foer >= 0 }}"
+                      then:
+                        - service: media_player.volume_set
+                          continue_on_error: true
+                          target:
+                            entity_id: media_player.hoejttaler
+                          data:
+                            volume_level: "{{ vol_foer }}"
+                    - stop: "Lydklip fejlede"
+                # Fade ind i fem trin over `fade` s (vind-suset tager til).
+                - if:
+                    - condition: template
+                      value_template: "{{ k_fade > 0 }}"
+                  then:
+                    - repeat:
+                        for_each: [0.35, 0.5, 0.65, 0.82, 1.0]
+                        sequence:
+                          - delay:
+                              milliseconds: "{{ (k_fade * 200) | int }}"
+                          - service: media_player.volume_set
+                            continue_on_error: true
+                            target:
+                              entity_id: media_player.hoejttaler
+                            data:
+                              volume_level: "{{ (vol_klip | float(0.2) * repeat.item) | round(3) }}"
+                - wait_template: >-
+                    {{ is_state('binary_sensor.spotify_bro_spiller', 'on')
+                       or state_attr('sensor.hoejttaler_spotify', 'myair') == true
+                       or (stop_e != '' and not is_state(stop_e, 'on')) }}
+                  timeout:
+                    seconds: >-
+                      {% set ud = ((ma.stdout | default('')) if ma is defined else '') | trim %}
+                      {% set j = (ud | from_json) if ud.startswith('{') else {} %}
+                      {{ [k_sek - (j.forspring | default(0) | float(0) if j is mapping else 0) - 2 * k_fade, 0.5] | max | round(1) }}
+                  continue_on_timeout: true
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {{ is_state('binary_sensor.spotify_bro_spiller', 'on')
+                           or state_attr('sensor.hoejttaler_spotify', 'myair') == true }}
+                  then:
+                    - service: logbook.log
+                      data:
+                        name: "Højttaler"
+                        message: "Lydklip afbrudt — en telefon tog over med Spotify."
+                    - stop: "Spotify tog over"
+                # Fade ud i tre trin (~1,2 s) — et klip der klippes hårdt af,
+                # lyder som en fejl, ikke som noget i huset. Med `fade` eller
+                # `ud`: seks trin på ~3-6 dB over så mange s (tre trin på 5-10 dB
+                # kan høres som hop).
+                - variables:
+                    k_ud_s: "{{ k_fade if k_fade > 0 else k_ud }}"
+                - repeat:
+                    for_each: "{{ [0.7, 0.5, 0.33, 0.2, 0.1, 0.04] if k_ud_s > 0 else [0.55, 0.25, 0.08] }}"
+                    sequence:
+                      - service: media_player.volume_set
+                        continue_on_error: true
+                        target:
+                          entity_id: media_player.hoejttaler
+                        data:
+                          volume_level: "{{ (vol_klip | float(0.2) * repeat.item) | round(3) }}"
+                      - delay:
+                          milliseconds: "{{ (k_ud_s * 1000 / 6) | int if k_ud_s > 0 else 400 }}"
+                - service: shell_command.hoejttaler_ma_stop
+                  continue_on_error: true
+          - if:
+              - condition: template
+                value_template: "{{ vol_foer >= 0 }}"
+            then:
+              - service: media_player.volume_set
+                continue_on_error: true
+                target:
+                  entity_id: media_player.hoejttaler
+                data:
+                  volume_level: "{{ vol_foer }}"
+          - service: logbook.log
+            data:
+              name: "Højttaler"
+              message: >-
+                Spillede {{ klipliste | count }} lydklip{{ ' (' ~ grund ~ ')' if grund else '' }}.
+          - stop: "Lydklip færdige"
       - service: shell_command.hoejttaler_ma_spil
         continue_on_error: true
         response_variable: ma

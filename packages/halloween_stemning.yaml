@@ -1,0 +1,913 @@
+# =============================================================================
+# Halloween-stemning — Auto-lys med en løs forbindelse (bygget 2026-10-24)
+# =============================================================================
+# User-spec 2026-10-24:
+#   · "halloween mood som er helt ligesom auto mode men med uhyggelige glimt og
+#     udfald (mørke) en gang imellem. når den er på skal lyset være helt
+#     normalt auto i 96% af tiden (slider)"
+#   · "det er ikke uhyggeligt hvis det er for åbenlyst med mange farver … det
+#     uhyggelige er hvis lyset glipper som en løs forbindelse (det der tændt),
+#     og så normale suspense lyde fra højtaleren, men igen, ikke for åbenlyst.
+#     og det skal kun køre hvis det er mørkt udenfor."
+#   · Dør-lyden 5n6QIj8bkPHfyIwhQiVJfw "kan du bruge noget af men der skal være
+#     forskellige".
+#   · Aftenen 24/10: "meget korte grønne blink en sjælden gang i mellem er ok.
+#     og vind sus på spotify" · "spisestuen slukkede lang tid på os" ·
+#     "udfald med blinkene sker også for ofte. det tager fidusen af dem".
+#   · 24/10 kl. 21: "det må ikke blive forudsigeligt. det samme udfald skal
+#     ikke køre to gange på en dag og heller ikke de samme lyde. det skal
+#     heller ikke være forudsigeligt fra dag til dag. det skal føles
+#     uprogrameret. og blinkene skal gå hurtigere. giv mig slider til det."
+#
+# DESIGN
+#   · Intet der tændes: kun pærer der ALLEREDE lyser, kun lysstyrken (og det
+#     grønne blink), og hver pære tilbage på sit eget niveau bagefter. Huset
+#     kører Auto som altid — stemningen låner en pære i 0,1-8 s ad gangen.
+#   · Kun ZHA-pærer (stuens læsehygge, spisestue-loftet, sove-loftet, børne-loft
+#     og -lampe, badets spot 4-5, depotet). Thread-pærerne (entré-loftet,
+#     stue-spotsene, badets spot 1-3) tåler ikke et kald pr. 0,1 s.
+#   · 14 slags glimt (trinene: custom_templates/halloween.jinja, glimt):
+#       små, ÉN pære   — knitren, hak, dobbelthak, summen, døende pære,
+#                        spændingsfald, grønt blink (kun en farve-pære i
+#                        farvetemperatur; dens kelvin gendannes)
+#       store, rummet  — flimmer, udfald, kaskade, brownout, hjerteslag, langt
+#                        udfald, bølge
+#     Hvert glimt trækkes på ny (antal, dybder, tider), så to af samme slags
+#     aldrig er ens. Et stort glimt højst ét pr. halloween_stemning_udfald_
+#     minutter, og hver stor slags højst ÉN gang pr. dag i hele huset. En lille
+#     slags kører ikke to gange på samme pære samme dag, før alle par er brugt
+#     — og aldrig samme slags to gange i træk. Brugt: input_text.halloween_
+#     stemning_brugt ("dag|sidste|id id …", id = slags + pære-/rum-tegn).
+#   · DAGEN (kl. 12 til 12, så en aften over midnat er én dag) får sin egen
+#     profil i input_text.halloween_stemning_dag: vægten af hver lille slags
+#     (×0,3-2), af hvert rum (×0,5-2), et humør (glimt-tæthed ×0,7-1,4), chancen
+#     for et stort glimt (20-50 %) og — 7 af 10 dage — én "dårlig pære" der
+#     glipper 3× så tit. Et rum med nogen i vejer ×4 oven i.
+#   · Gulv = niveau 3, aldrig `off`: et sluk ville sætte hver eneste sluk-vej i
+#     gang (bad, sove-lyskæden, manuel-sluk-trackere) — og niveau 1 ER et sluk
+#     på Innr/Hue via ZHA (se pære-scriptet).
+#   · BLINK-TEMPO (input_number.halloween_stemning_blink_tempo, 100 % = 24/10):
+#     deler blink-trinenes tid; mørke- og hold-pauserne står fast. Gulv 20 ms
+#     pr. trin — ZHA-kaldet selv tager ~60-90 ms, så trinene lå målt 0,25-0,29 s
+#     fra hinanden (median, 24/10) ved 100 % og når ikke under ~0,09 s.
+#   · "99 % normalt" = tids-andel: pausen efter et glimt på d s (d ved tempo
+#     100 %, mindst 1,5 s) trækkes eksponentielt med middel d·p/(100−p)/humør,
+#     15 s-45 min — og hver 4. gang ×2,2 ellers ×0,6 (samme middel), så glimtene
+#     klumper sig og holder lange pauser som noget ægte, ikke et ur.
+#     Live-test 24/10: et glimt varer 0,9-4,2 s (median ~2,2), så 96 % gav ét
+#     glimt i minuttet et sted i huset → user valgte 99 % (≈ hvert 4. min).
+#   · Kun når solen står under input_number.halloween_stemning_sol_graense.
+#
+# HVEM ANDRE RØRER PÆRERNE (#1/#27):
+#   · Rummet skal være Auto, uden dark mode/filmmørke/Sofa Zen/stue-ild/putning;
+#     ingen fest, Party-scene, godnat, Sleep Over eller Dormant. En pære i den
+#     aktive scenes snapshot, eller skrevet < 15 s siden, springes over.
+#   · Skriver nogen andre på pæren under dykket (user_id eller en automations
+#     parent_id i dens context), giver stemningen slip og gendanner IKKE.
+#   · Lånte pærer står i input_text.halloween_stemning_laan; custom_templates/
+#     halloween.jinja (laant) lader power-recovery og stue-spejlet være dem.
+#   · Vejr-blinkene, legetøjsdagen og pre-dark venter ≤ 15 s på et igangværende
+#     glimt før deres scene.create, og stemningen springer over mens de kører.
+#   · En restart eller script.reload midt i et dyk: halloween_stemning_ret
+#     sætter pærerne tilbage på deres b0 fra stemplet.
+#
+# LYD: script.hoejttaler_spil_sang med `klip` (packages/hoejttaler_annoncering
+# .yaml) — kun når intet spiller, ikke i AirBnB, ikke under godnat (heller ikke
+# børnenes: løkken venter stille). Et vind-tæppe (40 s-4 min fra ét af 4 lange
+# numre, aldrig samme to gange i træk, fade 3-12 s, lydstyrke ×0,6-1,15, hver
+# 4. runde et stille hul i stedet) og derimellem et kort stykke (5-8 s, toner
+# ind over 3 s og blødt ud over 0,8-2,5 s) fra et tilfældigt sted i ét af 27
+# numre — hvert nummer højst én gang pr. dag
+# (input_text.halloween_stemning_lyde_brugt); er alle brugt, kun vind.
+# Volumen pr. nummer = slideren × v — et SKØN (24/10, ikke målt): tætte, høje
+# optagelser (fodtrin, ugle, vind) ned, spredte knirk og uret op.
+#
+# AirBnB: familie-only (gaten), ryddes ved entry og exit (automations/
+# airbnb_mode.yaml) og står i privacy-purgen.
+# =============================================================================
+
+input_boolean:
+  halloween_stemning:
+    name: "Halloween-stemning"
+    icon: mdi:ghost
+
+input_number:
+  halloween_stemning_normal_pct:
+    name: "Halloween-stemning: normalt lys"
+    icon: mdi:lightbulb-on-outline
+    min: 80
+    max: 99.5
+    step: 0.5
+    unit_of_measurement: "%"
+    mode: slider
+  halloween_stemning_lyd_minutter:
+    name: "Halloween-stemning: minutter mellem lyde"
+    icon: mdi:door-closed-lock
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: min
+    mode: slider
+  halloween_stemning_lyd_volumen:
+    name: "Halloween-stemning: lydstyrke"
+    icon: mdi:volume-low
+    min: 5
+    max: 60
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+  # Vind-tæppet under de korte lyde (Spotify, fade ind/ud). 0 = ingen vind.
+  halloween_stemning_vind_volumen:
+    name: "Halloween-stemning: vind-lydstyrke"
+    icon: mdi:weather-windy
+    min: 0
+    max: 60
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+  halloween_stemning_udfald_minutter:
+    name: "Halloween-stemning: minutter mellem udfald"
+    icon: mdi:flash-off
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: min
+    mode: slider
+  # Deler blink-trinenes tid (100 % = 24/10's tempo); hold/mørke står fast.
+  halloween_stemning_blink_tempo:
+    name: "Halloween-stemning: blink-tempo"
+    icon: mdi:flash
+    min: 50
+    max: 400
+    step: 25
+    unit_of_measurement: "%"
+    mode: slider
+  halloween_stemning_sol_graense:
+    name: "Halloween-stemning: kun når solen er under"
+    icon: mdi:weather-night
+    min: -18
+    max: 6
+    step: 1
+    unit_of_measurement: "°"
+    mode: slider
+  # Festlys-eventet halloween (packages/dance_mode.yaml): dør-knirk i
+  # strømsvigtet + ulv/torden/latter i chokket. 0 = ingen lyd.
+  festlys_halloween_lyd_volumen:
+    name: "Festlys halloween: lydstyrke"
+    icon: mdi:volume-high
+    min: 0
+    max: 80
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+input_text:
+  # Unix-tid for sidste rum-flimmer/udfald (afstanden mellem dem).
+  halloween_stemning_stort_sidst:
+    name: "Halloween-stemning: sidste udfald"
+    max: 20
+  # "<slut-unix>|lys[:b0],…|<rum>" — se custom_templates/halloween.jinja.
+  halloween_stemning_laan:
+    name: "Halloween-stemning: lånte pærer (runtime)"
+    max: 255
+  # Dagens profil: "dag|vægte k,h,d,s,x,v,g|rum-faktorer ×2|humør ×10|stor-%|dårlig pære".
+  halloween_stemning_dag:
+    name: "Halloween-stemning: dagens profil (runtime)"
+    max: 255
+  # "dag|sidste id|id id …" (2 tegn pr. id, uden skilletegn).
+  halloween_stemning_brugt:
+    name: "Halloween-stemning: dagens glimt (runtime)"
+    max: 255
+  # "dag|palet-indeks,…|sidste vind-indeks".
+  halloween_stemning_lyde_brugt:
+    name: "Halloween-stemning: dagens lyde (runtime)"
+    max: 255
+
+template:
+  - binary_sensor:
+      - name: "Halloween-stemning aktiv"
+        unique_id: halloween_stemning_aktiv
+        icon: mdi:ghost
+        state: >-
+          {{ is_state('input_boolean.halloween_stemning', 'on')
+             and (state_attr('sun.sun', 'elevation') | float(90))
+                 < (states('input_number.halloween_stemning_sol_graense') | float(-6))
+             and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+             and not is_state('input_select.house_state', 'Dormant')
+             and not is_state('binary_sensor.godnat_common_active', 'on')
+             and not is_state('input_boolean.sleepover_i_nat', 'on')
+             and not is_state('binary_sensor.festlys_aktiv', 'on')
+             and not is_state('binary_sensor.scene_party_active', 'on') }}
+
+automation:
+  - id: halloween_stemning_start
+    alias: "Halloween-stemning: start glimt- og lyd-løkkerne"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.halloween_stemning_aktiv
+        from: "off"
+        to: "on"
+      # En restart dræber løkkerne; /5-backstoppen fanger et script.reload.
+      - platform: homeassistant
+        event: start
+        id: start
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.halloween_stemning_aktiv
+        state: "on"
+    action:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay:
+              seconds: 60
+      - if:
+          - condition: state
+            entity_id: script.halloween_stemning_loekke
+            state: "off"
+        then:
+          - service: script.turn_on
+            target:
+              entity_id: script.halloween_stemning_loekke
+      - if:
+          - condition: state
+            entity_id: script.halloween_stemning_lyde
+            state: "off"
+        then:
+          - service: script.turn_on
+            target:
+              entity_id: script.halloween_stemning_lyde
+
+  # Et dyk der blev afbrudt (restart, script.reload): stemplet har stadig b0.
+  # Pæren sættes tilbage hvis den stadig lyser, rummet er Auto, ingen bruger
+  # har rørt den, og den står under sit b0.
+  - id: halloween_stemning_ret
+    alias: "Halloween-stemning: ret et dyk der blev afbrudt"
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+        id: start
+      - platform: template
+        value_template: >-
+          {% set g = (states('input_text.halloween_stemning_laan') ~ '').split('|') %}
+          {{ g | count == 3 and ':' in g[1]
+             and now().timestamp() > (g[0] | float(0)) + 20
+             and is_state('script.halloween_stemning_glimt', 'off') }}
+    action:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay:
+              seconds: 20
+      - condition: template
+        value_template: >-
+          {% set g = (states('input_text.halloween_stemning_laan') ~ '').split('|') %}
+          {{ g | count == 3 and ':' in g[1]
+             and now().timestamp() > (g[0] | float(0)) + 20
+             and is_state('script.halloween_stemning_glimt', 'off') }}
+      - variables:
+          par: >-
+            {% set g = (states('input_text.halloween_stemning_laan') ~ '').split('|') %}
+            {% set ns = namespace(p=[]) %}
+            {% for x in g[1].split(',') if ':' in x %}
+              {% set ns.p = ns.p + [[x.split(':')[0], x.split(':')[1] | int(0)]] %}
+            {% endfor %}
+            {{ ns.p }}
+          rum: "{{ (states('input_text.halloween_stemning_laan') ~ '').split('|')[2] }}"
+      # Lånet forlænges uden b0 → power-recovery lader gendannelsen være, og
+      # triggeren slipper.
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.halloween_stemning_laan
+        data:
+          value: "{{ (now().timestamp() + 10) | int }}|{{ par | map(attribute=0) | join(',') }}|{{ rum }}"
+      - repeat:
+          for_each: "{{ par }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: >-
+                    {% set s = states[repeat.item[0]] %}
+                    {{ s is not none and s.state == 'on'
+                       and is_state('input_select.room_mode_' ~ rum, 'Auto')
+                       and s.context.user_id is none
+                       and repeat.item[1] >= 20
+                       and (s.attributes.brightness | int(0)) < repeat.item[1] - 2 }}
+              then:
+                - service: light.turn_on
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ repeat.item[0] }}"
+                  data:
+                    brightness: "{{ repeat.item[1] }}"
+                    transition: 1
+                - service: logbook.log
+                  data:
+                    name: "Halloween-stemning"
+                    message: "Satte {{ repeat.item[0] }} tilbage på {{ repeat.item[1] }} efter et afbrudt glimt."
+
+script:
+  # ---------------------------------------------------------------------------
+  # Glimt-løkken: glimt → pause → glimt … så længe gaten er on. Pausen regnes
+  # af glimtets NOMINELLE varighed (tempo 100 %), så blink-tempoet ikke ændrer
+  # hvor tit det sker — kun hvor hurtigt det går.
+  # ---------------------------------------------------------------------------
+  halloween_stemning_loekke:
+    alias: "Halloween-stemning: glimt-løkken"
+    icon: mdi:ghost
+    mode: single
+    max_exceeded: silent
+    sequence:
+      # Første glimt kommer ikke i samme minut som man tænder.
+      - wait_template: "{{ is_state('binary_sensor.halloween_stemning_aktiv', 'off') }}"
+        timeout:
+          seconds: "{{ range(60, 601) | random }}"
+        continue_on_timeout: true
+      - repeat:
+          while:
+            - condition: state
+              entity_id: binary_sensor.halloween_stemning_aktiv
+              state: "on"
+          sequence:
+            - service: script.halloween_stemning_glimt
+              continue_on_error: true
+              response_variable: svar
+            - variables:
+                p: "{{ [80, [99.5, states('input_number.halloween_stemning_normal_pct') | float(99)] | min] | max }}"
+                u: "{{ (range(1, 10001) | random) / 10000 }}"
+                humoer: >-
+                  {% set h = (states('input_text.halloween_stemning_dag') ~ '').split('|') %}
+                  {{ [0.5, (h[3] | int(10) if h | count == 6 else 10) / 10] | max }}
+                # Intet glimt (ingen tændt pære i et Auto-rum) → kig igen om 2 min.
+                pause: >-
+                  {% set r = svar if svar is defined and svar is mapping else {} %}
+                  {% if not r.ok | default(false) %}120
+                  {% else %}
+                    {% set d = [1.5, (r.nominel | float(0)) / 1000] | max %}
+                    {% set klump = 2.2 if (range(100) | random) < 25 else 0.6 %}
+                    {{ [15, [2700, d * p / (100 - p) / humoer * klump * -(u | log)] | min] | max | round(1) }}
+                  {% endif %}
+            - wait_template: "{{ is_state('binary_sensor.halloween_stemning_aktiv', 'off') }}"
+              timeout:
+                seconds: "{{ pause | float(120) }}"
+              continue_on_timeout: true
+
+  # ---------------------------------------------------------------------------
+  # Ét glimt: dagens profil → vælg slags og pære/rum (ingen gentagelse samme
+  # dag, se headeren) → trinene fra halloween.jinja → lån pærerne; én parallel
+  # kørsel pr. pære på samme ur; vent; aflevér. Svarer {ok, nominel}.
+  # ---------------------------------------------------------------------------
+  halloween_stemning_glimt:
+    alias: "Halloween-stemning: ét glimt i ét rum"
+    icon: mdi:ghost
+    mode: single
+    max_exceeded: silent
+    variables:
+      # Rækkefølgen ER id'erne i input_text.halloween_stemning_brugt (rum-tegn
+      # = rummets plads, pære-tegn = pladsen i den samlede pære-liste) — tilføj
+      # nyt sidst.
+      rum_liste:
+        - mode: stue
+          # Kun læsehyggen: sofa-lamperne og hjørnelampen er pærer i et skab (B132).
+          lys: [light.stue_laesehygge]
+          blok: [binary_sensor.dark_mode_stue, binary_sensor.filmmoerke_stue, binary_sensor.sofa_zen_holder_sofa, binary_sensor.stue_spots_ild_aktiv]
+          occ: binary_sensor.stue_apollo_occupancy_filtered
+        - mode: spisestue
+          lys: [light.spisestue_loft]
+          blok: []
+          occ: binary_sensor.spisestue_apollo_occupancy_filtered
+        # spisestue_pendel ER sove-loftet (CLAUDE.md).
+        - mode: sovevaerelse
+          lys: [light.spisestue_pendel, light.sovevaerelse_loft]
+          blok: [binary_sensor.dark_mode_sove, binary_sensor.filmmoerke_sove]
+          occ: binary_sensor.sovevaerelse_apollo_occupancy
+        - mode: boernevaerelse
+          lys: [light.boernevaerelse_loft, light.boernevaerelse_lampe]
+          blok: [binary_sensor.dark_mode_boern, binary_sensor.filmmoerke_boern, input_boolean.godnat_boern_active, input_boolean.puttelys_descent_active]
+          occ: binary_sensor.boernevaerelse_apollo_occupancy
+        - mode: badevaerelse
+          lys: [light.badevaerelse_spot_4, light.badevaerelse_spot_5]
+          blok: []
+          occ: binary_sensor.badevaerelse_inde_occupancy
+        - mode: depot
+          lys: [light.depot_strip, light.depot_loft_hue_1, light.depot_loft_hue_2]
+          blok: []
+          occ: binary_sensor.depot_valhorn_occupancy
+      # Låner selv pærerne med et scene-snapshot (#27) — mens de kører, holder
+      # stemningen sig væk.
+      laanere:
+        - automation.vejr_varsel_regn_bla_glimt_vind_hvid_blink_morgen_20min
+        - automation.vejr_varsel_aften_blink_push_for_nattens_vejr_16_30_17_00_18_30
+        - automation.legetojsdag_disko_varsel_forste_abne_fredag_i_maneden_efter_vejrvarsler
+        - automation.pre_dark_daemp_gardiner_ned_ved_afspilning
+    sequence:
+      - variables:
+          dag: "{{ (now() - timedelta(hours=12)).date() | string }}"
+          alle: "{{ rum_liste | map(attribute='lys') | sum(start=[]) }}"
+      # Ny dag → ny profil (se headeren).
+      - if:
+          - condition: template
+            value_template: "{{ (states('input_text.halloween_stemning_dag') ~ '').split('|')[0] != dag }}"
+        then:
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.halloween_stemning_dag
+            data:
+              value: >-
+                {%- set ns = namespace(s=[], r=[]) -%}
+                {%- for b in [30, 30, 20, 20, 10, 20, 10] -%}
+                  {%- set ns.s = ns.s + [[1, (b * (range(30, 201) | random) / 100) | round(0) | int] | max] -%}
+                {%- endfor -%}
+                {%- for r in rum_liste -%}{%- set ns.r = ns.r + [range(1, 5) | random] -%}{%- endfor -%}
+                {{- dag }}|{{ ns.s | join(',') }}|{{ ns.r | join(',') }}|{{ range(7, 15) | random }}|{{ range(20, 51) | random }}|{{ (alle | random) if (range(100) | random) < 70 else '' -}}
+      - variables:
+          plan: >-
+            {% from 'halloween.jinja' import glimt %}
+            {% set fri = is_state('binary_sensor.halloween_stemning_aktiv', 'on')
+                         and is_state('script.entre_ned_sluk_alt', 'off')
+                         and (laanere | map('state_attr', 'current') | map('int', 0) | sum) == 0 %}
+            {% set sc = states('input_select.active_scene') %}
+            {% set e = states['scene.snap_' ~ sc] if sc not in ['none', 'unknown', 'unavailable', ''] else none %}
+            {% set scene_lys = (e.attributes.entity_id or []) if (e is not none and e.state != 'unavailable') else [] %}
+            {% set tegn = '0123456789abcdef' %}
+            {% set p = (states('input_text.halloween_stemning_dag') ~ '').split('|') %}
+            {% set pok = p | count == 6 and p[0] == dag %}
+            {% set sw = (p[1] if pok else '30,30,20,20,10,20,10').split(',') | map('int', 10) | list %}
+            {% set rf = (p[2] if pok else '2,2,2,2,2,2').split(',') | map('int', 2) | list %}
+            {% set stor_pct = p[4] | int(35) if pok else 35 %}
+            {% set fejl = p[5] if pok else '' %}
+            {% set b = (states('input_text.halloween_stemning_brugt') ~ '').split('|') %}
+            {% set bok = b | count == 3 and b[0] == dag %}
+            {% set sidst = b[1] if bok else '' %}
+            {% set ids = b[2] if bok else '' %}
+            {% set nb = namespace(l=[]) %}
+            {% for i in range(0, ids | length, 2) %}{% set nb.l = nb.l + [ids[i:i + 2]] %}{% endfor %}
+            {% set brugte_store = nb.l | map('first') | select('in', 'FUKBPLW') | list %}
+            {# Puljer af [vægt, rum, pærer, slags, id]: store (ubrugt slag i dag),
+               små ubrugte, og små i alt (når hvert par er brugt). Aldrig samme
+               slags som sidst. #}
+            {% set ns = namespace(stor=[], ny=[], alt=[]) %}
+            {% for r in rum_liste if fri %}
+              {% set ri = loop.index0 %}
+              {% if is_state('input_select.room_mode_' ~ r.mode, 'Auto')
+                    and r.blok | select('is_state', 'on') | list | count == 0 %}
+                {% set nl = namespace(l=[], f=[]) %}
+                {% for l in r.lys %}
+                  {% set s = states[l] %}
+                  {% if s is not none and s.state == 'on'
+                        and (s.attributes.brightness | int(0)) >= 20
+                        and (now() - s.last_updated).total_seconds() > 15
+                        and l not in scene_lys %}
+                    {% set nl.l = nl.l + [l] %}
+                    {# Grønt kræver en farve-pære i farvetemperatur (dens kelvin gendannes). #}
+                    {% if 'xy' in ((s.attributes.supported_color_modes or []) | map('string') | list)
+                          and ('' ~ s.attributes.color_mode) == 'color_temp'
+                          and (s.attributes.color_temp_kelvin | int(0)) > 0 %}
+                      {% set nl.f = nl.f + [l] %}
+                    {% endif %}
+                  {% endif %}
+                {% endfor %}
+                {% set n = nl.l | count %}
+                {% set rw = (4 if is_state(r.occ, 'on') else 1) * rf[ri] | default(2) %}
+                {% for L in 'FUKBPLW' if n > 0 and L != sidst[:1] and L not in brugte_store and (L != 'K' or n >= 2) %}
+                  {% set ns.stor = ns.stor + [[rw, r.mode, nl.l, L, L ~ tegn[ri]]] %}
+                {% endfor %}
+                {% for l in nl.l %}
+                  {% set lt = tegn[alle.index(l)] %}
+                  {% for L in 'khdsxvg' %}
+                    {% if L != sidst[:1] and (L != 'g' or l in nl.f) %}
+                      {% set w = [1, (sw[loop.index0] * rw * (3 if l == fejl else 1) / n) | round(0) | int] | max %}
+                      {% set ns.alt = ns.alt + [[w, r.mode, [l], L, L ~ lt]] %}
+                      {% if (L ~ lt) not in nb.l %}{% set ns.ny = ns.ny + [[w, r.mode, [l], L, L ~ lt]] %}{% endif %}
+                    {% endif %}
+                  {% endfor %}
+                {% endfor %}
+              {% endif %}
+            {% endfor %}
+            {# Store: højst ét pr. N min (user 24/10: "udfald med blinkene sker også
+               for ofte. det tager fidusen af dem"), 0 = ingen. #}
+            {% set mu = states('input_number.halloween_stemning_udfald_minutter') | float(30) %}
+            {% set ss = states('input_text.halloween_stemning_stort_sidst') | float(0) %}
+            {% set stor = ns.stor | count > 0 and mu > 0 and now().timestamp() - ss >= mu * 60
+                          and (range(100) | random) < stor_pct %}
+            {% set pulje = ns.stor if stor else (ns.ny if ns.ny | count > 0 else ns.alt) %}
+            {% if pulje | count == 0 %}{{ {'lys': [], 'nominel': 0} }}
+            {% else %}
+              {% set c = namespace(sum=0, v=none) %}
+              {% for x in pulje %}{% set c.sum = c.sum + x[0] %}{% endfor %}
+              {% set t = range(c.sum) | random %}
+              {% set c.sum = 0 %}
+              {% for x in pulje %}
+                {% set c.sum = c.sum + x[0] %}
+                {% if c.v is none and t < c.sum %}{% set c.v = x %}{% endif %}
+              {% endfor %}
+              {% set g = glimt(c.v[3], c.v[2] | count,
+                               (states('input_number.halloween_stemning_blink_tempo') | float(100)) / 100) | from_json %}
+              {{ {'slags': c.v[3], 'stor': stor, 'rum': c.v[1], 'lys': c.v[2],
+                  'paerer': g.paerer, 'ms': g.ms, 'nominel': g.nominel,
+                  'brugt': dag ~ '|' ~ c.v[4] ~ '|' ~ ids ~ ('' if c.v[4] in nb.l else c.v[4])} }}
+            {% endif %}
+      - if:
+          - condition: template
+            value_template: "{{ plan is mapping and plan.lys | default([]) | count > 0 }}"
+        then:
+          - variables:
+              b0s: >-
+                {% set ns = namespace(d=[]) %}
+                {% for l in plan.lys %}
+                  {% set ns.d = ns.d + [[l, state_attr(l, 'brightness') | int(0)]] %}
+                {% endfor %}
+                {{ ns.d }}
+          # 10 s margin: et ZHA-kald kan hænge ~5 s (spisestue-loftet).
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.halloween_stemning_laan
+            data:
+              value: >-
+                {{ (now().timestamp() + plan.ms / 1000 + 10) | int }}|{{ b0s | map('join', ':') | join(',') }}|{{ plan.rum }}
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.halloween_stemning_brugt
+            data:
+              value: "{{ plan.brugt }}"
+          - if:
+              - condition: template
+                value_template: "{{ plan.stor }}"
+            then:
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.halloween_stemning_stort_sidst
+                data:
+                  value: "{{ now().timestamp() | int }}"
+          # script.turn_on = fire-and-forget → én kørsel pr. pære på samme ur
+          # (kaskaden forskyder dem med `forsink`).
+          - repeat:
+              for_each: "{{ b0s }}"
+              sequence:
+                - service: script.turn_on
+                  target:
+                    entity_id: script.halloween_stemning_paere
+                  data:
+                    variables:
+                      lys: "{{ repeat.item[0] }}"
+                      b0: "{{ repeat.item[1] }}"
+                      trin: "{{ plan.paerer[repeat.index - 1].trin }}"
+                      forsink: "{{ plan.paerer[repeat.index - 1].forsink }}"
+                      rum: "{{ plan.rum }}"
+          - delay:
+              milliseconds: "{{ plan.ms | int(0) }}"
+          - wait_template: "{{ is_state('script.halloween_stemning_paere', 'off') }}"
+            timeout:
+              seconds: 15
+            continue_on_timeout: true
+          # Aflevér: uden b0 (intet at rette) og 5 s til pærens sidste rapport.
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.halloween_stemning_laan
+            data:
+              value: "{{ (now().timestamp() + 5) | int }}|{{ plan.lys | join(',') }}|{{ plan.rum }}"
+      - variables:
+          svar: >-
+            {% set ok = plan is mapping and plan.lys | default([]) | count > 0 %}
+            {{ {'ok': ok, 'slags': plan.slags if ok else '', 'nominel': plan.nominel if ok else 0} }}
+      - stop: "glimt"
+        response_variable: svar
+
+  # ---------------------------------------------------------------------------
+  # Én pæres glimt: niveau-kald, transition 0 — kun det grønne blink rører
+  # farven ('g' = grøn hue, 'n' = pærens egen kelvin igen). Niveauerne undgår
+  # firmware-power-on-intervallerne som power-recovery lytter efter
+  # (automations/light_power_recovery.yaml) — stemplet dækker også, dette er
+  # selen. Skriver nogen andre undervejs → slip, ingen gendannelse (men en pære
+  # der stadig står i VORES grønne, får sin kelvin igen).
+  # GULV 3, ALDRIG 1 (24/10 18:39-18:40): ZHA sender move_to_level_with_on_off,
+  # og når niveauet rammer pærens min-niveau, slukker den (ZCL) — spisestue- og
+  # sove-loftet (Innr) gik helt ud, og "kun hvis den stadig lyser" lod dem stå
+  # slukket i 10 min. Depotets Hue gjorde det samme 12:25. Sluk pæren alligevel
+  # på VORES kald (context = mig), tændes den igen.
+  # ---------------------------------------------------------------------------
+  halloween_stemning_paere:
+    alias: "Halloween-stemning: én pæres glimt"
+    icon: mdi:lightbulb-alert-outline
+    mode: parallel
+    max: 10
+    fields:
+      lys:
+        description: "Pæren"
+        required: true
+      b0:
+        description: "Pærens niveau før glimtet (0-255)"
+        required: true
+      trin:
+        description: "Liste af [andel af b0, ms]"
+        required: true
+      rum:
+        description: "room_mode-suffikset, fx stue"
+        required: true
+      forsink:
+        description: "ms før første trin (kaskaden)"
+        required: false
+    sequence:
+      - variables:
+          mig: "{{ context.id }}"
+          # Pærens context FØR glimtet: auto-lyset skrev den (parent_id sat), og
+          # det er ikke en indblanding. Kun en NY fremmed skrivning undervejs er.
+          foer: "{{ states[lys].context.id if states[lys] is not none else '' }}"
+          niveau: "{{ b0 | default(0) | int(0) }}"
+          rum_mode: "{{ 'input_select.room_mode_' ~ (rum | default('')) }}"
+          # Det grønne blink: pærens kelvin FØR glimtet (planen vælger kun
+          # pærer i color_temp), så 'n'-trinnet og afleveringen kan gendanne den.
+          k0: "{{ state_attr(lys, 'color_temp_kelvin') | int(0) if lys is defined else 0 }}"
+          farvet: "{{ trin | default([]) | map('count') | select('gt', 2) | list | count > 0 }}"
+      # Efter `foer`: en fremmed skrivning MENS kaskaden venter er også en indblanding.
+      - delay:
+          milliseconds: "{{ forsink | default(0) | int(0) }}"
+      - repeat:
+          for_each: "{{ trin | default([]) }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: >-
+                    {% set s = states[lys] %}
+                    {{ s is not none and (s.state == 'on' or s.context.id == mig) and is_state(rum_mode, 'Auto')
+                       and (s.context.id in [mig, foer]
+                            or (s.context.user_id is none and s.context.parent_id is none)) }}
+              then:
+                - service: light.turn_on
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ lys }}"
+                  data: >-
+                    {% set ns = namespace(v=[3, [255, (niveau * (repeat.item[0] | float(1))) | round(0) | int] | min] | max) %}
+                    {% for r in [[175, 181], [151, 155], [124, 130], [100, 104], [73, 79], [61, 67], [11, 15]] %}
+                      {% if r[0] <= ns.v <= r[1] %}{% set ns.v = r[0] - 1 %}{% endif %}
+                    {% endfor %}
+                    {% set f = repeat.item[2] if repeat.item | count > 2 else '' %}
+                    {% if f == 'g' %}
+                      {{ {'brightness': ns.v, 'transition': 0, 'hs_color': [repeat.item[3] | int(120), 100]} }}
+                    {% elif f == 'n' and k0 > 0 %}
+                      {{ {'brightness': ns.v, 'transition': 0, 'color_temp_kelvin': k0} }}
+                    {% else %}
+                      {{ {'brightness': ns.v, 'transition': 0} }}
+                    {% endif %}
+            - delay:
+                milliseconds: "{{ repeat.item[1] | int(100) }}"
+      - if:
+          - condition: template
+            value_template: >-
+              {% set s = states[lys] %}
+              {{ niveau >= 1 and s is not none and (s.state == 'on' or s.context.id == mig)
+                 and is_state(rum_mode, 'Auto')
+                 and (s.context.id in [mig, foer]
+                      or (s.context.user_id is none and s.context.parent_id is none)) }}
+        then:
+          - service: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ lys }}"
+            data: >-
+              {% if farvet and k0 > 0 %}
+                {{ {'brightness': niveau, 'transition': 0, 'color_temp_kelvin': k0} }}
+              {% else %}
+                {{ {'brightness': niveau, 'transition': 0} }}
+              {% endif %}
+        else:
+          # Nogen andre skrev undervejs — men står pæren stadig i vores grønne
+          # (en skriver der kun satte lysstyrke), får den sin kelvin igen.
+          - if:
+              - condition: template
+                value_template: >-
+                  {% set s = states[lys] %}
+                  {% set hs = (s.attributes.hs_color or [0, 0]) if s is not none else [0, 0] %}
+                  {{ farvet and k0 > 0 and s is not none and s.state == 'on'
+                     and ('' ~ s.attributes.color_mode) in ['xy', 'hs']
+                     and 100 <= (hs[0] | float(0)) <= 140 and (hs[1] | float(0)) > 80 }}
+            then:
+              - service: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: "{{ lys }}"
+                data:
+                  color_temp_kelvin: "{{ k0 }}"
+                  transition: 0
+
+  # ---------------------------------------------------------------------------
+  # Lyd-løkken: vind-tæppe + et kort, almindeligt lydklip med tilfældige
+  # mellemrum. palet = [Spotify-id, volumen-faktor, sekunder]; indekset ER
+  # id'et i input_text.halloween_stemning_lyde_brugt — tilføj nyt sidst.
+  # ---------------------------------------------------------------------------
+  halloween_stemning_lyde:
+    alias: "Halloween-stemning: lyd-løkken"
+    icon: mdi:door-open
+    mode: single
+    max_exceeded: silent
+    variables:
+      palet:
+        - ["5n6QIj8bkPHfyIwhQiVJfw", 0.8, 6]   # knirkende dør (users eget forslag)
+        - ["1W0Pw64mQOxC65iqOQ4ScS", 1.0, 5]   # dør
+        - ["4Bhgd2HO5YxHrqDSSnVi1H", 1.0, 5]   # knirkende stol
+        - ["165nU0Cmftpt3FRaONS3TZ", 1.1, 7]   # gulvbrædder (spredt)
+        - ["3XkWbquWWhft57M7j8Pi5r", 0.7, 5]   # fodtrin (tæt, højt)
+        - ["0X1N18ThrcOgbTky6sUOSp", 1.0, 6]   # fodtrin
+        - ["1cLNK1BALjVZiMosMFNq1M", 0.8, 5]   # banken
+        - ["2gX4PtGk7yK6SoJ40HdF2L", 0.8, 5]   # banken
+        # Ikke 0dWju0Ikr9sTnbz5n6PNI8 (festlys-eventets): "Ghost Moaning - Dog
+        # Howling" er for åbenlyst til stemningen (user 24/10).
+        - ["2nxwaMCMnZ1WTjTzQpQ1g6", 0.6, 6]   # ugle
+        - ["4eh7FzgdfJPfuM8ITNPwXv", 0.7, 6]   # vind
+        - ["7ApzWgxjmMOFn0Kh46R7AB", 0.6, 7]   # vind
+        - ["0p1zSy0HO5onxZFYnabbsm", 1.2, 7]   # ur der tikker
+        # 24/10 kl. 21 ("heller ikke de samme lyde"): 15 til, så en aften kan
+        # få et nyt nummer hver gang. Fundet via MA-søgning, opslået med --dry.
+        - ["1NseIN5o0RPYUd1E0e22uk", 1.0, 6]   # gulvbrædder 2 (27 s)
+        - ["10ROWFVCJpMNhtz7TBx44B", 1.0, 6]   # gulvbrædder (151 s)
+        - ["5K476Px65oTSc0hLDPRbC7", 0.8, 8]   # fjern torden 1
+        - ["2gYpP4TDZXoxD4iYTEUxUN", 0.8, 8]   # fjern torden 2
+        - ["1YswA40U8UjnOjt2X8wqy3", 0.7, 5]   # krager
+        - ["4AUHOfP3nxfZ0toWZsEb5a", 1.0, 6]   # gyngestol i træ
+        - ["2aAaLAh8sDuR4MQtzNelvm", 1.1, 7]   # dryp i en hule
+        - ["3Vy6K434NdrKMMvLFdwtra", 0.8, 5]   # banken på ruden (14 s)
+        - ["18ugWeMI96zcWdQrOAUXqe", 0.8, 5]   # kniv der skraber træ
+        - ["5gTccypVElo5NHKYpG7ov0", 0.8, 7]   # uhyggelig vindklokke
+        - ["6cAtexxRhRgPBf9H8mfyOS", 0.9, 8]   # fjern kirkeklokke
+        - ["5xtie8Z9r2GTj2jVAwGpMk", 0.8, 6]   # ræv der skriger langt væk
+        - ["6azP2L4BvP7cG45rCM0aEr", 0.7, 6]   # ugle med fårekyllinger
+        - ["1o2ncPlr0uqBmf9Xuu3mzU", 0.9, 8]   # standur der slår
+        - ["08UfzxjLqe642oPKGXVJnO", 0.6, 5]   # radio-sus (gammelt rørapparat)
+      # Vind-laget (user 24/10: "vind sus på spotify"): lange, rolige stykker
+      # med fade ind/ud — tæppet de korte lyde ligger oven på. [id, faktor, s].
+      vind:
+        - ["1zG6DOCYs9UKunD3edlywN", 1.0, 599]   # Howling Wind Ambience for Study
+        - ["0QX7fsmzIPHYukbz9PjdSU", 1.0, 361]   # Howling Wind
+        - ["6Wtq0Y3qiNPvlOtLsC6aws", 1.0, 178]   # Howling Wind Ambience, Pt. 9
+        - ["4kaWfqbvhzD95NSMCMEFTE", 1.0, 108]   # Whistling Wind Through Open Window
+    # Hver runde: vind i 40 s-4 min (hver 4. runde et stille hul på 2-8 min i
+    # stedet), et kort hul, og med sandsynlighed rundens-længde / "minutter
+    # mellem lyde" et kort klip — så gennemsnittet stadig er ét klip pr. N min.
+    # Højttaleren optaget (en andens musik, en besked, godnat) → vent stille et
+    # minut og kig igen; spil_sang ville ellers logge "der spiller allerede
+    # noget"/"godnat" hver runde (24/10: hvert minut under børnenes godnat).
+    # Begge kald har `forsoeg: 2` (MA-køen hang 2 af 4 gange 24/10, inkl.
+    # aftenens eneste klip) og `stop_ved` = stemningen, så et vind-stykke
+    # fader ud i det sekund stemningen slutter.
+    sequence:
+      - repeat:
+          while:
+            - condition: state
+              entity_id: binary_sensor.halloween_stemning_aktiv
+              state: "on"
+          sequence:
+            - variables:
+                m: "{{ states('input_number.halloween_stemning_lyd_minutter') | float(0) }}"
+                vv: "{{ states('input_number.halloween_stemning_vind_volumen') | float(0) }}"
+                t0: "{{ as_timestamp(now()) }}"
+                dag: "{{ (now() - timedelta(hours=12)).date() | string }}"
+                optaget: >-
+                  {{ is_state('binary_sensor.hoejttaler_spiller_reelt', 'on')
+                     or is_state('binary_sensor.spotify_bro_spiller', 'on')
+                     or is_state('script.hoejttaler_annoncer', 'on')
+                     or is_state('script.hoejttaler_vejr_oplaesning', 'on')
+                     or is_state('script.hoejttaler_spil_sang', 'on')
+                     or is_state('binary_sensor.godnat_common_active', 'on')
+                     or is_state('input_boolean.godnat_boern_active', 'on')
+                     or is_state('input_boolean.sleepover_i_nat', 'on') }}
+            - if:
+                - condition: template
+                  value_template: "{{ optaget }}"
+              then:
+                - wait_template: "{{ is_state('binary_sensor.halloween_stemning_aktiv', 'off') }}"
+                  timeout:
+                    seconds: 60
+                  continue_on_timeout: true
+              else:
+                - if:
+                    - condition: template
+                      value_template: "{{ vv > 0 and (range(100) | random) >= 25 }}"
+                  then:
+                    # Aldrig samme vind-nummer to gange i træk.
+                    - variables:
+                        vi: >-
+                          {% set b = (states('input_text.halloween_stemning_lyde_brugt') ~ '').split('|') %}
+                          {% set sidst = b[2] | int(-1) if b | count == 3 else -1 %}
+                          {{ range(vind | count) | reject('eq', sidst) | list | random }}
+                    - service: input_text.set_value
+                      target:
+                        entity_id: input_text.halloween_stemning_lyde_brugt
+                      data:
+                        value: >-
+                          {%- set b = (states('input_text.halloween_stemning_lyde_brugt') ~ '').split('|') -%}
+                          {{- dag }}|{{ b[1] if b | count == 3 and b[0] == dag else '' }}|{{ vi -}}
+                    # Efter vores eget klip står sensor.hoejttaler_spotify på kilde
+                    # 'ha' (MA-strøm i MPD) til næste 30-s-poll, og spil_sang læser
+                    # det som en andens musik (24/10 19:10:55: to klip sprunget over).
+                    - wait_template: >-
+                        {{ is_state('binary_sensor.hoejttaler_spiller_reelt', 'off')
+                           and state_attr('sensor.hoejttaler_spotify', 'kilde') != 'ha' }}
+                      timeout:
+                        seconds: 40
+                      continue_on_timeout: true
+                    - service: script.hoejttaler_spil_sang
+                      continue_on_error: true
+                      data:
+                        anledning: halloween-stemning (vind)
+                        volumen: >-
+                          {{ [5, [100, (vv * vind[vi][1] * (range(60, 116) | random) / 100) | round(0) | int] | min] | max }}
+                        stop_ved: binary_sensor.halloween_stemning_aktiv
+                        klip:
+                          - uri: "spotify://track/{{ vind[vi][0] }}"
+                            ved: 2
+                            sek: "{{ [range(40, 241) | random, vind[vi][2] - 10] | min }}"
+                            start: -1
+                            fade: "{{ range(3, 13) | random }}"
+                            forsoeg: 2
+                    # Sprang spil_sang over med det samme (højttaler slukket,
+                    # MA nede …), skal løkken ikke hamre den hvert sekund.
+                    - if:
+                        - condition: template
+                          value_template: "{{ as_timestamp(now()) - t0 < 45 }}"
+                      then:
+                        - wait_template: "{{ is_state('binary_sensor.halloween_stemning_aktiv', 'off') }}"
+                          timeout:
+                            seconds: 60
+                          continue_on_timeout: true
+                  else:
+                    # Stille hul (eller ingen vind): én pause — med vind 2-8 min,
+                    # uden N min ±50 % (0 = kig efter en ny værdi om 5 min).
+                    - wait_template: "{{ is_state('binary_sensor.halloween_stemning_aktiv', 'off') }}"
+                      timeout:
+                        seconds: >-
+                          {% if vv > 0 %}{{ range(120, 481) | random }}
+                          {% elif m <= 0 %}300
+                          {% else %}{{ (m * 60 * (range(50, 151) | random) / 100) | round(0) }}
+                          {% endif %}
+                      continue_on_timeout: true
+                - variables:
+                    chance: >-
+                      {% set varede = as_timestamp(now()) - t0 %}
+                      {{ 0 if m <= 0 else (1 if vv <= 0 else [1, varede / (m * 60)] | min) }}
+                    # Dagens ubrugte numre (indeks i paletten).
+                    ledige: >-
+                      {% set b = (states('input_text.halloween_stemning_lyde_brugt') ~ '').split('|') %}
+                      {% set brugt = (b[1].split(',') | map('int', -1) | list) if b | count == 3 and b[0] == dag else [] %}
+                      {{ range(palet | count) | reject('in', brugt) | list }}
+                - if:
+                    - condition: state
+                      entity_id: binary_sensor.halloween_stemning_aktiv
+                      state: "on"
+                    - condition: template
+                      value_template: "{{ ledige | count > 0 and (range(1000) | random) / 1000 < chance | float(0) }}"
+                  then:
+                    - wait_template: "{{ is_state('binary_sensor.halloween_stemning_aktiv', 'off') }}"
+                      timeout:
+                        seconds: "{{ range(4, 21) | random if vv > 0 else 0 }}"
+                      continue_on_timeout: true
+                    # MA-strømmen er slut, men Volumio kan hænge et par sekunder i
+                    # playing, og kilde 'ha' til næste 30-s-poll (se vind-kaldet).
+                    - wait_template: >-
+                        {{ is_state('binary_sensor.hoejttaler_spiller_reelt', 'off')
+                           and state_attr('sensor.hoejttaler_spotify', 'kilde') != 'ha' }}
+                      timeout:
+                        seconds: 40
+                      continue_on_timeout: true
+                    - if:
+                        - condition: state
+                          entity_id: binary_sensor.halloween_stemning_aktiv
+                          state: "on"
+                        - condition: template
+                          value_template: >-
+                            {{ is_state('script.hoejttaler_spil_sang', 'off')
+                               and is_state('binary_sensor.hoejttaler_spiller_reelt', 'off') }}
+                      then:
+                        - variables:
+                            ki: "{{ ledige | random }}"
+                        # Brugt FØR afspilning: et klip der hænger, tæller også —
+                        # ellers kan samme nummer komme igen om lidt.
+                        - service: input_text.set_value
+                          target:
+                            entity_id: input_text.halloween_stemning_lyde_brugt
+                          data:
+                            value: >-
+                              {%- set b = (states('input_text.halloween_stemning_lyde_brugt') ~ '').split('|') -%}
+                              {%- set nye = b[1] if b | count == 3 and b[0] == dag else '' -%}
+                              {{- dag }}|{{ (nye ~ ',' if nye != '' else '') ~ ki }}|{{ b[2] if b | count == 3 else '' -}}
+                        - service: script.hoejttaler_spil_sang
+                          continue_on_error: true
+                          data:
+                            anledning: halloween-stemning
+                            volumen: >-
+                              {{ [5, [100, (states('input_number.halloween_stemning_lyd_volumen') | float(20) * palet[ki][1]) | round(0) | int] | min] | max }}
+                            stop_ved: binary_sensor.halloween_stemning_aktiv
+                            klip:
+                              - uri: "spotify://track/{{ palet[ki][0] }}"
+                                ved: 2
+                                sek: "{{ palet[ki][2] }}"
+                                start: -1
+                                # Blød udtoning, ny længde hvert klip (ind: MA's 3 s).
+                                ud: "{{ (range(8, 26) | random) / 10 }}"
+                                forsoeg: 2

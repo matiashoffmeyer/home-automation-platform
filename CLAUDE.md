@@ -36,11 +36,6 @@ og incident-forløb ligger i docs/ og koster kun tokens når nogen læser dem.
 måledata: `grep -n "Sprint <dato>" docs/sprint_log.md`.** Er en lærdom permanent,
 hører den i "Permanente fakta" eller som en fejlklasse — ikke i en sprint-note.
 
-- **2026-10-20 — et spørgsmål du kender svaret på er støj.** 699 pushes på 14
-  dage: aktivitets-træneren spurgte om gæt med 8/8 rigtige, "Nattens vejr" kom 3×
-  med samme tekst. Nu spørger trænerne kun når gættets seneste svar er i tvivl
-  (`scripts/trainer_tvivl.py`, `trainer_sikker_*`), vejret kun igen ved ændring,
-  og tekster får danske navne + decimal-komma fra `custom_templates/tekst.jinja`. B241.
 - **2026-10-21 — en regel der vogter DELE af tallet, vogter ikke tallet.**
   "Kun ned ved hoveddøren" lækkede 51 gange på 14 døgn: v5 låste familie- og
   ekstra-delen, mens Dormant, geofence-exit, familie-vækst, rå zoner og manuel-
@@ -51,6 +46,11 @@ hører den i "Permanente fakta" eller som en fejlklasse — ikke i en sprint-not
   Dormant kom 27 s før dør-vinduet lukkede → 1 i et tomt hus hele dagen. Nu
   sætter Dormant ≤ `people_afgang_dom_minutter` (120) efter døren 0 og rydder
   ekstra (30 døgn: dommen 35-104 min, første forkerte Dormant 284 min). B246.
+- **2026-10-25 — budgettér HUSETS sum, ikke pr. pære.** Halloween sendte ~2
+  Matter-kommandoer/s (B222's tempo-gulv pr. pære holdt ikke summen nede) og
+  hard-hang OTBR'en. Nu skriver festlys kun til Thread-pærerne på deres plads i
+  ét fælles gitter (`custom_templates/festlys.jinja`, 8/min for hele huset): 7 min
+  worst case = 1 enkelt reset. En reset-KLYNGE er festens tegn; ~1,8/t er baggrund. B260.
 ---
 
 ## 💡 Permanente fakta (destilleret fra arkiverede sprints)

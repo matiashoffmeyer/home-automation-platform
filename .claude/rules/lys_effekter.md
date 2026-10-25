@@ -37,8 +37,11 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
 - **Matter-pærer deler ÉN flaskehals: ~0,1-0,15 s × antal Matter-pærer pr.
   kommando, et farvet turn_on = 2 kommandoer, og 2-3 % gensendes med ~5,2 s
   hæng** (normalt, ikke et sygt net). **Signatur:** Matter-pærer ude af takt i
-  en hurtig effekt mens ZHA-naboen holder den. → tempo-gulv pr. pære (`inv` i
-  `dance_event_bulb`), aldrig samme takt som ZHA.
+  en hurtig effekt mens ZHA-naboen holder den. → **de danser slet ikke med i
+  koreografien (25/10, B260):** festlys skriver kun til Thread-pærerne på deres
+  plads i husets fælles gitter (`custom_templates/festlys.jinja`,
+  `input_number.festlys_thread_skrivninger` pr. minut for ALLE tilsammen) — et
+  tempo-gulv pr. pære (det gamle `inv`) holdt ikke HUSETS sum nede.
 - **Et FARVET `light.turn_on` er TO zigbee-frames pr. pære**, et `turn_off` én
   (målt 2:1) → i en blink-løkke: sæt farven ÉN gang før løkken, rene niveau-kald
   i den. **Et blink hvis ON-fase er kortere end bølgen kan ALDRIG se synkront

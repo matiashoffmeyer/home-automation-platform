@@ -17,7 +17,7 @@ Search keywords: `badevaerelse, bad`
 
 - **Badelys: post-strom -> sun-aware default** (line 69, mode=single)
   - Bath bulb wake fra wall-switch eller mesh-flicker → fader til sun-aware
-- **AirBnB: Alle lys post-strøm → lux-aware (bad=fuld)** (line 410, mode=parallel)
+- **AirBnB: Alle lys post-strøm → lux-aware (bad=fuld)** (line 449, mode=parallel)
   - AirBnB undtagelse 2: vægkontakt-genstart tænder lys på passende niveau for
 
 ### `automations/presence_badevaerelse.yaml`
@@ -95,7 +95,7 @@ Search keywords: `badevaerelse, bad`
 - `binary_sensor.badevaerelse_fugt_frisk` — 9 refs in 2 file(s)
 - `binary_sensor.badevaerelse_inde_1_occupancy` — 24 refs in 9 file(s)
 - `binary_sensor.badevaerelse_inde_2_occupancy` — 23 refs in 8 file(s)
-- `binary_sensor.badevaerelse_inde_occupancy` — 131 refs in 37 file(s)
+- `binary_sensor.badevaerelse_inde_occupancy` — 132 refs in 38 file(s)
 - `binary_sensor.badevaerelse_lys_on_effektiv` — 1 refs in 1 file(s)
 - `binary_sensor.badevaerelse_matter_spots_ok` — 12 refs in 5 file(s)
 - `binary_sensor.badevaerelse_natlys_aktiv` — 10 refs in 3 file(s)
@@ -216,8 +216,8 @@ Search keywords: `badevaerelse, bad`
 - `light.badevaerelse_spot_1` — 37 refs in 23 file(s)
 - `light.badevaerelse_spot_2` — 43 refs in 23 file(s)
 - `light.badevaerelse_spot_3` — 34 refs in 20 file(s)
-- `light.badevaerelse_spot_4` — 31 refs in 17 file(s)
-- `light.badevaerelse_spot_5` — 31 refs in 17 file(s)
+- `light.badevaerelse_spot_4` — 32 refs in 18 file(s)
+- `light.badevaerelse_spot_5` — 32 refs in 18 file(s)
 
 ### `script.*`
 

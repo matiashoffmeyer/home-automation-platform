@@ -156,6 +156,67 @@ script:
             {{ states('select.s8_maxv_ultra_mop_intensity') }}, mop-rute
             {{ states('select.s8_maxv_ultra_mop_mode') }}.
 
+  # ---------------------------------------------------------------------------
+  # Forlad SmartPlan — ÉT sted for exit'en (fejlklasse #2)
+  # ---------------------------------------------------------------------------
+  # 2026-10-24, user: "den ignorerer sin kø!" — målt: efter en SmartPlan-tur
+  # står alle tre koder på smart_mode, og robotten AFVISER så en løs mop-rute-
+  # skrivning ("Error while calling SET_MOP_MODE"). Rum-køens grundig-gren
+  # skrev mop-ruten uden continue_on_error → hele kicket aborterede hvert 2.
+  # min i 10 min, indtil afleveringen nedenfor endelig kørte. Derfor kalder
+  # ENHVER vej der skriver en profil dette script FØRST; det er en tavs no-op
+  # når robotten ikke står i SmartPlan. Blokerende kald: sensoren er gen-
+  # renderet når kalderen fortsætter.
+  roborock_forlad_smartplan:
+    alias: "Roborock: forlad SmartPlan (før en profil-skrivning)"
+    icon: mdi:robot-vacuum-off
+    mode: queued
+    max: 6
+    sequence:
+      - condition: state
+        entity_id: binary_sensor.roborock_smartplan_aktiv
+        state: "on"
+      # Vej 1: samme atomiske kald som indgangen, med bibliotekets
+      # VACUUM-profil (balanced / vand off / standard-rute).
+      - service: vacuum.send_command
+        continue_on_error: true
+        target: {entity_id: vacuum.s8_maxv_ultra}
+        data:
+          command: set_clean_motor_mode
+          params:
+            - fan_power: 102
+              water_box_mode: 200
+              mop_mode: 300
+      - delay: "00:00:03"
+      # Vej 2: husets egne entity-skrivninger, i husets rækkefølge.
+      - if:
+          - condition: state
+            entity_id: binary_sensor.roborock_smartplan_aktiv
+            state: "on"
+        then:
+          - service: select.select_option
+            continue_on_error: true
+            target: {entity_id: select.s8_maxv_ultra_mop_mode}
+            data: {option: standard}
+          - service: select.select_option
+            continue_on_error: true
+            target: {entity_id: select.s8_maxv_ultra_mop_intensity}
+            data: {option: "off"}
+          - service: vacuum.set_fan_speed
+            continue_on_error: true
+            target: {entity_id: vacuum.s8_maxv_ultra}
+            data: {fan_speed: balanced}
+          - delay: "00:00:03"
+      - service: logbook.log
+        data:
+          name: "Roborock SmartPlan"
+          message: >-
+            {{ 'Forlod SmartPlan' if is_state('binary_sensor.roborock_smartplan_aktiv', 'off')
+               else 'Kunne IKKE forlade SmartPlan' }} før en ny profil (sug
+            {{ state_attr('vacuum.s8_maxv_ultra', 'fan_speed') }}, mop-styrke
+            {{ states('select.s8_maxv_ultra_mop_intensity') }}, mop-rute
+            {{ states('select.s8_maxv_ultra_mop_mode') }}).
+
 automation:
   # ---------------------------------------------------------------------------
   # Aflevering: ud af SmartPlan igen når HA's SmartPlan-tur er slut
@@ -204,44 +265,16 @@ automation:
              and (now().timestamp() - seg) >= 540 }}
     action:
       # Stod robotten slet ikke i SmartPlan (sæt-forsøget landede aldrig, og
-      # kø-motoren kørte HURTIG i stedet), er der kun flaget at rydde.
+      # kø-motoren kørte HURTIG i stedet — eller en profil-vej har allerede
+      # forladt den via script.roborock_forlad_smartplan), er der kun flaget
+      # at rydde.
       - variables:
           var_smart: "{{ is_state('binary_sensor.roborock_smartplan_aktiv', 'on') }}"
       - if:
           - condition: template
             value_template: "{{ var_smart }}"
         then:
-          # Vej 1: samme atomiske kald som indgangen, med bibliotekets
-          # VACUUM-profil (balanced / vand off / standard-rute).
-          - service: vacuum.send_command
-            continue_on_error: true
-            target: {entity_id: vacuum.s8_maxv_ultra}
-            data:
-              command: set_clean_motor_mode
-              params:
-                - fan_power: 102
-                  water_box_mode: 200
-                  mop_mode: 300
-          - delay: "00:00:03"
-          # Vej 2: husets egne entity-skrivninger, i husets rækkefølge.
-          - if:
-              - condition: state
-                entity_id: binary_sensor.roborock_smartplan_aktiv
-                state: "on"
-            then:
-              - service: select.select_option
-                continue_on_error: true
-                target: {entity_id: select.s8_maxv_ultra_mop_mode}
-                data: {option: standard}
-              - service: select.select_option
-                continue_on_error: true
-                target: {entity_id: select.s8_maxv_ultra_mop_intensity}
-                data: {option: "off"}
-              - service: vacuum.set_fan_speed
-                continue_on_error: true
-                target: {entity_id: vacuum.s8_maxv_ultra}
-                data: {fan_speed: balanced}
-              - delay: "00:00:03"
+          - service: script.roborock_forlad_smartplan
       # Flaget ryddes uanset udfald — ingen retry-løkke mod robottens sky hvert
       # kvarter. Kunne vi ikke komme ud, siger vi det i stedet.
       - service: input_boolean.turn_off

@@ -15,7 +15,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/airbnb_mode.yaml`
 
-- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 937, mode=queued)
+- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 948, mode=queued)
   - Undtagelse 1 (user 2026-06-30; rev. 2026-07-08 #12): BØRNEVÆRELSE må aldrig
 
 ### `automations/boern_ankomst_detekter.yaml`
@@ -33,9 +33,9 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/boern_loft_manual_cycle.yaml`
 
-- **Børn loft: stamp last-off timestamp (cycle tracker)** (line 26, mode=queued)
+- **Børn loft: stamp last-off timestamp (cycle tracker)** (line 27, mode=queued)
   - Stamps input_datetime.boern_loft_left_on_at hver gang lyset forlader
-- **Børn loft: manuel cycle → kraftigt lys (100%/3000K)** (line 45, mode=single)
+- **Børn loft: manuel cycle → kraftigt lys (100%/3000K)** (line 46, mode=single)
   - Når lyset går til on uden automation-context og last-off var 2-15 sek
 
 ### `automations/boern_sleep_latch.yaml`
@@ -45,9 +45,9 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/boernevaerelse_hyggelys_mirror.yaml`
 
-- **Børnehygge: plug-lampe følger hygge-strip (app + Styrbar)** (line 29, mode=queued)
+- **Børnehygge: plug-lampe følger hygge-strip (app + Styrbar)** (line 33, mode=queued)
   - Plug-lampen følger light.boernevaerelse_hygge_strip on/off, så den tænder
-- **Børn: Styrbar OP tænder hyggelys direkte (dagstime)** (line 95, mode=single)
+- **Børn: Styrbar OP tænder hyggelys direkte (dagstime)** (line 101, mode=single)
   - OP-klik ('on') + OP-langklik ('move_with_on_off') på børne-Styrbaren tænder
 
 ### `automations/godnat_night.yaml`
@@ -57,7 +57,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/light_power_recovery.yaml`
 
-- **Børneværelselys: post-strøm → lux-aware default** (line 325, mode=single)
+- **Børneværelselys: post-strøm → lux-aware default** (line 351, mode=single)
   - Boern bulb waker fra wall-switch på NVRAM-default 5% (brightness=13).
 
 ### `automations/morning_lights_sanity_check.yaml`
@@ -116,7 +116,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `binary_sensor.boern_putte_zone_aktiv` — 4 refs in 3 file(s)
 - `binary_sensor.boern_set_i_eftermiddag` — 6 refs in 2 file(s)
 - `binary_sensor.boernevaerelse_any_lys` — 1 refs in 1 file(s)
-- `binary_sensor.boernevaerelse_apollo_occupancy` — 120 refs in 45 file(s)
+- `binary_sensor.boernevaerelse_apollo_occupancy` — 121 refs in 46 file(s)
 - `binary_sensor.boernevaerelse_apollo_online` — 1 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_moving_target` — 12 refs in 10 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_still_target` — 4 refs in 3 file(s)
@@ -132,8 +132,8 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `binary_sensor.boernevaerelse_vaekning_bevaegelse` — 1 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_vaekning_hold` — 5 refs in 4 file(s)
 - `binary_sensor.boernevaerelse_vaekning_koert_i_dag` — 2 refs in 1 file(s)
-- `binary_sensor.dark_mode_boern` — 3 refs in 3 file(s)
-- `binary_sensor.filmmoerke_boern` — 6 refs in 4 file(s)
+- `binary_sensor.dark_mode_boern` — 4 refs in 4 file(s)
+- `binary_sensor.filmmoerke_boern` — 7 refs in 5 file(s)
 - `binary_sensor.mood_pause_boernevaerelse` — 2 refs in 1 file(s)
 
 ### `button.*`
@@ -158,7 +158,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `input_boolean.boernevaerelse_manual_off_lock` — 46 refs in 14 file(s)
 - `input_boolean.dance_room_boern` — 15 refs in 7 file(s)
 - `input_boolean.festlys_boern_styrbar` — 8 refs in 3 file(s)
-- `input_boolean.godnat_boern_active` — 92 refs in 39 file(s)
+- `input_boolean.godnat_boern_active` — 94 refs in 40 file(s)
 - `input_boolean.koekken_lav_krop_boern_enabled` — 3 refs in 3 file(s)
 - `input_boolean.people_boern_set_efter_doer` — 12 refs in 2 file(s)
 - `input_boolean.roborock_styrbar_kort_op_boernevaerelse` — 1 refs in 1 file(s)
@@ -245,10 +245,10 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `light.boernevaerelse_all` — 19 refs in 10 file(s)
 - `light.boernevaerelse_apollo_rgb_light` — 5 refs in 5 file(s)
-- `light.boernevaerelse_hygge_strip` — 88 refs in 31 file(s)
+- `light.boernevaerelse_hygge_strip` — 89 refs in 31 file(s)
 - `light.boernevaerelse_hyggelys` — 53 refs in 21 file(s)
-- `light.boernevaerelse_lampe` — 43 refs in 19 file(s)
-- `light.boernevaerelse_loft` — 93 refs in 36 file(s)
+- `light.boernevaerelse_lampe` — 44 refs in 20 file(s)
+- `light.boernevaerelse_loft` — 95 refs in 37 file(s)
 
 ### `number.*`
 

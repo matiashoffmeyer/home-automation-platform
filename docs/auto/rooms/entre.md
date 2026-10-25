@@ -15,7 +15,7 @@ Search keywords: `entre`
 
 ### `automations/airbnb_mode.yaml`
 
-- **AirBnB: Dormant -> Active ved entré presence (comfort welcome)** (line 1083, mode=single)
+- **AirBnB: Dormant -> Active ved entré presence (comfort welcome)** (line 1094, mode=single)
   - Hvis huset er Dormant og guest entrer entré, tænd lys "behageligt"
 
 ### `automations/arrival.yaml`
@@ -129,7 +129,7 @@ Search keywords: `entre`
 ### `script.*`
 
 - `script.entre_fade_ud` — 5 refs in 4 file(s)
-- `script.entre_ned_sluk_alt` — 6 refs in 2 file(s)
+- `script.entre_ned_sluk_alt` — 7 refs in 3 file(s)
 - `script.roborock_grundig_entre` — 1 refs in 1 file(s)
 - `script.roborock_hurtig_entre` — 1 refs in 1 file(s)
 

@@ -29,12 +29,12 @@ Search keywords: `koekken, kokken`
 - **Lysnet: Køkken tænd** (line 32, mode=single)
 - **Lysnet: Køkken-spots ved madlavning (central zone + lux-gated)** (line 193, mode=single)
   - 2026-06-17 (item 1 user-spec, omlagt): tænd KUN køkken-spots
-- **Lysnet: Køkken-spots sluk (køkken tomt)** (line 593, mode=restart)
+- **Lysnet: Køkken-spots sluk (køkken tomt)** (line 611, mode=restart)
   - 2026-06-17 rev.2 (user-spec "wider zone only"): spots slukker når man
-- **Lysnet: Køkken-spots sluk ved dagslys** (line 746, mode=single)
+- **Lysnet: Køkken-spots sluk ved dagslys** (line 764, mode=single)
   - Slukker switch.koekken_spots når køkkenets egen lux har ligget over
-- **Lysnet: Køkken-lyskæde sluk (køkken tomt / lys stiger)** (line 810, mode=restart)
-- **Lysnet: Køkken-session slut (tomt X min / godnat / væk)** (line 1047, mode=restart)
+- **Lysnet: Køkken-lyskæde sluk (køkken tomt / lys stiger)** (line 828, mode=restart)
+- **Lysnet: Køkken-session slut (tomt X min / godnat / væk)** (line 1065, mode=restart)
   - Afslut madlavnings-sessionen (input_boolean.koekken_session_active) når
 
 ---

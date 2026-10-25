@@ -36,6 +36,10 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   `light.turn_on` indeholder brightness + color_temp + transition > 0 samtidig.
   Husets eneste: `light.depot_loft_ikea` → split i to, eller
   `script.tradfri_ws_bri_fix` efter gruppe-kald.
+- **`brightness: 1` via ZHA er et SLUK på Innr og Hue** (move_to_level_with_on_off
+  rammer min-niveauet → pæren melder `off`). **Signatur:** et dæmp-script
+  efterlader en pære slukket, og en "kun hvis den stadig lyser"-guard
+  gendanner den aldrig. → gulv på 3 (`halloween_stemning_paere`).
 - **En RGBW-strip kan ikke crossfade mellem RGB-motoren og sin hvide kanal** —
   bliv i ÉT color_mode; oversæt kelvin til RGB (`script.boern_natlys_set`).
 - **En pære med `power_on_behavior = Off` er usynligt død fra vægkontakten.**

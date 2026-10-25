@@ -42,7 +42,7 @@ Search keywords: `spisestue`
 - `binary_sensor.spisestue_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_frossen_ghost` — 2 refs in 2 file(s)
 - `binary_sensor.spisestue_apollo_occupancy` — 29 refs in 19 file(s)
-- `binary_sensor.spisestue_apollo_occupancy_filtered` — 111 refs in 39 file(s)
+- `binary_sensor.spisestue_apollo_occupancy_filtered` — 112 refs in 40 file(s)
 - `binary_sensor.spisestue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_radar_moving_target` — 12 refs in 11 file(s)
 - `binary_sensor.spisestue_apollo_radar_still_target` — 1 refs in 1 file(s)
@@ -126,8 +126,8 @@ Search keywords: `spisestue`
 ### `light.*`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
-- `light.spisestue_loft` — 120 refs in 46 file(s)
-- `light.spisestue_pendel` — 135 refs in 38 file(s)
+- `light.spisestue_loft` — 121 refs in 47 file(s)
+- `light.spisestue_pendel` — 136 refs in 39 file(s)
 
 ### `number.*`
 

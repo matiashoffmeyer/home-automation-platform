@@ -507,7 +507,8 @@ den korte bullet (CLAUDE.md eller regel-filen) og afsnittet her.
   chase-ticks i tilfældig rækkefølge ("ustabile events"). **Signatur:** Matter-pærer der hakker/kommer ud af takt
   i en hurtig effekt, mens en ZHA-pære ved siden af holder takten (p50 114 ms). → `dance_event_bulb` får `inv`
   (s pr. kommando, 0 for ZHA) og spiller kun hvert mm'te tick på det fælles ur. Åbent: eventets FØRSTE kald hænger
-  33 % af gangene mod 2,4 % for resten (B222).
+  33 % af gangene mod 2,4 % for resten (B222). **Afløst 25/10 (B260):** `inv` holdt hver pære i takt, men ikke
+  HUSETS sum under RCP'ens grænse — Thread-pærerne er nu helt ude af koreografien (næste afsnit om festlys' gitter).
 - **Et FARVET `light.turn_on` er TO zigbee-frames pr. pære; et `turn_off` er én.**
   Zigbee har ingen kommando der sætter farve og niveau samtidig, så ZHA sender
   color-cluster + level-cluster hver for sig. Målt 30/8 over 3 døgn på husets tre
@@ -823,6 +824,16 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   en valideringsfejl** (huset har 61 af dem). `id`-attributten duer IKKE som
   skillelinje — orphans bærer den også. Ægte fejl = `restored` mangler, og står
   som "could not be validated" i core-loggen (#22).
+- **`brightness: 1` via ZHA er et SLUK på Innr og Hue.** ZHA sender
+  move_to_level_with_on_off, og når niveauet rammer pærens min-niveau, slukker
+  pæren efter ZCL og melder `off`. Ramt 24/10 af halloween-stemningens udfald
+  (niveau 1): depotets Hue LWE007 12:25, spisestue- og sove-loftet (Innr RB 282 C
+  / RF 271 T) 18:39-18:40 og stue-læselampen 18:59 — og stemningens "kun hvis den
+  stadig lyser"-guard sprang gendannelsen over, så spisestuen stod slukket i
+  10 min. min_level-attributten (cluster 8, attr 2) kan ikke læses på nogen af
+  dem (None / "Unknown error"), så grænsen er målt ved udfald, ikke slået op.
+  → dæmp aldrig under 3, og lad en guard der vogter "stadig tændt" også godtage
+  et `off` hvis context er dit eget kald.
 - **`IKEA TRADFRI bulb E27 WS globe 1055lm` lander på 2 % hvis ét `light.turn_on`
   indeholder brightness + color_temp + transition > 0 samtidig.** Målt live
   08-18: 5/255 hver gang, mens de samme tre uden `transition` (eller uden
@@ -1093,6 +1104,31 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   uden HW flow control. ZBDongle-E har ingen flow-control-linjer (darkxst
   README), og alle darkxst-RCP-builds til den er `no_flow_460800` (2.5.3 og
   2.7.0). ZBT-2'en (ZHA) kører `flow_control: hardware`.
+- **Festlys' Thread-gitter: budgettér HUSETS sum af Matter-kommandoer, ikke pr. pære (25/10, B260, user: "det går
+  ikke at events lægger thread ned hver gang … vær mere nænsom").** Halloween-eventet (v2/v3) sendte ~22 kommandoer
+  på 33 s pr. Matter-pære ≈ 0,67/s pr. stk, ≈ 2/s for entré-loftet + de to stue-spots, plus deres rapporter — 4×
+  over trappe-testens rene trin. 24/10: fem test-løb à ~36 s kostede hver 3-5 RCP-resets. 25/10: et låst løb startet
+  06:20:08, slukket 06:21:38 (2 løb); OTBR'en hard-hang 06:21:44, og ALLE Thread-enheder var `unavailable` ~3 min.
+  Baggrunds-disko'en (`dance_single_bulb`, farvet skrivning hvert ~4,5 s pr. pære ved hastighed 50) lå med 3 Matter-
+  pærer på ~1,3 kommandoer/s — ikke bevist som udløser (17/10 07:02-07:09 uden reset-spring), men over 1/s-trinnet.
+  **Design:** `custom_templates/festlys.jinja` — ét absolut unix-ur, én Thread-skrivning hvert 60/N s i HELE huset
+  (`input_number.festlys_thread_skrivninger` = N, default 8 → 7,5 s), pærerne på skift (Matter-pære m ejer skridt j
+  hvor j % antal == m, i `sensor.dance_active_bulbs`' rækkefølge). Events, disko-loopet og løb der følger tæt på
+  hinanden deler gitteret, så summen holder uanset hvad der kører. Én skrivning ≤ 2 kommandoer (farve + niveau, uden
+  `transition` i events — den koster 2 RemainingTime-rapporter), og der skrives kun når pæren ikke allerede står i
+  eventets look (hue ± 5°, sat ± 8, niveau ± 3 %). Hurtige blink-events (strobe, lyn, sparkle, comet, jump, heartbeat,
+  halloween) = Thread-pærerne mørke; police/pulse/split/cascade = ét statisk look; chase = langsom regnbue; ild =
+  glød 15-45 %. Gruppe-events (blackout, warm, breathe, ildens udbrænding) er kun ZHA. Thread-pausen
+  (`binary_sensor.stue_spots_ild_thread_pause`: router nede, spot/entré væk, resets/t over loftet eller 30 min efter
+  en byge) = de sidder helt over. **Pris:** med 3 Thread-pærer skifter hver højst hvert 22,5 s og kan komme op til
+  22,5 s for sent ind i et event. Worst case 16 kommandoer/min ≈ 0,27/s (trappens rene trin: 0,5/s).
+  **Målt 25/10 07:06-07:18** (2 låste chase-løb, 7 min): skrivningerne 0,01-0,07 s efter pladsen, 15-16
+  kommandoer/min, 1 enkelt RCP-reset uden klynge — mod 3-5 pr. 36-s løb før. Baggrunden uden fest er ~1,8
+  reset-episoder/t (B232), så én reset i et løb er ikke et festlys-tegn; en KLYNGE (3+ inden for 30 s) er.
+  **Med-ejer fundet samme dag (#1):** `entre_motion_off`'s /2-backstop startede `script.entre_fade_ud` midt i
+  festen (entréen er tom, og motion_off læser ikke `room_mode_entre`) → 9 dæmpe-trin à 4,5 s mod festens farve.
+  Scriptet springer nu over mens entréen danser (`dance_mode`/`dance_event_manual_active` + entre_loft i
+  `sensor.dance_active_bulbs`).
 - **Entré-loftet + stue-spotsene er det skrøbeligste Thread-led (15/10, user-spec
   "meget forsigtige med at belaste entre loft og stue spots").** Stuen hænger
   (indtil 15/10 18:51) kun på OTBR'en via entré-loftet (node 461) — derefter
@@ -1639,6 +1675,15 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   **`get_collision_avoid_status` = `{'status': 2}` efter at user slog forsigtig
   kørsel til i appen** (var 1; 0 = fra; 2 er udokumenteret) → appens valg er
   facit, `script.roborock_apply_forsigtig` skriver 2.
+- **I SmartPlan afviser robotten løse profil-skrivninger** (målt 2026-10-24):
+  efter en Styrbar-SmartPlan-tur stod sug/vand/mop-rute alle på `smart_mode`, og
+  `select.select_option` på `select.s8_maxv_ultra_mop_mode` → `standard` fejlede
+  med "Error while calling SET_MOP_MODE" — hvert 2. min i 10 min, indtil
+  afleveringen (`roborock_smartplan_aflever`, venter 10 min efter turen) kom ud
+  med det atomiske `set_clean_motor_mode` (102/200/300, landede på 3 s). Rum-
+  køens grundig-gren havde ingen `continue_on_error`, så 6 bestilte rum hang
+  ("den ignorerer sin kø!"). Fix: `script.roborock_forlad_smartplan` kaldes
+  først af hver profil-vej; no-op uden SmartPlan.
 
 <!-- flyttet fra CLAUDE.md 2026-09-12 under linje-budget-oprydningen -->
 - **HA Core's shell_command-subproces har en `SUPERVISOR_TOKEN`, men supervisor-proxyen

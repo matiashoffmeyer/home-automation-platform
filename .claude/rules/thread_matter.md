@@ -78,6 +78,15 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   byge (≥ `stue_spots_ild_rcp_byge` på 10 min, 17/10) — crashet kommer som en
   byge, timeloftet når det for sent. Byg aldrig ny
   Matter-trafik med > ~1 kommando/5 s pr. pære uden at måle den her.
+  **Festlys deler samme vagt** (`binary_sensor.stue_spots_ild_thread_pause`).
+- **Budgettér HUSETS sum, ikke pr. pære (25/10, B260):** halloween sendte ~0,67
+  kommandoer/s pr. Matter-pære = ~2/s i alt og fældede OTBR'en (06:21, alle
+  Thread-enheder væk ~3 min); hvert test-løb 24/10 kostede 3-5 RCP-resets.
+  **Signatur:** KLYNGER af RCP-resets (3+ inden for 30 s) i takt med festlys-
+  events, OTBR hard-hang lige efter et låst event — enkelt-resets ~1,8/t er
+  baggrund (B232). → ét fælles gitter for alle Thread-pærer på et absolut ur
+  (`custom_templates/festlys.jinja`, `input_number.festlys_thread_skrivninger`
+  pr. minut, default 8 ≈ 0,27 kommandoer/s), skriv kun når udseendet skifter.
   **Diagnose-trafik tæller også:** `meshdiag` spørger hver router over luften
   → Thread-kortets måle-interval er `input_number.thread_kort_maaling_minutter` (4 min fra 15/10; RCP-resets/t var ens ved 2 og 30 min).
 - **Entré-loftet + stue-spotsene er husets SKRØBELIGSTE Thread-led (user-spec

@@ -33,3 +33,8 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   `input_text.roborock_spejder_fase` (`<fase>:<epoch>:<script>:<profil>[:<seg-seg>]`).
   Dens rengørings-post genkendes på start ≈ epoch → tæller ALDRIG som rengøring.
   En ny segment-vej uden spejder-kaldet er en regression (`grep spejdertur_rum`).
+- **I SmartPlan (alle tre koder `smart_mode`) AFVISER robotten løse profil-
+  skrivninger** (`Error while calling SET_MOP_MODE`) — kun det atomiske
+  `set_clean_motor_mode` kommer ud. **Signatur: en kø/start der aborterer på
+  sin første select-skrivning lige efter en SmartPlan-tur.** → enhver
+  profil-vej kalder `script.roborock_forlad_smartplan` FØRST (`grep forlad_smartplan`).

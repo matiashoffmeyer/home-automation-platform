@@ -93,8 +93,8 @@ Search keywords: `stue, open_plan`
 
 ### `binary_sensor.*`
 
-- `binary_sensor.dark_mode_stue` — 19 refs in 7 file(s)
-- `binary_sensor.filmmoerke_stue` — 15 refs in 9 file(s)
+- `binary_sensor.dark_mode_stue` — 20 refs in 8 file(s)
+- `binary_sensor.filmmoerke_stue` — 16 refs in 10 file(s)
 - `binary_sensor.godnat_spisestue_sol_under_graense` — 1 refs in 1 file(s)
 - `binary_sensor.mood_pause_stue` — 15 refs in 7 file(s)
 - `binary_sensor.open_plan_empty_for_20m` — 4 refs in 3 file(s)
@@ -112,7 +112,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.spisestue_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_frossen_ghost` — 2 refs in 2 file(s)
 - `binary_sensor.spisestue_apollo_occupancy` — 29 refs in 19 file(s)
-- `binary_sensor.spisestue_apollo_occupancy_filtered` — 111 refs in 39 file(s)
+- `binary_sensor.spisestue_apollo_occupancy_filtered` — 112 refs in 40 file(s)
 - `binary_sensor.spisestue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_radar_moving_target` — 12 refs in 11 file(s)
 - `binary_sensor.spisestue_apollo_radar_still_target` — 1 refs in 1 file(s)
@@ -128,7 +128,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.stue_apollo_bevaegelse_frisk` — 2 refs in 2 file(s)
 - `binary_sensor.stue_apollo_frossen_ghost` — 4 refs in 3 file(s)
 - `binary_sensor.stue_apollo_occupancy` — 24 refs in 16 file(s)
-- `binary_sensor.stue_apollo_occupancy_filtered` — 118 refs in 47 file(s)
+- `binary_sensor.stue_apollo_occupancy_filtered` — 119 refs in 48 file(s)
 - `binary_sensor.stue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.stue_apollo_radar_moving_target` — 10 refs in 9 file(s)
 - `binary_sensor.stue_apollo_radar_still_target` — 1 refs in 1 file(s)
@@ -140,7 +140,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.stue_lys_on_effektiv` — 4 refs in 3 file(s)
 - `binary_sensor.stue_manuel_lys_hold` — 4 refs in 2 file(s)
 - `binary_sensor.stue_mork_morgen` — 5 refs in 5 file(s)
-- `binary_sensor.stue_spots_ild_aktiv` — 8 refs in 2 file(s)
+- `binary_sensor.stue_spots_ild_aktiv` — 9 refs in 3 file(s)
 - `binary_sensor.stue_spots_ild_mulig` — 2 refs in 2 file(s)
 - `binary_sensor.stue_spots_ild_thread_pause` — 2 refs in 2 file(s)
 - `binary_sensor.stue_spots_spotify_aktiv` — 8 refs in 3 file(s)
@@ -306,12 +306,12 @@ Search keywords: `stue, open_plan`
 ### `light.*`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
-- `light.spisestue_loft` — 120 refs in 46 file(s)
-- `light.spisestue_pendel` — 135 refs in 38 file(s)
+- `light.spisestue_loft` — 121 refs in 47 file(s)
+- `light.spisestue_pendel` — 136 refs in 39 file(s)
 - `light.stue_all` — 24 refs in 13 file(s)
 - `light.stue_apollo_rgb_light` — 5 refs in 3 file(s)
 - `light.stue_hjoernelampe` — 53 refs in 26 file(s)
-- `light.stue_laesehygge` — 78 refs in 36 file(s)
+- `light.stue_laesehygge` — 81 refs in 37 file(s)
 - `light.stue_loft` — 2 refs in 2 file(s)
 - `light.stue_plug` — 73 refs in 27 file(s)
 - `light.stue_room` — 20 refs in 13 file(s)
