@@ -95,7 +95,6 @@ via `automation.godnat_boern_active_on_actions` i godnat_night.yaml. Se
 
 | Fil | Beskrivelse | Antal |
 |---|---|---|
-| **[backup_schedule.yaml](backup_schedule.yaml)** | Daglig backup.create_automatic kl 02:00 (F4 fix: modern API, opdaterer sensors). Retention 7 dage via UI config. | 1 |
 | **[battery_alerts.yaml](battery_alerts.yaml)** | <15% warning + <5% kritisk for alle Styrbar/Somrig/Vallhorn/Badring batterier. Mute'd i guest_mode + nat. | 2 |
 | **[device_health_check.yaml](device_health_check.yaml)** | HA start + dagligt 09:00 → tjek alle kendte entities er available. Notification ved degradation. | 1 |
 | **[zha_auto_config.yaml](zha_auto_config.yaml)** | Ved device-pair: anvend model-specifikke defaults via script.<model>_defaults. | 1 |

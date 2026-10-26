@@ -502,8 +502,9 @@ opdage. **Her står kun signatur → metode. Incident, måledata og fuld begrund
 
 **Tid, test og spor**
 
-18. **history/logbook-API'et svarer i UTC** — vi er UTC+2, så **læg 2 timer til**
-   i din parser, ikke i hovedet.
+18. **history/logbook-API'et svarer i UTC** — huset følger dansk tid (UTC+1
+   vinter, UTC+2 sommer) → konvertér med `ZoneInfo('Europe/Copenhagen')` i din
+   parser, aldrig en fast offset og aldrig i hovedet.
 8. **Midnats-vinduer:** `today_at()` efter kl. 00 peger på NÆSTE vindue → shift
    86400 bagud når "i nat" skal betyde den igangværende nat.
 5. **"Live sat via API"-skridt bliver glemt.** → Ny slider = **4** skridt SAMME

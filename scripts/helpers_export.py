@@ -168,6 +168,7 @@ RUNTIME_NUMBERS = {
     "sove_seng_personer",  # sove_seng_taeller.yaml: "RUNTIME-tællingen"
     "wakeup_fallback_udskyd_min",  # parent_b_alarm.yaml: "kun i nat", ryddes kl. 10
     "foedselsdag_sidste_skift_ts",  # foedselsdag_mood.yaml: epoch for sidste skift
+    "dyrespil_vol_foer",  # festlys_dyrespil.yaml: "RUNTIME" volumen før spillet, -1 = lukket
     "gardin_syd_antaget_pos",  # broadlink_gardiner.yaml: antaget RF-position
     "gardin_vest_antaget_pos",
     "gardin_spisestue_antaget_pos",

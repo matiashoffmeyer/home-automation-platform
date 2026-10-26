@@ -74,8 +74,9 @@ input_boolean:
     initial: true
 
 input_number:
-  # Tempo for dør-fanfaren. ÉN kilde: både hus-kaskaden og entré-spinnet
-  # skaleres af den, så de to grene ikke kan komme i utakt indbyrdes.
+  # Tempo for dør-fanfarens Zigbee-kaskade. Thread-pærerne (entré, stue-
+  # spots, badets KAJPLATS) følger IKKE tempoet siden 25/10 (B261): de skriver
+  # kun på deres plads i husets Thread-gitter (input_number.festlys_thread_skrivninger).
   # Skalering: ms mellem farveskift = 250 - tempo * 1.8
   #   tempo  25 →  205 ms (roligere end den gamle faste 180)
   #   tempo  50 →  160 ms
@@ -342,6 +343,10 @@ script:
       # to grene der skriver farver til samme pære ville slås om den. Den
       # filtreres derfor eksplicit ud af roster-halen — den ligger i rosteret
       # siden 2026-08-21, så uden filteret ville den snige sig med.
+      #
+      # 2026-10-25 (B261, user valgte "b"): INGEN Matter-pære i kaskaden —
+      # stue-spotsene og badets KAJPLATS fik ~8 farvede kald/s i bølgerne. De
+      # skriver nu kun på deres plads i husets Thread-gitter (`thread_plan`).
       bulbs: >-
         {% set roster = state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] %}
         {% set spatial = ['light.spisestue_loft', 'light.stue_hjoernelampe',
@@ -356,6 +361,7 @@ script:
         {% endfor %}
         {% for e in roster %}
           {% if e not in spatial and e != 'light.entre_loft'
+                and e not in integration_entities('matter')
                 and states(e) not in ['unavailable', 'unknown'] %}
             {% set ns.b = ns.b + [e] %}
           {% endif %}
@@ -371,25 +377,10 @@ script:
       # --- Tempo (ÉN kilde for begge grene, så de ikke kan komme i utakt) ---
       tempo: "{{ states('input_number.fest_ankomst_tempo') | float(75) }}"
       step_ms: "{{ (250 - tempo * 1.8) | round(0) | int }}"
-      # Entréen kører kortere skridt end huset: den er gæstens første indtryk,
-      # og den sidder på Thread/Matter — en anden radio end husets Zigbee-pærer
-      # — så dens kald slås ikke med kaskaden om samme sendetid.
-      #
-      # MÅLT 2026-08-21f på en live fanfare. Antagelsen HOLDER: entréen nåede
-      # alle 14 toner mens huset kørte sine bølger, så Thread deler ikke
-      # sendetid med Zigbee.
-      #
-      # Men målingen væltede en ANDEN antagelse: `delay` er ikke showets tempo.
-      # Selve service-kaldet koster mere end skridtet — Zigbee ~160 ms målt inde
-      # i sekvensen (isoleret: spisestue 140, køkken 179, depot 283), Thread
-      # ~200 ms (isoleret 137). Ved default-tempo er step_ms 115 ms, altså UNDER
-      # kald-prisen: skruer man tempo-slideren i top, bliver showet knap nok
-      # hurtigere, for radioen sætter gulvet. Derfor udledes varigheden nedenfor
-      # af kald-prisen PLUS skridtet — regnede vi kun på skridtet, ville et
-      # "5 sekunders show" i praksis køre næsten dobbelt så længe.
+      # Selve service-kaldet koster mere end skridtet (målt 2026-08-21f inde i
+      # sekvensen: Zigbee ~160 ms; isoleret spisestue 140, køkken 179, depot
+      # 283), så varigheden nedenfor udledes af kald-prisen PLUS skridtet.
       call_ms: 160
-      entre_call_ms: 200
-      entre_step_ms: "{{ [ (step_ms * 0.7) | round(0) | int, 100 ] | max }}"
       # ALLE farveskift i fanfaren er transition: 0 = hårde snap. Indtil
       # 2026-08-21f fadede huset over 1,6 × skridtet, altså LÆNGERE end skridtet
       # selv — så to nabo-toner overlappede permanent, og showet læstes som et
@@ -417,9 +408,33 @@ script:
       # 1,6 s længere end huset, så festen genoptog i to ryk.
       total_ms: >-
         {{ (boelger | int) * (bulbs | count) * ((step_ms | int) + (call_ms | int)) }}
-      entre_steps: >-
-        {{ [ ((total_ms | int) / ((entre_step_ms | int) + (entre_call_ms | int)))
-             | round(0) | int, 6 ] | max }}
+      # Thread-pærerne (entré + Matter-halen af rosteret) på husets fælles gitter
+      # (custom_templates/festlys.jinja, B260): én farvet skrivning på hver
+      # plads der falder inden for showet — ved 8/min er det højst én pr. pære,
+      # og som regel kun ÉN i alt. Før (B261) sendte entréen ~14 farvede toner
+      # på ~5 s (≈ 5 kommandoer/s) — 10× over trappe-testens rene trin, og
+      # præcis det tempo der fældede OTBR'en 25/10. Lander pladsen efter
+      # showet, tager festlyset pæren på sin egen plads bagefter. Elementer:
+      # [unix-tid, pære]; tonerne deles ud i tids-rækkefølge (gyldne vinkel).
+      thread_plan: >-
+        {% from 'festlys.jinja' import thread_naeste %}
+        {% set roster = state_attr('sensor.dance_active_bulbs', 'entity_ids') or [] %}
+        {% set t0 = now().timestamp() %}
+        {% set slut = t0 + (total_ms | int) / 1000 %}
+        {% set ns = namespace(p=[]) %}
+        {% for e in roster | select('in', integration_entities('matter')) %}
+          {% if states(e) not in ['unavailable', 'unknown']
+                and (e != 'light.entre_loft' or entre_klar) %}
+            {% set t = namespace(v=thread_naeste(e, t0) | float(0)) %}
+            {% for i in range(4) %}
+              {% if 0 < t.v <= slut %}
+                {% set ns.p = ns.p + [[t.v, e]] %}
+                {% set t.v = thread_naeste(e, t.v + 0.5) | float(0) %}
+              {% endif %}
+            {% endfor %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.p | sort }}
     sequence:
       # Park festens per-pære-loops. De venter i wait_template med 15 s timeout
       # og continue_on_timeout, så selv hvis dette script dør midtvejs, kommer
@@ -428,14 +443,15 @@ script:
         target:
           entity_id: input_boolean.dance_strobe_active
 
-      # Terrasse-blink, hus-kaskade og entré-spin skal ske SAMTIDIG — det er ét
-      # varsel, ikke tre. Kald-budget: HA klarer ~5-10 light-kald/sek på Zigbee,
-      # og terrasse+hus lå ALLEREDE på ~10/sek i de 1,5 s de overlapper. Derfor
-      # kan tempo-slideren ikke bare skrue huset hurtigere uden at ramme loftet
-      # (og et design over loftet fejler TAVST — det kører bare langsommere).
-      # Entréen er den frie bane: Matter/Thread er en anden radio end Zigbee, så
-      # dens kald konkurrerer ikke med de andre to grene om sendetid. Det er
-      # dér "meget hurtigere" faktisk kan hentes.
+      # Terrasse-blink, hus-kaskade og Thread-gitteret skal ske SAMTIDIG — det
+      # er ét varsel, ikke tre. Kald-budget: HA klarer ~5-10 light-kald/sek på
+      # Zigbee, og terrasse+hus lå ALLEREDE på ~10/sek i de 1,5 s de overlapper.
+      # Derfor kan tempo-slideren ikke bare skrue huset hurtigere uden at ramme
+      # loftet (og et design over loftet fejler TAVST — det kører bare
+      # langsommere). Thread var engang "den frie bane" (en anden radio end
+      # Zigbee) — det holdt for sendetiden, men ikke for donglens RCP, der går
+      # ned ved ~1 kald/s (B260/B261). Thread-pærerne har derfor intet tempo
+      # her, kun deres plads i husets gitter.
       - parallel:
           # --- Terrassen: tre klare blink, så tilbage på fuld ---
           # if/then frem for en bar `condition:` — en fejlende condition inde i
@@ -567,45 +583,26 @@ script:
                               - delay:
                                   milliseconds: "{{ step_ms }}"
 
-          # --- Entréen: ankomst-pærens eget, hurtige regnbue-spin ---
-          # Egen gren, ikke en plads i hus-kaskaden: dér ville den kun få 3
-          # farveskift (én pr. bølge) og være den langsomste pære i huset —
-          # stik modsat pointen. Her får den `entre_steps` skift på samme
-          # varighed, altså mange gange flere toner på gæstens første pære.
-          #
-          # Skridtet på farvecirklen er 137,5° (den gyldne vinkel), ikke en
-          # jævn N-deling: to nabo-toner bliver derved altid maksimalt
-          # forskellige, uanset hvor mange skift der nås. En jævn deling ville
-          # ved høje step-tal give næsten ens naboer = et pulserende ensfarvet
-          # lys frem for en regnbue.
+          # --- Thread-pærerne: kun på deres plads i husets gitter (B261) ---
+          # Én sekvens over planen i tids-rækkefølge — ikke én parallel-gren pr.
+          # pære (parallel-grene deler variabel-scope). Hver skrivning er ét
+          # farvet kald = 2 kommandoer, og fuldt lys: gæsten mødes af lys, ikke
+          # af et dyk. Tom plan (Thread-pause, slider 0, ingen plads i vinduet)
+          # = grenen er færdig med det samme.
           - sequence:
-              - if:
-                  - condition: template
-                    value_template: "{{ entre_klar }}"
-                then:
-                  - repeat:
-                      count: "{{ entre_steps }}"
-                      sequence:
-                        - service: light.turn_on
-                          continue_on_error: true
-                          target:
-                            entity_id: light.entre_loft
-                          data:
-                            hs_color: >-
-                              {{ [ (((repeat.index - 1) * 137.5) % 360) | round(1),
-                                   100 ] }}
-                            # Hvert 3. skridt dykker — ikke hvert 2. Entréen
-                            # kører flere skridt end huset, og en 50/50-veksling
-                            # ville dér læses som et jævnt flimmer. To lyse mod
-                            # ét mørkt giver en tydelig PULS. Sidste skridt er
-                            # altid fuldt, så gæsten mødes af lys, ikke af et
-                            # dyk, når smooth-loopet overtager.
-                            brightness_pct: >-
-                              {{ 100 if (repeat.index == (entre_steps | int)
-                                         or repeat.index % 3 != 0) else dip_pct }}
-                            transition: 0
-                        - delay:
-                            milliseconds: "{{ entre_step_ms }}"
+              - repeat:
+                  for_each: "{{ thread_plan }}"
+                  sequence:
+                    - delay:
+                        seconds: "{{ [repeat.item[0] - now().timestamp(), 0] | max | round(2) }}"
+                    - service: light.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ repeat.item[1] }}"
+                      data:
+                        hs_color: "{{ [((repeat.index - 1) * 137.5) % 360, 100] }}"
+                        brightness_pct: 100
+                        transition: 0
 
       # Ingen sluk til sidst. Pærerne bliver stående i deres regnbue-tone, og
       # smooth-loopet driver videre DERFRA (det læser hs_color live) — så

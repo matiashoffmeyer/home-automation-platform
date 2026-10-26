@@ -18,6 +18,9 @@
 #     ikke køre to gange på en dag og heller ikke de samme lyde. det skal
 #     heller ikke være forudsigeligt fra dag til dag. det skal føles
 #     uprogrameret. og blinkene skal gå hurtigere. giv mig slider til det."
+#   · 25/10: "der må gerne komme de sjældne grønne glimt i halloween mood hvis
+#     lyset allerede er tændt. hurtige flicker. selv hvis det ikke er mørkt
+#     udenfor, fx hvis du kan se vi sidder og spiser (aktivitet) eller laver mad."
 #
 # DESIGN
 #   · Intet der tændes: kun pærer der ALLEREDE lyser, kun lysstyrken (og det
@@ -57,6 +60,17 @@
 #     Live-test 24/10: et glimt varer 0,9-4,2 s (median ~2,2), så 96 % gav ét
 #     glimt i minuttet et sted i huset → user valgte 99 % (≈ hvert 4. min).
 #   · Kun når solen står under input_number.halloween_stemning_sol_graense.
+#   · OM DAGEN (solen over grænsen, 25/10): kun et grønt flimmer (G: 2-4
+#     hurtige grønne pulser) i en tændt farve-pære i stue/spisestue, og kun
+#     mens sensor.activity_state er cooking/dining/social_dining (binary_sensor
+#     .halloween_stemning_dag_gron). Pausen trækkes eksponentielt med middel
+#     input_number.halloween_stemning_dag_groen_minutter (0 = fra), 1 min-4×
+#     middel. Målt 22-25/10: ~4 t/døgn sådan aktivitet i dagslys (80 skift/
+#     døgn) → 30 min ≈ 8 flimmer om dagen. Ingen lyd, ingen store glimt.
+#     Aktiviteten flimrer (p50 23 s), så løkken lever 10 min efter at gaten
+#     slap; planen kræver gaten LIVE. Skifter skumringen tilstand midt i en
+#     pause, starter en ny tilfældig 1-10 min-pause (#19: ellers et glimt i
+#     præcis det sekund solen passerer grænsen).
 #
 # HVEM ANDRE RØRER PÆRERNE (#1/#27):
 #   · Rummet skal være Auto, uden dark mode/filmmørke/Sofa Zen/stue-ild/putning;
@@ -142,6 +156,16 @@ input_number:
     step: 25
     unit_of_measurement: "%"
     mode: slider
+  # Middel-pausen mellem dagens grønne flimmer (stue/spisestue, kun mens I
+  # spiser eller laver mad). 0 = intet grønt om dagen.
+  halloween_stemning_dag_groen_minutter:
+    name: "Halloween-stemning: minutter mellem grønne glimt om dagen"
+    icon: mdi:flash-outline
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: min
+    mode: slider
   halloween_stemning_sol_graense:
     name: "Halloween-stemning: kun når solen er under"
     icon: mdi:weather-night
@@ -198,6 +222,23 @@ template:
              and not is_state('input_boolean.sleepover_i_nat', 'on')
              and not is_state('binary_sensor.festlys_aktiv', 'on')
              and not is_state('binary_sensor.scene_party_active', 'on') }}
+      # Dagens gate: kun det grønne flimmer, kun mens nogen spiser/laver mad.
+      # Spejler aktiv's gate med solen vendt + aktiviteten; ret begge sammen.
+      - name: "Halloween-stemning dag-grøn"
+        unique_id: halloween_stemning_dag_gron
+        icon: mdi:flash-outline
+        state: >-
+          {{ is_state('input_boolean.halloween_stemning', 'on')
+             and (state_attr('sun.sun', 'elevation') | float(-90))
+                 >= (states('input_number.halloween_stemning_sol_graense') | float(-6))
+             and (states('input_number.halloween_stemning_dag_groen_minutter') | float(0)) > 0
+             and states('sensor.activity_state') in ['cooking', 'dining', 'social_dining']
+             and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+             and not is_state('input_select.house_state', 'Dormant')
+             and not is_state('binary_sensor.godnat_common_active', 'on')
+             and not is_state('input_boolean.sleepover_i_nat', 'on')
+             and not is_state('binary_sensor.festlys_aktiv', 'on')
+             and not is_state('binary_sensor.scene_party_active', 'on') }}
 
 automation:
   - id: halloween_stemning_start
@@ -205,7 +246,9 @@ automation:
     mode: single
     trigger:
       - platform: state
-        entity_id: binary_sensor.halloween_stemning_aktiv
+        entity_id:
+          - binary_sensor.halloween_stemning_aktiv
+          - binary_sensor.halloween_stemning_dag_gron
         from: "off"
         to: "on"
       # En restart dræber løkkerne; /5-backstoppen fanger et script.reload.
@@ -215,9 +258,14 @@ automation:
       - platform: time_pattern
         minutes: "/5"
     condition:
-      - condition: state
-        entity_id: binary_sensor.halloween_stemning_aktiv
-        state: "on"
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: binary_sensor.halloween_stemning_aktiv
+            state: "on"
+          - condition: state
+            entity_id: binary_sensor.halloween_stemning_dag_gron
+            state: "on"
     action:
       - if:
           - condition: trigger
@@ -233,7 +281,11 @@ automation:
           - service: script.turn_on
             target:
               entity_id: script.halloween_stemning_loekke
+      # Lyd kun i mørket (dagens gate er kun det grønne flimmer).
       - if:
+          - condition: state
+            entity_id: binary_sensor.halloween_stemning_aktiv
+            state: "on"
           - condition: state
             entity_id: script.halloween_stemning_lyde
             state: "off"
@@ -316,7 +368,9 @@ script:
   # ---------------------------------------------------------------------------
   # Glimt-løkken: glimt → pause → glimt … så længe gaten er on. Pausen regnes
   # af glimtets NOMINELLE varighed (tempo 100 %), så blink-tempoet ikke ændrer
-  # hvor tit det sker — kun hvor hurtigt det går.
+  # hvor tit det sker — kun hvor hurtigt det går. Om dagen (dag-grøn) kun det
+  # grønne flimmer med sin egen middel-pause; løkken lever 10 min efter at
+  # dag-gaten slap, så aktivitetens flimmer (p50 23 s) ikke genstarter den.
   # ---------------------------------------------------------------------------
   halloween_stemning_loekke:
     alias: "Halloween-stemning: glimt-løkken"
@@ -325,15 +379,19 @@ script:
     max_exceeded: silent
     sequence:
       # Første glimt kommer ikke i samme minut som man tænder.
-      - wait_template: "{{ is_state('binary_sensor.halloween_stemning_aktiv', 'off') }}"
+      - wait_template: "{{ is_state('input_boolean.halloween_stemning', 'off') }}"
         timeout:
           seconds: "{{ range(60, 601) | random }}"
         continue_on_timeout: true
       - repeat:
           while:
-            - condition: state
-              entity_id: binary_sensor.halloween_stemning_aktiv
-              state: "on"
+            - condition: template
+              value_template: >-
+                {% set d = states['binary_sensor.halloween_stemning_dag_gron'] %}
+                {{ is_state('binary_sensor.halloween_stemning_aktiv', 'on')
+                   or (d is not none and d.state == 'on')
+                   or (d is not none and is_state('input_boolean.halloween_stemning', 'on')
+                       and (now() - d.last_changed).total_seconds() < 600) }}
           sequence:
             - service: script.halloween_stemning_glimt
               continue_on_error: true
@@ -345,18 +403,38 @@ script:
                   {% set h = (states('input_text.halloween_stemning_dag') ~ '').split('|') %}
                   {{ [0.5, (h[3] | int(10) if h | count == 6 else 10) / 10] | max }}
                 # Intet glimt (ingen tændt pære i et Auto-rum) → kig igen om 2 min.
+                # Dagens grønne flimmer (G): egen middel, samme klumpning.
                 pause: >-
                   {% set r = svar if svar is defined and svar is mapping else {} %}
                   {% if not r.ok | default(false) %}120
+                  {% elif r.slags | default('') == 'G' %}
+                    {% set m = states('input_number.halloween_stemning_dag_groen_minutter') | float(30) * 60 %}
+                    {% set klump = 2.2 if (range(100) | random) < 25 else 0.6 %}
+                    {{ [60, [m * 4, m * klump * -(u | log)] | min] | max | round(1) }}
                   {% else %}
                     {% set d = [1.5, (r.nominel | float(0)) / 1000] | max %}
                     {% set klump = 2.2 if (range(100) | random) < 25 else 0.6 %}
                     {{ [15, [2700, d * p / (100 - p) / humoer * klump * -(u | log)] | min] | max | round(1) }}
                   {% endif %}
-            - wait_template: "{{ is_state('binary_sensor.halloween_stemning_aktiv', 'off') }}"
+                nat: "{{ states('binary_sensor.halloween_stemning_aktiv') }}"
+            # Afbrydes når mørke-tilstanden skifter (skumring, godnat, fest) —
+            # ikke af dag-gaten, der flimrer med aktiviteten.
+            - wait_template: >-
+                {{ states('binary_sensor.halloween_stemning_aktiv') != nat
+                   or is_state('input_boolean.halloween_stemning', 'off') }}
               timeout:
                 seconds: "{{ pause | float(120) }}"
               continue_on_timeout: true
+            # Skiftet tilstand → ny tilfældig start-pause, ikke et glimt i
+            # samme sekund som skiftet (#19).
+            - if:
+                - condition: template
+                  value_template: "{{ wait.completed and is_state('input_boolean.halloween_stemning', 'on') }}"
+              then:
+                - wait_template: "{{ is_state('input_boolean.halloween_stemning', 'off') }}"
+                  timeout:
+                    seconds: "{{ range(60, 601) | random }}"
+                  continue_on_timeout: true
 
   # ---------------------------------------------------------------------------
   # Ét glimt: dagens profil → vælg slags og pære/rum (ingen gentagelse samme
@@ -372,13 +450,17 @@ script:
       # Rækkefølgen ER id'erne i input_text.halloween_stemning_brugt (rum-tegn
       # = rummets plads, pære-tegn = pladsen i den samlede pære-liste) — tilføj
       # nyt sidst.
+      # dag: true = med i dagens grønne flimmer (åbent køkken/spisestue/stue,
+      # dér hvor man spiser og laver mad).
       rum_liste:
         - mode: stue
+          dag: true
           # Kun læsehyggen: sofa-lamperne og hjørnelampen er pærer i et skab (B132).
           lys: [light.stue_laesehygge]
           blok: [binary_sensor.dark_mode_stue, binary_sensor.filmmoerke_stue, binary_sensor.sofa_zen_holder_sofa, binary_sensor.stue_spots_ild_aktiv]
           occ: binary_sensor.stue_apollo_occupancy_filtered
         - mode: spisestue
+          dag: true
           lys: [light.spisestue_loft]
           blok: []
           occ: binary_sensor.spisestue_apollo_occupancy_filtered
@@ -406,6 +488,7 @@ script:
         - automation.vejr_varsel_aften_blink_push_for_nattens_vejr_16_30_17_00_18_30
         - automation.legetojsdag_disko_varsel_forste_abne_fredag_i_maneden_efter_vejrvarsler
         - automation.pre_dark_daemp_gardiner_ned_ved_afspilning
+        - automation.dyrespil_3_blink_i_hele_lejligheden
     sequence:
       - variables:
           dag: "{{ (now() - timedelta(hours=12)).date() | string }}"
@@ -429,7 +512,10 @@ script:
       - variables:
           plan: >-
             {% from 'halloween.jinja' import glimt %}
-            {% set fri = is_state('binary_sensor.halloween_stemning_aktiv', 'on')
+            {# Om dagen (dag-grøn, live): kun G i rum med dag: true, aldrig store. #}
+            {% set nat = is_state('binary_sensor.halloween_stemning_aktiv', 'on') %}
+            {% set dagtid = not nat and is_state('binary_sensor.halloween_stemning_dag_gron', 'on') %}
+            {% set fri = (nat or dagtid)
                          and is_state('script.entre_ned_sluk_alt', 'off')
                          and (laanere | map('state_attr', 'current') | map('int', 0) | sum) == 0 %}
             {% set sc = states('input_select.active_scene') %}
@@ -453,7 +539,7 @@ script:
                små ubrugte, og små i alt (når hvert par er brugt). Aldrig samme
                slags som sidst. #}
             {% set ns = namespace(stor=[], ny=[], alt=[]) %}
-            {% for r in rum_liste if fri %}
+            {% for r in rum_liste if fri and (nat or r.dag | default(false)) %}
               {% set ri = loop.index0 %}
               {% if is_state('input_select.room_mode_' ~ r.mode, 'Auto')
                     and r.blok | select('is_state', 'on') | list | count == 0 %}
@@ -475,14 +561,15 @@ script:
                 {% endfor %}
                 {% set n = nl.l | count %}
                 {% set rw = (4 if is_state(r.occ, 'on') else 1) * rf[ri] | default(2) %}
-                {% for L in 'FUKBPLW' if n > 0 and L != sidst[:1] and L not in brugte_store and (L != 'K' or n >= 2) %}
+                {% for L in 'FUKBPLW' if nat and n > 0 and L != sidst[:1] and L not in brugte_store and (L != 'K' or n >= 2) %}
                   {% set ns.stor = ns.stor + [[rw, r.mode, nl.l, L, L ~ tegn[ri]]] %}
                 {% endfor %}
                 {% for l in nl.l %}
                   {% set lt = tegn[alle.index(l)] %}
-                  {% for L in 'khdsxvg' %}
-                    {% if L != sidst[:1] and (L != 'g' or l in nl.f) %}
-                      {% set w = [1, (sw[loop.index0] * rw * (3 if l == fejl else 1) / n) | round(0) | int] | max %}
+                  {# Dagens G har kun sig selv → undtaget "aldrig samme slags i træk". #}
+                  {% for L in ('khdsxvg' if nat else 'G') %}
+                    {% if (L != sidst[:1] or not nat) and (L not in 'gG' or l in nl.f) %}
+                      {% set w = [1, ((sw[loop.index0] if nat else 10) * rw * (3 if l == fejl else 1) / n) | round(0) | int] | max %}
                       {% set ns.alt = ns.alt + [[w, r.mode, [l], L, L ~ lt]] %}
                       {% if (L ~ lt) not in nb.l %}{% set ns.ny = ns.ny + [[w, r.mode, [l], L, L ~ lt]] %}{% endif %}
                     {% endif %}
@@ -774,6 +861,7 @@ script:
                      or is_state('script.hoejttaler_annoncer', 'on')
                      or is_state('script.hoejttaler_vejr_oplaesning', 'on')
                      or is_state('script.hoejttaler_spil_sang', 'on')
+                     or is_state('script.dyrespil_afspil', 'on')
                      or is_state('binary_sensor.godnat_common_active', 'on')
                      or is_state('input_boolean.godnat_boern_active', 'on')
                      or is_state('input_boolean.sleepover_i_nat', 'on') }}

@@ -506,37 +506,64 @@ script:
             {% set raw = bulbs | default([]) %}
             {{ ([raw] if raw is string else raw)
                | reject('is_state', 'unavailable') | reject('is_state', 'unknown') | list }}
-          # [pærer der hører til tænd-vejen, tænd-automation, presence-kanal]
+          # [pærer der hører til tænd-vejen, tænd-automation, presence-kanaler,
+          #  hold i sekunder efter at en kanal blev tom (0 = kun "on" lige nu)]
+          # 2026-10-25 (user: "stue la.pen er slukket nu igen. fejl. ret"):
+          # læselampen gik ud ved begge fest-slut 07:08/07:17 og kom aldrig
+          # tilbage. To fejl i sofa-vejen: (1) kun stue-radaren blev spurgt,
+          # men zonen holdes også af køkkenet hele dagen og entréen 04-12 —
+          # nu SAMME hold-regel som presence_light_sofa_off (presence_stue.yaml,
+          # #2: ret begge); stue-radaren var tom fra 07:14, køkkenet optaget.
+          # (2) listen var kopieret i hånden uden hyggelampe-pluggen (#16), så
+          # en plug brugeren selv havde tændt (Styrbar 06:37) blev stående, og
+          # tænd-vejens "HELE sofa-zonen slukket" afviste genoptændingen.
+          # Nu rosteret, og hele vejens zone slukkes før den spørges igen (#27).
           veje: >-
+            {% from 'rosters.jinja' import stue_sofa_lys %}
+            {% set familie = states('input_select.house_mode') in ['Normal', 'Home Vacation']
+                             and is_state('binary_sensor.godnat_common_active', 'off') %}
             {{ [
               [['light.spisestue_loft'],
                'automation.lysnet_stue_taend',
-               'binary_sensor.spisestue_apollo_occupancy_filtered'],
-              [['light.stue_sofa_lampe', 'light.stue_sofa_lampe_2', 'light.stue_hjoernelampe',
-                'light.stue_laesehygge', 'light.stue_spot_1', 'light.stue_spot_2'],
+               ['binary_sensor.spisestue_apollo_occupancy_filtered'], 0],
+              [stue_sofa_lys + ['light.stue_spot_1', 'light.stue_spot_2'],
                'automation.lysnet_sofa_stue_taend',
-               'binary_sensor.stue_apollo_occupancy_filtered'],
+               ['binary_sensor.stue_apollo_occupancy_filtered']
+               + ((['binary_sensor.koekken_apollo_occupancy_filtered']
+                   + (['binary_sensor.entre_valhorn_occupancy'] if 4 <= now().hour < 12 else []))
+                  if familie else []),
+               states('sensor.sofa_stue_off_sekunder') | int(1200)],
               [['light.koekken_lyskaede'],
                'automation.lysnet_kokken_taend',
-               'binary_sensor.koekken_apollo_occupancy_filtered'],
+               ['binary_sensor.koekken_apollo_occupancy_filtered'], 0],
               [['light.entre_loft'],
                'automation.entre_lys_taend_ved_bevaegelse',
-               'binary_sensor.entre_valhorn_occupancy']
+               ['binary_sensor.entre_valhorn_occupancy'], 0]
             ] }}
           genoptaend: >-
             {% set ns = namespace(a=[], p=[]) %}
             {% for v in veje %}
-              {% if (v[0] | select('in', b) | list | count > 0) and is_state(v[2], 'on') %}
+              {% set h = namespace(optaget=false) %}
+              {% for s in expand(v[2]) %}
+                {% if s.state == 'on'
+                      or (s.state == 'off' and (now() - s.last_changed).total_seconds() < v[3] | float(0)) %}
+                  {% set h.optaget = true %}
+                {% endif %}
+              {% endfor %}
+              {% if (v[0] | select('in', b) | list | count > 0) and h.optaget %}
                 {% set ns.a = ns.a + [v[1]] %}
                 {% set ns.p = ns.p + v[0] %}
               {% endif %}
             {% endfor %}
             {{ {'automations': ns.a, 'paerer': ns.p} }}
+          # Festens pærer + resten af de zoner der skal tændes igen (pluggen).
+          slukkes: >-
+            {{ (b + (genoptaend.paerer | select('is_state', 'on') | list)) | unique | list }}
       - condition: template
         value_template: "{{ b | count > 0 and is_state('input_select.active_scene', 'none') }}"
       - service: light.turn_off
         continue_on_error: true
-        target: {entity_id: "{{ b }}"}
+        target: {entity_id: "{{ slukkes }}"}
         data: {transition: 1}
       # Tænd-automationerne kræver at deres lys er SLUKKET (de er tænd-veje,
       # ikke justér-veje) og tjekker det igen efter 500 ms. 2 s dækker den 1 s

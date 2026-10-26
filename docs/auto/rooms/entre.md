@@ -65,7 +65,7 @@ Search keywords: `entre`
 - `binary_sensor.entre_morgen_passager_nok` — 1 refs in 1 file(s)
 - `binary_sensor.entre_roegalarm` — 2 refs in 2 file(s)
 - `binary_sensor.entre_stedfortraeder_bevaegelse` — 6 refs in 2 file(s)
-- `binary_sensor.entre_valhorn_occupancy` — 105 refs in 47 file(s)
+- `binary_sensor.entre_valhorn_occupancy` — 106 refs in 47 file(s)
 - `binary_sensor.entre_vallhorn_haengt` — 6 refs in 3 file(s)
 
 ### `button.*`
@@ -119,7 +119,7 @@ Search keywords: `entre`
 ### `light.*`
 
 - `light.entre_all` — 11 refs in 6 file(s)
-- `light.entre_loft` — 80 refs in 34 file(s)
+- `light.entre_loft` — 82 refs in 34 file(s)
 - `light.entre_loft_tradfri_udgaaet` — 1 refs in 1 file(s)
 
 ### `scene.*`

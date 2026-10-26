@@ -1,0 +1,547 @@
+# =============================================================================
+# Dyrespil — hest mod flodhest på Festlys-siden (bygget 2026-10-25, B264)
+# =============================================================================
+# User-spec 2026-10-25: "to knapper på festlys siden, en der afspiller lyden
+# af en flodhest og en anden knap der afspiller lyden af en hest. det
+# overruler alle andre lyde. kommer til at bruge den meget sjældent … max 5
+# sek. lydstyrke 70%." + "efter lyden skal der komme et tal der går opad
+# læst højt … hestelyden og så 'One point' og næste gang hestelyd og '2
+# points'. og så skal jeg ha reset knapper til counteren og en plus og en
+# minus knap til hver lyd til at justere point manuelt og lydløst hvis der
+# sker fejl. det er et spil." + "heste lyden skal også give 3 røde blink i
+# hele lejligheden og flodheste lyden skal give 3 blå blink" + "en vinder lyd
+# mest hest/eller flodhest lyd før og efter når et hold har vundet, så en knap
+# til at trigge det."
+#
+# LYDENE (www/dyrespil/, valgt af user efter en afspilning 25/10 08:54; kilder
+# og licenser i www/dyrespil/KILDER.md, alle CC0): klippet til ≤ 5 s,
+# loudnorm -14 LUFS (samme oplevede styrke), mono 44,1 kHz 128 kbps — og 5 s
+# STILHED bagi: Volumio starter en "webradio"-fil FORFRA når den er slut
+# (samme fælde som tts_url.py's stilhed, 13/10), så næste afspilning skal
+# lande i stilheden. `sek` herunder er lydens længde UDEN stilheden (ffprobe).
+#
+# OVERRULER AL ANDEN LYD (user-spec): ingen godnat-/AirBnB-/"der spiller
+# noget"-gate — det er et fingertryk. Kørende lyd-scripts stoppes FØR første
+# lyd (ellers fader et halloween-klip eller morgenradioen volumen ned midt i
+# hesten), MA-køen stoppes hvis HA's Music Assistant spillede, og mens spillet
+# spiller, springer beskeder, sange/klip og halloween-lyd-løkken over
+# (script.dyrespil_afspil står i deres optaget-tjek). Musik der blev afbrudt,
+# genoptages IKKE (husets regel siden B233: "genoptag" startede P4 i stedet
+# for Spotify) — volumen sættes tilbage.
+#
+# BLINKET kører i en AUTOMATION, ikke i scriptet: et dashboard-tryk bærer
+# brugerens user_id i sin context, og hvert light.turn_on i et script startet
+# derfra ville ligne en app-justering → automations/manual_override.yaml
+# satte rummene i Manual i 3 t (fejlklasse #11). En automation trigget af et
+# event får sin egen context uden user_id (parent_id = scriptets).
+#   · KUN Zigbee-/andre farvepærer — Thread-pærerne (Matter) blinker ikke med:
+#     Thread-donglens RCP går ned ved ~1 Matter-kald/s (B260, faldt 25/10
+#     06:21), og 3 blink × 6 pærer + restore er ~50 kald på 3 s, pr. point.
+#   · Hvide pærer kan ikke blive røde/blå → med som i røgalarmens røde blink:
+#     kun pærer med en farve-mode.
+#   · Børneværelset blinker ikke under børnenes putning eller fælles godnat.
+#   · Køkken-lyskæden har ejerskabs-register: blinket er kravet `dyrespil`
+#     (ejerskab/koekken_lyskaede.yaml), og afleveringen maler husets mål —
+#     derfor er kæden IKKE med i restore-snapshottet (#27).
+#   · Snapshot + restore af resten (scene.dyrespil_restore). Halloween-
+#     stemningens glimt ventes ud først som vejr-blinkene (≤ 15 s), og
+#     stemningen holder sig væk mens blinket kører (dens `laanere`).
+#   · Festlys kører → dens per-pære-loops parkeres (dance_strobe_active, som
+#     gæste-fanfaren) og slippes efter restoren.
+#   · Én løkke pr. pære på et fælles ur (script.dyrespil_paere_blink): et
+#     gruppe-kald pr. frame ventede på den langsomste pære (25/10: ~12 s
+#     forsinket blink). Stue-spotsenes følge-automation holder pause mens
+#     blinket kører (packages/stue_spots.yaml) — ellers trak læselampen dem med.
+#   · mode: restart — det seneste tryk vinder (se SENESTE OVERRULER). Et
+#     afbrudt blink har allerede taget snapshottet af lyset FØR blinket; det
+#     nye genbruger det i stedet for at snapshotte det røde (#27).
+#
+# SENESTE OVERRULER (user-spec 25/10 09:20: "hvis jeg trykker på et dyr mens
+# det andet spiller skal det seneste overrule og point skal virke"): lyd og
+# blink kører i mode: restart. Pointet tælles i tryk-øjeblikket i
+# script.dyrespil_point, så et afbrudt dyr har allerede fået sit point; det
+# nye dyr læser SIT tal op. HA starter den nye kørsel FØR den stopper den
+# gamle og skriver ikke `current` imellem (helpers/script.py, update_state=
+# False) → køkken-kravet blinker ikke over i 'hus' midt i et skift.
+# Volumen før spillet bor i input_number.dyrespil_vol_foer (-1 = intet spil
+# åbent), fordi en afbrudt kørsels variabler dør med den.
+#
+# POINT: counter.dyrespil_hest / counter.dyrespil_flodhest (restore over
+# restart; −/+ er tile-features på Festlys-siden, nulstil en knap med
+# bekræftelse — helt lydløse).
+# =============================================================================
+
+counter:
+  dyrespil_hest:
+    name: "Hest"
+    icon: mdi:horse-variant
+    initial: 0
+    step: 1
+    minimum: 0
+  dyrespil_flodhest:
+    name: "Flodhest"
+    icon: mdi:paw
+    initial: 0
+    step: 1
+    minimum: 0
+
+input_number:
+  # User-spec 25/10: "lydstyrke 70%". Gælder dyrelydene, fanfaren og point-
+  # oplæsningen; volumen før spillet sættes tilbage bagefter.
+  dyrespil_volumen:
+    name: "Dyrespil: lydstyrke"
+    icon: mdi:volume-high
+    min: 10
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+  # RUNTIME (helpers_export.py RUNTIME_NUMBERS): højttalerens volumen før
+  # spillet, sat ved spillets første lyd, -1 når den er givet tilbage.
+  dyrespil_vol_foer:
+    name: "Dyrespil: volumen før spillet"
+    icon: mdi:volume-source
+    min: -1
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+
+script:
+  # Knappen. mode: parallel — hvert tryk tæller med det samme; lyden
+  # (script.dyrespil_afspil, mode: restart) afbryder den der spiller.
+  dyrespil_point:
+    alias: "Dyrespil: point til et hold (lyd + oplæsning + blink)"
+    icon: mdi:horse-variant
+    mode: parallel
+    max: 10
+    fields:
+      dyr:
+        description: "hest eller flodhest"
+        required: true
+        example: hest
+    sequence:
+      - variables:
+          d: "{{ dyr | default('') | string | trim }}"
+      - condition: template
+        value_template: "{{ d in ['hest', 'flodhest'] }}"
+      - service: counter.increment
+        target:
+          entity_id: "counter.dyrespil_{{ d }}"
+      - service: script.turn_on
+        target:
+          entity_id: script.dyrespil_afspil
+        data:
+          variables:
+            dyr: "{{ d }}"
+            point: "{{ states('counter.dyrespil_' ~ d) | int(0) }}"
+
+  # Vinder-knappen: førerens dyr → fanfare → førerens dyr. Uafgjort: begge.
+  dyrespil_vinder:
+    alias: "Dyrespil: vinderen (dyr, fanfare, dyr)"
+    icon: mdi:trophy
+    mode: parallel
+    max: 3
+    sequence:
+      - variables:
+          h: "{{ states('counter.dyrespil_hest') | int(0) }}"
+          f: "{{ states('counter.dyrespil_flodhest') | int(0) }}"
+      - service: script.turn_on
+        target:
+          entity_id: script.dyrespil_afspil
+        data:
+          variables:
+            dyr: vinder
+            vinder: "{{ 'hest' if h > f else ('flodhest' if f > h else 'uafgjort') }}"
+
+  dyrespil_afspil:
+    alias: "Dyrespil: afspil (overruler al anden lyd)"
+    icon: mdi:speaker
+    mode: restart
+    fields:
+      dyr:
+        description: "hest, flodhest eller vinder"
+        required: true
+        example: hest
+      point:
+        description: "Tallet der læses op efter lyden (hest/flodhest)"
+        example: 3
+      vinder:
+        description: "Ved dyr: vinder — hest, flodhest eller uafgjort"
+        example: hest
+    sequence:
+      - variables:
+          d: "{{ dyr | default('') | string | trim }}"
+          p: "{{ point | default(0) | int(0) }}"
+          # Højttaleren henter filerne over LAN'et (internal_url, som tts_url.py).
+          base: "http://192.0.2.151:8123/local/dyrespil/"
+          lyde:
+            hest: {fil: hest.mp3, sek: 4.0, hue: 0}
+            flodhest: {fil: flodhest.mp3, sek: 5.0, hue: 240}
+            vinder: {fil: vinder.mp3, sek: 4.4, hue: -1}
+          raekke: >-
+            {% set v = vinder | default('uafgjort', true) | string | trim %}
+            {% if d in ['hest', 'flodhest'] %}{{ [d] }}
+            {% elif d == 'vinder' and v in ['hest', 'flodhest'] %}{{ [v, 'vinder', v] }}
+            {% elif d == 'vinder' %}{{ ['flodhest', 'vinder', 'hest'] }}
+            {% else %}{{ [] }}{% endif %}
+          tekst: >-
+            {% if d in ['hest', 'flodhest'] %}{{ 'One point' if p == 1 else p ~ ' points' }}{% endif %}
+          lyd: >-
+            {{ states('media_player.hoejttaler') not in ['unavailable', 'unknown']
+               and is_state('binary_sensor.hoejttaler_online', 'on') }}
+          # Lyd-scripts der ellers skruer på volumen eller spiller oven i.
+          andre: >-
+            {{ ['script.hoejttaler_annoncer', 'script.hoejttaler_vejr_oplaesning',
+                'script.hoejttaler_spil_sang', 'script.hoejttaler_radio',
+                'script.hoejttaler_morgenradio_fade']
+               | select('is_state', 'on') | list }}
+          ma_spillede: >-
+            {{ is_state('script.hoejttaler_spil_sang', 'on')
+               or state_attr('sensor.hoejttaler_spotify', 'kilde') == 'ha' }}
+          vol_foer: "{{ state_attr('media_player.hoejttaler', 'volume_level') | float(-1) }}"
+          gemt: "{{ states('input_number.dyrespil_vol_foer') | float(-1) }}"
+          vol: "{{ ([[states('input_number.dyrespil_volumen') | float(70), 5] | max, 100] | min) / 100 }}"
+      - condition: template
+        value_template: "{{ raekke | count > 0 }}"
+      # Højttaleren væk: point og blink alligevel (spillet går videre).
+      - if:
+          - condition: template
+            value_template: "{{ not lyd }}"
+        then:
+          - repeat:
+              for_each: "{{ raekke | select('in', ['hest', 'flodhest']) | list }}"
+              sequence:
+                - event: dyrespil_blink
+                  event_data:
+                    hue: "{{ lyde[repeat.item].hue }}"
+          - service: logbook.log
+            data:
+              name: "Dyrespil"
+              message: "{{ d }}{{ ' → ' ~ tekst if tekst else '' }} (højttaleren er slukket — kun blink)."
+          - stop: "Højttaleren er slukket"
+      - if:
+          - condition: template
+            value_template: "{{ andre | count > 0 }}"
+        then:
+          - service: script.turn_off
+            continue_on_error: true
+            target:
+              entity_id: "{{ andre }}"
+      - if:
+          - condition: template
+            value_template: "{{ ma_spillede }}"
+        then:
+          - service: shell_command.hoejttaler_ma_stop
+            continue_on_error: true
+      # Husk volumen før spillet — kun når intet spil er åbent, eller nogen
+      # har skruet siden (står den på spillets volumen, er det et afbrudt
+      # dyr, og den gemte er stadig den rigtige). Et afbrudt lyd-script
+      # midt i et fade → husets start-volumen, ikke fadets bund.
+      - if:
+          - condition: template
+            value_template: "{{ vol_foer >= 0 and (gemt < 0 or (vol_foer - vol) | abs > 0.01) }}"
+        then:
+          - service: input_number.set_value
+            continue_on_error: true
+            target:
+              entity_id: input_number.dyrespil_vol_foer
+            data:
+              value: >-
+                {{ (states('input_number.hoejttaler_standby_start_volumen') | float(25)) | round(0)
+                   if andre | count > 0 else (vol_foer * 100) | round(0) }}
+      - service: media_player.volume_set
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+        data:
+          volume_level: "{{ vol }}"
+      - repeat:
+          for_each: "{{ raekke }}"
+          sequence:
+            - variables:
+                t0: "{{ now().timestamp() }}"
+            - service: media_player.play_media
+              continue_on_error: true
+              target:
+                entity_id: media_player.hoejttaler
+              data:
+                media_content_type: music
+                media_content_id: >-
+                  {{ {'uri': base ~ lyde[repeat.item].fil, 'service': 'webradio',
+                      'type': 'webradio', 'title': 'Dyrespil'} | to_json }}
+            - if:
+                - condition: template
+                  value_template: "{{ lyde[repeat.item].hue >= 0 }}"
+              then:
+                - event: dyrespil_blink
+                  event_data:
+                    hue: "{{ lyde[repeat.item].hue }}"
+            # Oplæsningen hentes MENS dyret spiller (Google-TTS ~0,3-1 s).
+            - if:
+                - condition: template
+                  value_template: "{{ repeat.last and tekst != '' }}"
+              then:
+                - service: shell_command.hoejttaler_tts_url
+                  continue_on_error: true
+                  response_variable: tts
+                  data:
+                    b64: "{{ tekst | base64_encode }}"
+                    sprog: en
+            # Lydens længde + 2 s til at Volumio henter og starter filen (som
+            # beskederne); de 5 s stilhed bagi tager resten.
+            - delay:
+                milliseconds: >-
+                  {{ ([t0 | float(0) + lyde[repeat.item].sek + 2 - now().timestamp(), 0] | max * 1000) | int }}
+      - if:
+          - condition: template
+            value_template: "{{ tekst != '' }}"
+        then:
+          - variables:
+              svar: >-
+                {% set ud = ((tts.stdout | default('')) if tts is defined else '') | trim %}
+                {{ (ud | from_json) if ud.startswith('{') else {} }}
+              url: "{{ (svar.url | default('')) if svar is mapping else '' }}"
+              sekunder: "{{ ((svar.sekunder | default(0)) if svar is mapping else 0) | float(0) }}"
+          - if:
+              - condition: template
+                value_template: "{{ url.startswith('http') }}"
+            then:
+              - service: media_player.play_media
+                continue_on_error: true
+                target:
+                  entity_id: media_player.hoejttaler
+                data:
+                  media_content_type: music
+                  media_content_id: >-
+                    {{ {'uri': url, 'service': 'webradio', 'type': 'webradio', 'title': 'Dyrespil'} | to_json }}
+              - delay:
+                  milliseconds: "{{ (((sekunder if sekunder > 0 else 1.5) + 2) * 1000) | int }}"
+      # Ryd køen, så Volumio-appens play-knap ikke spiller hesten igen.
+      - service: media_player.media_stop
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+      - service: media_player.clear_playlist
+        continue_on_error: true
+        target:
+          entity_id: media_player.hoejttaler
+      # Volumen tilbage til før spillet, og spillet er lukket (-1).
+      - variables:
+          tilbage: "{{ states('input_number.dyrespil_vol_foer') | float(-1) }}"
+      - if:
+          - condition: template
+            value_template: "{{ tilbage >= 0 }}"
+        then:
+          - service: media_player.volume_set
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+            data:
+              volume_level: "{{ tilbage / 100 }}"
+          - service: input_number.set_value
+            continue_on_error: true
+            target:
+              entity_id: input_number.dyrespil_vol_foer
+            data:
+              value: -1
+      - service: logbook.log
+        data:
+          name: "Dyrespil"
+          message: >-
+            {{ raekke | join(' → ') }}{{ ' → "' ~ tekst ~ '"' if tekst else '' }}{{ ' (stoppede ' ~ andre | join(', ') ~ ')' if andre | count > 0 else '' }}.
+
+  # Én pæres 3 blink på blinkets fælles ur. 25/10 (første spil): ét gruppe-
+  # kald pr. frame ventede på den langsomste pære — blinket kom ~12 s efter
+  # lyden, og et 3. tænd hang 5,5 s (lys_effekter: dance_event_bulb-mønstret).
+  # Tiderne er ABSOLUTTE fra t0: en pære der har hængt, springer de tabte
+  # frames over i stedet for at blinke forsinket. Farven skrives altid først
+  # (også for sent), så et senere rent niveau-kald aldrig tænder i den gamle.
+  dyrespil_paere_blink:
+    alias: "Dyrespil: én pæres 3 blink"
+    mode: parallel
+    max: 60
+    max_exceeded: silent
+    fields:
+      paere:
+        description: "Pæren"
+      hue:
+        description: "Farvetone (0 = rød, 240 = blå)"
+      t0:
+        description: "Fælles start (unix-tid)"
+    sequence:
+      - variables:
+          T0: "{{ t0 | default(0) | float(0) }}"
+      # Startet efter hele blinket (2,55 s) → intet; restore'en klarer resten.
+      - condition: template
+        value_template: "{{ now().timestamp() < T0 + 2.2 }}"
+      - delay:
+          milliseconds: "{{ [0, (T0 - now().timestamp()) * 1000] | max | int }}"
+      - service: light.turn_on
+        continue_on_error: true
+        target:
+          entity_id: "{{ paere }}"
+        data:
+          hs_color: ["{{ hue | default(0) | float(0) }}", 100]
+          brightness: 255
+          transition: 0
+      # Frame 2-6: sluk ved +0,5 s, tænd ved +0,85 s … (ON 500 / OFF 350 ms).
+      - repeat:
+          count: 5
+          sequence:
+            - variables:
+                ts: "{{ T0 + (repeat.index // 2) * 0.85 + (0.5 if repeat.index is odd else 0) }}"
+            - delay:
+                milliseconds: "{{ [0, (ts - now().timestamp()) * 1000] | max | int }}"
+            - if:
+                - condition: template
+                  value_template: "{{ now().timestamp() - ts < 0.3 }}"
+              then:
+                - if:
+                    - condition: template
+                      value_template: "{{ repeat.index is odd }}"
+                  then:
+                    - service: light.turn_off
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ paere }}"
+                      data:
+                        transition: 0
+                  else:
+                    - service: light.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ paere }}"
+                      data:
+                        brightness: 255
+                        transition: 0
+
+automation:
+  # 3 blink i hestens/flodhestens farve (headeren: hvorfor en automation).
+  - id: dyrespil_blink
+    alias: "Dyrespil: 3 blink i hele lejligheden"
+    mode: restart
+    trigger:
+      - platform: event
+        event_type: dyrespil_blink
+    variables:
+      hue: "{{ trigger.event.data.hue | default(0) | float(0) }}"
+      # Et blink kører endnu (renderes FØR restart stopper det). Har det
+      # taget sit snapshot, er det lyset før blinket → genbrug. Hænger det i
+      # halloween-ventet (glimtet kører), har det intet taget → normal vej.
+      afbrudt: >-
+        {{ (state_attr('automation.dyrespil_3_blink_i_hele_lejligheden', 'current') | int(0)) > 0
+           and is_state('script.halloween_stemning_glimt', 'off')
+           and is_state('script.halloween_stemning_paere', 'off') }}
+      sover: >-
+        {{ is_state('input_boolean.godnat_boern_active', 'on')
+           or is_state('binary_sensor.godnat_common_active', 'on') }}
+      lamper: >-
+        {% set ns = namespace(t=[]) %}
+        {% set thread = integration_entities('matter') %}
+        {% for l in expand('light.alle_lys') %}
+          {% set m = l.attributes.get('supported_color_modes') or [] %}
+          {% if l.state not in ['unavailable', 'unknown']
+                and l.entity_id not in thread
+                and ('hs' in m or 'xy' in m or 'rgb' in m or 'rgbw' in m or 'rgbww' in m)
+                and not (sover and l.object_id.startswith('boernevaerelse')) %}
+            {% set ns.t = ns.t + [l.entity_id] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.t }}
+      snap: "{{ lamper | reject('eq', 'light.koekken_lyskaede') | list }}"
+      # scene.create'd ved hvert blink (findes ikke efter en restart før første).
+      snap_id: dyrespil_restore
+      fest: "{{ is_state('binary_sensor.festlys_aktiv', 'on') }}"
+    condition:
+      - condition: template
+        value_template: "{{ lamper | count > 0 }}"
+    action:
+      # Et afbrudt blinks pære-løkker kører videre efter restart → stop dem,
+      # så de ikke blinker den gamle farve ind i den nye.
+      - service: script.turn_off
+        continue_on_error: true
+        target:
+          entity_id: script.dyrespil_paere_blink
+      - if:
+          - condition: template
+            value_template: "{{ not afbrudt }}"
+        then:
+          - wait_template: "{{ is_state('script.halloween_stemning_glimt', 'off') and is_state('script.halloween_stemning_paere', 'off') }}"
+            timeout:
+              seconds: 15
+            continue_on_timeout: true
+          - if:
+              - condition: template
+                value_template: "{{ snap | count > 0 }}"
+            then:
+              - service: scene.create
+                continue_on_error: true
+                data:
+                  scene_id: "{{ snap_id }}"
+                  snapshot_entities: "{{ snap }}"
+      # Kæden kun når blinket EJER den (registrets regel 2: kravet `dyrespil`
+      # er aktivt så længe denne automation kører; røgalarm/nødlys/timer-
+      # alarm står over den, og så blinker kæden ikke med).
+      - wait_template: "{{ is_state('sensor.koekken_lyskaede_ejer', 'dyrespil') }}"
+        timeout:
+          seconds: 2
+        continue_on_timeout: true
+      - variables:
+          lamper: >-
+            {{ lamper if is_state('sensor.koekken_lyskaede_ejer', 'dyrespil')
+               else lamper | reject('eq', 'light.koekken_lyskaede') | list }}
+      - if:
+          - condition: template
+            value_template: "{{ fest }}"
+        then:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.dance_strobe_active
+      # Én løkke pr. pære på et fælles ur (script.dyrespil_paere_blink). Farven
+      # ÉN gang (første blink), derefter rene niveau-kald — et farvet turn_on
+      # er to zigbee-frames, et sluk én (script_pkg/vejr_varsel_blink).
+      # t0 + 0,25 s: alle løkker er startet før første frame.
+      - variables:
+          t0: "{{ now().timestamp() + 0.25 }}"
+      - repeat:
+          for_each: "{{ lamper }}"
+          sequence:
+            - service: script.turn_on
+              continue_on_error: true
+              target:
+                entity_id: script.dyrespil_paere_blink
+              data:
+                variables:
+                  paere: "{{ repeat.item }}"
+                  hue: "{{ hue }}"
+                  t0: "{{ t0 }}"
+      # Blinket slutter t0 + 2,55 s. En pære der stadig hænger i et kald 2 s
+      # efter, stoppes, så den ikke slukker oven i restore'en.
+      - delay:
+          milliseconds: "{{ [0, (t0 + 2.55 - now().timestamp()) * 1000] | max | int }}"
+      - wait_template: "{{ (state_attr('script.dyrespil_paere_blink', 'current') | int(0)) == 0 }}"
+        timeout:
+          seconds: 2
+        continue_on_timeout: true
+      - service: script.turn_off
+        continue_on_error: true
+        target:
+          entity_id: script.dyrespil_paere_blink
+      - if:
+          - condition: template
+            value_template: "{{ snap | count > 0 }}"
+        then:
+          - service: scene.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "scene.{{ snap_id }}"
+            data:
+              transition: 0
+      - if:
+          - condition: template
+            value_template: "{{ fest }}"
+        then:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.dance_strobe_active

@@ -431,6 +431,30 @@ den korte bullet (CLAUDE.md eller regel-filen) og afsnittet her.
   og `/addons/local_gesture_frame_shim/info` gav
   `version: 0.8.4, version_latest: 0.8.4, state: started` = deployet og i sync.
 
+- **Et add-on's host-port (`ports:` / `network` i `/addons/<slug>/info`) er en
+  dør UDEN HA-login — på LAN'et OG tailnettet.** Ingress beskytter kun vejen
+  gennem HA's UI; den samme container-port mappet ud på værten (`8099/tcp: 8099`)
+  svarer enhver der kan nå `192.0.2.151` eller `198.51.100.101`. Add-ons der
+  taler sammen gør det over Docker-nettet (`core-mosquitto:1883`,
+  `http://local-gesture-frame-shim:8090`), og ingress går direkte til
+  container-IP'en — ingen af dem bruger host-porten.
+
+  **Målt 2026-10-25 (B251):** `hand_recognition` (8099) udleverede `/api/config`
+  inkl. MQTT-passwordet for `gestus` og `/api/snapshots` (100 køkken-billeder),
+  og `gesture_frame_shim` (8090) udleverede køkkenkameraets aktuelle billede
+  (`/api/koekken/latest.jpg`, 200 `image/jpeg`) — alt uden login. Mosquitto
+  havde 1883/1884/8883/8884 åbne på værten, så det lækkede password kunne
+  publicere falske gestus på `hand-recognition/koekken`. Broker-loggen 17/9-25/10
+  havde KUN klienter fra `172.30.32.1` (HA) og Docker-nettet. Alle tre mappinger
+  sat til `null` via `POST /addons/<slug>/options {"network": {...: null}}` +
+  restart; kæden HA → `house/gesture/scan` → snapshot → svar verificeret bagefter.
+
+  **Signatur:** en `ports:`-linje i et add-on som ingen LAN-enhed forbinder til.
+  → `null`, medmindre en enhed UDEN FOR NUC'en skal ind (Volumio henter
+  `spotify_bro`'s stream på 8098; MA's afspiller-protokoller). Tjek fladen:
+  `ss -tlnH` i SSH-add-on'et (host-net) + `curl http://192.0.2.151:<port>/`.
+  Et nyt LAN-MQTT-device (Shelly, Tasmota …) kræver 1883 åbnet igen.
+
 - **Music Assistant-add-on'en (`d5369777_music_assistant`, 2.10.5, installeret
   2026-10-09 til B204 "Spotify via HA") kræver login på sit API.** Admin-brugeren
   blev oprettet via `POST :8095/setup`; navn + password står i secrets.yaml
@@ -2081,7 +2105,7 @@ Raspbian 9; ingen `/sys/class/power_supply`, I2C-1 har kun RTC'en pcf2127 (0x51,
 sleep-timer eller alarmer aktive. Den røde "lad op"-LED kommer altså fra
 batteriets eget ladekort. Eneste kandidater: Pi'ens undervolt-flag
 (`vcgencmd get_throttled`, 0x0 med fuldt batteri) og input-GPIO 4 (pull-up)/17/
-27/22/13/23 — logget under test 2 (`/share/axiomair_n3_backup/batteritest2_signaler.log`):
+27/22/13/23 — logget under test 2 (`/media/axiomair_n3_backup/batteritest2_signaler.log`):
 throttled forblev 0x0 til døden, men **GPIO 17 gik 0 → 1 ~3 min før batteriet
 døde** (14:21 → 14:24:13; 0 i 48 forudgående samples) og var 0 igen efter genstart
 under opladning — én aflading, ikke bekræftet. Ingen LED ved døden (heller ikke rød).
@@ -2092,7 +2116,7 @@ system_controller/system enableSSH, `data:'false'` slår fra; overlever genstart
 login volumio/volumio — slået FRA igen 10/10. Smart-ladning droppet: user kører den
 på konstant strøm (B212). Et GPIO 17 → webhook-varsel blev bygget og rullet tilbage
 (9e8aa02c), hvis det nogensinde skal genopstå. Fuld SD-backup
-(p1+p2 rå, p3-overlay, config) i `/share/axiomair_n3_backup/2026-10-10/` med README.
+(p1+p2 rå, p3-overlay, config) i `/media/axiomair_n3_backup/2026-10-10/` med README.
 
 ## `parallel:`-grene deler variabel-scope (2026-10-12)
 

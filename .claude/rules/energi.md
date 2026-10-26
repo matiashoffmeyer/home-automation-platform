@@ -35,4 +35,4 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   (ingen fuel gauge på I2C, ingen power_supply). Forbrug målt ~10,6 W døgn-snit
   (≈ 93 kWh / ~180 kr om året) → `input_number.cost_hoejttaler_watt` i setup-kosten.
   Kører den på batteri og går offline, afgør LED'en (ingen = slukket, blå/rød
-  blink = egen hotspot, grøn = hængt). SD-backup: `/share/axiomair_n3_backup/`.
+  blink = egen hotspot, grøn = hængt). SD-backup: `/media/axiomair_n3_backup/` (ikke i HA-backup'en).

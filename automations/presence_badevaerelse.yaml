@@ -2215,31 +2215,50 @@
     # Rør aldrig manuel dæmpning.
     - condition: template
       value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
-    # KUN-NEDAD: aktuel brightness skal ligge OVER probe-niveauet (blokerer
-    # natlys 8 % og allerede-dæmpet lys — proben løfter aldrig).
+    # KUN-NEDAD: aktuel brightness skal ligge OVER probe-niveauet (allerede-
+    # dæmpet lys — proben løfter aldrig) … ELLER natlyset er tændt.
+    # 2026-10-25 (user: "bad lys blev holdt tændt … hele natten"): natlys 8 %
+    # blokerede HELE proben, og den er husets eneste vej ud af "lukket dør +
+    # Fuld" (gradvis-sluk og nat-toilet vetoer på lukket dør). Man lukker døren
+    # efter sig om natten, og dør-flanken (eneste udgangs-bevis) blev ædt af
+    # klima-holdet i full_leave_off → kun max-on watchdog'en slukkede: 2/2 nætter
+    # på 30 døgn (13/10 59 min, 25/10 60 min); dagen ryddede proben på ~14,5 min.
+    # Dør åbnet+lukket alene beviser IKKE udgang (30 døgn: 20 gange var nogen
+    # stadig inde, stille op til 4,4 min) → nat = samme probe-vindue, bare uden
+    # dæmpning (8 % kan ikke dæmpes synligt, og en løftning er forbudt).
     - condition: template
       value_template: >-
         {{ (state_attr('light.badevaerelse_all', 'brightness') | int(0))
            > (((states('input_number.badevaerelse_wasp_probe_brightness') | float(40))
-               * 2.55) | int) }}
+               * 2.55) | int)
+           or is_state('binary_sensor.badevaerelse_natlys_aktiv', 'on') }}
   action:
     - variables:
         probe_pct: "{{ states('input_number.badevaerelse_wasp_probe_brightness') | int(40) }}"
-    - service: light.turn_on
-      continue_on_error: true
-      target:
-        entity_id: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
-      data:
-        brightness_pct: "{{ probe_pct }}"
-        # Blød dæmpning — signalet SKAL kunne ses fra karbadet, men ikke chokere.
-        transition: 10
+        daempe: >-
+          {{ (state_attr('light.badevaerelse_all', 'brightness') | int(0))
+             > ((probe_pct | float(40)) * 2.55) | int }}
+    - if:
+        - condition: template
+          value_template: "{{ daempe }}"
+      then:
+        - service: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: "{{ states('sensor.badevaerelse_fase_spots').split(',') }}"
+          data:
+            brightness_pct: "{{ probe_pct }}"
+            # Blød dæmpning — signalet SKAL kunne ses fra karbadet, men ikke chokere.
+            transition: 10
     - service: logbook.log
       data:
         name: "Bad wasp-probe"
         message: >-
-          Dæmpet til {{ probe_pct }} % — ingen bevægelse i
+          {{ ('Dæmpet til ' ~ probe_pct ~ ' %') if daempe else 'Natlys (dæmpes ikke)' }}
+          — ingen bevægelse i
           {{ states('input_number.badevaerelse_wasp_probe_minutes') }} min bag
-          lukket dør. Bevægelse løfter til Fuld igen.
+          lukket dør. {{ 'Bevægelse løfter til Fuld igen.' if daempe
+             else 'Slukker om ' ~ (states('input_number.badevaerelse_wasp_probe_off_minutes') | int(4)) ~ ' min uden bevægelse.' }}
         entity_id: light.badevaerelse_all
     - wait_for_trigger:
         - platform: state
@@ -2262,10 +2281,11 @@
               * 60) * (states('sensor.badevaerelse_airbnb_off_factor') | float(1.0))) | int }}
     - choose:
         # Motion under proben → straks Fuld igen (fasens spots, Fuld-slider).
+        # Kun hvis VI dæmpede — om natten står natlyset urørt (løft aldrig).
         - conditions:
             - condition: template
               value_template: >-
-                {{ wait.trigger is not none
+                {{ daempe and wait.trigger is not none
                    and wait.trigger.entity_id == 'binary_sensor.badevaerelse_inde_occupancy' }}
           sequence:
             - service: light.turn_on
@@ -2406,11 +2426,16 @@
            and (now() - st.last_changed).total_seconds() >= n }}
     # Proben er ikke allerede i gang: har den dæmpet, ligger brightness på
     # probe-niveau og dens egen KUN-NEDAD-gate ville alligevel blokere.
+    # Natlyset dæmpes ikke (25/10) → om natten er `current` det eneste bevis på
+    # at proben kører; en re-trigger midt i dens fugt-vent ville nulstille den.
     - condition: template
       value_template: >-
-        {{ (state_attr('light.badevaerelse_all', 'brightness') | int(0))
-           > (((states('input_number.badevaerelse_wasp_probe_brightness') | float(40))
-               * 2.55) | int) }}
+        {{ ((state_attr('light.badevaerelse_all', 'brightness') | int(0))
+            > (((states('input_number.badevaerelse_wasp_probe_brightness') | float(40))
+                * 2.55) | int)
+            or is_state('binary_sensor.badevaerelse_natlys_aktiv', 'on'))
+           and (state_attr('automation.lysnet_badevaerelse_wasp_probe_daemp_sluk_ved_stilhed_bag_lukket_dor',
+                           'current') | int(0)) == 0 }}
   action:
     - service: logbook.log
       data:

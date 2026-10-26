@@ -66,7 +66,7 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.koekken_apollo_naer_bekraeftet` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_naer_kandidat` — 4 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_occupancy` — 33 refs in 18 file(s)
-- `binary_sensor.koekken_apollo_occupancy_filtered` — 110 refs in 43 file(s)
+- `binary_sensor.koekken_apollo_occupancy_filtered` — 111 refs in 43 file(s)
 - `binary_sensor.koekken_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_radar_moving_target` — 19 refs in 12 file(s)
 - `binary_sensor.koekken_apollo_radar_still_target` — 2 refs in 2 file(s)
@@ -228,7 +228,7 @@ Search keywords: `koekken, kokken`
 
 - `light.koekken_apollo_rgb_light` — 13 refs in 5 file(s)
 - `light.koekken_loft` — 2 refs in 2 file(s)
-- `light.koekken_lyskaede` — 188 refs in 43 file(s)
+- `light.koekken_lyskaede` — 190 refs in 44 file(s)
 - `light.koekken_room` — 11 refs in 8 file(s)
 
 ### `number.*`
@@ -298,7 +298,7 @@ Search keywords: `koekken, kokken`
 - `sensor.koekken_lys_on_idag` — 8 refs in 2 file(s)
 - `sensor.koekken_lys_timer_dag` — 1 refs in 1 file(s)
 - `sensor.koekken_lyskaede_cooking_kelvin_effektiv` — 3 refs in 1 file(s)
-- `sensor.koekken_lyskaede_ejer` — 17 refs in 7 file(s)
+- `sensor.koekken_lyskaede_ejer` — 19 refs in 8 file(s)
 - `sensor.koekken_lyskaede_fade_hurtig_effektiv` — 9 refs in 4 file(s)
 - `sensor.koekken_lyskaede_fade_langsom_effektiv` — 7 refs in 4 file(s)
 - `sensor.koekken_lyskaede_kurve_slut` — 2 refs in 2 file(s)

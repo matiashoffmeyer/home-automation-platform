@@ -10,16 +10,17 @@ Ejer nu: `sensor.koekken_lyskaede_ejer` (state = krav-id eller `hus`). `binary_s
 | — | `timer_nedtaelling` Timer-nedtælling | nedtælling kører — bursts via signal-kanalen; huset ejer udseendet | overlay |
 | — | `kvittering` Kvitteringer | vink/puls/burst/grøn — sekunder lange, køet i script.koekken_lyskaede_signal | overlay |
 | 4 | `vejrvarsel` Vejrvarsel | et vejr-blink kører (rører ikke kæden siden 23/9, se huller) | maal |
-| 5 | `dance` Dance | festlys danser i køkkenet (auto-shuffle ELLER låst event) | maal |
-| 6 | `cirkus` Cirkus/fødselsdag | cirkus- eller fødselsdags-scenen kører | maal |
-| 7 | `legetoejsdag` Legetøjsdag | disko-varslet kører | maal |
-| 8 | `farve_preview` Farve-preview | du skruer på kædens farve/mætning/lysstyrke (viser den i N sek.) | maal |
-| 9 | `styrbar_farveloop` Styrbar-farveloop | du holder stue-Styrbar L/R (kæden kører farver) | maal |
-| 10 | `haand` Din hånd | du har selv sat udseendet (app-justering mens den lyser, sluppet farveloop, valgt scene, fuldt lys) — slipper ved sluk eller når madlavning er i gang | maal |
-| 11 | `velkomst` AirBnB-velkomst | gæste-velkomsten kører (gæstens eget tryk = din hånd, slipper den) | maal |
-| 12 | `sofa_zen` Sofa Zen | Sofa Zen låner kæden (køkkenet ikke i brug) | maal + genoptag |
-| 13 | `morgenrampe` Morgenrampe | morgenrampen kører (viger for madlavning) | ingen |
-| 14 | `nattur` Godnat/nattur | godnat er aktiv (nattur-lyset ejer kæden; viger for madlavning) | ingen |
+| 5 | `dyrespil` Dyrespil | hest/flodhest-blinket kører (3 røde eller blå blink) | maal |
+| 6 | `dance` Dance | festlys danser i køkkenet (auto-shuffle ELLER låst event) | maal |
+| 7 | `cirkus` Cirkus/fødselsdag | cirkus- eller fødselsdags-scenen kører | maal |
+| 8 | `legetoejsdag` Legetøjsdag | disko-varslet kører | maal |
+| 9 | `farve_preview` Farve-preview | du skruer på kædens farve/mætning/lysstyrke (viser den i N sek.) | maal |
+| 10 | `styrbar_farveloop` Styrbar-farveloop | du holder stue-Styrbar L/R (kæden kører farver) | maal |
+| 11 | `haand` Din hånd | du har selv sat udseendet (app-justering mens den lyser, sluppet farveloop, valgt scene, fuldt lys) — slipper ved sluk eller når madlavning er i gang | maal |
+| 12 | `velkomst` AirBnB-velkomst | gæste-velkomsten kører (gæstens eget tryk = din hånd, slipper den) | maal |
+| 13 | `sofa_zen` Sofa Zen | Sofa Zen låner kæden (køkkenet ikke i brug) | maal + genoptag |
+| 14 | `morgenrampe` Morgenrampe | morgenrampen kører (viger for madlavning) | ingen |
+| 15 | `nattur` Godnat/nattur | godnat er aktiv (nattur-lyset ejer kæden; viger for madlavning) | ingen |
 | — | `hus` husets mål | ingen krav aktive | — |
 
 **Når ejer = hus** vælger mål-sensorerne udseendet: dark_mode_stue > filmmoerke_koekken > madlavningslys/arbejdslys (morgen- og hjemkomstlys) > maaltidslys > hygge (sliders × elpris). Styrke: `sensor.koekken_lyskaede_target_brightness`; farve: `script.koekken_lyskaede_maal`.

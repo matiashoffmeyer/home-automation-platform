@@ -56,7 +56,7 @@ Search keywords: `badevaerelse, bad`
   - Sikkerhedsnet 2026-06-15 (user-spec): Når bad-presence-sensorerne (VALLHORN/
 - **Lysnet: Badeværelse wasp-probe (dæmp→sluk ved stilhed bag lukket dør)** (line 2166, mode=restart)
   - Lukket dør + Fuld + ingen inde-motion i badevaerelse_wasp_probe_minutes →
-- **Lysnet: Badeværelse wasp-probe re-arm (flanke tabt over restart)** (line 2371, mode=single)
+- **Lysnet: Badeværelse wasp-probe re-arm (flanke tabt over restart)** (line 2391, mode=single)
   - Lys tændt + Fuld + lukket dør + stilhed langt ud over probe-vinduet =
 
 ### `automations/styrbar_rooms.yaml`
@@ -77,7 +77,7 @@ Search keywords: `badevaerelse, bad`
 - `automation.airbnb_alle_lys_post_strom_lux_aware_bad_fuld` — 1 refs in 1 file(s)
 - `automation.lysnet_badevaerelse_60_100_langsom_optrapning_kun_ved_ophold` — 1 refs in 1 file(s)
 - `automation.lysnet_badevaerelse_taend` — 1 refs in 1 file(s)
-- `automation.lysnet_badevaerelse_wasp_probe_daemp_sluk_ved_stilhed_bag_lukket_dor` — 1 refs in 1 file(s)
+- `automation.lysnet_badevaerelse_wasp_probe_daemp_sluk_ved_stilhed_bag_lukket_dor` — 2 refs in 1 file(s)
 
 ### `binary_sensor.*`
 
@@ -98,7 +98,7 @@ Search keywords: `badevaerelse, bad`
 - `binary_sensor.badevaerelse_inde_occupancy` — 132 refs in 38 file(s)
 - `binary_sensor.badevaerelse_lys_on_effektiv` — 1 refs in 1 file(s)
 - `binary_sensor.badevaerelse_matter_spots_ok` — 12 refs in 5 file(s)
-- `binary_sensor.badevaerelse_natlys_aktiv` — 10 refs in 3 file(s)
+- `binary_sensor.badevaerelse_natlys_aktiv` — 12 refs in 3 file(s)
 - `binary_sensor.badevaerelse_optaget_lukket_doer` — 2 refs in 1 file(s)
 - `binary_sensor.badevaerelse_thread_lys_nede` — 8 refs in 2 file(s)
 - `binary_sensor.badevaerelse_tumbler_mistanke` — 2 refs in 2 file(s)
@@ -200,7 +200,7 @@ Search keywords: `badevaerelse, bad`
 - `input_number.badevaerelse_sluk_alt_efterslaeb_minutter` — 3 refs in 3 file(s)
 - `input_number.badevaerelse_wasp_probe_brightness` — 5 refs in 3 file(s)
 - `input_number.badevaerelse_wasp_probe_minutes` — 5 refs in 3 file(s)
-- `input_number.badevaerelse_wasp_probe_off_minutes` — 5 refs in 3 file(s)
+- `input_number.badevaerelse_wasp_probe_off_minutes` — 6 refs in 3 file(s)
 - `input_number.radiator_trin_bad` — 2 refs in 2 file(s)
 - `input_number.sove_gardin_bad_min_aktivitet_minutter` — 5 refs in 3 file(s)
 - `input_number.sove_gardin_bad_tomt_minutter` — 5 refs in 3 file(s)
@@ -212,7 +212,7 @@ Search keywords: `badevaerelse, bad`
 
 ### `light.*`
 
-- `light.badevaerelse_all` — 130 refs in 23 file(s)
+- `light.badevaerelse_all` — 131 refs in 23 file(s)
 - `light.badevaerelse_spot_1` — 37 refs in 23 file(s)
 - `light.badevaerelse_spot_2` — 43 refs in 23 file(s)
 - `light.badevaerelse_spot_3` — 34 refs in 20 file(s)

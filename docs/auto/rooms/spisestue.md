@@ -164,7 +164,7 @@ Search keywords: `spisestue`
 - `sensor.spisestue_apollo_radar_still_distance` — 3 refs in 3 file(s)
 - `sensor.spisestue_apollo_radar_still_energy` — 1 refs in 1 file(s)
 - `sensor.spisestue_apollo_temperature` — 1 refs in 1 file(s)
-- `sensor.spisestue_dagslys_lx` — 13 refs in 9 file(s)
+- `sensor.spisestue_dagslys_lx` — 15 refs in 9 file(s)
 - `sensor.spisestue_dagslys_sample` — 7 refs in 2 file(s)
 - `sensor.spisestue_lux` — 2 refs in 2 file(s)
 - `sensor.spisestue_lux_reel` — 32 refs in 11 file(s)

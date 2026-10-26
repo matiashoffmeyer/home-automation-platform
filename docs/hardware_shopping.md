@@ -70,6 +70,20 @@ Matter-parring: [matter_pairing_playbook.md](matter_pairing_playbook.md) FØRST 
 
 ## Skal købes ⏳
 
+### Backup-maskine til NUC'en — kold standby (B252, user 2026-10-25)
+User 25/10: "klar men slukket". Krav og bindinger: `docs/nuc_beredskab.md`.
+
+**Forslag: Beelink Mini S12 Pro** — Intel N100 (x86-64, 4 kerner), 16 GB RAM,
+500 GB SSD, **4× USB-A 3.2**, 1× gigabit-LAN, auto power-on i BIOS. Ca.
+1.500-2.000 kr (tjek dagens pris). Den er hurtigere end NUC'en (i5-5250U,
+2015) og bruger mindre strøm. Den kommer med Windows, men HAOS' generiske
+x86-64-image skrives ind over det.
+- **Forlængerne flytter med donglerne:** USB 3-porte støjer på 2,4 GHz.
+  Sonoff-donglen sidder i dag i en 0,6 m USB 2.0-forlænger (`docs/hardware.md`);
+  hvordan ZBT-2 sidder, er ikke dokumenteret → tjekkes ved B253-øvelsen.
+- Sæt BIOS til at tænde efter strømsvigt, før den lægges på hylden.
+- Alternativ: en brugt Intel NUC (8.-11. gen), samme krav.
+
 ### ~~USB-hub med per-port power switching til Thread-donglen~~ ❌ AFVIST (user 2026-10-09: "nej jeg skal ikke købe noget")
 
 Står kun her så ingen foreslår den igen. Stigen i

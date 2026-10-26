@@ -158,7 +158,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `input_boolean.boernevaerelse_manual_off_lock` — 46 refs in 14 file(s)
 - `input_boolean.dance_room_boern` — 15 refs in 7 file(s)
 - `input_boolean.festlys_boern_styrbar` — 8 refs in 3 file(s)
-- `input_boolean.godnat_boern_active` — 94 refs in 40 file(s)
+- `input_boolean.godnat_boern_active` — 95 refs in 41 file(s)
 - `input_boolean.koekken_lav_krop_boern_enabled` — 3 refs in 3 file(s)
 - `input_boolean.people_boern_set_efter_doer` — 12 refs in 2 file(s)
 - `input_boolean.roborock_styrbar_kort_op_boernevaerelse` — 1 refs in 1 file(s)

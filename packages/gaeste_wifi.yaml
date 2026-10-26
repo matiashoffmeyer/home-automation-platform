@@ -1,0 +1,140 @@
+# Gæste-wifi — kun tændt i AirBnB-mode eller under en test (B267, 2026-10-26)
+#
+# Routerens gæste-SSID (navn + kode i secrets.yaml: gaeste_wifi_ssid/_kode) er
+# isoleret fra husets LAN ("kun internet"), så gæster kan bruge nettet uden at
+# se HA, NUC'en eller pærerne. User-spec 25/10: nettet må KUN være tændt når
+# huset står i AirBnB, eller når han tester det — ellers står en ekstra åben
+# indgang til routeren tændt for ingenting.
+#
+# scripts/gaeste_wifi.py taler routerens web-API og skriver KUN når routeren
+# afviger fra det ønskede. Hver ændring giver hoved-wifi'en et kort blip (målt
+# 25/10: Apollo'erne < 1 s, højttaleren 5 s), så der skiftes kun ved en ægte
+# tilstands-ændring — aldrig på et tick.
+#
+# Ønsket = AirBnB ELLER test. Én automation ejer nettet (single owner, #1):
+#   - house_mode-skift → slår testen fra (testen ryddes ved AirBnB entry OG exit,
+#     så flag-listerne i airbnb_mode.yaml behøver ikke kende den) og afstemmer.
+#   - test-knappen → afstemmer; testen slukker selv efter 1 time.
+#   - HA-start → testen slås fra (en restart dræber 1-times-`for:`'en) og
+#     routeren afstemmes efter settle.
+#   - dagligt 05:10 → afstemmer, hvis routeren selv er blevet ændret
+#     (udbyderens centrale styring kan skubbe en standard-konfiguration ud).
+# Fejl → persistent_notification (ingen push: virker også tavst i AirBnB).
+
+input_boolean:
+  # RUNTIME — ikke i helpers-snapshottet (helpers_export.py tager kun
+  # *_enabled/notif_*). Ingen `initial:`: HA-start slår den selv fra.
+  gaeste_wifi_test:
+    name: "Test gæste-wifi"
+    icon: mdi:wifi-star
+
+input_text:
+  # Sidste afstemnings udfald, vist på AirBnB-fanen. Skrives kun her.
+  gaeste_wifi_status:
+    name: "Gæste-wifi status"
+    icon: mdi:wifi-check
+    max: 100
+
+shell_command:
+  # Max ~45 s (login + skrivning + ventetid VENT_S=40 i scriptet) — under
+  # shell_command's 60 s. Argumentet tvinges til on/off her.
+  gaeste_wifi: "python3 /config/scripts/gaeste_wifi.py {{ 'on' if onsket == 'on' else 'off' }}"
+
+automation:
+  - id: gaeste_wifi_afstem
+    alias: "Gæste-wifi: kun tændt i AirBnB eller under test"
+    description: >-
+      Tænder routerens gæste-wifi i AirBnB-mode eller mens test-knappen er
+      tændt (max 1 time), ellers slukket. Skriver kun ved afvigelse.
+    mode: queued
+    max: 4
+    max_exceeded: silent
+    triggers:
+      - trigger: state
+        entity_id: input_select.house_mode
+        not_from: [unavailable, unknown]
+        not_to: [unavailable, unknown]
+        id: mode
+      - trigger: state
+        entity_id: input_boolean.gaeste_wifi_test
+        from: ["on", "off"]
+        to: ["on", "off"]
+        id: test
+      - trigger: state
+        entity_id: input_boolean.gaeste_wifi_test
+        to: "on"
+        for: "01:00:00"
+        id: test_udloeb
+      - trigger: homeassistant
+        event: start
+        id: start
+      - trigger: time
+        at: "05:10:00"
+        id: dagligt
+    actions:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          # Netværk/integrationer falder på plads efter boot.
+          - delay: "00:01:00"
+      - if:
+          - condition: trigger
+            id: [mode, test_udloeb, start]
+          - condition: state
+            entity_id: input_boolean.gaeste_wifi_test
+            state: "on"
+        then:
+          # Flanken herfra lægger en kørsel mere i køen; den finder routeren
+          # allerede som ønsket og skriver intet.
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.gaeste_wifi_test
+      - variables:
+          aarsag: >-
+            {{ 'airbnb' if is_state('input_select.house_mode', 'AirBnB')
+               else 'test' if is_state('input_boolean.gaeste_wifi_test', 'on')
+               else 'ingen' }}
+          onsket: "{{ 'off' if aarsag == 'ingen' else 'on' }}"
+      - action: shell_command.gaeste_wifi
+        data:
+          onsket: "{{ onsket }}"
+        response_variable: svar
+        continue_on_error: true
+      - variables:
+          # Timeout (60 s) giver intet svar; exit 1/2 giver stadig stdout.
+          res: >-
+            {{ (svar.stdout if svar is defined and svar.stdout is defined else '')
+               | from_json(default={}) }}
+          fejl: >-
+            {% if not res %}intet svar fra scriptet
+            {% elif res.fejl is defined %}{{ res.fejl }}
+            {% elif not res.ok %}routeren står ikke som ønsket
+            {% elif onsket == 'on' and not res.kun_internet %}ikke isoleret fra LAN
+            {% elif not res.navn_ok %}forkert navn
+            {% else %}{% endif %}
+          tid: "{{ now().strftime('%-d/%-m %H:%M') }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.gaeste_wifi_status
+        data:
+          value: >-
+            {% if fejl | trim %}Fejl {{ tid }}: {{ fejl | trim }}
+            {% elif onsket == 'on' %}Tændt{{ ' (test)' if aarsag == 'test' else '' }} · {{ tid }}
+            {% else %}Slukket · {{ tid }}{% endif %}
+      - if:
+          - condition: template
+            value_template: "{{ fejl | trim | length > 0 }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              notification_id: gaeste_wifi
+              title: "Gæste-wifi"
+              message: >-
+                Kunne ikke {{ 'tænde' if onsket == 'on' else 'slukke' }}
+                gæste-wifi'en: {{ fejl | trim }}. Prøv test-knappen på
+                Indstillinger → AirBnB, eller `python3 scripts/gaeste_wifi.py status`.
+        else:
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: gaeste_wifi

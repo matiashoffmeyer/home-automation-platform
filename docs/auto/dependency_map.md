@@ -8,26 +8,26 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 
 | Entity | Files | Refs |
 |---|---|---|
-| `input_select.house_mode` | 119 | 285 |
-| `input_select.house_state` | 74 | 237 |
+| `input_select.house_mode` | 121 | 289 |
+| `input_select.house_state` | 74 | 238 |
 | `binary_sensor.stue_apollo_occupancy_filtered` | 48 | 119 |
 | `light.spisestue_loft` | 47 | 121 |
-| `binary_sensor.entre_valhorn_occupancy` | 47 | 105 |
+| `binary_sensor.entre_valhorn_occupancy` | 47 | 106 |
 | `binary_sensor.sovevaerelse_apollo_occupancy` | 46 | 91 |
 | `binary_sensor.boernevaerelse_apollo_occupancy` | 46 | 121 |
 | `script.push_notify` | 45 | 98 |
-| `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 110 |
+| `light.koekken_lyskaede` | 44 | 190 |
+| `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 111 |
 | `input_boolean.godnat_active` | 43 | 96 |
-| `light.koekken_lyskaede` | 43 | 188 |
-| `sun.sun` | 41 | 143 |
-| `input_boolean.godnat_boern_active` | 40 | 94 |
+| `input_boolean.godnat_boern_active` | 41 | 95 |
+| `sun.sun` | 41 | 144 |
 | `binary_sensor.spisestue_apollo_occupancy_filtered` | 40 | 112 |
 | `light.spisestue_pendel` | 39 | 136 |
 | `binary_sensor.badevaerelse_inde_occupancy` | 38 | 132 |
-| `light.stue_laesehygge` | 37 | 81 |
+| `light.stue_laesehygge` | 37 | 82 |
 | `light.boernevaerelse_loft` | 37 | 95 |
 | `sensor.open_plan_lux` | 35 | 103 |
-| `light.entre_loft` | 34 | 80 |
+| `light.entre_loft` | 34 | 82 |
 | `binary_sensor.depot_valhorn_occupancy` | 31 | 70 |
 | `light.boernevaerelse_hygge_strip` | 31 | 89 |
 | `binary_sensor.godnat_any_active` | 29 | 58 |
@@ -39,7 +39,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | Entity | Purpose | Files |
 |---|---|---|
 | `input_select.house_state` | Top-level state: Active vs Dormant | 74 |
-| `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 119 |
+| `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 121 |
 | `input_boolean.godnat_active` | Godnat night mode | 43 |
 | `input_boolean.godnat_pending` | Godnat in progress | 19 |
 | `input_boolean.cinema_active` | Cinema mode (mood) | 29 |
@@ -48,7 +48,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `input_boolean.bedroom_only_winddown` | Soft winddown for bedroom-only | 4 |
 | `input_boolean.kalde_active` | Kids' kalde-button active | 20 |
 | `input_boolean.airbnb_mode` | AirBnB shortcut (rare) | 0 |
-| `sensor.activity_state` | Computed activity classifier | 13 |
+| `sensor.activity_state` | Computed activity classifier | 14 |
 | `sensor.people_estimate` | Computed people count estimate | 15 |
 | `binary_sensor.presence_sensors_available` | Master gate for all presence-driven automations | 28 |
 | `binary_sensor.terrasse_active` | Terrasse activity (Sherlock-deduktion) | 10 |

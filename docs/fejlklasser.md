@@ -224,15 +224,18 @@ sessioners arbejde. Tjek disse aktivt — de er billige at undgå, dyre at opdag
     verificér zone-/platform-antagelser mod live `/api/states` (fundet+fixet
     2026-07-15d).
 18. **⏰ HA history/logbook-API'et returnerer tidsstempler i UTC — IKKE lokal
-    tid.** `last_changed`/`last_updated`/logbook-`when` ender på `+00:00`. Vi er
-    UTC+2 (dansk sommertid) → **læg 2 timer til** før du fortolker "hvornår
-    skete det". Klassisk selv-fejl: læse "22:42:46" fra history som 22:42 aften,
-    men det er 00:42 lokal (næste nat). Konsekvens: forkert nat, forkert
-    korrelation med godnat/mode/soltider, forkerte konklusioner. Metode: konvertér
-    ALTID i din parser (`datetime.fromisoformat(t).astimezone(ZoneInfo('Europe/
-    Copenhagen'))` eller `+timedelta(hours=2)`) FØR du ræsonnerer om timingen.
-    (De tider du SENDER til API'et med eksplicit `+02:00` er fine — det er kun
-    svarene der er UTC.)
+    tid.** `last_changed`/`last_updated`/logbook-`when` ender på `+00:00`.
+    Huset følger dansk tid: UTC+2 om sommeren, UTC+1 om vinteren (sommertiden
+    sluttede 2026-10-25 kl. 03:00 → 02:00; reglen sagde "læg 2 timer til" og blev
+    forkert samme nat). Klassisk selv-fejl: læse "22:42:46" fra history som 22:42
+    aften, men det er 00:42 lokal om sommeren (23:42 om vinteren). Konsekvens:
+    forkert nat, forkert korrelation med godnat/mode/soltider, forkerte
+    konklusioner. Metode: konvertér ALTID i din parser
+    (`datetime.fromisoformat(t).astimezone(ZoneInfo('Europe/Copenhagen'))`) FØR
+    du ræsonnerer om timingen — **aldrig en fast `timedelta(hours=N)`**. Natten
+    til skift-dagen har ét klokkeslæt to gange (02:00-03:00 i oktober): læs
+    offsettet med (`hq.py` viser `+02`/`+01` omkring skiftet). Tider du SENDER
+    til API'et skal have eksplicit offset eller være UTC.
 19. **⏱️ En blokeret automation fyrer i SAMME sekund blokeringen ophæves.**
     Ikke det samme som #4/#15: triggeren går ikke tabt, den bliver **opsamlet**
     og udløst præcis i det øjeblik gaten åbner — så alle side-effekter lander på
