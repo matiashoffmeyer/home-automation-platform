@@ -1,0 +1,285 @@
+# =============================================================================
+# FESTLYS: FROST-SANGENE (2026-10-26)
+# =============================================================================
+# User-spec 26/10: "hvis en af de to sange spilles skal hele openplan eksplodere
+# i blåt hvidt iskrystal festlys: Lad det ske (frost), Let it go (frozen)".
+#
+# Design
+#   - binary_sensor.festlys_frost_sang er ÉN gate for alt: kill-switchen,
+#     højttaleren spiller (Spotify-broen), titlen starter med "let it go" /
+#     "lad det ske" OG nummeret er fra filmen (album/titel nævner Frozen/Frost,
+#     eller kunstneren er Idina Menzel / Maria Lucia — James Bays "Let It Go"
+#     er ikke med), familie-mode og ingen godnat/sleepover. Alle stop-veje
+#     (#21) går derfor gennem sensorens on → off: slukker man kontakten, går
+#     huset i AirBnB eller godnat, slukker festen med det samme.
+#     delay_off 6 s: et nummer-skift eller et kort "spiller"-flap mellem to
+#     afspilninger af samme sang må ikke slukke og eksplodere igen.
+#   - Starten låser festlys-eventet `frost` (packages/dance_mode.yaml, EVENT 17)
+#     i stue, spisestue og køkken — samme maskine som Festlys-siden: rum-claim,
+#     Thread-budget (B260), stop-rostere og release følger med gratis.
+#   - Kørte festlys ikke i forvejen, danser KUN open-plan (de andre rum-
+#     knapper slås fra). Kørte en fest, kommer open-plan med i den.
+#   - Tilstanden før sangen gemmes i input_text.festlys_frost_foer (JSON:
+#     d = dance_mode, e = låst event, r = rum-knapper der var tændt) og
+#     overlever en restart. Når sangen slutter, gendannes den — men KUN hvis
+#     frost stadig kører: har nogen skiftet event eller slukket festen midt i
+#     sangen, vinder deres valg (kun rum-knapperne lægges tilbage, og kun hvis
+#     festen er slukket).
+#
+# Med-ejere: dance_manual_event_runner (claim/release af rummene),
+# airbnb_mode.yaml (rydder festlys ved AirBnB entry/exit — slut-vejen finder
+# så eventet ≠ frost og gendanner kun rum-knapperne).
+#
+# AirBnB: gaten kræver Normal/Home Vacation — en gæst der spiller Let It Go
+# får ingen fest (påtving aldrig familie-rutiner på en gæst).
+# =============================================================================
+
+input_boolean:
+  # Ingen `initial:` — kill-switchen skal overleve en restart.
+  festlys_frost:
+    name: "Festlys: Frost-sangene"
+    icon: mdi:snowflake
+
+input_text:
+  # Festlys-tilstanden før sangen (JSON). Tom = intet at gendanne.
+  festlys_frost_foer:
+    name: "Festlys frost: tilstand før sangen"
+    max: 255
+
+template:
+  - binary_sensor:
+      - name: "Festlys frost sang"
+        unique_id: festlys_frost_sang
+        icon: mdi:snowflake-variant
+        delay_off:
+          seconds: 6
+        state: >-
+          {% set t = (state_attr('sensor.spotify_bro', 'titel') or '') | string | lower %}
+          {% set al = (state_attr('sensor.spotify_bro', 'album') or '') | string | lower %}
+          {% set ku = (state_attr('sensor.spotify_bro', 'kunstner') or '') | string | lower %}
+          {% set film = 'frozen' in (t ~ ' ' ~ al) or 'frost' in (t ~ ' ' ~ al)
+                        or 'idina menzel' in ku or 'maria lucia' in ku %}
+          {{ is_state('input_boolean.festlys_frost', 'on')
+             and is_state('binary_sensor.spotify_bro_spiller', 'on')
+             and (t.startswith('let it go') or t.startswith('lad det ske')) and film
+             and states('input_select.house_mode') in ['Normal', 'Home Vacation']
+             and not is_state('binary_sensor.godnat_common_active', 'on')
+             and not is_state('input_boolean.godnat_boern_active', 'on')
+             and not is_state('input_boolean.sleepover_i_nat', 'on') }}
+
+script:
+  festlys_frost_start:
+    alias: "Festlys: Frost-sangen starter — iskrystal i open-plan"
+    mode: queued
+    max: 5
+    variables:
+      rum: "{{ (state_attr('sensor.dance_rum_kort', 'rum') or {}).keys() | list }}"
+      openplan: ["stue", "spisestue", "koekken"]
+      koerte: >-
+        {{ is_state('input_boolean.dance_mode', 'on')
+           or not is_state('input_select.dance_manual_event', 'off') }}
+      andre: >-
+        {% set ns = namespace(l=[]) %}
+        {% for k in rum %}{% if k not in openplan and is_state('input_boolean.dance_room_' ~ k, 'on') %}{% set ns.l = ns.l + ['input_boolean.dance_room_' ~ k] %}{% endif %}{% endfor %}
+        {{ ns.l }}
+    sequence:
+      # Gem kun hvis intet er gemt: en genstart midt i sangen eller et nyt
+      # start-flanke før slut-vejen har ryddet må ikke gemme frost som "før".
+      - if:
+          - condition: template
+            value_template: >-
+              {{ not states('input_text.festlys_frost_foer').startswith('{') }}
+        then:
+          - service: input_text.set_value
+            target: {entity_id: input_text.festlys_frost_foer}
+            data:
+              value: >-
+                {% set ns = namespace(r=[]) %}
+                {% for k in rum %}{% if is_state('input_boolean.dance_room_' ~ k, 'on') %}{% set ns.r = ns.r + [k] %}{% endif %}{% endfor %}
+                {{ {'d': states('input_boolean.dance_mode'),
+                    'e': states('input_select.dance_manual_event'),
+                    'r': ns.r} | to_json }}
+      # Ingen fest i forvejen → KUN open-plan. Rum-knapperne slås fra før de
+      # nye tændes (dance_room_change_restart er stille mens festen er slukket).
+      - if:
+          - condition: template
+            value_template: "{{ not koerte and andre | count > 0 }}"
+        then:
+          - service: input_boolean.turn_off
+            target: {entity_id: "{{ andre }}"}
+      - service: input_boolean.turn_on
+        target:
+          entity_id:
+            - input_boolean.dance_room_stue
+            - input_boolean.dance_room_spisestue
+            - input_boolean.dance_room_koekken
+      # sensor.dance_active_bulbs gen-renderer på rum-skiftet (samme 300 ms
+      # som dance_room_change_restart venter).
+      - delay: {milliseconds: 400}
+      # Samme rækkefølge som light.festlys' set_effect: eventet FØR dance_mode
+      # slukkes, ellers læser orchestrate's stop-gren event == off → release.
+      - service: input_select.select_option
+        target: {entity_id: input_select.dance_manual_event}
+        data: {option: frost}
+      - if:
+          - condition: state
+            entity_id: input_boolean.dance_mode
+            state: "on"
+        then:
+          - service: input_boolean.turn_off
+            target: {entity_id: input_boolean.dance_mode}
+      - service: logbook.log
+        data:
+          name: "Festlys"
+          message: >-
+            Frost: "{{ state_attr('sensor.spotify_bro', 'titel') }}" spiller — iskrystal i
+            stue, spisestue og køkken.
+
+  festlys_frost_slut:
+    alias: "Festlys: Frost-sangen slut — tilbage til før"
+    mode: queued
+    max: 5
+    variables:
+      # Læs + parse i ÉN blok: en variabel med JSON-teksten native-parses til
+      # en dict (ingen .startswith) — slut-vejen døde på det 26/10.
+      snap: >-
+        {% set f = states('input_text.festlys_frost_foer') %}
+        {{ f | from_json if f.startswith('{') else {} }}
+      rum: "{{ (state_attr('sensor.dance_rum_kort', 'rum') or {}).keys() | list }}"
+      eier: "{{ is_state('input_select.dance_manual_event', 'frost') }}"
+      fam: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+      foer_event: "{{ snap.e | default('off') }}"
+      foer_dance: "{{ snap.d | default('off') }}"
+      events: "{{ state_attr('input_select.dance_manual_event', 'options') or [] }}"
+    sequence:
+      - if:
+          - condition: template
+            value_template: "{{ eier and foer_event != 'frost' }}"
+        then:
+          - choose:
+              # Et låst event kørte før sangen → tilbage til det.
+              - conditions:
+                  - condition: template
+                    value_template: "{{ fam and foer_event != 'off' and foer_event in events }}"
+                sequence:
+                  - service: input_select.select_option
+                    target: {entity_id: input_select.dance_manual_event}
+                    data: {option: "{{ foer_event }}"}
+              # Auto-shufflen kørte → tænd den FØR eventet slippes, så
+              # runnerens off-gren ikke kalder release.
+              - conditions:
+                  - condition: template
+                    value_template: "{{ fam and foer_dance == 'on' }}"
+                sequence:
+                  - service: input_boolean.turn_on
+                    target: {entity_id: input_boolean.dance_mode}
+                  - service: input_select.select_option
+                    target: {entity_id: input_select.dance_manual_event}
+                    data: {option: "off"}
+            # Ingen fest før → slip eventet: runneren sætter rummene Auto og
+            # festens pærer tilbage til Auto-looket.
+            default:
+              - service: input_select.select_option
+                target: {entity_id: input_select.dance_manual_event}
+                data: {option: "off"}
+          # Rum-knapperne må først lægges tilbage når release er færdig —
+          # dance_restore_auto læser festens pærer (`valgte`) undervejs.
+          - wait_template: "{{ is_state('script.dance_room_modes_release', 'on') }}"
+            timeout: "00:00:10"
+            continue_on_timeout: true
+          - wait_template: "{{ is_state('script.dance_room_modes_release', 'off') }}"
+            timeout: "00:00:45"
+            continue_on_timeout: true
+      # Rum-knapperne tilbage — når vi selv afsluttede, eller når festen er
+      # slukket. Har nogen skiftet til et andet event midt i sangen, ejer de
+      # rum-valget nu.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ 'r' in snap and (eier
+                 or (is_state('input_boolean.dance_mode', 'off')
+                     and is_state('input_select.dance_manual_event', 'off'))) }}
+        then:
+          - repeat:
+              for_each: "{{ rum }}"
+              sequence:
+                - variables:
+                    kontakt: "input_boolean.dance_room_{{ repeat.item }}"
+                    skal: "{{ 'on' if repeat.item in snap.r else 'off' }}"
+                - if:
+                    - condition: template
+                      value_template: "{{ states(kontakt) in ['on', 'off'] and states(kontakt) != skal }}"
+                  then:
+                    - service: "input_boolean.turn_{{ skal }}"
+                      target: {entity_id: "{{ kontakt }}"}
+      - service: input_text.set_value
+        target: {entity_id: input_text.festlys_frost_foer}
+        data: {value: ""}
+      - service: logbook.log
+        data:
+          name: "Festlys"
+          message: >-
+            Frost slut — {{ 'festlys tilbage som før sangen' if eier
+            else 'festen var allerede skiftet/slukket; kun rum-knapperne lagt tilbage' }}.
+
+automation:
+  - id: festlys_frost_sang
+    alias: "Festlys: Frost-sangene → iskrystal i open-plan"
+    description: >-
+      Let It Go (Frozen) / Lad det ske (Frost) på højttaleren → festlys-eventet
+      frost i stue, spisestue og køkken; tilbage til før når sangen slutter.
+    mode: queued
+    max: 5
+    trigger:
+      # Eksplicit from: (B103) — et template.reload går on → unavailable → on.
+      - platform: state
+        entity_id: binary_sensor.festlys_frost_sang
+        from: "off"
+        to: "on"
+        id: start
+      - platform: state
+        entity_id: binary_sensor.festlys_frost_sang
+        from: "on"
+        to: "off"
+        id: slut
+    action:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: start
+            sequence:
+              - service: script.festlys_frost_start
+          - conditions:
+              - condition: trigger
+                id: slut
+            sequence:
+              - service: script.festlys_frost_slut
+
+  # Efter en restart er dance_manual_event "off" (initial), og sensorens første
+  # state er ingen flanke: spiller sangen stadig, start igen; er en fest-
+  # tilstand gemt og sangen væk, gendan. Egen automation: 60 s-ventetiden må
+  # ikke stå i kø foran en ægte start-flanke (målt 26/10: 42 s forsinket start
+  # da sangen blev sat på lige efter en restart).
+  - id: festlys_frost_genstart
+    alias: "Festlys: Frost-sangene efter restart"
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - delay: {seconds: 60}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ is_state('binary_sensor.festlys_frost_sang', 'on')
+                     and not is_state('input_select.dance_manual_event', 'frost') }}
+            sequence:
+              - service: script.festlys_frost_start
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ is_state('binary_sensor.festlys_frost_sang', 'off')
+                     and states('input_text.festlys_frost_foer').startswith('{') }}
+            sequence:
+              - service: script.festlys_frost_slut

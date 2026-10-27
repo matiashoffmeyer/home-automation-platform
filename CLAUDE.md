@@ -36,21 +36,21 @@ og incident-forløb ligger i docs/ og koster kun tokens når nogen læser dem.
 måledata: `grep -n "Sprint <dato>" docs/sprint_log.md`.** Er en lærdom permanent,
 hører den i "Permanente fakta" eller som en fejlklasse — ikke i en sprint-note.
 
-- **2026-10-21 — en regel der vogter DELE af tallet, vogter ikke tallet.**
-  "Kun ned ved hoveddøren" lækkede 51 gange på 14 døgn: v5 låste familie- og
-  ekstra-delen, mens Dormant, geofence-exit, familie-vækst, rå zoner og manuel-
-  udløb sænkede det VISTE tal. v6: ét holdt tal, ned kun i dør-vinduet; tjek
-  `ha_health.sh people`. Samme dag: bad-boksen beviser ≥ 2. B245, B246.
-- **2026-10-22 — en dom der lander efter vinduet, er stadig dørens dom.** Dør
-  08:10; et sove-spøgelse holdt buddet på 1 og gen-låste ekstra-gulvet, og
-  Dormant kom 27 s før dør-vinduet lukkede → 1 i et tomt hus hele dagen. Nu
-  sætter Dormant ≤ `people_afgang_dom_minutter` (120) efter døren 0 og rydder
-  ekstra (30 døgn: dommen 35-104 min, første forkerte Dormant 284 min). B246.
 - **2026-10-25 — budgettér HUSETS sum, ikke pr. pære.** Halloween sendte ~2
   Matter-kommandoer/s (B222's tempo-gulv pr. pære holdt ikke summen nede) og
   hard-hang OTBR'en. Nu skriver festlys kun til Thread-pærerne på deres plads i
   ét fælles gitter (`custom_templates/festlys.jinja`, 8/min for hele huset): 7 min
   worst case = 1 enkelt reset. En reset-KLYNGE er festens tegn; ~1,8/t er baggrund. B260.
+- **2026-10-26 — et vidne for en sovende partner beskytter ingen, når begge
+  voksne beviseligt er gået.** Sove-spøgelset (06:39-09:24; g2_still = 100 dæmper
+  ikke energi 100, B269) spærrede alle hurtige dvale-veje, prel-vagten satte Active
+  igen. `binary_sensor.sove_efterslaeb_efter_afgang` (episode før døren + Parent B's
+  anker-flanke ved døren) tager vidnet ud; latchens børne-ring er brudt. B268.
+- **2026-10-27 — en fest tælles i zone-MASSE, ikke i hoveder.** 15 gæster
+  viste 3: zonerne er låst til 8 (loft 6), og ekstra-gulvet nulstilles ved hver
+  dør. `binary_sensor.people_fest` (min(45-, 15-min-snit af optagne zoner) ≥ 4,2;
+  uden fest max 3,71 på 30 døgn) løfter buddet til 3,0 × masse, loft 30. Massen
+  tæller IKKE 1-4 personer (p50 1,5-1,8 for alle) — faktoren hviler på én fest. B271.
 ---
 
 ## 💡 Permanente fakta (destilleret fra arkiverede sprints)

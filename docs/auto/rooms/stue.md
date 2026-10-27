@@ -112,7 +112,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.spisestue_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_frossen_ghost` — 2 refs in 2 file(s)
 - `binary_sensor.spisestue_apollo_occupancy` — 29 refs in 19 file(s)
-- `binary_sensor.spisestue_apollo_occupancy_filtered` — 112 refs in 40 file(s)
+- `binary_sensor.spisestue_apollo_occupancy_filtered` — 114 refs in 41 file(s)
 - `binary_sensor.spisestue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_radar_moving_target` — 12 refs in 11 file(s)
 - `binary_sensor.spisestue_apollo_radar_still_target` — 1 refs in 1 file(s)
@@ -128,7 +128,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.stue_apollo_bevaegelse_frisk` — 2 refs in 2 file(s)
 - `binary_sensor.stue_apollo_frossen_ghost` — 4 refs in 3 file(s)
 - `binary_sensor.stue_apollo_occupancy` — 24 refs in 16 file(s)
-- `binary_sensor.stue_apollo_occupancy_filtered` — 119 refs in 48 file(s)
+- `binary_sensor.stue_apollo_occupancy_filtered` — 121 refs in 49 file(s)
 - `binary_sensor.stue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.stue_apollo_radar_moving_target` — 10 refs in 9 file(s)
 - `binary_sensor.stue_apollo_radar_still_target` — 1 refs in 1 file(s)
@@ -164,8 +164,8 @@ Search keywords: `stue, open_plan`
 
 ### `input_boolean.*`
 
-- `input_boolean.dance_room_spisestue` — 3 refs in 3 file(s)
-- `input_boolean.dance_room_stue` — 4 refs in 3 file(s)
+- `input_boolean.dance_room_spisestue` — 4 refs in 4 file(s)
+- `input_boolean.dance_room_stue` — 5 refs in 4 file(s)
 - `input_boolean.open_plan_fuldt_lys` — 18 refs in 7 file(s)
 - `input_boolean.putte_glare_spisestue_vest_ned` — 9 refs in 4 file(s)
 - `input_boolean.roborock_let_stue_enabled` — 4 refs in 3 file(s)

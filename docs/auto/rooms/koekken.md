@@ -66,7 +66,7 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.koekken_apollo_naer_bekraeftet` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_naer_kandidat` — 4 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_occupancy` — 33 refs in 18 file(s)
-- `binary_sensor.koekken_apollo_occupancy_filtered` — 111 refs in 43 file(s)
+- `binary_sensor.koekken_apollo_occupancy_filtered` — 112 refs in 43 file(s)
 - `binary_sensor.koekken_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_radar_moving_target` — 19 refs in 12 file(s)
 - `binary_sensor.koekken_apollo_radar_still_target` — 2 refs in 2 file(s)
@@ -77,7 +77,7 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.koekken_arbejdslys` — 8 refs in 3 file(s)
 - `binary_sensor.koekken_bevaegelse_nylig` — 5 refs in 2 file(s)
 - `binary_sensor.koekken_bevaegelse_raa` — 2 refs in 1 file(s)
-- `binary_sensor.koekken_dvale_vidne` — 2 refs in 2 file(s)
+- `binary_sensor.koekken_dvale_vidne` — 3 refs in 3 file(s)
 - `binary_sensor.koekken_hjemkomstlys` — 1 refs in 1 file(s)
 - `binary_sensor.koekken_kamera_krop` — 9 refs in 5 file(s)
 - `binary_sensor.koekken_kamera_krop_gyldig` — 2 refs in 2 file(s)
@@ -101,7 +101,7 @@ Search keywords: `koekken, kokken`
 
 ### `input_boolean.*`
 
-- `input_boolean.dance_room_koekken` — 8 refs in 5 file(s)
+- `input_boolean.dance_room_koekken` — 9 refs in 6 file(s)
 - `input_boolean.koekken_blik_arm_enabled` — 3 refs in 3 file(s)
 - `input_boolean.koekken_cooking_ramp` — 4 refs in 3 file(s)
 - `input_boolean.koekken_kamera_krop_enabled` — 7 refs in 5 file(s)

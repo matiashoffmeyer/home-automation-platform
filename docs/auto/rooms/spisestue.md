@@ -42,7 +42,7 @@ Search keywords: `spisestue`
 - `binary_sensor.spisestue_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_frossen_ghost` — 2 refs in 2 file(s)
 - `binary_sensor.spisestue_apollo_occupancy` — 29 refs in 19 file(s)
-- `binary_sensor.spisestue_apollo_occupancy_filtered` — 112 refs in 40 file(s)
+- `binary_sensor.spisestue_apollo_occupancy_filtered` — 114 refs in 41 file(s)
 - `binary_sensor.spisestue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_radar_moving_target` — 12 refs in 11 file(s)
 - `binary_sensor.spisestue_apollo_radar_still_target` — 1 refs in 1 file(s)
@@ -65,7 +65,7 @@ Search keywords: `spisestue`
 
 ### `input_boolean.*`
 
-- `input_boolean.dance_room_spisestue` — 3 refs in 3 file(s)
+- `input_boolean.dance_room_spisestue` — 4 refs in 4 file(s)
 - `input_boolean.putte_glare_spisestue_vest_ned` — 9 refs in 4 file(s)
 - `input_boolean.roborock_styrbar_kort_op_spisestue` — 1 refs in 1 file(s)
 - `input_boolean.roborock_styrbar_lang_op_spisestue` — 1 refs in 1 file(s)

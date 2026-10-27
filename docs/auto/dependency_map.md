@@ -8,38 +8,38 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 
 | Entity | Files | Refs |
 |---|---|---|
-| `input_select.house_mode` | 121 | 289 |
+| `input_select.house_mode` | 123 | 293 |
 | `input_select.house_state` | 74 | 238 |
-| `binary_sensor.stue_apollo_occupancy_filtered` | 48 | 119 |
+| `binary_sensor.stue_apollo_occupancy_filtered` | 49 | 121 |
+| `binary_sensor.entre_valhorn_occupancy` | 48 | 108 |
 | `light.spisestue_loft` | 47 | 121 |
-| `binary_sensor.entre_valhorn_occupancy` | 47 | 106 |
-| `binary_sensor.sovevaerelse_apollo_occupancy` | 46 | 91 |
-| `binary_sensor.boernevaerelse_apollo_occupancy` | 46 | 121 |
+| `binary_sensor.sovevaerelse_apollo_occupancy` | 46 | 94 |
+| `binary_sensor.boernevaerelse_apollo_occupancy` | 46 | 123 |
 | `script.push_notify` | 45 | 98 |
 | `light.koekken_lyskaede` | 44 | 190 |
-| `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 111 |
+| `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 112 |
 | `input_boolean.godnat_active` | 43 | 96 |
-| `input_boolean.godnat_boern_active` | 41 | 95 |
+| `input_boolean.godnat_boern_active` | 42 | 96 |
+| `binary_sensor.spisestue_apollo_occupancy_filtered` | 41 | 114 |
 | `sun.sun` | 41 | 144 |
-| `binary_sensor.spisestue_apollo_occupancy_filtered` | 40 | 112 |
+| `binary_sensor.badevaerelse_inde_occupancy` | 39 | 134 |
 | `light.spisestue_pendel` | 39 | 136 |
-| `binary_sensor.badevaerelse_inde_occupancy` | 38 | 132 |
 | `light.stue_laesehygge` | 37 | 82 |
 | `light.boernevaerelse_loft` | 37 | 95 |
 | `sensor.open_plan_lux` | 35 | 103 |
 | `light.entre_loft` | 34 | 82 |
-| `binary_sensor.depot_valhorn_occupancy` | 31 | 70 |
+| `binary_sensor.depot_valhorn_occupancy` | 32 | 72 |
 | `light.boernevaerelse_hygge_strip` | 31 | 89 |
+| `binary_sensor.godnat_common_active` | 30 | 77 |
 | `binary_sensor.godnat_any_active` | 29 | 58 |
 | `input_boolean.cinema_active` | 29 | 58 |
-| `light.terrasse_paerelyskaede` | 29 | 99 |
 
 ## State machine entities (kritiske)
 
 | Entity | Purpose | Files |
 |---|---|---|
 | `input_select.house_state` | Top-level state: Active vs Dormant | 74 |
-| `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 121 |
+| `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 123 |
 | `input_boolean.godnat_active` | Godnat night mode | 43 |
 | `input_boolean.godnat_pending` | Godnat in progress | 19 |
 | `input_boolean.cinema_active` | Cinema mode (mood) | 29 |

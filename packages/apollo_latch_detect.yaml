@@ -180,21 +180,48 @@ template:
             ('boernevaerelse','boernevaerelse','Børneværelse')] %}
           {% set lim = states('input_number.apollo_latch_minutter') | float(120) * 60 %}
           {% set mgn = states('input_number.apollo_latch_margin') | float(4) %}
-          {# ALLE ude = ingen af de to voksne er i home-zonen OG børnene er ikke
-             hjemme. For Parent A er TRACKEREN (ikke input_boolean.<person>_home)
+          {# VOKSNE ude = ingen af de to voksne er i home-zonen (børnene afgøres
+             pr. rum, se næste blok). For Parent A er TRACKEREN (ikke input_boolean.<person>_home)
              det ærlige signal: `*_home`-flagene slukkes også af ren
              GPS-staleness, mens trackeren kun står 'not_home' ved en
              registreret afgang. For Parent B findes den ærlighed ikke længere —
              hendes tracker er permanent frossen på 'home' efter iOS-migrationen
              08-15, hvilket gjorde HELE latch-detektoren død (= ingen nødudgang
              for en hængende radar). Hun læses derfor via ankeret. #}
-          {% set ude = is_state('person.parent_a', 'not_home')
-                       and is_state('binary_sensor.parent_b_hjemme_anker', 'off')
-                       and not is_state('binary_sensor.kids_home', 'on') %}
+          {# 2026-10-26 (B268): børnene tæller kun når ET ANDET RUM viser
+             tilstedeværelse. Uden voksne er kids_home = force-on OG
+             physical_presence_recent — og recent fodres af netop den radar vi
+             skal dømme. Et spøgelse holdt dermed sig selv i live: spøgelse →
+             recent → kids_home → "ikke ude" → ingen maske → recent (fejlklasse
+             #23, 26/10: sove-spøgelset 06:39 → hele formiddagen, mens børnene
+             var i institution). Barnepige-sagen er bevaret: sovende børn +
+             en voksen uden tracker — hun ses i et ANDET rum end børnene, og så
+             tæller de stadig (og maskeres/repareres ikke).
+             Vidnerne er de spøgelses-filtrerede dvale-sensorer, ikke de rå —
+             køkkenets rå radar blinker konstant og ville tænde/slukke masken. #}
+          {% set voksne_ude = is_state('person.parent_a', 'not_home')
+                              and is_state('binary_sensor.parent_b_hjemme_anker', 'off') %}
+          {% set boern = is_state('binary_sensor.kids_home', 'on') %}
+          {% set vidner = [
+            ('stue', 'binary_sensor.stue_apollo_occupancy_filtered'),
+            ('spisestue', 'binary_sensor.spisestue_apollo_occupancy_filtered'),
+            ('koekken', 'binary_sensor.koekken_dvale_vidne'),
+            ('sovevaerelse', 'binary_sensor.sovevaerelse_dvale_vidne'),
+            ('boernevaerelse', 'binary_sensor.boernevaerelse_apollo_occupancy'),
+            ('bad', 'binary_sensor.badevaerelse_inde_occupancy'),
+            ('entre', 'binary_sensor.entre_valhorn_occupancy'),
+            ('depot', 'binary_sensor.depot_valhorn_occupancy')] %}
           {% set bad = ['unknown', 'unavailable', 'none', ''] %}
           {% set ns = namespace(laaste=[], plan=[]) %}
-          {% if is_state('input_boolean.apollo_latch_enabled', 'on') and ude %}
+          {% if is_state('input_boolean.apollo_latch_enabled', 'on') and voksne_ude %}
             {% for room, slug, navn in rooms %}
+              {% set andre = namespace(paa=false) %}
+              {% for vrum, ve in vidner %}
+                {% if vrum != room and is_state(ve, 'on') %}
+                  {% set andre.paa = true %}
+                {% endif %}
+              {% endfor %}
+              {% set ude = not (boern and andre.paa) %}
               {# 💡 `ts > 0` er IKKE nok: et URØRT input_datetime med has_date
                  står på DAGENS midnat (ikke 1970), og dets timestamp læses 2 t
                  forskudt → "aldrig sat" ser ud som et stempel fra kl. 02:00 i
@@ -207,7 +234,7 @@ template:
               {% set sat = raw not in bad and raw[11:] != '00:00:00' %}
               {% set ts = state_attr('input_datetime.' ~ slug ~ '_apollo_occ_since',
                                      'timestamp') | float(0) %}
-              {% if is_state('binary_sensor.' ~ room ~ '_apollo_occupancy', 'on')
+              {% if ude and is_state('binary_sensor.' ~ room ~ '_apollo_occupancy', 'on')
                     and sat and (now().timestamp() - ts) >= lim %}
                 {% set ns.laaste = ns.laaste + [room] %}
                 {% set md = states('sensor.' ~ room ~ '_apollo_radar_moving_distance') %}

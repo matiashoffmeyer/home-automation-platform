@@ -27,7 +27,7 @@ Search keywords: `hoveddoer, parasoll_hoveddoer`
 
 ### `input_datetime.*`
 
-- `input_datetime.hoveddoer_last_open` — 5 refs in 5 file(s)
+- `input_datetime.hoveddoer_last_open` — 10 refs in 7 file(s)
 
 ### `input_number.*`
 

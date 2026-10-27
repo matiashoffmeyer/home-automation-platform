@@ -15,7 +15,7 @@ Search keywords: `entre`
 
 ### `automations/airbnb_mode.yaml`
 
-- **AirBnB: Dormant -> Active ved entré presence (comfort welcome)** (line 1094, mode=single)
+- **AirBnB: Dormant -> Active ved entré presence (comfort welcome)** (line 1095, mode=single)
   - Hvis huset er Dormant og guest entrer entré, tænd lys "behageligt"
 
 ### `automations/arrival.yaml`
@@ -65,7 +65,7 @@ Search keywords: `entre`
 - `binary_sensor.entre_morgen_passager_nok` — 1 refs in 1 file(s)
 - `binary_sensor.entre_roegalarm` — 2 refs in 2 file(s)
 - `binary_sensor.entre_stedfortraeder_bevaegelse` — 6 refs in 2 file(s)
-- `binary_sensor.entre_valhorn_occupancy` — 106 refs in 47 file(s)
+- `binary_sensor.entre_valhorn_occupancy` — 108 refs in 48 file(s)
 - `binary_sensor.entre_vallhorn_haengt` — 6 refs in 3 file(s)
 
 ### `button.*`

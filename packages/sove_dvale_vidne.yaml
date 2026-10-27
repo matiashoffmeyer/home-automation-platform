@@ -69,3 +69,113 @@ template:
         delay_off:
           minutes: 16
         state: "{{ is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'on') }}"
+
+  # Parent B's seneste anker-afgang som SKREVET stempel. `last_changed` duer ikke:
+  # den nulstilles ved hver restart, og et hængende anker ville så ligne en frisk
+  # afgang. En trigger-sensor gendanner sin state efter restart. `from: "on"`
+  # gør reload-/opstarts-flanker (unavailable → off) usynlige.
+  - trigger:
+      - platform: state
+        entity_id: binary_sensor.parent_b_hjemme_anker
+        from: "on"
+        to: "off"
+    sensor:
+      - name: "Parent B anker off stempel"
+        unique_id: parent_b_anker_off_stempel
+        device_class: timestamp
+        icon: mdi:map-marker-off
+        state: "{{ now().isoformat() }}"
+
+  # =======================================================================
+  # EFTERSLÆB EFTER AFGANG (2026-10-26, B268) — vidnet er ikke et bevis når
+  # begge voksne BEVISELIGT er gået
+  # =======================================================================
+  # INCIDENT 26/10: Parent A kørte 07:13, Parent B gik ud ad hoveddøren 07:38
+  # (anker off 07:43:47). Sove-radaren havde holdt optaget siden 06:39 og
+  # blev ved — still-mål på 150-218 cm med still-energi 100 %, selv om
+  # g2_still står på 100. Vidnet holdt derfor ON, og det blokerede ALLE
+  # hurtige veje: afgangs-dvalen (~07:56), flag-fast (~08:14), idle
+  # (activity_state = bedroom_only). 3t-vejen satte Dormant 09:09, og
+  # bounce-vagten satte Active igen 09:14 på samme vidne. Samme spøgelse
+  # 20/10 og 24/10 (huset flappede Dormant↔Active hvert 5.-10. min).
+  #
+  # Blokken på vidnet findes for at beskytte en SOVENDE PARTNER. En sovende
+  # partner er en voksen — og er begge voksne beviseligt væk, er der ingen
+  # at beskytte. "Beviseligt" er hele sagen:
+  #   • Parent A: person-entityen (Android, zone-baseret) står kun væk ved en
+  #     registreret afgang.
+  #   • Parent B: ankeret kan HÆNGE off — 21/10 sendte hendes iOS-genvej
+  #     aldrig "arrive", og hun sov hjemme med ankeret off hele natten.
+  #     Derfor kræves en FRISK off-flanke, der hører til netop denne
+  #     afgang. Målt 30 døgn (`hoveddoer_last_open` × anker-flanker): når
+  #     det er Parent B der går, kommer off-flanken 3-17 min EFTER døren
+  #     (n = 18); det forældede anker 21-22/10 lå 245-554 min FØR døren.
+  #     Grænsen "tidligst 10 min før døren" ligger i det hul.
+  #     Og senest `people_afgang_dom_minutter` EFTER døren — samme vindue
+  #     som people-tallets dør-dom (22/10): en afgang der lander i vinduet
+  #     er dørens; en anker-flanke timer senere uden dør er ikke et bevis.
+  #   • Rå-episoden skal være startet FØR døren (skrevet, restart-sikkert
+  #     stempel `sove_apollo_occ_since`). Et nyt ophold efter døren er en
+  #     ny observation, ikke efterslæb — så ARMER vi ikke.
+  #
+  # ARM + HOLD (trigger-sensor, så staten overlever restart og reload):
+  # spøgelset taber og gen-fanger sit mål — så nulstilles occ_since til et
+  # tidspunkt EFTER døren, mens vidnet bygger bro i 16 min. Uden hold ville
+  # masken slippe midt i episoden, og bounce-vagten ville sætte Active på
+  # det vidne den lige var holdt fri af (20/10 + 24/10: Dormant↔Active
+  # hvert 5.-10. min). Masken HOLDER derfor til (a) både vidne og rå radar
+  # står off, (b) hoveddøren går igen (`doer`-attributten skifter), eller
+  # (c) en voksen er hjemme / ankeret on / AirBnB. `unknown`/`unavailable`
+  # (restart, template-reload) bryder ikke holdet — kun et bekræftet off.
+  #
+  # Bevidst IKKE dækket: går Parent A sidst (Parent B's flanke er ældre end
+  # døren), kan vi ikke skelne hendes ægte afgang fra et hængende anker →
+  # vidnet blokerer som før, og latch-detektoren tager spøgelset efter
+  # `apollo_latch_minutter`.
+  #
+  # Forbrugere (KUN dvale-beslutningerne, ikke vækning/godnat/lys):
+  # departure_dormant.yaml (blokken), house_modes.yaml
+  # (physical_presence_credible_fast) og dormant_schedule.yaml (09:30,
+  # weekend og bounce-vagten).
+  - trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.sovevaerelse_dvale_vidne
+          - binary_sensor.sovevaerelse_apollo_occupancy
+          - input_datetime.sove_apollo_occ_since
+          - input_datetime.hoveddoer_last_open
+          - person.parent_a
+          - binary_sensor.parent_b_hjemme_anker
+          - sensor.parent_b_anker_off_stempel
+          - input_select.house_mode
+          - input_number.people_afgang_dom_minutter
+      - platform: homeassistant
+        event: start
+    binary_sensor:
+      - name: "Sove efterslaeb efter afgang"
+        unique_id: sove_efterslaeb_efter_afgang
+        icon: mdi:bed-clock
+        state: >-
+          {% set bad = ['unknown', 'unavailable', 'none', ''] %}
+          {% set doer = state_attr('input_datetime.hoveddoer_last_open', 'timestamp') | float(0) %}
+          {% set dom = states('input_number.people_afgang_dom_minutter') | float(120) * 60 %}
+          {% set occ_raw = states('input_datetime.sove_apollo_occ_since') %}
+          {% set occ = state_attr('input_datetime.sove_apollo_occ_since', 'timestamp') | float(0) %}
+          {% set c_off = as_timestamp(states('sensor.parent_b_anker_off_stempel'), 0) %}
+          {% set raw = states('binary_sensor.sovevaerelse_apollo_occupancy') %}
+          {% set vidne = states('binary_sensor.sovevaerelse_dvale_vidne') %}
+          {% set voksne_ude = not is_state('input_select.house_mode', 'AirBnB')
+                              and states('person.parent_a') not in ['home'] + bad
+                              and is_state('binary_sensor.parent_b_hjemme_anker', 'off') %}
+          {# occ_since: 1970 = ryddet, dagens midnat = urørt → begge har
+             tidsdel 00:00:00 og tæller som "ikke sat" (fejler lukket). #}
+          {% set arm = voksne_ude and raw == 'on'
+                       and occ_raw not in bad and occ_raw[11:] != '00:00:00'
+                       and doer > 86400 and occ < doer
+                       and doer - 600 <= c_off <= doer + dom %}
+          {% set hold = voksne_ude and this.state == 'on'
+                        and ((this.attributes.doer | default(0)) | float(0) - doer) | abs < 1
+                        and not (vidne == 'off' and raw == 'off') %}
+          {{ arm or hold }}
+        attributes:
+          doer: "{{ state_attr('input_datetime.hoveddoer_last_open', 'timestamp') | float(0) }}"

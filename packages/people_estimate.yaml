@@ -93,6 +93,25 @@
 # og rydder ekstra-gulvet (people_gulv_foelg). Et Dormant uden en dør foran sig
 # sænker stadig intet.
 #
+# v7 (2026-10-27, user: "i søndags havde vi besøg af 15 mennesker. people count
+# gættede på 3 … måske skal vi også bruge apollo akkumulering"): FEST-VEJEN.
+# Zone-modellen kan ikke tælle en fest — 8 zoner, loft 6, og ekstra-gulvet
+# nulstilles ved hver dør (25/10 stod ekstra_nu > 0 i 66 min i alt, aldrig
+# 900 s i træk). En fest er i stedet MANGE zoner optaget LÆNGE:
+#   sensor.people_zone_masse  — antal optagne zoner (husets_occupancy) samplet
+#                               hvert minut; min(snit over 45 min, over 15 min).
+#   binary_sensor.people_fest — masse ≥ people_fest_masse (4,2); holder til
+#                               45-min-snittet < people_fest_slip_masse (3,5).
+#   bud                       — max(familie-buddet, people_fest_faktor (3,0) ×
+#                               masse), loft 30, kun mens festen står.
+# Målt 30 døgn (27/9-27/10, minut-gitter): uden fest max 3,71 (p99,9 3,47),
+# festen 25/10 ≥ 4,2 i 94 min fra 13:56, plateau-median 4,9 → faktor 3,0 =
+# 15 personer. Faktoren er kalibreret på ÉN fest; masse 1,5-1,8 for 1-4 kendte
+# personer, så massen tæller ikke små selskaber. Dør-reglen er uændret: festens
+# tal holdes til næste hoveddør (folk går ud ad den), i vinduet følger det
+# massen. Simuleret 25/10: 13 kl. 13:55, 16 i toppen, 12 fra 15:40 til døren
+# 16:46.
+#
 # v5 (2026-10-01, user: "people count bør ikke gå ned uden hoveddøren åbnes.
 # systemet skal stole på sig selv … feks er vi 3 hjemme i dag"): v4 gav kun
 # EKSTRA-delen et gulv. Familie-delen faldt uden dør: barnet talte kun mens
@@ -165,10 +184,11 @@ input_number:
   # tal står (runtime, ikke config → udeladt af helpers-snapshot). Skrives af
   # people_gulv_foelg (op på et bud der har holdt, ned kun i dør-vinduet),
   # people_manuel_juster og "For mange"-svaret. Dormant rører det ikke.
+  # v7: max 30 for fest-vejen (familie-vejen har stadig loft 6 i buddet).
   people_gulv:
     name: "People: holdt antal (runtime)"
     min: 0
-    max: 6
+    max: 30
     step: 1
     icon: mdi:account-lock
     mode: box
@@ -181,10 +201,11 @@ input_number:
   # v6: people_manuel_juster sætter også det holdte tal, så udløbet ikke flytter
   # tallet.
   # Runtime, ikke config → udeladt af helpers-snapshot.
+  # v7: max 30 — 25/10 kunne user ikke engang taste 15 gæster.
   people_manuel:
     name: "People: manuelt antal (runtime, -1 = model)"
     min: -1
-    max: 6
+    max: 30
     step: 1
     icon: mdi:account-edit
     mode: box
@@ -283,6 +304,38 @@ input_number:
     step: 30
     unit_of_measurement: "s"
     icon: mdi:timer-lock-outline
+    mode: box
+
+  # v7 FEST-VEJEN (se headeren). Målt 30 døgn: uden fest max 3,71, festen
+  # 25/10 ≥ 4,2 i 94 min → 0,5 margin; 8 = fra (8 zoner er max).
+  people_fest_masse:
+    name: "People: fest når zone-massen er mindst"
+    min: 2
+    max: 8
+    step: 0.1
+    icon: mdi:party-popper
+    mode: box
+
+  # Slip på 45-min-snittet: 25/10 holdt det ≥ 3,5 til 16:11 (min-massen faldt
+  # under 4,2 allerede 15:39). Uden fest max 3,78 — men festen skal først op
+  # på people_fest_masse, så familien alene holder den ikke i live.
+  people_fest_slip_masse:
+    name: "People: festen slutter når 45-min-massen er under"
+    min: 1
+    max: 8
+    step: 0.1
+    icon: mdi:party-popper
+    mode: box
+
+  # Personer pr. optaget zone. 25/10: 15 gæster ved masse-plateau 4,9 → 3,0.
+  # ÉT datapunkt — ret den når næste fest har et facit (+/- på Status logger
+  # zone_masse i people_estimate_feedback.jsonl).
+  people_fest_faktor:
+    name: "People: personer pr. optaget zone under fest"
+    min: 1
+    max: 6
+    step: 0.1
+    icon: mdi:account-group
     mode: box
 
   # v4: antal børn når børnene er hjemme. Default 2 (Child A + Child B); user
@@ -462,6 +515,57 @@ template:
         delay_on: >
           {{ ((states('number.boernevaerelse_apollo_radar_timeout') | float(900))
               + (states('input_number.people_boern_solo_sekunder') | float(60))) | int }}
+
+  # FEST-MASSEN (v7, 2026-10-27, se headeren). Hvert minut: hvor mange af
+  # husets 8 zoner (rosters/husets_occupancy.yaml) er optaget, i en ring-buffer
+  # på 45 samples. Masse = min(snit 45 min, snit 15 min): 45 min kræver at
+  # festen har HOLDT, 15 min at den stadig står (falder ~20 min efter at
+  # folk går). Målt på samme minut-gitter som her (30 døgn).
+  # Robotten kører gennem alle zoner → bufferen fryses mens dens maske står.
+  # State er aldrig none: en trigger-sensor på `unknown` får IKKE bufferen
+  # gendannet ved restart (template/entity.py). Bufferen skifter hvert minut →
+  # ekskluderet fra recorderen (configuration.yaml); zonerne selv er optaget,
+  # så massen kan altid regnes efter offline.
+  - trigger:
+      - trigger: time_pattern
+        minutes: "/1"
+    action:
+      - variables:
+          buf: >-
+            {% from 'rosters.jinja' import husets_occupancy %}
+            {% set b = state_attr('sensor.people_zone_masse', 'buf') %}
+            {% set b = b if b is list else [] %}
+            {% if is_state('binary_sensor.roborock_zone_maskering', 'on') %}{{ b }}
+            {% else %}{{ (b + [husets_occupancy | select('is_state', 'on') | list | count])[-45:] }}
+            {% endif %}
+      - variables:
+          m45: >-
+            {{ ((buf | sum) / (buf | count)) | round(3) if buf | count > 0 else 0 }}
+          m15: >-
+            {% set k = buf[-15:] %}
+            {{ ((k | sum) / (k | count)) | round(3) if k | count > 0 else 0 }}
+    sensor:
+      - name: "People zone-masse"
+        unique_id: people_zone_masse
+        icon: mdi:account-group
+        unit_of_measurement: "zoner"
+        state: "{{ [m45, m15] | min | round(2) }}"
+        attributes:
+          buf: "{{ buf }}"
+          m45: "{{ m45 | round(2) }}"
+          m15: "{{ m15 | round(2) }}"
+    binary_sensor:
+      # Hysterese: TÆND på min-massen, SLIP først når 45-min-snittet er faldet.
+      # 25/10: tændt 13:56-16:11. Kræver en fuld buffer, så en frisk sensor
+      # (første deploy) ikke tænder på få samples.
+      - name: "People fest"
+        unique_id: people_fest
+        icon: mdi:party-popper
+        state: >-
+          {{ buf | count >= 45
+             and ([m45, m15] | min >= states('input_number.people_fest_masse') | float(8)
+                  or (this.state == 'on'
+                      and m45 >= states('input_number.people_fest_slip_masse') | float(8))) }}
 
   - sensor:
       - name: "People zones now"
@@ -728,10 +832,16 @@ template:
                gæst. Uden kendt familie (AirBnB, begge flag off mens nogen ER her)
                er zonerne det eneste bevis → brug dem straks, som v3.
                v2: loft på 6 (user-spec "people count skal gå op til 6"). #}
+            {# v7: fest-vejen — faktor × zone-masse mens festen står, loft 30
+               (= max på people_gulv). Familie-vejens loft 6 er uændret. #}
+            {% set fest = ([(states('input_number.people_fest_faktor') | float(3)
+                              * states('sensor.people_zone_masse') | float(0))
+                             | round(0) | int, 30] | min)
+                 if is_state('binary_sensor.people_fest', 'on') else 0 %}
             {% if familie > 0 %}
-              {{ [familie + gulv, 6] | min }}
+              {{ [[familie + gulv, 6] | min, fest] | max }}
             {% else %}
-              {{ [[states('sensor.people_zones_now') | int(0), gulv] | max, 6] | min }}
+              {{ [[[states('sensor.people_zones_now') | int(0), gulv] | max, 6] | min, fest] | max }}
             {% endif %}
           {% endif %}
 
@@ -761,6 +871,7 @@ template:
           voksne: "{{ states('sensor.people_voksne') | int(0) }}"
           boern: "{{ states('sensor.people_boern') | int(0) }}"
           ekstra_gulv: "{{ states('input_number.people_ekstra_gulv') | int(0) }}"
+          fest: "{{ is_state('binary_sensor.people_fest', 'on') }}"
           gulv_siden_doer: "{{ states('input_number.people_gulv') | int(0) }}"
           kids_home: "{{ is_state('binary_sensor.kids_home', 'on') }}"
           konfidens_pct: "{{ states('sensor.presence_signal_confidence') | int(0) }}"
@@ -807,6 +918,9 @@ script:
               'boern_bevis_4t': states('sensor.boern_solo_bevis_4h') | int(0),
               'ekstra_nu': states('sensor.people_ekstra_nu') | int(0),
               'ekstra_gulv': states('input_number.people_ekstra_gulv') | int(0),
+              'zone_masse': states('sensor.people_zone_masse') | float(0),
+              'zone_masse_45': state_attr('sensor.people_zone_masse', 'm45') | float(0),
+              'fest': is_state('binary_sensor.people_fest', 'on'),
               'hoveddoer': states('binary_sensor.parasoll_hoveddoer'),
               'activity': states('sensor.activity_state'),
               'house_state': states('input_select.house_state'),
@@ -860,7 +974,7 @@ script:
           d: "{{ delta | int(0) }}"
           foer: "{{ states('sensor.people_estimate') | int(0) }}"
           manuel_foer: "{{ states('input_number.people_manuel') | int(-1) }}"
-          til: "{{ -1 if d == 0 else [[foer + d, 0] | max, 6] | min }}"
+          til: "{{ -1 if d == 0 else [[foer + d, 0] | max, 30] | min }}"
       - condition: template
         value_template: "{{ til != manuel_foer }}"
       - service: script.people_feedback_log
@@ -1210,6 +1324,9 @@ automation:
   #     på 1 i et tomt hus resten af dagen. Rydningen er nødvendig: prel-vagten
   #     satte Active 08:45, og buddet var da ekstra-gulvet (1) igen. Er huset
   #     ikke tomt, prellet Dormant tilbage, og buddet stiger efter 150 s.
+  #   - FEST (v7, 2026-10-27): mens binary_sensor.people_fest står, gælder buddet
+  #     som holdt. Udenfor vinduet bliver tallet festens top; i vinduet følger
+  #     det massen; når festen slutter, venter tallet på næste hoveddør.
   # /1-tick: vinduets udløb, hold-tiden og genstart har ingen flanke (#4).
   - id: people_gulv_foelg
     alias: "People: holdt antal følger buddet (ned kun efter hoveddøren)"
@@ -1234,10 +1351,13 @@ automation:
     variables:
       maal: "{{ states('sensor.people_estimate_model') | int(0) }}"
       gulv: "{{ states('input_number.people_gulv') | int(0) }}"
+      # v7: under en fest skifter buddet med massen hvert minut eller to og
+      # holder aldrig 150 s — men festen ER allerede et 45/15-min-bevis.
       holdt: >-
         {% set s = states.sensor.people_estimate_model %}
-        {{ s is not none and (now() - s.last_changed).total_seconds()
-           >= states('input_number.people_zone_sustain_seconds') | float(150) }}
+        {{ is_state('binary_sensor.people_fest', 'on')
+           or (s is not none and (now() - s.last_changed).total_seconds()
+               >= states('input_number.people_zone_sustain_seconds') | float(150)) }}
       # state_attr(...,'timestamp'), ALDRIG as_timestamp(states(...)) (#18).
       # > 86400 = ikke 1970-sentinellen.
       stamp: >-

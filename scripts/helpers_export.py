@@ -63,6 +63,7 @@ DATETIME_CONFIG = {
     "dormant_idle_dagslut",
     "badevaerelse_dagmode_senest",
     "putning_vindue_slut",
+    "kids_home_hverdag_afgang_senest",  # B270
     "wakeup_fallback_tid",
     "badevaerelse_bruser_vagt_start",
     "badevaerelse_bruser_vagt_slut",
@@ -215,6 +216,9 @@ def is_config(domain, name):
         # Music Assistant-knappen (B204/B205) — konfiguration, ikke *_enabled.
         # + Spotify-bro-knappen (B237); uden add-on'en er start en logget no-op.
         if name in ("hoejttaler_spotify_via_ha", "hoejttaler_spotify_bro", "hoejttaler_myair"):
+            return True
+        # Frost-sangenes kill-switch (packages/festlys_frost.yaml, 2026-10-26).
+        if name == "festlys_frost":
             return True
         # kill-switches + notifikations-toggles (master/enable/phone-valg)
         return name.endswith("_enabled") or name.startswith("notif_")
