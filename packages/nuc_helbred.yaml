@@ -1,0 +1,268 @@
+# =============================================================================
+# NUC-helbred — SMART, skrivninger, temperatur og kernel-fejl (B272 + B273)
+# =============================================================================
+# Sprint 2026-10-28 (user: "forbedre nuc health"). Huset kører på én NUC5i5RYB
+# fra 2015 med en Kingston SM2280S3 120 GB (Phison S8). Ingen af dens dødsårsager
+# var synlige i HA før nu.
+#
+# SMART: scripts/nuc_smart.py taler selv ATA (kun læsende kommandoer), fordi
+# Supervisor nægter ethvert add-on adgang til systemdisken. HA Core-containeren
+# er privilegeret og må. Hver 6. time.
+#
+# Baseline 28/10: PASSED · host-skrivninger 4037 GiB · NAND 5085 GiB (WAF ~1,26)
+# · gennemsnitlig slettecyklus 113, max 147 · 0 nye dårlige blokke / pending /
+# urettelige / CRC / fejllog · 48 usikre nedlukninger af 107 power cycles.
+# POH står på præcis 20000 — tjek om den tæller; ellers er den låst i firmwaren.
+#
+# SSD-VINDUET er IKKE husets risiko: TBW (datablad, 120 GB) = 230 TB, og ved
+# 18,5 GB/døgn (målt over 41 døgns oppetid) er der ~33 år tilbage. Slid efter
+# slettecyklus: 113 / 3000 = 3,8 % (3000 P/E er en MLC-antagelse — databladet
+# oplyser kun TBW). Alder, køling, strømforsyning og strømsvigt er de reelle
+# risici; de to sidste kan SMART ikke se (B272.7).
+#
+# TEMPERATUR: coretemp "Package id 0" (max/crit 105 °C). Målt 52-54 °C ved load
+# 0,3 og 61-64 °C ved load ~1. Alarm-grænsen er en slider med 90 °C som default,
+# langt over alt målt; kalibreres efter 2-3 døgns data (idle-temp mod load).
+#
+# ALARM: binary_sensor.nuc_helbred_alarm, grundene i custom_templates/nuc.jinja.
+# Push (nid `nuc`) når grund-teksten skifter og har holdt 15 min, samt mandag
+# 10:00 mens alarmen står. SMART-tællerne er livstids-tællere: en grund
+# forsvinder ikke af sig selv, derfor er påmindelsen ugentlig og ikke daglig.
+#
+# OBSERVERER KUN — rører intet. Skrive-mønsteret (fejlklasse 24): disk-tælleren
+# hvert 15. min, temperatur i hele grader hvert 2. min, resten timer eller mere.
+# =============================================================================
+
+command_line:
+  - sensor:
+      name: nuc_smart
+      unique_id: nuc_smart
+      command: "python3 /config/scripts/nuc_smart.py"
+      command_timeout: 30
+      value_template: >-
+        {% if value_json is defined and value_json.passed is true %}PASSED{%
+        elif value_json is defined and value_json.passed is false %}FAILED{%
+        else %}ukendt{% endif %}
+      json_attributes:
+        - ts
+        - failing_attrs
+        - power_on_hours
+        - power_cycles
+        - unsafe_shutdowns
+        - retired_blocks
+        - bad_blocks_later
+        - bad_blocks_early
+        - uncorrectable
+        - pending
+        - crc_errors
+        - error_log
+        - host_writes_gib
+        - nand_writes_gib
+        - host_reads_gib
+        - avg_erase
+        - max_erase
+      scan_interval: 21600
+      icon: mdi:harddisk
+
+  # Sektorer skrevet siden host-boot (/sys/block/sda/stat felt 7 × 512 B).
+  # Nulstilles når HAOS genstarter hosten; total_increasing gør, at long-term
+  # statistics alligevel giver et rigtigt døgn-tal (statistics-graph `change`).
+  - sensor:
+      name: nuc_disk_skrevet
+      unique_id: nuc_disk_skrevet
+      command: "awk '{printf \"%.2f\", $7*512/1e9}' /sys/block/sda/stat"
+      unit_of_measurement: GB
+      device_class: data_size
+      state_class: total_increasing
+      scan_interval: 900
+      icon: mdi:harddisk-plus
+
+  # Gennemsnit siden host-boot. Tidligt efter en boot er tallet pustet op af
+  # boot-skrivningerne — SSD-vinduet herunder venter derfor 14 døgns oppetid.
+  - sensor:
+      name: nuc_disk_gb_dag
+      unique_id: nuc_disk_gb_dag
+      command: >-
+        awk 'NR==FNR{s=$7;next}{printf "{\"gb_dag\":%.1f,\"oppe_dage\":%.1f}",
+        s*512/1e9/($1/86400), $1/86400}' /sys/block/sda/stat /proc/uptime
+      value_template: "{{ value_json.gb_dag }}"
+      json_attributes:
+        - oppe_dage
+      unit_of_measurement: "GB/d"
+      state_class: measurement
+      scan_interval: 3600
+      icon: mdi:speedometer
+
+  # hwmon-numrene kan skifte mellem boots → find coretemp på navnet.
+  - sensor:
+      name: nuc_cpu_temperatur
+      unique_id: nuc_cpu_temperatur
+      command: >-
+        for h in /sys/class/hwmon/hwmon*; do [ "$(cat $h/name)" = coretemp ] || continue;
+        for l in $h/temp*_label; do [ "$(cat $l)" = "Package id 0" ] && cat ${l%_label}_input;
+        done; done
+      value_template: "{{ (value | float / 1000) | round(0) | int }}"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      scan_interval: 120
+
+  # 5-min load (hostens, /proc/loadavg er ikke namespacet) — til at skille
+  # idle-temperatur fra arbejds-temperatur når grænsen skal kalibreres.
+  - sensor:
+      name: nuc_load
+      unique_id: nuc_load
+      command: "cut -d' ' -f2 /proc/loadavg"
+      value_template: "{{ value | float | round(1) }}"
+      state_class: measurement
+      scan_interval: 300
+      icon: mdi:chip
+
+  # Disk-/hardwarefejl i kernel-ringbufferen (hele oppetiden, 28/10: 0 linjer).
+  # Ringbufferen ruller: gamle linjer forsvinder, så tallet kan falde igen.
+  - sensor:
+      name: nuc_kernel_fejl
+      unique_id: nuc_kernel_fejl
+      command: >-
+        m=$(dmesg | grep -iE 'mce:|machine check|hardware error|i/o error|blk_update_request|ata[0-9.]+: (exception|failed command|error)|ext4-fs error|squashfs error');
+        printf '{"antal":%s,"sidste":"%s"}' "$(printf '%s' "$m" | grep -c .)"
+        "$(printf '%s' "$m" | tail -1 | tr -d '"\\' | cut -c1-200)"
+      value_template: "{{ value_json.antal }}"
+      json_attributes:
+        - sidste
+      scan_interval: 3600
+      icon: mdi:alert-octagon-outline
+
+template:
+  - sensor:
+      # Slid efter gennemsnitlig slettecyklus (attribut 244) mod 3000 P/E.
+      - name: "NUC SSD slid"
+        unique_id: nuc_ssd_slid
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:harddisk-remove
+        state: >-
+          {% set e = state_attr('sensor.nuc_smart', 'avg_erase') %}
+          {{ (e | float / 3000 * 100) | round(1) if e is number else none }}
+        availability: "{{ state_attr('sensor.nuc_smart', 'avg_erase') is number }}"
+
+  # År til TBW (230 TB host-skrivninger) med husets egen skrive-takt. Trigger-
+  # baseret, så sidste gode værdi overlever både HA-restart og host-boot: den
+  # regnes kun om når oppetiden er ≥ 14 døgn (B272 ville have 30 døgns historik,
+  # men HAOS-opdateringer genstarter hosten oftere end det — 14 døgns snit er
+  # stadig langt fra støj, og boot-skrivningerne er < 1 % af det).
+  # Oppetids-attributten skifter hver time, så vinduet regnes om hver time —
+  # tallet er hele år, så det giver kun en DB-række når året skifter.
+  - trigger:
+      - platform: state
+        entity_id: sensor.nuc_disk_gb_dag
+      - platform: state
+        entity_id: sensor.nuc_disk_gb_dag
+        attribute: oppe_dage
+    condition:
+      - condition: template
+        value_template: >-
+          {{ state_attr('sensor.nuc_disk_gb_dag', 'oppe_dage') | float(0) >= 14
+             and states('sensor.nuc_disk_gb_dag') | float(0) > 0
+             and state_attr('sensor.nuc_smart', 'host_writes_gib') is number }}
+    sensor:
+      - name: "NUC SSD vindue"
+        unique_id: nuc_ssd_vindue
+        unit_of_measurement: "år"
+        icon: mdi:timer-sand
+        state: >-
+          {% set skrevet_gb = state_attr('sensor.nuc_smart', 'host_writes_gib') * 1.073741824 %}
+          {{ ((230000 - skrevet_gb) / states('sensor.nuc_disk_gb_dag') | float / 365.25) | round(0) | int }}
+
+  - binary_sensor:
+      - name: "NUC helbred alarm"
+        unique_id: nuc_helbred_alarm
+        device_class: problem
+        state: "{% from 'nuc.jinja' import nuc_grunde %}{{ nuc_grunde() | trim != '' }}"
+        attributes:
+          grunde: "{% from 'nuc.jinja' import nuc_grunde %}{{ nuc_grunde() | trim }}"
+
+input_number:
+  nuc_cpu_temp_graense:
+    name: "NUC CPU-temperatur — alarm over (°C)"
+    min: 60
+    max: 105
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-alert
+
+input_boolean:
+  notif_nuc_enabled:
+    name: "🖥️ NUC-helbred — send"
+    icon: mdi:server
+  notif_nuc_parent_a:
+    name: "🖥️ NUC-helbred — Parent A"
+    icon: mdi:cellphone
+  notif_nuc_parent_b:
+    name: "🖥️ NUC-helbred — Parent B"
+    icon: mdi:cellphone
+  notif_nuc_airbnb:
+    name: "🖥️ NUC-helbred — også i AirBnB"
+    icon: mdi:home-account
+
+input_datetime:
+  notif_nuc_start:
+    name: "🖥️ NUC-helbred — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_nuc_slut:
+    name: "🖥️ NUC-helbred — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+
+automation:
+  - id: nuc_helbred_push
+    alias: "NUC-helbred: push ved nyt problem"
+    description: >
+      Pusher når alarmens grund-tekst skifter og har holdt 15 min (nyt problem
+      eller en SMART-tæller der vokser), og mandag 10:00 mens alarmen står.
+      Overgange fra/til unavailable (restart, template.reload) tæller ikke —
+      mandags-påmindelsen dækker dem.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.nuc_helbred_alarm
+        attribute: grunde
+        for: "00:15:00"
+        id: skift
+      - platform: time
+        at: "10:00:00"
+        id: ugentlig
+    condition:
+      - condition: state
+        entity_id: binary_sensor.nuc_helbred_alarm
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% if trigger.id == 'skift' %}
+            {{ trigger.from_state is not none and trigger.from_state.state in ['on', 'off'] }}
+          {% else %}
+            {{ now().weekday() == 0 }}
+          {% endif %}
+    action:
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: nuc
+          title: "🖥️ NUC-helbred"
+          message: >-
+            {{ state_attr('binary_sensor.nuc_helbred_alarm', 'grunde') }}.
+            {% if states('sensor.nuc_kernel_fejl') | int(0) > 0 %}
+            Seneste kernel-linje: {{ state_attr('sensor.nuc_kernel_fejl', 'sidste') }}.
+            {% endif %}
+            CPU {{ states('sensor.nuc_cpu_temperatur') }} °C. Detaljer: Status →
+            System Diagnostics, eller ha_health.sh nuc.
+          payload:
+            tag: nuc_helbred
+      - service: logbook.log
+        data:
+          name: "NUC-helbred"
+          message: "{{ state_attr('binary_sensor.nuc_helbred_alarm', 'grunde') }}"
+          entity_id: binary_sensor.nuc_helbred_alarm

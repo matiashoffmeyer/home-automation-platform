@@ -440,7 +440,7 @@ den korte bullet (CLAUDE.md eller regel-filen) og afsnittet her.
   container-IP'en — ingen af dem bruger host-porten.
 
   **Målt 2026-10-25 (B251):** `hand_recognition` (8099) udleverede `/api/config`
-  inkl. MQTT-passwordet for `gestus` og `/api/snapshots` (100 køkken-billeder),
+  inkl. MQTT-passwordet for `gestus` og `/api/snapshots` (dengang 100 køkken-billeder, nu 10 — B273),
   og `gesture_frame_shim` (8090) udleverede køkkenkameraets aktuelle billede
   (`/api/koekken/latest.jpg`, 200 `image/jpeg`) — alt uden login. Mosquitto
   havde 1883/1884/8883/8884 åbne på værten, så det lækkede password kunne
@@ -454,6 +454,35 @@ den korte bullet (CLAUDE.md eller regel-filen) og afsnittet her.
   `spotify_bro`'s stream på 8098; MA's afspiller-protokoller). Tjek fladen:
   `ss -tlnH` i SSH-add-on'et (host-net) + `curl http://192.0.2.151:<port>/`.
   Et nyt LAN-MQTT-device (Shelly, Tasmota …) kræver 1883 åbnet igen.
+
+- **Supervisor nægter ETHVERT add-on adgang til systemdisken** (målt 28/10, B272):
+  et lokalt add-on med `devices: [/dev/sda]` + `privileged: [SYS_RAWIO]` bygger
+  og starter, men device-mappingen bliver tom, og Supervisor-loggen siger
+  `App <navn> tried to access blocked device sda!`. SSH-add-on'et har `smartctl`
+  men får "Operation not permitted" på `/dev/sda`. **HA Core-containeren er
+  derimod privilegeret** (`docker inspect homeassistant` → Privileged=true): den
+  kan åbne `/dev/sda`, læse `/sys/block`, `/sys/class/hwmon` og `dmesg`. Derfor
+  kører `scripts/nuc_smart.py` som command_line-sensor i HA selv og taler ATA
+  gennem SG_IO (ATA PASS-THROUGH 16, kun SMART READ DATA/THRESHOLDS/LOG + RETURN
+  STATUS) — facit identisk med `smartctl -x`. **Signatur:** et add-on der
+  starter og dør med exit 2 uden fejl i sit eget log.
+
+- **Skrive-bytes pr. add-on måles på Docker-socket'en, og en fil der slettes
+  inden 30 s når aldrig disken** (målt 28/10, B273). `curl --unix-socket
+  /var/run/docker.sock http://localhost/containers/<navn>/stats?stream=false&one-shot=true`
+  → `blkio_stats.io_service_bytes_recursive` (op `write`) er containerens præcise
+  bytes til disken; Supervisor-API'ets `blk_write` er 0 for alle, og `docker stats`
+  runder for groft til et 10-min-vindue. Hostens journald og ext4-journalen (jbd2)
+  står i ingen container (≈ 6,5 GB/døgn 28/10) → **`python3 scripts/nuc_skrivere.py`**
+  læser `wbytes` fra hver `io.stat` i HOSTENS cgroup-træ via en kortlivet
+  `--cgroupns=host`-container (summen = sda): journald 4,9 GB/døgn, ~50× sin
+  tekst-mængde (14.800 linjer/t, 78 % fra hand_recognitions 2 INFO-linjer pr. billede). Kernen skriver beskidte sider
+  efter `vm.dirty_expire_centisecs` = 3000: hand_recognition gemte hvert billede
+  som jpg i et galleri på 100 (~72 s levetid ved 1,4 billeder/s) = 15 GB/døgn;
+  ved 10 (~7 s) slettes filen før write-back, og containeren skrev 0,49 GB/døgn —
+  selvom processens `/proc/<pid>/io` `write_bytes` stadig viser ~16 GB/døgn
+  (de annullerede bytes tæller med dér). **Signatur:** et add-on hvis blkio står
+  i et fast forhold til en fil-rotation.
 
 - **Music Assistant-add-on'en (`d5369777_music_assistant`, 2.10.5, installeret
   2026-10-09 til B204 "Spotify via HA") kræver login på sit API.** Admin-brugeren

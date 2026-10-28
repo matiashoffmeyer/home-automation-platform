@@ -24,6 +24,16 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   (`core-mosquitto`, `local-gesture-frame-shim:8090`). **Signatur: en `ports:`-
   linje som ingen enhed uden for NUC'en forbinder til** → `null` (8090, 8099 og
   MQTT lukket 25/10, B251: kamera-billeder + MQTT-password lå åbne).
+- **Intet add-on får systemdisken** — Supervisor blokerer `/dev/sda` tavst
+  (`tried to access blocked device sda` i Supervisor-loggen, add-on'et dør med
+  exit 2). HA Core-containeren ER privilegeret → disk-/hardware-læsning hører i
+  en command_line-sensor (`scripts/nuc_smart.py`, B272), ikke i et add-on.
+- **Skrive-bytes pr. add-on: Docker-socket'ens blkio** (`/containers/<navn>/stats?
+  stream=false&one-shot=true` → `io_service_bytes_recursive`) — Supervisor-API'ets
+  `blk_write` er altid 0, og `docker stats` er for grov. Hosten med (journald
+  m.fl.): `scripts/nuc_skrivere.py`. **En fil der slettes
+  < 30 s efter den er skrevet, når aldrig disken** (`dirty_expire` 30 s) → et
+  ringbuffer-galleri skal rulle inden for 30 s (hand_recognition, B273).
 - **Music Assistant (`d5369777_music_assistant`) kræver login; boot er `manual`,
   og `input_boolean.hoejttaler_spotify_via_ha` ejer start/stop** (B204). API'et
   kaldes med `scripts/ma_api.py` (password i secrets, printes aldrig). Streams-

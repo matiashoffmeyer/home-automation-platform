@@ -164,7 +164,7 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sovevaerelse_dvale_vidne` — 19 refs in 9 file(s)
 - `binary_sensor.sovevaerelse_empty_effective` — 2 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_lys_on_effektiv` — 1 refs in 1 file(s)
-- `binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv` — 38 refs in 16 file(s)
+- `binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv` — 39 refs in 16 file(s)
 - `binary_sensor.sovevaerelse_voksne_oppe` — 5 refs in 3 file(s)
 
 ### `button.*`

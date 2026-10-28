@@ -284,6 +284,7 @@ Resten sættes i add-on'ets web-UI. Værdier for den Frigate-frie vej:
 | `continuous_snapshot_interval` | `0.5` | 2026-10-11 (før 1): målt ~0,62 s pr. billede → ~3,8 s pr. byge |
 | `recognizer_backend` | `landmarks` | `three_fingers` findes kun her |
 | `output_topic_template` | `hand-recognition/{camera}` | |
+| `max_snapshots` | `10` | 2026-10-28 (før 100), B273: hvert billede gemmes som jpg, og med 10 slettes det efter ~7 s — før kernen skriver det til disken (30 s) → ~4 KiB pr. billede mod 134. **Aldrig 0:** crasher (`popleft` på tom deque) |
 
 HA publicerer så et fladt payload til `house/gesture/scan`:
 

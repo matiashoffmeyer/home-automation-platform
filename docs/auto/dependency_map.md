@@ -13,9 +13,9 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `binary_sensor.stue_apollo_occupancy_filtered` | 49 | 121 |
 | `binary_sensor.entre_valhorn_occupancy` | 48 | 108 |
 | `light.spisestue_loft` | 47 | 121 |
+| `script.push_notify` | 46 | 99 |
 | `binary_sensor.sovevaerelse_apollo_occupancy` | 46 | 94 |
 | `binary_sensor.boernevaerelse_apollo_occupancy` | 46 | 123 |
-| `script.push_notify` | 45 | 98 |
 | `light.koekken_lyskaede` | 44 | 190 |
 | `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 112 |
 | `input_boolean.godnat_active` | 43 | 96 |
@@ -27,7 +27,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `light.stue_laesehygge` | 37 | 82 |
 | `light.boernevaerelse_loft` | 37 | 95 |
 | `sensor.open_plan_lux` | 35 | 103 |
-| `light.entre_loft` | 34 | 82 |
+| `light.entre_loft` | 35 | 83 |
 | `binary_sensor.depot_valhorn_occupancy` | 32 | 72 |
 | `light.boernevaerelse_hygge_strip` | 31 | 89 |
 | `binary_sensor.godnat_common_active` | 30 | 77 |

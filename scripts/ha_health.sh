@@ -17,6 +17,8 @@
 #                                       #   requirement); deliberately not notified
 #   ./scripts/ha_health.sh people       # people count fell without the front door
 #                                       #   (user-spec; the rule leaked for months)
+#   ./scripts/ha_health.sh nuc          # the NUC's health: SMART, wear window,
+#                                       #   writes per day, temperature (B272)
 #   ./scripts/ha_health.sh log [n]      # the last n lines of the core log (200)
 #   ./scripts/ha_health.sh flags|lights|noisy|zha|docs|backup|sys
 
@@ -245,6 +247,34 @@ check_docs() {
 # rettelse). Reglen lækkede i tre måneder fordi intet tjekkede det viste tal.
 check_people() { hdr "People count kun ned ved hoveddør"; python3 "$(dirname "$0")/people_invariant.py" --dage 2; }
 
+check_nuc() {
+  # B272: SMART-tallene er HA's 6-timers aflæsning (scripts/nuc_smart.py kan kun
+  # køre i den privilegerede HA-container); temperatur og skrivninger læses live.
+  hdr "NUC-helbred"
+  local oppe gb temp
+  oppe=$(awk '{printf "%.1f", $1/86400}' /proc/uptime)
+  gb=$(awk -v d="$oppe" '{printf "%.1f", $7*512/1e9/d}' /sys/block/sda/stat)
+  for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name")" = coretemp ] && temp=$(( $(cat "$h/temp1_input") / 1000 )); done
+  echo "NUC5i5RYB (BIOS 2015) · Kingston SM2280S3 120 GB · oppe $oppe døgn · load $(cut -d' ' -f1-3 /proc/loadavg)"
+  echo "CPU ${temp:-?} °C · skrevet $gb GB/døgn siden boot"
+  api states | python3 -c '
+import json,sys
+st={s["entity_id"]:s for s in json.load(sys.stdin)}
+g=lambda e:st.get("sensor."+e,{}).get("state","mangler")
+a=st.get("sensor.nuc_smart",{}).get("attributes",{})
+al=st.get("binary_sensor.nuc_helbred_alarm",{})
+ts=str(a.get("ts","?"))[5:16].replace("T"," ")
+print("SMART %s (læst %s) · slid %s %% · vindue %s år" % (g("nuc_smart"),ts,g("nuc_ssd_slid"),g("nuc_ssd_vindue")))
+print("  skrevet i alt %s GiB (NAND %s) · slettecyklus snit/max %s/%s" % (a.get("host_writes_gib"),a.get("nand_writes_gib"),a.get("avg_erase"),a.get("max_erase")))
+fejl=["bad_blocks_later","retired_blocks","pending","uncorrectable","crc_errors","error_log"]
+print("  fejl-tællere: "+" · ".join("%s %s" % (k,a.get(k)) for k in fejl)+" · kernel "+g("nuc_kernel_fejl"))
+print("  strøm: %s power cycles, heraf %s usikre nedlukninger · POH %s" % (a.get("power_cycles"),a.get("unsafe_shutdowns"),a.get("power_on_hours")))
+grunde=al.get("attributes",{}).get("grunde","")
+print("Alarm: "+al.get("state","mangler")+(" -> "+grunde if grunde else ""))
+'
+  echo "Uden tæller (B272.7): 19 V-strømforsyning (2015) · kølepasta/blæser · CMOS-batteri"
+}
+
 check_backup() { hdr "Backups"; ls -1t /backup/ 2>/dev/null | head -5; }
 check_sys()    { hdr "Ressourcer"; free -h | head -2; df -h /config | tail -1; uptime; }
 
@@ -260,7 +290,8 @@ case "${1:-all}" in
   docs)   check_docs ;;
   backup) check_backup ;;
   sys)    check_sys ;;
+  nuc)    check_nuc ;;
   log)    curl -s -m 30 "${AUTH[@]}" "http://supervisor/core/logs?lines=${2:-200}" ;;
-  all)    check_deploy; check_blind; check_kamera; check_people; check_flags; check_lights; check_noisy; check_zha; check_docs; check_backup; check_sys ;;
-  *)      sed -n '2,18p' "$0"; exit 1 ;;
+  all)    check_deploy; check_blind; check_kamera; check_people; check_flags; check_lights; check_noisy; check_zha; check_docs; check_backup; check_sys; check_nuc ;;
+  *)      sed -n '2,20p' "$0"; exit 1 ;;
 esac
