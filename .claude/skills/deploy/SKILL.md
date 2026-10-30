@@ -39,7 +39,10 @@ python3 scripts/ha_offline.py check   # Home Assistant's own validator, ~13 s, a
 - Restart only when a reload cannot load the change, and only with
   `bash scripts/ha_restart.sh`. It saves restore-state first, because Home
   Assistant segfaults during shutdown on this host. A plain `ha core restart`
-  is blocked by the restart guard.
+  is blocked by the restart guard, and every restart first needs the
+  household's yes: `python3 scripts/live_godkend.py spørg "<why>" --genstart`
+  (run it in the background; exit 0 = approved for 10 min). The live guard
+  blocks the restart without it.
 - Skip this step for docs-only commits.
 
 ## 4. Prove it loaded
@@ -51,7 +54,9 @@ python3 scripts/ha_offline.py check   # Home Assistant's own validator, ~13 s, a
 `unavailable` without `restored: true` is a real failure (failure class 22).
 If the change has a physical effect (light, curtains, sound, timing), measure
 the real behaviour: state after the action, `hs_color`, brightness 0-254. Do
-not stop at "looks like it works".
+not stop at "looks like it works". Triggering the effect yourself is a live
+test and needs the household's yes first (`live_godkend.py spørg`); proof
+that is already in history needs none.
 
 ## 5. Push and notify
 

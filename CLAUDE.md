@@ -243,8 +243,10 @@ Skip kun ved ren research uden deploy. Kanal: `notify/mobile_app_phone_a` via
 deploy-opsummeringen) — telefonen kan være i gæstens hænder. **Tjek mode FØR du
 pusher.** Kode/dashboards/reloads er fine; det er kun notifikationerne der
 undertrykkes. Nævn i din tekst-opsummering at pushen blev sprunget over.
-**Én bevidst undtagelse (user-spec 2026-09-11):** `packages/kamera_airbnb_vagt.yaml`
-SKAL pushe i AirBnB — varslet rammer user i det sekund HAN selv flipper mode.
+**Tre bevidste undtagelser** SKAL pushe i AirBnB — alle rammer user i det sekund
+HAN selv flipper mode: `packages/kamera_airbnb_vagt.yaml` (user-spec 2026-09-11),
+udtjekningsdatoen i `packages/airbnb_udtjekning.yaml` (2026-10-28) og
+velkomstbesked-påmindelsen i `packages/airbnb_velkomst.yaml` (2026-10-29).
 
 ### 🧪 Test fysisk + mål når nyt går live (per 2026-05-03)
 
@@ -255,6 +257,16 @@ Har ændringen **observerbar fysisk effekt** (lys, gardiner, lyd, timing): deplo
 matcher observationen ikke design-intent, itererér med målinger. **Stop ikke ved
 første "ser ud til at virke".** **HA's reelle throughput er ~5-10
 light-kald/sek** — loop-designs der antager >10/sek fejler silently.
+
+### ✋ Live-test og genstart kræver ja via push FØRST (per 2026-10-28, user-spec)
+
+**Alt huset kan se eller høre (lys, lyd, gardiner, robot) og enhver genstart**
+spørges om FØR: `python3 scripts/live_godkend.py spørg "<hvad, kort dansk>"
+[--genstart]` med `run_in_background` → push med Godkend / Afvis / Om 20 min
+(exit 0 = ja, gyldig 15 min / genstart 10; 1 = nej; 2 = intet svar = nej;
+3 = AirBnB → spørg i chatten). `scripts/live_guard.py` blokerer kaldene uden
+et gyldigt ja; `slut` når testen er færdig. Passivt bevis i history kræver intet.
+Detaljer: `grep -n "Live-test og genstart" docs/standing_instructions.md`.
 
 ### 🎛️ Tjek eksisterende slidere FØR du bygger nyt (per 2026-05-17)
 

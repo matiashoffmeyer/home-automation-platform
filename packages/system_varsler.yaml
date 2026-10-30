@@ -177,6 +177,16 @@ input_number:
     step: 1
     unit_of_measurement: "t"
     icon: mdi:backup-restore
+  # B273 (28/10, user-spec "ugentlig er fint"): DB'en (~600 MB komprimeret) med
+  # i backuppen kun hver N. dag. Max 7 = retention (7 kopier) — længere ville
+  # efterlade dage uden NOGEN DB-backup at gendanne fra.
+  backup_db_hver_dage:
+    name: "💾 Backup — database med hver (dage)"
+    min: 1
+    max: 7
+    step: 1
+    unit_of_measurement: "d"
+    icon: mdi:database-clock
   apollo_esp_temp_graense:
     name: "🌡️ Apollo ESP-temp — push over (°C)"
     min: 45
@@ -185,9 +195,47 @@ input_number:
     unit_of_measurement: "°C"
     icon: mdi:chip
 
+shell_command:
+  # Stdout = én JSON-linje (response_variable). Se scriptets docstring.
+  backup_db_saet: "python3 /config/scripts/backup_db_ugentlig.py set {{ dage }}"
+  backup_db_status: "python3 /config/scripts/backup_db_ugentlig.py status"
+
 automation:
   # ---------------------------------------------------------------------------
-  # 2) Backup-vagt — dagligt tjek kl 10:00 (backup kører ~03:00-03:30)
+  # 2a) Backup: DB'en med kun hver N. dag (B273). HA har ét globalt flag og ingen
+  #     service → scriptet sætter det via websocket kl. 03:00, før den automatiske
+  #     backup (~05:00), ud fra ALDEREN på nyeste backup med DB (ikke ugedagen:
+  #     fejler én, tager næste nat DB'en med). Start-triggeren dækker en nat hvor
+  #     HA var nede kl. 03:00. Prisen: en gendannelse fra en backup uden DB har
+  #     ingen historik — tag DB'en fra den nyeste med (≤ N dage gammel).
+  # ---------------------------------------------------------------------------
+  - id: backup_db_interval_saet
+    alias: "Backup: database med hver N. dag"
+    mode: single
+    trigger:
+      - platform: time
+        at: "03:00:00"
+      - platform: homeassistant
+        event: start
+    action:
+      - if: "{{ trigger is defined and trigger.platform == 'homeassistant' }}"
+        then:
+          - delay: "00:02:00"
+      - service: shell_command.backup_db_saet
+        data:
+          dage: "{{ states('input_number.backup_db_hver_dage') | float(7) | int }}"
+        response_variable: svar
+      - if: "{{ svar.returncode != 0 or (svar.stdout | from_json).changed }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Backup-DB"
+              message: >-
+                {{ svar.stdout if svar.returncode == 0
+                   else 'fejl ' ~ svar.returncode ~ ': ' ~ svar.stderr[-200:] }}
+
+  # ---------------------------------------------------------------------------
+  # 2) Backup-vagt — dagligt tjek kl 10:00 (backup kører ~05:00, målt 28/10)
   # ---------------------------------------------------------------------------
   - id: backup_vagt_dagligt_tjek
     alias: "Backup-vagt: seneste backup for gammel"
@@ -235,6 +283,96 @@ automation:
           message: >-
             Backup for gammel/ukendt (alder {{ age_h }} t, grænse
             {{ max_h | int }} t) — push sendt.
+
+  # Søster til backup-vagten (fejlklasse #12): med DB'en kun hver N. dag kan
+  # alle 7 kopier være uden DB, hvis flag-scriptet er dødt eller DB-backups
+  # fejler. Grænse N døgn + 1½ = én misset nat efter planen.
+  - id: backup_vagt_db_alder
+    alias: "Backup-vagt: nyeste backup med database for gammel"
+    mode: single
+    trigger:
+      - platform: time
+        at: "10:00:00"
+    action:
+      - service: shell_command.backup_db_status
+        response_variable: svar
+      - variables:
+          max_t: "{{ (states('input_number.backup_db_hver_dage') | float(7) + 1.5) * 24 }}"
+          alder_t: >-
+            {{ (svar.stdout | from_json).nyeste_db_alder_t
+               if svar.returncode == 0 else none }}
+      - condition: template
+        value_template: "{{ alder_t is none or alder_t | float > max_t | float }}"
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: backup
+          title: "💾 Ingen frisk backup med database"
+          message: >-
+            {% if svar.returncode != 0 %}
+            Backup-DB-scriptet fejlede ({{ svar.returncode }}) — kan ikke se
+            om en backup har databasen med.
+            {% elif alder_t is none %}
+            Ingen backup med database ligger både på NUC'en og Drive.
+            {% else %}
+            Nyeste backup med database er {{ (alder_t | float / 24) | round(1) }}
+            døgn gammel (plan: hver {{ states('input_number.backup_db_hver_dage') | int }}.).
+            {% endif %}
+            Tjek Settings → System → Backups.
+          payload:
+            tag: backup_vagt_db
+
+  # Søster nr. 2 (B252, 28/10): HA kalder en backup lykkedes selvom en
+  # placering var utilgængelig (manager.py: kun agent_errors, ikke
+  # unavailable_agents, holder last_completed tilbage) → et udløbet Drive-login
+  # ville stoppe off-site-kopien i tavshed. Måler alderen pr. placering i stedet.
+  # Grænse = samme slider som backup_vagt_dagligt_tjek (én misset nat).
+  - id: backup_vagt_placering
+    alias: "Backup-vagt: en placering får ingen backups"
+    mode: single
+    trigger:
+      - platform: time
+        at: "10:00:00"
+    action:
+      - service: shell_command.backup_db_status
+        response_variable: svar
+      - variables:
+          max_t: "{{ states('input_number.backup_max_alder_timer') | float(26) }}"
+          gamle: >-
+            {% set ns = namespace(l=[]) %}
+            {% if svar.returncode == 0 %}
+              {% set d = svar.stdout | from_json %}
+              {% for a, v in d.agenter.items() if v.konfigureret %}
+                {% if v.nyeste_alder_t is none or v.nyeste_alder_t > max_t | float %}
+                  {% set navn = 'Google Drive' if a.startswith('google_drive')
+                     else "NUC'ens disk" if a == 'hassio.local' else a %}
+                  {% set ns.l = ns.l + [navn ~ ' (' ~ ('ingen' if v.nyeste_alder_t is none
+                     else (v.nyeste_alder_t | round(0) | int) ~ ' t') ~ ')'] %}
+                {% endif %}
+              {% endfor %}
+              {% for a in d.agent_fejl %}
+                {% set ns.l = ns.l + [a ~ ' svarer ikke'] %}
+              {% endfor %}
+            {% endif %}
+            {{ ns.l | join(', ') }}
+      - condition: template
+        value_template: "{{ svar.returncode != 0 or gamle | length > 0 }}"
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: backup
+          title: "💾 Backup mangler et sted"
+          message: >-
+            {% if svar.returncode != 0 %}
+            Backup-scriptet fejlede ({{ svar.returncode }}) — kan ikke se
+            hvor backups ligger.
+            {% else %}
+            Nyeste backup er for gammel her: {{ gamle }}
+            (grænse {{ max_t | int }} t). Er Google Drive med, så tjek
+            login under Enheder & tjenester → Google Drive.
+            {% endif %}
+          payload:
+            tag: backup_vagt_placering
 
   # ---------------------------------------------------------------------------
   # 3) Apollo ESP-temp-canary — chip-wear-varsling (jf. CLAUDE.md >50°C-reglen)

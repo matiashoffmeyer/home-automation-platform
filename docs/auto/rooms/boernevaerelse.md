@@ -78,9 +78,9 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/presence_lights.yaml`
 
-- **Lysnet: Børneværelse tænd ved LUX-fald** (line 599, mode=single)
+- **Lysnet: Børneværelse tænd ved LUX-fald** (line 622, mode=single)
   - Daylight fades while børneværelse occupied — gentle light for kids.
-- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1015, mode=single)
+- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1100, mode=single)
   - Dagslys tilbage i børneværelset mens loftet står tændt — blid fade off.
 
 ### `automations/putning_auto_detect.yaml`

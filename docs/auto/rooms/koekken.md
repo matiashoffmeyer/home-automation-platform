@@ -34,7 +34,7 @@ Search keywords: `koekken, kokken`
 - **Lysnet: Køkken-spots sluk ved dagslys** (line 764, mode=single)
   - Slukker switch.koekken_spots når køkkenets egen lux har ligget over
 - **Lysnet: Køkken-lyskæde sluk (køkken tomt / lys stiger)** (line 828, mode=restart)
-- **Lysnet: Køkken-session slut (tomt X min / godnat / væk)** (line 1065, mode=restart)
+- **Lysnet: Køkken-session slut (tomt X min / godnat / væk)** (line 1107, mode=restart)
   - Afslut madlavnings-sessionen (input_boolean.koekken_session_active) når
 
 ---
@@ -60,7 +60,7 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.filmmoerke_koekken` — 6 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_bevaegelse_frisk` — 3 refs in 2 file(s)
-- `binary_sensor.koekken_apollo_central_zone` — 5 refs in 2 file(s)
+- `binary_sensor.koekken_apollo_central_zone` — 6 refs in 3 file(s)
 - `binary_sensor.koekken_apollo_central_zone_filtered` — 4 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_frossen_ghost` — 6 refs in 4 file(s)
 - `binary_sensor.koekken_apollo_naer_bekraeftet` — 2 refs in 1 file(s)
@@ -83,7 +83,7 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.koekken_kamera_krop_gyldig` — 2 refs in 2 file(s)
 - `binary_sensor.koekken_kamera_vaagen` — 6 refs in 3 file(s)
 - `binary_sensor.koekken_lys_on_effektiv` — 2 refs in 2 file(s)
-- `binary_sensor.koekken_lyskaede_laant` — 3 refs in 2 file(s)
+- `binary_sensor.koekken_lyskaede_laant` — 4 refs in 3 file(s)
 - `binary_sensor.koekken_lyskaede_lux_ok` — 6 refs in 4 file(s)
 - `binary_sensor.koekken_lyskaede_scene_laan` — 5 refs in 2 file(s)
 - `binary_sensor.koekken_maaltidslys` — 7 refs in 3 file(s)
@@ -163,7 +163,7 @@ Search keywords: `koekken, kokken`
 - `input_number.koekken_lyskaede_dark_hold_sekunder` — 3 refs in 3 file(s)
 - `input_number.koekken_lyskaede_dark_pct` — 4 refs in 3 file(s)
 - `input_number.koekken_lyskaede_dark_session_pct` — 3 refs in 3 file(s)
-- `input_number.koekken_lyskaede_doed_fade_sekunder` — 3 refs in 3 file(s)
+- `input_number.koekken_lyskaede_doed_fade_sekunder` — 4 refs in 3 file(s)
 - `input_number.koekken_lyskaede_doed_minutter` — 3 refs in 3 file(s)
 - `input_number.koekken_lyskaede_efter_session_minutter` — 5 refs in 3 file(s)
 - `input_number.koekken_lyskaede_eget_lys_lx` — 2 refs in 2 file(s)
@@ -206,7 +206,7 @@ Search keywords: `koekken, kokken`
 
 ### `input_select.*`
 
-- `input_select.room_mode_koekken` — 36 refs in 22 file(s)
+- `input_select.room_mode_koekken` — 37 refs in 22 file(s)
 
 ### `input_text.*`
 
@@ -228,7 +228,7 @@ Search keywords: `koekken, kokken`
 
 - `light.koekken_apollo_rgb_light` — 13 refs in 5 file(s)
 - `light.koekken_loft` — 2 refs in 2 file(s)
-- `light.koekken_lyskaede` — 190 refs in 44 file(s)
+- `light.koekken_lyskaede` — 194 refs in 45 file(s)
 - `light.koekken_room` — 11 refs in 8 file(s)
 
 ### `number.*`
@@ -263,7 +263,7 @@ Search keywords: `koekken, kokken`
 - `script.koekken_gestus_set_signal` — 2 refs in 2 file(s)
 - `script.koekken_gestus_telefon_alarm` — 2 refs in 1 file(s)
 - `script.koekken_gestus_telefon_timer` — 2 refs in 1 file(s)
-- `script.koekken_lyskaede_maal` — 12 refs in 6 file(s)
+- `script.koekken_lyskaede_maal` — 13 refs in 6 file(s)
 - `script.koekken_lyskaede_preview_slut` — 2 refs in 1 file(s)
 - `script.koekken_lyskaede_signal` — 15 refs in 6 file(s)
 - `script.koekken_skift_registrer` — 1 refs in 1 file(s)

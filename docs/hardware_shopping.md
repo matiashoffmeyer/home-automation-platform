@@ -58,7 +58,7 @@ Matter-parring: [matter_pairing_playbook.md](matter_pairing_playbook.md) FØRST 
    ét tryk skruer.
 7. **Beskeder (B199, bygget 2026-10-07):** `packages/hoejttaler_annoncering.yaml`
    kræver samme `binary_sensor.hoejttaler_online`. Test: start radioen, kør
-   `script.hoejttaler_annoncer` med besked "Kitchen timer is done" → radioen
+   `script.hoejttaler_annoncer` med besked "Køkkentimeren er færdig" → radioen
    pauser, beskeden siges ÉN gang (klippes slutningen af? → hæv de +2 s i
    delay'et), radioen kommer igen på samme kanal og volumen. Så uden musik
    (volumen sat tilbage? køen ryddet?), og med Spotify Connect (skal springes

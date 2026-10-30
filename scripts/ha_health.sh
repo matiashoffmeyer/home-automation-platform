@@ -275,7 +275,20 @@ print("Alarm: "+al.get("state","mangler")+(" -> "+grunde if grunde else ""))
   echo "Uden tæller (B272.7): 19 V-strømforsyning (2015) · kølepasta/blæser · CMOS-batteri"
 }
 
-check_backup() { hdr "Backups"; ls -1t /backup/ 2>/dev/null | head -5; }
+# Per location (B252): HA counts a backup as successful even when a location
+# was unavailable, so the age per location is the real check.
+check_backup() {
+  hdr "Backups pr. placering"
+  python3 "$(dirname "$0")/backup_db_ugentlig.py" status | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+t=lambda x:"ingen" if x is None else "%s t" % x
+for a,v in d["agenter"].items():
+  print("  %-40s %d kopier · nyeste %s · nyeste med DB %s%s" % (a,v["antal"],t(v["nyeste_alder_t"]),t(v["nyeste_db_alder_t"]),"" if v["konfigureret"] else " (IKKE konfigureret)"))
+print("  DB-flag nu: %s (sættes 03:00) · DB-backup på alle placeringer: %s" % (d["include_database"],t(d["nyeste_db_alder_t"])))
+for a in d["agent_fejl"]: print("  FEJL: %s svarer ikke" % a)
+'
+}
 check_sys()    { hdr "Ressourcer"; free -h | head -2; df -h /config | tail -1; uptime; }
 
 case "${1:-all}" in

@@ -47,7 +47,8 @@
 # 🔁 KØEN. Roborock har ingen server-side kø: sender man `app_segment_clean`
 # mens robotten kører, taber man enten den nye eller den igangværende opgave.
 # Køen bor derfor i HA (`input_text.roborock_rum_koe`, format `<seg>:<h|g|s>`
-# komma-separeret; `s` = SmartPlan, packages/roborock_smartplan.yaml) og
+# komma-separeret; `s` = SmartPlan, packages/roborock_smartplan.yaml;
+# segment 0 = hele huset med `H`/`N`/`G` = start_quick/full/max) og
 # tømmes af `roborock_rum_koe_kick`, der KUN dispatcher når robotten
 # beviseligt er ledig (docked/idle + cleaning off + ingen fejl + batteri
 # ≥ 15 %).
@@ -179,8 +180,9 @@ template:
               {% for j in jobs %}
                 {% set seg = j.split(':')[0] %}
                 {% set md = j.split(':')[1] %}
-                {% set ns.o = ns.o + [ m.get(seg, 'Segment ' ~ seg)
-                                       ~ {'g': ' (grundig)', 's': ' (SmartPlan)'}.get(md, ' (hurtig)') ] %}
+                {% set ns.o = ns.o + [ ('Hele huset' if seg == '0' else m.get(seg, 'Segment ' ~ seg))
+                                       ~ {'g': ' (grundig)', 's': ' (SmartPlan)', 'G': ' (grundig)',
+                                          'N': ' (normal)'}.get(md, ' (hurtig)') ] %}
               {% endfor %}
               {{ ns.o | unique | join(' → ') }}
             {% endif %}
@@ -203,11 +205,11 @@ script:
     max: 16
     fields:
       segment:
-        description: "Roborock-segment-nummer (16-23)"
+        description: "Roborock-segment-nummer (16-25) · 0 = hele huset"
         required: true
         example: 20
       grundighed:
-        description: "'h' = hurtig (kun støvsug) · 'g' = grundig (støvsug + gulvvask) · 's' = SmartPlan (robotten vælger selv pr. rum)"
+        description: "'h' = hurtig (kun støvsug) · 'g' = grundig (støvsug + gulvvask) · 's' = SmartPlan (robotten vælger selv pr. rum) · hele huset (segment 0): 'H' hurtig · 'N' normal · 'G' grundig"
         required: true
         example: "h"
     variables:
@@ -220,8 +222,10 @@ script:
       job: "{{ segment | int(0) }}:{{ grundighed }}"
       navn: >-
         {% set m = state_attr('sensor.roborock_rum_kort', 'rum') | default({}, true) %}
-        {{ m.get(segment | int(0) | string, 'Segment ' ~ segment) }}
-      grundighed_navn: "{{ {'g': 'grundig', 's': 'SmartPlan'}.get(grundighed, 'hurtig') }}"
+        {{ 'Hele huset' if segment | int(0) == 0
+           else m.get(segment | int(0) | string, 'Segment ' ~ segment) }}
+      grundighed_navn: >-
+        {{ {'g': 'grundig', 's': 'SmartPlan', 'G': 'grundig', 'N': 'normal'}.get(grundighed, 'hurtig') }}
     sequence:
       - choose:
           # Samme rum + samme grundighed ligger allerede og venter → et ekstra
@@ -347,6 +351,55 @@ script:
       - condition: template
         value_template: "{{ jobs | count > 0 and ledig }}"
 
+      # --- hele huset (segment 0) ------------------------------------------
+      # Hel-hus-knapperne på Støvsug-siden lægger sig her i stedet for at
+      # skrive direkte til robotten: start_max mens robotten kørte rev
+      # SmartPlan af den igangværende tur og fejlede så på
+      # set_collision_avoid_status (robotten afviser den under kørsel) — en
+      # fejl i UI'et og ingen rengøring (2026-10-30 06:51 + 08:15).
+      # Startes som det samme script knappen kaldte før. Dispatch fra
+      # flanke/backstop bærer intet user_id, så manuel-start stemples HER —
+      # ellers ville Dormant-/hjemkomst-/AirBnB-guardene docke turen som
+      # auto-startet (roborock_manuel_session_stamp).
+      - if:
+          - condition: template
+            value_template: "{{ jobs[0].split(':')[0] == '0' }}"
+        then:
+          - variables:
+              hus_job: "{{ jobs[0] }}"
+              hus_mode: "{{ jobs[0].split(':')[1] }}"
+              hus_script: >-
+                {{ {'G': 'script.roborock_start_max', 'N': 'script.roborock_start_full'}
+                   .get(hus_mode, 'script.roborock_start_quick') }}
+              hus_navn: "{{ {'G': 'Grundig', 'N': 'Normal'}.get(hus_mode, 'Hurtig') }}"
+          # Frisk læsning + fjern-efter-værdi, samme grund som under "opdatér
+          # køen" nedenfor.
+          - service: input_text.set_value
+            target: {entity_id: input_text.roborock_rum_koe}
+            data:
+              value: >-
+                {% set q = states('input_text.roborock_rum_koe') %}
+                {% set nu = [] if q in ['unknown', 'unavailable', 'none', '', '-']
+                            else q.split(',') | reject('eq', '') | list %}
+                {{ nu | reject('eq', hus_job) | join(',') }}
+          - service: input_text.set_value
+            target: {entity_id: input_text.roborock_rum_koe_nu}
+            data: {value: "{{ hus_navn }}: Hele huset"}
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.roborock_rum_koe_stemplet}
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - service: input_datetime.set_datetime
+            target: {entity_id: input_datetime.roborock_manual_start_at}
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - service: logbook.log
+            data:
+              name: "Roborock rum-kø"
+              message: "Startet hele huset ({{ hus_navn | lower }}) fra køen."
+          - service: "{{ hus_script }}"
+          - stop: "Hele huset startet."
+
       # --- spejdertur (mild mop) i tomt hus, user-spec 2026-10-22 -------------
       # Spejderen får ALLE ventende rum, ikke kun batchen: én tur dækker hele
       # køen, og de næste batches er så allerede spejdet. Mens den kører,
@@ -355,7 +408,7 @@ script:
       - service: script.roborock_spejdertur_rum
         data:
           segmenter: >-
-            {{ jobs | map('regex_replace', ':.*$', '') | map('int') | unique | list }}
+            {{ jobs | map('regex_replace', ':.*$', '') | map('int') | reject('eq', 0) | unique | list }}
           efter: script.roborock_rum_koe_kick
         response_variable: spejder
       - if:

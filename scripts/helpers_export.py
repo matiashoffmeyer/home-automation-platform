@@ -129,6 +129,7 @@ SELECT_CONFIG = {
     # Morgenradioens kanal (2026-10-05, B193) — rent brugervalg.
     "hoejttaler_morgenradio_kanal",
     "hoejttaler_morgenradio_dage",
+    "airbnb_velkomst_sprog",
 }
 
 # input_text er næsten udelukkende runtime-display (last_flap, spøgelses-lister,

@@ -27,7 +27,8 @@ BEGGE lag.
   `variables:` FØR en `delay`.
 - **`initial:` RESTORER IKKE — den PÅTVINGER** ved hver HA-start. Skal en værdi
   overleve: udelad `initial:` helt, og kør aldrig `input_boolean.reload` for én
-  ny helper. **Gratis helper-reloads: `input_text` og `input_number`** (sidstnævnte
+  ny helper. **Gratis helper-reloads: `input_text`, `input_number` og `input_datetime`**
+  (sidstnævnte målt 10-28: stempler med `initial:` urørte; `input_number`
   målt 10-05: 0/778 ændret — tjek først at alle med `initial:` står PÅ den). Ny
   slider = reload + API-set (den starter på `min`), ingen restart.
 - **HA springer SELV `unavailable` entities over i service-kald** → døde pærer

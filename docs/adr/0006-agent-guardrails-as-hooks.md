@@ -29,6 +29,7 @@ through hooks configured in `.claude/settings.json`:
 | `scripts/claude_rules.py hook` | loads the rule file for a domain the first time a call touches it, including through shell commands |
 | `scripts/ejerskab_hook.py` | shows a lamp's ownership contract before an edit and lints the edit afterwards ([ADR 4](0004-lamp-ownership-registry.md)) |
 | `scripts/restart_guard.py` | rejects a plain `ha core restart`; restarts go through `scripts/ha_restart.sh`, which saves state first |
+| `scripts/live_guard.py` | rejects light, sound and restart commands until the household has said yes on a push with Godkend / Afvis / Om 20 min (`scripts/live_godkend.py spørg`); a restart passes when Home Assistant is down |
 | `scripts/agent_guard.py` | at most two subagents at a time; a cheaper model on every workflow agent; no unbounded fan-out |
 
 Context hooks fail open: a broken hook must never block a session.

@@ -17,14 +17,14 @@ Search keywords: `spisestue`
 
 - **Lysnet: Spisestue tænd ved LUX-fald** (line 78, mode=single)
   - Daylight fades while spisebordet er besat — spisestue-loftet kommer blidt på.
-- **Lysnet: Spisestue tænd på mørk indedag** (line 252, mode=single)
-- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 845, mode=single)
+- **Lysnet: Spisestue tænd på mørk indedag** (line 256, mode=single)
+- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 916, mode=single)
   - Lux-præmissen bag dagslys-sluk faldt bort mens rummet stadig er optaget →
 
 ### `automations/presence_stue.yaml`
 
 - **Lysnet: Spisestue tænd** (line 17, mode=single)
-- **Lysnet: Spisestue gradvis sluk** (line 376, mode=restart)
+- **Lysnet: Spisestue gradvis sluk** (line 391, mode=restart)
   - 2026-06-19 (user-spec): spisestue-loftet slukker når spisebords-Apolloen
 
 ---
@@ -126,7 +126,7 @@ Search keywords: `spisestue`
 ### `light.*`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
-- `light.spisestue_loft` — 121 refs in 47 file(s)
+- `light.spisestue_loft` — 124 refs in 48 file(s)
 - `light.spisestue_pendel` — 136 refs in 39 file(s)
 
 ### `number.*`
@@ -167,7 +167,7 @@ Search keywords: `spisestue`
 - `sensor.spisestue_dagslys_lx` — 15 refs in 9 file(s)
 - `sensor.spisestue_dagslys_sample` — 7 refs in 2 file(s)
 - `sensor.spisestue_lux` — 2 refs in 2 file(s)
-- `sensor.spisestue_lux_reel` — 32 refs in 11 file(s)
+- `sensor.spisestue_lux_reel` — 34 refs in 12 file(s)
 - `sensor.spisestue_lys_on_idag` — 8 refs in 2 file(s)
 - `sensor.spisestue_lys_timer_dag` — 1 refs in 1 file(s)
 - `sensor.spisestue_off_sekunder` — 5 refs in 2 file(s)

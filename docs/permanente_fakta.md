@@ -311,6 +311,10 @@ den korte bullet (CLAUDE.md eller regel-filen) og afsnittet her.
   GPS-friskhed. Skal en ny helper bære tilstand og deployes uden restart, så
   vælg `input_text` og kod værdien som en streng (fx `<fase>:<epoch>`).
   Mønster: `packages/airbnb_checkin_prep.yaml`.
+  **`input_datetime.reload` er OGSÅ gratis** (målt 2026-10-28, B256): de to
+  GPS-stempler MED `initial: 2000-01-01` stod urørte efter reloadet — 9/9-
+  påstanden ovenfor var en slutning, ikke en måling. Kilden er den samme som
+  for input_number: `async_update_config` sætter kun config, aldrig værdien.
   **`input_number.reload` er OGSÅ gratis** (målt 2026-10-05: før/efter-diff
   af alle 778 input_numbers = 0 ændret). HA's `async_update_config` bevarer
   den aktuelle værdi og klemmer den kun ind i min/max; en NY slider oprettes

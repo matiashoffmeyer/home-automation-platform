@@ -66,10 +66,33 @@ Lokale og dermed uberørte: ZHA, Matter/Thread (OTBR), Hue, ESPHome
   langt net-udfald som inaktivitet, hvis git eller Claude tæller som aktivitet
   (spørgsmål til B256).
 
+## Gardinerne (vurderet 2026-10-28, kode + historik)
+
+**Intet gardin kører forkert og intet låses.** Motorerne er lokale (Somfy via
+Broadlink-RF, sove-gardinet på Zigbee), så alle knapper og manuelle veje virker. Fem
+automatiske veje læser met.no. Alle fejler på én af to måder: som "klart vejr",
+hvor lokal lux/temp stadig afgør, eller som "rør ikke gardinet".
+
+| Vej | Læser | Uden net |
+|---|---|---|
+| Sommer-forsvar (Dormant, 09-20) | skydække, `float(0)` | antager klart; luk afgøres af inde-temp (TIMMERFLOTTE/Broadlink, lokal) = hede-beskyttelsen bevares. Genåbning ved skyer udebliver |
+| Putte-vest-blænding | skydække, `float(0)` | antager klart; lux-gaten (lokal) afgør stadig |
+| Mosbilledet | skydække kun i log/feedback | ingen effekt, beslutningen er lux |
+| Vinter: Dormant-luk, mørke-luk, sol-opvarmning, kuldebølge | `sensor.udetemp` | `unknown` → numeric_state falsk → **intet luk, ingen åbning**. Mørke-luk re-armer selv på `unknown → under`-flanken når nettet kommer tilbage; sol-opvarmningen gør ikke (kun komfort) |
+
+Prisen: under et udfald i fyringssæsonen (`winter_heating_season_temp`, i dag
+5 °C) lukker stuen ikke af sig selv ved mørkets frembrud. Det er det neutrale
+valg ("slip frem for at tvinge"), og det sker allerede i dag: met.no var væk
+3 gange på 30 døgn, 56-63 min hver (3/10, 19/10, 21/10). `sensor.udetemp` blev
+`unknown` i hele vinduet. En lokal udetemp-føler ville fjerne hullet, men huset
+har ingen. Genvex'en viser ingen ude-temp i HA.
+
+Telefon-vejene (`house_state_to_dormant_gps_fast`, ankomst) mister GPS fra
+telefoner ude af huset. Dormant kommer så kun via døren og presence, og
+sommer-forsvaret (kun Dormant) fyrer sjældnere. Det er ikke farligt.
+
 ## Ikke dækket her
 
-- Gardinerne (sommer-/vinter-forsvaret læser met.no's skydække og udetemp).
-  De er hverken lys eller radio, og deres fail-retning er ikke vurderet.
 - **HA-genstart MENS nettet er væk**: integrationerne går i setup-retry →
   `unavailable` → samme fail-open. Det er kun læst i koden, ikke testet.
 

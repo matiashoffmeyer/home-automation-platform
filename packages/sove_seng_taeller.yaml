@@ -29,6 +29,9 @@
 #   - Sove-radaren taber en sovende i OVER 30 min (22:25-22:55 den 16/09), så
 #     "tomt rum" må ALDRIG nulstille tælleren om natten. Nulstilling: kl. 12
 #     og ved Dormant.
+#   - 2026-10-30: to ANKRE der kun kan hæve (godnat-knappen → ≥ 1, kl. 03 med
+#     stille entré+bad → voksne hjemme), fordi IND undertalte ved sengetid 6 af
+#     10 nætter. Se automationerne sove_seng_godnat_anker / sove_seng_nat_anker.
 #   - Der findes intet facit endnu → TRÆNER-knapper (0/1/2/3, Indstillinger)
 #     sætter tallet og logger i ai_feedback/sove_seng_feedback.jsonl, så en
 #     senere session kan kalibrere mod brugerens svar.
@@ -250,6 +253,112 @@ automation:
           entity_id: input_number.sove_seng_personer
         data:
           value: 0
+
+
+  # ---------------------------------------------------------------------------
+  # ANKRE (2026-10-30, user: "gennemgå sengetælleren og forbedr den").
+  # Målt 20/10-30/10 (user i Spanien 19-23/10 → én voksen de nætter): ved
+  # sengetid stod tælleren under antal voksne i sengen 6 af 10 nætter
+  # (IND-kravet om stille-i-sengen fejlede 20 gange — "ikke talt"), mens
+  # UD fangede begge morgen-afgange hver gang. Undertællingen kostede: 29/10
+  # 05:01 talte en nattur ned til 0 med partneren i sengen, og 30/10 06:05 tændte
+  # godmorgen sove-loftet på en der lå der. Ankrene kan kun HÆVE tallet; et for
+  # højt tal betyder et mørkt soveværelse (user: "hellere mørkt"), og nulstillingen
+  # kl. 12 / Dormant er uændret.
+  # ---------------------------------------------------------------------------
+  # Godnat-knappen i soveværelset (voksen-godnat) = trykkeren ligger i sengen.
+  # Venter 3 min, så en IND-tælling for SAMME person (op til 150 s) er landet
+  # først — ellers talte vi trykkeren to gange.
+  - id: sove_seng_godnat_anker
+    alias: "Sengetæller: mindst 1 i sengen efter voksen-godnat"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: input_boolean.godnat_voksne_active
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.sove_seng_taeller_enabled
+        state: "on"
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    action:
+      - delay:
+          minutes: 3
+      - condition: state
+        entity_id: input_boolean.godnat_voksne_active
+        state: "on"
+      - condition: numeric_state
+        entity_id: input_number.sove_seng_personer
+        below: 1
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.sove_seng_personer
+        data:
+          value: 1
+      - service: logbook.log
+        data:
+          name: "Sengetæller"
+          message: "Godnat-anker → 1 i sengen."
+          entity_id: input_number.sove_seng_personer
+
+  # Midt om natten: entré OG bad har været stille i 30 min mens godnat er aktiv
+  # → alle voksne hjemme ligger i sengen. Målt 21/10-30/10: hver nat havde ≥ 46
+  # min stille kl. 03 (oftest 4-6 t), så ankeret lander kl. 03:00 i praksis.
+  # Hæver højst én gang pr. nat (last_triggered sættes kun når den handler), så
+  # en der flytter på sofaen efter ankeret ikke tælles tilbage i sengen. Stod
+  # tallet allerede rigtigt kl. 03, er den ikke brugt og kan løfte senere.
+  # Voksne hjemme = 0 mens godnat er trykket (GPS-ankeret viste 0 21-22/10 mens
+  # Parent B var hjemme alene) → mindst 1.
+  - id: sove_seng_nat_anker
+    alias: "Sengetæller: nat-anker — alle voksne hjemme i sengen kl. 03"
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/10"
+    condition:
+      - condition: time
+        after: "03:00:00"
+        before: "05:00:00"
+      - condition: state
+        entity_id: input_boolean.sove_seng_taeller_enabled
+        state: "on"
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+      - condition: state
+        entity_id: binary_sensor.godnat_common_active
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.entre_valhorn_occupancy
+        state: "off"
+        for:
+          minutes: 30
+      - condition: state
+        entity_id: binary_sensor.badevaerelse_inde_occupancy
+        state: "off"
+        for:
+          minutes: 30
+      - condition: template
+        value_template: >-
+          {{ as_timestamp(now())
+             - as_timestamp(this.attributes.last_triggered, 0) > 6 * 3600 }}
+      - condition: template
+        value_template: >-
+          {{ states('input_number.sove_seng_personer') | int(0)
+             < [states('sensor.voksne_hjemme_antal') | int(0), 1] | max }}
+    action:
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.sove_seng_personer
+        data:
+          value: "{{ [states('sensor.voksne_hjemme_antal') | int(0), 1] | max }}"
+      - service: logbook.log
+        data:
+          name: "Sengetæller"
+          message: "Nat-anker → {{ states('input_number.sove_seng_personer') | int(0) }} i sengen."
+          entity_id: input_number.sove_seng_personer
 
 script:
   # TRÆNER: brugeren siger hvor mange der ligger i sengen. Sætter tallet OG

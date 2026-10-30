@@ -123,6 +123,10 @@
     - condition: state
       entity_id: input_select.house_state
       state: "Active"
+    # 2026-10-29: sol i stuen → sofa-zonen og spisestuen venter; køkkenet
+    # tænder som før (packages/stue_sol_vindue.yaml). Unavailable = normal drift.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.stue_sol_vindue', 'on') }}"
     # 2026-06-10 (opg 4): Manual mode = bruger har selv indstillet lyset —
     # auto-tænd blokeret indtil drift-back → Auto.
     - condition: template
@@ -273,6 +277,10 @@
     - condition: state
       entity_id: input_select.house_state
       state: "Active"
+    # 2026-10-29: sol i stuen → sofa-zonen og spisestuen venter; køkkenet
+    # tænder som før (packages/stue_sol_vindue.yaml). Unavailable = normal drift.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.stue_sol_vindue', 'on') }}"
     - condition: template
       value_template: "{{ not is_state('input_select.room_mode_spisestue', 'Manual') }}"
     - condition: template
@@ -351,6 +359,14 @@
       entity_id: binary_sensor.open_plan_mork_indedag
       from: "off"
       to: "on"
+    # 2026-10-28 B274 (fejlklasse #4): om dagen kræver conditionen at mørket
+    # har HOLDT 10 min, men lux-flanken ovenfor fyrer efter 2 — uden denne
+    # re-arm ville et ægte mørkt vejr aldrig tænde sofaen før nogen satte sig
+    # igen. from: "off" (b103): reload-flanken unavailable → on er ingen dom.
+    - platform: state
+      entity_id: binary_sensor.stue_dagmorke_holdt
+      from: "off"
+      to: "on"
   variables:
     sofa_lights: !include ../rosters/stue_sofa_lys.yaml
     # 2026-07-31: LUKSUS-BLOK — samme filter som presence_light_sofa_on
@@ -380,6 +396,10 @@
     - condition: state
       entity_id: input_select.house_state
       state: "Active"
+    # 2026-10-29: sol i stuen → sofa-zonen og spisestuen venter; køkkenet
+    # tænder som før (packages/stue_sol_vindue.yaml). Unavailable = normal drift.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.stue_sol_vindue', 'on') }}"
     - condition: template
       value_template: "{{ not is_state('input_select.room_mode_stue', 'Manual') }}"
     - condition: template
@@ -415,10 +435,13 @@
     - condition: state
       entity_id: binary_sensor.sofa_zen_holder_sofa
       state: "off"
+    # 2026-10-28 B274: dag-loft + holdt mørke — se presence_light_sofa_on (#2).
     - condition: template
       value_template: >-
         {% set lux = states('sensor.open_plan_lux') | float(50) %}
-        {{ lux < (states('sensor.stue_lux_gate') | float(40)) }}
+        {{ lux < (states('sensor.stue_lux_gate') | float(40))
+           and (not is_state('sensor.sun_bracket', 'day')
+                or states('binary_sensor.stue_dagmorke_holdt') != 'off') }}
     - condition: state
       entity_id: input_boolean.entre_shutdown_grace
       state: "off"
@@ -742,20 +765,44 @@
   description: >
     Dagslys tilbage i open-plan mens lys står tændt — blid fade off af
     spisestue-loft + sofa-zonen. Re-armende, presence-uafhængig (B49).
+    Om dagen slukkes sofa-zonen alene allerede ved tænd-gaten × 1,2 (B274).
   mode: single
   variables:
     openplan_lights: !include ../rosters/open_plan_lys.yaml
+    sofa_lights: !include ../rosters/stue_sofa_lys.yaml
   trigger:
     # Eksplicitte is_state-kald = entity-tracking i template-triggeren
     # (spejler presence_light_sofa_off's re-arm-trigger). Slider-refs gør at
     # tærskel-ændringer re-evaluerer templaten med det samme.
-    - platform: template
+    - id: alle
+      platform: template
       value_template: >-
         {% set thr = states('sensor.stue_dagslys_sluk_effektiv') | float(0) %}
         {{ thr > 0
            and (states('sensor.open_plan_lux') | float(0)) > thr
            and (is_state('light.spisestue_loft', 'on')
                 or is_state('light.stue_sofa_lampe', 'on')
+                or is_state('light.stue_sofa_lampe_2', 'on')
+                or is_state('light.stue_hjoernelampe', 'on')
+                or is_state('light.stue_plug', 'on')
+                or is_state('light.stue_laesehygge', 'on')) }}
+      for:
+        minutes: "{{ states('input_number.stue_dagslys_sluk_minutter') | int(5) }}"
+    # 2026-10-28 B274: SOFA-ZONEN ALENE om dagen, ved tænd-gaten × 1,2 (30 → 36
+    # lx). Klagen ("tændt ved halvmørke/lyse hjemmedage, i sær læselampen";
+    # Parent B slukkede den 5 gange i appen ved 33-48 lx) var et dødbånd: et
+    # sky-dyk tændte under gaten, og lux'en blev så liggende mellem gaten og
+    # den fælles sluk (49,8) — ingen vej slukkede. Den fælles sluk sænkes IKKE,
+    # fordi den også slukker spisestue_loft, der har sin EGEN tænd-gate
+    # (spisestue_dagslys_lx < 50) → en lavere fælles sluk = tænd/sluk-krig.
+    # Om aftenen/natten (ikke 'day') er gaten 83 og båndet uændret.
+    - id: sofa_dag
+      platform: template
+      value_template: >-
+        {% set g = states('sensor.stue_lux_gate') | float(0) %}
+        {{ is_state('sensor.sun_bracket', 'day') and g > 0
+           and (states('sensor.open_plan_lux') | float(0)) > g * 1.2
+           and (is_state('light.stue_sofa_lampe', 'on')
                 or is_state('light.stue_sofa_lampe_2', 'on')
                 or is_state('light.stue_hjoernelampe', 'on')
                 or is_state('light.stue_plug', 'on')
@@ -769,7 +816,8 @@
     # ny flanke. Resultat: spisestue-loftet hang tændt i 200 lx (user-rapport).
     # /15-backstop re-evaluerer sluk-betingelsen periodisk; conditions nedenfor
     # gør den til en no-op når intet open-plan-lys er tændt i dagslys.
-    - platform: time_pattern
+    - id: backstop
+      platform: time_pattern
       minutes: "/15"
   condition:
     - condition: state
@@ -820,25 +868,48 @@
       state: "off"
     # Re-tjek efter for-vinduet (mode single + template-for burde række, men
     # billigt bælte: fyr aldrig på stale trigger-data).
+    # B274: sofa-grenen kræver på backstoppen (og via automation.trigger) at
+    # mørket ikke har holdt i for-vinduet — ét /15-tick over 36 lx er ingen dom
+    # (#14). stue_dagmorke_holdt er off når lux ≥ gaten; last_changed nulstilles
+    # ved restart, hvilket kun gør backstoppen langsommere, aldrig hurtigere.
     - condition: template
       value_template: >-
+        {% set lux = states('sensor.open_plan_lux') | float(0) %}
         {% set thr = states('sensor.stue_dagslys_sluk_effektiv') | float(0) %}
-        {{ thr > 0 and (states('sensor.open_plan_lux') | float(0)) > thr
-           and openplan_lights | select('is_state', 'on') | list | length > 0 }}
+        {% set g = states('sensor.stue_lux_gate') | float(0) %}
+        {% set minutter = states('input_number.stue_dagslys_sluk_minutter') | int(5) %}
+        {% set tid = trigger.id if trigger is defined and trigger.id is defined else 'backstop' %}
+        {% set h = states.binary_sensor.stue_dagmorke_holdt %}
+        {% set alle = thr > 0 and lux > thr
+           and openplan_lights | select('is_state', 'on') | list | length > 0 %}
+        {% set sofa = is_state('sensor.sun_bracket', 'day') and g > 0 and lux > g * 1.2
+           and sofa_lights | select('is_state', 'on') | list | length > 0
+           and (tid == 'sofa_dag'
+                or (h is not none and h.state == 'off'
+                    and (now() - h.last_changed).total_seconds() >= minutter * 60)) %}
+        {{ alle or sofa }}
   action:
+    - variables:
+        sluk_alle: >-
+          {% set thr = states('sensor.stue_dagslys_sluk_effektiv') | float(0) %}
+          {{ thr > 0 and (states('sensor.open_plan_lux') | float(0)) > thr }}
+        sluk_maal: "{{ openplan_lights if sluk_alle else sofa_lights }}"
     - service: logbook.log
       data:
         name: "Stue dagslys-sluk"
         message: >-
           lux {{ states('sensor.open_plan_lux') | float(0) | round(0) }} >
-          tærskel {{ states('sensor.stue_dagslys_sluk_effektiv') | float(0) | round(0) }}
+          {% if sluk_alle %}tærskel {{ states('sensor.stue_dagslys_sluk_effektiv') | float(0) | round(0) }}
           (slider {{ states('input_number.stue_dagslys_sluk_lux') | int(50) }},
           tænd-gate {{ states('sensor.stue_lux_gate') | float(0) | round(0) }})
+          {%- else %}sofa-dag {{ (states('sensor.stue_lux_gate') | float(0) * 1.2) | round(0) }}
+          (tænd-gate {{ states('sensor.stue_lux_gate') | float(0) | round(0) }} × 1,2){% endif %}
           i {{ states('input_number.stue_dagslys_sluk_minutter') | int(5) }} min
-          — slukker {{ openplan_lights | select('is_state', 'on') | list | join(', ') }}
+          — slukker {{ sluk_maal | select('is_state', 'on') | list | join(', ') }}
     - service: light.turn_off
+      continue_on_error: true
       target:
-        entity_id: "{{ openplan_lights }}"
+        entity_id: "{{ sluk_maal }}"
       data:
         transition: "{{ states('sensor.fade_living_effective') | int(30) }}"
 
@@ -873,6 +944,16 @@
     - platform: homeassistant
       event: start
       id: boot
+    # 2026-10-29 (fejlklasse #4): sol-vinduet (packages/stue_sol_vindue.yaml)
+    # slugte lux-faldet og occupancy-flanken mens solen stod ind. Når det
+    # slutter (sky eller sol under grænsen), får tænd-vejene en ny chance —
+    # deres EGNE lux-conditions afgør (skip_condition: false). from: "on"
+    # (b103): reload-flanken unavailable → off er ingen dom.
+    - platform: state
+      entity_id: binary_sensor.stue_sol_vindue
+      from: "on"
+      to: "off"
+      id: sol_slut
   condition:
     - condition: state
       entity_id: binary_sensor.presence_sensors_available
@@ -881,11 +962,13 @@
       entity_id: input_select.house_state
       state: "Active"
     # Re-tjek efter for-vinduet: fyr aldrig på stale trigger-data.
+    # sol_slut: spisestuen har sin egen tærskel (spisestue_dagslys_lx), så
+    # stue-gaten må ikke afgøre for den — målene re-tjekker selv.
     - condition: template
       value_template: >-
         {% set lux = states('sensor.open_plan_lux') | float(-1) %}
         {% set gate = states('sensor.stue_lux_gate') | float(0) %}
-        {{ lux >= 0 and gate > 0 and lux < gate }}
+        {{ trigger.id == 'sol_slut' or (lux >= 0 and gate > 0 and lux < gate) }}
     # No-op hvis intet optaget open-plan-rum står mørkt.
     - condition: template
       value_template: >-
@@ -914,8 +997,10 @@
           data:
             name: "Stue re-arm"
             message: >-
-              open_plan_lux {{ states('sensor.open_plan_lux') }} <
-              tænd-gate {{ states('sensor.stue_lux_gate') }} og spisestuen er
+              {% if trigger.id == 'sol_slut' %}sol-vinduet sluttede
+              (sky eller sol under grænsen){% else %}open_plan_lux
+              {{ states('sensor.open_plan_lux') }} < tænd-gate
+              {{ states('sensor.stue_lux_gate') }}{% endif %} og spisestuen er
               optaget men mørk → re-armer Lysnet: Spisestue tænd
         - service: automation.trigger
           target:

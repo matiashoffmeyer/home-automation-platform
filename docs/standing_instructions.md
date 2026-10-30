@@ -185,6 +185,19 @@ Backstop-automationen gentager varslet (op til 15 min forsinket), entry-flanken
 findes for at reaktionen er øjeblikkelig. NB triggeren har eksplicit
 `not_from: [unknown, unavailable]`, så et `template.reload` ikke fyrer varslet.
 
+**↪ Anden UNDER-undtagelse: `packages/airbnb_udtjekning.yaml` (user-spec
+2026-10-28):** "når airbnb starter skal der laves en udtjekningsdato, default 6
+dage senere, giv mig push om at rette det". Samme præmis som kamera-vagten:
+pushen fyrer KUN på flanken ind i AirBnB (ingen backstop, ingen gentagelse), så
+den rammer user mens han selv står med telefonen. Datoen er B256's grænse for
+hvor længe gæster antages at bo i huset.
+
+**↪ Tredje UNDER-undtagelse: velkomstbesked-påmindelsen i
+`packages/airbnb_velkomst.yaml` (user-spec 2026-10-29):** "når jeg slår airbnb
+til skal jeg påmindes om at skrive en tekst eller slette en gammel tekst".
+Samme præmis: kun på flanken ind i AirBnB, én push med "Slet beskeden"-knap;
+knappens bekræftelse er svar på hans eget tryk.
+
 ### 🧪 Test fysisk + mål når nyt går live (per 2026-05-03)
 
 Har ændringen **observerbar fysisk effekt** (lys, gardiner, lyd, timing):
@@ -197,6 +210,52 @@ Har ændringen **observerbar fysisk effekt** (lys, gardiner, lyd, timing):
 4. **HA's reelle throughput: ~5-10 light-kald/sek max.** Loop-designs der
    antager >10/sek fejler silently (kører, bare langsommere). Målt 2026-05-03:
    et "40 ticks/sek"-design leverede 7,5.
+
+### ✋ Live-test og genstart kræver ja via push FØRST (per 2026-10-28, user-spec)
+
+User 2026-10-28: *"hvis der skal testes live med lys eller noget jeg kan høre
+eller der genstartes så skal jeg spørges med action knapper før. du må gøre det
+så jeg kan godkende eller afvise eller sige om 20min"*. Skærper "ingen live
+tests uden lov" (25/10 + 26/10: ét bestilt løb = ét; gen-test efter et fix
+kræver et nyt ja).
+
+**Hvad kræver et ja:** ethvert kald huset kan se eller høre — `light`, `switch`,
+`scene`, `script`, `media_player`, `tts`, `cover`, `siren`, `remote`, `button`,
+`fan`, `vacuum`, `automation.trigger`, `homeassistant.turn_on/off/toggle` — og
+enhver genstart (`ha_restart.sh`, `ha core restart/stop/rebuild/update`, host
+reboot, add-on restart/stop/update). **Kræver intet:** reloads, notifikationer,
+helper-skrivninger (`input_*`), læsninger og passivt bevis i history.
+
+**Sådan:**
+
+1. `python3 scripts/live_godkend.py spørg "<hvad der skal ske, kort dansk>"
+   [--genstart] [--minutter N] [--frist M]` med `run_in_background` — ventetiden
+   kan være lang.
+2. Pushen (tag `claude_godkend`) har knapperne **Godkend / Afvis / Om 20 min**.
+   Scriptet abonnerer på `mobile_app_notification_action` FØR pushen sendes;
+   knappernes action-id bærer et tilfældigt runde-id, så et tryk på en gammel
+   push aldrig tæller.
+3. Exit-koder: **0** godkendt (`.cache/live_godkendelse.json` skrives, gyldig 15
+   min / 10 min ved genstart, fra trykket) · **1** afvist · **2** intet svar
+   inden fristen (default 30 min) eller udsat 6 gange = nej · **3** AirBnB ·
+   **4** fejl. **Om 20 min** = spørg igen om 20 min (samme knapper).
+4. Efter testen: `live_godkend.py slut` — et ja gælder den test der blev spurgt
+   om, ikke det næste kvarters eksperimenter.
+5. Svar logges i `.cache/live_godkendelse.log` og i HA's logbog
+   ("Claude-godkendelse").
+
+**AirBnB:** ingen push (telefonen kan være hos gæsten) → exit 3; spørg i
+chatten, og registrér brugerens ja med `live_godkend.py chat "<brugerens ord>"
+[--genstart]` (afvises uden for AirBnB).
+
+**Håndhævelse:** `scripts/live_guard.py` (PreToolUse på Bash, ADR 0006) afviser
+kommandoen med exit 2 uden et gyldigt ja af rette slags. Kommandoer der kun
+NÆVNER et mønster (grep, git, en heredoc til cat/git) passerer; afgøres pr.
+simpel kommando, så `grep … && <kald>` stadig fanges. En heredoc til python
+regnes som kode — skal du blot skrive TEKST der nævner `ha_restart.sh`, så brug
+Edit/Write. En genstart slippes igennem når HA ikke svarer (ingen at spørge,
+intet at forstyrre). Kun user må slå vagten fra (`.claude/live_guard_off`,
+git-ignoreret). Omgå den aldrig.
 
 ### 🎛️ Tjek eksisterende slidere FØR du bygger nyt (per 2026-05-17)
 

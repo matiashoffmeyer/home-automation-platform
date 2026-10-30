@@ -8,8 +8,8 @@
 # Works in ALL modes: Normal, AirBnB, Home Vacation.
 #
 # FLOW:
-#   1. Hoveddør opens → entré light ON (LUX-aware brightness). Har OGSÅ en
-#      device_tracker-fallback, gatet på en ÆGTE afgang (se nederst).
+#   1. Hoveddør opens → entré light ON (LUX-aware brightness). KUN døren —
+#      GPS-fallbacken er fjernet (B275, se GHOST-HJEMKOMST nederst).
 #   1a. If nobody was in open-plan when door opened → stue + køkken
 #       welcome light ON at LUX-adapted brightness. KUN døren — ingen GPS
 #       (user-spec 2026-08-07).
@@ -33,25 +33,11 @@
   description: "Turn on entré light when front door opens, adapted to LUX"
   mode: single
   trigger:
+    # B275 2026-10-28: døren er ENESTE trigger — GPS-fallbacken er fjernet,
+    # se GHOST-HJEMKOMST nederst i filen.
     - platform: state
       entity_id: binary_sensor.parasoll_hoveddoer
       to: "on"
-    # Sprint A.2 fix audit 2026-05-07: door sensor er i kasse pre-flyt →
-    # arrival never fires. Tilfojet device_tracker `to: home` som fallback
-    # trigger. Post-flyt: begge triggers redundant for robusthed.
-    # A91 fix audit-5 2026-05-12: `for: minutes: 2` debouncer phone-flap.
-    # Door-trigger forbliver instant (real event). Phone-trigger venter på
-    # 2 min stabil "home" før den fyrer welcome.
-    - platform: state
-      entity_id: device_tracker.phone_a
-      to: "home"
-      for:
-        minutes: 2
-    - platform: state
-      entity_id: device_tracker.phone_b
-      to: "home"
-      for:
-        minutes: 2
   condition:
     # 2026-09-27 (user-spec: "hvis en gæst sover i open plan skal hjemkomst og
     # andre automations heller ikke tænde lys i openplan, terrasse og entré").
@@ -79,20 +65,6 @@
     # åben dør entré-lyset ned til lux-base efter manuel skru-op.
     - condition: template
       value_template: "{{ not is_state('input_select.room_mode_entre', 'Manual') }}"
-    # 2026-08-06f: GPS-jitter må ikke tælle som hjemkomst — se ÆGTE-AFGANG
-    # nederst i filen. Gælder KUN tracker-triggerne; døren fyrer u-gatet.
-    - condition: template
-      value_template: >-
-        {% set p = trigger.entity_id | default('', true) if trigger is defined else '' %}
-        {% if p == 'device_tracker.phone_a' %}{% set f = 'input_boolean.parent_a_home' %}
-        {% elif p == 'device_tracker.phone_b' %}{% set f = 'input_boolean.parent_b_home' %}
-        {% else %}{% set f = '' %}{% endif %}
-        {% if f == '' %}true
-        {% else %}
-        {% set s = states[f] %}
-        {{ s is none or s.state == 'off'
-           or (now() - s.last_changed).total_seconds() < 60 }}
-        {% endif %}
     # Only if there's a need for light (not bright daylight)
     # Day-aware threshold (sprint 2026-05-07): halve threshold under sun_bracket=day.
     # 2026-08-19: BEVIDST ikke flyttet til sensor.open_plan_haendelse_lux_gate.
@@ -143,9 +115,8 @@
     # ikke ved gps". Døren er ENESTE trigger her — de to device_tracker-
     # fallbacks er fjernet. De blev tilføjet 2026-05-07 fordi dørsensoren lå
     # i en kasse pre-flyt; den virker nu, og GPS'en har vist sig at kunne
-    # opfinde en hjemkomst (se ÆGTE-AFGANG nederst i filen). Entré-lyset
-    # beholder bevidst tracker-fallbacken — dét lys er billigt at tage fejl
-    # med, mens velkomstlyset tænder stue/spisestue.
+    # opfinde en hjemkomst (se GHOST-HJEMKOMST nederst i filen). Entré-lyset
+    # fulgte efter 2026-10-28 (B275).
     - platform: state
       entity_id: binary_sensor.parasoll_hoveddoer
       to: "on"
@@ -220,11 +191,16 @@
     # spisestue-loftet kun på spisestue-Apolloen — hoveddøren (også en voksen
     # der GÅR) er ikke den. Køkken-kæden nedenfor er urørt. Søstre:
     # godnat_adult_nightwalk, presence_light_stue_on (grep B216).
+    # 2026-10-29: sol i stuen → spisestue-loftet venter, køkkenet tænder
+    # (user-valg b, packages/stue_sol_vindue.yaml). Slutter vinduet mens
+    # spisestuen er optaget, tænder presence_lux_stue_rearm loftet.
     - if:
         - condition: template
           value_template: >-
             {{ not (now().hour >= 4 and now().hour < 12
                     and is_state('input_boolean.boern_sov_her_i_nat', 'on')) }}
+        - condition: template
+          value_template: "{{ not is_state('binary_sensor.stue_sol_vindue', 'on') }}"
       then:
         - service: light.turn_on
           target:
@@ -291,13 +267,35 @@
             transition: "{{ states('sensor.koekken_lyskaede_fade_hurtig_effektiv') | int(2) }}"
 
 # =============================================================================
-# ÆGTE-AFGANG-GATEN (2026-08-06f) — hvorfor entré-lysets tracker-trigger er
-# betinget
+# GHOST-HJEMKOMST (B275, 2026-10-28) — hvorfor ingen hjemkomst-regel lytter på
+# GPS
 # =============================================================================
-# NB 2026-08-07: gaten sidder nu KUN på `arrival_entre_light`. Velkomstlyset
-# har efter user-spec ("velkomstlys skal kun køre ved maindoor open, ikke ved
-# gps") ingen tracker-triggers længere og kan derfor slet ikke nås ad GPS-vejen.
+# User 2026-10-28: "i nat var der et lys der tændte kort … 2-3 tiden?" →
+# "ghost hjemkomst uden dør!!". Entré-loftet tændte 02:31:50 og slukkede
+# 02:32:49. Hoveddøren stod lukket 22:00-06:57. Telefonen lå hjemme, og
+# geokodningen sprang til en anden adresse (02:15:32 not_home → 02:29:50 home
+# = 14 min), så `parent_a_home` faldt efter 5 min grace (02:20:32), og
+# ægte-afgang-gaten herunder godkendte den falske "afgang". Samme nat
+# 23:30-23:44 (14 min), og samme fejl i entréen 23:46:39.
 #
+# Målt over 30 døgn (15 tracker-udløste kørsler, alle phone_a):
+#   - 6 uden NOGEN dør-åbning ± 15 min = ghosts (10-11, 10-14, 10-25 ×2,
+#     10-27, 10-28).
+#   - 8 ægte, hvor GPS'en kom 43-480 s FØR døren. Lyset slukkes af
+#     entre_motion_off ~1 min efter (målt 59 s i nat), så det var som regel
+#     slukket igen når døren gik op. Døren tænder selv u-gatet.
+#   - 1 hvor døren allerede havde tændt (redundant).
+# Leave-graceens 5 min skiller altså ikke jitter fra ture: nat-jitteren er
+# vokset til 14 min, og en tærskel derover æder korte ægte ture.
+#
+# Fallbacken blev bygget 2026-05-07, da dørsensoren lå i en kasse. Falder
+# parasoll ud (8 gange på 30 døgn, p50 43 min), tænder entre_motion stadig
+# på VALLHORN-PIR når man går ind. Det koster kun den dæmpede "lys før døren"-
+# velkomst, som sjældent nåede at holde. Skal GPS nogensinde tilbage, så kun
+# gatet på at parasoll er `unavailable` (fejlklasse #9) — og helst på en dør-
+# afgang (jf. people-reglen: kun døren beviser at nogen gik).
+#
+# Historik, ÆGTE-AFGANG-GATEN (2026-08-06f, nu fjernet sammen med triggerne):
 # User 2026-08-06: "entre tændte lige under godnat wtf!". Facit fra history:
 # godnat blev sat 22:12:06, huset slukket 22:13:09 — og 22:18:03 tændte BÅDE
 # entre_loft og spisestue_loft igen. Ingen var i entréen (valhorn-occupancy
@@ -321,15 +319,12 @@
 # 0,1-0,9 min (15 forekomster), ægte ture ≥ 11,1 min. De få 3-5 min "ture"
 # ligger kl. 03 om natten og er også jitter. Vi vælger IKKE et minuttal her —
 # vi arver husets egen definition af "en rigtig afgang" (leave-graceen), så
-# der kun er ét sted at justere.
+# der kun er ét sted at justere. (Holdt til 2026-10-28: nat-jitter på 14 min
+# slap igennem graceen — se B275 ovenfor.)
 #
-# Falske negativer er billige: døren fyrer u-gatet, og entre_motion tænder
-# alligevel på VALLHORN-PIR når man går ind. Tracker-triggeren er kun den
-# fallback der blev tilføjet pre-flyt da dørsensoren lå i en kasse.
-#
-# NB: gaten rører IKKE godnat-adfærden. At entré/velkomst fyrer dæmpet (8 %
-# / 12 % @ 2000 K) under godnat er en bevidst user-beslutning (A22, sprint
-# 2026-05-06) og gælder stadig for ÆGTE hjemkomster.
+# NB: At entré/velkomst fyrer dæmpet (8 % / 12 % @ 2000 K) under godnat er en
+# bevidst user-beslutning (A22, sprint 2026-05-06) og gælder stadig for
+# hjemkomster ad døren.
 # =============================================================================
 
 # --- 2a: Entré-sluk ejes af entre_motion_off ---

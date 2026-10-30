@@ -1,0 +1,142 @@
+# Højttaler-Bluetooth — synlig KUN for AirBnB-gæster i open plan (B276, 2026-10-29)
+#
+# User 29/10: "gæsterne skal ikke rode fysisk med højttaleren" + "it should be
+# discoverable only in airbnb mode when there is open plan presence". N3'en har
+# ingen knap/fjernbetjening i brug, så HA styrer parringen.
+#
+# Synlig = nye telefoner kan finde "myair" og parre (uden PIN). Skjult = ingen
+# nye parringer, men allerede parrede telefoner kan stadig forbinde — en gæst
+# der har parret én gang, mister intet når stuen tømmes. Højttaleren starter
+# altid SKJULT efter en genstart (bt-set-agent på højttaleren, se
+# scripts/hoejttaler_bt.py for hardware-sporet: USB-dongle væk, onboard-chip).
+#
+# Én automation ejer tilstanden (single owner, #1):
+#   - open plan optaget i 1 min (AirBnB) → synlig
+#   - open plan tom i `hoejttaler_bt_skjul_minutter` (AirBnB) → skjul. 15 min =
+#     målt 7 døgn 22/10-29/10: 503 off-huller, p90 6,9 min, 35 over 15 min —
+#     radaren taber en stille sofa-gæst i minutter, ikke i et kvarter.
+#   - house_mode-skift → afstem; FRA AirBnB → skjul + glem alle parrede
+#     telefoner (gæstens telefon må ikke kunne forbinde efter udtjekning).
+#   - HA-start (restart dræber `for:`'en) og højttaleren tilbage → afstem.
+# Uden for AirBnB kører open plan-triggerne slet ikke (ingen SSH-kald for
+# ingenting). Fejl → persistent_notification (ingen push: virker tavst i AirBnB).
+input_number:
+  hoejttaler_bt_skjul_minutter:
+    name: "Højttaler-BT: skjul efter tom open plan"
+    min: 5
+    max: 60
+    step: 5
+    unit_of_measurement: min
+    icon: mdi:bluetooth-off
+
+input_text:
+  # Sidste afstemnings udfald, vist på AirBnB-fanen. Skrives kun her.
+  hoejttaler_bt_status:
+    name: "Højttaler-BT status"
+    icon: mdi:bluetooth-settings
+    max: 100
+
+shell_command:
+  # Max ~40 s (SSH åbnes ≤ 12 s, kald, synlig venter ≤ 12 s på chippen, SSH
+  # lukkes ≤ 8 s) — under shell_command's 60 s. Handlingen tvinges her.
+  hoejttaler_bt: >-
+    python3 /config/scripts/hoejttaler_bt.py
+    {{ handling if handling in ['synlig', 'skjul', 'ryd'] else 'status' }}
+
+automation:
+  - id: hoejttaler_bt_afstem
+    alias: "Højttaler-BT: synlig kun for AirBnB-gæster i open plan"
+    description: >-
+      Gør højttaleren synlig for Bluetooth-parring i AirBnB-mode, når nogen er
+      i open plan, og skjuler den igen når open plan har været tom. Glemmer
+      alle parrede telefoner når AirBnB-mode slutter.
+    mode: queued
+    max: 4
+    max_exceeded: silent
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.open_plan_occupied
+        from: "off"
+        to: "on"
+        for: "00:01:00"
+        id: nogen
+      - trigger: state
+        entity_id: binary_sensor.open_plan_occupied
+        from: "on"
+        to: "off"
+        for:
+          minutes: "{{ states('input_number.hoejttaler_bt_skjul_minutter') | int(15) }}"
+        id: tomt
+      - trigger: state
+        entity_id: input_select.house_mode
+        not_from: [unavailable, unknown]
+        not_to: [unavailable, unknown]
+        id: mode
+      - trigger: state
+        entity_id: binary_sensor.hoejttaler_online
+        from: "off"
+        to: "on"
+        for: "00:01:30"
+        id: hoejttaler_tilbage
+      - trigger: homeassistant
+        event: start
+        id: start
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.id in ['mode', 'hoejttaler_tilbage', 'start']
+             or is_state('input_select.house_mode', 'AirBnB') }}
+    actions:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          # Netværk/integrationer falder på plads efter boot.
+          - delay: "00:01:00"
+      - variables:
+          handling: >-
+            {% if trigger.id == 'mode' and trigger.from_state.state == 'AirBnB' %}ryd
+            {% elif is_state('input_select.house_mode', 'AirBnB')
+                 and is_state('binary_sensor.open_plan_occupied', 'on') %}synlig
+            {% else %}skjul{% endif %}
+      - action: shell_command.hoejttaler_bt
+        data:
+          handling: "{{ handling }}"
+        response_variable: svar
+        continue_on_error: true
+      - variables:
+          # Timeout (60 s) giver intet svar; exit 1 giver stadig stdout.
+          res: >-
+            {{ (svar.stdout if svar is defined and svar.stdout is defined else '')
+               | from_json(default={}) }}
+          fejl: >-
+            {% if not res %}intet svar fra scriptet
+            {% elif res.fejl is defined %}{{ res.fejl }}
+            {% elif not res.ok %}blev ikke {{ 'synlig' if handling == 'synlig' else 'skjult' }}
+            {% else %}{% endif %}
+          tid: "{{ now().strftime('%-d/%-m %H:%M') }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.hoejttaler_bt_status
+        data:
+          value: >-
+            {% if fejl | trim %}Fejl {{ tid }}: {{ fejl | trim }}
+            {% elif handling == 'synlig' %}Synlig som myair · {{ tid }}
+            {% elif (res.glemt | default(0)) > 0 %}Skjult, {{ res.glemt }} telefon{{ 'er' if res.glemt > 1 else '' }} glemt · {{ tid }}
+            {% else %}Skjult · {{ tid }}{% endif %}
+      - if:
+          - condition: template
+            value_template: "{{ fejl | trim | length > 0 }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              notification_id: hoejttaler_bt
+              title: "Højttaler-Bluetooth"
+              message: >-
+                Kunne ikke {{ 'gøre højttaleren synlig' if handling == 'synlig'
+                else 'skjule højttaleren' }}: {{ fejl | trim }}.
+                Tjek med `python3 scripts/hoejttaler_bt.py status`.
+        else:
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: hoejttaler_bt

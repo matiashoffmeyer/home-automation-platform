@@ -82,12 +82,57 @@ input_boolean:
     icon: mdi:motion-sensor
 
 input_datetime:
+  # Beskeden venter på stuen (user 2026-10-29: "den skal først afspilles når de
+  # kommer ind i stuen"). Sat af ceremonien, 1970 = intet venter. Skrevet
+  # stempel, så det overlever en restart mellem dør og stue.
+  airbnb_velkomst_besked_armeret_at:
+    name: "AirBnB velkomst: besked venter siden"
+    icon: mdi:message-processing
+    has_date: true
+    has_time: true
+  # TESTKØRSEL (user 2026-10-29: "jeg skal kunne simulere det hele"). Sat af
+  # script.airbnb_test_start, læst via binary_sensor.airbnb_test_aktiv.
+  airbnb_test_til:
+    name: "AirBnB test: aktiv til"
+    icon: mdi:test-tube
+    has_date: true
+    has_time: true
   # SKREVET sluttidspunkt — ikke last_changed, som nulstilles ved restart.
   airbnb_velkomst_slut_at:
     name: "AirBnB: velkomst slutter kl."
     icon: mdi:clock-end
     has_date: true
     has_time: true
+
+# VELKOMST-BESKED (user 2026-10-29: "et felt hvor jeg kan taste en velkomst
+# besked ind og vælge oplæsningssprog til airbnbs"). Læses op på højttaleren
+# første gang gæsten kommer ind i stuen efter ceremonien (stue-Apolloen),
+# via script.hoejttaler_annoncer (Google-TTS, springer
+# over hvis noget spiller). Tom liste = ingen oplæsning.
+#
+# TEKSTEN BOR I todo.airbnb_velkomst (local_todo, oprettet via config-flow
+# 2026-10-29), ikke i en input_text: HA's input_text har et hårdt loft på 255
+# tegn (user: "250 chr are not enough"). Hvert ÅBENT punkt er et afsnit
+# (titel + evt. beskrivelse, ubegrænset længde), læst i listens rækkefølge;
+# afkrydsede punkter springes over. NB listen ligger i .storage
+# (local_todo.airbnb_velkomst.ics), ikke i config_snapshots.
+
+# Visningsnavn → Google-TTS-kode står i script.airbnb_velkomst_oplaes.
+input_select:
+  airbnb_velkomst_sprog:
+    name: "AirBnB velkomst: oplæsningssprog"
+    icon: mdi:translate
+    options:
+      - Engelsk
+      - Dansk
+      - Tysk
+      - Svensk
+      - Norsk
+      - Hollandsk
+      - Fransk
+      - Spansk
+      - Italiensk
+      - Polsk
 
 input_number:
   airbnb_velkomst_fade_sekunder:
@@ -115,7 +160,170 @@ input_number:
     unit_of_measurement: "%"
     mode: slider
 
+# ÉT anker for "gæste-kæden må køre uden AirBnB-mode" — læst af
+# airbnb_velkomst_start, airbnb_velkomst_besked_i_stuen og airbnb_checkin_notify
+# (fejlklasse #2). Kun i conditions, aldrig som trigger (template.reload).
+template:
+  - binary_sensor:
+      - name: "AirBnB test aktiv"
+        unique_id: airbnb_test_aktiv
+        icon: mdi:test-tube
+        state: >-
+          {{ now().timestamp() < (state_attr('input_datetime.airbnb_test_til', 'timestamp') | float(0)) }}
+
 script:
+  # ---------------------------------------------------------------------------
+  # TESTKØRSEL — simulerer gæstens ankomst uden at skifte house_mode.
+  # Springer 1-times-armeringen og 24-t-Normal-kravet over; resten af kæden
+  # (dør → ceremoni → stue → besked, check-in-push) er den ægte kode.
+  # AirBnB-regimet selv (stilhed, nat-mode, flag-oprydning) simuleres IKKE.
+  # ---------------------------------------------------------------------------
+  airbnb_test_start:
+    alias: "AirBnB: start testkørsel af gæste-ankomsten"
+    icon: mdi:test-tube
+    mode: single
+    sequence:
+      - condition: template
+        value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_test_til
+        data:
+          datetime: "{{ (now() + timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_checkin_arm_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_velkomst_besked_armeret_at
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: input_boolean.turn_on
+        target:
+          entity_id:
+            - input_boolean.airbnb_checkin_pending
+            - input_boolean.airbnb_velkomst_pending
+      # Samme påmindelse som når AirBnB slås til.
+      - service: script.airbnb_velkomst_paamind
+      - service: notify.mobile_app_phone_a
+        continue_on_error: true
+        data:
+          title: "🧪 AirBnB-test i gang (til {{ (now() + timedelta(minutes=30)).strftime('%H:%M') }})"
+          message: >-
+            1) Gå ud og åbn hoveddøren → check-in-push + velkomstlys.
+            2) Gå ind i stuen → beskeden læses op. Testen stopper selv.
+          data:
+            tag: airbnb_test
+      - service: logbook.log
+        data:
+          name: "AirBnB test"
+          message: "Testkørsel startet — gæste-kæden armeret i 30 min."
+
+  airbnb_test_stop:
+    alias: "AirBnB: stop testkørsel"
+    icon: mdi:stop-circle-outline
+    mode: single
+    sequence:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_test_til
+        data:
+          datetime: "1970-01-01 00:00:00"
+      # Ryd kun gæste-flagene når vi IKKE er i ægte AirBnB — ellers ville en
+      # sen stop slette et rigtigt ophold. Ellers kunne et rest-flag fra testen
+      # fyre ceremonien ved næste AirBnB-start, der ikke selv armerer (< 24 t).
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+        then:
+          - service: input_boolean.turn_off
+            target:
+              entity_id:
+                - input_boolean.airbnb_checkin_pending
+                - input_boolean.airbnb_velkomst_pending
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.airbnb_velkomst_besked_armeret_at
+            data:
+              datetime: "1970-01-01 00:00:00"
+          - if:
+              - condition: state
+                entity_id: input_boolean.airbnb_velkomst_active
+                state: "on"
+            then:
+              - service: script.airbnb_velkomst_slip
+      - service: logbook.log
+        data:
+          name: "AirBnB test"
+          message: "Testkørsel stoppet — gæste-flag ryddet."
+
+  # ---------------------------------------------------------------------------
+  # Beskeden som tekst — ÉN ejer af "hvad er velkomsten", læst af oplæsningen
+  # og påmindelsen. Returnerer {tekst, punkter}.
+  # ---------------------------------------------------------------------------
+  airbnb_velkomst_tekst:
+    alias: "AirBnB: hent velkomstbeskeden fra listen"
+    icon: mdi:format-list-text
+    mode: parallel
+    sequence:
+      - service: todo.get_items
+        continue_on_error: true
+        target:
+          entity_id: todo.airbnb_velkomst
+        data:
+          status: needs_action
+        response_variable: liste
+      - variables:
+          svar: >-
+            {%- set items = (liste['todo.airbnb_velkomst']['items'] | default([]))
+                            if liste is defined and liste is mapping else [] -%}
+            {%- set ns = namespace(dele=[]) -%}
+            {%- for i in items -%}
+              {%- for felt in [i.summary | default(''), i.description | default('')] -%}
+                {%- if felt and felt | trim -%}
+                  {%- set ns.dele = ns.dele + [felt | trim] -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {{ {'tekst': ns.dele | join(' '), 'punkter': items | count} }}
+      - stop: "Velkomsttekst hentet"
+        response_variable: svar
+
+  # ---------------------------------------------------------------------------
+  # Påmindelses-pushen — ÉN ejer, kaldt ved AirBnB-start og af testkørslen.
+  # ---------------------------------------------------------------------------
+  airbnb_velkomst_paamind:
+    alias: "AirBnB: påmind om velkomstbeskeden"
+    icon: mdi:message-alert
+    mode: single
+    sequence:
+      - service: script.airbnb_velkomst_tekst
+        response_variable: svar
+      - variables:
+          tekst: "{{ svar.tekst | default('') }}"
+          punkter: "{{ svar.punkter | default(0) | int(0) }}"
+          sprog: "{{ states('input_select.airbnb_velkomst_sprog') }}"
+      - service: notify.mobile_app_phone_a
+        continue_on_error: true
+        data:
+          title: "🏡 AirBnB: velkomstbesked"
+          message: >-
+            {% if tekst | string | trim != '' %}
+              Nuværende besked ({{ sprog }}, {{ tekst | length }} tegn): "{{ tekst | truncate(120) }}"
+              Skriv en ny på Indstillinger → AirBnB, eller slet den gamle.
+            {% else %}
+              Ingen besked endnu — skriv en på Indstillinger → AirBnB, så den
+              læses op når gæsterne kommer ind i stuen.
+            {% endif %}
+          data:
+            tag: airbnb_velkomst_besked
+            clickAction: /indstillinger-dash/airbnb-tuning
+            actions: >-
+              {{ [{'action': 'AIRBNB_VELKOMST_SLET', 'title': 'Slet beskeden'}]
+                 if tekst | string | trim != '' else [] }}
+
   # ---------------------------------------------------------------------------
   # Selve ceremonien — ét sted, så start-automationen ikke kan divergere fra en
   # evt. manuel test-kørsel (fejlklasse #2).
@@ -214,6 +422,49 @@ script:
             Velkomst-ceremoni startet ({{ bri }} %, {{ fade }} s fade) —
             entré, open-plan, bad og soveværelse. Slipper til Auto om
             {{ states('input_number.airbnb_velkomst_minutter') | int(10) }} min.
+      # Beskeden spilles ikke her, men ved første ophold i stuen
+      # (airbnb_velkomst_besked_i_stuen).
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_velkomst_besked_armeret_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  # ---------------------------------------------------------------------------
+  # Oplæsningen — ÉN ejer, kaldt af ceremonien og af test-knappen.
+  # vigtig: true så en AirBnB-natmode (godnat-flag) ikke tier velkomsten; den
+  # afbryder stadig aldrig noget der spiller.
+  # ---------------------------------------------------------------------------
+  airbnb_velkomst_oplaes:
+    alias: "AirBnB: læs velkomst-beskeden op"
+    icon: mdi:account-voice
+    mode: single
+    sequence:
+      - variables:
+          koder:
+            Engelsk: en
+            Dansk: da
+            Tysk: de
+            Svensk: sv
+            Norsk: "no"
+            Hollandsk: nl
+            Fransk: fr
+            Spansk: es
+            Italiensk: it
+            Polsk: pl
+          sprog: "{{ koder.get(states('input_select.airbnb_velkomst_sprog'), 'en') }}"
+      - service: script.airbnb_velkomst_tekst
+        response_variable: svar
+      - variables:
+          tekst: "{{ svar.tekst | default('') }}"
+      - condition: template
+        value_template: "{{ tekst | string | trim != '' }}"
+      - service: script.hoejttaler_annoncer
+        continue_on_error: true
+        data:
+          besked: "{{ tekst }}"
+          sprog: "{{ sprog }}"
+          vigtig: true
 
   # ---------------------------------------------------------------------------
   # Afslutning — ÉN skriver af oprydningen, kaldt både af backstoppen og af en
@@ -334,9 +585,10 @@ automation:
       - condition: state
         entity_id: input_boolean.airbnb_velkomst_enabled
         state: "on"
-      - condition: state
-        entity_id: input_select.house_mode
-        state: "AirBnB"
+      - condition: template
+        value_template: >-
+          {{ is_state('input_select.house_mode', 'AirBnB')
+             or is_state('binary_sensor.airbnb_test_aktiv', 'on') }}
       - condition: state
         entity_id: input_boolean.airbnb_velkomst_pending
         state: "on"
@@ -434,6 +686,124 @@ automation:
              or now().timestamp() >= (state_attr('input_datetime.airbnb_velkomst_slut_at', 'timestamp') | float(0)) }}
     action:
       - service: script.airbnb_velkomst_slip
+
+  # ---------------------------------------------------------------------------
+  # BESKEDEN — første gang gæsten kommer ind i stuen efter ceremonien
+  # ---------------------------------------------------------------------------
+  # Filtreret occupancy (spøgelses-gaten), `from: "off"` mod reload-ekkoer.
+  # Udløber efter 2 t: en velkomst der først kommer om aftenen er ikke en
+  # velkomst. Stemplet ryddes FØR oplæsningen → kun én gang pr. ophold.
+  - id: airbnb_velkomst_besked_i_stuen
+    alias: "AirBnB velkomst: læs beskeden op når gæsten kommer ind i stuen"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.stue_apollo_occupancy_filtered
+        from: "off"
+        to: "on"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ is_state('input_select.house_mode', 'AirBnB')
+             or is_state('binary_sensor.airbnb_test_aktiv', 'on') }}
+      - condition: template
+        value_template: >-
+          {% set t = state_attr('input_datetime.airbnb_velkomst_besked_armeret_at', 'timestamp') | float(0) %}
+          {{ t > 86400 and 0 <= now().timestamp() - t <= 7200 }}
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_velkomst_besked_armeret_at
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: script.airbnb_velkomst_oplaes
+
+  # ---------------------------------------------------------------------------
+  # PÅMINDELSE — når ejeren slår AirBnB til: skriv en ny besked eller slet den
+  # gamle (user 2026-10-29). Bevidst push i AirBnB, samme undtagelse som
+  # udtjekningsdatoen (packages/airbnb_udtjekning.yaml): kun på flanken ind, i
+  # det sekund han selv slår mode til. Knappen SLET tømmer feltet.
+  # ---------------------------------------------------------------------------
+  - id: airbnb_velkomst_besked_paamind
+    alias: "AirBnB velkomst: påmind om beskeden når AirBnB slås til"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.house_mode
+        to: "AirBnB"
+        not_from:
+          - "unknown"
+          - "unavailable"
+    action:
+      # Nyt ophold: ingen besked fra sidste ophold må vente på stuen.
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_velkomst_besked_armeret_at
+        data:
+          datetime: "1970-01-01 00:00:00"
+      # Et ægte ophold afløser en evt. igangværende test.
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.airbnb_test_til
+        data:
+          datetime: "1970-01-01 00:00:00"
+      - service: script.airbnb_velkomst_paamind
+
+  # ---------------------------------------------------------------------------
+  # TESTKØRSEL udløbet → ryd op (restart-robust, læser skrevet stempel)
+  # ---------------------------------------------------------------------------
+  - id: airbnb_test_udloeb
+    alias: "AirBnB test: ryd op når testkørslen er udløbet"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: time_pattern
+        minutes: "/1"
+    condition:
+      # Sat (> 1970) og passeret. Ægte AirBnB-start sætter selv 1970.
+      - condition: template
+        value_template: >-
+          {% set t = state_attr('input_datetime.airbnb_test_til', 'timestamp') | float(0) %}
+          {{ t > 86400 and now().timestamp() >= t
+             and states('input_datetime.airbnb_test_til')[11:] != '00:00:00' }}
+    action:
+      - service: script.airbnb_test_stop
+
+  - id: airbnb_velkomst_besked_slet
+    alias: "AirBnB velkomst: slet beskeden fra push-knappen"
+    mode: single
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: AIRBNB_VELKOMST_SLET
+    action:
+      - service: todo.get_items
+        target:
+          entity_id: todo.airbnb_velkomst
+        response_variable: liste
+      - variables:
+          uids: >-
+            {{ (liste['todo.airbnb_velkomst']['items'] | default([]))
+               | map(attribute='uid') | list }}
+      - if:
+          - condition: template
+            value_template: "{{ uids | count > 0 }}"
+        then:
+          - service: todo.remove_item
+            target:
+              entity_id: todo.airbnb_velkomst
+            data:
+              item: "{{ uids }}"
+      - service: notify.mobile_app_phone_a
+        continue_on_error: true
+        data:
+          title: "🏡 AirBnB: velkomstbesked slettet"
+          message: "Ingen oplæsning ved ankomst, før du skriver en ny."
+          data:
+            tag: airbnb_velkomst_besked
+            clickAction: /indstillinger-dash/airbnb-tuning
 
   # ---------------------------------------------------------------------------
   # SIKKERHEDSNET — forlader vi AirBnB midt i en ceremoni, slip rummene

@@ -172,6 +172,10 @@ Huset kører **ingen Adaptive Lighting-integration**.
   - Gate = `input_number.<rum>_lux_threshold` × 0,5 om dagen ×
     `sensor.global_lux_threshold_factor`.
   - Faktoren styres af `input_number.global_lux_sensitivity`.
+  - Stuen om dagen: højst `input_number.stue_dag_lux_loft` (30 lx), og mørket
+    skal have holdt `input_number.stue_dagmoerke_minutter` (10 min,
+    `binary_sensor.stue_dagmorke_holdt`). Sofa-zonen slukker alene om dagen
+    over gaten × 1,2 (B274).
   - Filer: `packages/room_lux_tuning.yaml` og `.claude/rules/lux_dagslys.md`.
 - **Lysstyrke:** × `sensor.global_brightness_factor`
   (`input_number.global_light_aggressiveness`).
