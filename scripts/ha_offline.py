@@ -93,10 +93,44 @@ def _find_uv() -> str | None:
     return None
 
 
+# Integrationer hvis krav SKAL ligge i venv'et før boot. HA installerer ellers
+# integrations-krav selv under opstart (skip_pip=False), men lykkes det ikke —
+# målt i den offentlige CI 30/10 på et frisk venv — melder hver stemme-
+# automation "Integration 'conversation' does not provide trigger support" og
+# checket fejler på noget der ikke er en fejl i huset.
+PREINSTALL_DOMAINS = ("conversation",)
+
+
+def _preinstall_requirements(venv: Path, uv: str | None) -> None:
+    """Installér PREINSTALL_DOMAINS' manifest-krav, én gang pr. venv."""
+    marker = venv / ".preinstalled"
+    if marker.exists():
+        return
+    py = _venv_python(venv)
+    code = (
+        "import json, sys, homeassistant.components as c, pathlib\n"
+        "base = pathlib.Path(c.__file__).parent\n"
+        "for d in sys.argv[1:]:\n"
+        "    print(*json.loads((base / d / 'manifest.json').read_text()).get('requirements', []), sep='\\n')"
+    )
+    r = subprocess.run([str(py), "-c", code, *PREINSTALL_DOMAINS], capture_output=True, text=True)
+    reqs = r.stdout.split() if r.returncode == 0 else []
+    # HA's eget venv har uv som afhængighed — brug den, hvis ingen uv på PATH.
+    uv = uv or str(venv / "bin" / "uv")
+    if (
+        reqs
+        and subprocess.run([uv, "pip", "install", "-q", "--python", str(py), *reqs]).returncode == 0
+    ):
+        marker.write_text("\n".join(reqs) + "\n")
+    else:
+        print(f"⚠️ kunne ikke forudinstallere {', '.join(PREINSTALL_DOMAINS)}-krav", file=sys.stderr)
+
+
 def ensure_venv(version: str) -> Path:
     venv = CACHE / f"venv-{version}"
     py = _venv_python(venv)
     if py.exists():
+        _preinstall_requirements(venv, _find_uv())
         return py
     uv = _find_uv()
     if not uv:
@@ -139,6 +173,7 @@ def ensure_venv(version: str) -> Path:
                 file=sys.stderr,
             )
             sys.exit(3)
+    _preinstall_requirements(venv, uv)
     return _venv_python(venv)
 
 
