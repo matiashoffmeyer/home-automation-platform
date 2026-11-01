@@ -6,8 +6,8 @@ Search keywords: `sovevaerelse, sove`
 
 ## Indhold
 - [Automations](sovevaerelse.md#automations) (37)
-- [Entities](sovevaerelse.md#entities) (229)
-- [Helpers](sovevaerelse.md#helpers) (84)
+- [Entities](sovevaerelse.md#entities) (236)
+- [Helpers](sovevaerelse.md#helpers) (85)
 
 ---
 
@@ -57,7 +57,7 @@ Search keywords: `sovevaerelse, sove`
 
 - **Morgen: Sove lys auto-sluk (lyst eller tomt)** (line 179, mode=single)
   - Slukker sove_loft hvis (a) Apollo lux > 50 i 5 min ELLER (b) occupancy
-- **Morgen: Sove lys fast-off ved LUX surge (gardin rolled)** (line 404, mode=single)
+- **Morgen: Sove lys fast-off ved LUX surge (gardin rolled)** (line 407, mode=single)
   - 5 sek above 80*factor → fade off. Reagerer hurtigt naar user manuelt
 
 ### `automations/presence_lights.yaml`
@@ -153,8 +153,9 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sove_moerke_godnat_kandidat` — 2 refs in 1 file(s)
 - `binary_sensor.sove_morgen_moerklagt` — 7 refs in 5 file(s)
 - `binary_sensor.sove_radar_frossen` — 3 refs in 3 file(s)
+- `binary_sensor.sove_radiator_signatur` — 1 refs in 1 file(s)
 - `binary_sensor.sove_retur_til_seng` — 8 refs in 4 file(s)
-- `binary_sensor.sovevaerelse_apollo_occupancy` — 94 refs in 46 file(s)
+- `binary_sensor.sovevaerelse_apollo_occupancy` — 90 refs in 45 file(s)
 - `binary_sensor.sovevaerelse_apollo_online` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_moving_target` — 18 refs in 10 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_still_target` — 21 refs in 9 file(s)
@@ -164,7 +165,9 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sovevaerelse_dvale_vidne` — 19 refs in 9 file(s)
 - `binary_sensor.sovevaerelse_empty_effective` — 2 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_lys_on_effektiv` — 1 refs in 1 file(s)
-- `binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv` — 39 refs in 16 file(s)
+- `binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv` — 40 refs in 16 file(s)
+- `binary_sensor.sovevaerelse_optaget_reelt` — 7 refs in 3 file(s)
+- `binary_sensor.sovevaerelse_radiator_spoegelse` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_voksne_oppe` — 5 refs in 3 file(s)
 
 ### `button.*`
@@ -180,7 +183,7 @@ Search keywords: `sovevaerelse, sove`
 
 ### `cover.*`
 
-- `cover.gardin_sovevaerelse` — 98 refs in 25 file(s)
+- `cover.gardin_sovevaerelse` — 99 refs in 25 file(s)
 
 ### `input_boolean.*`
 
@@ -205,7 +208,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_boolean.sove_morgen_anden_krop` — 5 refs in 2 file(s)
 - `input_boolean.sove_radar_watchdog_enabled` — 2 refs in 2 file(s)
 - `input_boolean.sove_retur_enabled` — 2 refs in 2 file(s)
-- `input_boolean.sove_seng_taeller_enabled` — 8 refs in 4 file(s)
+- `input_boolean.sove_seng_taeller_enabled` — 11 refs in 6 file(s)
 - `input_boolean.sovevaerelse_manual_off_lock` — 24 refs in 8 file(s)
 - `input_boolean.sovevaerelse_morgen_beskyttelse_enabled` — 6 refs in 5 file(s)
 - `input_boolean.styrbar_lr_grace_sovevaerelse` — 3 refs in 2 file(s)
@@ -227,7 +230,8 @@ Search keywords: `sovevaerelse, sove`
 - `input_datetime.sove_radar_watchdog_last_probe` — 2 refs in 1 file(s)
 - `input_datetime.sove_radar_watchdog_last_restart` — 2 refs in 1 file(s)
 - `input_datetime.sove_retur_seng_sidst` — 3 refs in 2 file(s)
-- `input_datetime.sove_seng_sidst_talt` — 6 refs in 1 file(s)
+- `input_datetime.sove_seng_sidst_ind` — 2 refs in 1 file(s)
+- `input_datetime.sove_seng_sidst_talt` — 5 refs in 1 file(s)
 - `input_datetime.sove_snooze_until` — 10 refs in 3 file(s)
 - `input_datetime.sove_winddown_at` — 12 refs in 3 file(s)
 - `input_datetime.styrbar_last_press_sovevaerelse` — 11 refs in 7 file(s)
@@ -268,7 +272,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_number.sove_lyskaede_min_loft_pct` — 3 refs in 3 file(s)
 - `input_number.sove_lyskaede_presence_minutter` — 3 refs in 3 file(s)
 - `input_number.sove_moerke_godnat_minutter` — 5 refs in 3 file(s)
-- `input_number.sove_morgen_2p_doerzone_cm` — 9 refs in 5 file(s)
+- `input_number.sove_morgen_2p_doerzone_cm` — 10 refs in 5 file(s)
 - `input_number.sove_morgen_afgang_entre_sekunder` — 3 refs in 3 file(s)
 - `input_number.sove_morgen_anden_krop_minutter` — 4 refs in 3 file(s)
 - `input_number.sove_morgen_doer_aaben_minutter` — 5 refs in 3 file(s)
@@ -277,10 +281,10 @@ Search keywords: `sovevaerelse, sove`
 - `input_number.sove_radar_reprobe_minutes` — 2 refs in 2 file(s)
 - `input_number.sove_radar_watchdog_cooldown_minutes` — 2 refs in 2 file(s)
 - `input_number.sove_retur_min_sekunder` — 3 refs in 3 file(s)
-- `input_number.sove_retur_seng_cm` — 5 refs in 5 file(s)
-- `input_number.sove_retur_vindue_sekunder` — 4 refs in 3 file(s)
+- `input_number.sove_retur_seng_cm` — 6 refs in 5 file(s)
+- `input_number.sove_retur_vindue_sekunder` — 5 refs in 3 file(s)
 - `input_number.sove_seng_bliv_sekunder` — 2 refs in 2 file(s)
-- `input_number.sove_seng_personer` — 26 refs in 4 file(s)
+- `input_number.sove_seng_personer` — 31 refs in 6 file(s)
 - `input_number.sove_seng_still_sekunder` — 2 refs in 2 file(s)
 - `input_number.sove_sengelys_brightness` — 2 refs in 2 file(s)
 - `input_number.sove_snooze_knap_minutter` — 3 refs in 3 file(s)
@@ -318,7 +322,7 @@ Search keywords: `sovevaerelse, sove`
 
 ### `light.*`
 
-- `light.sove_lyskaede` — 24 refs in 11 file(s)
+- `light.sove_lyskaede` — 25 refs in 12 file(s)
 - `light.sovevaerelse_all` — 17 refs in 9 file(s)
 - `light.sovevaerelse_apollo_rgb_light` — 13 refs in 8 file(s)
 - `light.sovevaerelse_loft` — 12 refs in 8 file(s)
@@ -366,7 +370,7 @@ Search keywords: `sovevaerelse, sove`
 - `sensor.sove_knap_battery` — 3 refs in 2 file(s)
 - `sensor.sove_lux` — 2 refs in 2 file(s)
 - `sensor.sove_lyskaede_current` — 1 refs in 1 file(s)
-- `sensor.sove_lyskaede_power` — 3 refs in 3 file(s)
+- `sensor.sove_lyskaede_power` — 4 refs in 4 file(s)
 - `sensor.sove_lyskaede_presence_siden_loft` — 2 refs in 1 file(s)
 - `sensor.sove_lyskaede_summation_delivered` — 1 refs in 1 file(s)
 - `sensor.sove_lyskaede_voltage` — 1 refs in 1 file(s)
@@ -375,14 +379,17 @@ Search keywords: `sovevaerelse, sove`
 - `sensor.sove_plug_current_voltage` — 1 refs in 1 file(s)
 - `sensor.sove_plug_power` — 1 refs in 1 file(s)
 - `sensor.sove_presence_60min` — 5 refs in 3 file(s)
+- `sensor.sove_seng_stempel` — 2 refs in 1 file(s)
 - `sensor.sove_sidste_tryk` — 1 refs in 1 file(s)
+- `sensor.sove_still_afstand_p25` — 4 refs in 2 file(s)
+- `sensor.sove_still_afstand_p75` — 3 refs in 2 file(s)
 - `sensor.sove_temperatur` — 3 refs in 2 file(s)
 - `sensor.sovevaerelse_apollo_esp_temperature` — 4 refs in 3 file(s)
 - `sensor.sovevaerelse_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
 - `sensor.sovevaerelse_apollo_lux` — 10 refs in 6 file(s)
 - `sensor.sovevaerelse_apollo_radar_move_energy` — 1 refs in 1 file(s)
 - `sensor.sovevaerelse_apollo_radar_moving_distance` — 8 refs in 4 file(s)
-- `sensor.sovevaerelse_apollo_radar_still_distance` — 3 refs in 3 file(s)
+- `sensor.sovevaerelse_apollo_radar_still_distance` — 5 refs in 4 file(s)
 - `sensor.sovevaerelse_apollo_radar_still_energy` — 2 refs in 2 file(s)
 - `sensor.sovevaerelse_apollo_temperature` — 3 refs in 2 file(s)
 - `sensor.sovevaerelse_dagslys_sluk_effektiv` — 9 refs in 4 file(s)
@@ -443,6 +450,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_datetime.sove_radar_watchdog_last_probe` (defined in `packages/sove_apollo_radar_watchdog.yaml`)
 - `input_datetime.sove_radar_watchdog_last_restart` (defined in `packages/sove_apollo_radar_watchdog.yaml`)
 - `input_datetime.sove_retur_seng_sidst` (defined in `packages/nattur_retur.yaml`)
+- `input_datetime.sove_seng_sidst_ind` (defined in `packages/sove_seng_taeller.yaml`)
 - `input_datetime.sove_seng_sidst_talt` (defined in `packages/sove_seng_taeller.yaml`)
 - `input_datetime.sove_snooze_until` (defined in `packages/sovevaerelse_morgen_beskyttelse.yaml`)
 - `input_datetime.styrbar_last_press_sovevaerelse` (defined in `packages/room_modes.yaml`)

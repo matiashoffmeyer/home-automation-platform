@@ -7,7 +7,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 ## Indhold
 - [Automations](boernevaerelse.md#automations) (26)
 - [Entities](boernevaerelse.md#entities) (173)
-- [Helpers](boernevaerelse.md#helpers) (52)
+- [Helpers](boernevaerelse.md#helpers) (51)
 
 ---
 
@@ -15,7 +15,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/airbnb_mode.yaml`
 
-- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 949, mode=queued)
+- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 958, mode=queued)
   - Undtagelse 1 (user 2026-06-30; rev. 2026-07-08 #12): BØRNEVÆRELSE må aldrig
 
 ### `automations/boern_ankomst_detekter.yaml`
@@ -64,7 +64,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - **Morgen: Børn lys auto-sluk (lyst eller tomt)** (line 39, mode=single)
   - Slukker børnelyset hvis (a) rummet er lyst nok i 5 min ELLER (b) occupancy
-- **Morgen: Børn lys fast-off ved LUX surge (gardin rolled)** (line 302, mode=single)
+- **Morgen: Børn lys fast-off ved LUX surge (gardin rolled)** (line 305, mode=single)
   - 5 sek above 80*factor → fade off. Reagerer hurtigt naar user manuelt
 
 ### `automations/presence_boernevaerelse.yaml`
@@ -115,7 +115,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `binary_sensor.boern_aften_laasevindue` — 3 refs in 2 file(s)
 - `binary_sensor.boern_putte_zone_aktiv` — 4 refs in 3 file(s)
 - `binary_sensor.boern_set_i_eftermiddag` — 6 refs in 2 file(s)
-- `binary_sensor.boernevaerelse_any_lys` — 1 refs in 1 file(s)
+- `binary_sensor.boernevaerelse_any_lys` — 2 refs in 2 file(s)
 - `binary_sensor.boernevaerelse_apollo_occupancy` — 123 refs in 46 file(s)
 - `binary_sensor.boernevaerelse_apollo_online` — 1 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_moving_target` — 12 refs in 10 file(s)
@@ -133,7 +133,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `binary_sensor.boernevaerelse_vaekning_hold` — 5 refs in 4 file(s)
 - `binary_sensor.boernevaerelse_vaekning_koert_i_dag` — 2 refs in 1 file(s)
 - `binary_sensor.dark_mode_boern` — 4 refs in 4 file(s)
-- `binary_sensor.filmmoerke_boern` — 7 refs in 5 file(s)
+- `binary_sensor.filmmoerke_boern` — 8 refs in 6 file(s)
 - `binary_sensor.mood_pause_boernevaerelse` — 2 refs in 1 file(s)
 
 ### `button.*`
@@ -153,12 +153,12 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `input_boolean.boern_morgen_beskyttelse_enabled` — 4 refs in 3 file(s)
 - `input_boolean.boern_morgen_bevaeget` — 16 refs in 5 file(s)
 - `input_boolean.boern_morgen_nedtoning_aktiv` — 22 refs in 5 file(s)
-- `input_boolean.boern_sov_her_i_nat` — 24 refs in 9 file(s)
+- `input_boolean.boern_sov_her_i_nat` — 25 refs in 9 file(s)
 - `input_boolean.boernevaerelse_gaest_sover` — 20 refs in 7 file(s)
-- `input_boolean.boernevaerelse_manual_off_lock` — 46 refs in 14 file(s)
+- `input_boolean.boernevaerelse_manual_off_lock` — 47 refs in 15 file(s)
 - `input_boolean.dance_room_boern` — 15 refs in 7 file(s)
 - `input_boolean.festlys_boern_styrbar` — 8 refs in 3 file(s)
-- `input_boolean.godnat_boern_active` — 96 refs in 42 file(s)
+- `input_boolean.godnat_boern_active` — 99 refs in 42 file(s)
 - `input_boolean.koekken_lav_krop_boern_enabled` — 3 refs in 3 file(s)
 - `input_boolean.people_boern_set_efter_doer` — 12 refs in 2 file(s)
 - `input_boolean.roborock_styrbar_kort_op_boernevaerelse` — 1 refs in 1 file(s)
@@ -230,11 +230,11 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `input_select.*`
 
-- `input_select.room_mode_boernevaerelse` — 24 refs in 18 file(s)
+- `input_select.room_mode_boernevaerelse` — 25 refs in 19 file(s)
 
 ### `input_text.*`
 
-- `input_text.boern_aften_niveau_hold` — 21 refs in 7 file(s)
+- `input_text.boern_aften_niveau_hold` — 22 refs in 8 file(s)
 - `input_text.boern_ankomst_pending` — 4 refs in 2 file(s)
 - `input_text.boern_ankomst_pending_kilde` — 3 refs in 2 file(s)
 - `input_text.boernevaerelse_apollo_last_flap` — 1 refs in 1 file(s)
@@ -245,7 +245,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `light.boernevaerelse_all` — 19 refs in 10 file(s)
 - `light.boernevaerelse_apollo_rgb_light` — 5 refs in 5 file(s)
-- `light.boernevaerelse_hygge_strip` — 89 refs in 31 file(s)
+- `light.boernevaerelse_hygge_strip` — 90 refs in 32 file(s)
 - `light.boernevaerelse_hyggelys` — 53 refs in 21 file(s)
 - `light.boernevaerelse_lampe` — 44 refs in 20 file(s)
 - `light.boernevaerelse_loft` — 95 refs in 37 file(s)
@@ -342,7 +342,6 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `input_datetime.boernevaerelse_apollo_flap_last_bump` (defined in `packages/apollo_flap_hunt.yaml`)
 - `input_datetime.boernevaerelse_apollo_occ_since` (defined in `packages/apollo_latch_detect.yaml`)
 - `input_datetime.boernevaerelse_flapcount_since` (defined in `packages/apollo_flap_hunt.yaml`)
-- `input_datetime.boernevaerelse_last_off` (defined in `packages/house_modes.yaml`)
 - `input_datetime.styrbar_last_press_boernevaerelse` (defined in `packages/room_modes.yaml`)
 
 ### `input_number.*`

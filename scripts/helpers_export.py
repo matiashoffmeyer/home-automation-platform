@@ -166,6 +166,9 @@ TEXT_CONFIG = {
 # people_boern_antal står bevidst IKKE her: den måles hver morgen, men min (0
 # børn) er en værre frisk værdi end den sidst målte.
 RUNTIME_NUMBERS = {
+    "elpris_pf_anvendt",
+    "lys_besparelse_korrektion",  # elpris_styring.yaml: engangs-korrektion (RUNTIME)
+    "luksus_besparelse_korrektion",  # luksus_besparelse.yaml: engangs-korrektion (RUNTIME)  # elpris_styring.yaml: "RUNTIME" faktor tændte lys står på
     "roborock_aktiv_minutter_akkumuleret",  # roborock_aktiv_timer.yaml: "RUNTIME-akkumulator"
     "sove_seng_personer",  # sove_seng_taeller.yaml: "RUNTIME-tællingen"
     "wakeup_fallback_udskyd_min",  # parent_b_alarm.yaml: "kun i nat", ryddes kl. 10

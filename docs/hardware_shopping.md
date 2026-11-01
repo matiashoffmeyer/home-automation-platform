@@ -272,8 +272,9 @@ med `E27 WS globe`-quirken (2 %-bug ved bri+ct+transition i samme kald):
 
 ### Chromecast / streaming-stick til projektor
 
-- **Status:** Bruger har Chromecast Google TV — skal pares som ESPHome/Google Cast i HA + omdøbes til `media_player.stue_chromecast`
-- **Formål:** Cinema mode tænder/slukker projektor via HDMI CEC. Pt. kommenteret ud i scene_cinema indtil paret.
+- **Status (2026-10-31):** parret via Google Cast (dukkede op 31/10 som "Bedroom TV", model "Chromecast") og omdøbt til `media_player.projektor_chromecast`. Sidder i projektorens HDMI og følger den rundt; strømmen følger projektoren. En cast-session på den tæller som "projektor aktiv" (`packages/projektor_predark.yaml`); rummet gættes og spørges om (`packages/projektor_rum.yaml`).
+- **Åbent:** er det Chromecast med Google TV, kan apps startet fra dens egen fjernbetjening være usynlige for Cast → Android TV Remote-integrationen giver tændt/slukket + aktuel app.
+- **Formål (gammelt):** Cinema mode tænder/slukker projektor via HDMI CEC. Pt. kommenteret ud i scene_cinema.
 
 ---
 
@@ -331,7 +332,7 @@ Disse er ikke i koden endnu, men vil enable features fra audit-runde 2026-04-29:
 - [x] 5× IKEA Tradfri hvid bulbs (har)
 - [x] 5× IKEA Somrig (har)
 - [x] 1× IKEA Vallhorn (har, til entré)
-- [ ] Pair Chromecast til HA (allerede ejet)
+- [x] Pair Chromecast til HA (allerede ejet) — `media_player.projektor_chromecast`, 2026-10-31
 
 **Post-2026-05-05 (Matter migration):**
 - [ ] **Modtag Sonoff ZBDongle-P** (næste uge) — flash til OpenThread RCP for Thread BR

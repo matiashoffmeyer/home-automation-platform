@@ -96,7 +96,31 @@ sommer-forsvaret (kun Dormant) fyrer sjældnere. Det er ikke farligt.
 - **HA-genstart MENS nettet er væk**: integrationerne går i setup-retry →
   `unavailable` → samme fail-open. Det er kun læst i koden, ikke testet.
 
-## Testen (afventer user-OK)
+## Testen 31/10 — resultat
+
+Coax-kablet skruet af routeren ~13:12-13:24 (globe-lampen slukket). Coax er
+husets eneste forbindelse udadtil; netværksportene, også en evt. "WAN", er LAN.
+
+**⚠️ Routeren lyver når WAN er væk:** den svarer selv på TCP til 1.1.1.1:443 og
+8.8.8.8:53, DNS svarer fra cache, og HTTPS får routerens eget certifikat. Dens
+API (`/api/v1/wan/status`) blev ved med at sige `UP`, uden ny `lastchange`. En
+ping/TCP-probe ser derfor "oppe" under hele udfaldet. **Signatur i HA-loggen:**
+først `Timeout while contacting DNS servers`, derefter `SSLCertVerificationError`
+mod alle cloud-hosts (DMI, Nord Pool). En internet-sensor (B256) skal derfor lave
+et HTTPS-kald med certifikat-tjek, ikke ping.
+
+| Mål | Resultat |
+|---|---|
+| 1. Lys (tryk + presence) | normalt (user) |
+| 2. Gates | `global_brightness_factor` 2,75-2,77 og `luksus_lys_elpris_block` on som før; Nord Pool skiftede kvarter 13:15 fra cachen |
+| 3. Højttaler | genstartede ikke selv. Radio gav ingen lyd (forventet), men HA viste `playing` med en gammel titel → ingen fejl-feedback |
+| 4. Telefoner | begge `home` hele vejen, `people_estimate` 3 |
+| 5. Tilbage | ingen fejl efter 13:24; 0 nye unavailable mod baseline; `ha_health.sh deploy` rent |
+
+Ikke målt: local push (test-pushen afhang af proben, som blev snydt) og
+lys-latens i tal.
+
+## Testen (plan)
 
 Hent WAN-kablet ud af routeren i ~30 min, mens familien er hjemme. Brug ægte
 tryk og ægte bevægelse i hvert rum, og stop til sidst radioen fra en Styrbar.

@@ -1,0 +1,79 @@
+{#- =========================================================================
+    Projektor-rum: hvilket rum står projektoren (og dens Chromecast) i?
+    2026-11-01, user-spec: "chromecast følger altid projektoren. du skal vælge
+    most likely room og sende en notifikation til os begge … most likely rum
+    skal tage mange ting i overvejelse."
+
+    point() → JSON-liste [[rum, point, "grunde"], …] for sove/boern/stue.
+    gaet()  → rummet med flest point ('' hvis alle står på 0).
+    Én definition (#2): sensor.moerklaegning_scope_rum (packages/dark_mode.yaml),
+    pushen og facit-loggen (packages/projektor_rum.yaml) læser herfra.
+
+    POINT (målt 31/10 + 26-30/10, se packages/projektor_rum.yaml):
+      +2,5  sidst kendte rum (input_select.projektor_rum — svar fra telefonen,
+            ellers sidste gæt). Projektoren flytter sjældent: fem sessioner i
+            træk i sove 26-30/10.
+      +1,5  optaget nu · +1,5 presence ≤ 90 s (rum_med_nylig_presence)
+      +1    presence ≤ 10 min (sofa-radaren taber stille seere i 40+ min)
+      sove: +2 nogen i sengen (sengetælleren) · +1 bevægelse ≤ 90 s (radiatoren
+            er kun et still-mål) · presence ×0,25 når radiator-signaturen står
+            og sengen er tom (31/10 19:30-20:51)
+      boern: presence ×0,5 i putte-vinduet / børne-godnat (børn der puttes)
+      stue: +0,5 køkken/spisestue optaget ≤ 10 min (folk er i open plan)
+    Lige point: sove før boern før stue (den gamle stige).
+========================================================================= -#}
+
+{%- macro _alder(e) -%}
+{%- set s = states[e] -%}
+{%- if s is none or s.state in ['unavailable', 'unknown'] -%}99999
+{%- elif s.state == 'on' -%}0
+{%- else -%}{{ (now() - s.last_changed).total_seconds() | int }}{%- endif -%}
+{%- endmacro -%}
+
+{%- macro point() -%}
+{%- set kand = states('sensor.rum_med_nylig_presence').split() -%}
+{%- set prior = states('input_select.projektor_rum') -%}
+{%- set seng = states('input_number.sove_seng_personer') | int(0) -%}
+{%- set radiator = is_state('binary_sensor.sove_radiator_signatur', 'on') and seng == 0 -%}
+{%- set putning = is_state('binary_sensor.putning_vindue_aktivt', 'on')
+                  or is_state('input_boolean.godnat_boern_active', 'on') -%}
+{%- set occ = {'sove': 'binary_sensor.sovevaerelse_apollo_occupancy',
+               'boern': 'binary_sensor.boernevaerelse_apollo_occupancy',
+               'stue': 'binary_sensor.stue_apollo_occupancy_filtered'} -%}
+{%- set navn = {'sove': 'soveværelset', 'boern': 'børneværelset', 'stue': 'stuen'} -%}
+{%- set ns = namespace(l=[]) -%}
+{%- for r, ep in [('sove', 0.003), ('boern', 0.002), ('stue', 0.001)] -%}
+  {%- set a = _alder(occ[r]) | int -%}
+  {%- set g = namespace(p=0.0, w=[]) -%}
+  {%- if a == 0 -%}{%- set g.p = g.p + 1.5 -%}{%- set g.w = g.w + ['optaget nu'] -%}{%- endif -%}
+  {%- if r in kand -%}{%- set g.p = g.p + 1.5 -%}{%- if a != 0 -%}{%- set g.w = g.w + ['nylig bevægelse'] -%}{%- endif -%}{%- endif -%}
+  {%- if a < 600 -%}{%- set g.p = g.p + 1.0 -%}{%- if a != 0 and r not in kand -%}{%- set g.w = g.w + ['nogen der for < 10 min siden'] -%}{%- endif -%}{%- endif -%}
+  {%- if r == 'sove' and radiator and g.p > 0 -%}
+    {%- set g.p = g.p * 0.25 -%}{%- set g.w = g.w + ['men det ligner radiatoren'] -%}
+  {%- endif -%}
+  {%- if r == 'boern' and putning and g.p > 0 -%}
+    {%- set g.p = g.p * 0.5 -%}{%- set g.w = g.w + ['men det er putte-tid'] -%}
+  {%- endif -%}
+  {%- if r == 'sove' and seng >= 1 -%}
+    {%- set g.p = g.p + 2.0 -%}{%- set g.w = g.w + [seng ~ ' i sengen'] -%}
+  {%- endif -%}
+  {%- if r == 'sove' and (_alder('binary_sensor.sovevaerelse_apollo_radar_moving_target') | int) < 90 -%}
+    {%- set g.p = g.p + 1.0 -%}{%- set g.w = g.w + ['bevægelse i sengen'] -%}
+  {%- endif -%}
+  {%- if r == 'stue' and [(_alder('binary_sensor.koekken_apollo_occupancy_filtered') | int),
+                          (_alder('binary_sensor.spisestue_apollo_occupancy_filtered') | int)] | min < 600 -%}
+    {%- set g.p = g.p + 0.5 -%}{%- set g.w = g.w + ['folk i open plan'] -%}
+  {%- endif -%}
+  {%- if prior == r -%}
+    {%- set g.p = g.p + 2.5 -%}{%- set g.w = ['stod her sidst'] + g.w -%}
+  {%- endif -%}
+  {%- set ns.l = ns.l + [[r, ((g.p + (ep if g.p > 0 else 0)) | round(3)), g.w | join(', ')]] -%}
+{%- endfor -%}
+{{- ns.l | to_json -}}
+{%- endmacro -%}
+
+{%- macro gaet() -%}
+{%- set pl = point() | from_json -%}
+{%- set top = pl | sort(attribute='1', reverse=true) | first -%}
+{{- top[0] if top[1] > 0 else '' -}}
+{%- endmacro -%}

@@ -184,10 +184,22 @@ template:
         # timer-beskeden "genoptog" P4 oven i Spotify (2×) og Styrbar skiftede
         # til P8. Derfor: aldrig on mens en anden kilde spiller (ankeret
         # binary_sensor.hoejttaler_anden_kilde, packages/hoejttaler.yaml).
+        # 2026-10-31 (user: "styrbar stue burde styre højttaler nu men styrede
+        # lys? lige efter timer udløb"): startes radioen lige efter en besked,
+        # melder Volumio BESKEDENS mp3 (type music) indtil streamen sender sin
+        # første titel — 31/10 c9:c4:90-ab:c2:f1 (2 min 59 s), også set 28-29/10.
+        # Imens var tilstanden off → Styrbar = lys, og morgenradioens fade-in
+        # gav op på 5 %. En besked-URI mens INTET tale-script kører er
+        # derfor hængende metadata = radioen spiller.
         state: >-
+          {% set uri = state_attr('media_player.hoejttaler', 'media_content_id') | string %}
+          {% set taler = ['script.hoejttaler_annoncer', 'script.hoejttaler_vejr_oplaesning',
+                          'script.dyrespil_afspil'] | select('is_state', 'on') | list %}
+          {% set gammel_besked = '/local/hoejttaler_tts/' in uri and taler | count == 0 %}
           {{ states('input_text.hoejttaler_radio_kanal') not in ['', 'unknown', 'unavailable']
              and is_state('media_player.hoejttaler', 'playing')
-             and is_state_attr('media_player.hoejttaler', 'media_content_type', 'channel')
+             and (is_state_attr('media_player.hoejttaler', 'media_content_type', 'channel')
+                  or gammel_besked)
              and is_state('binary_sensor.hoejttaler_online', 'on')
              and not is_state('binary_sensor.hoejttaler_anden_kilde', 'on') }}
       # Styrbar stue ejes af radioen (styrbar_stue_radio): mens den spiller,
@@ -241,9 +253,16 @@ template:
           {% set o = state_attr('input_datetime.sove_apollo_occ_since', 'timestamp') | float(0) %}
           {% set alene_oppe = (state_attr('sensor.people_estimate', 'voksne') | int(0)) == 1
              and a >= today_at('04:00').timestamp()
-             and is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'off')
+             and is_state('binary_sensor.sovevaerelse_optaget_reelt', 'off')
              and o < a %}
           {{ to_oppe or alene_oppe }}
+
+shell_command:
+  # Ser streamen ud af huset FØR play_media (B254, WAN-test 31/10): uden net
+  # svarer routeren selv, med sit eget certifikat, og Volumio meldte "playing"
+  # i stilhed i 5 min med den gamle kanals titel. HEAD svarer 200 på ~0,1 s
+  # (målt 31/10); falsk router/ingen DNS giver 000.
+  hoejttaler_stream_tjek: "curl -s -I -m 4 -o /dev/null -w '%{http_code}' {{ url }}"
 
 script:
   hoejttaler_radio:
@@ -275,6 +294,22 @@ script:
           url: "{{ streams.get(k, '') }}"
       - condition: template
         value_template: "{{ url != '' }}"
+      - service: shell_command.hoejttaler_stream_tjek
+        continue_on_error: true
+        data:
+          url: "{{ url }}"
+        response_variable: tjek
+      # Ingen stream = intet play_media, så HA ikke viser "playing" i stilhed.
+      - if:
+          - condition: template
+            value_template: "{{ not (tjek is defined and (tjek.stdout | default('') | trim) == '200') }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Højttaler"
+              message: "{{ k }} ikke startet: streamen svarer ikke (internet væk?)"
+              entity_id: media_player.hoejttaler
+          - stop: "stream utilgængelig"
       - if:
           - condition: template
             value_template: "{{ volumen is defined and (volumen | float(-1)) >= 0 }}"

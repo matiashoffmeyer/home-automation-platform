@@ -1,0 +1,94 @@
+# =============================================================================
+# SOVE-RADIATOR-SPØGELSET — B269 (2026-10-31, user-valg "b")
+# =============================================================================
+# User 31/10: "kan være varme fra en radiator, passer nogenlunde" (~2,1 m fra
+# Apolloen). Om morgenen, når radiatoren varmer, holder sove-Apolloen et
+# still-mål på 200-219 cm i op til 1 t 40 min efter at sengen er tømt
+# (27/10 06:12→07:52, 31/10 06:25:51→07:31:14).
+#
+# SIGNATUREN (målt 26-31/10, 5 døgn, still_distance er recorder-included):
+#   rullende 5 min: p25 ≥ 196 cm, p75 ≤ 228 cm, p75 − p25 ≤ 9 cm, ≥ 120 samples.
+#   → træf KUN morgener 06:07-07:33; 0 træf 00-05 (sovende på samme afstand:
+#     IQR p50 15 cm, 57 samples/5 min — radiatoren 7 cm, 201 samples).
+# MEN signaturen ramte også mens én stadig lå i sengen (27/10 06:07-06:13,
+# 28/10, 29/10 — sengetæller 1): radaren melder ÉT still-mål = det stærkeste,
+# og radiatoren overdøver en stille sovende længere inde. Signaturen betyder
+# "radaren ser radiatoren", ALDRIG "tomt" → den tæller kun som tomt sammen med
+# sengetællerens 0 (user-valg b: "kun når sengetælleren også er 0").
+#
+# FORBRUGERE af `binary_sensor.sovevaerelse_optaget_reelt` (kun "er rummet
+# tomt om morgenen"-veje): morning_lights_sanity_check (empty), morning_curtains
+# backstop, hoejttaler_radio (én voksen oppe). Tænd-veje og nat-logik læser
+# fortsat den rå occupancy — de skal SE en sovende.
+# =============================================================================
+
+sensor:
+  # To percentiler over samme vindue; antal samples = buffer_usage_ratio ×
+  # sampling_size (attribut på p25). Recorder-ekskluderet (configuration.yaml):
+  # de skifter ved hvert sample.
+  - platform: statistics
+    name: "Sove still afstand p25"
+    unique_id: sove_still_afstand_p25
+    entity_id: sensor.sovevaerelse_apollo_radar_still_distance
+    state_characteristic: percentile
+    percentile: 25
+    sampling_size: 600
+    max_age:
+      minutes: 5
+    precision: 0
+  - platform: statistics
+    name: "Sove still afstand p75"
+    unique_id: sove_still_afstand_p75
+    entity_id: sensor.sovevaerelse_apollo_radar_still_distance
+    state_characteristic: percentile
+    percentile: 75
+    sampling_size: 600
+    max_age:
+      minutes: 5
+    precision: 0
+
+template:
+  - binary_sensor:
+      # 2026-10-31: SIGNATUREN alene (hele døgnet, uden sengetælleren) —
+      # delt ud så projektor-rum-gættet (sensor.moerklaegning_scope_rum,
+      # packages/dark_mode.yaml) kan vægte sove-presence ned om aftenen, hvor
+      # radiatoren holdt sove optaget 31/10 19:30-20:51 (~210-219 cm). Én
+      # definition af signaturen (#2); spøgelset nedenfor = signatur + 04-12 +
+      # sengetæller 0.
+      - name: "Sove radiator signatur"
+        unique_id: sove_radiator_signatur
+        icon: mdi:radiator
+        state: >-
+          {% set p25 = states('sensor.sove_still_afstand_p25') %}
+          {% set p75 = states('sensor.sove_still_afstand_p75') %}
+          {% set n = (state_attr('sensor.sove_still_afstand_p25', 'buffer_usage_ratio') | float(0)) * 600 %}
+          {{ p25 | is_number and p75 | is_number
+             and p25 | float >= 196 and p75 | float <= 228
+             and (p75 | float - p25 | float) <= 9
+             and n >= 120 }}
+
+      # Radiator-signaturen OG ingen i sengen (sengetælleren aktiv og på 0).
+      # Kun 04-12: signaturen er kun målt om morgenen.
+      - name: "Sovevaerelse radiator spoegelse"
+        unique_id: sovevaerelse_radiator_spoegelse
+        icon: mdi:radiator
+        state: >-
+          {{ 4 <= now().hour < 12
+             and is_state('binary_sensor.sove_radiator_signatur', 'on')
+             and is_state('input_boolean.sove_seng_taeller_enabled', 'on')
+             and states('input_number.sove_seng_personer') | is_number
+             and states('input_number.sove_seng_personer') | int(1) == 0 }}
+        attributes:
+          p25: "{{ states('sensor.sove_still_afstand_p25') }}"
+          p75: "{{ states('sensor.sove_still_afstand_p75') }}"
+
+      # Soveværelset optaget, minus radiator-spøgelset. Kun til "tomt"-veje.
+      - name: "Sovevaerelse optaget reelt"
+        unique_id: sovevaerelse_optaget_reelt
+        icon: mdi:bed
+        device_class: occupancy
+        availability: >-
+          {{ states('binary_sensor.sovevaerelse_apollo_occupancy') in ['on', 'off'] }}
+        state: >-
+          {{ is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'on')
+             and not is_state('binary_sensor.sovevaerelse_radiator_spoegelse', 'on') }}

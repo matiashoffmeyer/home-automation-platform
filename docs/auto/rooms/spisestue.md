@@ -126,8 +126,8 @@ Search keywords: `spisestue`
 ### `light.*`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
-- `light.spisestue_loft` — 124 refs in 48 file(s)
-- `light.spisestue_pendel` — 136 refs in 39 file(s)
+- `light.spisestue_loft` — 125 refs in 49 file(s)
+- `light.spisestue_pendel` — 137 refs in 40 file(s)
 
 ### `number.*`
 

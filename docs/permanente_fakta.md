@@ -1401,6 +1401,16 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   valideret. Valideret på 137.412 rene sample-par 16-30/9: 0 × falsk mørke i
   dagtimerne, median fremskrevet/målt 0,84. `koekken_dagslys_lx` og
   `entre_lux_reel` arver den via `open_plan_lux` (B167 lukket).
+  **2026-10-31 (B266): også et FORMIDDAGS-sample holdt forbi hold-vinduet ind i
+  eftermiddagen** fremskrives i `spisestue_dagslys_lx` (fra sample-højden og
+  ned) i stedet for at falde til fallbacken (25/10: lampelys × 0,65 = 43,8 lx
+  ved 3,8° sol, overskyet målt 7-12 → dødbånd). Retningen er IKKE kendt som om
+  aftenen — det vestvendte rum er lysere om eftermiddagen end om formiddagen
+  ved samme solhøjde (58 par, 31 døgn: ln(faktisk/fremskrevet) p10 −0,24 · p50
+  +0,11 · p90 +1,65), så fejlen går mest mod MØRKT = den harmløse for lys-
+  gates; værst ×2 for lyst mod fallbackens ×4-6. Egen `kilde`
+  (`formiddag_fremskrevet`), som mosbilledet ignorerer ligesom fallbacken. Sket
+  2 af 31 dage.
   Alle tre hold-sensorer tager derfor `min(sample, rå *_apollo_lux)` — hold-tiden
   er kalibreret efter hvor længe lyset kan lyse, ikke efter hvor hurtigt
   aftensolen kan falde (målt: 556 → 112 lx på 30 min i vestvendt spisestue, mens
@@ -1755,6 +1765,28 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   secrets.yaml gennem `scripts/ha_secrets.py` — kontrakten er `secrets.example.yaml`,
   håndhævet af `scripts/secrets_contract.py`. Ti kopierede parsere var sådan en
   nøgle-omdøbning blev overset.)
+- **HA core-containeren har `UV_SYSTEM_PYTHON=true` (og `UV_NO_CACHE`, HA's
+  musllinux-wheel-index) — sådan installerer HA i Docker sine krav i system-
+  Pythonen. Et script der fra core (command_line/shell_command) starter en ANDEN
+  HA-instans, også i et venv, arver variablen, og dens `install_package` kalder
+  `python -m uv pip install` uden `--python` → uv vælger system-Pythonen =
+  PRODUKTIONEN** (2026-10-31, beta-tjekkets første ægte kørsel). 29 pakker blev
+  beta-versioner 12:32:27-51 — `zha` 2.3.1→2.4.2, `zigpy`, `bellows`,
+  `matter-python-client`, `home-assistant-frontend`, `pydantic`, `cryptography`,
+  `orjson`, `aiohasupervisor` 0.6→0.8 — og gendannet 12:38:13 med
+  `python -m uv pip install --system --constraint <homeassistant>/package_constraints.txt
+  <prod's pins>` beregnet i core af HA's egne krav + manifester (`--dry-run`
+  først). Den kørende HA havde de gamle moduler i hukommelsen: ingen fejl, ingen
+  entity gik ned; en genstart i vinduet havde kørt 2026.10.4 på beta-afhængigheder.
+  9 transitive (bl.a. `colorlog`, `pygbl`, `pyelftools` — nye; `click`,
+  `truststore`, `httpx2` — anden minor) står tilbage; de opfylder prod's krav.
+  **Signatur: "No module named 'X'" i test-instansen UDEN en "Unable to install
+  package X"-advarsel** — installationen lykkedes, bare et andet sted. Rettet ved
+  kilden i `ha_offline.reexec_in_venv` (fjerner `UV_SYSTEM_PYTHON`/`UV_PYTHON`,
+  sætter `VIRTUAL_ENV`; kører aldrig i produktionens interpreter, når
+  `/usr/src/homeassistant` findes), og `ha_beta_tjek.py` sammenligner produktionens
+  pakker før/efter hver kørsel (alarm-push + spærring). Samme kørsel: git i core
+  kræver `-c safe.directory=/config` — core kører som root, `.git` ejes af uid 1000.
 - **DMI lever på ÉN host, `opendataapi.dmi.dk`, med TO versioner:** prognose =
   `/v1/forecastedr`, observationer = `/v2/metObs` (**begge keyless** — rettet
   2026-09-17; ingen `headers:` i noget DMI-`rest_command`). Versionen hører
@@ -2215,3 +2247,27 @@ stille (genvex-forsøget, badets tørretid, fugt-varslet).
   kalibreres: sove − køkken driver −2,5 (jun) → −4,6 °C (okt) med årstiden (B247).
 - Alle tre sensorer har attributten `kilde` (køkken/depot).
 
+
+## Lys-pris-faktoren lægges på ved SKRIVNING — og recorderen kender ikke lysstyrken (2026-10-31)
+
+`sensor.elpris_dim_factor` ganges ind i lysstyrken i det øjeblik en tænd-vej
+skriver. Før B279 blev intet tændt lys dæmpet når prisen steg — aftenlyset tændt
+~16:30 (faktor ≈ 1) brændte uændret gennem 17-21-spidslasten. Nu skalerer
+`automation.el_pris_skaler_taendte_auto_lys_nar_pris_faktoren_flytter_sig` (id `elpris_daemp_taendte_lys`) tændte auto-lys ved hvert skift ≥ 0,03 via
+`script.lys_omskaler_taendte` (delt med skyder-trækket). Og faktoren skal på
+EFTER 100 %-loftet: med `global_light_aggressiveness` 70 (base 3,0) når enhver
+basis ≥ ~37 % loftet, så `min(100, N × base × pf)` sluger pf. Mønsteret er
+`min(100, N × base) × pf` (base = attribut `base` på global_brightness_factor).
+
+Recorderen gemmer IKKE `brightness` på lys (shared_attrs har kun
+off_with_transition/off_brightness/friendly_name) → historisk energi pr. lys kan
+kun regnes som øvre grænse (fuld styrke × tændt-tid). Effekt-totalen findes som
+LTS (`sensor.lys_estimat_effekt`).
+
+Målte watt (stik, 16/10-31/10): sofa-hyggelampen 53-58 W (ikke 39), terrasse-
+kæden 13-14 W når den alene trækker (ikke 6). Robotten lader også UDEN for sit
+off-peak-vindue ved lavt batteri (6/16 cykler) → `binary_sensor.robot_batteri_stiger`.
+Regnskabs-historikken (LTS) blev omskrevet 31/10 via websocket
+`recorder/import_statistics` + `recorder/adjust_sum_statistics`; en omdøbning i
+entity-registret FLYTTER statistikken med — den nye sensor på det gamle id starter
+tom, og grafen mister serien indtil historikken importeres igen.

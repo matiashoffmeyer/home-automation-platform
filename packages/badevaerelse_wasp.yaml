@@ -141,6 +141,17 @@ input_boolean:
     name: "Bad approach-lys aktivt (pre-niveau)"
     icon: mdi:lightbulb-on-30
 
+input_datetime:
+  # 2026-10-31 (B197): SKREVET arm-tidspunkt (fejlklasse #5). Safety-clear'ens
+  # restart-backstop måler fra det, fordi last_changed nulstilles ved restart.
+  # Skrives ét sted (badevaerelse_wasp_arm_stempel) — der er tre arm-veje.
+  # Runtime → ude af helper-snapshottet.
+  badevaerelse_wasp_armeret_at:
+    name: "Bad wasp armeret kl."
+    has_date: true
+    has_time: true
+    icon: mdi:shield-lock
+
 automation:
   - id: badevaerelse_wasp_arm
     alias: "Bad: Wasp arm (ny bevægelse bag lukket dør)"
@@ -281,6 +292,26 @@ automation:
   # besøgs-tid", default 40 min). Måles fra arm-tidspunktet (state on for:).
   # Gælder uanset om lyset er tændt eller slukket → fjerner også den latente
   # "armeret men lys slukket"-fælde der ellers ville veto'e næste tænd.
+  #
+  # 2026-10-31 (B197): en HA-restart mens wasp er armeret dræber den ventende
+  # `for:` (Permanente fakta), og efter boot kommer der ingen ny on-flanke →
+  # låsen holdt indtil døren blev åbnet. /5-backstoppen måler fra det SKREVNE
+  # arm-stempel, så restarten hverken nulstiller eller forlænger fristen.
+  - id: badevaerelse_wasp_arm_stempel
+    alias: "Bad: Wasp armeret → stempl tidspunktet"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: input_boolean.badevaerelse_wasp_active
+        from: "off"
+        to: "on"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.badevaerelse_wasp_armeret_at
+        data:
+          timestamp: "{{ now().timestamp() | int }}"
+
   - id: badevaerelse_wasp_safety_clear
     alias: "Bad: Wasp safety auto-clear (armeret for længe)"
     description: >
@@ -297,10 +328,24 @@ automation:
           seconds: >-
             {{ ((states('input_number.badevaerelse_max_on_minutes') | float(40))
                 * 60) | int }}
+      # B197: restart-backstop (se kommentaren over arm-stemplet).
+      - platform: time_pattern
+        minutes: "/5"
+        id: backstop
     condition:
       - condition: state
         entity_id: input_boolean.badevaerelse_wasp_active
         state: "on"
+      # Kun backstoppen læser stemplet — for:-vejen må ikke afhænge af den nye
+      # helper. Et urørt stempel står på oprettelses-dagens midnat, men wasp
+      # var off ved deploy (31/10), og hver arm skriver stemplet i flankens
+      # sekund — før backstoppen kan nå at læse det.
+      - condition: template
+        value_template: >-
+          {% set maks = (states('input_number.badevaerelse_max_on_minutes') | float(40)) * 60 %}
+          {% set t = state_attr('input_datetime.badevaerelse_wasp_armeret_at', 'timestamp') | float(0) %}
+          {{ trigger is not defined or trigger.id != 'backstop'
+             or (t > 0 and now().timestamp() - t >= maks) }}
     action:
       - service: input_boolean.turn_off
         target:

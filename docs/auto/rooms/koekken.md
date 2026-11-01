@@ -6,7 +6,7 @@ Search keywords: `koekken, kokken`
 
 ## Indhold
 - [Automations](koekken.md#automations) (9)
-- [Entities](koekken.md#entities) (242)
+- [Entities](koekken.md#entities) (243)
 - [Helpers](koekken.md#helpers) (42)
 
 ---
@@ -311,6 +311,7 @@ Search keywords: `koekken, kokken`
 - `sensor.koekken_spots_lux_gate_effektiv` — 10 refs in 5 file(s)
 - `sensor.koekken_stemme_kommando` — 6 refs in 1 file(s)
 - `sensor.koekken_stemme_sidst` — 4 refs in 3 file(s)
+- `sensor.koekken_timer_varsel_tid` — 1 refs in 1 file(s)
 - `sensor.koekken_trigger_log` — 4 refs in 2 file(s)
 - `sensor.radiator_effekt_kokken` — 2 refs in 2 file(s)
 - `sensor.thread_router_koekken_energy` — 1 refs in 1 file(s)
@@ -326,7 +327,7 @@ Search keywords: `koekken, kokken`
 
 ### `timer.*`
 
-- `timer.koekken_gestus` — 32 refs in 6 file(s)
+- `timer.koekken_gestus` — 36 refs in 6 file(s)
 
 ---
 

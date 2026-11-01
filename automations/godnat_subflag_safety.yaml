@@ -273,3 +273,101 @@
     - service: input_boolean.turn_off
       target:
         entity_id: input_boolean.puttelys_descent_active
+
+# =============================================================================
+# Puttelys: landings-vagt (2026-10-31)
+# =============================================================================
+# Hvorfor (user 31/10: "nu sidder den igen fast, rampen, uden at ende på de 6 %
+# natlys … fix for evigt"): fase 1 forlades kun ad veje der kræver at noget
+# SKER — radaren ser læse-stilstand (puttelys_descent), Styrbar-starten får
+# lægge-presence, eller nogen trykker. Sker intet, står puttelyset til 20:30-
+# bagkanten — og efter den (genåbning, sen putning) resten af aftenen. Målt:
+#   31/10 + 23/10  Styrbar-ventetiden opgav (radaren tom med to i sengen)
+#   14/10          rampen dræbt af en reload ~19:45 → natlys først 21:24
+#   28-29/10       aften-holdet vetoede natlyset (rettet c0e95866)
+# Invarianten: er fase 1 tændt i putte-vinduet, og har hverken en nedtrapning
+# eller børne-godnat taget over inden fristen, starter vagten selv en 5-min
+# nedtrapning — den kanoniske vej (puttelys_descent_run), som ender i natlys +
+# godnat_boern_active. Fristen er et SKREVET stempel (#5): seneste fase 1 /
+# sol-tryk + puttelys_konvergens_minutter, eller en nedtrapnings planlagte
+# slut + 3 min (en dræbt rampe lander dér).
+# Bevidst stille (mørkt eller urørt er det rigtige svar): manuel-sluk-låsen
+# (dækker også gæste-hold og sluk under putning — de stopper rampen selv),
+# aften-niveau-holdet (du har selv sat strippen), filmmørke/Dark Mode, et tomt
+# hus (Dormant), rum-mode Off, mens Styrbar-starten stadig venter, AirBnB (eget
+# nat-regime) og kill-switchen auto_putning_enabled (#21).
+# time_pattern frem for flanke: fristen ER en tid, og intet tabes mens en gate
+# står lukket (#4/#15). /1 evaluerer kun conditions; intet skrives før den
+# handler (#7). 6 t-loftet på fristen: et stempel fra i går lander aldrig noget.
+- id: puttelys_konvergens_vagt
+  alias: "Puttelys: landings-vagt (fase 1 uden nedtrapning → natlys)"
+  description: >
+    Fase 1 må aldrig hænge: står puttelyset tændt i putte-vinduet forbi
+    landings-fristen uden nedtrapning eller børne-godnat, starter vagten en
+    5-min nedtrapning til natlys.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: time_pattern
+      minutes: "/1"
+  condition:
+    - condition: state
+      entity_id: input_boolean.auto_putning_enabled
+      state: "on"
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    - condition: time
+      after: input_datetime.putning_vindue_start
+      before: input_datetime.putning_vindue_slut
+    - condition: state
+      entity_id: input_boolean.puttelys_phase1_fired
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    - condition: state
+      entity_id: script.puttelys_descent_run
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.boernevaerelse_manual_off_lock
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.filmmoerke_boern
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ not states('input_text.boern_aften_niveau_hold').startswith('hold')
+           and not is_state('input_select.house_state', 'Dormant')
+           and not is_state('input_select.room_mode_boernevaerelse', 'Off')
+           and (state_attr('automation.putning_styrbar_op_laegge_presence_fase_1_forkortet_nedtrapning', 'current') | int(0)) == 0 }}
+    # Noget at lande: loft/plug, eller strippen OVER natlys-niveau (any_lys
+    # tæller en strip < 26 raw som natlys). Et slukket rum er en beslutning,
+    # og en strip på natlys er allerede landet.
+    - condition: state
+      entity_id: binary_sensor.boernevaerelse_any_lys
+      state: "on"
+    - condition: template
+      value_template: >-
+        {% set f = state_attr('input_datetime.puttelys_konvergens_frist', 'timestamp') %}
+        {% set nu = as_timestamp(now()) %}
+        {{ f is not none and nu >= (f | float) and nu - (f | float) < 6 * 3600 }}
+  action:
+    - service: logbook.log
+      data:
+        name: "Puttelys (landings-vagt)"
+        message: >-
+          {{ now().strftime('%H:%M') }} fase 1 stod uden nedtrapning forbi fristen
+          {{ states('input_datetime.puttelys_konvergens_frist')[11:16] }} → 5-min
+          nedtrapning til natlys.
+        entity_id: input_boolean.puttelys_phase1_fired
+    # script.turn_on (ikke blokerende): scriptet sætter descent_active i sit
+    # første trin, så næste tick står stille af sig selv.
+    - service: script.turn_on
+      target:
+        entity_id: script.puttelys_descent_run
+      data:
+        variables:
+          duration_minutes: 5

@@ -36,11 +36,6 @@ og incident-forløb ligger i docs/ og koster kun tokens når nogen læser dem.
 måledata: `grep -n "Sprint <dato>" docs/sprint_log.md`.** Er en lærdom permanent,
 hører den i "Permanente fakta" eller som en fejlklasse — ikke i en sprint-note.
 
-- **2026-10-25 — budgettér HUSETS sum, ikke pr. pære.** Halloween sendte ~2
-  Matter-kommandoer/s (B222's tempo-gulv pr. pære holdt ikke summen nede) og
-  hard-hang OTBR'en. Nu skriver festlys kun til Thread-pærerne på deres plads i
-  ét fælles gitter (`custom_templates/festlys.jinja`, 8/min for hele huset): 7 min
-  worst case = 1 enkelt reset. En reset-KLYNGE er festens tegn; ~1,8/t er baggrund. B260.
 - **2026-10-26 — et vidne for en sovende partner beskytter ingen, når begge
   voksne beviseligt er gået.** Sove-spøgelset (06:39-09:24; g2_still = 100 dæmper
   ikke energi 100, B269) spærrede alle hurtige dvale-veje, prel-vagten satte Active
@@ -51,6 +46,11 @@ hører den i "Permanente fakta" eller som en fejlklasse — ikke i en sprint-not
   dør. `binary_sensor.people_fest` (min(45-, 15-min-snit af optagne zoner) ≥ 4,2;
   uden fest max 3,71 på 30 døgn) løfter buddet til 3,0 × masse, loft 30. Massen
   tæller IKKE 1-4 personer (p50 1,5-1,8 for alle) — faktoren hviler på én fest. B271.
+- **2026-10-31 — en tilstand der kun forlades når en radar SER noget, hænger
+  når radaren er blind.** Puttelyset stod på fase 1 (31/10, 23/10, 14/10 efter en
+  reload) fordi hver vej ned krævede radar eller et tryk. Nu en skrevet frist
+  (`input_datetime.puttelys_konvergens_frist`) + `automation.puttelys_konvergens_vagt`
+  der lander på natlys. Spørg om ENHVER venteløkke: hvad lander den, når intet sker? B280.
 ---
 
 ## 💡 Permanente fakta (destilleret fra arkiverede sprints)

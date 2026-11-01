@@ -70,7 +70,8 @@ presence_lights 44, godmorgen_godnat 43, entre_motion 38.
 | Fil | Hvad |
 |---|---|
 | `scripts/ha_offline.py` | check / equiv / staging / refs / slugcheck (se tabellen øverst) |
-| `scripts/ha_offline_version.txt` | HA-versionen der valideres mod — **skal = prod** |
+| `scripts/ha_offline_version.txt` | HA-versionen der valideres mod — **skal = prod**; pre-push blokerer ellers (`ha_offline.py pin --check`), `ha_offline.py pin` flytter den |
+| `scripts/ha_beta_tjek.py` (+ `packages/ha_beta_tjek.yaml`) | torsdag 03:40 i core-containeren: huset mod HA's næste beta; push kun ved fejl (`sensor.ha_beta_tjek`) |
 | `scripts/ha_slug.py` | ÉN slugify; = HA's over 4.767 navne (`ha_offline.py slugcheck`) |
 | `scripts/roster_drift.py` (+ `_allow.txt`) | rapport + `--staged` JIT: "13 tvillinger har stadig den gamle liste" |
 | `scripts/session_start.sh` + `.claude/settings.json` | SessionStart: synk git-hooks, bagud-tjek, cloud-venv i baggrunden |
@@ -110,8 +111,10 @@ Rækkefølgen er vigtig: intet af dette kræver en restart før punkt 7.
 1. **Hent branchen** og læs dette afsnit: `git fetch origin && git checkout ccr-a9defbaf-p8ulxr`.
 2. **HA-versionen = prod?**
    `curl -s -H "Authorization: Bearer $SUPERVISOR_TOKEN" http://supervisor/core/api/config | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])'`
-   Afviger den fra `scripts/ha_offline_version.txt` (2026.9.2, sidst kendt fra git), så
-   ret filen. Hele værktøjskassen validerer mod den version.
+   Afviger den fra `scripts/ha_offline_version.txt`, så kør
+   `python3 scripts/ha_offline.py pin` (tjekker huset mod prod's core og flytter
+   filen; pre-push blokerer siden 2026-10-31 når de to er uenige). Hele
+   værktøjskassen validerer mod den version.
 3. **Byg venv'et** — helst på PC'en: `pip install --user -U uv` og så
    `python3 scripts/ha_offline.py check`. På NUC'ens SSH-add-on: ukendt om
    Python ≥ 3.14.2 kan hentes (musl); prøv, og dokumentér resultatet her. Venv'et er
@@ -246,6 +249,18 @@ væk fra det rum den gælder.
   template-blokke, platform-lister); action-sekvenser sammenlignes MED rækkefølge.
 - HA-venv'et skal matche prod-versionen; et `--version <ny>` før en core-opdatering
   er en gratis generalprøve (legacy-template-lintet ville have fanget d7c39571).
+  **Siden 2026-10-31 er begge dele automatiske** (frenck/home-assistant-config
+  tjekker mod stable/beta/dev i CI): pre-push blokerer når pinnen ≠ prod (29-31/10
+  validerede den mod 2026.9.2 mens huset kørte 2026.10.4), og
+  `scripts/ha_beta_tjek.py` kører generalprøven mod næste beta hver torsdag 03:40 i
+  core-containeren — eget cache-dir `.cache/ha-offline-core` (et venv bygget i
+  core peger på cores Python), og git kaldes med `safe.directory`, fordi core
+  kører som root mens `.git` ejes af uid 1000. **Core har `UV_SYSTEM_PYTHON=true`:**
+  uden rettelsen i `reexec_in_venv` installerede beta-instansen sine krav i
+  produktionens Python (31/10, `grep -n "UV_SYSTEM_PYTHON" docs/permanente_fakta.md`);
+  barnet sammenligner nu produktionens pakker før/efter og spærrer ved ændring. Bestil et tjek nu:
+  `touch .cache/ha-offline-core/koer_nu` + `homeassistant.update_entity` på
+  `sensor.ha_beta_tjek`.
 
 ---
 

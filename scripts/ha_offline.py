@@ -21,6 +21,9 @@ Subcommands:
   staging [--rev R] [--wait 45]    boot the house headless as a fresh, sanitized install
   refs    [--rev R]                entity references that do not exist (staging + production list)
   slugcheck                        prove that scripts/ha_slug.py equals Home Assistant's slugify
+  pin     [--check]                follow production's core: --check fails when the pin
+                                   differs (pre-push); without it, check against prod's
+                                   core and move the pin
 
 Without ``--rev`` the working tree is used, including uncommitted changes and
 excluding everything git-ignored: ``secrets.yaml``, ``.storage`` and ``.env``
@@ -29,8 +32,10 @@ never enter the copy, and ``!secret`` lookups get the placeholders from
 
 The first run builds ``.cache/ha-offline/venv-<version>`` with uv (1-2 min,
 about 1.1 GB; ``HA_OFFLINE_CACHE=/path`` moves it). The version is pinned in
-``scripts/ha_offline_version.txt`` and must equal production. Before a core
-update, ``--version <new>`` tests the house against the new core.
+``scripts/ha_offline_version.txt`` and must equal production: the pre-push hook
+blocks when it does not (``pin --check``), and ``pin`` moves it. Before a core
+update, ``--version <new>`` tests the house against the new core;
+``scripts/ha_beta_tjek.py`` does that weekly against the next beta.
 
 Exit codes: 0 clean, 1 problems found, 3 the venv could not be built.
 """
@@ -53,6 +58,8 @@ REPO = Path(__file__).resolve().parent.parent
 # placeres uden for /config med HA_OFFLINE_CACHE=/sti.
 CACHE = Path(os.environ.get("HA_OFFLINE_CACHE") or REPO / ".cache" / "ha-offline")
 VERSION_FILE = REPO / "scripts" / "ha_offline_version.txt"
+# Findes kun i HA's core-container (produktionen): dér kører husets HA selv.
+PROD_CONTAINER = Path("/usr/src/homeassistant/homeassistant")
 PROD_ENTITY_LIST = REPO / "config_snapshots" / "entity_ids.txt"
 NEVER_COPY = {
     "secrets.yaml",
@@ -69,16 +76,20 @@ NEVER_COPY = {
 # --------------------------------------------------------------------------
 
 
-def wanted_version(cli: str | None) -> str:
-    if cli:
-        return cli
-    if os.environ.get("HA_OFFLINE_VERSION"):
-        return os.environ["HA_OFFLINE_VERSION"]
+def pinned_version() -> str:
     for line in VERSION_FILE.read_text().splitlines():
         line = line.split("#", 1)[0].strip()
         if line:
             return line
     sys.exit("scripts/ha_offline_version.txt er tom")
+
+
+def wanted_version(cli: str | None) -> str:
+    if cli:
+        return cli
+    if os.environ.get("HA_OFFLINE_VERSION"):
+        return os.environ["HA_OFFLINE_VERSION"]
+    return pinned_version()
 
 
 def _venv_python(venv: Path) -> Path:
@@ -87,7 +98,17 @@ def _venv_python(venv: Path) -> Path:
 
 
 def _find_uv() -> str | None:
-    for cand in (shutil.which("uv"), str(Path.home() / ".local" / "bin" / "uv")):
+    # PATH og ~/.local/bin, så dev-venv'ets PINNEDE uv (requirements-dev.txt) og
+    # til sidst uv'en i et eksisterende HA-venv (HA har uv som afhængighed).
+    # 31/10: uv lå i .cache/dev-venv/bin, men et kald uden for `make` fandt den
+    # ikke ("uv mangler") — et nyt venv kunne kun bygges med dev-venv'et på PATH.
+    cands = [
+        shutil.which("uv"),
+        str(Path.home() / ".local" / "bin" / "uv"),
+        str(REPO / ".cache" / "dev-venv" / "bin" / "uv"),
+        *(str(p) for p in sorted(CACHE.glob("venv-*/bin/uv"), reverse=True)),
+    ]
+    for cand in cands:
         if cand and Path(cand).exists():
             return cand
     return None
@@ -191,15 +212,30 @@ def reexec_in_venv(version: str) -> None:
         sys.exit(3)
     if os.environ.get("HA_OFFLINE_INNER") == version:
         return
-    try:
-        from homeassistant.const import __version__ as have  # noqa: PLC0415
+    # I HA's PRODUKTIONS-container må tjekket aldrig køre i husets egen
+    # interpreter: check_config installerer integrations-krav dér (se nedenfor).
+    if not PROD_CONTAINER.is_dir():
+        try:
+            from homeassistant.const import __version__ as have  # noqa: PLC0415
 
-        if have == version:
-            return
-    except Exception:  # noqa: BLE001
-        pass
+            if have == version:
+                return
+        except Exception:  # noqa: BLE001
+            pass
     py = ensure_venv(version)
     env = dict(os.environ, HA_OFFLINE_INNER=version)
+    # 31/10-hændelsen: HA core-containeren har UV_SYSTEM_PYTHON=true (sådan
+    # installerer HA i Docker sine krav i system-Pythonen). Arvet af venv'ets
+    # HA kaldte dens install_package `python -m uv pip install` UDEN --python,
+    # og uv valgte system-Pythonen = PRODUKTIONEN: 29 pakker (zha, zigpy,
+    # frontend, pydantic, aiohasupervisor …) blev beta-versioner 12:32:27-51 og
+    # måtte gendannes 12:38. VIRTUAL_ENV + ingen UV_SYSTEM_PYTHON/UV_PYTHON =
+    # uv installerer i venv'et, som i SSH-add-on'et.
+    for var in ("UV_SYSTEM_PYTHON", "UV_PYTHON", "PIP_TARGET", "PIP_PREFIX"):
+        env.pop(var, None)
+    venv = py.parent.parent
+    env["VIRTUAL_ENV"] = str(venv)
+    env["PATH"] = f"{py.parent}{os.pathsep}{env.get('PATH', '')}"
     r = subprocess.run([str(py), str(Path(__file__).resolve()), *sys.argv[1:]], env=env)
     sys.exit(r.returncode)
 
@@ -209,24 +245,29 @@ def reexec_in_venv(version: str) -> None:
 # --------------------------------------------------------------------------
 
 
+def _git(*args: str) -> bytes:
+    """git i repoet. `safe.directory` fordi HA core-containeren kører som root,
+    mens /config/.git ejes af uid 1000 → git nægter ("dubious ownership", exit
+    128; målt 31/10 i beta-tjekkets første kørsel). SSH-add-on'et har undtagelsen
+    i sin globale config, core-containeren har ikke. Fejlteksten går med ud."""
+    r = subprocess.run(
+        ["git", "-c", f"safe.directory={REPO}", "-C", str(REPO), *args], capture_output=True
+    )
+    if r.returncode != 0:  # infrastruktur, ikke en fejl i huset → exit 3 som venv-fejl
+        msg = r.stderr.decode().strip()[:300]
+        print(f"❌ git {' '.join(args[:2])} fejlede ({r.returncode}): {msg}", file=sys.stderr)
+        sys.exit(3)
+    return r.stdout
+
+
 def materialize(rev: str | None, dest: Path) -> Path:
     """Kopiér repoet (en rev eller working tree) til dest — aldrig secrets."""
     dest.mkdir(parents=True, exist_ok=True)
     if rev:
-        arch = subprocess.run(
-            ["git", "-C", str(REPO), "archive", rev], capture_output=True, check=True
-        ).stdout
+        arch = _git("archive", rev)
         subprocess.run(["tar", "-x", "-C", str(dest)], input=arch, check=True)
     else:
-        files = (
-            subprocess.run(
-                ["git", "-C", str(REPO), "ls-files", "-z", "-co", "--exclude-standard"],
-                capture_output=True,
-                check=True,
-            )
-            .stdout.decode()
-            .split("\0")
-        )
+        files = _git("ls-files", "-z", "-co", "--exclude-standard").decode().split("\0")
         for rel in files:
             if not rel:
                 continue
@@ -1364,6 +1405,114 @@ def cmd_slugcheck(args) -> int:
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# pin — offline-tjekkets core SKAL være den core huset kører
+# --------------------------------------------------------------------------
+# 29-31/10 validerede pre-push mod 2026.9.2, mens huset kørte 2026.10.4 (opdateret
+# 29/10 06:43) — ingen opdagede det, for filen er hånd-holdt. frenck/home-
+# assistant-config tjekker mod stable/beta/dev i CI; vores "stable" er prod, og
+# den følges nu her: `pin --check` (pre-push, hurtig, intet venv) blokerer når de
+# to er uenige, `pin` bygger prod's venv, tjekker huset mod det og flytter filen.
+
+
+def prod_version() -> str | None:
+    """Den version huset KØRER, eller None hvis den ikke kan ses herfra.
+
+    `.HA_VERSION` skrives af HA ved hver start og findes kun dér hvor HA kører
+    (NUC'en, core-containeren); den er ikke i git. En PC-checkout spørger
+    live-API'et med ha_validate's token-veje (.env/$HA_TOKEN/$SUPERVISOR_TOKEN).
+    """
+    f = REPO / ".HA_VERSION"
+    if f.is_file():
+        v = f.read_text().strip()
+        if v:
+            return v
+    try:
+        sys.path.insert(0, str(REPO / "scripts"))
+        from ha_validate import load_ha_token  # noqa: PLC0415
+
+        token, base = load_ha_token()
+    except Exception:  # noqa: BLE001
+        return None
+    if not token:
+        return None
+    import urllib.request  # noqa: PLC0415
+
+    try:
+        req = urllib.request.Request(
+            f"{base}/api/config", headers={"Authorization": f"Bearer {token}"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.load(r).get("version") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _write_pin(version: str) -> None:
+    from datetime import date  # noqa: PLC0415
+
+    out = []
+    for line in VERSION_FILE.read_text().splitlines():
+        if line.startswith("# Sidst"):
+            line = f"# Sidst flyttet med `ha_offline.py pin` {date.today()}: huset kørte {version}, check rent."
+        elif line.split("#", 1)[0].strip():
+            line = version
+        out.append(line)
+    VERSION_FILE.write_text("\n".join(out) + "\n")
+
+
+def _prune_venvs(keep: set[str]) -> None:
+    """Slet gamle venv-<version> (≈1,1 GB hver) — de bygges igen ved behov."""
+    for p in CACHE.glob("venv-*"):
+        if p.is_dir() and p.name.removeprefix("venv-") not in keep:
+            shutil.rmtree(p, ignore_errors=True)
+            print(f"🧹 slettede {p.name}", file=sys.stderr)
+
+
+def cmd_pin(args) -> int:
+    pin, prod = pinned_version(), prod_version()
+    if args.check:
+        if prod is None:
+            print(
+                f"ℹ  pin {pin}: husets HA-version kan ikke ses herfra — pin-tjek sprunget over",
+                file=sys.stderr,
+            )
+            return 0
+        if prod == pin:
+            return 0
+        print(
+            f"❌ scripts/ha_offline_version.txt = {pin}, men huset kører {prod} — offline-tjekket\n"
+            f"   validerer mod en anden core end produktionen.\n"
+            f"   Ret:  python3 scripts/ha_offline.py pin   (bygger venv, tjekker huset, flytter filen)",
+            file=sys.stderr,
+        )
+        return 1
+    if prod is None:
+        print(
+            "❌ husets HA-version kan ikke ses herfra (ingen .HA_VERSION, intet API-token)",
+            file=sys.stderr,
+        )
+        return 2
+    if prod == pin:
+        print(f"✅ pin = prod = {prod}")
+        return 0
+    print(f"🔁 pin {pin} → prod {prod}: tjekker huset mod {prod} først …", file=sys.stderr)
+    r = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--version", prod, "check", "--quiet"]
+    )
+    if r.returncode != 0:
+        print(
+            f"❌ huset fejler mod sin EGEN core {prod} (se ovenfor) — pin IKKE flyttet. "
+            "Det er en fejl i produktionen nu, ikke kun i tjekket.",
+            file=sys.stderr,
+        )
+        return r.returncode
+    _write_pin(prod)
+    _prune_venvs({prod})
+    print(f"✅ pin {pin} → {prod}. Commit scripts/ha_offline_version.txt.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__ or "", formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1389,8 +1538,14 @@ def main() -> int:
     p = sub.add_parser("refs")
     p.add_argument("--rev")
     sub.add_parser("slugcheck")
+    p = sub.add_parser("pin")
+    p.add_argument(
+        "--check", action="store_true", help="exit 1 hvis pin ≠ husets version (pre-push)"
+    )
     args = ap.parse_args()
 
+    if args.cmd == "pin":  # behøver intet HA-venv
+        return cmd_pin(args)
     reexec_in_venv(wanted_version(args.version))
     return {
         "check": cmd_check,

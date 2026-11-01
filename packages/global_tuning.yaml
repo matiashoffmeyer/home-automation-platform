@@ -620,11 +620,35 @@ input_number:
     unit_of_measurement: "min"
     mode: slider
 
+  # 2026-10-31 (user: "nu sidder den igen fast, rampen … fix for evigt"):
+  # landings-vagtens frist. Fase 1 forlades ellers KUN når radaren ser læse-
+  # stilstand eller lægge-presence — er den blind (31/10: tom fra 19:02 med to
+  # i sengen), stod puttelyset til 20:30-bagkanten. Senest N min efter SENESTE
+  # fase 1 (eller en nedtrapnings planlagte slut + 3 min) starter
+  # puttelys_konvergens_vagt selv en 5-min nedtrapning til natlys.
+  # Målt 1/10-31/10 (n=17 aftener): seneste fase 1 → nedtrapning p50 2,8 min,
+  # max 10,7 (12/10); fra aftenens FØRSTE fase 1 max 25,7 (27/10).
+  # 20 min = user-valg 31/10 ("lidt kortere, 20 min"): ~2× over max målt fra
+  # SENESTE fase 1 (stemplet flyttes ved hvert fase 1/sol-tryk); 27/10's lange
+  # første fase 1 (23,7 min til næste) ville være landet 3-4 min før.
+  # Bruges i automations/godnat_subflag_safety.yaml::puttelys_konvergens_vagt
+  # (fristen skrives af puttelys_phase1_apply og putning_trappe_op).
+  puttelys_konvergens_minutter:
+    name: "Puttelys: landings-frist (min)"
+    icon: mdi:timer-sand-complete
+    min: 10
+    max: 90
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+
   # 2026-06-18 (user-spec): Styrbar-OP-putning (ankomst-aftener hvor børn-detect
   # er off). Styrbar børn OP efter 18:45 + N min presence ≥ zone-min cm i
   # lægge-zonen → fade fase 1 + start nedtrapning. De N min tæller som allerede-
   # puttet → nedtrapningen forkortes med N min (vi har jo puttet i N min).
-  # Bruges i automations/godnat_night.yaml::puttelys_styrbar_start. Range 1-15.
+  # Bruges i automations/putning_auto_detect.yaml::puttelys_styrbar_start. Range 1-15.
+  # 2026-10-31: kun UDEN putte-kontekst (børn ikke registreret hjemme) — i
+  # putte-kontekst starter OP nedtrapningen med det samme (user-spec).
   puttelys_styrbar_presence_minutes:
     name: "Puttelys: Styrbar-OP presence-vindue (min)"
     icon: mdi:bed-clock-outline
@@ -1523,10 +1547,51 @@ automation:
         entity_id: input_select.active_scene
         state: "none"
     action:
-      - variables:
+      - action: script.lys_omskaler_taendte
+        data:
           r: >-
             {{ trigger.to_state.attributes.base | float(1) /
                trigger.from_state.attributes.base | float(1) }}
+          kilde: "Lys-aggressivitet"
+          aarsag: >-
+            skyder-faktor {{ trigger.from_state.attributes.base }} →
+            {{ trigger.to_state.attributes.base }}
+
+# 2026-10-31 (B279): omskaleringen er flyttet ud i et script, så skyder-trækket
+# OG el-pris-skiftet (packages/elpris_styring.yaml) deler ÉN roster + ét sæt
+# gates (#2). Kalderen sender forholdet r = ny/gammel faktor; scriptet gater
+# selv på godnat/fest/film/scene og rører kun TÆNDTE auto-lys i Auto-rum.
+# mode: queued → to kaldere skriver aldrig samme lampe samtidig (#2).
+script:
+  lys_omskaler_taendte:
+    alias: "Lys: omskalér tændte auto-lys med en faktor"
+    mode: queued
+    max: 10
+    fields:
+      r:
+        description: "Forhold ny/gammel faktor (fx 0.9 = 10 % ned)"
+      kilde:
+        description: "Navn i logbogen"
+      aarsag:
+        description: "Tekst i logbogen"
+    sequence:
+      - variables:
+          r: "{{ r | default(1) | float(1) }}"
+      - condition: template
+        value_template: "{{ r > 0 and r != 1 }}"
+      - condition: state
+        entity_id: binary_sensor.godnat_any_active
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.dance_mode
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.cinema_active
+        state: "off"
+      - condition: state
+        entity_id: input_select.active_scene
+        state: "none"
+      - variables:
           maal: >-
             {% set grupper = {
                  'light.stue_all': 'input_select.room_mode_stue',
@@ -1575,9 +1640,7 @@ automation:
                 transition: 1
       - action: logbook.log
         data:
-          name: "Lys-aggressivitet"
+          name: "{{ kilde | default('Lys-omskalering') }}"
           message: >-
-            skyder-faktor {{ trigger.from_state.attributes.base }} →
-            {{ trigger.to_state.attributes.base }} (×{{ r | round(2) }}):
+            {{ aarsag | default('') }} (×{{ r | round(3) }}):
             {{ maal | map(attribute='e') | map('replace', 'light.', '') | join(', ') }}
-

@@ -36,3 +36,10 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   (≈ 93 kWh / ~180 kr om året) → `input_number.cost_hoejttaler_watt` i setup-kosten.
   Kører den på batteri og går offline, afgør LED'en (ingen = slukket, blå/rød
   blink = egen hotspot, grøn = hængt). SD-backup: `/media/axiomair_n3_backup/` (ikke i HA-backup'en).
+- **Lys-pris-faktoren lægges på ved SKRIVNING, og EFTER 100 %-loftet** —
+  `min(100, N × base) × pf`; tændte lys følger kun med via
+  `automation.el_pris_skaler_taendte_auto_lys_nar_pris_faktoren_flytter_sig` (id `elpris_daemp_taendte_lys`). Recorderen gemmer ikke lysenes
+  `brightness` → historisk energi pr. lys er kun en øvre grænse.
+  `grep -n "Lys-pris-faktoren" docs/permanente_fakta.md`.
+- **En entity-registry-omdøbning FLYTTER statistikken med** — den nye sensor på
+  det gamle id starter tom (graf-serien forsvinder) → importér historikken igen.

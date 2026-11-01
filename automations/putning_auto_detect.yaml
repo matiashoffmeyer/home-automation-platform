@@ -397,13 +397,20 @@
 # (lyset bliver slukket), Styrbar OP = "nu putter vi rigtigt". Gentagelses-
 # spærringen er i stedet presence-kravet (N min i lægge-zonen) +
 # puttelys_descent_active=off.
+# 2026-10-31 (user-spec: "start med det samme ved OP-tryk"): i PUTTE-KONTEKST
+# (binary_sensor.putning_vindue_aktivt eller godnat_boern_active — samme gate
+# som styrbar_brightness_step's fase 1-gren) starter nedtrapningen i fuld
+# slider-tid ved trykket, uden radar-ventetid. Presence-kravet gælder nu KUN
+# uden putte-kontekst (børn ikke registreret hjemme), hvor trykket gav
+# almindeligt lys og radaren er eneste bevis for en putning.
 # =============================================================================
 - id: puttelys_styrbar_start
   alias: "Putning: Styrbar OP + lægge-presence → fase 1 + forkortet nedtrapning"
   description: >
-    Trigger D (ankomst-aften): Styrbar børn OP efter 18:45 + N min presence i
-    lægge-zonen (≥150 cm) → fase 1 puttelys + forkortet nedtrapning (−N min) +
-    boern_sov_her_i_nat=on. Virker uafhængigt af kids_home (børn lige ankommet).
+    Styrbar børn OP efter 18:45: i putte-kontekst (børn hjemme / nat-mode)
+    starter nedtrapningen med det samme. Uden (ankomst-aften, kids_home off)
+    kræves N min presence i lægge-zonen (≥150 cm) → fase 1 + forkortet
+    nedtrapning + boern_sov_her_i_nat=on.
   mode: restart
   max_exceeded: silent
   trigger:
@@ -440,14 +447,94 @@
     # afsluttet nedtrapning står den on, og et OP-tryk kunne derfor ikke starte
     # en NY putte-session — præcis det user beder om efter en tv-pause ("når tv
     # så slukker … hvis jeg så trykker styrbar børne op, så starter vi en
-    # puttesession"). Flaget ryddes i action'en efter presence-bekræftelsen, så
-    # en genstart kræver stadig at nogen faktisk ligger i lægge-zonen i N min.
-    - condition: state
-      entity_id: input_boolean.puttelys_descent_active
-      state: "off"
+    # puttesession"). 2026-10-31: i putte-kontekst starter OP nedtrapningen med
+    # det samme — også midt i en kørende (rampen startes forfra), så
+    # "descent_active off" er flyttet ind i presence-grenen nedenfor.
   action:
     - variables:
         n: "{{ states('input_number.puttelys_styrbar_presence_minutes') | float(5) }}"
+        t_tryk: "{{ as_timestamp(now()) }}"
+        # Samme putte-kontekst som styrbar_brightness_step's fase 1-gren (den
+        # tænder fase 1 på netop dette tryk). Læst ved trykket: kids_home
+        # flytter sig ikke af et tryk, og godnat-flaget ryddes først af
+        # genåbningen efter et par hundrede ms.
+        putte_kontekst: >-
+          {{ is_state('binary_sensor.putning_vindue_aktivt', 'on')
+             or is_state('input_boolean.godnat_boern_active', 'on') }}
+    # ---------------------------------------------------------------------
+    # PUTTE-KONTEKST: OP = nedtrapningen starter NU (user-spec 2026-10-31:
+    # "start med det samme ved OP-tryk"). Før ventede den på N min lægge-
+    # presence, og radaren ser ofte ikke to der ligger stille i sengen
+    # (31/10: tom fra 19:02 → AFBRUDT 19:07, fase 1 til 20:30; 23/10 samme).
+    # Gælder også en genåbning (tv-pause) og et tryk midt i en kørende
+    # nedtrapning: OP har tændt fase 1 igen, så rampen startes forfra i fuld
+    # længde (descent_run er mode: restart). Manuel-sluk-låsen ryddes af selve
+    # trykket (boernevaerelse_manual_off_lock_clear_op); slukker du under
+    # rampen, stopper låsen scriptet.
+    # ---------------------------------------------------------------------
+    - if:
+        - condition: template
+          value_template: "{{ putte_kontekst | bool }}"
+      then:
+        # Lad styrbar_brightness_step nå at tænde fase 1 først: nedtrapningen
+        # læser loftets AKTUELLE niveau som startpunkt, og et loft der endnu
+        # ikke er tændt bliver sprunget over. 2 s til at scriptet starter,
+        # vent til det er færdigt, 3 s til loftets 3 s-transition.
+        - delay:
+            seconds: 2
+        - wait_template: "{{ is_state('script.puttelys_phase1_apply', 'off') }}"
+          timeout:
+            seconds: 15
+          continue_on_timeout: true
+        - delay:
+            seconds: 3
+        # Genåbningen rydder normalt børne-godnat selv; står det stadig on,
+        # ville nat-mode-gatene slukke puttelyset igen undervejs.
+        - if:
+            - condition: state
+              entity_id: input_boolean.godnat_boern_active
+              state: "on"
+          then:
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.godnat_boern_active
+        - service: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.boern_sov_her_i_nat
+        - service: logbook.log
+          data:
+            name: "Putning (Styrbar OP)"
+            message: >-
+              Styrbar OP i putte-tid → nedtrapning
+              {{ states('input_number.global_puttelys_descent_minutes') | float(20) | round(0) | int }} min
+              startet med det samme (ingen radar-ventetid).
+            entity_id: input_boolean.puttelys_phase1_fired
+        # Pushen FØR den blokerende nedtrapning, så klokkeslættet er sandt.
+        - service: script.push_notify
+          continue_on_error: true
+          data:
+            notif_id: putning
+            title: "🛏️ Putning startet (Styrbar OP)"
+            message: >-
+              Nedtrapning ({{ states('input_number.global_puttelys_descent_minutes') | float(20) | round(0) | int }} min)
+              startet kl {{ now().strftime('%H:%M') }}.
+            payload:
+              tag: "putning_auto"
+              channel: "Putning"
+              importance: low
+        - service: script.puttelys_descent_run
+          data:
+            duration_minutes: "{{ states('input_number.global_puttelys_descent_minutes') | float(20) }}"
+        - stop: "Putte-kontekst: nedtrapning startet ved trykket"
+    # ---------------------------------------------------------------------
+    # UDEN putte-kontekst (børn ikke registreret hjemme — ankomst-aften):
+    # trykket gav almindeligt lys, så radaren er eneste bevis for at der
+    # puttes → N min lægge-presence som før, så et voksen-tryk ikke
+    # nedtrapper rummet og sætter børne-latchen.
+    # ---------------------------------------------------------------------
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
     # Vent på N min SAMMENHÆNGENDE presence i lægge-zonen (= vi ligger og putter).
     # Timeout = 3× vinduet fra OP-tryk; ingen ro-presence = ingen putning (abort).
     - wait_for_trigger:
@@ -501,33 +588,30 @@
             message: >-
               AFBRUDT: intet {{ n | round(0) | int }} min sammenhængende ophold
               i lægge-zonen (≥{{ states('input_number.puttelys_styrbar_zone_min_cm') | int(150) }} cm)
-              eller occupancy inden {{ (n * 3) | round(0) | int }} min — ingen putning startet.
+              eller occupancy inden {{ (n * 3) | round(0) | int }} min — ingen putning startet
+              (børn ikke registreret hjemme, så radaren skal bekræfte).
             entity_id: input_boolean.puttelys_phase1_fired
         - stop: "Ingen lægge-presence efter Styrbar OP"
     # Re-tjek gates (kan have ændret sig under ventetiden — fx anden putte-vej).
     - condition: state
       entity_id: input_boolean.puttelys_descent_active
       state: "off"
-    # 2026-08-07 GENSTART: stod godnat_boern_active on (afsluttet nedtrapning
-    # tidligere samme aften — fx afbrudt af tv), så ryddes den her, FØR fase 1
-    # tændes. Ellers ville nat-mode's gates slukke puttelyset igen med det
-    # samme. Sker først EFTER presence-bekræftelsen, så et tilfældigt OP-tryk
-    # ikke kan rive et sovende barn ud af nat-mode.
+    # Børne-godnat var off ved trykket (ellers putte-kontekst ovenfor) — står
+    # det on nu, har en anden vej landet putningen under ventetiden
+    # (natlys-dæmp, kalde-knap, trappe-bund). Den rives ikke op igen.
     - if:
         - condition: state
           entity_id: input_boolean.godnat_boern_active
           state: "on"
       then:
-        - service: input_boolean.turn_off
-          target:
-            entity_id: input_boolean.godnat_boern_active
         - service: logbook.log
           data:
             name: "Putning (Styrbar OP)"
             message: >-
-              Genstart: børne-godnat var allerede sat (tidligere putning/tv-pause)
-              → ryddet, ny putte-session starter.
+              Putningen blev landet ad en anden vej under ventetiden
+              (børne-godnat sat) — ingen ny nedtrapning.
             entity_id: input_boolean.godnat_boern_active
+        - stop: "Allerede landet under ventetiden"
     # 2026-06-19 (user-spec FULD LÅS): hvis brugeren slukkede lyset under presence-
     # ventetiden (= "nej, vi putter ikke, vi ser TV"), så ARMERES låsen og denne
     # putning skal IKKE tænde fase 1. Dette var præcis incident'en 2026-06-19
@@ -541,31 +625,35 @@
     - service: input_boolean.turn_on
       target:
         entity_id: input_boolean.boern_sov_her_i_nat
+    # Nedtrapningen forkortes med den tid der ER gået siden trykket (vi har
+    # puttet imens), så OP → natlys tager slider-tiden.
+    - variables:
+        gaaet_min: "{{ ((as_timestamp(now()) - (t_tryk | float)) / 60) | round(1) }}"
+        varighed: >-
+          {{ [ (states('input_number.global_puttelys_descent_minutes') | float(20)) - (gaaet_min | float(0)), 5 ] | max | round(1) }}
     - service: logbook.log
       data:
         name: "Putning (Styrbar OP)"
         message: >-
           Styrbar OP + {{ n | round(0) | int }} min lægge-presence (≥150 cm) →
-          fase 1 + nedtrapning forkortet {{ n | round(0) | int }} min.
-          boern_sov_her_i_nat=on.
+          fase 1 + nedtrapning {{ varighed | float | round(0) | int }} min
+          (forkortet {{ gaaet_min | float | round(0) | int }} min). boern_sov_her_i_nat=on.
     - service: script.puttelys_phase1_apply
-    - service: script.puttelys_descent_run
-      data:
-        duration_minutes: >-
-          {{ [ (states('input_number.global_puttelys_descent_minutes') | float(20)) - n, 5 ] | max }}
     - service: script.push_notify
       continue_on_error: true
       data:
         notif_id: putning
         title: "🛏️ Putning startet (Styrbar OP)"
         message: >-
-          Fase 1 + nedtrapning
-          ({{ [ (states('input_number.global_puttelys_descent_minutes') | float(20)) - n, 5 ] | max | round(0) | int }} min)
+          Fase 1 + nedtrapning ({{ varighed | float | round(0) | int }} min)
           startet kl {{ now().strftime('%H:%M') }}.
         payload:
           tag: "putning_auto"
           channel: "Putning"
           importance: low
+    - service: script.puttelys_descent_run
+      data:
+        duration_minutes: "{{ varighed }}"
 
 # =============================================================================
 # SEN HJEMKOMST (2026-10-06, user-spec): "hvis vi så kommer hjem og der er

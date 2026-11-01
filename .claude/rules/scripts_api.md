@@ -37,5 +37,11 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   automation, og som er startet `--detach` (stderr i /dev/null = tavs død). → brug
   `ha_api_token` via `scripts/ha_secrets.py` + `127.0.0.1:8123` (som plant_notify/
   notif_queue/sky_notify) og log `--detach`-børn til fil. Fanget i `apollo_kalib_capture.py` (B182).
+- **HA core-containeren har `UV_SYSTEM_PYTHON=true` → alt der fra core starter en
+  HA-instans eller `uv pip install` (også i et venv) installerer i PRODUKTIONENS
+  Python** (31/10: 29 pakker blev beta-versioner i 6 min). **Signatur: "No module
+  named X" uden "Unable to install package X".** → fjern `UV_SYSTEM_PYTHON`/
+  `UV_PYTHON` og sæt `VIRTUAL_ENV` (`ha_offline.reexec_in_venv`); git fra core kræver
+  `-c safe.directory=/config`. `grep -n "UV_SYSTEM_PYTHON" docs/permanente_fakta.md`.
 - **Scripts læser secrets.yaml KUN via `scripts/ha_secrets.py`** — en ny nøgle skal stå i
   `secrets.example.yaml`, ellers afviser `scripts/secrets_contract.py` committen.

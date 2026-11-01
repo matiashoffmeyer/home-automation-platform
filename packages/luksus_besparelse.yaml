@@ -113,11 +113,16 @@ template:
           {% set flagermus = is_state('input_boolean.flagermus_enabled', 'on')
                              and is_state('binary_sensor.gaester_for_nylig', 'off') %}
           {% set base = 40 if elev >= -6 else (65 if elev >= -12 else 90) %}
-          {% set sol_pct = [[(base * (states('sensor.global_brightness_factor') | float(1.0)))
+          {# B279: spejler terrasse_paerelys_til — loft før el-pris. #}
+          {% set sol_pct = [[(([base * (state_attr('sensor.global_brightness_factor', 'base') | float(1.0)), 100] | min)
+                              * ([states('sensor.elpris_dim_factor') | float(1.0), 1.0] | min))
                              | round(0) | int, 100] | min, 5] | max %}
           {% set t_pct = (states('input_number.flagermus_dusk_dim_pct') | int(20))
                          if flagermus else sol_pct %}
-          {% set t_w = (6.0 * t_pct / 100) if t_blokeret else 0 %}
+          {# 2026-10-31 (el-audit): watt fra sensor.lys_watt_kort (ÉN ejer, #2)
+             — før hardcodet 6 W / 39 W mod målt ~14 W / ~55 W. #}
+          {% set t_max = (state_attr('sensor.lys_watt_kort', 'watt') or {}).get('light.terrasse_paerelyskaede', 14) | float(14) %}
+          {% set t_w = (t_max * t_pct / 100) if t_blokeret else 0 %}
 
           {# --- 🧸 Børne-strippens natlys efter putning ------------------------ #}
           {% set b_blokeret = blok
@@ -139,7 +144,8 @@ template:
              and not is_state('input_select.room_mode_stue', 'Manual')
              and is_state('input_select.house_state', 'Active')
              and states('input_select.house_mode') in ['Normal', 'Home Vacation'] %}
-          {% set s_w = 39.0 if s_blokeret else 0 %}
+          {% set s_max = ((state_attr('sensor.lys_watt_kort', 'maalt') or {}).get('light.stue_plug', [none, 55]))[1] | float(55) %}
+          {% set s_w = s_max if s_blokeret else 0 %}
 
           {{ (t_w + b_w + s_w) | round(3) }}
         attributes:
@@ -191,11 +197,38 @@ template:
           {{ ((states('sensor.luksus_blokeret_effekt') | float(0)) / 1000
               * (states('sensor.elpris_allin_aktuel') | float(0))) | round(6) }}
 
+  - sensor:
+      # 2026-10-31 (el-audit, user: "ret retrospektivt"): regnskabet brugte 39 W
+      # for hyggelampen og 6 W for terrasse-kæden mod målt ~55 / ~14 W →
+      # undervurderet. Integralet kan ikke rettes, så det hedder nu _raa, og
+      # DENNE sensor (samme entity_id som før, så dashboards/total er urørte)
+      # lægger korrektionen oveni. Historikken (LTS) er omskrevet samme dag.
+      - name: "Luksus besparelse total"
+        unique_id: luksus_besparelse_total_korrigeret
+        unit_of_measurement: "kr"
+        state_class: total
+        icon: mdi:piggy-bank
+        state: >-
+          {{ ((states('sensor.luksus_besparelse_raa') | float(0))
+              + (states('input_number.luksus_besparelse_korrektion') | float(0))) | round(4) }}
+
+input_number:
+  # RUNTIME (helpers_export.py RUNTIME_NUMBERS): engangs-korrektion af det
+  # historiske integral, sat 31/10. Frisk install = 0 (integralet starter forfra).
+  luksus_besparelse_korrektion:
+    name: "Luksus-besparelse: historisk korrektion"
+    icon: mdi:calculator-variant
+    min: 0
+    max: 1000
+    step: 0.0001
+    unit_of_measurement: "kr"
+    mode: box
+
 sensor:
   # --- Riemann-integration → akkumuleret kr (all-time, restore'es ved restart) -
   # Kan aldrig falde (raten er ≥ 0), modsat cykel-laderens der må gå negativ.
   - platform: integration
-    name: "Luksus besparelse total"
+    name: "Luksus besparelse raa"
     unique_id: luksus_besparelse_total
     source: sensor.luksus_kost_rate_sparet
     method: left

@@ -49,7 +49,9 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
     `k_idag`) (under 3° falder
     spisestuen ≥ ×e^−0,59 pr. grad i ALLE målte par), fald aldrig tilbage til en
     kontamineret fallback (`spisestue_dagslys_lx`; `open_plan_lux` under 11° sol
-    siden 30/9 — samme bånd-tabel, ret begge). **Kun sikkert for LYS-gates:
+    siden 30/9 — samme bånd-tabel, ret begge). Et formiddags-sample holdt ind i
+    eftermiddagen fremskrives også (`kilde` = `formiddag_fremskrevet`, B266) —
+    rummet er lysere om eftermiddagen, så fejlen går mod mørkt. **Kun sikkert for LYS-gates:
     en solbeskyttelse ser ikke sol der bryder igennem** → rå minus målt
     lampelys (`sensor.mosbillede_lux_maalt`). `open_plan_lux` har et SOL-LOFT
     på begge grene (morgen og aften har HVER sin målte kurve — morgenen er langt

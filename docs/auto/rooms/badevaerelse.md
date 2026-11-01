@@ -6,8 +6,8 @@ Search keywords: `badevaerelse, bad`
 
 ## Indhold
 - [Automations](badevaerelse.md#automations) (22)
-- [Entities](badevaerelse.md#entities) (166)
-- [Helpers](badevaerelse.md#helpers) (40)
+- [Entities](badevaerelse.md#entities) (167)
+- [Helpers](badevaerelse.md#helpers) (41)
 
 ---
 
@@ -136,7 +136,7 @@ Search keywords: `badevaerelse, bad`
 - `input_boolean.badevaerelse_quick_spot_3` — 2 refs in 2 file(s)
 - `input_boolean.badevaerelse_quick_spot_4` — 2 refs in 2 file(s)
 - `input_boolean.badevaerelse_quick_spot_5` — 2 refs in 2 file(s)
-- `input_boolean.badevaerelse_wasp_active` — 34 refs in 8 file(s)
+- `input_boolean.badevaerelse_wasp_active` — 35 refs in 8 file(s)
 - `input_boolean.dance_room_bad` — 7 refs in 6 file(s)
 - `input_boolean.notif_bad_lys_airbnb` — 1 refs in 1 file(s)
 - `input_boolean.notif_bad_lys_parent_b` — 1 refs in 1 file(s)
@@ -161,6 +161,7 @@ Search keywords: `badevaerelse, bad`
 - `input_datetime.badevaerelse_dagmode_senest` — 4 refs in 3 file(s)
 - `input_datetime.badevaerelse_sidste_indre_pir` — 6 refs in 3 file(s)
 - `input_datetime.badevaerelse_sluk_alt_udskudt` — 5 refs in 2 file(s)
+- `input_datetime.badevaerelse_wasp_armeret_at` — 2 refs in 1 file(s)
 - `input_datetime.notif_bad_lys_slut` — 1 refs in 1 file(s)
 - `input_datetime.notif_bad_lys_start` — 1 refs in 1 file(s)
 - `input_datetime.styrbar_last_press_badevaerelse` — 5 refs in 4 file(s)
@@ -187,7 +188,7 @@ Search keywords: `badevaerelse, bad`
 - `input_number.badevaerelse_klimabevis_maks_minutter` — 2 refs in 2 file(s)
 - `input_number.badevaerelse_leave_off_seconds` — 5 refs in 3 file(s)
 - `input_number.badevaerelse_manual_til_auto_minutes` — 3 refs in 2 file(s)
-- `input_number.badevaerelse_max_on_minutes` — 11 refs in 5 file(s)
+- `input_number.badevaerelse_max_on_minutes` — 12 refs in 5 file(s)
 - `input_number.badevaerelse_medium_brightness` — 6 refs in 3 file(s)
 - `input_number.badevaerelse_medium_off_minutes` — 7 refs in 3 file(s)
 - `input_number.badevaerelse_min_kelvin` — 6 refs in 3 file(s)
@@ -311,6 +312,7 @@ Search keywords: `badevaerelse, bad`
 - `input_datetime.badevaerelse_bruser_vagt_slut` (defined in `packages/badevaerelse_bruser_vagt.yaml`)
 - `input_datetime.badevaerelse_bruser_vagt_start` (defined in `packages/badevaerelse_bruser_vagt.yaml`)
 - `input_datetime.badevaerelse_dagmode_senest` (defined in `packages/badevaerelse_faser.yaml`)
+- `input_datetime.badevaerelse_wasp_armeret_at` (defined in `packages/badevaerelse_wasp.yaml`)
 - `input_datetime.notif_bad_lys_slut` (defined in `packages/notifikationer.yaml`)
 - `input_datetime.notif_bad_lys_start` (defined in `packages/notifikationer.yaml`)
 - `input_datetime.styrbar_last_press_badevaerelse` (defined in `packages/room_modes.yaml`)

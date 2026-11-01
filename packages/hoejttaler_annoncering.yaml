@@ -62,6 +62,18 @@ input_boolean:
     icon: mdi:music-note
 
 input_number:
+  # Køkken-timerens varsel (user-spec 2026-10-31: "når der er 20 sek (slider)
+  # tilbage af en køkkentimer så lav oplæsning: N sekunder tilbage af timeren").
+  # 20 = brugerens tal. 0 = varslet er slået fra.
+  hoejttaler_timer_varsel_sekunder:
+    name: "Højttaler: varsel før køkken-timeren er færdig"
+    icon: mdi:timer-alert-outline
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
   # Fast niveau for beskeder — uafhængigt af hvad musikken stod på; den gamle
   # volumen sættes tilbage bagefter. 35 % = gæt (højttaleren findes ikke endnu,
   # 2×75 W) — mål når den er i brug.
@@ -86,6 +98,25 @@ shell_command:
   # Lydklip (2026-10-24, halloween): kun `klip` s fra `start` s inde i
   # nummeret (-1 = et tilfældigt sted) — ma_api.py play --klip.
   hoejttaler_ma_klip: "python3 /config/scripts/ma_api.py play up26491670 {{ uri }} --klip {{ klip }} --start {{ start }} --forsoeg {{ forsoeg | default(1) }}"
+
+template:
+  - sensor:
+      # Hvornår varslet skal siges: finishes_at − slideren. Ingen now() → ingen
+      # minut-rækker (#24); en `platform: time`-trigger ignorerer et tidspunkt
+      # der allerede er passeret (timer kortere end varslet). Pause = ingen
+      # finishes_at → unknown; genoptag/restart giver et nyt tidspunkt.
+      - name: "Koekken timer varsel tid"
+        unique_id: koekken_timer_varsel_tid
+        device_class: timestamp
+        icon: mdi:timer-alert-outline
+        state: >-
+          {% set f = state_attr('timer.koekken_gestus', 'finishes_at') %}
+          {% set n = states('input_number.hoejttaler_timer_varsel_sekunder') | int(0) %}
+          {% if is_state('timer.koekken_gestus', 'active') and f not in [none, ''] and n > 0 %}
+            {{ (as_datetime(f) - timedelta(seconds=n)).isoformat() }}
+          {% else %}
+            {{ none }}
+          {% endif %}
 
 script:
   hoejttaler_annoncer:
@@ -251,10 +282,10 @@ script:
   # spring-over-regler, plus: ingen besked i gang, og ingen musik der er sat
   # på pause inden for den sidste time (et klip tømmer MA-køen). Ingen 3 s
   # forsinkelse og ingen ventetid på en besked — et klip hører til ét øjeblik.
-  # Hvert klip fades ud (~1,2 s) før stop. Kører i DETTE script, så alle de
+  # Hvert klip fades ud (~1,2 s, glidende) før stop. Kører i DETTE script, så alle de
   # steder der undtager "vores egen MA-afspilning" (spil_sang on) også dækker klip.
   # Valgfrit pr. klip (2026-10-24, stemningens vind-sus): `fade` = s ind OG ud
-  # (lange stykker vind, op til 600 s), `ud` = s KUN ud, blødt i seks trin
+  # (lange stykker vind, op til 600 s), `ud` = s KUN ud, glidende
   # (stemningens korte lyde — MA toner selv ind over 3 s), `forsoeg` = 2 → ma_api.py starter en
   # hængende kø én gang til (kun klip uden fast øjeblik). Feltet `stop_ved` = en
   # entity: går den fra `on`, fades klippet ud straks (stemningen der slukker).
@@ -322,11 +353,16 @@ script:
           # IKKE binary_sensor.hoejttaler_spotify_aktiv: den undtager netop
           # dette script, mens det kører (= nu) → den ville sige "ingen Spotify"
           # og sangen afbrød en telefons Spotify via HA (09/10 16:42). Her har
-          # vi ikke spillet noget endnu, så MA-strøm i MPD = en andens musik.
+          # vi ikke spillet noget endnu, så MA-strøm i MPD = en andens musik —
+          # men kun mens Volumio spiller: scannerens 30-s-poll kan fange VORES
+          # netop slut-spillede klip og stå på 'ha' til næste poll, mens
+          # højttaleren er idle (31/10 17:34/17:39/17:43: festlys-halloween
+          # sprunget over 2-3 s efter forrige burst, hvert 4.-5. burst lydløst).
           spotify: >-
             {{ is_state('binary_sensor.spotify_bro_spiller', 'on')
                or state_attr('sensor.hoejttaler_spotify', 'myair') == true
-               or state_attr('sensor.hoejttaler_spotify', 'kilde') == 'ha' }}
+               or (state_attr('sensor.hoejttaler_spotify', 'kilde') == 'ha'
+                   and is_state('media_player.hoejttaler', 'playing')) }}
           stille: >-
             {{ is_state('binary_sensor.godnat_common_active', 'on')
                or is_state('input_boolean.godnat_boern_active', 'on')
@@ -477,23 +513,31 @@ script:
                         name: "Højttaler"
                         message: "Lydklip afbrudt — en telefon tog over med Spotify."
                     - stop: "Spotify tog over"
-                # Fade ud i tre trin (~1,2 s) — et klip der klippes hårdt af,
-                # lyder som en fejl, ikke som noget i huset. Med `fade` eller
-                # `ud`: seks trin på ~3-6 dB over så mange s (tre trin på 5-10 dB
-                # kan høres som hop).
+                # Fade ud (~1,2 s, med `fade`/`ud` så mange s) — et klip der
+                # klippes hårdt af, lyder som en fejl. Kurven er geometrisk
+                # (lige mange dB pr. tid) fra 0,85× til 0,03× og drives af
+                # URET: hvert trin sætter det niveau kurven har NU, så et
+                # langsomt kald ikke strækker fadet. Volumio tager et kald pr.
+                # ~0,1-0,14 s (målt 31/10) → ~20 trin på 2,5 s; seks faste trin
+                # på 3-8 dB hørtes som tydelige hak (user 31/10).
                 - variables:
-                    k_ud_s: "{{ k_fade if k_fade > 0 else k_ud }}"
+                    k_ud_s: "{{ [k_fade if k_fade > 0 else k_ud, 1.2] | max }}"
+                    k_ud_t0: "{{ now().timestamp() }}"
                 - repeat:
-                    for_each: "{{ [0.7, 0.5, 0.33, 0.2, 0.1, 0.04] if k_ud_s > 0 else [0.55, 0.25, 0.08] }}"
                     sequence:
                       - service: media_player.volume_set
                         continue_on_error: true
                         target:
                           entity_id: media_player.hoejttaler
                         data:
-                          volume_level: "{{ (vol_klip | float(0.2) * repeat.item) | round(3) }}"
+                          volume_level: >-
+                            {% set x = [(now().timestamp() - k_ud_t0 | float(0)) / k_ud_s | float(1.2), 1] | min %}
+                            {{ (vol_klip | float(0.2) * 0.85 * (0.03 / 0.85) ** x) | round(2) }}
                       - delay:
-                          milliseconds: "{{ (k_ud_s * 1000 / 6) | int if k_ud_s > 0 else 400 }}"
+                          milliseconds: 40
+                    until:
+                      - condition: template
+                        value_template: "{{ now().timestamp() - k_ud_t0 | float(0) >= k_ud_s | float(1.2) or repeat.index >= 150 }}"
                 - service: shell_command.hoejttaler_ma_stop
                   continue_on_error: true
           - if:
@@ -743,6 +787,43 @@ automation:
       - service: script.hoejttaler_annoncer
         data:
           besked: "Timeren er startet, {{ minutter }} {{ 'minut' if minutter | int(0) == 1 else 'minutter' }}"
+          sprog: "da"
+
+  # ---------------------------------------------------------------------------
+  # N sekunder før → "N sekunder tilbage af timeren" (2026-10-31, user-spec)
+  # ---------------------------------------------------------------------------
+  # Ikke `vigtig`: et varsel må ikke bryde godnat-stilheden; slut-beskeden gør.
+  - id: hoejttaler_koekken_timer_varsel
+    alias: "Højttaler: sig når køkken-timeren næsten er færdig"
+    mode: queued
+    max: 3
+    trigger:
+      - platform: time
+        at: sensor.koekken_timer_varsel_tid
+    condition:
+      - condition: state
+        entity_id: input_boolean.hoejttaler_timer_annoncering_enabled
+        state: "on"
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+      - condition: state
+        entity_id: binary_sensor.hoejttaler_online
+        state: "on"
+      - condition: state
+        entity_id: timer.koekken_gestus
+        state: "active"
+      # En timer der knap er længere end varslet: start-beskeden og varslet
+      # ville falde oven i hinanden → spring varslet over.
+      - condition: template
+        value_template: >-
+          {% set p = (state_attr('timer.koekken_gestus', 'duration') or '0:00:00') | string %}
+          {% set d = p.split(':') %}
+          {% set tot = ((d[0] | int(0)) * 3600 + (d[1] | int(0)) * 60 + (d[2] | default('0') | float(0))) if d | count == 3 else 0 %}
+          {{ tot >= (states('input_number.hoejttaler_timer_varsel_sekunder') | int(0)) + 15 }}
+    action:
+      - service: script.hoejttaler_annoncer
+        data:
+          besked: "{{ states('input_number.hoejttaler_timer_varsel_sekunder') | int(0) }} sekunder tilbage af timeren"
           sprog: "da"
 
   # ---------------------------------------------------------------------------

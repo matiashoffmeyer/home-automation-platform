@@ -204,6 +204,15 @@ input_datetime:
     name: "Roborock let stue-rengøring startet kl."
     has_date: true
     has_time: true
+  # 2026-10-31 (B248): sidste gang en HA-session blev lukket UDEN gennemført-
+  # stempel (stop_dock, fejl-vagten, spejder-aflys, hånd-lukning). Skrives ét
+  # sted (roborock_session_afbrudt_stamp); roborock_fremmed_clean_stamp afviser
+  # en rengørings-post der begyndte før stemplet = den afbrudte kørsel selv.
+  # Runtime → ude af helper-snapshottet, ligesom let_clean_at.
+  roborock_session_afbrudt_at:
+    name: "Roborock session afbrudt kl."
+    has_date: true
+    has_time: true
 
 script:
   # 2026-07-27 (user-spec): fælles "anvend forsigtig-mode"-helper. Sætter
@@ -1451,12 +1460,14 @@ automation:
     alias: "Roborock: session gennemført → stamp completed"
     mode: single
     trigger:
-      # Når robotten selv afslutter, går status cleaning → returning →
-      # charging/docked. Interrupt-flowet har ALLEREDE clearet session-flag,
-      # så condition session_active=on betyder "robotten blev selv færdig".
-      - platform: state
-        entity_id: sensor.s8_maxv_ultra_status
-        to: "returning"
+      # Når robotten selv afslutter, går status cleaning → returning_home →
+      # charging. Interrupt-flowet har ALLEREDE clearet session-flag, så
+      # condition session_active=on betyder "robotten blev selv færdig".
+      # Kun charging stempler: status-sensoren siger `returning_home`, aldrig
+      # `returning` (10 døgn 21-31/10: 36 × returning_home, 0 × returning) —
+      # den gamle `to: returning`-trigger fyrede aldrig og er fjernet (B248).
+      # NB charging-flanken kommer også efter en fastkørsel man har sendt hjem;
+      # den session er da lukket af roborock_session_fejl_afbryd.
       - platform: state
         entity_id: sensor.s8_maxv_ultra_status
         to: "charging"
@@ -1500,6 +1511,92 @@ automation:
           message: >-
             Session gennemført ({{ 'FULL' if was_full else 'QUICK' }}) —
             stamped completed for i dag.
+
+  # ---------------------------------------------------------------------------
+  # 3-fejl) Robotten sidder fast i ≥ 10 min → sessionen lukkes som afbrudt
+  # ---------------------------------------------------------------------------
+  # B248 (2026-10-31). session_completed tjekker kun fejlen i SELVE ladnings-
+  # sekundet, og en fastkørt robot man frigør og sender hjem lader uden fejl.
+  # Målt: 24/10 hovedbørste fast 14:07-17:24 (to episoder) → "gennemført"
+  # 17:27; 30/10 fast 12:08-13:48 → FULL gennemført 13:56 (aktiv-timer
+  # nulstillet efter 39 min clean); 22/10 9 t 37 min lukket i hånden.
+  # Skellet er målt på vacuum_error, 30 døgn: selv-rettende fejl varer 1-16 s
+  # (én wheels_suspended 7 min), fastkørsler 1 t 37 min - 9 t 37 min, og
+  # robotten opgiver selv efter 10 min (status error → charger_disconnected
+  # efter 9 min 59 s, 4/4) — derfor 10 min, og derfor vacuum_error og ikke
+  # status: den står stadig på fejlkoden når status er gået i dvale.
+  # Spejderturen ejer sin egen session (user-spec 22/10, "der må vi hjælpe
+  # den") → springes over. Lukningen stempler afbrudt via ankeret nedenfor.
+  - id: roborock_session_fejl_afbryd
+    alias: "Roborock: fast i ≥ 10 min → session lukkes som afbrudt"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: sensor.s8_maxv_ultra_vacuum_error
+        not_to: ["none", "ok", "unknown", "unavailable"]
+        for: "00:10:00"
+      # En HA-restart dræber den ventende for: (Permanente fakta). Efter boot
+      # er last_changed = boot → backstoppen venter 10 min mere, aldrig mindre.
+      - platform: time_pattern
+        minutes: "/10"
+    condition:
+      - condition: state
+        entity_id: input_boolean.roborock_session_active
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set s = states.sensor.s8_maxv_ultra_vacuum_error %}
+          {{ s is not none
+             and s.state not in ['none', 'ok', 'unknown', 'unavailable']
+             and (now() - s.last_changed).total_seconds() >= 600 }}
+      - condition: template
+        value_template: >-
+          {% set f = states('input_text.roborock_spejder_fase') %}
+          {{ not (f.startswith('spejd:') or f.startswith('fejl:')) }}
+    action:
+      - variables:
+          fejl: "{{ states('sensor.s8_maxv_ultra_vacuum_error') }}"
+          was_full: "{{ is_state('input_select.roborock_session_type', 'full') }}"
+      - service: input_boolean.turn_off
+        target: {entity_id: input_boolean.roborock_session_active}
+      - service: input_select.select_option
+        target: {entity_id: input_select.roborock_session_type}
+        data: {option: none}
+      - service: logbook.log
+        data:
+          name: "Roborock"
+          message: >-
+            Session afbrudt — robotten har siddet fast ({{ fejl }}) i over
+            10 min. {{ 'FULL' if was_full else 'QUICK' }}-kørslen tæller ikke
+            som gennemført, heller ikke når den bliver sendt hjem.
+
+  # ---------------------------------------------------------------------------
+  # 3-anker) Session lukket UDEN gennemført-stempel → stempl afbrudt
+  # ---------------------------------------------------------------------------
+  # B248 (2026-10-31). Ét anker for alle lukke-veje (stop_dock, fejl-vagten
+  # ovenfor, spejder-aflys, hånd-lukning i UI/REST) frem for et stempel i hver
+  # — de ville divergere (fejlklasse #2). session_completed skriver
+  # last_completed FØR den slukker flaget, så et stempel fra samme sekund =
+  # gennemført; alt andet = afbrudt. Forbruger: roborock_fremmed_clean_stamp.
+  - id: roborock_session_afbrudt_stamp
+    alias: "Roborock: session lukket uden gennemført → stempl afbrudt"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: input_boolean.roborock_session_active
+        from: "on"
+        to: "off"
+    condition:
+      - condition: template
+        value_template: >-
+          {% set t = state_attr('input_datetime.roborock_last_completed', 'timestamp') | float(0) %}
+          {{ now().timestamp() - t > 10 }}
+    action:
+      - service: input_datetime.set_datetime
+        target: {entity_id: input_datetime.roborock_session_afbrudt_at}
+        data:
+          timestamp: "{{ now().timestamp() | int }}"
 
   # ---------------------------------------------------------------------------
   # 3a2) DELVIS rengøring startet udefra → markér den som delvis
@@ -1560,12 +1657,11 @@ automation:
       vælger i tvivlstilfælde det grundige.
     mode: single
     trigger:
+      # (`to: returning` fjernet 2026-10-31, B248: status-sensoren siger
+      # `returning_home` — triggeren fyrede aldrig.)
       - platform: state
         entity_id: sensor.s8_maxv_ultra_status
         to: "charging"
-      - platform: state
-        entity_id: sensor.s8_maxv_ultra_status
-        to: "returning"
     condition:
       # HA startede den ikke (ellers ejer roborock_session_completed stemplet).
       - condition: state
@@ -1608,6 +1704,17 @@ automation:
              if ':' in states('input_text.roborock_spejder_fase') else 0 %}
           {% set b = as_timestamp(states('sensor.s8_maxv_ultra_last_clean_begin'), 0) %}
           {{ t0 <= 0 or b <= 0 or (b - t0) | abs >= 300 }}
+      # Ikke en HA-session vi selv lukkede som afbrudt (B248, 2026-10-31): dens
+      # post begyndte FØR afbrudt-stemplet. Målt 17/10: stop_dock 12:27:56
+      # ("ikke completed") → denne automation stemplede SAMME kørsel som
+      # fremmed rengøring 12:28:27. En app-kørsel startet efter en afbrydelse
+      # begynder efter stemplet og tæller som før. (Posten bærer robottens
+      # oprindelige start også efter et genoptag midt i turen — målt 24/10.)
+      - condition: template
+        value_template: >-
+          {% set a = state_attr('input_datetime.roborock_session_afbrudt_at', 'timestamp') | float(0) %}
+          {% set b = as_timestamp(states('sensor.s8_maxv_ultra_last_clean_begin'), 0) %}
+          {{ a <= 86400 or b <= 0 or b > a }}
       # Kun ét stempel pr. rengøring: slut-tiden skal være nyere end stemplet.
       - condition: template
         value_template: >-

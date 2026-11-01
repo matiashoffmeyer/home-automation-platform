@@ -31,6 +31,7 @@ NOT_IN_CI = {
     ),
     "ha_validate.py --check refs": "needs the running Home Assistant's entity registry",
     "ha_validate.py --check stale_whitelist": "needs the running Home Assistant",
+    "ha_offline.py pin": "compares the pin with the version the house runs, which CI cannot see",
 }
 
 _INVOCATION = re.compile(r"\bpython3\s+(?:\S*/)?scripts/(\w+\.py)((?:[ \t]+[^\s|;&)]+)*)")

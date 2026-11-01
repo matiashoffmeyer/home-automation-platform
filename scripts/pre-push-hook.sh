@@ -45,6 +45,16 @@ if [ -f scripts/helpers_export.py ] && [ -f config_snapshots/helper_values.yaml 
     fi
 fi
 
+# === Pin = prod: offline-tjekket skal køre mod den core huset KØRER (2026-10-31) ===
+# 29-31/10 validerede hooken nedenfor mod 2026.9.2, mens huset kørte 2026.10.4 —
+# filen er hånd-holdt, og ingen opdagede det. Hurtig (intet venv); springer over
+# hvis husets version ikke kan ses herfra (PC uden token, CI).
+if [ -f scripts/ha_offline.py ] && ! python3 scripts/ha_offline.py pin --check; then
+    echo "❌ PUSH BLOKERET: offline-tjekkets HA-version ≠ husets (se ovenfor)." >&2
+    echo "   Skip (kun hvis du VED hvorfor):  git push --no-verify" >&2
+    exit 1
+fi
+
 # === Offline: HA's EGEN validator (konsolidering 2026-10-04) ===
 # Fanger fejlklasse #22 (validerings-fejlet = stum automation) og "én ugyldig
 # sensor dræber hele template:-blokken" FØR deploy — uden HA, uden netværk.

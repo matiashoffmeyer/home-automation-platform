@@ -36,6 +36,49 @@ input_number:
     step: 1
     mode: slider
 
+  # 2026-10-31 (user: "tiltag der sparer lidt mere … slider så jeg kan styre
+  # aggressiviteten"): hvor meget NETTARIFFEN tæller i dæmpningen.
+  #   0   = kun spotprisen mod spot-30d-snittet (adfærden før 31/10)
+  #   100 = den pris vi faktisk betaler (all-in) mod all-in-30d-snittet
+  # Spot alene ser ikke spidslasten: tariffen er 0,96 kr kl. 17-21 mod 0,32 /
+  # 0,11 resten af døgnet. Målt 1/10-31/10 (all-in, timesnit): 17-20 = 3,23-3,50
+  # kr mod 30d-snit 2,12 (+52-65 %), mens spot-ratioen kun løfter ~+40 %. Og
+  # 17-21 er 52 % af lysets kroner (0,61 af 1,18 kr/døgn, sensor.lys_estimat_
+  # effekt × all-in). Default 100: ved elpris_paavirkning 34 dæmper spidslasten
+  # ~13 % (før ~8 %); morgenen 7-9 (+11-15 %) ~3 %; natten/middag intet.
+  # Luksus-blokken (packages/luksus_lys.yaml) læser BEVIDST stadig kun spot —
+  # all-in ville blokere børne-natlyset hver eneste aften kl. 17-21.
+  elpris_spidslast_vaegt:
+    name: "Nettarif i lys-dæmpning"
+    icon: mdi:transmission-tower-export
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+
+  # RUNTIME (helpers_export.py RUNTIME_NUMBERS): engangs-korrektion af det
+  # historiske lys-regnskab, sat 31/10. Frisk install = 0.
+  lys_besparelse_korrektion:
+    name: "Lys-besparelse: historisk korrektion"
+    icon: mdi:calculator-variant
+    min: 0
+    max: 1000
+    step: 0.0001
+    unit_of_measurement: "kr"
+    mode: box
+
+  # RUNTIME (B279, 2026-10-31): den pris-faktor de tændte auto-lys senest blev
+  # skaleret til. Skrives KUN af elpris_daemp_taendte_lys — ikke konfiguration
+  # (helpers_export.py RUNTIME_NUMBERS).
+  elpris_pf_anvendt:
+    name: "El-pris: faktor tændte lys står på"
+    icon: mdi:brightness-percent
+    min: 0.3
+    max: 1
+    step: 0.001
+    mode: box
+
 template:
   - sensor:
       # --- Aktuel spot-pris (indirektion til Nord Pool core-entiteten) --------
@@ -57,6 +100,8 @@ template:
       # --- Pris-dæmpnings-faktor (0.40 .. 1.0; 1.0 = ingen dæmpning) ----------
       # k = slider/100. x = hvor langt timen er over 30d-gns (0 ved/under gns,
       # 1 ved ≥2× gns). dæmpning = k·x·0.60 → gulv 0.40 ved k=1, x=1.
+      # 2026-10-31: x blandes af spot- og all-in-ratioen efter
+      # elpris_spidslast_vaegt (w). Mangler all-in-snittet, bruges spot alene.
       - name: "Elpris dim factor"
         unique_id: elpris_dim_factor
         icon: mdi:brightness-percent
@@ -67,7 +112,16 @@ template:
           {% if k <= 0 or p < -100 or avg <= 0 %}
             1.0
           {% else %}
-            {% set x = [[(p - avg) / avg, 0] | max, 1] | min %}
+            {% set xs = [[(p - avg) / avg, 0] | max, 1] | min %}
+            {% set w = (states('input_number.elpris_spidslast_vaegt') | float(0)) / 100 %}
+            {% set a = states('sensor.elpris_allin_aktuel') | float(0) %}
+            {% set aavg = states('sensor.elpris_allin_30d_gns') | float(0) %}
+            {% if a > 0 and aavg > 0 %}
+              {% set xa = [[(a - aavg) / aavg, 0] | max, 1] | min %}
+            {% else %}
+              {% set w = 0 %}{% set xa = 0 %}
+            {% endif %}
+            {% set x = (1 - w) * xs + w * xa %}
             {{ (1.0 - k * x * 0.60) | round(3) }}
           {% endif %}
 
@@ -96,10 +150,34 @@ template:
         unique_id: lys_kost_rate_baseline
         unit_of_measurement: "kr/h"
         icon: mdi:cash-clock
+        # 2026-10-31 (B279): kun lys pris-faktoren faktisk RAMMER divideres med
+        # pf. Før blev hele effekten divideret — også sofa-hyggelampen (onoff,
+        # målt ~104 Wh/døgn), spisestue-loftet (rå %, user-spec 10/7), sove-
+        # loftet/-kæden og børne-natlyset, som aldrig dæmpes → kroner der aldrig
+        # blev sparet. Watt pr. lys = samme model som sensor.lys_estimat_effekt.
         state: >-
           {% set pf = states('sensor.elpris_dim_factor') | float(1.0) %}
-          {{ ((states('sensor.lys_kost_rate_faktisk') | float(0))
-              / (pf if pf > 0.05 else 1.0)) | round(4) }}
+          {% set pf = pf if pf > 0.05 else 1.0 %}
+          {% set total = states('sensor.lys_estimat_effekt') | float(0) %}
+          {% set kort = state_attr('sensor.lys_watt_kort', 'watt') or {} %}
+          {% set ns = namespace(w=0) %}
+          {% for e in ['light.spisestue_loft', 'light.spisestue_pendel',
+                       'light.boernevaerelse_hygge_strip'] %}
+            {% if is_state(e, 'on') %}
+              {% set b = state_attr(e, 'brightness') %}
+              {% set ns.w = ns.w + (kort.get(e, 0) | float(0))
+                                   * ((b / 255) if b is number else 1) %}
+            {% endif %}
+          {% endfor %}
+          {% if is_state('light.stue_plug', 'on') %}
+            {% set ns.w = ns.w + states('sensor.stue_plug_power') | float(0) %}
+          {% endif %}
+          {% if is_state('light.sove_lyskaede', 'on') %}
+            {% set ns.w = ns.w + states('sensor.sove_lyskaede_power') | float(0) %}
+          {% endif %}
+          {% set daempbar = [total - ns.w, 0] | max %}
+          {{ ((total + daempbar * (1 / pf - 1)) / 1000
+              * (states('sensor.elpris_allin_aktuel') | float(2.5))) | round(4) }}
 
       # --- Dagens besparelse (baseline − faktisk, kr) ------------------------
       - name: "Lys besparelse i dag"
@@ -131,9 +209,15 @@ template:
         # total tillader op/ned uden reset-antagelse.
         state_class: total
         icon: mdi:piggy-bank
+        # 2026-10-31 (el-audit, user: "ret retrospektivt"): minus en engangs-
+        # korrektion — baselinen talte dæmpning der aldrig skete (B279). Målt
+        # 2/10-31/10: højst ~35 % af de bogførte kroner var reelle (læselampe,
+        # køkken-kæde og stue-spots med pf ved tænding; alt andet blev ikke
+        # dæmpet). LTS-historikken er omskrevet med samme faktor.
         state: >-
           {{ [ (states('sensor.lys_kost_baseline_total') | float(0))
-               - (states('sensor.lys_kost_faktisk_total') | float(0)), 0 ] | max | round(4) }}
+               - (states('sensor.lys_kost_faktisk_total') | float(0))
+               - (states('input_number.lys_besparelse_korrektion') | float(0)), 0 ] | max | round(4) }}
 
       # --- SAMLET BESPARELSE: lys + cykel-lader + luksus-blok + robot-lader --
       # 2026-07-29e: "det skal tælle med i opgørelsen over hvor meget strøm vi
@@ -210,6 +294,17 @@ sensor:
       days: 30
     sampling_size: 5000
 
+  # 2026-10-31: all-in-modstykket til elspot_30d_gns (nævner for spidslast-
+  # vægten i elpris_dim_factor). all-in skifter ~1×/t → ~970 samples/30 d.
+  - platform: statistics
+    name: "Elpris allin 30d gns"
+    unique_id: elpris_allin_30d_gns
+    entity_id: sensor.elpris_allin_aktuel
+    state_characteristic: mean
+    max_age:
+      days: 30
+    sampling_size: 5000
+
   # --- Riemann-integration af kost-rates (kr/h) → akkumuleret kr -------------
   - platform: integration
     name: "Lys kost faktisk total"
@@ -243,3 +338,50 @@ utility_meter:
   # og lagde den genvundne værdi til igen → ~37× oppustet dags-besparelse (1,18
   # vs reelt 0,03 kr). Grafen peger nu i st.f. på sensor.lys_besparelse_i_dag
   # (forskel mellem to RENE dags-meters, state_class total).
+
+# =============================================================================
+# B279 (2026-10-31): pris-skiftet skal også nå lys der ALLEREDE lyser
+# =============================================================================
+# Pris-faktoren blev kun lagt på i det sekund et lys TÆNDTE. Aftenlyset tænder
+# ~16:30 (faktor ≈ 1), så 17-21-spidslasten blev aldrig dæmpet. Her skaleres de
+# tændte auto-lys med ny/anvendt faktor via det delte script (samme roster og
+# gates som skyder-trækket i global_tuning.yaml).
+# HYSTERESE 0,03: faktoren skifter hvert kvarter (spot er kvarters-pris, ~105
+# samples/døgn målt 1/10-31/10) → uden den én Thread-/Zigbee-runde pr. kvarter.
+# Lys tændt siden sidste skalering bærer allerede den nye faktor; fejlen ved at
+# skalere dem igen er < hysteresen. Køkken-lyskæden har sin egen mål-sensor og
+# følger IKKE med (bevidst, packages/koekken_lyskaede.yaml ~1768).
+automation:
+  - id: elpris_daemp_taendte_lys
+    alias: "El-pris: skalér tændte auto-lys når pris-faktoren flytter sig"
+    mode: queued
+    max: 3
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: sensor.elpris_dim_factor
+    condition:
+      - condition: template
+        value_template: >-
+          {% set ny = trigger.to_state.state | float(-1) if trigger.to_state else -1 %}
+          {% set gl = states('input_number.elpris_pf_anvendt') | float(1.0) %}
+          {{ 0.05 < ny <= 1.0 and (ny - gl) | abs >= 0.03 }}
+    action:
+      - variables:
+          ny: "{{ trigger.to_state.state | float(1.0) }}"
+          gl: "{{ [states('input_number.elpris_pf_anvendt') | float(1.0), 0.05] | max }}"
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.elpris_pf_anvendt
+        data:
+          value: "{{ ny }}"
+      # Faktoren kan ikke komme under 0,40 (k·x·0,60 ≤ 0,60) → et anvendt-tal
+      # derunder er en frisk helper på sit min, ikke en skalering. Gem kun.
+      - condition: template
+        value_template: "{{ gl >= 0.39 }}"
+      - action: script.lys_omskaler_taendte
+        continue_on_error: true
+        data:
+          r: "{{ ny / gl }}"
+          kilde: "El-pris-dæmpning"
+          aarsag: "pris-faktor {{ gl }} → {{ ny }}"

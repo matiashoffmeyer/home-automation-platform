@@ -1,0 +1,260 @@
+# =============================================================================
+# Projektor-rum — gæt rummet, spørg begge telefoner, ret mørklægningen (B281)
+# =============================================================================
+# User-spec 2026-11-01: "chromecast følger altid projektoren. du skal vælge most
+# likely room og sende en notifikation til os begge på tlf med valg: Korrekt,
+# X rum, Y rum hvor x og y er de rum du ikke gætter på. most likely rum skal
+# tage mange ting i overvejelse."
+#
+# HVORFOR: 31/10 20:05-22:15 kørte filmen i stuen (cast til Chromecasten i
+# projektorens HDMI), mens mørklægnings-stigen stod på 'sove': sove-radaren
+# holdt optaget fra før 19:30 til 20:51 på B269's radiator-signatur (~210-219
+# cm), og børneværelset var optaget til ~20:15 (putte-tid). Stuens radar var
+# kun optaget 12 % af filmen (stille seere), sove 35 %. Ingen presence-regel
+# kan se hvor projektoren står → huset gætter med flere signaler OG spørger.
+#
+# GÆTTET: custom_templates/projektor_rum.jinja (point()/gaet()) — det sidst
+# kendte rum vægter tungest, så et svar her flytter næste films gæt.
+# sensor.moerklaegning_scope_rum (packages/dark_mode.yaml) ER gættet; når der er
+# svaret under den igangværende session, er den svaret.
+#
+# SPØRG: ved hver projektor-session (projektor_aktiv off→on) i familie-modes →
+# push til begge (script.push_notify, notif_id projektor_rum) med knapperne
+# "Korrekt" + de to andre rum. Intet gæt (alle point 0) → tre rum-knapper.
+# Ikke igen hvis samme rum blev bekræftet < 6 t siden (film genstartet).
+# AirBnB: ingen push (telefonen kan være hos gæsten; ingen _airbnb-toggle) —
+# gættet virker stadig for pre-dark.
+#
+# SVAR: input_select.projektor_rum + stempel, facit i
+# ai_feedback/projektor_rum_feedback.jsonl, og ved en RETTELSE mens filmen
+# kører: Dark Mode genstartes (OFF → ON), så ON-grenen tager det rigtige rum med
+# kun_sove/cinema_active rigtigt sat, og OFF-grenen har sluppet det forkerte rum
+# (rum → Auto, gardiner genåbnet i dagslys). Kører kun pre-dark, flyttes dens
+# rum-scope. Kører ingen af dem (gættet var tomt), startes Dark Mode som
+# projektor-styreren ville have gjort.
+# =============================================================================
+
+input_select:
+  # Hvor projektoren stod sidst. Runtime-state (ikke i snapshottet): sættes af
+  # gættet ved hver session og af telefon-svaret. Uden initial: (restore).
+  projektor_rum:
+    name: "Projektor: står i"
+    options:
+      - ukendt
+      - stue
+      - sove
+      - boern
+    icon: mdi:projector
+
+input_datetime:
+  projektor_rum_bekraeftet:
+    name: "Projektor: rum bekræftet"
+    has_date: true
+    has_time: true
+    icon: mdi:check-decagram
+
+input_text:
+  # "<rum>|<epoch>" for sessionens gæt — svar-handleren afgør Korrekt/rettelse
+  # mod DETTE, ikke mod et live gæt der kan have flyttet sig siden.
+  projektor_rum_gaet:
+    name: "Projektor: sessionens gæt"
+    max: 60
+    icon: mdi:help-circle-outline
+
+automation:
+  - id: projektor_rum_spoerg
+    alias: "Projektor-rum: gæt og spørg begge telefoner"
+    mode: queued
+    max: 2
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.projektor_aktiv
+        from: "off"
+        to: "on"
+    condition:
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    action:
+      - variables:
+          # Samme værdi som Dark Mode/pre-dark læser på samme flanke.
+          gaet: "{{ states('sensor.moerklaegning_scope_rum') }}"
+          prior: "{{ states('input_select.projektor_rum') }}"
+          point: >-
+            {% from 'projektor_rum.jinja' import point %}{{ point() | from_json }}
+          grunde: >-
+            {% set m = point | selectattr('0', 'eq', gaet) | list %}
+            {{ m[0][2] if m and m[0][2] else '' }}
+          bek_alder: >-
+            {{ (now().timestamp()
+                - (state_attr('input_datetime.projektor_rum_bekraeftet', 'timestamp') | float(0))) | int }}
+          navn: >-
+            {{ {'sove': 'Soveværelset', 'boern': 'Børneværelset', 'stue': 'Stuen'} }}
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.projektor_rum_gaet
+        data:
+          value: "{{ gaet }}|{{ now().timestamp() | int }}"
+      # Gættet er det nye "sidst kendte" — et svar overskriver det.
+      - if:
+          - condition: template
+            value_template: "{{ gaet in ['stue', 'sove', 'boern'] }}"
+        then:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.projektor_rum
+            data:
+              option: "{{ gaet }}"
+      - service: shell_command.ai_feedback_append
+        continue_on_error: true
+        data:
+          log_slug: projektor_rum
+          payload_b64: >-
+            {{ {'ts': now().isoformat(), 'type': 'gaet', 'gaet': gaet,
+                'prior': prior, 'point': point,
+                'cast': 'chromecast' if is_state('binary_sensor.projektor_chromecast_aktiv', 'on')
+                        else 'projektor'} | to_json | base64_encode }}
+      # Samme rum bekræftet for nylig (filmen genstartet) → spørg ikke igen.
+      - condition: template
+        value_template: "{{ not (gaet == prior and bek_alder < 6 * 3600) }}"
+      - service: script.push_notify
+        data:
+          notif_id: projektor_rum
+          title: >-
+            🎬 {{ ('Film i ' ~ navn[gaet].lower() ~ '?') if gaet in navn else 'Hvor ser I film?' }}
+          message: >-
+            {% if gaet in navn %}Mørklægger {{ navn[gaet].lower() }}{{ (' (' ~ grunde ~ ')') if grunde else '' }}. Forkert rum? Tryk det rigtige.
+            {% else %}Huset kunne ikke se hvor projektoren står — tryk rummet, så mørklægges det.{% endif %}
+          payload:
+            tag: projektor_rum
+            actions: >-
+              {% set ns = namespace(a=[]) %}
+              {% if gaet in navn %}
+              {% set ns.a = [{'action': 'PROJEKTOR_RUM_OK', 'title': 'Korrekt'}] %}
+              {% endif %}
+              {% for r in ['stue', 'sove', 'boern'] if r != gaet %}
+              {% set ns.a = ns.a + [{'action': 'PROJEKTOR_RUM_' ~ r, 'title': navn[r]}] %}
+              {% endfor %}
+              {{ ns.a }}
+
+  - id: projektor_rum_svar
+    alias: "Projektor-rum: svar fra telefonen"
+    mode: queued
+    max: 4
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    condition:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default('')) in
+             ['PROJEKTOR_RUM_OK', 'PROJEKTOR_RUM_stue', 'PROJEKTOR_RUM_sove', 'PROJEKTOR_RUM_boern'] }}
+    action:
+      - variables:
+          gaet: "{{ states('input_text.projektor_rum_gaet').split('|')[0] }}"
+          svar: "{{ trigger.event.data.action | replace('PROJEKTOR_RUM_', '') }}"
+          rum: "{{ gaet if svar == 'OK' else svar }}"
+          rettelse: "{{ svar != 'OK' and svar != gaet }}"
+          film: "{{ is_state('binary_sensor.projektor_aktiv', 'on') }}"
+      # Et OK på et tomt gæt kan ikke ske (knappen sendes ikke), men et gammelt
+      # varsel kan svares efter et nyt gæt — så kræv et gyldigt rum.
+      - condition: template
+        value_template: "{{ rum in ['stue', 'sove', 'boern'] }}"
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.projektor_rum
+        data:
+          option: "{{ rum }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.projektor_rum_bekraeftet
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - service: shell_command.ai_feedback_append
+        continue_on_error: true
+        data:
+          log_slug: projektor_rum
+          payload_b64: >-
+            {{ {'ts': now().isoformat(), 'type': 'svar', 'gaet': gaet, 'svar': rum,
+                'rettelse': rettelse, 'film_koerer': film} | to_json | base64_encode }}
+      # Svaret er nu sessionens gæt: trykker den anden telefon det samme rum
+      # bagefter, er det et Korrekt og genstarter ikke Dark Mode igen.
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.projektor_rum_gaet
+        data:
+          value: "{{ rum }}|{{ now().timestamp() | int }}"
+      # Tag varslet af BEGGE telefoner — den anden skal ikke svare igen.
+      - repeat:
+          for_each:
+            - mobile_app_phone_a
+            - mobile_app_phone_b
+          sequence:
+            - service: "notify.{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                message: clear_notification
+                data:
+                  tag: projektor_rum
+      - service: logbook.log
+        data:
+          name: "Projektor-rum"
+          message: >-
+            {{ 'Rettet fra telefonen: ' ~ (gaet or 'intet gæt') ~ ' → ' ~ rum if rettelse
+               else 'Bekræftet fra telefonen: ' ~ rum }}
+          entity_id: input_select.projektor_rum
+      - condition: template
+        value_template: "{{ rettelse and film }}"
+      - choose:
+          # Dark Mode-session → genstart den, så ON-grenen læser svaret.
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.dark_mode
+                state: "on"
+              - condition: state
+                entity_id: input_boolean.dark_mode_projektor_session
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.dark_mode
+              - wait_template: "{{ is_state('input_boolean.cinema_active', 'off') }}"
+                timeout:
+                  seconds: 20
+                continue_on_timeout: true
+              - delay:
+                  seconds: 2
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.dark_mode
+          # Kun pre-dark → flyt dens rum-scope (gates følger input_text'en).
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.predark_active
+                state: "on"
+              - condition: state
+                entity_id: input_boolean.dark_mode
+                state: "off"
+            sequence:
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.predark_rooms
+                data:
+                  value: "{{ rum }}"
+          # Intet kørte (tomt gæt) → start Dark Mode som projektor-styreren
+          # ville (dark_mode_projektor_styrer: samme betingelser).
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.dark_mode
+                state: "off"
+              - condition: state
+                entity_id: input_boolean.dark_mode_ved_projektor
+                state: "on"
+              - condition: state
+                entity_id: input_boolean.godnat_active
+                state: "off"
+              - condition: template
+                value_template: "{{ not is_state('input_select.house_mode', 'AirBnB') }}"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.dark_mode
