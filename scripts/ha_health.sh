@@ -20,7 +20,7 @@
 #   ./scripts/ha_health.sh nuc          # the NUC's health: SMART, wear window,
 #                                       #   writes per day, temperature (B272)
 #   ./scripts/ha_health.sh log [n]      # the last n lines of the core log (200)
-#   ./scripts/ha_health.sh flags|lights|noisy|zha|docs|backup|sys
+#   ./scripts/ha_health.sh flags|flipflop|lights|noisy|zha|docs|backup|sys
 
 set -uo pipefail
 API="http://supervisor/core/api"
@@ -198,7 +198,7 @@ for age,n in sorted(rows,reverse=True):
 
 check_lights() {
   hdr "Lys taendt af automations seneste 24 t"
-  local start; start=$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%S')
+  local start; start=$(date -u -d "@$(( $(date +%s) - 86400 ))" '+%Y-%m-%dT%H:%M:%SZ')
   api "logbook/$start" | python3 -c '
 import json,sys,collections
 try: ev=json.load(sys.stdin)
@@ -289,6 +289,28 @@ print("  DB-flag nu: %s (sættes 03:00) · DB-backup på alle placeringer: %s" %
 for a in d["agent_fejl"]: print("  FEJL: %s svarer ikke" % a)
 '
 }
+check_flipflop() {
+  # Fejlklasse #29: en tilstand der ryddes og sættes igen inden for få minutter
+  # er to automatik-veje der overskriver hinanden — typisk en soak/backstop der
+  # tæller tid fra FØR clear'et (2026-11-02: godmorgen-clear 05:39, auto-godnat
+  # 05:45 → open plan kulsort). Kører over 7 døgn; hit = læs `hq.py who <flag>`.
+  hdr "Flip-flop: tilstands-flag sat igen < 30 min efter clear (7 døgn)"
+  local start end; start=$(date -u -d "@$(( $(date +%s) - 7*86400 ))" '+%Y-%m-%dT%H:%M:%SZ'); end=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  local ids="input_boolean.godnat_active,input_boolean.godnat_voksne_active,input_boolean.godnat_boern_active,input_boolean.putning_sove_active,input_boolean.sleepover_i_nat,input_boolean.kalde_active,input_boolean.open_plan_fuldt_lys"
+  api "history/period/$start?end_time=$end&filter_entity_id=$ids&minimal_response&no_attributes" | python3 -c '
+import json,sys,datetime
+from zoneinfo import ZoneInfo
+tz=ZoneInfo("Europe/Copenhagen"); n=0
+for rows in json.load(sys.stdin):
+    eid=rows[0]["entity_id"] if rows else "?"
+    seq=[(r["state"],datetime.datetime.fromisoformat(r["last_changed"])) for r in rows if r["state"] in ("on","off")]
+    for (a,_),(b,tb),(c,tc) in zip(seq,seq[1:],seq[2:]):
+        if a=="on" and b=="off" and c=="on" and (tc-tb).total_seconds()<1800:
+            n+=1; print(f"  {eid}: off {tb.astimezone(tz):%m-%d %H:%M} → on igen {tc.astimezone(tz):%H:%M} ({(tc-tb).total_seconds()/60:.0f} min)")
+print(f"  {n} flip-flop(s)" + ("" if n else " — rent"))
+'
+}
+
 check_sys()    { hdr "Ressourcer"; free -h | head -2; df -h /config | tail -1; uptime; }
 
 case "${1:-all}" in
@@ -303,8 +325,9 @@ case "${1:-all}" in
   docs)   check_docs ;;
   backup) check_backup ;;
   sys)    check_sys ;;
+  flipflop) check_flipflop ;;
   nuc)    check_nuc ;;
   log)    curl -s -m 30 "${AUTH[@]}" "http://supervisor/core/logs?lines=${2:-200}" ;;
-  all)    check_deploy; check_blind; check_kamera; check_people; check_flags; check_lights; check_noisy; check_zha; check_docs; check_backup; check_sys; check_nuc ;;
+  all)    check_deploy; check_blind; check_kamera; check_people; check_flags; check_flipflop; check_lights; check_noisy; check_zha; check_docs; check_backup; check_sys; check_nuc ;;
   *)      sed -n '2,20p' "$0"; exit 1 ;;
 esac

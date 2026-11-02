@@ -6,7 +6,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ## Indhold
 - [Automations](boernevaerelse.md#automations) (26)
-- [Entities](boernevaerelse.md#entities) (173)
+- [Entities](boernevaerelse.md#entities) (176)
 - [Helpers](boernevaerelse.md#helpers) (51)
 
 ---
@@ -78,9 +78,9 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/presence_lights.yaml`
 
-- **Lysnet: Børneværelse tænd ved LUX-fald** (line 622, mode=single)
+- **Lysnet: Børneværelse tænd ved LUX-fald** (line 628, mode=single)
   - Daylight fades while børneværelse occupied — gentle light for kids.
-- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1100, mode=single)
+- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1106, mode=single)
   - Dagslys tilbage i børneværelset mens loftet står tændt — blid fade off.
 
 ### `automations/putning_auto_detect.yaml`
@@ -107,7 +107,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `automation.klima_bornevaerelse_for_koldt` — 2 refs in 1 file(s)
 - `automation.lysnet_bornevaerelse_gradvis_sluk` — 2 refs in 1 file(s)
 - `automation.lysnet_bornevaerelse_sluk_ved_lux_stigning` — 3 refs in 2 file(s)
-- `automation.lysnet_bornevaerelse_taend` — 3 refs in 2 file(s)
+- `automation.lysnet_bornevaerelse_taend` — 4 refs in 3 file(s)
 - `automation.lysnet_bornevaerelse_taend_ved_lux_fald` — 2 refs in 1 file(s)
 
 ### `binary_sensor.*`
@@ -116,23 +116,23 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `binary_sensor.boern_putte_zone_aktiv` — 4 refs in 3 file(s)
 - `binary_sensor.boern_set_i_eftermiddag` — 6 refs in 2 file(s)
 - `binary_sensor.boernevaerelse_any_lys` — 2 refs in 2 file(s)
-- `binary_sensor.boernevaerelse_apollo_occupancy` — 123 refs in 46 file(s)
+- `binary_sensor.boernevaerelse_apollo_occupancy` — 124 refs in 47 file(s)
 - `binary_sensor.boernevaerelse_apollo_online` — 1 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_moving_target` — 12 refs in 10 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_still_target` — 4 refs in 3 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_zone_1_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_zone_2_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_zone_3_occupancy` — 1 refs in 1 file(s)
-- `binary_sensor.boernevaerelse_bevaegelse_frisk` — 4 refs in 3 file(s)
+- `binary_sensor.boernevaerelse_bevaegelse_frisk` — 5 refs in 4 file(s)
 - `binary_sensor.boernevaerelse_lys_on_effektiv` — 1 refs in 1 file(s)
-- `binary_sensor.boernevaerelse_morgen_beskyttelse_aktiv` — 8 refs in 5 file(s)
-- `binary_sensor.boernevaerelse_morgen_bevaegelse` — 1 refs in 1 file(s)
+- `binary_sensor.boernevaerelse_morgen_beskyttelse_aktiv` — 9 refs in 6 file(s)
+- `binary_sensor.boernevaerelse_morgen_bevaegelse` — 2 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_morgen_vindue` — 3 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_solo_bevis` — 7 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_vaekning_bevaegelse` — 1 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_vaekning_hold` — 5 refs in 4 file(s)
 - `binary_sensor.boernevaerelse_vaekning_koert_i_dag` — 2 refs in 1 file(s)
-- `binary_sensor.dark_mode_boern` — 4 refs in 4 file(s)
+- `binary_sensor.dark_mode_boern` — 5 refs in 5 file(s)
 - `binary_sensor.filmmoerke_boern` — 8 refs in 6 file(s)
 - `binary_sensor.mood_pause_boernevaerelse` — 2 refs in 1 file(s)
 
@@ -155,10 +155,10 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `input_boolean.boern_morgen_nedtoning_aktiv` — 22 refs in 5 file(s)
 - `input_boolean.boern_sov_her_i_nat` — 25 refs in 9 file(s)
 - `input_boolean.boernevaerelse_gaest_sover` — 20 refs in 7 file(s)
-- `input_boolean.boernevaerelse_manual_off_lock` — 47 refs in 15 file(s)
+- `input_boolean.boernevaerelse_manual_off_lock` — 48 refs in 15 file(s)
 - `input_boolean.dance_room_boern` — 15 refs in 7 file(s)
 - `input_boolean.festlys_boern_styrbar` — 8 refs in 3 file(s)
-- `input_boolean.godnat_boern_active` — 99 refs in 42 file(s)
+- `input_boolean.godnat_boern_active` — 100 refs in 42 file(s)
 - `input_boolean.koekken_lav_krop_boern_enabled` — 3 refs in 3 file(s)
 - `input_boolean.people_boern_set_efter_doer` — 12 refs in 2 file(s)
 - `input_boolean.roborock_styrbar_kort_op_boernevaerelse` — 1 refs in 1 file(s)
@@ -186,6 +186,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `input_number.boern_eftermiddag_bevis_min` — 2 refs in 2 file(s)
 - `input_number.boern_eftermiddag_fra_time` — 5 refs in 2 file(s)
 - `input_number.boern_eftermiddag_tjek_min_foer` — 2 refs in 2 file(s)
+- `input_number.boern_morgen_bevaegelse_akkum_sekunder` — 4 refs in 3 file(s)
 - `input_number.boern_morgen_bevaegelse_sekunder` — 7 refs in 4 file(s)
 - `input_number.boern_morgen_nedtoning_minutter` — 4 refs in 3 file(s)
 - `input_number.boern_morgen_nedtoning_stilhed_sek` — 6 refs in 3 file(s)
@@ -245,7 +246,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `light.boernevaerelse_all` — 19 refs in 10 file(s)
 - `light.boernevaerelse_apollo_rgb_light` — 5 refs in 5 file(s)
-- `light.boernevaerelse_hygge_strip` — 90 refs in 32 file(s)
+- `light.boernevaerelse_hygge_strip` — 92 refs in 33 file(s)
 - `light.boernevaerelse_hyggelys` — 53 refs in 21 file(s)
 - `light.boernevaerelse_lampe` — 44 refs in 20 file(s)
 - `light.boernevaerelse_loft` — 95 refs in 37 file(s)
@@ -270,7 +271,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `script.boern_ankomst_spoerg` — 5 refs in 2 file(s)
 - `script.boern_morgen_nedtoning_rampe` — 7 refs in 3 file(s)
-- `script.boern_natlys_set` — 6 refs in 4 file(s)
+- `script.boern_natlys_set` — 7 refs in 5 file(s)
 - `script.boernevaerelse_apollo_apply_all_gates` — 1 refs in 1 file(s)
 - `script.festlys_boern_slut` — 3 refs in 2 file(s)
 - `script.roborock_grundig_boernevaerelse` — 1 refs in 1 file(s)
@@ -296,11 +297,13 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `sensor.boernevaerelse_apollo_radar_still_distance` — 5 refs in 4 file(s)
 - `sensor.boernevaerelse_apollo_radar_still_energy` — 1 refs in 1 file(s)
 - `sensor.boernevaerelse_apollo_temperature` — 3 refs in 2 file(s)
+- `sensor.boernevaerelse_apollo_uptime` — 2 refs in 1 file(s)
 - `sensor.boernevaerelse_auto_lys_pct` — 2 refs in 2 file(s)
 - `sensor.boernevaerelse_dagslys_sluk_effektiv` — 10 refs in 4 file(s)
 - `sensor.boernevaerelse_lux_reel` — 16 refs in 8 file(s)
 - `sensor.boernevaerelse_lys_on_idag` — 8 refs in 2 file(s)
 - `sensor.boernevaerelse_lys_timer_dag` — 1 refs in 1 file(s)
+- `sensor.boernevaerelse_morgen_bevaegelse_akkum` — 3 refs in 1 file(s)
 - `sensor.boernevaerelse_morgen_bevaegelse_recent` — 3 refs in 1 file(s)
 - `sensor.boernevaerelse_morgen_lux_gate` — 1 refs in 1 file(s)
 - `sensor.boernevaerelse_styrbar_battery` — 10 refs in 6 file(s)

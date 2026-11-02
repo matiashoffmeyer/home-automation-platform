@@ -540,3 +540,88 @@
           {{ 'natlys (bad under godnat)' if bad and nat
              else '100% (bad=fuld)' if bad
              else '90% varm hvid' }}.
+
+# =============================================================================
+# Strømsvigt om natten → intet lys (user-spec 2026-11-01, alle house_modes)
+# =============================================================================
+# "ved strømsvigt om natten må soveværelset ikke tænde! heller ikke andre lys
+# om natten ved strømsvigt". NUC'en har ingen UPS: ved et ægte svigt dør HA
+# også, pærerne tænder SELV på deres firmware-start-niveau når strømmen kommer,
+# og HA booter minutter senere — så recoveries ovenfor (state-flanker) ser
+# aldrig noget, og lyset blev stående hele natten.
+#
+# Bevis for strømsvigt (fejlklasse #23 — ikke HA's egen opstart, som også er
+# en almindelig ha_restart.sh): mindst 2 Apollo'er har uptime < 30 min ved
+# HA-start. De sidder på hver sin stikkontakt og genstarter kun samtidig når
+# huset mister strøm (målt 2026-11-01: uptimes 5-38 døgn, alle forskellige).
+# Nat = godnat_any_active (husets egen nat-definition; AirBnB-natmode sætter
+# samme flag). Børnenes natlys gengives (det var tændt før svigtet), resten
+# slukkes. Vægkontakt-flip med HA oppe er UBERØRT (recoveries ovenfor).
+- id: stroemsvigt_nat_lys_sluk
+  alias: "Strømsvigt om natten: sluk lyset pærerne selv tændte"
+  mode: single
+  trigger:
+    - platform: homeassistant
+      event: start
+  action:
+    # ESPHome-Apollo'erne forbinder først efter opstart — vent til mindst 3
+    # har en tal-uptime (max 5 min), og giv ZHA/Matter tid til at melde lys.
+    - wait_template: >-
+        {{ ['sensor.boernevaerelse_apollo_uptime', 'sensor.koekken_apollo_uptime',
+            'sensor.sovevaerelse_apollo_uptime', 'sensor.spisestue_apollo_uptime',
+            'sensor.stue_apollo_uptime']
+           | map('states') | select('is_number') | list | count >= 3 }}
+      timeout: "00:05:00"
+      continue_on_timeout: true
+    - delay:
+        seconds: 30
+    - variables:
+        nye_apolloer: >-
+          {{ ['sensor.boernevaerelse_apollo_uptime', 'sensor.koekken_apollo_uptime',
+              'sensor.sovevaerelse_apollo_uptime', 'sensor.spisestue_apollo_uptime',
+              'sensor.stue_apollo_uptime']
+             | map('states') | select('is_number') | map('float')
+             | select('lt', 1800) | list | count }}
+        taendte: >-
+          {{ expand('light.alle_lys') | selectattr('state', 'eq', 'on')
+             | map(attribute='entity_id') | list }}
+    - condition: template
+      value_template: "{{ nye_apolloer | int(0) >= 2 }}"
+    - condition: state
+      entity_id: binary_sensor.godnat_any_active
+      state: "on"
+    - service: logbook.log
+      data:
+        name: "Strømsvigt om natten"
+        message: >-
+          {{ nye_apolloer }} Apollo'er genstartet sammen med HA under godnat →
+          slukker {{ taendte | join(', ') if taendte else 'intet (alt var slukket)' }}.
+    - if:
+        - condition: template
+          value_template: "{{ taendte | count > 0 }}"
+      then:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id: "{{ taendte | reject('eq', 'light.boernevaerelse_hygge_strip') | list }}"
+    # Børnenes natlys: samme betingelser som puttelysets natlys-trin.
+    - if:
+        - condition: state
+          entity_id: input_boolean.godnat_boern_active
+          state: "on"
+        - condition: state
+          entity_id: binary_sensor.dark_mode_boern
+          state: "off"
+        - condition: state
+          entity_id: input_boolean.boernevaerelse_manual_off_lock
+          state: "off"
+      then:
+        - service: script.boern_natlys_set
+          continue_on_error: true
+          data:
+            transition: 2
+      else:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id: light.boernevaerelse_hygge_strip

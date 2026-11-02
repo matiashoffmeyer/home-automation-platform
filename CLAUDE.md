@@ -322,7 +322,7 @@ automations der er valideringsfejlet og dermed fuldstændig stumme (#22).
 ### 👁️ Monitoring — `./scripts/ha_health.sh`
 
 Ét script dækker det ugentlige helbreds-tjek. Subkommandoer: `deploy` (fejlede
-automations — kør efter HVER deploy), `flags`, `lights`, `noisy`, `zha`, `docs`,
+automations — kør efter HVER deploy), `flags`, `flipflop`, `lights`, `noisy`, `zha`, `docs`,
 `backup`, `sys`, `log [n]`, `blind`, `kamera`. Uden argument køres alle.
 
 **Git-hooks er installeret** (`.git/hooks/pre-commit` + `pre-push`, kopier af
@@ -394,6 +394,18 @@ sprint som ændringen:
   rettelse. Ingen ny vej ned (geofence, Dormant UDEN dør foran, decay, familie-
   vækst) — for højt rettes ved KILDEN.
   Bevis: **`./scripts/ha_health.sh people`** (tjekker det viste tal, ikke delene).
+- **Tjek hvem der sover — BEGGE soveværelser — før du rydder godnat/sætter
+  Auto/kalder scripts** (user-spec 11-02): sengetæller + `sovevaerelse_dvale_vidne`
+  (sove-Apolloen taber en sovende), `kids_home` + dens attributter (en latch med
+  ~0 t ophold lyver). Sover nogen: `sove_sovende_beskyttes` skal være on FØR
+  clear'et — sæt ALDRIG sove-snoozen manuelt (blokerer to-oppe → radio/gardin). `grep -n "Tjek hvem der sover" docs/standing_instructions.md`.
+- **Efter et bug-fix: sæt de rum user tog manuelt (Styrbar/app) tilbage på
+  Auto** (user-spec 11-02) — ikke ved specielt lys (party, mood, film, farvet).
+  Ret årsagen først, ellers slukker Auto lyset igen.
+- **Knap-tryk (Styrbar/RODRET/SOMRIG) respekteres altid — også fejltryk**
+  (user-spec 11-01): ingen vagt, godnat-lås eller suppressor må omgøre et tryk;
+  kun automatik. Ny knap i et soveværelse → med i `bedroom_styrbar_intent_at`-
+  stemplet. `grep -n "Knap-tryk respekteres" docs/standing_instructions.md`.
 - **Nye problemer** → [BACKLOG.md](BACKLOG.md) i rette kategori med næste ledige
   ID (`python3 scripts/backlog_ids.py --next`; genbruges aldrig). **Løste** →
   "Done" med dato, eller slet hvis trivielt.
@@ -511,6 +523,11 @@ opdage. **Her står kun signatur → metode. Incident, måledata og fuld begrund
    et tal der springer i takt med én radar og hænger på den høje værdi i
    præcis decay-tiden. → latch kun hvad der har HOLDT (`for:` + samme krav på
    alle re-arm-veje), gulv kun på det ingen stabil kilde beviser (people v4).
+29. **En soak målt fra kandidatens egen flanke tæller tid fra FØR det der
+   modbeviste den — en bro bærer kandidaten hen over en opvågning/clear.
+   Signatur:** en automatik der sætter et flag få min efter at den MODSATTE
+   vej ryddede det, på et backstop-tick. → tæl også fra flagets seneste
+   skift; `./scripts/ha_health.sh flipflop`.
 
 **Tid, test og spor**
 

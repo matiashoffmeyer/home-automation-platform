@@ -26,6 +26,10 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   "findes dette filter?".
 - **`/api/history/period/{start}` defaulter `end_time` til start + 1 DØGN** —
   længere forespørgsler trunkeres TAVST uden `&end_time=`.
+- **En tidszone-løs `start`/`end_time` i history/logbook-URL'en læses som LOKAL
+  tid**, ikke UTC → `date -u` uden `Z` forskyder vinduet 1-2 t og taber de
+  nyeste rækker. Skriv altid `…Z`. Og busybox' `date` forstår ikke
+  `-d '24 hours ago'` → `-d "@$(( $(date +%s) - 86400 ))"`.
 - **En entity der KUN skabes af `POST /api/states` er FRAVÆRENDE efter hver
   genstart** — ikke `unavailable`, men ikke-eksisterende (`states[x]` er `none`,
   dashboardet siger "entity not found"). → stil en YAML-defineret template-sensor

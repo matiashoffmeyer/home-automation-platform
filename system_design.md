@@ -96,6 +96,9 @@ Kill-switch: `input_boolean.drift_back_enabled`.
   - Pr. rum: `mood_pause_<rum>`, `aktivitet_pause`, `dance_claim`,
     `sove_evening_hold` og `open_plan_fuldt_lys` (sidstnævnte gælder ikke
     fallback).
+  - Sove: ALLE auto-tænd-veje spærres af `binary_sensor.sove_sovende_beskyttes`
+    (sengetæller > 0 eller stille krop bag lukket dør); knapper og alarm-vækning
+    undtaget (`packages/sove_sovende_beskyttelse.yaml`).
 - **Parallelt lag:** `binary_sensor.stue_manuel_lys_hold`
   (`input_number.manuel_lys_hold_timer`) holder sluk-veje væk fra
   stue-/spisestue-lys efter et manuelt tryk, uanset mode.
@@ -200,7 +203,7 @@ betyder at den globale faktor ikke anvendes.
 | Sove | `sensor.rum_tom_sluk_sekunder` (`packages/room_absence_tuning.yaml`) |
 | Børn | Som sove. Desuden 06 → sengetid: `input_number.boernevaerelse_uden_boern_sluk_sekunder` / `…_med_boern_sluk_sekunder`, uden faktor |
 | Sofa-zonen | `input_number.stue_sofa_off_minutter` → `sensor.sofa_stue_off_sekunder` |
-| Spisestue-loft | `input_number.spisestue_off_minutter` (hurtig-sluk ved flytning til sofaen). Begge open plan-tider klampes til `input_number.solo_tom_rum_sluk_minutter` når én person er hjemme uden for open plan |
+| Spisestue-loft | `input_number.spisestue_off_minutter` (¼ af tiden når spisebordet er tomt og sofa eller køkken er optaget — køkkenet holder IKKE loftet, user 1/11). Begge open plan-tider klampes til `input_number.solo_tom_rum_sluk_minutter` når én person er hjemme uden for open plan |
 | Køkken | `input_number.koekken_spots_off_seconds`, uden faktor. Køkken-lyskæden har ejerskabsregister (`ejerskab/`) |
 | Bad | `input_number.badevaerelse_off_minutter` + stadier, uden faktor. **Ingen automatisk sluk uden en frisk fugt-måling** (`binary_sensor.badevaerelse_fugt_frisk`, user-spec 1/10) |
 | Depot | `input_number.depot_quick_off_seconds` / `_medium_` / `_long_` (`packages/depot_visit_quality.yaml`) |

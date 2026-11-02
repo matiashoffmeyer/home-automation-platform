@@ -473,6 +473,74 @@ radaren. Fuld incident + kode-eksempel:
 **Canary:** `sensor.*_apollo_esp_temperature` over ~50 °C steady-state = noget
 hamrer for hårdt. Efter ny parring/factory-reset: `script.apollo_radar_apply_now`.
 
+### 🛏️ Tjek hvem der sover — begge soveværelser — FØR du ændrer husets tilstand (per 2026-11-02, user-spec)
+
+User 2/11 (efter at en session ryddede godnat kl. 05:58 for at give open plan
+lys tilbage): *"og du er med på at parent_b stadig sover?"* · *"det skal være en
+fast regel at tjekke"* · *"både børn og voksen soveværelse"* · *"men du kan jo
+se at børnene ikke er hjemme.....?"*
+
+- **Før ethvert manuelt indgreb i godnat-/rum-/mode-flag** (rydde godnat, sætte
+  Auto, kalde scripts) — og før du FORKLARER et rum som "tomt" — tjek begge
+  soveværelser på BEVIS, ikke på én sensor:
+  - **Voksen-soveværelset:** `input_number.sove_seng_personer` (sengetælleren)
+    + `binary_sensor.sovevaerelse_dvale_vidne`. Sove-Apolloen TABER en der
+    ligger stille (5-15 min) — `occupancy off` er aldrig bevis for tomt.
+  - **Børneværelset:** `binary_sensor.kids_home` + dens attributter
+    (`signal_overnight_hours`, `signal_latch_slept`). Står kids_home on KUN på
+    latchen med ~0 t ophold, er latchen mistænkt — spørg/tjek, stol ikke på den.
+- **Sover nogen, så tjek at `binary_sensor.sove_sovende_beskyttes` er `on` FØR du
+  rydder** (sengetæller > 0 eller stille krop bag lukket dør — spærrer alle
+  sove-auto-lys af sig selv). **Sæt ALDRIG sove-snoozen manuelt**
+  (`input_datetime.sove_snooze_until`): den betyder "godnat-knap om morgenen =
+  vi sover videre" og blokerer dør-vejens to-oppe-bekræftelse → ingen
+  morgenradio, intet gardin op (2/11: sat 06:00 som "beskyttelse", Parent B stod
+  op 06:19, radioen startede aldrig).
+- **Ret aldrig et flag op efter en anden sensors påstand uden at krydstjekke**
+  (2/11: `godnat_boern_active` blev sat tilbage fordi `boern_sov_her_i_nat`
+  stod on — men børnene var taget hjem søndag; latchen ryddes først 06:30).
+
+### 🔁 Efter et bug-fix: sæt de rum user tog manuelt tilbage på Auto (per 2026-11-02, user-spec)
+
+User 2/11: *"det skal også være en fast del af vores metode at når der er en
+bug og jeg så bruger manuelle knapper for at få lys, så slutter du af med at
+sætte på auto mode (selvfølgelig ikke hvis vi har specielt lys på, som party og
+moods, men hvis det er nær auto lys eller ser normalt ud) når du er færdig med
+fixet."*
+
+- **Sidste skridt i et bug-fix:** find rum hvor user greb ind manuelt under
+  bug'en (`hq.py who input_select.room_mode_<rum>` / Styrbar-tryk i vinduet) og
+  sæt `input_select.room_mode_<rum>` → `Auto`.
+- **Undtagelse:** står der SPECIELT lys (party, mood/scene, film, dance, zen,
+  farvet) → lad det være. Kun "nær auto-lys / ser normalt ud".
+- **Rækkefølge:** ret årsagen først (fx en fejl-sat godnat), ellers slukker
+  Auto bare lyset igen — og tjek soveværelserne først (reglen ovenfor).
+- Dette er brugerens eget ønske, så det kræver ikke `live_godkend` — men nævn
+  det i opsummeringen.
+
+### 🔘 Knap-tryk respekteres — også fejltryk (per 2026-11-01, user-spec)
+
+User 1/11: *"tryk på kontakter som styrbar, rodret, somrig skal respekteres
+generelt. så når jeg tænder lys i soveværelset med dem skal det ikke lukkes
+ned af godnat, feks. det er en generel regel at manuelle valg skal
+respekteres. fejltryk på dem skal systemet ikke beskytte imod."*
+
+- **Ingen vagt, lås eller beskyttelse må omgøre et fysisk knap-tryk** — nat-låse
+  (`bedroom_night_guard`), morgen-snooze (`sovevaerelse_morgen_beskyttelse`),
+  godnat-tilstande, suppressorer. De findes for at stoppe AUTOMATIK, ikke hånden.
+- **Et fejltryk er stadig et valg.** Byg ikke bekræftelser, forsinkelser eller
+  "tænder kun det svage" for at gætte hvad brugeren *egentlig* ville.
+- **Mekanik:** soveværelserne læser `input_datetime.bedroom_styrbar_intent_at`
+  (stemples af `bedroom_styrbar_emergency_intent` FØR lys-logikken, < 8 s =
+  tryk). **En ny knap der kan tænde et soveværelse-lys skal med i dens
+  triggers** — RODRET manglede indtil 1/11 (31/10 22:42: kort-OP under godnat
+  snappet slukket 1 s efter). Øvrige rum: room_mode Manual via
+  `script.styrbar_stamp_press`.
+- **Et SENERE tryk vinder over et tidligere** — godnat-knappen der slukker et lys
+  du tændte med Styrbar 5 min før, er ikke et brud.
+- **Undtagelser der står ved magt:** AirBnB-låsen på børneværelset (privat rum)
+  og røgalarm/nødlys.
+
 ### 🏡 ALT vi bygger skal spille med AirBnB-mode (per 2026-07-28, user-spec)
 
 Gælder **hver eneste ændring**, ikke kun dem der "handler om AirBnB":

@@ -466,6 +466,29 @@ sessioners arbejde. Tjek disse aktivt — de er billige at undgå, dyre at opdag
     fra en history_stats over et vindue (restart-sikker), ikke fra radarens
     øjebliks-state. Replay: over-tælling 17,4 % → 4,9 %, skift 23 → 11/døgn.
 
+29. **🔁 En soak målt fra kandidatens EGEN flanke tæller tid fra FØR den
+    hændelse der modbeviste den — og en bro bærer kandidaten hen over
+    hændelsen.** Fundet 2026-11-02 i `automations/godnat_auto_declare.yaml`:
+    godmorgen-clear (brusebad-grenen, fra 05:00 siden 16/10 `fc9c7101`)
+    slukkede godnat 05:39:06, men `binary_sensor.godnat_auto_kandidat` stod
+    `on` hele natten — bad-blippene var < sin 120 s `delay_off`, og
+    sove-vidnet har 16 min bro. Backstop-ticket 05:45:00 læste "kandidat on
+    ≥ 120 min, godnat off" og erklærede godnat igen 6 min efter opvågningen,
+    mens partneren sov (sengetæller 1; sove-Apolloen havde tabt hende). Presence-lyset var spærret, natturen krævede en i
+    sengen → open plan kulsort. Latent siden broerne + /5-backstoppen kom ind
+    (`71b7a0ce`, 26/8); nåbar først da en clear kunne lande før 07:00.
+    **Hvorfor det var usynligt:** hver del var rigtig — broerne skal tåle en
+    sovende krop, backstoppen skal overleve en restart, og `godnat_active
+    == off` lignede en re-declare-vagt. Men vagten tjekker kun NU, ikke om
+    det modsatte lige er sket.
+    **Signatur:** en automatik-handling der fyrer få minutter efter at den
+    MODSATTE vej har ryddet samme flag, typisk på et backstop-tick (:00/:05).
+    **Metode:** (1) en soak skal også tælle fra seneste modsatte handling
+    (`now() - <flag>.last_changed ≥ soak`), ikke kun fra kandidatens flanke.
+    (2) Spørg om enhver bro: "hvilken hændelse må den IKKE bære kandidaten
+    hen over?" (3) **`./scripts/ha_health.sh flipflop`** finder flag sat igen
+    < 30 min efter clear (7 døgn); ét hit = to veje der overskriver hinanden.
+
 ---
 
 ## Jinja-gotchas — den fulde liste

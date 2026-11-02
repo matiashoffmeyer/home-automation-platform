@@ -78,6 +78,13 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   spisestuens RÅ radar er stille, ud over radar-timeouten (900 s om natten
   holder ellers ethvert blip 15 min) → `binary_sensor.boernevaerelse_solo_bevis`.
   Rå flanker/`boern_occupancy_4h` som børne-bevis = over-tælling (6/10: 4 med 2).
+- **En Apollo-sensor på `unknown` (eller på en gendannet værdi efter genstart)
+  siger ikke HVORFOR — nodens I2C-scan gør:
+  `.cache/dev-venv/bin/python scripts/apollo_diag.py [rum]`** (kun læsning).
+  Status 1/11: **SCD40 (CO2) svarer på INGEN af de fem** = ikke monteret, ikke
+  en fejl. Døde chips: stue LTR390 (B12), DPS310 i spisestue + børneværelse.
+  De døde DPS310'ere læses kun af dashboards; Genvex-evalueringen læser
+  sove/stue (`sensor.sove_temperatur`/`stue_temperatur`, de lever).
 - **En Matter/Thread SLEEPY END DEVICE der mister sin forælder mens den melder
   `on`, sender aldrig sin `off`** — HA står `on` i op mod 40 min.
 

@@ -8,29 +8,29 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 
 | Entity | Files | Refs |
 |---|---|---|
-| `input_select.house_mode` | 127 | 307 |
-| `input_select.house_state` | 74 | 241 |
+| `input_select.house_mode` | 127 | 306 |
+| `input_select.house_state` | 75 | 249 |
 | `binary_sensor.stue_apollo_occupancy_filtered` | 50 | 122 |
 | `light.spisestue_loft` | 49 | 125 |
 | `binary_sensor.entre_valhorn_occupancy` | 48 | 109 |
 | `script.push_notify` | 47 | 103 |
-| `binary_sensor.boernevaerelse_apollo_occupancy` | 46 | 123 |
+| `binary_sensor.boernevaerelse_apollo_occupancy` | 47 | 124 |
 | `binary_sensor.sovevaerelse_apollo_occupancy` | 45 | 90 |
 | `light.koekken_lyskaede` | 45 | 194 |
-| `input_boolean.godnat_active` | 44 | 97 |
+| `input_boolean.godnat_active` | 44 | 98 |
 | `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 112 |
-| `input_boolean.godnat_boern_active` | 42 | 99 |
-| `sun.sun` | 42 | 146 |
+| `sun.sun` | 43 | 150 |
+| `input_boolean.godnat_boern_active` | 42 | 100 |
 | `binary_sensor.spisestue_apollo_occupancy_filtered` | 41 | 114 |
 | `binary_sensor.badevaerelse_inde_occupancy` | 40 | 135 |
 | `light.spisestue_pendel` | 40 | 137 |
 | `light.stue_laesehygge` | 38 | 87 |
 | `light.boernevaerelse_loft` | 37 | 95 |
-| `sensor.open_plan_lux` | 35 | 106 |
+| `sensor.open_plan_lux` | 35 | 107 |
 | `light.entre_loft` | 35 | 83 |
+| `light.boernevaerelse_hygge_strip` | 33 | 92 |
 | `binary_sensor.depot_valhorn_occupancy` | 32 | 72 |
-| `light.boernevaerelse_hygge_strip` | 32 | 90 |
-| `binary_sensor.godnat_common_active` | 31 | 79 |
+| `binary_sensor.godnat_common_active` | 32 | 86 |
 | `input_boolean.cinema_active` | 30 | 60 |
 | `light.stue_plug` | 30 | 81 |
 
@@ -38,7 +38,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 
 | Entity | Purpose | Files |
 |---|---|---|
-| `input_select.house_state` | Top-level state: Active vs Dormant | 74 |
+| `input_select.house_state` | Top-level state: Active vs Dormant | 75 |
 | `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 127 |
 | `input_boolean.godnat_active` | Godnat night mode | 44 |
 | `input_boolean.godnat_pending` | Godnat in progress | 19 |

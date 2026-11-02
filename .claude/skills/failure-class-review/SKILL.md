@@ -41,6 +41,7 @@ git diff -U0 | grep -oE '(light|switch|input_boolean|input_number|binary_sensor|
 | 22 | Did every automation load? | `./scripts/ha_health.sh deploy` after reload |
 | 26 | Is a house-wide gate locking a room-scoped state? | scope the gate and its neighbour conditions |
 | 27 | Does a borrower hand back a stale snapshot? | ask the house again at hand-back |
+| 29 | Does a soak/backstop count time from BEFORE the opposite path cleared the flag? | also require `now() - <flag>.last_changed ≥ soak`; `./scripts/ha_health.sh flipflop` |
 
 Also check the guest mode: `house_mode` has three options (`Normal`,
 `AirBnB`, `Home Vacation`), so family logic is `in ['Normal','Home Vacation']`,

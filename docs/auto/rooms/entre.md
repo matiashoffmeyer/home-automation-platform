@@ -146,7 +146,7 @@ Search keywords: `entre`
 - `sensor.entre_styrbar_battery` — 3 refs in 2 file(s)
 - `sensor.entre_tom_sluk_sekunder` — 5 refs in 3 file(s)
 - `sensor.entre_valhorn_battery` — 2 refs in 2 file(s)
-- `sensor.entre_valhorn_illuminance` — 10 refs in 3 file(s)
+- `sensor.entre_valhorn_illuminance` — 12 refs in 3 file(s)
 
 ### `switch.*`
 

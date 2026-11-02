@@ -74,7 +74,8 @@ input_boolean:
 
 input_datetime:
   # KONFIG (med i helpers_export DATETIME_CONFIG): hvornår beskyttelsen slipper.
-  # Default 07:30 = user-spec. Dækker vinduet fra godnat-flagenes rydning
+  # Default 07:30 = user-spec 08-15; 07:00 fra 2026-11-01 (user: "pigerne sover
+  # ikke til efter kl 07 normalt"). Dækker vinduet fra godnat-flagenes rydning
   # (~06:00-06:10) til børnene reelt er oppe.
   boern_morgen_beskyttelse_slut:
     name: "Børn: morgen-beskyttelse slutter"
@@ -90,6 +91,24 @@ input_number:
   # akkumulerer 45 s bevægelse på under et minut.
   boern_morgen_bevaegelse_sekunder:
     name: "Børn: krævet morgen-bevægelse"
+    icon: mdi:motion-sensor
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "s"
+    mode: slider
+
+  # 2026-11-01 (user-bug "børneværelset blev holdt mørkt her til morgen … der er
+  # mange clues til at børnene er oppe, fx … bevægelse (akkumuleret) og bare
+  # tidspunktet"). MÅLT 11-01 (søndag, ingen vækning): moving-bursts 06:25 (2 s),
+  # 06:35 (5 s), 06:52 (11 s), 06:57 (7 s) — et barn der går ud og ind. Det
+  # rullende 15-min-krav nåede aldrig 45 s før 07:14, brugeren tændte selv 07:15.
+  # Samme mønster 10-24/10-25 (manuel 07:21/06:21). Akkumuleret ÆGTE bevægelse
+  # SIDEN 06:00 frigiver også. 0 = kun det rullende krav. 30 s = user-valg
+  # 11-01, efter at et objekt foran Apolloen blev fjernet (11-01-målingen var
+  # skærmet; 20 s ville kunne nås af et sovende barn over en time).
+  boern_morgen_bevaegelse_akkum_sekunder:
+    name: "Børn: morgen-bevægelse i alt"
     icon: mdi:motion-sensor
     min: 0
     max: 300
@@ -158,7 +177,9 @@ template:
             {% set krav = states('input_number.boern_morgen_bevaegelse_sekunder') | float(45) %}
             {# history_stats type: time returnerer TIMER → ×3600 = sekunder #}
             {% set haves = (states('sensor.boernevaerelse_morgen_bevaegelse_recent') | float(0)) * 3600 %}
-            {{ krav > 0 and haves < krav }}
+            {% set akrav = states('input_number.boern_morgen_bevaegelse_akkum_sekunder') | float(0) %}
+            {% set akkum = (states('sensor.boernevaerelse_morgen_bevaegelse_akkum') | float(0)) * 3600 %}
+            {{ krav > 0 and haves < krav and not (akrav > 0 and akkum >= akrav) }}
           {% else %}
             false
           {% endif %}
@@ -166,6 +187,8 @@ template:
           bevaegelse_sekunder: >-
             {{ ((states('sensor.boernevaerelse_morgen_bevaegelse_recent') | float(0)) * 3600) | round(0) | int }}
           kraevet_sekunder: "{{ states('input_number.boern_morgen_bevaegelse_sekunder') | int(45) }}"
+          akkum_sekunder: >-
+            {{ ((states('sensor.boernevaerelse_morgen_bevaegelse_akkum') | float(0)) * 3600) | round(0) | int }}
           aarsag: >-
             {% if is_state('input_boolean.boern_morgen_beskyttelse_enabled', 'off') %}
               kill-switch fra
@@ -179,9 +202,15 @@ template:
             {% else %}
               {% set krav = states('input_number.boern_morgen_bevaegelse_sekunder') | float(45) %}
               {% set haves = (states('sensor.boernevaerelse_morgen_bevaegelse_recent') | float(0)) * 3600 %}
+              {% set akrav = states('input_number.boern_morgen_bevaegelse_akkum_sekunder') | float(0) %}
+              {% set akkum = (states('sensor.boernevaerelse_morgen_bevaegelse_akkum') | float(0)) * 3600 %}
+              {% if akrav > 0 and akkum >= akrav and haves < krav %}
+              frigivet — {{ akkum | round(0) | int }} s bevægelse siden 06:00
+              {% else %}
               {{ 'beskytter — ' ~ (haves | round(0) | int) ~ '/' ~ (krav | round(0) | int)
                  ~ ' s bevægelse' if haves < krav
                  else 'frigivet — nok bevægelse (' ~ (haves | round(0) | int) ~ ' s)' }}
+              {% endif %}
             {% endif %}
 
 sensor:
@@ -196,3 +225,39 @@ sensor:
     end: "{{ now() }}"
     duration:
       minutes: 15
+
+  # Akkumuleret ÆGTE bevægelse siden 06:00 (spejlet skriver kun i vinduet, så
+  # alt før 06:00 er 0). Ikke fejlklasse #20: moving_target latcher ikke.
+  - platform: history_stats
+    name: "Boernevaerelse morgen bevaegelse akkum"
+    unique_id: boernevaerelse_morgen_bevaegelse_akkum
+    entity_id: binary_sensor.boernevaerelse_morgen_bevaegelse
+    state: "on"
+    type: time
+    start: "{{ today_at('06:00') }}"
+    end: "{{ now() }}"
+
+automation:
+  # Re-arm (fejlklasse #4/#19): tænd-vejen fyrer kun på en occupancy-/bevægelses-
+  # FLANKE. Slipper beskyttelsen (07:00, nok bevægelse) mens et barn allerede er
+  # i rummet, kom der ellers intet lys før næste flanke. Målet læser ikke
+  # `trigger.` → automation.trigger med skip_condition: false er sikkert.
+  - id: boernevaerelse_morgen_beskyttelse_slip_rearm
+    alias: "Børn morgen-beskyttelse: slipper med barn i rummet → prøv tænd"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.boernevaerelse_morgen_beskyttelse_aktiv
+        from: "on"
+        to: "off"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ is_state('binary_sensor.boernevaerelse_apollo_occupancy', 'on')
+             or is_state('binary_sensor.boernevaerelse_bevaegelse_frisk', 'on') }}
+    action:
+      - service: automation.trigger
+        target:
+          entity_id: automation.lysnet_bornevaerelse_taend
+        data:
+          skip_condition: false

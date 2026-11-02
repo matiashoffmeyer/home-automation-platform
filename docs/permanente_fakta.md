@@ -2065,6 +2065,35 @@ Fix i begge sove-tænd-veje (`presence_sovevaerelse.yaml` + `presence_lights.yam
 blinde vinkel — vurdér dem med samme måling (sidste rapport efter solnedgang pr.
 aften vs. gaten), før du kopierer reglen.
 
+## Apollo-chips: nodens I2C-scan afgør hvilke der lever (2026-11-01, B282)
+
+HA viser en død chip som `unknown` — eller værre: efter en genstart som den
+gendannede værdi (børne-lux stod 18 t på 12,32 lx, 10-31 14:07 → 11-01 08:08,
+uden at chippen svarede). Huset har intet ESPHome-add-on, så nodens egen log
+var usynlig. `scripts/apollo_diag.py` kobler på nodens native API (plaintext,
+som HA-integrationen) og abonnerer på loggen med `dump_config=True` → noden
+udskriver bus-scanningen ("Found device at address 0x53") og hver komponent der
+er "marked FAILED". Kun læsning — ingen chip-skrivning (🔥 chip-wear).
+
+Målt 1/11 på alle fem (firmware ApolloAutomation.MSR-2_Factory 25.8.6.1,
+ESPHome 2025.7.5), `I2C Bus … Recovery: bus successfully recovered` på alle:
+
+| Rum | LTR390 0x53 | SCD40 0x62 | DPS310 0x77 |
+|---|---|---|---|
+| stue | ❌ (B12) | ❌ | ✅ |
+| køkken | ✅ | ❌ | ✅ |
+| spisestue | ✅ | ❌ | ❌ |
+| soveværelse | ✅ | ❌ | ✅ |
+| børneværelse | ✅ (tilbage efter strøm-cyklus 11-01 08:21; første værdi 09:35:45) | ❌ | ❌ |
+
+SCD40 svarer på ingen = modulet er ikke monteret (CO2-entities er altid
+`unknown`) — ikke en fejl. Ingen automation læser CO2. DPS310 læses via
+snapshottene i `sensor_snapshots.yaml` (availability-vagt): kun
+`genvex_fugt.yaml` bruger dem, og kun sove + stue (de lever); de døde
+(spisestue, børneværelse) står kun på dashboards. Inde-temperatur til
+husets logik går via `sensor.indoor_temperature_resilient`. Dashboardets
+Apollo-kort viser "—" for en død måler (før: 0,0 °C / 0,0 lx).
+
 ## Børne-Apolloen ser folk ved spisebordet gennem væggen (2026-10-05)
 
 Siden 23/9 må frisk radar-BEVÆGELSE tænde børneværelsets loft når børnene ikke er

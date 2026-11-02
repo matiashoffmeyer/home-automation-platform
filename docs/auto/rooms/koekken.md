@@ -6,7 +6,7 @@ Search keywords: `koekken, kokken`
 
 ## Indhold
 - [Automations](koekken.md#automations) (9)
-- [Entities](koekken.md#entities) (243)
+- [Entities](koekken.md#entities) (244)
 - [Helpers](koekken.md#helpers) (42)
 
 ---
@@ -284,6 +284,7 @@ Search keywords: `koekken, kokken`
 - `sensor.koekken_apollo_radar_still_distance` — 4 refs in 3 file(s)
 - `sensor.koekken_apollo_radar_still_energy` — 1 refs in 1 file(s)
 - `sensor.koekken_apollo_temperature` — 2 refs in 2 file(s)
+- `sensor.koekken_apollo_uptime` — 2 refs in 1 file(s)
 - `sensor.koekken_bevaegelse_5min_sekunder` — 3 refs in 3 file(s)
 - `sensor.koekken_bevaegelse_akkumuleret` — 1 refs in 1 file(s)
 - `sensor.koekken_blik_sidst` — 1 refs in 1 file(s)

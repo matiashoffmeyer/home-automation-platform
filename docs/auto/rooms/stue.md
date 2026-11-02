@@ -6,7 +6,7 @@ Search keywords: `stue, open_plan`
 
 ## Indhold
 - [Automations](stue.md#automations) (22)
-- [Entities](stue.md#entities) (310)
+- [Entities](stue.md#entities) (312)
 - [Helpers](stue.md#helpers) (95)
 
 ---
@@ -24,9 +24,9 @@ Search keywords: `stue, open_plan`
 
 ### `automations/godmorgen_godnat.yaml`
 
-- **Godnat: Børn oppe i stuen (forældre sover stadig)** (line 1177, mode=single)
+- **Godnat: Børn oppe i stuen (forældre sover stadig)** (line 1181, mode=single)
   - Weekend mornings: kids enter stue while godnat is still active.
-- **Godnat: Gendan stuelys ved godnat-slut (stue allerede beboet)** (line 1258, mode=single)
+- **Godnat: Gendan stuelys ved godnat-slut (stue allerede beboet)** (line 1262, mode=single)
   - When godnat_active clears (parents got up, godnat_auto_clear fired, or
 
 ### `automations/godnat_night.yaml`
@@ -46,9 +46,9 @@ Search keywords: `stue, open_plan`
   - Daylight fades while spisebordet er besat — spisestue-loftet kommer blidt på.
 - **Lysnet: Spisestue tænd på mørk indedag** (line 256, mode=single)
 - **Lysnet: Sofa-stue tænd ved LUX-fald** (line 328, mode=single)
-- **Lysnet: Stue sluk ved LUX-stigning** (line 763, mode=single)
+- **Lysnet: Stue sluk ved LUX-stigning** (line 769, mode=single)
   - Dagslys tilbage i open-plan mens lys står tændt — blid fade off af
-- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 916, mode=single)
+- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 922, mode=single)
   - Lux-præmissen bag dagslys-sluk faldt bort mens rummet stadig er optaget →
 
 ### `automations/presence_resync_on_start.yaml`
@@ -61,7 +61,7 @@ Search keywords: `stue, open_plan`
 - **Lysnet: Sofa-stue tænd** (line 185, mode=single)
 - **Lysnet: Spisestue gradvis sluk** (line 391, mode=restart)
   - 2026-06-19 (user-spec): spisestue-loftet slukker når spisebords-Apolloen
-- **Lysnet: Sofa-stue gradvis sluk** (line 520, mode=restart)
+- **Lysnet: Sofa-stue gradvis sluk** (line 514, mode=restart)
   - 2026-06-19: sofa-lamperne slukker når sofa-Apolloen (stue_apollo) har været
 
 ### `automations/somrig_buttons.yaml`
@@ -381,7 +381,7 @@ Search keywords: `stue, open_plan`
 - `sensor.open_plan_fade_ind_effektiv` — 10 refs in 5 file(s)
 - `sensor.open_plan_haendelse_lux_gate` — 4 refs in 3 file(s)
 - `sensor.open_plan_lampe_tilstand` — 1 refs in 1 file(s)
-- `sensor.open_plan_lux` — 106 refs in 35 file(s)
+- `sensor.open_plan_lux` — 107 refs in 35 file(s)
 - `sensor.open_plan_lux_snapshot` — 1 refs in 1 file(s)
 - `sensor.open_plan_mork_indedag_lux_gate` — 3 refs in 2 file(s)
 - `sensor.radiator_effekt_stue` — 2 refs in 2 file(s)
@@ -397,13 +397,14 @@ Search keywords: `stue, open_plan`
 - `sensor.spisestue_apollo_radar_still_distance` — 3 refs in 3 file(s)
 - `sensor.spisestue_apollo_radar_still_energy` — 1 refs in 1 file(s)
 - `sensor.spisestue_apollo_temperature` — 1 refs in 1 file(s)
+- `sensor.spisestue_apollo_uptime` — 2 refs in 1 file(s)
 - `sensor.spisestue_dagslys_lx` — 15 refs in 9 file(s)
 - `sensor.spisestue_dagslys_sample` — 7 refs in 2 file(s)
 - `sensor.spisestue_lux` — 2 refs in 2 file(s)
 - `sensor.spisestue_lux_reel` — 34 refs in 12 file(s)
 - `sensor.spisestue_lys_on_idag` — 8 refs in 2 file(s)
 - `sensor.spisestue_lys_timer_dag` — 1 refs in 1 file(s)
-- `sensor.spisestue_off_sekunder` — 5 refs in 2 file(s)
+- `sensor.spisestue_off_sekunder` — 4 refs in 2 file(s)
 - `sensor.spisestue_sofa_off_sekunder` — 2 refs in 1 file(s)
 - `sensor.stue_apollo_esp_temperature` — 4 refs in 3 file(s)
 - `sensor.stue_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
@@ -413,6 +414,7 @@ Search keywords: `stue, open_plan`
 - `sensor.stue_apollo_radar_still_distance` — 2 refs in 2 file(s)
 - `sensor.stue_apollo_radar_still_energy` — 1 refs in 1 file(s)
 - `sensor.stue_apollo_temperature` — 3 refs in 2 file(s)
+- `sensor.stue_apollo_uptime` — 2 refs in 1 file(s)
 - `sensor.stue_dagslys_sluk_effektiv` — 11 refs in 5 file(s)
 - `sensor.stue_lux` — 1 refs in 1 file(s)
 - `sensor.stue_lux_gate` — 21 refs in 6 file(s)

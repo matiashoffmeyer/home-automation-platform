@@ -16,6 +16,14 @@
 # "radaren ser radiatoren", ALDRIG "tomt" → den tæller kun som tomt sammen med
 # sengetællerens 0 (user-valg b: "kun når sengetælleren også er 0").
 #
+#
+# 2026-11-01 (bug-hunt, B283): sengetællerens 0 er ikke nok alene — UD tæller
+# også en INDgang som −1 (1/11 09:15:39: entré → tomt rum → −1, rummet optaget
+# 2 t bagefter). Spøgelset kræver derfor også at tællingen der gav 0 kom ≤ 150 s
+# efter en bevist udgang fra sengen (`sove_seng_til_doer`-pulsen, målt 60-97 s
+# før −1'et ved de tre udgange 1/11; ingen puls ved indgangen) eller et facit-0.
+# Kan kun gøre spøgelset SJÆLDNERE (= gammel adfærd: rummet tæller som optaget).
+#
 # FORBRUGERE af `binary_sensor.sovevaerelse_optaget_reelt` (kun "er rummet
 # tomt om morgenen"-veje): morning_lights_sanity_check (empty), morning_curtains
 # backstop, hoejttaler_radio (én voksen oppe). Tænd-veje og nat-logik læser
@@ -47,6 +55,33 @@ sensor:
       minutes: 5
     precision: 0
 
+input_datetime:
+  # Skrevet stempel (#5 — last_changed nulstilles ved restart). Skrives af
+  # stempel-automationen nedenfor og af facit-scriptet ved 0
+  # (packages/sove_seng_taeller.yaml).
+  sove_seng_udgang_bevist:
+    name: "Sengetæller: sidste beviste udgang fra sengen"
+    has_date: true
+    has_time: true
+
+automation:
+  - id: sove_seng_udgang_bevist_stempel
+    alias: "Sengetæller: stempl bevist udgang fra sengen"
+    mode: queued
+    max: 5
+    trigger:
+      # from: "off" — en template-reload giver unavailable → off/on (b103).
+      - platform: state
+        entity_id: binary_sensor.sove_seng_til_doer
+        from: "off"
+        to: "on"
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.sove_seng_udgang_bevist
+        data:
+          timestamp: "{{ as_timestamp(now()) | int }}"
+
 template:
   - binary_sensor:
       # 2026-10-31: SIGNATUREN alene (hele døgnet, uden sengetælleren) —
@@ -67,20 +102,28 @@ template:
              and (p75 | float - p25 | float) <= 9
              and n >= 120 }}
 
-      # Radiator-signaturen OG ingen i sengen (sengetælleren aktiv og på 0).
-      # Kun 04-12: signaturen er kun målt om morgenen.
+      # Radiator-signaturen OG ingen i sengen (sengetælleren aktiv og på 0,
+      # og det 0 kom fra en bevist udgang — se hovedet). Kun 04-12: signaturen
+      # er kun målt om morgenen.
       - name: "Sovevaerelse radiator spoegelse"
         unique_id: sovevaerelse_radiator_spoegelse
         icon: mdi:radiator
         state: >-
+          {% set talt = state_attr('input_datetime.sove_seng_sidst_talt', 'timestamp') | float(0) %}
+          {% set bevist = state_attr('input_datetime.sove_seng_udgang_bevist', 'timestamp') | float(0) %}
           {{ 4 <= now().hour < 12
              and is_state('binary_sensor.sove_radiator_signatur', 'on')
              and is_state('input_boolean.sove_seng_taeller_enabled', 'on')
              and states('input_number.sove_seng_personer') | is_number
-             and states('input_number.sove_seng_personer') | int(1) == 0 }}
+             and states('input_number.sove_seng_personer') | int(1) == 0
+             and bevist > 0 and -10 <= (talt - bevist) <= 150 }}
         attributes:
           p25: "{{ states('sensor.sove_still_afstand_p25') }}"
           p75: "{{ states('sensor.sove_still_afstand_p75') }}"
+          nul_bevist: >-
+            {% set talt = state_attr('input_datetime.sove_seng_sidst_talt', 'timestamp') | float(0) %}
+            {% set bevist = state_attr('input_datetime.sove_seng_udgang_bevist', 'timestamp') | float(0) %}
+            {{ bevist > 0 and -10 <= (talt - bevist) <= 150 }}
 
       # Soveværelset optaget, minus radiator-spøgelset. Kun til "tomt"-veje.
       - name: "Sovevaerelse optaget reelt"
