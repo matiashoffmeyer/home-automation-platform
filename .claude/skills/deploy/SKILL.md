@@ -32,10 +32,15 @@ python3 scripts/ha_offline.py check   # Home Assistant's own validator, ~13 s, a
 
 - Reload only the domains you touched:
   `curl -s -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" http://supervisor/core/api/services/<domain>/reload`.
-- **Reload automations before templates.** A `template.reload` sends every
-  template entity through `unavailable`, and `unavailable → off` fires
-  switch-off paths. A `delay_on` sensor also makes a real `off → on` exactly
-  `delay_on` after the reload.
+- **Templates: only `python3 scripts/ha_reload.py templates`** — never the bare
+  service (`scripts/reload_guard.py` blocks it). The script runs b103_scan,
+  snapshots every light, reloads, waits 45 s, and restores every light the
+  reload switched off or dimmed (via the allowlisted `scene.reload_restore`, so
+  no room drops to Manual). Read its report: exit 2 = changes it only reported.
+  A template reload sends every entity through `unavailable` and intermediate
+  values; on 2026-11-02 four bare reloads darkened open plan step by step
+  through the price rescale. **Reload automations before templates**, and batch:
+  one template reload per deploy, not one per fix.
 - Restart only when a reload cannot load the change, and only with
   `bash scripts/ha_restart.sh`. It saves restore-state first, because Home
   Assistant segfaults during shutdown on this host. A plain `ha core restart`

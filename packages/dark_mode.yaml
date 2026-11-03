@@ -1198,21 +1198,58 @@ automation:
       gæsten er OPPE lige nu (fælles-arealet aktivt): så er mørklægningen i
       brug, og et release ville gøre presence-lyset live midt i filmen.
       Backstop hvis vi holder igen: mood_flag_safety_cinema (4t stuck + tom stue).
+      B292 (2026-11-02, user: "vent for familien også"): BEGGE grene venter mens
+      nogen er oppe (fælles-arealet aktivt eller projektoren spiller) og prøver
+      igen hvert 5. min i 2 t efter cutover-tiden; derefter giver den op.
     mode: single
+    max_exceeded: silent
     trigger:
       - platform: time
         at: input_datetime.dark_mode_godnat_cutover
+      # B292: "vent" skal lande (fejlklasse #25) — før sprang en blokeret
+      # cutover bare over, og intet prøvede igen den nat. En sovende på sofaen
+      # kan holde stue-radaren optaget; den taber tit en stille krop, og så
+      # fyrer næste tick. Er nogen stadig oppe efter 2 t, er de reelt oppe.
+      - platform: time_pattern
+        minutes: "/5"
     condition:
       - condition: state
         entity_id: input_boolean.dark_mode
         state: "on"
+      # Kun i [cutover, cutover + 2 t) — midnats-sikkert (#8): sekunder siden
+      # cutover-klokkeslættet modulo et døgn (has_time-only → timestamp =
+      # sekunder siden midnat). Uden dette ville /5 cutte en aftenfilm over.
+      - condition: template
+        value_template: >-
+          {% set c = state_attr('input_datetime.dark_mode_godnat_cutover', 'timestamp') | int(10800) %}
+          {% set n = now().hour * 3600 + now().minute * 60 + now().second %}
+          {{ (n - c) % 86400 < 7200 }}
     action:
+      - variables:
+          # Er nogen OPPE lige nu → mørklægningen er i BRUG. Én definition for
+          # begge grene (fejlklasse #2). Fælles-arealet er LIVE-signalet (samme
+          # sensor som natmode's ro-detektion bruger). Medie-tjekket er BEVIDST
+          # kun sekundært: projektoren var 'unavailable' i døgn (også natten
+          # 07-27 hvor der REELT blev set film) fordi Cast-discovery via mDNS er
+          # brudt af HA-hostens to default-routes; genoprettet 2026-07-28 via
+          # known_hosts=192.0.2.97. Den kan stadig ikke bære gaten alene:
+          # HDMI-/app-afspilning uden Cast giver ikke 'playing' (fejlklasse #9).
+          oppe: >-
+            {{ is_state('binary_sensor.faelles_areal_aktiv', 'on')
+               or states('media_player.projector') == 'playing'
+               or states('media_player.projektor_chromecast') == 'playing' }}
+          foerste_tick: >-
+            {% set c = state_attr('input_datetime.dark_mode_godnat_cutover', 'timestamp') | int(10800) %}
+            {% set n = now().hour * 3600 + now().minute * 60 + now().second %}
+            {{ (n - c) % 86400 < 300 }}
       - choose:
           # ---------- Familie-modes: fuld overgang til godnat ----------
           - conditions:
               - condition: template
                 value_template: >-
                   {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+              - condition: template
+                value_template: "{{ not oppe }}"
             sequence:
               - service: logbook.log
                 data:
@@ -1229,21 +1266,10 @@ automation:
               - condition: state
                 entity_id: input_select.house_mode
                 state: "AirBnB"
-              # Er gæsten oppe lige nu → mørklægningen er i BRUG; slip den ikke.
-              # LIVE signal (samme sensor som natmode's ro-detektion bruger).
-              - condition: state
-                entity_id: binary_sensor.faelles_areal_aktiv
-                state: "off"
-              # Medie-tjek BEVIDST kun sekundært. Projektoren var 'unavailable' i
-              # døgn (også natten 07-27 hvor der REELT blev set film) fordi Cast-
-              # discovery via mDNS er brudt af HA-hostens to default-routes;
-              # genoprettet 2026-07-28 via known_hosts=192.0.2.97. Den kan
-              # stadig ikke bære gaten alene: HDMI-/app-afspilning uden Cast giver
-              # ikke 'playing' (fejlklasse #9 — unavailable er hverken on/off).
+              # Er gæsten oppe lige nu → mørklægningen er i BRUG; slip den ikke
+              # (se `oppe` øverst).
               - condition: template
-                value_template: >-
-                  {{ states('media_player.projector') != 'playing'
-                     and states('media_player.projektor_chromecast') != 'playing' }}
+                value_template: "{{ not oppe }}"
             sequence:
               - service: logbook.log
                 data:
@@ -1255,4 +1281,18 @@ automation:
                   entity_id: input_boolean.dark_mode
               - service: input_boolean.turn_off
                 target:
+                  entity_id: input_boolean.dark_mode
+        # Nogen er oppe: vent. Kun ÉN logbog-linje (første tick), ikke én pr. 5 min.
+        default:
+          - if:
+              - condition: template
+                value_template: "{{ foerste_tick }}"
+            then:
+              - service: logbook.log
+                data:
+                  name: "Dark Mode cutover"
+                  message: >-
+                    Dark Mode stadig tændt kl {{ now().strftime('%H:%M') }}, men nogen er
+                    oppe (fælles-areal aktivt / projektor spiller) → venter, prøver igen
+                    hvert 5. min i 2 t.
                   entity_id: input_boolean.dark_mode

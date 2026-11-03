@@ -363,7 +363,11 @@ sessioners arbejde. Tjek disse aktivt — de er billige at undgå, dyre at opdag
     så en konstant attribut koster ingenting.
     Slægtning til #7 (tæl skrivninger før deploy) — men her er prisen recorder-
     volumen, ikke API-kald.
-25. **⏳ "X har været `off` i N minutter" på en radar-afledt binær er
+25. **⏳ En udgang der venter på at en radar siger ÉN ting, arver radarens løgn
+    den anden vej.** Tre varianter er set, og alle er tavse: ingen fejl, bare en
+    watchdog der tager over en halv time for sent — eller ingenting.
+
+    **(a) "X har været `off` i N minutter" på en radar-afledt binær er
     uopfyldelig — ét 1-sekunds blip sletter hele den opsparede tid**, og jo
     større N, jo mere sikkert er gaten død. Fundet 2026-09-11: to fixes der
     hver især var rigtige gjorde tilsammen kravet umuligt. B117 flyttede
@@ -375,16 +379,48 @@ sessioners arbejde. Tjek disse aktivt — de er billige at undgå, dyre at opdag
     overgange* i stedet for at måle **flanke-AFSTANDEN** fremadrettet. Et replay
     af fortiden ser sundt ud, fordi det aldrig stiller spørgsmålet "hvor længe
     går der mellem to flanker?".
-    **Signatur:** en gate der ALDRIG fyrer, hvor hver enkelt betingelse ser
-    rimelig ud hver for sig.
-    **Metode:** mål stilhed på et **anker der kun flyttes af en flanke der
+    Her er signaturen en gate der ALDRIG fyrer, hvor hver enkelt betingelse ser
+    rimelig ud hver for sig, og svaret er at måle stilhed på et **anker der kun flyttes af en flanke der
     HOLDER** — `sensor.last_sustained_presence` — ikke på kanalens egen
     `last_changed`. Den korte 12 s-tier kunne ikke genbruges: spøgelser på 13-95
     s opfylder den og bumpede ankeret 26× på 4,3 t i et tomt hus, så der måtte
     en ny lang tier på **120 s** til. At hæve den korte i stedet ville gøre hele
     huset blindt (= 09-09d's fejl på tids-aksen).
-    Spejlbillede af #14: dér måles sustained forkert på en ANALOG sensor, her
-    slettes opsparet stilhed af en BINÆR der blipper.
+
+    **(b) "tomt" kommer aldrig under et still-spøgelse (B290, 2026-11-02).**
+    Sove-pre-lysets hurtig-sluk krævede `sovevaerelse_apollo_occupancy` off.
+    Spøgelset (B269) holdt den on 06:35-08:46 i et tomt rum (sengetæller 0, dør
+    åben, presence-tænd opgraderede aldrig) → pre-lyset brændte 06:42-07:20 og
+    08:48-09:20, til no-motion-watchdog'en tog det; 13 episoder ≥ 8 min på 14
+    døgn (p50 1,1 min, p95 19,6). På samme 14 døgn slukkede watchdog'en loftet
+    29 gange mod 13 for den primære "tomt"-vej: backstoppen gjorde den primære
+    vejs arbejde. Svaret: bevis "gik ikke ind" med **ingen BEVÆGELSE siden
+    pre-lyset** (`moving_target.last_changed` før flagets) — den der går ind
+    bevæger sig, et spøgelse og en sovende gør ikke.
+
+    **(c) "ser nogen" kommer aldrig mens radaren er blind (B280, 2026-10-31).**
+    Puttelyset hang på fase 1, fordi hver vej ned krævede at radaren så nogen
+    eller at nogen trykkede, og børne-radaren var tom med to børn i sengen.
+    Svaret: en skrevet frist (`input_datetime.puttelys_konvergens_frist`) og en
+    vagt der lander på natlys (`grep -n "Sprint 2026-10-31" docs/sprint_log.md`).
+
+    **En BESKYTTELSE er også en udgang** (bug-hunt 2/11, PLAUSIBLE, B269):
+    `sove_sovende_beskyttes` slipper først når dvale-vidnet går off eller døren
+    åbner, så bag en lukket dør holder den lige så længe som spøgelset (2,4 % af
+    dagtimerne med tom seng, målt da den blev bygget).
+
+    **Signatur:** en lampe eller tilstand der kun forlades af sin BACKSTOP —
+    præcis backstop-tiden for sent — eller aldrig, mens et replay af historiske
+    hændelser ser sundt ud. **Mål det:** `./scripts/ha_health.sh backstop`
+    (watchdog/safety/vagt-andelen af hver lampes sluk, 7 døgn; første kørsel
+    fandt også B291, hvor proben er eneste skriver = et frekvens-spørgsmål);
+    for én lampe `hq.py who <lampe> --since 14d --all`.
+    **Metode:** spørg om HVER udgang: hvilken radar-tilstand venter den på, og
+    hvad lander den på når radaren lyver den anden vej (blip, spøgelse, blind)?
+    Bevis med det løgnen ikke kan forfalske: ingen BEVÆGELSE siden X (spøgelser
+    er stille), et anker der kun flyttes af en flanke der HOLDER, eller en
+    skrevet frist. Spejlbillede af #14: dér måles sustained forkert på en ANALOG
+    sensor, her slettes eller forfalskes stilheden af en radar der lyver.
 
 26. **🏠 En HUS-BRED gate på en RUM-SCOPET tilstand låser alle de rum
     tilstanden intet har med at gøre.** Set to gange i samme fil,
@@ -488,6 +524,27 @@ sessioners arbejde. Tjek disse aktivt — de er billige at undgå, dyre at opdag
     (2) Spørg om enhver bro: "hvilken hændelse må den IKKE bære kandidaten
     hen over?" (3) **`./scripts/ha_health.sh flipflop`** finder flag sat igen
     < 30 min efter clear (7 døgn); ét hit = to veje der overskriver hinanden.
+
+30. **📉 En omskalering pr. VÆRDI-ændring multiplicerer et flimmer — og de
+    mellemliggende trin går ikke op.** Fundet 2026-11-02 i
+    `packages/elpris_styring.yaml` (`elpris_daemp_taendte_lys`): en bar
+    state-trigger på `sensor.elpris_dim_factor` (intet `to:`/`from:`/`for:`)
+    omskalerede tændte lys med `ny / gammel` ved hvert skift. Fire
+    template-reloads (16:00-16:33, agentens egne deploys) fik faktoren til at
+    flimre 0,768 → 1,0 → 0,64 → 0,768 på 2 s; op-trinnet ramte loftet, og
+    `queued max 3` tabte trin → open plan mørkere for hver reload
+    (læselampe 17 % mod formlens 61 %). User: "open plan er mega mørkt".
+    **Hvorfor b103 ikke fangede den:** scanneren så kun `to:` uden `from:`;
+    en trigger UDEN `to:` reagerer på hver mellemværdi, ikke kun på
+    `unavailable`.
+    **Signatur:** tændte lys der står lavere end deres egen tænd-formel, og
+    en række omskalerings-kørsler i SAMME sekund som et reload/en restart.
+    **Metode:** (1) enhver relativ handling (×faktor, +delta) kræver at
+    kilden har HOLDT (`for:`) og `not_from/not_to: [unknown, unavailable]`.
+    (2) **Reload KUN via `python3 scripts/ha_reload.py templates`** —
+    snapshot → reload → diff → gendan mørklagte lys; `scripts/reload_guard.py`
+    afviser den bare service. (3) De øvrige bare triggers på template-
+    entities står i BACKLOG B294.
 
 ---
 

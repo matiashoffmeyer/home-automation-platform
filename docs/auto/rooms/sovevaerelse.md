@@ -6,7 +6,7 @@ Search keywords: `sovevaerelse, sove`
 
 ## Indhold
 - [Automations](sovevaerelse.md#automations) (37)
-- [Entities](sovevaerelse.md#entities) (240)
+- [Entities](sovevaerelse.md#entities) (242)
 - [Helpers](sovevaerelse.md#helpers) (86)
 
 ---
@@ -77,10 +77,10 @@ Search keywords: `sovevaerelse, sove`
   - 60-sek empty + lux>40 + morning → fade off sove. Catches scenarie hvor
 - **Lysnet: Soveværelse gang-early-detect pre-lys** (line 539, mode=single)
   - Bevægelse i entréen tænder sove-lyset svagt+varmt når mørkt + ikke godnat,
-- **Lysnet: Soveværelse gang-early-detect hurtig-sluk** (line 687, mode=restart)
-  - Entré i ro + sove stadig på pre-lys + rummet tomt (Apollo occupancy off) →
-- **Lysnet: Soveværelse ryd approach-flag ved lys-sluk** (line 723, mode=single)
-- **Lysnet: Soveværelse hygge-fade (ligger stille)** (line 766, mode=restart)
+- **Lysnet: Soveværelse gang-early-detect hurtig-sluk** (line 688, mode=restart)
+  - Entré i ro + sove stadig på pre-lys + ingen bevægelse i rummet siden
+- **Lysnet: Soveværelse ryd approach-flag ved lys-sluk** (line 737, mode=single)
+- **Lysnet: Soveværelse hygge-fade (ligger stille)** (line 780, mode=restart)
   - Still-target on + ingen bevægelse i settle_delay = man ligger i sengen →
 
 ### `automations/somrig_buttons.yaml`
@@ -140,7 +140,7 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.dark_mode_sove` — 3 refs in 3 file(s)
 - `binary_sensor.filmmoerke_sove` — 13 refs in 7 file(s)
 - `binary_sensor.mood_pause_sovevaerelse` — 3 refs in 2 file(s)
-- `binary_sensor.parasoll_sovedoer` — 17 refs in 5 file(s)
+- `binary_sensor.parasoll_sovedoer` — 20 refs in 5 file(s)
 - `binary_sensor.sove_aften_laasevindue` — 2 refs in 2 file(s)
 - `binary_sensor.sove_alarm_morgen_lys` — 14 refs in 4 file(s)
 - `binary_sensor.sove_alarm_morgen_to_oppe` — 19 refs in 6 file(s)
@@ -152,19 +152,21 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sove_gardin_bad_klar` — 13 refs in 4 file(s)
 - `binary_sensor.sove_moerke_godnat_kandidat` — 2 refs in 1 file(s)
 - `binary_sensor.sove_morgen_moerklagt` — 7 refs in 5 file(s)
+- `binary_sensor.sove_nat_vindue` — 2 refs in 1 file(s)
 - `binary_sensor.sove_radar_frossen` — 3 refs in 3 file(s)
 - `binary_sensor.sove_radiator_signatur` — 1 refs in 1 file(s)
 - `binary_sensor.sove_retur_til_seng` — 8 refs in 4 file(s)
 - `binary_sensor.sove_seng_til_doer` — 1 refs in 1 file(s)
 - `binary_sensor.sove_sovende_beskyttes` — 7 refs in 4 file(s)
+- `binary_sensor.sove_stille_krop_bag_lukket_dor` — 2 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_occupancy` — 90 refs in 45 file(s)
 - `binary_sensor.sovevaerelse_apollo_online` — 1 refs in 1 file(s)
-- `binary_sensor.sovevaerelse_apollo_radar_moving_target` — 18 refs in 10 file(s)
+- `binary_sensor.sovevaerelse_apollo_radar_moving_target` — 19 refs in 10 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_still_target` — 21 refs in 9 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_zone_1_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_zone_2_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_zone_3_occupancy` — 1 refs in 1 file(s)
-- `binary_sensor.sovevaerelse_dvale_vidne` — 21 refs in 10 file(s)
+- `binary_sensor.sovevaerelse_dvale_vidne` — 23 refs in 10 file(s)
 - `binary_sensor.sovevaerelse_empty_effective` — 2 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_lys_on_effektiv` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv` — 40 refs in 16 file(s)
@@ -200,7 +202,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_boolean.putning_sove_active` — 26 refs in 13 file(s)
 - `input_boolean.roborock_styrbar_kort_op_sovevaerelse` — 1 refs in 1 file(s)
 - `input_boolean.roborock_styrbar_lang_op_sovevaerelse` — 1 refs in 1 file(s)
-- `input_boolean.sove_approach_lit` — 14 refs in 3 file(s)
+- `input_boolean.sove_approach_lit` — 15 refs in 3 file(s)
 - `input_boolean.sove_evening_hold` — 7 refs in 3 file(s)
 - `input_boolean.sove_gardin_aftenluk_enabled` — 6 refs in 5 file(s)
 - `input_boolean.sove_gardin_bad_foerste_besoeg_ovre` — 13 refs in 4 file(s)
@@ -210,7 +212,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_boolean.sove_morgen_anden_krop` — 5 refs in 2 file(s)
 - `input_boolean.sove_radar_watchdog_enabled` — 2 refs in 2 file(s)
 - `input_boolean.sove_retur_enabled` — 2 refs in 2 file(s)
-- `input_boolean.sove_seng_taeller_enabled` — 13 refs in 7 file(s)
+- `input_boolean.sove_seng_taeller_enabled` — 15 refs in 8 file(s)
 - `input_boolean.sovevaerelse_manual_off_lock` — 24 refs in 8 file(s)
 - `input_boolean.sovevaerelse_morgen_beskyttelse_enabled` — 6 refs in 5 file(s)
 - `input_boolean.styrbar_lr_grace_sovevaerelse` — 3 refs in 2 file(s)
@@ -287,7 +289,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_number.sove_retur_seng_cm` — 6 refs in 5 file(s)
 - `input_number.sove_retur_vindue_sekunder` — 5 refs in 3 file(s)
 - `input_number.sove_seng_bliv_sekunder` — 2 refs in 2 file(s)
-- `input_number.sove_seng_personer` — 34 refs in 7 file(s)
+- `input_number.sove_seng_personer` — 37 refs in 8 file(s)
 - `input_number.sove_seng_still_sekunder` — 2 refs in 2 file(s)
 - `input_number.sove_sengelys_brightness` — 2 refs in 2 file(s)
 - `input_number.sove_snooze_knap_minutter` — 3 refs in 3 file(s)

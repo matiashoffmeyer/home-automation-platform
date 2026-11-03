@@ -35,6 +35,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RULES_DIR = os.path.join(ROOT, ".claude", "rules")
 CLAUDE_MD_WARN_BYTES = 40_000
 MAX_SPRINT_NOTES = 3
+# Claude Code viser højst ~10 000 tegn additionalContext inline; mere gemmes i
+# en fil med 2 KB preview. Målt 3/11: 7 af 25 sessioner fik ha_yaml +
+# lux_dagslys + presence_radar i ét hug (16,5 KB) — modellen åbnede aldrig
+# filen, og markøren forhindrede at reglerne kom igen. → højst så meget pr. kald;
+# resten venter (umarkeret) til næste kald der rører en dækket fil.
+INJECT_MAX_CHARS = 9_000
 
 
 def glob_to_regex(g):
@@ -126,6 +132,11 @@ def check():
                 errs.append(
                     f".claude/rules/{name}.md: glob '{g}' rammer ingen trackede filer (omdøbt/slettet?)"
                 )
+        if len(_inject_text(name, r["body"])) > INJECT_MAX_CHARS:
+            errs.append(
+                f".claude/rules/{name}.md er over {INJECT_MAX_CHARS} tegn — hooken kan ikke vise den "
+                f"inline (Claude Code gemmer den i en fil, og modellen læser den ikke); del den op"
+            )
         if f"`{name}.md`" not in claude_md:
             errs.append(f".claude/rules/{name}.md mangler i CLAUDE.md's index-tabel (Domæne-fakta)")
     for row in re.findall(r"^\| `([a-z0-9_]+)\.md` \|", claude_md, re.M):
@@ -267,6 +278,13 @@ def _files_in(toks):
     return out
 
 
+def _inject_text(name, body):
+    return (
+        f"Contents of .claude/rules/{name}.md (path-scopet regel; dette Bash/Grep-kald rører "
+        f"en fil den dækker — vises én gang pr. session):\n\n{body.strip()}"
+    )
+
+
 def hook():
     data = json.load(sys.stdin)
     tool = data.get("tool_name") or ""
@@ -297,21 +315,22 @@ def hook():
         return
     mdir = os.path.join(tempfile.gettempdir(), "claude_rules")
     os.makedirs(mdir, exist_ok=True)
-    new = []
+    rules = load_rules()
+    chunks, used = [], 0
     for r in hit:
         marker = os.path.join(mdir, f"{sid}_{r}")
         if os.path.exists(marker):
             continue
+        chunk = _inject_text(r, rules[r]["body"])
+        if not native:
+            if chunks and used + len(chunk) > INJECT_MAX_CHARS:
+                continue  # umarkeret → kommer med næste kald
+            chunks.append(chunk)
+            used += len(chunk)
         open(marker, "w").close()
-        new.append(r)
-    if native or not new:
+    if native or not chunks:
         return  # Read/Edit/Write: Claude Code har selv loadet reglen
-    rules = load_rules()
-    text = "\n\n".join(
-        f"Contents of .claude/rules/{r}.md (path-scopet regel; dette Bash/Grep-kald rører "
-        f"en fil den dækker — vises én gang pr. session):\n\n{rules[r]['body'].strip()}"
-        for r in new
-    )
+    text = "\n\n".join(chunks)
     print(
         json.dumps(
             {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}},

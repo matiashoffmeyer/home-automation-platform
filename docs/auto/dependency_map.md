@@ -29,8 +29,8 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `sensor.open_plan_lux` | 35 | 107 |
 | `light.entre_loft` | 35 | 83 |
 | `light.boernevaerelse_hygge_strip` | 33 | 92 |
+| `binary_sensor.godnat_common_active` | 33 | 89 |
 | `binary_sensor.depot_valhorn_occupancy` | 32 | 72 |
-| `binary_sensor.godnat_common_active` | 32 | 86 |
 | `input_boolean.cinema_active` | 30 | 60 |
 | `light.stue_plug` | 30 | 81 |
 

@@ -17,6 +17,10 @@ Pick one or two clusters, in this order of yield:
 - **A contested lamp's ownership registry and its history.** Start the finder
   in `docs/auto/ejerskab/<lamp>.md` and `python3 scripts/hq.py who <lamp>`:
   the real collisions are in `who`, not in the code.
+- **A lamp whose backstop does the primary exit's job**: `./scripts/ha_health.sh
+  backstop` (~2 min). A watchdog among the top off-writers means a primary exit
+  waits for a radar state that never comes (failure class 25; B290 was found
+  this way in `who`, before any finder ran).
 - **Fresh code**: files changed in the last three days (`git log --since=3.days --name-only`).
 - **Fix churn**: `git log --grep=fix --name-only --since=30.days | sort | uniq -c | sort -rn | head`.
 

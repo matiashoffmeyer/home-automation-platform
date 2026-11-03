@@ -19,6 +19,8 @@
 #                                       #   (user-spec; the rule leaked for months)
 #   ./scripts/ha_health.sh nuc          # the NUC's health: SMART, wear window,
 #                                       #   writes per day, temperature (B272)
+#   ./scripts/ha_health.sh backstop     # lamps whose watchdog does the primary
+#                                       #   exit's job (failure class #25, B290)
 #   ./scripts/ha_health.sh log [n]      # the last n lines of the core log (200)
 #   ./scripts/ha_health.sh flags|flipflop|lights|noisy|zha|docs|backup|sys
 
@@ -247,6 +249,11 @@ check_docs() {
 # rettelse). Reglen lækkede i tre måneder fordi intet tjekkede det viste tal.
 check_people() { hdr "People count kun ned ved hoveddør"; python3 "$(dirname "$0")/people_invariant.py" --dage 2; }
 
+# Fejlklasse #25: en udgang der venter på at radaren siger ÉN ting, arver dens
+# løgn den anden vej — og så tager watchdog'en over, en halv time for sent
+# (B290: sove-loftet slukket 29× af spøgelses-watchdog'en mod 13× af "tomt").
+check_backstop() { hdr "Backstop gør den primære vejs arbejde (7 døgn)"; python3 "$(dirname "$0")/backstop_share.py" --dage 7; }
+
 check_nuc() {
   # B272: SMART-tallene er HA's 6-timers aflæsning (scripts/nuc_smart.py kan kun
   # køre i den privilegerede HA-container); temperatur og skrivninger læses live.
@@ -318,6 +325,7 @@ case "${1:-all}" in
   blind)  check_blind ;;
   kamera) check_kamera ;;
   people) check_people ;;
+  backstop) check_backstop ;;
   flags)  check_flags ;;
   lights) check_lights ;;
   noisy)  check_noisy ;;
@@ -328,6 +336,6 @@ case "${1:-all}" in
   flipflop) check_flipflop ;;
   nuc)    check_nuc ;;
   log)    curl -s -m 30 "${AUTH[@]}" "http://supervisor/core/logs?lines=${2:-200}" ;;
-  all)    check_deploy; check_blind; check_kamera; check_people; check_flags; check_flipflop; check_lights; check_noisy; check_zha; check_docs; check_backup; check_sys; check_nuc ;;
+  all)    check_deploy; check_blind; check_kamera; check_people; check_flags; check_flipflop; check_backstop; check_lights; check_noisy; check_zha; check_docs; check_backup; check_sys; check_nuc ;;
   *)      sed -n '2,20p' "$0"; exit 1 ;;
 esac

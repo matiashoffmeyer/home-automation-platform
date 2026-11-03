@@ -294,7 +294,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `sensor.boernevaerelse_apollo_lux` — 6 refs in 4 file(s)
 - `sensor.boernevaerelse_apollo_radar_move_energy` — 1 refs in 1 file(s)
 - `sensor.boernevaerelse_apollo_radar_moving_distance` — 4 refs in 3 file(s)
-- `sensor.boernevaerelse_apollo_radar_still_distance` — 5 refs in 4 file(s)
+- `sensor.boernevaerelse_apollo_radar_still_distance` — 6 refs in 5 file(s)
 - `sensor.boernevaerelse_apollo_radar_still_energy` — 1 refs in 1 file(s)
 - `sensor.boernevaerelse_apollo_temperature` — 3 refs in 2 file(s)
 - `sensor.boernevaerelse_apollo_uptime` — 2 refs in 1 file(s)

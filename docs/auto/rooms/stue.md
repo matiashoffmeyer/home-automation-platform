@@ -95,7 +95,7 @@ Search keywords: `stue, open_plan`
 ### `binary_sensor.*`
 
 - `binary_sensor.dark_mode_stue` — 20 refs in 8 file(s)
-- `binary_sensor.filmmoerke_stue` — 16 refs in 10 file(s)
+- `binary_sensor.filmmoerke_stue` — 17 refs in 10 file(s)
 - `binary_sensor.godnat_spisestue_sol_under_graense` — 1 refs in 1 file(s)
 - `binary_sensor.mood_pause_stue` — 15 refs in 7 file(s)
 - `binary_sensor.open_plan_empty_for_20m` — 4 refs in 3 file(s)

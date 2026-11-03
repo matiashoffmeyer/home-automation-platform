@@ -46,11 +46,6 @@ hører den i "Permanente fakta" eller som en fejlklasse — ikke i en sprint-not
   dør. `binary_sensor.people_fest` (min(45-, 15-min-snit af optagne zoner) ≥ 4,2;
   uden fest max 3,71 på 30 døgn) løfter buddet til 3,0 × masse, loft 30. Massen
   tæller IKKE 1-4 personer (p50 1,5-1,8 for alle) — faktoren hviler på én fest. B271.
-- **2026-10-31 — en tilstand der kun forlades når en radar SER noget, hænger
-  når radaren er blind.** Puttelyset stod på fase 1 (31/10, 23/10, 14/10 efter en
-  reload) fordi hver vej ned krævede radar eller et tryk. Nu en skrevet frist
-  (`input_datetime.puttelys_konvergens_frist`) + `automation.puttelys_konvergens_vagt`
-  der lander på natlys. Spørg om ENHVER venteløkke: hvad lander den, når intet sker? B280.
 ---
 
 ## 💡 Permanente fakta (destilleret fra arkiverede sprints)
@@ -78,6 +73,8 @@ gotchas m.fl. står i `.claude/rules/ha_yaml.md`, som loades ved første YAML-l�
   pre-commit**; er flanken selve BEVISET → dens `ALLOWLIST` med et hvorfor).
   **Og en `delay_on`-sensor laver en ÆGTE `off → on` præcis `delay_on` efter
   reloadet** → guard på off-fasens længde; reload automations FØR templates.
+  **Reload KUN via `python3 scripts/ha_reload.py templates`** (gendanner
+  mørklagte lys; `reload_guard.py` afviser den bare service, #30).
 - **HA SEGFAULTER under nedlukning (pychromecast-tråd, Python 3.14) → den
   afsluttende restore-state-skrivning sker ALDRIG**; kun 15-min-dumpet overlever.
   **Signatur: skyder-/boolean-ændringer fra de sidste < 15 min før en restart
@@ -167,7 +164,7 @@ Filosofien er uændret (**langsomt + grundigt frem for hurtigt**) — pengene sk
 bruges på diagnose og verifikation.
 
 - **Klassificér opgaven FØRST:** Er det SIMPEL (ændre én kendt slider/tærskel) = `< 10 tool-calls, INGEN fuld fil-Read`. Er det UNDERSØGELSE (bug-hunt/ny feature) = fuld log/history-graving. Det dyre anti-mønster er fuld udgravning til en tekstrettelse.
-- **Kontekst-længden ER regningen (målt 2026-10-08):** hvert kald genlæser hele samtalen — cache-reads ≈ 70 % af forbruget, og modellens egen thinking er ca. halvdelen af væksten. Loft: `autoCompactWindow: 200000` i NUC'ens `~/.claude/settings.json` (1M-vinduet compactede aldrig; sessioner nåede 820k). `/clear` mellem urelaterede opgaver. Cache-TTL'en (1 t) styrer Claude Code selv: efter en pause > 1 t skrives HELE konteksten igen til dobbelt pris → stor kontekst før en lang fysisk test = bed user om `/compact` først. Genlæs aldrig det du allerede har; hent kun det nye.
+- **Kontekst-længden ER regningen (målt 2026-11-03, `python3 scripts/token_audit.py sessions|context`):** hvert kald genlæser hele samtalen inkl. din thinking (≈ 18 % af forbruget). Loft `autoCompactWindow: 200000` står i **`.claude/settings.json`** (git; i `~/.claude` forsvandt det 29/10). CLAUDE.md er 18,6k af 33k fast kontekst (dansk ≈ 2,1 tegn/token). `/clear` mellem urelaterede opgaver. Pause > 1 t = HELE konteksten skrives igen til dobbelt pris → stor kontekst før en lang fysisk test = bed user om `/compact` først. Genlæs aldrig det du har; hent kun det nye.
 - **Spar ALDRIG på:** logs/history-graving ved en bug, kalibrering mod ægte data, eller verifikation efter deploy.
 - **Anti-mønstre:** re-Read'e en fil du selv lige har rettet · dumpe rå `/api/states` i stedet for at filtrere med python/grep. 
 
@@ -512,12 +509,15 @@ opdage. **Her står kun signatur → metode. Incident, måledata og fuld begrund
    evigt.** **Signatur:** en entity i toppen af `ha_health.sh noisy` hvor næsten
    alle rækker er attribut-ændringer. → Gate attributten på den tilstand hvor
    den er meningsfuld og kvantisér mod den tærskel den sammenlignes med.
-25. **"X har været `off` i N minutter" på en radar-afledt binær er uopfyldelig —
-   ét 1-sekunds blip sletter hele den opsparede tid.** **Signatur:** en gate der
-   ALDRIG fyrer, hvor hver betingelse ser rimelig ud, og hvor et replay af
-   *historiske* hændelser ser sundt ud. → Mål stilhed på et anker der kun
-   flyttes af en flanke der HOLDER (`sensor.last_sustained_presence`).
-   Spejlbillede af #14.
+25. **En udgang der venter på at en radar siger ÉN ting, arver radarens løgn den
+   anden vej:** "off i N min" slettes af ét blip, "tomt" kommer aldrig under et
+   still-spøgelse (B290), "ser nogen" aldrig mens den er blind (B280) — og en
+   beskyttelse der slipper på "tomt" er også en udgang. **Signatur:** watchdog'en
+   gør den primære vejs arbejde, præcis backstop-tiden for sent
+   (`./scripts/ha_health.sh backstop`) — eller tilstanden forlades aldrig. →
+   spørg hver udgang hvad den lander på når radaren lyver; bevis med det løgnen
+   ikke kan forfalske: ingen BEVÆGELSE siden X, et anker der kun flyttes af en
+   flanke der HOLDER (`sensor.last_sustained_presence`), eller en skrevet frist.
 28. **Et high-water-mark på et flimrende signal gemmer flimmerets TOP, og en
    bonus betinget af en radars øjebliks-state arver dens flimmer. Signatur:**
    et tal der springer i takt med én radar og hænger på den høje værdi i
@@ -528,6 +528,9 @@ opdage. **Her står kun signatur → metode. Incident, måledata og fuld begrund
    Signatur:** en automatik der sætter et flag få min efter at den MODSATTE
    vej ryddede det, på et backstop-tick. → tæl også fra flagets seneste
    skift; `./scripts/ha_health.sh flipflop`.
+30. **En omskalering pr. VÆRDI-ændring (bar trigger, `ny/gammel`) multiplicerer
+   et reload-flimmer — trinnene går ikke op. Signatur:** tændte lys under deres
+   egen tænd-formel efter et reload. → `for:` + `not_from/not_to`; B294.
 
 **Tid, test og spor**
 

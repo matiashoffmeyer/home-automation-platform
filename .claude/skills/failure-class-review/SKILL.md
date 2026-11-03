@@ -39,6 +39,7 @@ git diff -U0 | grep -oE '(light|switch|input_boolean|input_number|binary_sensor|
 | 19 | Does the blocked action fire the second the block lifts? | the action needs its own condition |
 | 21 | Is the kill switch a `condition` on every path in? | `grep -rn <feature>_enabled` against `grep -rn <action>` |
 | 22 | Did every automation load? | `./scripts/ha_health.sh deploy` after reload |
+| 25 | Which radar state does each exit (or protection) wait for, and what lands when the radar lies the other way: a blip, a still ghost, a blind radar? | prove with what the lie cannot fake (no movement since X, an anchor moved only by a flank that holds, a written deadline); `./scripts/ha_health.sh backstop`, or `hq.py who <lamp> --since 14d --all` — a watchdog among the top off-writers means the primary exit is dead |
 | 26 | Is a house-wide gate locking a room-scoped state? | scope the gate and its neighbour conditions |
 | 27 | Does a borrower hand back a stale snapshot? | ask the house again at hand-back |
 | 29 | Does a soak/backstop count time from BEFORE the opposite path cleared the flag? | also require `now() - <flag>.last_changed ≥ soak`; `./scripts/ha_health.sh flipflop` |

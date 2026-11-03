@@ -19,8 +19,10 @@
 #   1. sengetælleren > 0 (input_number.sove_seng_personer) — hovedbeviset;
 #      2/11 05:35 var døren ÅBEN hele natten, kun tælleren bar.
 #   2. stille krop (sovevaerelse_dvale_vidne: 150 s hold ind, 16 min bro ud)
-#      bag LUKKET dør (binary_sensor.parasoll_sovedoer off) — fanger en sovende
-#      tælleren har tabt. Den der kommer ind åbner døren → spærren slipper.
+#      der er OPSTÅET bag lukket dør (binary_sensor.parasoll_sovedoer off;
+#      sove_stille_krop_bag_lukket_dor) — fanger en sovende tælleren har
+#      tabt. Den der kommer ind åbner døren → spærren slipper og re-armer ikke
+#      når døren lukkes igen.
 # Slipper når I står op: tælleren tæller ud, og døren står åben.
 # Forbrugere — ALLE automatiske tænd-veje for sove-lys (fejlklasse #21: en spærre
 # der ikke står på hver vej ind, er pynt). `grep -rn sove_sovende_beskyttes`:
@@ -31,22 +33,97 @@
 # respekteres altid), alarm-vækningen ("er en alarm sat vækkes vi"),
 # røgalarm-blink og strøm-recovery.
 #
+# 2026-11-02 16:00 (user-bug "mørkt ved bevægelse"): vidnet havde stået on
+# (spøgelses-still) siden 06:31 med døren ÅBEN i 9½ t. 15:55 gik user ind og
+# lukkede døren bag sig → "stille krop bag lukket dør" → alt auto-lys spærret
+# under bevægelse. At døren LUKKES beviser intet om kroppen bag den; den der
+# lukker kan lige så vel være på vej IND. Derfor tæller leg 2 nu kun en stille
+# krop der er OPSTÅET bag en allerede lukket dør (vidnets off→on mens døren er
+# lukket) — trigger-sensoren nedenfor. Mister den en sovende fordi partneren
+# åbnede og lukkede døren, bærer sengetælleren (hovedbeviset).
+#
 # Fejlklasse #9: en død dør eller et dødt vidne er INGEN indikation (fail-open
 # pr. kanal) — de andre kanaler bærer stadig. Er tælleren slået fra, tæller den
 # ikke. Ingen now() → skriver kun når en kilde skifter (#24).
 # =============================================================================
 
 template:
+  # Stille krop der er opstået BAG en lukket dør. Trigger-sensor = skrevet
+  # tilstand der overlever restart (last_changed duer ikke). `from: "off"` /
+  # `from: "on"` gør reload-/opstarts-flanker (unavailable → x) usynlige (B103).
+  - trigger:
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_dvale_vidne
+        from: "off"
+        to: "on"
+        id: vidne_on
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_dvale_vidne
+        from: "on"
+        to: "off"
+        id: vidne_off
+      - platform: state
+        entity_id: binary_sensor.parasoll_sovedoer
+        from: "off"
+        to: "on"
+        id: doer_aaben
+      - platform: state
+        entity_id: binary_sensor.parasoll_sovedoer
+        from: "on"
+        to: "off"
+        id: doer_lukket
+    binary_sensor:
+      - name: "Sove stille krop bag lukket dør"
+        unique_id: sove_stille_krop_bag_lukket_doer
+        icon: mdi:door-closed-lock
+        state: >-
+          {{ trigger.id == 'vidne_on'
+             and is_state('binary_sensor.parasoll_sovedoer', 'off') }}
+
+  # Nat-vinduet (2026-11-02, user-spec: "brug non-godnat vinduet dynamisk").
+  # ON fra godnat (common: voksen/fuld/pending/kalde — børne-putning alene
+  # åbner det ikke, jf. presence_sovevaerelse) og efter godnat-clear SÅ LÆNGE
+  # sengetælleren stadig har nogen i sengen (2/11 05:39: godmorgen-clear på et
+  # brusebad mens partneren sov — tælleren stod på 1). OFF når godnat er slut
+  # OG tælleren er 0 → et sengetæller-udslag om dagen åbner det aldrig (lur om
+  # dagen = Dark Mode-knappen). Trigger-sensor: gendanner state efter restart;
+  # `from:` gør reload-flanker usynlige (B103).
+  - trigger:
+      - platform: state
+        entity_id: binary_sensor.godnat_common_active
+        from: "off"
+        to: "on"
+      - platform: state
+        entity_id: binary_sensor.godnat_common_active
+        from: "on"
+        to: "off"
+      - platform: state
+        entity_id: input_number.sove_seng_personer
+    binary_sensor:
+      - name: "Sove nat-vindue"
+        unique_id: sove_nat_vindue
+        icon: mdi:weather-night
+        state: >-
+          {% set seng = is_state('input_boolean.sove_seng_taeller_enabled', 'on')
+                        and states('input_number.sove_seng_personer') | int(0) > 0 %}
+          {{ is_state('binary_sensor.godnat_common_active', 'on')
+             or (this.state == 'on' and seng) }}
+
   - binary_sensor:
       - name: "Sove sovende beskyttes"
         unique_id: sove_sovende_beskyttes
         icon: mdi:bed-clock
+        # 2026-11-02 (user-spec): "om dagen vil jeg jo ha lys. hvis jeg vil
+        # sove om dagen bruger jeg dark mode knappen." → spærren gælder KUN i
+        # nat-vinduet ovenfor (dynamisk efter godnat, ikke et klokkeslæt).
         state: >-
+          {% set nat = is_state('binary_sensor.sove_nat_vindue', 'on') %}
           {% set seng = is_state('input_boolean.sove_seng_taeller_enabled', 'on')
                         and states('input_number.sove_seng_personer') | int(0) > 0 %}
-          {{ seng
-             or (is_state('binary_sensor.sovevaerelse_dvale_vidne', 'on')
-                 and is_state('binary_sensor.parasoll_sovedoer', 'off')) }}
+          {{ nat and (seng
+             or (is_state('binary_sensor.sove_stille_krop_bag_lukket_dor', 'on')
+                 and is_state('binary_sensor.sovevaerelse_dvale_vidne', 'on')
+                 and is_state('binary_sensor.parasoll_sovedoer', 'off'))) }}
         attributes:
           grunde: >-
             {% set g = [] %}
@@ -54,8 +131,10 @@ template:
                   and states('input_number.sove_seng_personer') | int(0) > 0 %}
               {% set g = g + ['sengetæller ' ~ states('input_number.sove_seng_personer') | int(0)] %}
             {% endif %}
-            {% if is_state('binary_sensor.sovevaerelse_dvale_vidne', 'on')
+            {% if is_state('binary_sensor.sove_stille_krop_bag_lukket_dor', 'on')
+                  and is_state('binary_sensor.sovevaerelse_dvale_vidne', 'on')
                   and is_state('binary_sensor.parasoll_sovedoer', 'off') %}
               {% set g = g + ['stille krop bag lukket dør'] %}
             {% endif %}
-            {{ g | join(', ') if g else 'ingen' }}
+            {{ (g | join(', ') if g else 'ingen')
+               if is_state('binary_sensor.sove_nat_vindue', 'on') else 'udenfor nat-vinduet: ingen spærre' }}

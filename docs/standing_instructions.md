@@ -666,6 +666,28 @@ vægtet cache-read 0,1 · input 1 · cache-write 2 · output 5):
 - CLAUDE.md 61 → 35 KB sparede ~10k tokens/kald (2-4 %); de path-scopede regler
   giver 6-20k tilbage i typiske sessioner.
 
+**Revideret 2026-11-03 — loftet bor i git, og den faste kontekst er skåret 32 %.**
+`python3 scripts/token_audit.py sessions` (pris/kontekst pr. session, advarer om
+sessioner over 200k uden compaction) og `token_audit.py context` (fast kontekst
+pr. kategori via `/context`, `--settings '<json>'` til A/B før commit). 25
+sessioner 29/10-3/11:
+
+| | Før | Efter |
+|---|---|---|
+| Auto-compact-vindue | 1M (`~/.claude` nulstillet 29/10) | 200k (`.claude/settings.json`) |
+| System tools (Artifact 10,3k, brugt 0×) | 20,1k | 10,2k |
+| Skills (23 aldrig kaldt af modellen) | 6,2k | 1k |
+| Fast kontekst pr. kald | ~48,6k | 33,1k |
+
+- Thinking bliver i konteksten resten af sessionen (Δkontekst = hele forrige
+  output inkl. thinking) → 7,7 % som output + 10,4 % som genlæsning.
+- CLAUDE.md er 18,6k tokens for 40 KB: dansk ≈ 2,1 tegn/token. Hver linje i den
+  koster ≈ 0,47 % af forbruget pr. 1k tokens.
+- `skillOverrides: user-invocable-only` skjuler en skill for modellen, men
+  `/navn` virker. `enableArtifact: false` kan kun sættes FRA i projekt-settings.
+- Regel-hooken: Claude Code viser højst ~10 000 tegn `additionalContext` inline
+  → `INJECT_MAX_CHARS` i `scripts/claude_rules.py`.
+
 ### Andre standing instructions
 
 - **People count falder KUN efter hoveddøren** (user-spec 2026-07-22, gentaget
