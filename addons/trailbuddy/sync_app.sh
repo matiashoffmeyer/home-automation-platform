@@ -13,7 +13,7 @@ else
   git clone --depth 1 --branch main "$SRC" "$REPO"
 fi
 rm -rf "$HERE/app"; mkdir -p "$HERE/app"
-for f in index.html sw.js manifest.webmanifest css js vendor data icons tiles; do
+for f in index.html sw.js manifest.webmanifest css js vendor data icons tiles watch; do
   cp -R "$REPO/$f" "$HERE/app/"
 done
 cp "$REPO/server/trailbuddy_server.py" "$HERE/"

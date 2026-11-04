@@ -7,8 +7,8 @@ and codified guardrails, tests and Home Assistant's own validator decide what
 reaches the house.
 
 It turns mmWave radar presence, Zigbee and Thread devices, phone location and
-cloud data (weather, electricity prices) into decisions about light, curtains,
-climate and notifications. It has been in daily use since March 2026.
+cloud data (weather, electricity prices, parliament votes) into decisions about
+light, curtains, climate and notifications. It has been in daily use since March 2026.
 
 | | |
 |---|---|
@@ -25,6 +25,7 @@ climate and notifications. It has been in daily use since March 2026.
 | **Morning** | A night-time visit that turns into getting up slowly brightens the open plan, and the radio starts at low volume. |
 | **Day** | The kitchen light follows measured daylight, and the blinds keep direct sun off a moss wall picture. |
 | **Daily** | Both phones vote on dishes, and the approved ones land on one shared shopping list. |
+| **Before a vote** | A bill from the Danish parliament arrives as a push with For, Against and Neutral; after the final vote, the house tallies which parties and members voted most like the answer. |
 | **Cheap hours** | The e-bikes charge when electricity is cheapest; in expensive hours the lights can dim. |
 | **Away** | When the last person leaves through the front door, the house goes dormant, and the robot vacuum cleans if the house has been busy enough. |
 | **Evening** | The light gets warmer, a projector mode darkens three rooms, and the house notices when everyone has gone to bed. |
@@ -82,6 +83,19 @@ Danish) records the request it answers and the measurements behind its numbers.
   ([`mad_planlaegning`](packages/mad_planlaegning.yaml), [`nemlig_kurv`](packages/nemlig_kurv.yaml),
   [docs/nemlig_kurv.md](docs/nemlig_kurv.md)). A meal detected from movement
   between kitchen and dining room can trigger a spot clean.
+- **Preparing for the next election.** Bills and parliamentary resolutions
+  from the Danish parliament's open data API ([oda.ft.dk](https://oda.ft.dk/))
+  arrive as pushes with For, Against and Neutral buttons, *before* parliament
+  votes, so the answer is a position and not a reaction to the result. When
+  the final vote is in, every answer is compared with each party's side and
+  with every member's recorded vote, and a dashboard ranks the parties and
+  politicians the household has agreed with most during the electoral term. Neutral, absence and split
+  parties do not count. A language model writes one neutral line per pushed
+  bill under a monthly spending ceiling (well under a cent each); the page
+  itself shows parliament's own summary. The answers are political opinions,
+  so they stay in the private repository, and the page is admin-only
+  ([`folketing`](packages/folketing.yaml), [`scripts/folketing.py`](scripts/folketing.py),
+  [`ai_forbrug`](packages/ai_forbrug.yaml)).
 - **Robot vacuum.** Cleans while the house is dormant once enough active hours
   have built up, with deeper runs when children have been home
   ([`roborock`](packages/roborock.yaml)).

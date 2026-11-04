@@ -14,8 +14,11 @@ add-on has no host ports; HA reads it on the Docker network as
 
 - The app: offline topo map, route stats, POIs, day plan, weather tab.
 - `/api/weather`, `/api/briefing`: the trip forecast (Open-Meteo), refreshed every 2 h.
+  They hold the camp coordinates, so they need the trip code too
+  (`?code=<trip_code>` or header `X-Trip-Code`).
 - `/api/group/<trip_code>`: each hiker's latest position and progress. The trip
   code is required, and without it nobody's position is visible.
+- `/api/camps/<trip_code>`: where the group actually camps each night (moved in the app).
 - `/api/om`, `/api/proxy`: Open-Meteo / Google Sheets / Overpass for the app.
 
 ## Install
@@ -59,6 +62,16 @@ and verify on `version`.
 
 - The add-on container is internet-facing through Funnel. It holds only the
   route, POIs, forecasts and the group's positions, and no HA token.
-- `/api/proxy` only fetches from Google Sheets, googleusercontent and Overpass.
-- Request bodies are capped at 64 KB; group entries keep a fixed set of fields.
+- Trip code: constant-time compare; after 20 wrong codes in 10 min every code
+  gets 429 until the window clears. Use 2–3 random words, not a name.
+- `/api/proxy` only fetches from Google Sheets, googleusercontent and Overpass,
+  follows redirects only to those hosts, answers only as JSON/CSV/text (never
+  HTML) in a sandbox, and the proxies are rate-limited (60/min).
+- Every page gets a strict Content-Security-Policy, `nosniff`, `X-Frame-Options:
+  DENY` and no referrer; no folder listings; the trip code is masked in the log.
+- Request bodies are capped at 64 KB; group entries keep a fixed set of fields
+  (numbers must be finite, text ≤ 80 chars, ≤ 20 members); camps take day 1–30
+  and a valid lat/lon only.
+- After the first start you can clear `tailscale_authkey`; the node keeps its
+  identity in `/data`.
 - Turn the `funnel` option off (or stop the add-on) after the trip.
