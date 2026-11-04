@@ -26,6 +26,8 @@ Hjælperskripter til codebase navigation, validation, og safe refactoring.
 | `session_start.sh` | SessionStart-hook: synk git-hooks, bagud-tjek, cloud-venv | Auto ved session-start |
 | `hq.py state\|hist\|flanks\|who\|auto\|find\|where\|tmpl` | Live HA-data som kompakt TSV (lokal tid, end_time-chunking, recorder-attribution) — erstatter ad hoc curl/sqlite | Hver undersøgelse |
 | `claude_rules.py check\|hook` | `.claude/rules/`: lint (pre-commit) + Bash/Grep-hook der giver path-scopede regler | Auto (pre-commit + hook) |
+| `token_audit.py sessions\|context\|push` | Claude Code-forbrug fra transcripts: pris/kontekst pr. session, fast kontekst via `/context`, time-statistik til Statistik → Claude | Manuelt + SessionStart/SessionEnd (push) |
+| `dash_screenshot.py <sti>` | PNG af et Lovelace-view som telefon/desktop ser det (headless Chromium i Docker, read-only) | Manuelt efter dashboard-ændringer |
 | `backstop_share.py [--dage N]` | Lamper hvis watchdog gør den primære udgangs arbejde (fejlklasse #25) — via `ha_health.sh backstop` | Ugentligt (`ha_health.sh`) / bug-hunt |
 
 Se [docs/konsolidering.md](../docs/konsolidering.md) for hvorfor og hvordan.

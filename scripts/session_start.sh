@@ -10,6 +10,8 @@
 #   2. "Check status before you code": how far behind origin/main are we?
 #   3. In the cloud: build the Home Assistant venv for scripts/ha_offline.py
 #      in the background, so `check` and `staging` are ready when needed.
+#   4. On the NUC: refresh the token statistics (Statistik -> Claude) in the
+#      background (scripts/token_audit.py push; SessionEnd runs it too).
 # Output is at most 2 lines, because everything here is paid for in tokens in
 # every session. Never fails the session: everything is best-effort, exit 0.
 # =============================================================================
@@ -49,6 +51,11 @@ if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] && [ -f scripts/ha_offline.py ]; then
         nohup python3 scripts/ha_offline.py check > .cache/ha-offline/bootstrap.log 2>&1 &
         notes+=("ha_offline-venv bygges i baggrunden")
     fi
+fi
+
+# 4) token-statistik til HA (baggrund, tavs; kun hvor supervisoren findes)
+if [ -n "${SUPERVISOR_TOKEN:-}" ] && [ -f scripts/token_audit.py ]; then
+    nohup python3 scripts/token_audit.py push --quiet >/dev/null 2>&1 &
 fi
 
 if [ "$behind" = "0" ]; then

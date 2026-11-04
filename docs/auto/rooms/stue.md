@@ -61,7 +61,7 @@ Search keywords: `stue, open_plan`
 - **Lysnet: Sofa-stue tænd** (line 185, mode=single)
 - **Lysnet: Spisestue gradvis sluk** (line 391, mode=restart)
   - 2026-06-19 (user-spec): spisestue-loftet slukker når spisebords-Apolloen
-- **Lysnet: Sofa-stue gradvis sluk** (line 514, mode=restart)
+- **Lysnet: Sofa-stue gradvis sluk** (line 521, mode=restart)
   - 2026-06-19: sofa-lamperne slukker når sofa-Apolloen (stue_apollo) har været
 
 ### `automations/somrig_buttons.yaml`

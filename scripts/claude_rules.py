@@ -9,7 +9,7 @@ matching file. This script closes two gaps:
          would load in every session, which is CLAUDE.md's job); every glob
          matches at least one tracked file (otherwise a renamed file silently
          orphans the rule); every rule is listed in CLAUDE.md's index table;
-         and "Seneste sprints" holds at most ``MAX_SPRINT_NOTES`` notes.
+         and "Recent sprints" holds at most ``MAX_SPRINT_NOTES`` notes.
          CLAUDE.md's size is only a warning.
   hook   PreToolUse (.claude/settings.json). Native loading only sees Read, so
          a session that reads or edits YAML through ``sed``, ``cat`` or
@@ -138,7 +138,7 @@ def check():
                 f"inline (Claude Code gemmer den i en fil, og modellen læser den ikke); del den op"
             )
         if f"`{name}.md`" not in claude_md:
-            errs.append(f".claude/rules/{name}.md mangler i CLAUDE.md's index-tabel (Domæne-fakta)")
+            errs.append(f".claude/rules/{name}.md mangler i CLAUDE.md's index-tabel (Domain facts)")
     for row in re.findall(r"^\| `([a-z0-9_]+)\.md` \|", claude_md, re.M):
         if row not in rules:
             errs.append(
@@ -146,7 +146,7 @@ def check():
             )
     # Sprint-noterne ruller: én ind = den ældste ud til docs/sprint_log.md i
     # SAMME commit. Stod før kun som tekst og voksede derfor i stilhed.
-    m = re.search(r"^## 🕐 Seneste sprints.*?$(.*?)^(?:---|## )", claude_md, re.M | re.S)
+    m = re.search(r"^## 🕐 Recent sprints.*?$(.*?)^(?:---|## )", claude_md, re.M | re.S)
     if m:
         n_sprints = len(re.findall(r"^- \*\*", m.group(1), re.M))
         if n_sprints > MAX_SPRINT_NOTES:
@@ -155,7 +155,7 @@ def check():
                 f"ud til docs/sprint_log.md i samme commit"
             )
     else:
-        errs.append("CLAUDE.md: sektionen '## 🕐 Seneste sprints' blev ikke fundet (omdøbt?)")
+        errs.append("CLAUDE.md: sektionen '## 🕐 Recent sprints' blev ikke fundet (omdøbt?)")
     size = len(claude_md.encode("utf-8"))
     if size > CLAUDE_MD_WARN_BYTES:
         warns.append(

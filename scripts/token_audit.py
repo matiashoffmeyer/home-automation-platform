@@ -14,6 +14,12 @@ the method each time (2026-10-08 and 2026-11-03 both started from scratch).
                        `/context` and prints the fixed context per category
                        (system tools, CLAUDE.md, skills) and the effective
                        auto-compact window. No model call.
+  push                 Hourly aggregates -> Home Assistant long-term statistics
+                       (external, `claude:*`), shown on Statistik -> Claude.
+                       Backfills everything the transcripts still hold; hours
+                       whose transcripts Claude Code has since cleaned up are
+                       kept in .cache/token_audit/hourly.json. Runs in the
+                       background from the SessionStart/SessionEnd hooks.
 
 Weights are relative to the input price: cache read 0.1, input 1, cache write
 2 (1 h TTL) / 1.25 (5 min), output 5. Thinking counts as output and stays in
@@ -26,6 +32,7 @@ See docs/standing_instructions.md, "Token-økonomi".
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import glob
 import json
@@ -44,9 +51,9 @@ def transcript_dir() -> str:
     return PROJECTS + re.sub(r"[^A-Za-z0-9]", "-", ROOT)
 
 
-def load_calls(path: str) -> tuple[list[dict], int]:
-    """API calls (one per message.id) and the number of compactions."""
-    calls, seen, compactions = [], set(), 0
+def load_calls(path: str) -> tuple[list[dict], list[str]]:
+    """API calls (one per message.id) and the timestamps of compactions."""
+    calls, seen, compactions = [], set(), []
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             try:
@@ -56,7 +63,7 @@ def load_calls(path: str) -> tuple[list[dict], int]:
             if d.get("isCompactSummary") or (
                 d.get("type") == "system" and "compact" in str(d.get("subtype", ""))
             ):
-                compactions += 1
+                compactions.append(d.get("timestamp", ""))
             if d.get("type") != "assistant":
                 continue
             m = d.get("message") or {}
@@ -114,7 +121,7 @@ def cmd_sessions(days: int) -> int:
                 "ctx0": ctx(calls[0]),
                 "mean": sum(map(ctx, calls)) / n,
                 "max": max(map(ctx, calls)),
-                "comp": comp,
+                "comp": len(comp),
                 "cost": sum(map(cost, calls)),
                 "sub": sub,
                 "think_out": sum(c["think"] for c in calls) * W["out"],
@@ -220,6 +227,192 @@ def cmd_context(extra: list[str]) -> int:
     return 0
 
 
+CACHE = os.path.join(ROOT, ".cache", "token_audit", "hourly.json")
+WS = "ws://supervisor/core/websocket"
+# (statistic_id, navn, enhed, slags): "mean" = gennemsnit/min/max pr. time,
+# "sum" = timens total + løbende sum (statistics-graph `change` = pr. dag).
+STATS = [
+    ("tokens_pr_kald", "Pris pr. kald", "k tokens", "mean"),
+    ("kontekst_pr_kald", "Kontekst pr. kald", "k tokens", "mean"),
+    ("fast_kontekst", "Kontekst ved sessionsstart", "k tokens", "mean"),
+    ("tokens", "Pris i alt", "M tokens", "sum"),
+    ("tokens_cache_laes", "Cache-læsning", "M tokens", "sum"),
+    ("tokens_cache_skriv", "Cache-skrivning", "M tokens", "sum"),
+    ("tokens_output", "Output", "M tokens", "sum"),
+    ("tokens_thinking", "Heraf thinking", "M tokens", "sum"),
+    ("tokens_subagenter", "Heraf subagenter", "M tokens", "sum"),
+    ("kald", "API-kald", "kald", "sum"),
+    ("sessioner", "Sessioner", "sessioner", "sum"),
+    ("compactions", "Compactions", "compactions", "sum"),
+]
+# Enheden bestemmer skalaen: rå tokens gav 8-cifrede tal, som HA's kort ikke
+# kan vise på en telefon (målt med scripts/dash_screenshot.py 3/11).
+SCALE = {"k tokens": 1e3, "M tokens": 1e6}
+
+
+def _hour(t: dt.datetime) -> str:
+    return t.astimezone(dt.UTC).replace(minute=0, second=0, microsecond=0).isoformat()
+
+
+def hourly() -> dict[str, dict]:
+    """Time-aggregater fra alle transcripts (hovedsessioner + subagenter)."""
+    base = transcript_dir()
+    hours: dict[str, dict] = {}
+
+    def h(key: str) -> dict:
+        return hours.setdefault(
+            key,
+            {
+                "calls": 0,
+                "cost": 0.0,
+                "ctx": 0,
+                "ctx_min": None,
+                "ctx_max": 0,
+                "c_min": None,
+                "c_max": 0.0,
+                "cr": 0.0,
+                "cw": 0.0,
+                "out": 0.0,
+                "think": 0.0,
+                "sub": 0.0,
+                "ctx0": [],
+                "comp": 0,
+            },
+        )
+
+    for f in glob.glob(os.path.join(base, "*.jsonl")):
+        calls, comp = load_calls(f)
+        if len(calls) >= 2:  # én-kalds-prober (`claude -p`) er ikke sessioner
+            h(_hour(calls[0]["t"]))["ctx0"].append(ctx(calls[0]))
+        for c in calls:
+            b = h(_hour(c["t"]))
+            k, x = cost(c), ctx(c)
+            b["calls"] += 1
+            b["cost"] += k
+            b["ctx"] += x
+            b["ctx_min"] = x if b["ctx_min"] is None else min(b["ctx_min"], x)
+            b["ctx_max"] = max(b["ctx_max"], x)
+            b["c_min"] = k if b["c_min"] is None else min(b["c_min"], k)
+            b["c_max"] = max(b["c_max"], k)
+            b["cr"] += c["cr"] * W["cr"]
+            b["cw"] += c["cw1h"] * W["cw1h"] + c["cw5m"] * W["cw5m"] + c["inp"] * W["inp"]
+            b["out"] += c["out"] * W["out"]
+            b["think"] += c["think"] * W["out"]
+        for ts in comp:
+            if ts:
+                h(_hour(dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))))["comp"] += 1
+        sid = os.path.basename(f)[:-6]
+        for s in glob.glob(os.path.join(base, sid, "subagents", "**", "*.jsonl"), recursive=True):
+            for c in load_calls(s)[0]:
+                k = cost(c)
+                b = h(_hour(c["t"]))
+                b["sub"] += k
+                b["cr"] += c["cr"] * W["cr"]
+                b["cw"] += c["cw1h"] * W["cw1h"] + c["cw5m"] * W["cw5m"] + c["inp"] * W["inp"]
+                b["out"] += c["out"] * W["out"]
+                b["think"] += c["think"] * W["out"]
+    # Claude Code sletter gamle transcripts (cleanupPeriodDays) → behold de
+    # timer cachen kender, ellers falder de løbende summer tilbage.
+    try:
+        with open(CACHE, encoding="utf-8") as fh:
+            old = json.load(fh)
+    except OSError, ValueError:
+        old = {}
+    merged = {**old, **hours}
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+    with open(CACHE + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(merged, fh)
+    os.replace(CACHE + ".tmp", CACHE)
+    return merged
+
+
+def build_stats(hours: dict[str, dict]) -> dict[str, list[dict]]:
+    unit = {sid: u for sid, _, u, _ in STATS}
+
+    def sc(sid: str, v: float) -> float:
+        f = SCALE.get(unit[sid], 1)
+        return round(v / f, 3 if f > 1 else 0)
+
+    out: dict[str, list[dict]] = {sid: [] for sid, *_ in STATS}
+    run: dict[str, float] = {}
+    for key in sorted(hours):
+        b = hours[key]
+        means = {}
+        if b["calls"]:
+            means["tokens_pr_kald"] = (b["cost"] / b["calls"], b["c_min"], b["c_max"])
+            means["kontekst_pr_kald"] = (b["ctx"] / b["calls"], b["ctx_min"], b["ctx_max"])
+        if b["ctx0"]:
+            v = b["ctx0"]
+            means["fast_kontekst"] = (sum(v) / len(v), min(v), max(v))
+        for sid, (m, lo, hi) in means.items():
+            out[sid].append(
+                {"start": key, "mean": sc(sid, m), "min": sc(sid, lo), "max": sc(sid, hi)}
+            )
+        per_hour = {
+            "tokens": b["cost"] + b["sub"],
+            "tokens_cache_laes": b["cr"],
+            "tokens_cache_skriv": b["cw"],
+            "tokens_output": b["out"],
+            "tokens_thinking": b["think"],
+            "tokens_subagenter": b["sub"],
+            "kald": b["calls"],
+            "sessioner": len(b["ctx0"]),
+            "compactions": b["comp"],
+        }
+        for sid, v in per_hour.items():
+            run[sid] = run.get(sid, 0.0) + v
+            out[sid].append({"start": key, "state": sc(sid, v), "sum": sc(sid, run[sid])})
+    return out
+
+
+async def _import(stats: dict[str, list[dict]]) -> int:
+    import websockets
+
+    tok = os.environ.get("SUPERVISOR_TOKEN")
+    if not tok:
+        raise RuntimeError("SUPERVISOR_TOKEN mangler (kører vi uden for add-on'et?)")
+    async with websockets.connect(WS, max_size=None, open_timeout=10) as ws:
+        await ws.recv()
+        await ws.send(json.dumps({"type": "auth", "access_token": tok}))
+        if json.loads(await ws.recv()).get("type") != "auth_ok":
+            raise RuntimeError("websocket-auth afvist")
+        n = 0
+        for i, (sid, name, unit, kind) in enumerate(STATS, start=1):
+            rows = stats[sid]
+            if not rows:
+                continue
+            meta = {
+                "source": "claude",
+                "statistic_id": f"claude:{sid}",
+                "name": name,
+                "unit_of_measurement": unit,
+                "unit_class": None,
+                "has_sum": kind == "sum",
+                "mean_type": 1 if kind == "mean" else 0,
+            }
+            msg = {"id": i, "type": "recorder/import_statistics", "metadata": meta, "stats": rows}
+            await ws.send(json.dumps(msg))
+            res = json.loads(await asyncio.wait_for(ws.recv(), 30))
+            if not res.get("success"):
+                raise RuntimeError(f"claude:{sid}: {res.get('error')}")
+            n += len(rows)
+        return n
+
+
+def cmd_push(quiet: bool) -> int:
+    hours = hourly()
+    stats = build_stats(hours)
+    try:
+        n = asyncio.run(_import(stats))
+    except (OSError, RuntimeError, TimeoutError) as e:
+        if not quiet:
+            print(f"push fejlede: {e}", file=sys.stderr)
+        return 1
+    if not quiet:
+        print(f"{n} time-rækker i {len(STATS)} statistikker (claude:*), {len(hours)} timer i alt")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -227,11 +420,15 @@ def main(argv: list[str] | None = None) -> int:
     sp = ap.add_subparsers(dest="cmd", required=True)
     p = sp.add_parser("sessions", help="pris og kontekst pr. session")
     p.add_argument("--days", type=int, default=7)
+    p = sp.add_parser("push", help="time-statistik til Home Assistant (claude:*)")
+    p.add_argument("--quiet", action="store_true", help="intet output (hooks)")
     p = sp.add_parser("context", help="fast kontekst pr. kategori via /context")
     p.add_argument("--settings", help="ekstra settings-JSON (sammenlign en ændring før commit)")
     a = ap.parse_args(argv)
     if a.cmd == "sessions":
         return cmd_sessions(a.days)
+    if a.cmd == "push":
+        return cmd_push(a.quiet)
     return cmd_context(["--settings", a.settings] if a.settings else [])
 
 

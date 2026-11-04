@@ -8,7 +8,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 
 | Entity | Files | Refs |
 |---|---|---|
-| `input_select.house_mode` | 127 | 306 |
+| `input_select.house_mode` | 127 | 307 |
 | `input_select.house_state` | 75 | 249 |
 | `binary_sensor.stue_apollo_occupancy_filtered` | 50 | 122 |
 | `light.spisestue_loft` | 49 | 125 |

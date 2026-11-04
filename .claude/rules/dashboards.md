@@ -28,6 +28,12 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   DELMÆNGDE ligner en konkurrent. Navnet må bære relationen (`👻 heraf uden
   radio`), og en ny serie skal ind i ALLE periode-varianter af kortet.
 
+- **"Det parser" siger intet om om teksten kan læses** (3/11: Claude-fanens tal
+  blev afkortet til "7,179,1… toke…" på telefonen) → se siden før du erklærer den
+  færdig: `python3 scripts/dash_screenshot.py /<dash>/<view>` (telefon-bredde;
+  `--height 760 --scroll N` for fuld opløsning, `--desktop`). Store tal → skalér
+  enheden (k/M) ved kilden; et `statistic`-kort har ingen præcisions-option.
+
 ## Standing instruction: tekst på dashboards (flyttet fra CLAUDE.md 📊)
 
 - **Tekst på dashboards (per 2026-09-29, user-spec: "kun hvad jeg har brug for

@@ -69,18 +69,18 @@ Search keywords: `sovevaerelse, sove`
 ### `automations/presence_sovevaerelse.yaml`
 
 - **Lysnet: Soveværelse tænd** (line 11, mode=single)
-- **Lysnet: Soveværelse gradvis sluk** (line 255, mode=restart)
+- **Lysnet: Soveværelse gradvis sluk** (line 269, mode=restart)
   - 5-minute absence rule (private-rum standard). Hold-alive modes respected. Fade 30s.
-- **Lysnet: Soveværelse no-motion watchdog (spøgelses-still)** (line 349, mode=single)
+- **Lysnet: Soveværelse no-motion watchdog (spøgelses-still)** (line 363, mode=single)
   - Ingen moving-target i slider-minutter mens lyset er tændt → sluk, uanset
-- **Lysnet: Soveværelse hurtig sluk når tomt + dagslys** (line 430, mode=restart)
+- **Lysnet: Soveværelse hurtig sluk når tomt + dagslys** (line 444, mode=restart)
   - 60-sek empty + lux>40 + morning → fade off sove. Catches scenarie hvor
-- **Lysnet: Soveværelse gang-early-detect pre-lys** (line 539, mode=single)
+- **Lysnet: Soveværelse gang-early-detect pre-lys** (line 553, mode=single)
   - Bevægelse i entréen tænder sove-lyset svagt+varmt når mørkt + ikke godnat,
-- **Lysnet: Soveværelse gang-early-detect hurtig-sluk** (line 688, mode=restart)
+- **Lysnet: Soveværelse gang-early-detect hurtig-sluk** (line 702, mode=restart)
   - Entré i ro + sove stadig på pre-lys + ingen bevægelse i rummet siden
-- **Lysnet: Soveværelse ryd approach-flag ved lys-sluk** (line 737, mode=single)
-- **Lysnet: Soveværelse hygge-fade (ligger stille)** (line 780, mode=restart)
+- **Lysnet: Soveværelse ryd approach-flag ved lys-sluk** (line 751, mode=single)
+- **Lysnet: Soveværelse hygge-fade (ligger stille)** (line 794, mode=restart)
   - Still-target on + ingen bevægelse i settle_delay = man ligger i sengen →
 
 ### `automations/somrig_buttons.yaml`
@@ -157,12 +157,12 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sove_radiator_signatur` — 1 refs in 1 file(s)
 - `binary_sensor.sove_retur_til_seng` — 8 refs in 4 file(s)
 - `binary_sensor.sove_seng_til_doer` — 1 refs in 1 file(s)
-- `binary_sensor.sove_sovende_beskyttes` — 7 refs in 4 file(s)
+- `binary_sensor.sove_sovende_beskyttes` — 8 refs in 4 file(s)
 - `binary_sensor.sove_stille_krop_bag_lukket_dor` — 2 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_occupancy` — 90 refs in 45 file(s)
 - `binary_sensor.sovevaerelse_apollo_online` — 1 refs in 1 file(s)
-- `binary_sensor.sovevaerelse_apollo_radar_moving_target` — 19 refs in 10 file(s)
-- `binary_sensor.sovevaerelse_apollo_radar_still_target` — 21 refs in 9 file(s)
+- `binary_sensor.sovevaerelse_apollo_radar_moving_target` — 20 refs in 10 file(s)
+- `binary_sensor.sovevaerelse_apollo_radar_still_target` — 22 refs in 9 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_zone_1_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_zone_2_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_zone_3_occupancy` — 1 refs in 1 file(s)

@@ -687,6 +687,12 @@ sessioner 29/10-3/11:
   `/navn` virker. `enableArtifact: false` kan kun sættes FRA i projekt-settings.
 - Regel-hooken: Claude Code viser højst ~10 000 tegn `additionalContext` inline
   → `INJECT_MAX_CHARS` i `scripts/claude_rules.py`.
+- CLAUDE.md er på engelsk siden 3/11 (15,3k tokens; dansk var 18,6k). De lange
+  versioner her og i docs/ forbliver danske; grep-hints i CLAUDE.md bruger danske
+  nøgleord.
+- Grafer: Statistik → Claude (`token_audit.py push`, kører fra SessionStart/
+  SessionEnd). Pris pr. kald, kontekst pr. kald, kontekst ved sessionsstart,
+  pris pr. dag fordelt, kald/sessioner/compactions.
 
 ### Andre standing instructions
 

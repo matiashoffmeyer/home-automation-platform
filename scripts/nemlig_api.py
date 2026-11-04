@@ -5,7 +5,9 @@ API-fladen er reverse-engineeret (jf. github.com/schourode/nemlig) og verificere
 live 2026-08-31. Den er LILLE — fire kald bærer hele integrationen:
 
     POST /webapi/login/login            {Username, Password, ...}  -> sætter .ASPXAUTH
-    GET  /webapi/s/0/1/0/Search/Search  ?query=&take=              -> produkter + lager
+    GET  {GATEWAY_SOEG}                 ?query=&take= + Bearer     -> produkter + lager
+        (2026-11: /webapi/s/0/1/0/Search/Search svarer nu "Not-found" med 200 —
+         søgningen flyttede til searchgateway; se Nemlig.search)
     GET  /webapi/basket/GetBasket                                  -> nuværende kurv
     POST /webapi/basket/AddToBasket     {productId, quantity}      -> sæt antal
 
@@ -63,6 +65,10 @@ UA = (
 # Sessionen holder i praksis timer, men udløbet kan ikke aflæses i cookien.
 # 6 timer er konservativt: et for tidligt udløb koster kun ét ekstra login.
 SESSION_MAX_ALDER = 6 * 3600
+# Søgningen siden ~oktober 2026 (målt 4/11: det gamle webapi-endpoint gav en
+# 200 "Not-found"-side, så ALLE varer endte som ingen_traef uden en fejl).
+GATEWAY_SOEG = "https://webapi.prod.knl.nemlig.it/searchgateway/api/search"
+GATEWAY_TOKEN_S = 240  # /webapi/Token udsteder JWT'er med expires_in 300
 RATE_LIMIT_S = 0.7  # schourode brugte 1,0 — vi er lidt hurtigere, stadig høfligt
 
 # Under denne score lægger vi IKKE varen i kurven af os selv. Målt 2026-08-31:
@@ -237,6 +243,7 @@ class Nemlig:
         self.cj = http.cookiejar.CookieJar()
         self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cj))
         self._logget_ind = False
+        self._gw_token, self._gw_token_tid, self._gw_params = None, 0.0, None
         self._genindlaes_session()
 
     # -- session-persistens --------------------------------------------------
@@ -353,10 +360,45 @@ class Nemlig:
         return True
 
     def search(self, query, take=12):
-        """Søgning virker uden login, men et login giver `Favorite`-flaget — og
-        en vare brugeren HAR købt før er et stærkere match end navne-lighed."""
+        """Søgning via searchgateway (JWT fra /webapi/Token). Login giver
+        `Favorite`-flaget — og en vare brugeren HAR købt før er et stærkere
+        match end navne-lighed. `includeFavorites` skal være debitor-id'et
+        (målt: "1" giver 0 favoritter); leveringszonen styrer lagerstatus."""
         self.login()
-        svar = self._kald("GET", "/s/0/1/0/Search/Search", params={"query": query, "take": take})
+        if self._gw_params is None:
+            kurv = self._kald("GET", "/basket/GetBasket")
+            bruger = self._kald("GET", "/user/GetCurrentUser")
+            self._gw_params = {
+                "timeslotUtc": kurv.get("TimeslotUtc"),
+                "deliveryZoneId": kurv.get("DeliveryZoneId"),
+                "includeFavorites": bruger.get("DebitorId"),
+            }
+        params = {"query": query, "take": take, "skip": 0, "recipeCount": 0}
+        params.update({k: v for k, v in self._gw_params.items() if v})
+        url = GATEWAY_SOEG + "?" + urllib.parse.urlencode(params)
+        for forsoeg in (0, 1):
+            if forsoeg or time.time() - self._gw_token_tid > GATEWAY_TOKEN_S:
+                self._gw_token = self._kald("GET", "/Token").get("access_token")
+                self._gw_token_tid = time.time()
+            time.sleep(RATE_LIMIT_S)
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": UA,
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {self._gw_token}",
+                },
+            )
+            try:
+                with self.op.open(req, timeout=30) as r:
+                    svar = json.loads(r.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and not forsoeg:
+                    continue
+                raise NemligFejl(f"søgning {query!r} -> HTTP {e.code}") from e
+            except (urllib.error.URLError, TimeoutError) as e:
+                raise NemligFejl(f"søgning {query!r} -> {e}") from e
         return (svar.get("Products") or {}).get("Products") or []
 
     @staticmethod

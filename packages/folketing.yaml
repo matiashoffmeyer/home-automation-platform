@@ -1,0 +1,135 @@
+# =============================================================================
+# Folketinget — demokratisk forberedelse (2026-11-04)
+# =============================================================================
+# User-spec: "forberede mig til næste folketingsvalg så jeg stemmer på dem jeg
+# har været mest enig med i valgperioden." Valg samme dag: spørg FØR
+# Folketinget stemmer (1a), Neutral tæller ikke med (2a), lovforslag OG
+# beslutningsforslag (3b), AI via HA's egen integration (4a).
+#
+# scripts/folketing.py henter Folketingets Åbne Data (oda.ft.dk, ingen nøgle)
+# og sender højst input_number.folketing_pr_dag pushes med For/Imod/Neutral.
+# Siden viser Folketingets eget resumé. AI (Haiku via scripts/ai_forbrug.py,
+# fælles loft input_number.ai_loft_kr_maaned) skriver KUN én neutral linje til
+# den sag der pushes (~0,7 øre) — titelkortet siger sjældent retningen
+# ("hold øje med costs", 2026-11-04). Loftet nået → titelkortet.
+# Svarene: ai_feedback/folketing_feedback.jsonl (git, privat data).
+#
+# Enighed:  parti   = konklusionens parti-lister (splittet parti tæller ikke;
+#                     tom konklusion → partier hvor ALLE fremmødte stemte ens)
+#           medlem  = hver Stemme (fravær og "hverken" tæller ikke, som dit Neutral)
+#
+# WIRING
+#   sensor.folketing (command_line) → `status`: JSON fra cachen + starter en
+#     detached `scan` når den sidste er > 55 min gammel. Kører ved HA-start og
+#     hvert kvarter; scanningen beder selv sensoren genlæse bagefter.
+#   push-knap FT_<SVAR>_<sag-id> → automation herunder → script.folketing_svar
+#   Folketing-siden (dashboards/folketing.yaml) → script.folketing_svar (aktuel sag)
+#   Notifikation: notif_id folketing (🔔-fanen), hjemkomst-kø default ON —
+#     et knapsvar på mobildata når aldrig frem (mad-spørgsmålene 2026-08-06).
+#
+# AirBnB: ingen _airbnb-toggle → aldrig push i AirBnB; køen venter bare.
+# Siden kræver admin (svarene er politiske holdninger).
+# =============================================================================
+
+input_number:
+  folketing_pr_dag:
+    name: "Folketinget — pushes pr. dag"
+    min: 0
+    max: 10
+    step: 1
+    mode: slider
+    icon: mdi:bank
+
+command_line:
+  - sensor:
+      name: "Folketing"
+      unique_id: folketing
+      icon: mdi:bank
+      command: "python3 /config/scripts/folketing.py status"
+      command_timeout: 30
+      scan_interval: 900
+      value_template: "{{ value_json.state }}"
+      json_attributes:
+        - aktuel
+        - naeste
+        - besvaret
+        - sammenlignet
+        - partier
+        - politikere
+        - politikere_mindst
+        - seneste
+        - sidst_scannet
+        - venter
+
+shell_command:
+  # Templated shell_command = exec uden shell; scriptet validerer sag/svar.
+  folketing_svar: "python3 /config/scripts/folketing.py svar {{ sag }} {{ svar }} {{ kilde }}"
+
+script:
+  # ÉN vej ind til et svar (fejlklasse #2): push-knappen og Folketing-siden.
+  folketing_svar:
+    alias: "Folketinget: gem svar"
+    icon: mdi:vote
+    mode: queued
+    max: 10
+    fields:
+      svar:
+        description: "FOR, IMOD eller NEUTRAL"
+        required: true
+      sag:
+        description: "Sagens id (udeladt = den aktuelle på Folketing-siden)"
+        required: false
+      kilde:
+        description: "push eller side"
+        required: false
+    sequence:
+      - variables:
+          # Valgfrie felter er UDEFINEREDE hvis de ikke sendes med (Jinja-gotcha).
+          s: >-
+            {% if sag is defined and sag %}{{ sag | string | trim }}
+            {% else %}{{ (state_attr('sensor.folketing', 'aktuel') or {}).get('id', '') }}{% endif %}
+          v: "{{ (svar if svar is defined else '') | string | upper | trim }}"
+          k: "{{ (kilde if kilde is defined else 'side') | string | lower | trim }}"
+      - condition: template
+        value_template: "{{ s | trim | regex_match('^[0-9]{1,9}$') and v in ['FOR', 'IMOD', 'NEUTRAL'] }}"
+      - service: shell_command.folketing_svar
+        data:
+          sag: "{{ s | trim }}"
+          svar: "{{ v }}"
+          kilde: "{{ k }}"
+      - service: homeassistant.update_entity
+        target:
+          entity_id: sensor.folketing
+      # Svaret fra siden: tag pushen af telefonen (en clear er ingen besked →
+      # uden om push_notify og dens AirBnB-tavshed, som planter).
+      - service: notify.mobile_app_phone_a
+        continue_on_error: true
+        data:
+          message: clear_notification
+          data:
+            tag: "folketing_{{ s | trim }}"
+
+automation:
+  - id: folketing_push_svar
+    alias: "Folketinget: svar fra push-knap"
+    description: >
+      For/Imod/Neutral på en Folketing-push (FT_<SVAR>_<sag-id>, sendt af
+      scripts/folketing.py) → script.folketing_svar.
+    mode: queued
+    max: 10
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+    conditions:
+      - condition: template
+        value_template: >
+          {{ trigger.event.data.action | default('')
+             | regex_match('^FT_(FOR|IMOD|NEUTRAL)_[0-9]+$') }}
+    actions:
+      - variables:
+          dele: "{{ trigger.event.data.action.split('_') }}"
+      - action: script.folketing_svar
+        data:
+          svar: "{{ dele[1] }}"
+          sag: "{{ dele[2] }}"
+          kilde: push

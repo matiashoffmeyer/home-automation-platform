@@ -42,13 +42,15 @@ model er involveret, kun et menneskes valg der huskes.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import ha_secrets  # noqa: E402  (sti skal sættes først)
+import ai_forbrug  # noqa: E402  (sti skal sættes først)
+import ha_secrets  # noqa: E402
 import mad_planner as MP  # noqa: E402
 import nemlig_api as NA  # noqa: E402
 
@@ -284,6 +286,9 @@ def parr(
                 for t in traef
                 if t["id"] != valgt["id"]
             ][:4],
+            # Kun til ai_tjek (et byt skal regne pakker ud fra den RÅ vare);
+            # fjernes før noget publiceres.
+            "_traef": {t["id"]: t for t in traef},
         }
         # Kategorien SKAL med: for vin står vareordet slet ikke i navnet
         # («P.Maufoux Chardonnay Horizon»), kun i ProductCategoryGroupName.
@@ -320,6 +325,117 @@ def parr(
             post["status"] = "ok"
         ud.append(post)
     return ud
+
+
+# =============================================================================
+# AI-tjekket (2026-11-04, user: "en ai går igennem at de rigtige vare er blevet
+# valgt og retter forkerte vare")
+# =============================================================================
+# ÉT samlet kald pr. kørsel (≈ 3-4k tokens ind, ~200 ud ≈ 3-5 øre) via
+# scripts/ai_forbrug.py, der fører regnskab og stopper ved månedsloftet. Kun
+# matcherens EGNE valg tjekkes: et lært valg er brugerens, og det rører AI'en
+# aldrig. AI'en må kun vælge blandt de produkter søgningen faktisk fandt —
+# den kan ikke finde på et produkt-id — og et byt kræver lager.
+#   ok      + "c er rigtig"    → byttes (begrundelse "AI-rettet")
+#   ok      + "ingen passer"   → usikker = et spørgsmål til dig, ikke i kurven
+#   usikker + "tag c"          → ok (det var den slags matcheren spurgte om)
+# Fejl, timeout eller nået loft → kurven bygges som før, uden AI.
+AI_PROMPT = """Du tjekker en dansk indkøbsliste, der automatisk er parret med varer
+i netbutikken Nemlig. For hver linje står opskriftens vare og nogle produkter;
+a) er det produkt der er valgt nu. Er a) den vare opskriften mener, er alt godt
+— også hvis mærke, øko, smag, variant eller pakke er en anden. Ret KUN når a)
+er en ANDEN slags vare (fx edamame til "grønne bønner", sodavand til "squash",
+croissant til "smør").
+
+Svar KUN med linjer for de varer hvor a) er forkert, i formatet
+  <nr>: <bogstav på det rigtige produkt, eller - hvis intet passer>
+Er alle a) rigtige, svar præcis: OK
+
+{linjer}"""
+
+
+def _ai_linje(nr, b):
+    navne = [b["produkt"]] + [a["navn"] for a in b["alternativer"]]
+    return f"{nr}. {b['navn']}: " + " ".join(f"{chr(97 + i)}) {n}" for i, n in enumerate(navne))
+
+
+def _byt(b, ny, grund):
+    """Skift beslutningen til alternativet `ny` (et søge-træf med `_raw`)."""
+    antal, hvorfor = NA.antal_pakker(b["maengde"], b["enhed"], ny["_raw"], navn=b["navn"])
+    gammel = b["produkt"]
+    b.update(
+        produkt=ny["navn"],
+        id=ny["id"],
+        score=round(ny["score"], 2),
+        antal=antal,
+        pakke=ny["pakning"],
+        hvorfor=hvorfor,
+        pris=ny["pris"],
+        oeko=ny["oeko"],
+        tilbud=ny["tilbud"],
+        kategori=ny.get("kategori"),
+        merpris_oeko=None,
+        besparelse_est=None,
+        status="ok",
+        begrundelse=f"AI: {grund}" if grund else "AI-rettet",
+        ai_rettet_fra=gammel,
+    )
+
+
+def ai_tjek(beslutninger):
+    """→ liste af {navn, fra, til, grund} for det AI'en ændrede."""
+    tjek = [
+        b
+        for b in beslutninger
+        if b["status"] in ("ok", "usikker") and not b.get("laert") and b.get("produkt")
+    ]
+    if not tjek:
+        return []
+    prompt = AI_PROMPT.format(linjer="\n".join(_ai_linje(i + 1, b) for i, b in enumerate(tjek)))
+    try:
+        svar = str(ai_forbrug.generer(f"nemlig {len(tjek)} varer", prompt) or "")
+    except Exception as e:  # AiLoft, timeout, HA nede → uden AI, som før
+        log(f"AI-tjek sprunget over: {e}")
+        return []
+    log(f"AI-tjek ({len(tjek)} varer): {svar.strip()[:400]!r}")
+    rettet = []
+    for linje in svar.splitlines():
+        m = re.match(r"\s*(\d+)\s*[:.)]\s*([a-e]|-)(?![a-zæøå])", linje, re.I)
+        if not m or not 1 <= int(m.group(1)) <= len(tjek):
+            continue
+        b = tjek[int(m.group(1)) - 1]
+        valg, grund = m.group(2).lower(), ""
+        fra = b["produkt"]
+        if valg == "a":
+            continue  # det valgte er rigtigt
+        if valg == "-":
+            if b["status"] == "ok":
+                b["status"] = "usikker"
+                b["begrundelse"] = f"AI: {grund or 'ingen passer'}"
+                rettet.append({"navn": b["navn"], "fra": fra, "til": None, "grund": grund})
+            continue
+        i = ord(valg) - 98  # b) = første alternativ
+        if i >= len(b["alternativer"]):
+            continue
+        alt = b["alternativer"][i]
+        ny = (b.get("_traef") or {}).get(alt["id"])
+        if ny is None or not ny["paa_lager"]:
+            # Det rigtige alternativ er udsolgt → spørg hellere end at købe forkert.
+            b["status"] = "usikker"
+            b["begrundelse"] = f"AI: {alt['navn']} er rigtig, men udsolgt"
+            rettet.append(
+                {"navn": b["navn"], "fra": fra, "til": None, "grund": "rigtig vare udsolgt"}
+            )
+            continue
+        gammel = (b.get("_traef") or {}).get(b["id"]) or {}
+        if gammel.get("undergruppe") and gammel["undergruppe"] == ny.get("undergruppe"):
+            # Samme blad i Nemligs varetræ = samme vareart (fx to rugbrød):
+            # en smagssag, ikke en fejl. Målt 4/11: Haiku byttede rugbrød.
+            continue
+        _byt(b, ny, grund)
+        b["alternativer"] = [a for a in b["alternativer"] if a["id"] != ny["id"]]
+        rettet.append({"navn": b["navn"], "fra": fra, "til": ny["navn"], "grund": grund})
+    return rettet
 
 
 # =============================================================================
@@ -824,7 +940,7 @@ def regnskab(beslutninger):
     }
 
 
-def rapport(beslutninger, lagt, kurv_total, retter, tørkørsel, kilde=KILDE_LISTE):
+def rapport(beslutninger, lagt, kurv_total, retter, tørkørsel, kilde=KILDE_LISTE, ai_rettet=()):
     udsolgt = [b for b in beslutninger if b["status"] == "udsolgt"]
     usikre = [b for b in beslutninger if b["status"] in ("usikker", "ingen_traef", "fejl")]
 
@@ -854,6 +970,12 @@ def rapport(beslutninger, lagt, kurv_total, retter, tørkørsel, kilde=KILDE_LIS
             + f"  ·  🏷️ tilbud: {r['tilbud_antal']}/{r['varer']}"
             + (f" (−{r['besparelse_est']:.0f} kr vs. fravalgte)" if r["besparelse_est"] else "")
         )
+    if ai_rettet:
+        linjer.append("\n🤖 AI RETTEDE:")
+        linjer += [
+            f"• {r['navn']}: «{r['fra']}» → " + (f"«{r['til']}»" if r["til"] else "spørger dig")
+            for r in ai_rettet
+        ]
     if udsolgt:
         linjer.append("\n❌ UDSOLGT (ikke lagt i):")
         linjer += [f"• {b['navn']} — {b.get('produkt', '?')}" for b in udsolgt]
@@ -892,6 +1014,7 @@ def main():
     ap.add_argument("--force", action="store_true", help="ignorér kill-switch")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--uden-ai", action="store_true", help="spring AI-tjekket over")
     a = ap.parse_args()
 
     token = ha_secrets.get(ha_secrets.HA_API_TOKEN)
@@ -981,6 +1104,9 @@ def main():
         MP.is_on(states, E_TILBUD, default=True),
         MP.num(states, E_FAV_LOFT, NA.FAVORIT_LOFT_PCT),
     )
+    ai_rettet = [] if a.uden_ai else ai_tjek(beslutninger)
+    for b in beslutninger:
+        b.pop("_traef", None)
     # Kilden følger varen HELE vejen — ind i kurv-afstemningen og ud i
     # sensoren, hvor siden viser de to grupper hver for sig.
     for b in beslutninger:
@@ -1005,7 +1131,7 @@ def main():
     if not tørkørsel:
         spurgt = stil_spoergsmaal(token, beslutninger, int(MP.num(states, E_SPOERG_MAX, 8)))
 
-    besked = rapport(beslutninger, lagt, total, retter, tørkørsel, kilde)
+    besked = rapport(beslutninger, lagt, total, retter, tørkørsel, kilde, ai_rettet)
     # Sensoren viser BEGGE kilder: denne kørsels varer + hvad den anden knap
     # lagde i sidst. Ellers ville et tryk på den ene knap tømme den anden
     # gruppe af siden, selv om varerne stadig ligger i kurven. Gælder også en
@@ -1034,6 +1160,7 @@ def main():
             ]
         ),
         "spurgt": spurgt,
+        "ai_rettet": ai_rettet,
         "regnskab": regnskab(varer),
         "aabne_spoergsmaal": len(hent_spoerg().get("aabne") or {}),
         "tekst": besked,
