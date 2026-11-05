@@ -50,7 +50,7 @@ import ha_secrets
 NOTIFY = "mobile_app_phone_a"
 REST = "http://supervisor/core/api"
 TAG = "claude_secret_set"
-TAILNET = ipaddress.ip_network("198.51.100.117/10")  # Tailscale hands out addresses here
+TAILNET = ipaddress.ip_network("100.64.0.0/10")  # Tailscale hands out addresses here
 MAX_BODY = 8192
 ALPHABETS = {
     "alnum": string.ascii_letters + string.digits,

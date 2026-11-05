@@ -166,17 +166,20 @@ class Ask(Base):
         self.assertFalse([c for c in self.calls if c.startswith("services/notify")])
 
     def test_listens_only_on_the_tailnet_or_the_home_network(self):
+        # Built from TAILNET, not written out: the public export rewrites tailnet addresses.
+        ts = str(secret_set.TAILNET.network_address + (49 << 16) + 258)
+        lan = "192.0.2.36"
         self.answers["config"] = {
-            "external_url": "http://198.51.100.174:8123",
-            "internal_url": "http://192.0.2.36:8123",
+            "external_url": f"http://{ts}:8123",
+            "internal_url": f"http://{lan}:8123",
         }
-        self.assertEqual(secret_set.address(lan=False), ("198.51.100.174", secret_set.TAILNET))
+        self.assertEqual(secret_set.address(lan=False), (ts, secret_set.TAILNET))
         self.assertEqual(
-            secret_set.address(lan=True), ("192.0.2.36", ipaddress.ip_network("192.168.0.0/24"))
+            secret_set.address(lan=True), (lan, ipaddress.ip_network(f"{lan}/24", strict=False))
         )
         self.answers["config"] = {
             "external_url": "http://203.0.113.7:8123",
-            "internal_url": "http://198.51.100.174:8123",
+            "internal_url": f"http://{ts}:8123",
         }
         for lan in (False, True):
             with self.subTest(lan=lan), self.assertRaises(RuntimeError):

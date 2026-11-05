@@ -189,7 +189,7 @@ def _yaml_agrees(old: str, new: str, key: str, value: str) -> bool:
     parse error is never re-raised: its message quotes the line, i.e. a value.
     """
     try:
-        import yaml
+        import yaml  # type: ignore[import-untyped]
     except ImportError:
         return True
     try:

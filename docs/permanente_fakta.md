@@ -2315,7 +2315,7 @@ et filter på afsender-netværket virker. HA's :8123 lytter også på 0.0.0.0, d
 virker `external_url` over tailnettet.
 
 → En ny lytter, der skal nås fra telefonen over Tailscale: bind `0.0.0.0` og afvis
-alt andet i `verify_request` (198.51.100.117/10 for tailnettet, LAN'ets /24 for `--lan`).
+alt andet i `verify_request` (100.64.0.0/10 for tailnettet, LAN'ets /24 for `--lan`).
 Bind aldrig til tailnet-adressen: det ser ud som en firewall, men er en tom port.
 
 ## Volumio har fabriks-koden skrevet ind i sin egen kode — sudoers bruger den SIDSTE regel (2026-11-05)
