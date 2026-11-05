@@ -13,6 +13,9 @@ Called from Home Assistant:
   flush              an automation on person -> home, a 30-minute backstop,
                      and leaving guest mode.
   count              a command_line sensor (JSON: total and per recipient).
+  drop-tag <tag>     a notice answered elsewhere (payload.tag), e.g. a
+                     Folketing bill answered on the dashboard while its push
+                     sat in the queue — otherwise it arrives already answered.
 
 The queue is ``/config/notif_queue.jsonl`` (a file survives restarts and
 recorder purges). Nothing is dropped for age, but duplicates per
@@ -118,6 +121,18 @@ def cmd_append(b64):
     with Lock():
         with open(QUEUE_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_drop_tag(tag):
+    if not re.fullmatch(r"[a-z0-9_]{1,60}", tag):
+        print(f"bad tag: {tag!r}", file=sys.stderr)
+        return 1
+    with Lock():
+        entries = read_entries()
+        keep = [e for e in entries if (e.get("payload") or {}).get("tag") != tag]
+        if len(keep) != len(entries):
+            write_entries(keep)
     return 0
 
 
@@ -236,7 +251,10 @@ def cmd_flush(dry_run=False):
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: notif_queue.py append <b64>|flush [--dry-run]|count", file=sys.stderr)
+        print(
+            "usage: notif_queue.py append <b64>|flush [--dry-run]|count|drop-tag <tag>",
+            file=sys.stderr,
+        )
         return 1
     cmd = sys.argv[1]
     if cmd == "append" and len(sys.argv) >= 3:
@@ -245,6 +263,8 @@ def main():
         return cmd_flush(dry_run="--dry-run" in sys.argv)
     if cmd == "count":
         return cmd_count()
+    if cmd == "drop-tag" and len(sys.argv) >= 3:
+        return cmd_drop_tag(sys.argv[2])
     print(f"ukendt kommando: {cmd}", file=sys.stderr)
     return 1
 

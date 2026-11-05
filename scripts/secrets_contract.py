@@ -64,6 +64,15 @@ OWNERS = {
     "scripts/ha_offline.py": "keeps the real file out of its copy and seeds the example",
     "scripts/ha_validate.py": "skips the file when it scans YAML for entity references",
     "scripts/secrets_contract.py": "this check",
+    "scripts/secret_leak_scan.py": "looks for every live value in the Claude transcripts",
+    "scripts/secret_set.py": "lists key names and lengths; writes through ha_secrets.put",
+}
+
+#: Files that may write the secrets file, and why. Few writers, so a value no one
+#: typed or saw has few ways in; ha_secrets.put checks it reads back before it lands.
+WRITERS = {
+    "scripts/secret_set.py": "generate / ask",
+    "scripts/hoejttaler_kode.py": "the speaker's password changes on the device and here together",
 }
 
 #: Keys whose values identify rather than authenticate (a name, an address, a
@@ -201,6 +210,11 @@ def python_keys(
                     )
                 else:
                     keys.setdefault(key, []).append(f"{rel}:{node.lineno}")
+            elif node.func.attr == "put" and rel not in WRITERS:
+                errors.append(
+                    f"{rel}:{node.lineno}: ha_secrets.put() writes the secrets file; "
+                    "only scripts/secret_set.py does (generate / ask), see WRITERS"
+                )
             elif node.func.attr == "load" and rel not in OWNERS:
                 errors.append(
                     f"{rel}:{node.lineno}: ha_secrets.load() hides which keys are read; "

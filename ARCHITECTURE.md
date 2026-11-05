@@ -250,6 +250,10 @@ flowchart LR
 - **Restart guard.** Home Assistant segfaults on shutdown in this setup, so
   the final state save never happens. `scripts/restart_guard.py` rejects a
   plain `ha core restart`; `scripts/ha_restart.sh` saves state first.
+- **Secret guard.** Whatever the agent reads lands in its transcript.
+  `scripts/secret_guard.py` rejects reading the credential stores and commands
+  that print a secret; `scripts/secret_leak_scan.py` scans the transcripts at
+  session end for the house's live values and pushes which one to rotate.
 - **Offline proofs.** `scripts/ha_offline.py` runs Home Assistant's own loader
   and validator against the repository with no hardware and no secrets:
   `check` (is it valid?), `equiv` (is the resolved config unchanged? — a

@@ -24,7 +24,11 @@ Kommandoer (packages/folketing.yaml):
                     beder HA genlæse sensoren.
   svar <sag> <FOR|IMOD|NEUTRAL> [kilde]
                     skriver ét svar (push-knap eller Folketing-siden).
+  vaegt <sag> <VIGTIG|NORMAL|UVIGTIG> [kilde]
+                    vægter et svar i enigheden (Vægtning-fanen på siden).
   scan --dry-run    henter og viser, skriver/sender intet.
+  scan --uden-push  henter og gemmer, sender ingen push.
+  opdater           starter `scan --uden-push` detached (Opdater-knappen på siden).
 
 Filer:
   /config/.folketing_cache.json      sager, afstemninger, medlemmer (gitignored;
@@ -60,6 +64,7 @@ from zoneinfo import ZoneInfo
 
 import ai_forbrug
 import ha_secrets
+import notif_queue
 
 TZ = ZoneInfo("Europe/Copenhagen")
 ODA = "https://oda.ft.dk/api"
@@ -79,8 +84,19 @@ SAGSTYPER = {3: "Lovforslag", 5: "Beslutningsforslag"}
 # Tilbagetaget, Udgået, Bortfaldet: der kommer ingen afstemning → ingen push.
 DOEDE_STATUS = {4, 9, 13}
 SVAR = ("FOR", "IMOD", "NEUTRAL")
+# Dit svars vægt i enighed-procenten (user-spec 2026-11-05: "markere mine svar
+# som vigtige eller uvigtige ... vægte udfaldet af stemmeanbefalingen").
+# Sager-tallet på siden er stadig ét pr. svar; kun procenten vægtes.
+VAEGTE = {"VIGTIG": 3.0, "NORMAL": 1.0, "UVIGTIG": 0.25}
 SCAN_HVER_MIN = 55
 PR_DAG_DEFAULT = 3
+# Et forslag vises/pushes først når Folketingets resumé er så langt (tegn):
+# nyfremsatte har 0-3 sætninger, og ft.dk udbygger resuméet løbende (user-spec
+# 2026-11-05: "skal kun komme ind hvis der er nok info"). Målt 5/11 på 184 sager:
+# p20 178, p30 279, p50 551 tegn; alle 20 under 400 var uafgjorte. Besvarede
+# vises altid. Slider input_number.folketing_min_resume_tegn (læses ved scan).
+E_MIN_RESUME = "input_number.folketing_min_resume_tegn"
+MIN_RESUME_DEFAULT = 400
 MIN_FAELLES = 5  # et medlem skal have stemt om mindst så mange af dine sager
 PARTI_NAVNE = {
     "S": "Socialdemokratiet",
@@ -273,8 +289,12 @@ def save_cache(c):
 
 
 def load_svar():
-    """Seneste svar pr. sag (et nyt svar på samme sag erstatter det gamle)."""
-    ud = {}
+    """Seneste svar pr. sag (et nyt svar på samme sag erstatter det gamle).
+
+    Vægt-rækker ({"vaegt": ...}, uden "svar") ligger i samme fil; den seneste
+    pr. sag hænges på svaret som r["vaegt"] — også hvis svaret ændres bagefter.
+    """
+    ud, vaegt = {}, {}
     try:
         with open(SVAR_FIL, encoding="utf-8") as f:
             for line in f:
@@ -284,8 +304,13 @@ def load_svar():
                     continue
                 if r.get("svar") in SVAR:
                     ud[str(r.get("sag"))] = r
+                elif r.get("vaegt") in VAEGTE:
+                    vaegt[str(r.get("sag"))] = r["vaegt"]
     except FileNotFoundError:
         pass
+    for sid, v in vaegt.items():
+        if sid in ud:
+            ud[sid] = {**ud[sid], "vaegt": v}
     return ud
 
 
@@ -329,8 +354,13 @@ def tekst(sag):
     return kort, detalje
 
 
+def moden(c, s):
+    """Resuméet er langt nok til at du kan tage stilling (MIN_RESUME_DEFAULT)."""
+    return len(s.get("resume") or "") >= c.get("min_resume", MIN_RESUME_DEFAULT)
+
+
 def koe(c, svar):
-    """Sager der skal spørges om: ubesvarede, ikke pushet, ikke døde.
+    """Sager der skal spørges om: ubesvarede, ikke pushet, ikke døde, modne.
 
     Uafgjorte først (1a: spørg FØR Folketinget stemmer), nyeste først; derefter
     de allerede afgjorte fra valgperioden, også nyeste først.
@@ -338,7 +368,10 @@ def koe(c, svar):
     kand = [
         (sid, s)
         for sid, s in c["sager"].items()
-        if sid not in svar and not s.get("pushet") and s.get("statusid") not in DOEDE_STATUS
+        if sid not in svar
+        and not s.get("pushet")
+        and s.get("statusid") not in DOEDE_STATUS
+        and moden(c, s)
     ]
     uafgjort = sorted(
         [k for k in kand if k[1].get("afst") is None],
@@ -415,7 +448,7 @@ def opdater_sager(c, dry):
     return nye
 
 
-def scan(dry=False):
+def scan(dry=False, push=True):
     lock = open(LOCK, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -443,10 +476,17 @@ def scan(dry=False):
     dag = datetime.now(TZ).date().isoformat()
     c["pushes"] = {dag: c.get("pushes", {}).get(dag, 0)}
     try:
+        forrige = c.get("min_resume", MIN_RESUME_DEFAULT)
+        c["min_resume"] = int(float((st.get(E_MIN_RESUME) or {}).get("state", forrige)))
+    except ValueError:
+        pass  # unavailable → behold den sidst læste
+    try:
         pr_dag = int(float((st.get(E_PR_DAG) or {}).get("state", PR_DAG_DEFAULT)))
     except ValueError:
         pr_dag = PR_DAG_DEFAULT
-    if q and st and c["pushes"][dag] < pr_dag and deliverable(st):
+    # Opdater-knappen på siden (push=False) må ikke sende dagens push midt i
+    # at man sidder og svarer — den henter kun afstemningerne.
+    if push and q and st and c["pushes"][dag] < pr_dag and deliverable(st):
         sid, s = q[0]
         if not s.get("ai") and not dry:
             try:
@@ -528,20 +568,26 @@ def status_doc(c, svar):
             continue
         sammenlignet += 1
         a, mit = s["afst"], r["svar"]
+        w = VAEGTE[r.get("vaegt", "NORMAL")]
         sider = parti_sider(c, a)
+        # [enig, uenig, vægtet enig, vægtet uenig]
         for side, kode in (("for", "FOR"), ("imod", "IMOD")):
             for p in sider[side]:
-                d = partier.setdefault(p, [0, 0])
-                d[0 if mit == kode else 1] += 1
+                d = partier.setdefault(p, [0, 0, 0.0, 0.0])
+                i = 0 if mit == kode else 1
+                d[i] += 1
+                d[i + 2] += w
         for aid, t in (a.get("stemmer") or {}).items():
             if t not in (1, 2):
                 continue  # fravær og "hverken" tæller ikke — som dit Neutral
-            d = medlemmer.setdefault(aid, [0, 0])
-            d[0 if (t == 1) == (mit == "FOR") else 1] += 1
+            d = medlemmer.setdefault(aid, [0, 0, 0.0, 0.0])
+            i = 0 if (t == 1) == (mit == "FOR") else 1
+            d[i] += 1
+            d[i + 2] += w
 
     pl = [
-        {"parti": p, "navn": PARTI_NAVNE.get(p, p), "enig": e, "uenig": u, "pct": pct(e, u)}
-        for p, (e, u) in partier.items()
+        {"parti": p, "navn": PARTI_NAVNE.get(p, p), "enig": e, "uenig": u, "pct": pct(we, wu)}
+        for p, (e, u, we, wu) in partier.items()
     ]
     # Et parti med 1 af 1 (de nordatlantiske mandater stemmer sjældent) må ikke
     # stå øverst: under MIN_FAELLES fælles sager rangerer det efter de andre.
@@ -552,7 +598,7 @@ def status_doc(c, svar):
             -(x["enig"] + x["uenig"]),
         )
     )
-    maks = max((e + u for e, u in medlemmer.values()), default=0)
+    maks = max((d[0] + d[1] for d in medlemmer.values()), default=0)
     # Medlemmer er fraværende ved mange afstemninger (pardannelse) → kræv en
     # tredjedel af dine sammenlignede sager, mindst MIN_FAELLES.
     graense = min(max(MIN_FAELLES, sammenlignet // 3), maks)
@@ -562,9 +608,9 @@ def status_doc(c, svar):
             "parti": c["aktoerer"].get(aid, {}).get("parti", ""),
             "enig": e,
             "uenig": u,
-            "pct": pct(e, u),
+            "pct": pct(we, wu),
         }
-        for aid, (e, u) in medlemmer.items()
+        for aid, (e, u, we, wu) in medlemmer.items()
         if e + u >= graense and graense > 0
     ]
     ml.sort(key=lambda x: (-(x["pct"] or 0), -(x["enig"] + x["uenig"]), x["navn"]))
@@ -572,7 +618,7 @@ def status_doc(c, svar):
     ubesvarede = [
         (sid, s)
         for sid, s in c["sager"].items()
-        if sid not in svar and s.get("statusid") not in DOEDE_STATUS
+        if sid not in svar and s.get("statusid") not in DOEDE_STATUS and moden(c, s)
     ]
     pushet = sorted(
         (x for x in ubesvarede if x[1].get("pushet")), key=lambda x: x[1]["pushet"], reverse=True
@@ -610,14 +656,40 @@ def status_doc(c, svar):
                 "url": ft_url(c, s),
             }
         )
+    # Hele listen til Folketing-siden (custom:folketing-liste-card): ubesvarede
+    # i kø-rækkefølge (uafgjorte først), så de besvarede, seneste svar først.
+    # Korte nøgler — 170 sager; sensoren er udenfor recorderen.
+    besvarede = sorted(
+        ((sid, s) for sid, s in c["sager"].items() if sid in svar),
+        key=lambda x: svar[x[0]].get("tid", ""),
+        reverse=True,
+    )
+    alle = []
+    for sid, s in pushet + q + besvarede:
+        a = s.get("afst")
+        r = {"id": sid, "n": s["nummer"], "k": tekst(s)[0], "st": a is not None, "u": ft_url(c, s)}
+        if a:
+            r["d"] = a.get("dato")
+        if sid in svar:
+            r["s"] = svar[sid]["svar"]
+            if svar[sid].get("vaegt", "NORMAL") != "NORMAL":
+                r["w"] = svar[sid]["vaegt"]
+            # Partiernes stemmer først EFTER dit svar (1a).
+            if a:
+                sider = parti_sider(c, a)
+                r.update(v=a.get("vedtaget"), f=sider["for"], i=sider["imod"])
+        alle.append(r)
     return {
         "state": len(ubesvarede),
+        "alle": alle,
         "aktuel": aktuel,
         "naeste": [
             {"nummer": s["nummer"], "kort": tekst(s)[0]}
             for _, s in [x for x in q if not aktuel or x[0] != aktuel["id"]][:5]
         ],
         "besvaret": len(svar),
+        "vigtige": sum(1 for r in svar.values() if r.get("vaegt") == "VIGTIG"),
+        "uvigtige": sum(1 for r in svar.values() if r.get("vaegt") == "UVIGTIG"),
         "sammenlignet": sammenlignet,
         # Besvaret med For/Imod, men Folketinget har ikke stemt endnu.
         "venter": sum(
@@ -641,18 +713,23 @@ def scan_forfalden(c):
     return (datetime.now(TZ) - datetime.fromisoformat(t)).total_seconds() > SCAN_HVER_MIN * 60
 
 
+def start_scan(*ekstra):
+    """Detached scan (logger til LOGFILE) — kalderen venter ikke på oda.ft.dk."""
+    with open(LOGFILE, "a") as logf:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "scan", *ekstra],
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+
+
 def status():
     c = load_cache()
     if scan_forfalden(c):
-        with open(LOGFILE, "a") as logf:
-            subprocess.Popen(
-                [sys.executable, os.path.abspath(__file__), "scan"],
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-            )
+        start_scan()
     print(json.dumps(status_doc(c, load_svar()), ensure_ascii=False))
     return 0
 
@@ -673,6 +750,30 @@ def gem_svar(sid, svar, kilde):
             "kilde": kilde,
         }
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # Svaret på siden mens pushen lå i hjemkomst-køen → ud af køen, ellers
+    # leveres et allerede besvaret forslag ved ankomst (11-04: B 37/38).
+    try:
+        notif_queue.cmd_drop_tag(f"folketing_{sid}")
+    except Exception as ex:  # noqa: BLE001
+        log(f"kø-oprydning fejlede: {ex}")
+    return 0
+
+
+def gem_vaegt(sid, vaegt, kilde):
+    vaegt = vaegt.upper()
+    if not re.fullmatch(r"\d{1,9}", sid) or vaegt not in VAEGTE:
+        log(f"ugyldig vægt: {sid!r} {vaegt!r}")
+        return 1
+    s = load_cache()["sager"].get(sid) or {}
+    with open(SVAR_FIL, "a", encoding="utf-8") as f:
+        rec = {
+            "tid": now_iso(),
+            "sag": sid,
+            "nummer": s.get("nummer"),
+            "vaegt": vaegt,
+            "kilde": kilde,
+        }
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return 0
 
 
@@ -681,9 +782,18 @@ def main(argv):
     if cmd == "status":
         return status()
     if cmd == "scan":
-        return scan(dry="--dry-run" in argv)
+        return scan(dry="--dry-run" in argv, push="--uden-push" not in argv)
+    if cmd == "opdater":
+        start_scan("--uden-push")
+        return 0
     if cmd == "svar" and len(argv) >= 4:
         return gem_svar(
+            argv[2],
+            argv[3],
+            re.sub(r"[^a-z]", "", (argv[4] if len(argv) > 4 else "ukendt").lower())[:20],
+        )
+    if cmd == "vaegt" and len(argv) >= 4:
+        return gem_vaegt(
             argv[2],
             argv[3],
             re.sub(r"[^a-z]", "", (argv[4] if len(argv) > 4 else "ukendt").lower())[:20],

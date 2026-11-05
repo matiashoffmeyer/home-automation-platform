@@ -198,6 +198,8 @@ inside the agent's tool calls ([`.claude/settings.json`](../.claude/settings.jso
 | `scripts/ejerskab_hook.py pre` / `post` | before a file is opened / after it is edited | shows the ownership table of any registered lamp the file writes; lints the edit against the registry |
 | `scripts/restart_guard.py` | before Bash | rejects a plain `ha core restart`: Home Assistant crashes during shutdown here and loses the last state write, so restarts go through `scripts/ha_restart.sh`, which saves state first |
 | `scripts/agent_guard.py` | before Agent/Workflow, at subagent stop | at most two subagents at a time; a cheaper model on every workflow agent; no unbounded fan-out |
+| `scripts/secret_guard.py` | before Read/Edit/Write/Grep/Bash | keeps secret values out of the transcript: rejects reading the credential stores and commands that print secrets (`env`, `bash -x`, `curl -v` with a token) |
+| `scripts/secret_leak_scan.py hook` | session end (and start) | the backstop: scans the transcripts for the house's live secret values and pushes which one to rotate; prints labels, never values |
 
 The agent guard is an example of the loop in section 2. The subagent limits
 existed as a written rule; one session broke it anyway, and the quota ran out

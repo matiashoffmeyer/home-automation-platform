@@ -1,0 +1,71 @@
+# =============================================================================
+# Trail Buddy — vagt på den offentlige adresse (2026-11-05)
+# =============================================================================
+# User-spec 2026-11-05 ("ja lav vagten"): efter add-on-genstarten kl. 09:53 lod
+# Tailscale-relæet hvert TLS-handshake udefra dø (PR_END_OF_FILE_ERROR hos en
+# ven), mens telefonerne på tailnettet virkede — ingen opdagede det. Funnel
+# off + on rettede det.
+#
+# To lag:
+#   1) addons/trailbuddy/run.sh: add-on'et henter selv sin offentlige
+#      /api/health hver 30. min; to fejl i træk → Funnel off + on (selvheling).
+#   2) HER: HA tjekker den samme adresse udefra hver 10. min (adressen
+#      hentes fra add-on'ets interne GET :8081/health, B299). Stadig nede efter
+#      1 time (= selvhelingen har haft mindst én runde) → push, højst hver 12. t.
+#
+# Funnel slået fra med vilje efter turen → sensoren er off for evigt: sluk
+# input_boolean.notif_trailbuddy_enabled (🔔-fanen), ellers en push hver 12. t.
+# AirBnB: notif_trailbuddy_airbnb (default off, AirBnB = tavs).
+# =============================================================================
+
+command_line:
+  - binary_sensor:
+      name: "Trail Buddy offentlig"
+      unique_id: trail_buddy_offentlig
+      device_class: connectivity
+      # Adressen spørges add-on'et om på den interne port (B299): tailnet-navnet
+      # står aldrig i git. Intet svar / Funnel fra → "000" (off), som før.
+      command: >-
+        u=$(curl -s --max-time 5 http://local-trailbuddy:8081/health | python3 -c
+        'import json,sys; u=json.load(sys.stdin).get("public_url",""); print(u if u.startswith("https://") else "")'
+        2>/dev/null); if [ -n "$u" ]; then curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$u/api/health";
+        else echo 000; fi
+      payload_on: "200"
+      payload_off: "000"
+      value_template: "{{ '200' if value == '200' else '000' }}"
+      command_timeout: 30
+      scan_interval: 600
+
+automation:
+  - id: trailbuddy_offentlig_nede
+    alias: "Trail Buddy: offentlig adresse nede"
+    description: >
+      binary_sensor.trail_buddy_offentlig off i 1 time → push (notif_id
+      trailbuddy), højst hver 12. time. Selvhelingen sidder i add-on'et.
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.trail_buddy_offentlig
+        from: "on"
+        to: "off"
+        for: "01:00:00"
+      # En genstart dræber ventende `for:` → backstop.
+      - trigger: time_pattern
+        minutes: "/30"
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.trail_buddy_offentlig
+        state: "off"
+        for: "01:00:00"
+      - condition: template
+        value_template: >
+          {{ as_timestamp(now()) - as_timestamp(this.attributes.last_triggered, 0) > 12 * 3600 }}
+    actions:
+      - action: script.push_notify
+        data:
+          notif_id: trailbuddy
+          title: "🥾 Trail Buddy kan ikke nås udefra"
+          message: >-
+            Den offentlige adresse har ikke svaret i over en time, og
+            add-on'ets egen genstart af Funnel hjalp ikke. Telefoner på
+            tailnettet virker stadig. Prøv at genstarte add-on'et.

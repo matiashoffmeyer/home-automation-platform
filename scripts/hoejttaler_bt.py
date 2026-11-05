@@ -17,10 +17,9 @@ genstarter (målt 29/10, alle baudrates).
 
 Ingen API på N3'en styrer BT → SSH. SSH er SLÅET FRA i drift og åbnes kun for
 kaldet (socket.io `enableSSH`, samme som web-UI'ets /dev-side) og lukkes igen
-bagefter. Login er Volumios fabriks-bruger; passwordet kan IKKE skiftes, fordi
-Volumio selv kører `echo volumio | sudo -S` (mpd-plugin, pluginmanager). Det
-står i secrets.yaml som `hoejttaler_ssh_password`. Værtsnøglen er låst i
-hoejttaler_known_hosts.
+bagefter. Login er Volumios bruger `volumio` med en tilfældig kode (skiftet 5/11
+af hoejttaler_kode.py, B297), som står i secrets.yaml som
+`hoejttaler_ssh_password`. Værtsnøglen er låst i hoejttaler_known_hosts.
 
   python3 hoejttaler_bt.py synlig   # nye telefoner kan finde "myair" og parre uden PIN
   python3 hoejttaler_bt.py skjul    # ingen nye parringer; parrede kan stadig forbinde
@@ -119,38 +118,50 @@ def port_22(aaben, sek):
     return False
 
 
-def koer(script):
-    pw = ha_secrets.get("hoejttaler_ssh_password")
+def askpass_env(d, mig):
     # HA-containerens /tmp er noexec (ssh: "exec(askpass): Permission denied" → login
     # afvist); .cache/ ligger på /config og er git-ignoreret. Hjælperen indeholder
-    # ikke passwordet, den kalder dette script igen med "askpass".
+    # ikke passwordet, den kalder scriptet `mig` igen med "askpass".
+    ask = Path(d) / "askpass"
+    py = shlex.quote(sys.executable)
+    ask.write_text(f"#!/bin/sh\nexec {py} {shlex.quote(str(mig))} askpass\n")
+    ask.chmod(0o700)
+    return {
+        **os.environ,
+        "SSH_ASKPASS": str(ask),
+        "SSH_ASKPASS_REQUIRE": "force",
+        "DISPLAY": os.environ.get("DISPLAY", ":0"),
+    }
+
+
+def cache_dir():
     cache = HER.parent / ".cache"
     cache.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=cache) as d:
-        ask = Path(d) / "askpass"
-        mig = shlex.quote(str(Path(__file__).resolve()))
-        ask.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {mig} askpass\n")
-        ask.chmod(0o700)
-        env = {
-            **os.environ,
-            "SSH_ASKPASS": str(ask),
-            "SSH_ASKPASS_REQUIRE": "force",
-            "DISPLAY": os.environ.get("DISPLAY", ":0"),
-        }
-        cmd = ["ssh", "-T"]
-        for o in (
-            f"UserKnownHostsFile={KNOWN_HOSTS}",
-            "GlobalKnownHostsFile=/dev/null",
-            "StrictHostKeyChecking=yes",
-            "HostKeyAlgorithms=ecdsa-sha2-nistp256",
-            "PubkeyAuthentication=no",
-            "PreferredAuthentications=password",
-            "NumberOfPasswordPrompts=1",
-            "ConnectTimeout=8",
-            "LogLevel=ERROR",
-        ):
-            cmd += ["-o", o]
-        cmd += [f"volumio@{hs.HOST}", "sudo -S -p '' sh -c " + shlex.quote(script)]
+    return cache
+
+
+def ssh_argv(remote):
+    cmd = ["ssh", "-T"]
+    for o in (
+        f"UserKnownHostsFile={KNOWN_HOSTS}",
+        "GlobalKnownHostsFile=/dev/null",
+        "StrictHostKeyChecking=yes",
+        "HostKeyAlgorithms=ecdsa-sha2-nistp256",
+        "PubkeyAuthentication=no",
+        "PreferredAuthentications=password",
+        "NumberOfPasswordPrompts=1",
+        "ConnectTimeout=8",
+        "LogLevel=ERROR",
+    ):
+        cmd += ["-o", o]
+    return cmd + [f"volumio@{hs.HOST}", remote]
+
+
+def koer(script):
+    pw = ha_secrets.get("hoejttaler_ssh_password")
+    with tempfile.TemporaryDirectory(dir=cache_dir()) as d:
+        env = askpass_env(d, Path(__file__).resolve())
+        cmd = ssh_argv("sudo -S -p '' sh -c " + shlex.quote(script))
         p = subprocess.run(
             cmd, input=pw + "\n", capture_output=True, text=True, timeout=30, env=env
         )

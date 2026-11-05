@@ -151,9 +151,11 @@
 #   morgen-rutinerne (open-plan: morning_curtains; sove/boern: wakeup) → ingen
 #   reopen-automation her (spejler Dormant-close, som house_state_to_active åbner).
 #
-# EDGE-triggers (ingen periodisk backstop = ingen morgen-fight): dusk-flanke +
-#   hjemkomst-i-mørke (house_state→Active) + kulde-flanke (dækker kilde-recovery
-#   fra unavailable, fejlklasse #9/#13 — en frisk below-flanke ved recovery lukker).
+# EDGE-triggers (ingen periodisk backstop = ingen morgen-fight): sove-aftenluk-
+#   flanken (2026-11-05, samme tid som soveværelset) + hjemkomst-i-mørke
+#   (house_state→Active, kun før godnat; rører ikke gardiner Dormant har lukket)
+#   + godnat-knappen (også når prognosen siger koldt i nat). Kulde-flanken er
+#   fjernet: den fyrede kun på met.no-recovery midt om natten (støj).
 # unavailable udetemp → numeric-condition false = ingen luk (#9). Manuelt åbnede
 #   gardiner respekteres via gardiner_manual_hold (samme reject-mønster som solar).
 # AirBnB: kører IKKE (user-valg 2026-10-04, B123 — kun sove-aftenluk lukker i
@@ -163,25 +165,40 @@
 - id: winter_active_dark_close
   alias: "Vinter: Luk gardiner ved mørkt+koldt (Active)"
   description: >
-    Active + rigtig mørkt UDE (sol < natlys_sol_elevation) + koldt UDE
-    (sensor.udetemp < winter_heating_season_temp) → luk gardiner (stue-vest 80%,
-    resten helt) mod gulv-kuldestrøm. Sol-vinkel genbrugt fra natlys-slideren.
+    Active + aften (sove-aftenluk-vinduet eller sol < natlys_sol_elevation) +
+    koldt UDE (sensor.udetemp < winter_heating_season_temp) → luk gardiner
+    (stue-vest 80%, resten helt) mod gulv-kuldestrøm. Lukker samtidig med
+    sove-gardinet eller på godnat-knappen hvis den kommer før — aldrig senere
+    om natten (støj, user-spec 2026-11-05).
   mode: single
   trigger:
-    # Skumring falder (sol krydser natlys-tærsklen nedad)
+    # 2026-11-05 (user-spec): "winter gardiner om natten larmer når de kører
+    # ned. de skal enten køre ned tidligere (f.eks. samtidig med soveværelset)
+    # eller når jeg trykker godnat knap hvis det er tidligere end soveværelset
+    # ville gå ned." → luk SAMMEN med sove-aftenluk (solnedgang + slider), og
+    # på godnat-knappen. Kulde-flanken (udetemp < tærskel) er FJERNET: den
+    # fyrede kun på met.no's recovery fra unavailable, og det skete midt om
+    # natten (3/11 21:29, 4/11 22:35). udetemp har nu DMI-reserve, så skumrings-
+    # tjekket ikke længere falder i et hul.
     - platform: state
-      entity_id: binary_sensor.natlys_sol_under_graense
+      entity_id: binary_sensor.sove_gardin_aftenluk_vindue
       from: "off"
       to: "on"
+      id: aften
     # Hjemkomst i mørke: huset bliver Active mens det allerede er mørkt+koldt
+    # (kun før godnat — se condition nedenfor).
     - platform: state
       entity_id: input_select.house_state
       to: "Active"
-    # Kulde-flanke: udetemp falder under fyrings-tærsklen (dækker også
-    # kilde-recovery unavailable→below = frisk flanke, fejlklasse #9/#13)
-    - platform: numeric_state
-      entity_id: sensor.udetemp
-      below: input_number.winter_heating_season_temp
+      id: hjem
+    # Godnat-knappen (Somrig kort/lang ned, widget): script.godnat_fuld stempler
+    # godnat_force_at — ingen andre skriver det, så auto-godnat (folk ligger
+    # allerede i sengen) fyrer IKKE denne vej.
+    - platform: state
+      entity_id: input_datetime.godnat_force_at
+      not_from: ["unknown", "unavailable"]
+      not_to: ["unknown", "unavailable"]
+      id: godnat
   condition:
     - condition: state
       entity_id: input_boolean.winter_active_dark_close_enabled
@@ -197,37 +214,114 @@
     - condition: state
       entity_id: input_select.house_state
       state: "Active"
-    # Rigtig mørkt UDE (sol under natlys-tærskel, genbrugt slider)
-    - condition: state
-      entity_id: binary_sensor.natlys_sol_under_graense
-      state: "on"
-    # Koldt UDE (fyrings-sæson). unavailable → false = ingen luk (#9).
-    - condition: numeric_state
-      entity_id: sensor.udetemp
-      below: input_number.winter_heating_season_temp
-    # Kun skumring→nat-fasen (ikke daggry) → aldrig fight mod morgen-åbning
-    - condition: template
-      value_template: "{{ state_attr('sun.sun', 'rising') == false }}"
+    # Ingen gardin-støj efter godnat: kun godnat-trykket selv må lukke, når
+    # godnat er aktiv (hjemkomst/aften-flanken efter godnat = folk sover).
+    - condition: or
+      conditions:
+        - condition: trigger
+          id: godnat
+        - condition: state
+          entity_id: input_boolean.godnat_voksne_active
+          state: "off"
+    # Aften + koldt + skumrings-fase bor i ÉT anker (packages/vinter_aftenluk.yaml),
+    # som hjemkomstens gardin-åbning også læser (#2). Godnat-trykket må lukke
+    # uden ankeret: aften (vindue/natlys) + 12-04 (`rising` vender ved
+    # sol-midnat ~00:45) — om det bliver koldt i nat afgøres i action'en.
+    - condition: or
+      conditions:
+        - condition: state
+          entity_id: binary_sensor.vinter_aftenluk_gaeldende
+          state: "on"
+        - condition: and
+          conditions:
+            - condition: trigger
+              id: godnat
+            - condition: template
+              value_template: >-
+                {{ (is_state('binary_sensor.sove_gardin_aftenluk_vindue', 'on')
+                    or is_state('binary_sensor.natlys_sol_under_graense', 'on'))
+                   and (now().hour >= 12 or now().hour < 4) }}
   action:
     # Helt lukket (0) undtagen stue-vest (20 = 80%, noget står under den).
     # Manuelt-ned-holdte gardiner springes over (gardiner_manual_hold — den
     # holder også sove mens putning_sove_active er on).
+    # Godnat-tryk en aften hvor det (endnu) ikke er koldt: luk hvis met.no's
+    # timeprognose går under fyrings-tærsklen inden for 12 t (user-spec
+    # 2026-11-05: "luk på godnat-knappen de aftener hvor det ser ud til at
+    # blive koldt"). met.no nede (B295) → ingen prognose → nu-temp (DMI-
+    # reserve) afgør alene. `stop` — en condition i en if-gren stopper kun grenen.
+    - if:
+        - condition: state
+          entity_id: binary_sensor.vinter_aftenluk_gaeldende
+          state: "off"
+      then:
+        - if:
+            - condition: template
+              value_template: "{{ states('weather.forecast_home') not in ['unavailable', 'unknown'] }}"
+          then:
+            - service: weather.get_forecasts
+              continue_on_error: true
+              data:
+                type: hourly
+              target:
+                entity_id: weather.forecast_home
+              response_variable: fc
+            - variables:
+                prognose_min: >-
+                  {% set hrs = (fc | default({})).get('weather.forecast_home', {}).get('forecast', []) %}
+                  {% set lim = now() + timedelta(hours=12) %}
+                  {% set ns = namespace(m=none) %}
+                  {% for h in hrs if (h.datetime | as_datetime(none)) is not none
+                                    and (h.datetime | as_datetime) <= lim
+                                    and h.temperature is not none %}
+                    {% set ns.m = h.temperature | float if ns.m is none else [ns.m, h.temperature | float] | min %}
+                  {% endfor %}
+                  {{ ns.m if ns.m is not none else 99 }}
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ prognose_min | float(99) >= states('input_number.winter_heating_season_temp') | float(12)
+                       and states('sensor.udetemp') | float(99) >= states('input_number.winter_heating_season_temp') | float(12) }}
+              then:
+                - stop: "Ikke koldt i nat ifølge prognosen"
+          else:
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ states('sensor.udetemp') | float(99) >= states('input_number.winter_heating_season_temp') | float(12) }}
+              then:
+                - stop: "Ingen prognose og ikke koldt nu"
     - variables:
         held: "{{ state_attr('sensor.gardiner_manual_hold', 'held_luk') | default([]) }}"
+        # Hjemkomst: Dormant har allerede lukket til 20 (winter_defense_close),
+        # og velkomsten ruller dem ikke op mens ankeret er on → kun gardiner
+        # Dormant sprang over (sol-blast, ferie-pause) lukkes; 20 → 0 er støj.
+        graense: "{{ 20 if trigger is defined and trigger.id == 'hjem' else 0 }}"
+    # 2026-11-05: gardiner der allerede står på/under målet springes over
+    # (samme mønster som winter_defense_close) — ellers kørte hjemkomst og
+    # godnat-tryk dem op og ned igen (timet position = fuld optur først), og
+    # godnat_fuld lukker selv sove-gardinet i samme sekund. Ukendt position
+    # (open-plan efter restart) → med som før.
     - service: cover.set_cover_position
       continue_on_error: true
       target:
         entity_id: >
-          {{ ['cover.gardin_stue_syd', 'cover.gardin_spisestue_vest',
-              'cover.gardin_sovevaerelse']
-             | reject('in', held) | list }}
+          {% set ns = namespace(l=[]) %}
+          {% for e in ['cover.gardin_stue_syd', 'cover.gardin_spisestue_vest',
+                       'cover.gardin_sovevaerelse'] if e not in held %}
+          {% set p = state_attr(e, 'current_position') %}
+          {% if p is none or (p | float(100)) > graense | int(0) %}{% set ns.l = ns.l + [e] %}{% endif %}
+          {% endfor %}
+          {{ ns.l }}
       data:
         position: 0
     - service: cover.set_cover_position
       continue_on_error: true
       target:
         entity_id: >
-          {{ ['cover.gardin_stue_vest_1'] | reject('in', held) | list }}
+          {% set p = state_attr('cover.gardin_stue_vest_1', 'current_position') %}
+          {{ ['cover.gardin_stue_vest_1'] | reject('in', held) | list
+             if p is none or (p | float(100)) > 20 else [] }}
       data:
         position: 20
     - service: notify.persistent_notification

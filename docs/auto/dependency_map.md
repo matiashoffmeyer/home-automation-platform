@@ -8,19 +8,19 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 
 | Entity | Files | Refs |
 |---|---|---|
-| `input_select.house_mode` | 127 | 307 |
-| `input_select.house_state` | 75 | 249 |
+| `input_select.house_mode` | 128 | 308 |
+| `input_select.house_state` | 75 | 250 |
 | `binary_sensor.stue_apollo_occupancy_filtered` | 50 | 122 |
 | `light.spisestue_loft` | 49 | 125 |
+| `script.push_notify` | 48 | 104 |
 | `binary_sensor.entre_valhorn_occupancy` | 48 | 109 |
-| `script.push_notify` | 47 | 103 |
-| `binary_sensor.boernevaerelse_apollo_occupancy` | 47 | 124 |
+| `binary_sensor.boernevaerelse_apollo_occupancy` | 47 | 127 |
 | `binary_sensor.sovevaerelse_apollo_occupancy` | 45 | 90 |
 | `light.koekken_lyskaede` | 45 | 194 |
 | `input_boolean.godnat_active` | 44 | 98 |
+| `sun.sun` | 44 | 151 |
 | `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 112 |
-| `sun.sun` | 43 | 150 |
-| `input_boolean.godnat_boern_active` | 42 | 100 |
+| `input_boolean.godnat_boern_active` | 42 | 101 |
 | `binary_sensor.spisestue_apollo_occupancy_filtered` | 41 | 114 |
 | `binary_sensor.badevaerelse_inde_occupancy` | 40 | 135 |
 | `light.spisestue_pendel` | 40 | 137 |
@@ -28,7 +28,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `light.boernevaerelse_loft` | 37 | 95 |
 | `sensor.open_plan_lux` | 35 | 107 |
 | `light.entre_loft` | 35 | 83 |
-| `light.boernevaerelse_hygge_strip` | 33 | 92 |
+| `light.boernevaerelse_hygge_strip` | 33 | 95 |
 | `binary_sensor.godnat_common_active` | 33 | 89 |
 | `binary_sensor.depot_valhorn_occupancy` | 32 | 72 |
 | `input_boolean.cinema_active` | 30 | 60 |
@@ -39,7 +39,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | Entity | Purpose | Files |
 |---|---|---|
 | `input_select.house_state` | Top-level state: Active vs Dormant | 75 |
-| `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 127 |
+| `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 128 |
 | `input_boolean.godnat_active` | Godnat night mode | 44 |
 | `input_boolean.godnat_pending` | Godnat in progress | 19 |
 | `input_boolean.cinema_active` | Cinema mode (mood) | 30 |

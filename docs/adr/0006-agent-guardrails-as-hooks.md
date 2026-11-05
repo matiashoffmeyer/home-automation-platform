@@ -31,6 +31,9 @@ through hooks configured in `.claude/settings.json`:
 | `scripts/restart_guard.py` | rejects a plain `ha core restart`; restarts go through `scripts/ha_restart.sh`, which saves state first |
 | `scripts/live_guard.py` | rejects light, sound and restart commands until the household has said yes on a push with Godkend / Afvis / Om 20 min (`scripts/live_godkend.py spørg`); a restart passes when Home Assistant is down |
 | `scripts/agent_guard.py` | at most two subagents at a time; a cheaper model on every workflow agent; no unbounded fan-out |
+| `scripts/secret_guard.py` | rejects reading the credential stores (`secrets.yaml`, `.storage/auth`, SSH keys …) and commands that print a secret (`env`, `bash -x`, `curl -v` with a token): what the agent reads goes into its transcript |
+| `scripts/install_guard.py` | rejects installs whose source the user has not approved (`claude mcp add`, `claude plugin install`, `npx`, `pip install <pkg>`, `npm install -g`, store add-ons, `curl … \| sh`); pinned installs from git pass (`dev_setup.sh`, `pip install -r`, `npm ci`, `npx --no`, `local_*` add-ons), and the user runs the rest with `! <command>` |
+| `scripts/secret_leak_scan.py` | at session end and start, scans the transcripts for the house's live secret values and pushes which to rotate; prints labels and fingerprints, never a value |
 
 Context hooks fail open: a broken hook must never block a session.
 Enforcement belongs to the git hooks and CI.

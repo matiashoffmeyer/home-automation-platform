@@ -1,0 +1,57 @@
+# =============================================================================
+# Trail Buddy — baggrunds-GPS fra HA Companion (2026-11-05, B305 valg b)
+# =============================================================================
+# User-spec 2026-11-05 ("b alligevel"): Trail Buddy er en web-app, og telefonen
+# fryser dens GPS i lommen (målt 5/11: 75 min uden et kald). Companion-appen
+# melder videre i baggrunden → HA sender hver position til add-on'ets INTERNE
+# port 8081 (ingen host-port, Funnel offentliggør kun 8080, ingen kode).
+#
+# Serveren (golden-repo server/trailbuddy_server.py, companion_fix):
+#   - gemmer positionerne i 3 døgn → appen udfylder sporets hul når den åbnes;
+#   - flytter Parent A's gruppe-position, KUN når appens egen er > 2 min ældre, og
+#     kun hvis appen har været brugt de sidste 2 døgn (ellers ses hjemmet ikke).
+# Kræver net på turen (Companion sender ikke positioner der blev taget uden net).
+# Navnet skal være det samme som "Your name" i appens Setup → Group.
+# Ingen push → AirBnB-neutral.
+# =============================================================================
+
+rest_command:
+  trailbuddy_companion:
+    url: http://local-trailbuddy:8081/companion
+    method: POST
+    content_type: application/json
+    payload: "{{ payload }}"
+    timeout: 10
+
+automation:
+  - id: trailbuddy_companion_position
+    alias: "Trail Buddy — baggrunds-GPS fra Companion"
+    description: >-
+      Hver ny position fra device_tracker.phone_a (også kun-attribut-ændringer)
+      sendes til Trail Buddy, som bruger den når web-appens GPS står stille i
+      lommen. Unøjagtige (> 100 m) springes over.
+    mode: queued
+    max: 5
+    trigger:
+      - platform: state
+        entity_id: device_tracker.phone_a
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.to_state is not none
+             and trigger.to_state.attributes.latitude is number
+             and trigger.to_state.attributes.longitude is number
+             and (trigger.to_state.attributes.gps_accuracy | float(999)) <= 100
+             and (trigger.from_state is none
+                  or trigger.from_state.attributes.latitude != trigger.to_state.attributes.latitude
+                  or trigger.from_state.attributes.longitude != trigger.to_state.attributes.longitude) }}
+    action:
+      - action: rest_command.trailbuddy_companion
+        continue_on_error: true
+        data:
+          payload: >-
+            {% set a = trigger.to_state.attributes %}
+            {{ {'name': 'Parent A', 'lat': a.latitude, 'lon': a.longitude,
+                'accuracy': a.gps_accuracy | float(0),
+                'ele': a.altitude | float(0) if a.altitude is number else none,
+                'time': (as_timestamp(trigger.to_state.last_updated) * 1000) | int} | to_json }}

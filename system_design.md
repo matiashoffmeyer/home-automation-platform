@@ -272,7 +272,9 @@ Måler **udetemperaturen** (`sensor.udetemp`), ikke indendørs.
 
 - Under `input_number.winter_heating_season_temp`:
   - Dormant → gardiner til position 20.
-  - Active + mørkt (sol < `input_number.natlys_sol_elevation`) → luk
+  - Active om aftenen → luk samtidig med sove-gardinets aftenluk
+    (`input_number.sove_gardin_aftenluk_offset_min`), ved hjemkomst i mørke, eller
+    på godnat-knappen hvis den kommer før — aldrig efter godnat (støj)
     (`input_boolean.winter_active_dark_close_enabled`).
 - **Sol-opvarmning** (åbner ved sol på ruden): `input_boolean.winter_solar_enabled`.
 - **Kuldebølge** under `input_number.winter_cold_snap_temp` tvangslukker.

@@ -15,6 +15,7 @@
 #   0d. custom_templates/rosters.jinja passer til rosters/ (rosters.py jinja --check)
 #   0h. secrets-kontrakten: nøgler ↔ secrets.example.yaml, ingen live credential i git
 #   0i. ruff + yamllint på stagede filer; hooks/Makefile/CI i trit (test_tooling_parity)
+#   0j. gitleaks på det stagede diff (--redact); secret_guard/leak-scan-tests
 #   (HA's egen validator kører i pre-PUSH: scripts/ha_offline.py check)
 #
 # Bruger ./scripts/ha_validate.py som engine. Kun staged YAML-filer scannes.
@@ -193,6 +194,34 @@ if [ -n "$STAGED_YML" ]; then
     else
         echo "⚠️  ⚠️  yamllint mangler — YAML-lint SPRUNGET OVER. Byg værktøjerne: bash scripts/dev_setup.sh" >&2
     fi
+fi
+
+# === Check 0j: gitleaks på det stagede diff (2026-11-05) ===
+# secrets_contract.py (0h) kender husets nøgler; gitleaks fanger kendte credential-
+# FORMER (API-nøgler, private nøgler, JWT'er) i alt der stages, også i en fil
+# kontrakten ikke kigger i. Samme version og .gitleaks.toml som `make security-check`
+# og CI; --redact, så et fund aldrig printes i klartekst. Under pre-commit-
+# frameworket kører dets egen gitleaks-hook i stedet.
+if [ -z "${PRE_COMMIT:-}" ]; then
+    if GITLEAKS=$(dev_tool gitleaks); then
+        (cd "$REPO_ROOT" && "$GITLEAKS" git --pre-commit --staged --redact --no-banner -v .) || {
+            echo "❌ COMMIT BLOKERET: gitleaks fandt en hemmelighed i det stagede diff (se ovenfor, redigeret)." >&2
+            echo "   Flyt værdien til secrets.yaml (!secret / ha_secrets.get). Falsk positiv: '# gitleaks:allow'" >&2
+            echo "   på linjen, fingeraftrykket i .gitleaksignore eller en allowlist i .gitleaks.toml." >&2
+            exit 1
+        }
+    else
+        echo "⚠️  ⚠️  gitleaks mangler — hemmeligheds-scan SPRUNGET OVER. Byg værktøjerne: bash scripts/dev_setup.sh" >&2
+    fi
+fi
+# Claude-værnene (secret_guard: PreToolUse; secret_leak_scan: SessionEnd) er tavse når
+# de går i stykker (fail open) → deres tests skal være grønne før de committes.
+if git diff --cached --name-only | grep -qE '^scripts/(secret_guard|secret_leak_scan|secret_set|hoejttaler_kode|install_guard)\.py$|^scripts/tests/test_(secret_|install_guard)'; then
+    (cd "$REPO_ROOT" && python3 -m unittest discover -q -s scripts/tests -p 'test_secret_*.py' \
+        && python3 -m unittest discover -q -s scripts/tests -p 'test_install_guard*.py') || {
+        echo "❌ COMMIT BLOKERET: secret_guard/secret_leak_scan/secret_set-tests fejler (se ovenfor)." >&2
+        exit 1
+    }
 fi
 # Hooks, Makefile, CI og versions-pins skal følges ad (scripts/tests/test_tooling_parity.py).
 if git diff --cached --name-only | grep -qE '^(Makefile|\.pre-commit-config\.yaml|requirements-dev\.txt|pyproject\.toml|\.github/workflows/|scripts/(pre-commit-hook|pre-push-hook|dev_setup)\.sh|scripts/tests/test_tooling_parity)'; then

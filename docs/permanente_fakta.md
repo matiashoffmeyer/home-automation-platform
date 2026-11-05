@@ -1112,7 +1112,9 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   observationerne passede. De to observationer (24/9 + 26/9, az 244-248°) er
   stadig ægte sol som 333° ikke kan forklare → dækket af en EMPIRISK
   strejflys-boks (az 224-270°, vej 273 cm kalibreret til "nederste 20 %";
-  fra = 240° siden 18/10: user så pletten nå billedets kant ved az 241,3°),
+  fra = 240° 18/10: user så pletten nå billedets kant ved az 241,3°; fra =
+  233° siden 5/11: user rullede selv ned ved az 235,8° / elev 3,1°, og 240°
+  + 1°-gulvet gjorde boksen tom nov-jan),
   som reproducerer den målte 27/9-regulering. Lysvejen er uafklaret.
 - **En Matter/Thread SLEEPY END DEVICE der mister sin forælder mens den melder
   `on`, sender aldrig sin `off`** — HA står `on` i op mod 40 min
@@ -2300,3 +2302,49 @@ Regnskabs-historikken (LTS) blev omskrevet 31/10 via websocket
 `recorder/import_statistics` + `recorder/adjust_sum_statistics`; en omdøbning i
 entity-registret FLYTTER statistikken med — den nye sensor på det gamle id starter
 tom, og grafen mister serien indtil historikken importeres igen.
+
+## En socket bundet til tailnet-adressen nægter alt — trafikken lander på LAN-adressen (2026-11-05)
+
+Målt under bygningen af `scripts/secret_set.py`: en HTTP-server bundet til
+198.51.100.101 (NUC'ens tailnet-adresse; ligger som /32 på `tailscale0`, `ip rule`
+sender Tailscale via tabel 52) afviste HVER forbindelse, også fra NUC'en selv
+(curl exit 7). Bundet til 0.0.0.0 svarede den på samme adresse, og den accepterede
+sockets lokale adresse var 192.0.2.111: forbindelser til tailnet-adressen omskrives
+(DNAT) til LAN-adressen før kernen slår lytteren op. Afsenderen bevares (100.x), så
+et filter på afsender-netværket virker. HA's :8123 lytter også på 0.0.0.0, derfor
+virker `external_url` over tailnettet.
+
+→ En ny lytter, der skal nås fra telefonen over Tailscale: bind `0.0.0.0` og afvis
+alt andet i `verify_request` (198.51.100.117/10 for tailnettet, LAN'ets /24 for `--lan`).
+Bind aldrig til tailnet-adressen: det ser ud som en firewall, men er en tom port.
+
+## Volumio har fabriks-koden skrevet ind i sin egen kode — sudoers bruger den SIDSTE regel (2026-11-05)
+
+Højttalerens Volumio (V2.13.3, Pi 3B) kalder `sudo -S` med producentens kode på
+stdin fire steder: `pluginmanager.js` (plugin `install.sh`/`uninstall.sh`) og
+`mpd/index.js` (`/bin/cp` af mpd-binæren når SACD-ISO-valget skiftes — mpd er
+stoppet forinden, så et afvist kald efterlader den stoppet). Andre steder: 0
+(målt i /volumio, /usr/local, /etc, systemd, /data). Kode-skiftet (B297) gav de
+fire kodeløs sudo i `/etc/sudoers.d/zz_hus_b297`. **Navnet skal sortere efter
+`volumio-user`**: sudo bruger den SIDSTE regel der passer, og `volumio-user`
+indeholder `volumio ALL=(ALL) ALL` (med kode); filer med `.` i navnet læses ikke.
+Bevist med `sudo -n /bin/sh /data/temp/<findes ikke>/install.sh` som volumio
+(svar "can't open", ikke "a password is required"). `volumio` har i forvejen
+kodeløs `systemctl`/`mv`/`dd` = root uden kode, så koden beskytter reelt kun
+SSH-login'et. Fabriks-nulstilling → producentens kode + ny værtsnøgle.
+`scripts/hoejttaler_kode.py` skifter koden igen.
+
+## NUC'en er headless — ingen skærm, intet tastatur (2026-11-05)
+
+Huset kører på en NUC uden skærm og tastatur, og sådan bliver det (user, sagt
+mange gange; 5/11: "jeg har hverken skærm eller tastatur til nuc som du ved
+(har jeg sagt mange gange)"). Alt foregår via SSH-add-on'en, REST/Supervisor-
+API'et eller users telefon (HA-appen, push-knapper, engangslinks). Derfor:
+- en ny hemmelighed skrives af `scripts/secret_set.py` (`generate`, eller
+  `ask` = engangslink på telefonen), aldrig "skriv den ind på NUC'en";
+- ingen plan, login eller recovery må forudsætte nogen VED maskinen — heller
+  ikke HA-CLI'en ved konsollens login-prompt;
+- en værtsfejl der tager netværket har ingen konsol at redde den fra. HAOS'
+  A/B-boot falder selv tilbage efter en mislykket OS-opdatering, men en fejl
+  i HA's egen konfiguration rettes kun over SSH — derfor `ha_offline.py check`
+  før push og husets eget genstarts-script i stedet for en bar genstart.

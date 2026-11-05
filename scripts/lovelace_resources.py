@@ -33,6 +33,7 @@ LOCAL_CARDS = [
     "thread-net-card.js",
     "zigbee-net-card.js",
     "lys-intensitet-card.js",
+    "folketing-liste-card.js",
 ]
 
 

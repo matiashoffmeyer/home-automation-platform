@@ -48,4 +48,10 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   `UV_PYTHON` og sæt `VIRTUAL_ENV` (`ha_offline.reexec_in_venv`); git fra core kræver
   `-c safe.directory=/config`. `grep -n "UV_SYSTEM_PYTHON" docs/permanente_fakta.md`.
 - **Scripts læser secrets.yaml KUN via `scripts/ha_secrets.py`** — en ny nøgle skal stå i
-  `secrets.example.yaml`, ellers afviser `scripts/secrets_contract.py` committen.
+  `secrets.example.yaml`, ellers afviser `scripts/secrets_contract.py` committen. Skriver
+  gør KUN `scripts/secret_set.py` (`ha_secrets.put` læser tilbage før den lander; `WRITERS`).
+- **En lytter bundet til tailnet-adressen (198.51.100.101) nægter HVER forbindelse** —
+  trafik dertil lander på LAN-adressen (192.0.2.111) før socket-opslaget; afsenderen
+  forbliver 100.x. **Signatur:** curl exit 7 mod tailnet-adressen, mens HA's :8123
+  (bundet til 0.0.0.0) svarer. → bind `0.0.0.0` og filtrér afsenderens netværk i
+  `verify_request` (`scripts/secret_set.py`). `grep -n "tailnet-adressen" docs/permanente_fakta.md`.

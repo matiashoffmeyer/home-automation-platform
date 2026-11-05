@@ -1,4 +1,4 @@
-"""The one reader for the secrets that Home Assistant and the helper scripts share.
+"""The one reader (and writer) for the secrets that Home Assistant and the scripts share.
 
 ``secrets.yaml`` is Home Assistant's own secrets store. It is gitignored, and its
 contract (every key, with a harmless placeholder) is the tracked
@@ -20,11 +20,17 @@ single-quoted and double-quoted values, trailing comments) is the subset that
 file uses.
 
 Values are never logged, and never included in exception messages.
+
+``put`` is the one writer, for values nobody types or sees: ``scripts/secret_set.py``
+generates one, or takes it from the user's phone, and hands it over here.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import shutil
 from pathlib import Path
 from typing import Literal, overload
 
@@ -46,11 +52,17 @@ def _unquote(raw: str) -> str:
     """Return the scalar value of the text after ``key:``, as YAML would read it."""
     raw = raw.strip()
     if raw[:1] == '"':
-        end = raw.find('"', 1)
-        while end > 0 and raw[end - 1] == "\\":
-            end = raw.find('"', end + 1)
-        if end > 0:
-            return raw[1:end].replace('\\"', '"').replace("\\\\", "\\")
+        i, out = 1, []
+        while i < len(raw):
+            pair = raw[i : i + 2]
+            if pair in ('\\"', "\\\\"):  # the only escapes put() writes
+                out.append(pair[1])
+                i += 2
+                continue
+            if raw[i] == '"':
+                return "".join(out)
+            out.append(raw[i])
+            i += 1
     elif raw[:1] == "'":
         i, out = 1, []
         while i < len(raw):
@@ -106,3 +118,85 @@ def get(key: str, required: bool = True) -> str | None:
     if value is None and required:
         raise SecretMissing(f"{key} is missing from {SECRETS_FILE}")
     return value
+
+
+KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def put(key: str, value: str, path: Path | None = None) -> bool:
+    """Set ``key`` to ``value`` in the secrets file. True when the key is new.
+
+    Only a one-line printable value is written, double-quoted. Every other line is
+    kept as it was; a comment on the key's own line goes. The new text must read
+    back to the same value before it replaces the file atomically, with the old
+    mode, and the previous file stays as ``<name>.prev``. Errors name the key,
+    never the value.
+    """
+    if not KEY.fullmatch(key):
+        raise ValueError(f"invalid key name {key!r}")
+    if not value or not value.isprintable():
+        raise ValueError(f"{key}: the value must be one non-empty line of printable text")
+    p = path or SECRETS_FILE
+    try:
+        text = p.read_bytes().decode("utf-8")  # bytes: keep the file's own line ends
+    except FileNotFoundError:
+        text = ""
+    lines = text.splitlines(keepends=True)
+    hits = [i for i, s in enumerate(lines) if re.match(rf"{re.escape(key)}[ \t]*:", s)]
+    if len(hits) > 1:
+        raise ValueError(f"{key} appears {len(hits)} times in {p}")
+    new_line = f"{key}: {json.dumps(value, ensure_ascii=False)}"
+    if hits:
+        i = hits[0]
+        rest = lines[i].partition(":")[2].strip()
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if rest[:1] in ("|", ">") or (nxt[:1] in (" ", "\t") and nxt.strip()):
+            raise ValueError(f"{key} holds a multi-line value in {p}: change it by hand")
+        lines[i] = new_line + lines[i][len(lines[i].rstrip("\r\n")) :]
+    else:
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += "\n"
+        lines.append(new_line + "\n")
+    out = "".join(lines)
+    if parse(out).get(key) != value or not _yaml_agrees(text, out, key, value):
+        raise ValueError(f"{key}: the new line does not read back; {p} is unchanged")
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(out)
+            f.flush()
+            os.fsync(f.fileno())
+        if p.exists():
+            st = p.stat()
+            os.chmod(tmp, st.st_mode & 0o7777)
+            try:
+                os.chown(tmp, st.st_uid, st.st_gid)
+            except PermissionError:
+                pass
+            shutil.copy2(p, p.with_name(p.name + ".prev"))
+        os.replace(tmp, p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return not hits
+
+
+def _yaml_agrees(old: str, new: str, key: str, value: str) -> bool:
+    """A second opinion from PyYAML where it is installed (HA Core always has it).
+
+    A file PyYAML could not read before is not held against the new one, and a
+    parse error is never re-raised: its message quotes the line, i.e. a value.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return True
+    try:
+        yaml.safe_load(old)
+    except yaml.YAMLError:
+        return True
+    try:
+        return (yaml.safe_load(new) or {}).get(key) == value
+    except yaml.YAMLError:
+        return False

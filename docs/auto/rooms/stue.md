@@ -46,9 +46,9 @@ Search keywords: `stue, open_plan`
   - Daylight fades while spisebordet er besat — spisestue-loftet kommer blidt på.
 - **Lysnet: Spisestue tænd på mørk indedag** (line 256, mode=single)
 - **Lysnet: Sofa-stue tænd ved LUX-fald** (line 328, mode=single)
-- **Lysnet: Stue sluk ved LUX-stigning** (line 769, mode=single)
+- **Lysnet: Stue sluk ved LUX-stigning** (line 797, mode=single)
   - Dagslys tilbage i open-plan mens lys står tændt — blid fade off af
-- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 922, mode=single)
+- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 950, mode=single)
   - Lux-præmissen bag dagslys-sluk faldt bort mens rummet stadig er optaget →
 
 ### `automations/presence_resync_on_start.yaml`
@@ -142,7 +142,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.stue_lys_on_effektiv` — 4 refs in 3 file(s)
 - `binary_sensor.stue_manuel_lys_hold` — 4 refs in 2 file(s)
 - `binary_sensor.stue_mork_morgen` — 5 refs in 5 file(s)
-- `binary_sensor.stue_sol_vindue` — 8 refs in 4 file(s)
+- `binary_sensor.stue_sol_vindue` — 13 refs in 6 file(s)
 - `binary_sensor.stue_spots_ild_aktiv` — 9 refs in 3 file(s)
 - `binary_sensor.stue_spots_ild_mulig` — 2 refs in 2 file(s)
 - `binary_sensor.stue_spots_ild_thread_pause` — 2 refs in 2 file(s)
@@ -163,7 +163,7 @@ Search keywords: `stue, open_plan`
 
 - `cover.gardin_spisestue_vest` — 77 refs in 22 file(s)
 - `cover.gardin_stue_syd` — 69 refs in 22 file(s)
-- `cover.gardin_stue_vest_1` — 66 refs in 22 file(s)
+- `cover.gardin_stue_vest_1` — 67 refs in 22 file(s)
 
 ### `input_boolean.*`
 
@@ -271,8 +271,8 @@ Search keywords: `stue, open_plan`
 - `input_number.stue_lux_threshold` — 2 refs in 2 file(s)
 - `input_number.stue_rodret_seq_minutes` — 2 refs in 2 file(s)
 - `input_number.stue_sofa_off_minutter` — 5 refs in 3 file(s)
-- `input_number.stue_sol_vindue_min_elevation` — 2 refs in 2 file(s)
-- `input_number.stue_sol_vindue_min_lux` — 2 refs in 2 file(s)
+- `input_number.stue_sol_vindue_min_elevation` — 4 refs in 3 file(s)
+- `input_number.stue_sol_vindue_min_lux` — 3 refs in 2 file(s)
 - `input_number.stue_spot_1_brugerstyrke` — 3 refs in 3 file(s)
 - `input_number.stue_spot_2_brugerstyrke` — 3 refs in 3 file(s)
 - `input_number.stue_spots_auto_brightness_pct` — 5 refs in 4 file(s)

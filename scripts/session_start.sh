@@ -12,6 +12,9 @@
 #      in the background, so `check` and `staging` are ready when needed.
 #   4. On the NUC: refresh the token statistics (Statistik -> Claude) in the
 #      background (scripts/token_audit.py push; SessionEnd runs it too).
+#   5. On the NUC: scan the Claude transcripts for live secrets in the
+#      background (scripts/secret_leak_scan.py --push; SessionEnd runs it too,
+#      this catches a session that died without one).
 # Output is at most 2 lines, because everything here is paid for in tokens in
 # every session. Never fails the session: everything is best-effort, exit 0.
 # =============================================================================
@@ -56,6 +59,11 @@ fi
 # 4) token-statistik til HA (baggrund, tavs; kun hvor supervisoren findes)
 if [ -n "${SUPERVISOR_TOKEN:-}" ] && [ -f scripts/token_audit.py ]; then
     nohup python3 scripts/token_audit.py push --quiet >/dev/null 2>&1 &
+fi
+
+# 5) lækage-scan af Claude-transskripter (baggrund, tavs) — fanger sessioner der døde uden SessionEnd
+if [ -n "${SUPERVISOR_TOKEN:-}" ] && [ -f scripts/secret_leak_scan.py ]; then
+    nohup python3 scripts/secret_leak_scan.py --push --quiet >/dev/null 2>&1 &
 fi
 
 if [ "$behind" = "0" ]; then

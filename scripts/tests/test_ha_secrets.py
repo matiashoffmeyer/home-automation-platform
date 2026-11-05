@@ -85,6 +85,71 @@ class Get(unittest.TestCase):
         self.assertIsNone(ha_secrets.get("present", required=False))
 
 
+class Put(unittest.TestCase):
+    SECRET = "Syn-th3tic-Value"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.path = self.dir / "s.yaml"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, text, mode=0o600):
+        self.path.write_text(text, encoding="utf-8")
+        os.chmod(self.path, mode)
+
+    def text(self, name="s.yaml"):
+        return (self.dir / name).read_bytes().decode("utf-8")
+
+    def test_new_key_is_appended_and_every_other_byte_kept(self):
+        self.write("# header\nother: 'x' # note\nno_newline: y")
+        self.assertTrue(ha_secrets.put("fresh", "v-1", self.path))
+        self.assertEqual(
+            self.text(), "# header\nother: 'x' # note\nno_newline: y\nfresh: \"v-1\"\n"
+        )
+
+    def test_existing_key_is_replaced_in_place_and_the_old_file_kept(self):
+        self.write("a: 1\r\nkey: old # comment\r\nb: 2\r\n", mode=0o640)
+        self.assertFalse(ha_secrets.put("key", "new", self.path))
+        self.assertEqual(self.text(), 'a: 1\r\nkey: "new"\r\nb: 2\r\n')
+        self.assertEqual(self.text("s.yaml.prev"), "a: 1\r\nkey: old # comment\r\nb: 2\r\n")
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["s.yaml", "s.yaml.prev"])
+
+    def test_a_missing_file_is_created_private(self):
+        self.assertTrue(ha_secrets.put("a", "1", self.path))
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_awkward_values_read_back_as_written(self):
+        values = ['quo"te', "back\\slash", "ends\\", '\\"', "hash # x", "æøå: 'x'", " lead", "€"]
+        for i, value in enumerate(values):
+            ha_secrets.put(f"k{i}", value, self.path)
+        self.assertEqual(ha_secrets.load(self.path), {f"k{i}": v for i, v in enumerate(values)})
+
+    def test_refuses_what_it_cannot_write_safely_and_never_names_the_value(self):
+        before = "multi: |\n  one\nfolded: >\n  x\nnested:\n  inner: 1\ntwice: a\ntwice: b\n"
+        self.write(before)
+        cases = [
+            ("multi", self.SECRET),  # block scalar
+            ("folded", self.SECRET),
+            ("nested", self.SECRET),  # a mapping under the key
+            ("inner", self.SECRET),  # only indented: the new line would not be read first
+            ("twice", self.SECRET),
+            ("bad key", self.SECRET),
+            ("ok", ""),
+            ("ok", self.SECRET + "\nsecond line"),
+            ("ok", self.SECRET + "\tTab"),
+        ]
+        for key, value in cases:
+            with self.subTest(key=key), self.assertRaises(ValueError) as cm:
+                ha_secrets.put(key, value, self.path)
+            self.assertNotIn(self.SECRET, str(cm.exception))
+        self.assertEqual(self.text(), before)
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["s.yaml"])
+
+
 class Contract(unittest.TestCase):
     LIB = {"HA_API_TOKEN": "ha_api_token"}
 
@@ -119,6 +184,11 @@ class Contract(unittest.TestCase):
             everything = ha_secrets.load()
             """)
         self.assertEqual(len(errors), 4, errors)
+
+    def test_only_the_writer_may_put(self):
+        source = "import ha_secrets\nha_secrets.put('k', 'v')\n"
+        self.assertEqual(len(self.scan(source)[1]), 1)
+        self.assertEqual(self.scan(source, rel="scripts/secret_set.py")[1], [])
 
     def test_second_path_to_the_file_is_an_error_but_prose_is_not(self):
         _, errors = self.scan('''\

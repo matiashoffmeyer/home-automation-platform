@@ -23,7 +23,8 @@
 #     detached `scan` når den sidste er > 55 min gammel. Kører ved HA-start og
 #     hvert kvarter; scanningen beder selv sensoren genlæse bagefter.
 #   push-knap FT_<SVAR>_<sag-id> → automation herunder → script.folketing_svar
-#   Folketing-siden (dashboards/folketing.yaml) → script.folketing_svar (aktuel sag)
+#   Folketing-siden (dashboards/folketing.yaml) → script.folketing_svar (aktuel sag;
+#     listen www/folketing-liste-card.js sender sag-id'et, også for at ÆNDRE et svar)
 #   Notifikation: notif_id folketing (🔔-fanen), hjemkomst-kø default ON —
 #     et knapsvar på mobildata når aldrig frem (mad-spørgsmålene 2026-08-06).
 #
@@ -39,6 +40,17 @@ input_number:
     step: 1
     mode: slider
     icon: mdi:bank
+  # Et forslag kommer først med når Folketingets resumé har så mange tegn —
+  # nyfremsatte har 0-3 sætninger, resuméet modnes løbende (user-spec 5/11).
+  # Besvarede vises altid. Læses ved hver scan (scripts/folketing.py moden()).
+  folketing_min_resume_tegn:
+    name: "Folketinget — mindste resumé"
+    min: 0
+    max: 1500
+    step: 50
+    mode: slider
+    unit_of_measurement: tegn
+    icon: mdi:text-short
 
 command_line:
   - sensor:
@@ -51,8 +63,11 @@ command_line:
       value_template: "{{ value_json.state }}"
       json_attributes:
         - aktuel
+        - alle
         - naeste
         - besvaret
+        - vigtige
+        - uvigtige
         - sammenlignet
         - partier
         - politikere
@@ -64,6 +79,10 @@ command_line:
 shell_command:
   # Templated shell_command = exec uden shell; scriptet validerer sag/svar.
   folketing_svar: "python3 /config/scripts/folketing.py svar {{ sag }} {{ svar }} {{ kilde }}"
+  # Opdater-knappen på Folketing-siden: detached scan uden push; scanningen
+  # beder selv sensor.folketing genlæse når den er færdig.
+  folketing_vaegt: "python3 /config/scripts/folketing.py vaegt {{ sag }} {{ vaegt }} {{ kilde }}"
+  folketing_opdater: "python3 /config/scripts/folketing.py opdater"
 
 script:
   # ÉN vej ind til et svar (fejlklasse #2): push-knappen og Folketing-siden.
@@ -108,6 +127,35 @@ script:
           message: clear_notification
           data:
             tag: "folketing_{{ s | trim }}"
+
+  # Vægtning-fanen: Vigtig/Normal/Uvigtig på et besvaret forslag. Vægten tæller
+  # kun i enighed-procenten (VAEGTE i scripts/folketing.py).
+  folketing_vaegt:
+    alias: "Folketinget: vægt et svar"
+    icon: mdi:scale-balance
+    mode: queued
+    max: 20
+    fields:
+      sag:
+        description: "Sagens id"
+        required: true
+      vaegt:
+        description: "VIGTIG, NORMAL eller UVIGTIG"
+        required: true
+    sequence:
+      - variables:
+          s: "{{ (sag if sag is defined else '') | string | trim }}"
+          v: "{{ (vaegt if vaegt is defined else '') | string | upper | trim }}"
+      - condition: template
+        value_template: "{{ s | regex_match('^[0-9]{1,9}$') and v in ['VIGTIG', 'NORMAL', 'UVIGTIG'] }}"
+      - service: shell_command.folketing_vaegt
+        data:
+          sag: "{{ s }}"
+          vaegt: "{{ v }}"
+          kilde: side
+      - service: homeassistant.update_entity
+        target:
+          entity_id: sensor.folketing
 
 automation:
   - id: folketing_push_svar

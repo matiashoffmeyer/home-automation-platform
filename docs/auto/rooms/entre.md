@@ -76,7 +76,7 @@ Search keywords: `entre`
 
 - `input_boolean.airbnb_velkomst_move_entre` — 3 refs in 2 file(s)
 - `input_boolean.dance_room_entre` — 5 refs in 5 file(s)
-- `input_boolean.entre_shutdown_grace` — 25 refs in 9 file(s)
+- `input_boolean.entre_shutdown_grace` — 26 refs in 9 file(s)
 - `input_boolean.entre_somrig_undo_grace` — 8 refs in 3 file(s)
 - `input_boolean.entre_valhorn_outage_alerted` — 4 refs in 2 file(s)
 - `input_boolean.entre_valhorn_stuck_alerted` — 3 refs in 1 file(s)

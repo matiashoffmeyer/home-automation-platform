@@ -28,7 +28,32 @@ if [ -n "${AUTHKEY}" ] || [ -s /data/tailscale/tailscaled.state ]; then
   fi
   if bashio::config.true 'funnel'; then
     tailscale funnel --bg 8080 || bashio::log.error "Funnel failed: enable HTTPS + the funnel node attribute for tag:trailbuddy in the Tailscale admin console"
-    bashio::log.info "Public address: https://$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
+    PUBLIC="https://$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
+    bashio::log.info "Public address: ${PUBLIC}"
+    # Home Assistant asks the internal port for this (GET :8081/health), so the
+    # tailnet name never has to be written into its config (B299).
+    export PUBLIC_URL="${PUBLIC}"
+    # Funnel watchdog (2026-11-05): after the 0.5.0 restart Funnel said "running"
+    # but the relay dropped every outside TLS handshake for hours (phones on the
+    # tailnet still worked, so nobody noticed); off + on fixed it. Every 30 min,
+    # fetch our own public /api/health the way an outsider does; two misses in a
+    # row → re-register Funnel. Home Assistant runs its own outside check and
+    # pushes if this doesn't help (packages/trailbuddy_vagt.yaml).
+    (
+      ok() { curl -fsS -o /dev/null --max-time 20 "${PUBLIC}/api/health"; }
+      sleep 300
+      while true; do
+        if ! ok && { sleep 60; ! ok; }; then
+          echo "[funnel-watchdog] ${PUBLIC} unreachable from outside: re-registering Funnel"
+          tailscale funnel --https=443 off >/dev/null 2>&1 || true
+          sleep 3
+          tailscale funnel --bg 8080 >/dev/null 2>&1 || echo "[funnel-watchdog] funnel on failed"
+          sleep 30
+          if ok; then echo "[funnel-watchdog] reachable again"; else echo "[funnel-watchdog] still unreachable"; fi
+        fi
+        sleep 1800
+      done
+    ) >/proc/1/fd/1 2>&1 &
   else
     tailscale funnel --bg off >/dev/null 2>&1 || true
   fi
