@@ -1,0 +1,135 @@
+# Cykel-plug skiftloft — max 6 tænd/sluk pr. time, for ALLE (user-spec 2026-11-07)
+#
+# User 7/11: "ingen - ingen, heller ikke os, må tænd slukke for cykelbatteri
+# plug mange gange. heller ikke automations gone rogue. max 4 on/off per time.
+# ej ok 6." → 6 skift (on→off eller off→on) i et rullende vindue på 60 min.
+# Bevidst en konstant, ikke en slider: loftet skal ikke kunne skrues op i
+# farten. Målt 4-7/11: ladeplanen skifter ~4 gange i døgnet, max 2 i timen.
+#
+# Det er en undtagelse fra "knap-tryk respekteres altid" (user selv: "heller
+# ikke os"). HA kan ikke forhindre et fysisk tryk på pluggen, kun rulle det
+# tilbage — derfor er reglen: OVER LOFTET MÅ PLUGGEN KUN SLUKKES. Sluk er den
+# sikre side (røgalarm, AirBnB, max-stop skal altid kunne slukke); et tænd
+# over loftet slukkes straks igen. Vagtens eget sluk tæller med i vinduet, så
+# en løbsk afsender holder låsen så længe den bliver ved — og slipper selv en
+# time efter at den holdt op (automatisk exit, også for en AirBnB-gæst).
+#
+# Husets egne tænd-veje (ladeplanen + proben i cykel_lader.yaml) læser
+# binary_sensor.cykel_plug_skiftloft og tænder ikke mens den er on — ellers
+# ville planens 5-min-tick køre i ring mod vagten.
+#
+# Tælleren er en streng af epoch-sekunder i input_text (restart-sikker, uden
+# `initial:`). `unavailable → on` er et Zigbee-ekko og tæller ikke (kun
+# on↔off-flanker).
+
+input_text:
+  # RUNTIME — kommasepareret epoch pr. skift inden for den seneste time.
+  cykel_plug_skift_log:
+    name: "Cykel-plug: skift i den seneste time"
+    icon: mdi:counter
+    max: 255
+
+input_datetime:
+  # Seneste push om en tilbagerullet tænding (dedupe 15 min, så en løbsk
+  # afsender ikke også spammer telefonen).
+  cykel_plug_skiftloft_varslet:
+    name: "Cykel-plug: skiftloft varslet"
+    has_date: true
+    has_time: true
+    icon: mdi:bell-ring
+
+template:
+  - binary_sensor:
+      - name: "Cykel plug skiftloft"
+        unique_id: cykel_plug_skiftloft
+        icon: mdi:power-plug-off
+        # on = 6 skift brugt i den seneste time → pluggen må kun slukkes.
+        state: >-
+          {% set nu = now().timestamp() %}
+          {% set ns = namespace(n=0) %}
+          {% for t in states('input_text.cykel_plug_skift_log').split(',') %}
+            {% if t | int(0) > nu - 3600 %}{% set ns.n = ns.n + 1 %}{% endif %}
+          {% endfor %}
+          {{ ns.n >= 6 }}
+        attributes:
+          skift: >-
+            {% set nu = now().timestamp() %}
+            {% set ns = namespace(n=0) %}
+            {% for t in states('input_text.cykel_plug_skift_log').split(',') %}
+              {% if t | int(0) > nu - 3600 %}{% set ns.n = ns.n + 1 %}{% endif %}
+            {% endfor %}
+            {{ ns.n }}
+
+automation:
+  - id: cykel_plug_skiftloft_vagt
+    alias: "Cykel-plug: max 6 tænd/sluk pr. time"
+    description: >-
+      Registrerer hvert on↔off-skift på cykel-pluggen. Er 6 skift brugt i den
+      seneste time, slukkes en ny tænding straks igen (uanset afsender:
+      app, knap, automation). Sluk er altid tilladt.
+    # queued: hurtige skift skal alle tælles, i rækkefølge.
+    mode: queued
+    max: 50
+    max_exceeded: silent
+    triggers:
+      - trigger: state
+        entity_id: switch.entre_cykel_lader_plug
+        from: "off"
+        to: "on"
+      - trigger: state
+        entity_id: switch.entre_cykel_lader_plug
+        from: "on"
+        to: "off"
+    actions:
+      - variables:
+          nu: "{{ now().timestamp() | int }}"
+          # Kun skift inden for den seneste time, FØR dette skift. En LISTE, ikke
+          # en komma-streng: en egen variables-nøgle med "1,2" bliver en tuple.
+          tidligere: >-
+            {% set ns = namespace(l=[]) %}
+            {% for t in states('input_text.cykel_plug_skift_log').split(',') %}
+              {% if t | int(0) > nu - 3600 %}{% set ns.l = ns.l + [t | int] %}{% endif %}
+            {% endfor %}
+            {{ ns.l[-20:] }}
+          antal_foer: "{{ tidligere | length }}"
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.cykel_plug_skift_log
+        data:
+          value: "{{ (tidligere + [nu | int]) | join(',') }}"
+      # Et tænd som det 7. skift (eller senere) i timen rulles tilbage.
+      - if:
+          - condition: template
+            value_template: "{{ trigger.to_state.state == 'on' and antal_foer | int >= 6 }}"
+        then:
+          - service: switch.turn_off
+            continue_on_error: true
+            target:
+              entity_id: switch.entre_cykel_lader_plug
+          - service: logbook.log
+            data:
+              name: "Cykel-plug"
+              message: >-
+                Tænding rullet tilbage: {{ antal_foer }} skift i den seneste time
+                (loft 6). Afsender: {{ 'en person' if trigger.to_state.context.user_id
+                else ('en automation' if trigger.to_state.context.parent_id else 'pluggen selv/knap') }}.
+          - if:
+              - condition: template
+                value_template: >-
+                  {% set v = state_attr('input_datetime.cykel_plug_skiftloft_varslet', 'timestamp') %}
+                  {{ v is none or nu - v > 900 }}
+            then:
+              - service: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.cykel_plug_skiftloft_varslet
+                data:
+                  timestamp: "{{ nu }}"
+              - service: script.push_notify
+                continue_on_error: true
+                data:
+                  notif_id: cykel_lader
+                  title: "🔌 Cykel-pluggen blev slukket igen"
+                  message: >-
+                    Den er tændt/slukket {{ antal_foer }} gange den seneste time
+                    (max 6). Den kan tændes igen om lidt, når de ældste skift er over
+                    en time gamle.

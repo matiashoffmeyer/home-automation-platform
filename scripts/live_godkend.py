@@ -42,6 +42,12 @@ TAG = "claude_godkend"
 EVENT = "mobile_app_notification_action"
 OM_MIN = 20
 MAX_RUNDER = 6  # 5 udsættelser = 1 t 40 min, så er svaret nej
+# Ubesvaret push sendes igen (samme tag = erstatter boblen). 7/11 05:25 nåede en
+# push aldrig telefonen (user: "jeg får ikke approval notification når jeg er på
+# hjemme wifi") — Android-appen tager pushen over sin lokale websocket hjemme, og
+# en hængt forbindelse sluger den. HA river en kanal ned der ikke kvitterer på
+# 10 s, så en gen-sending går over FCM.
+GENSEND_MIN = (3, 8)
 WS = "ws://supervisor/core/websocket"
 REST = "http://supervisor/core/api"
 
@@ -101,11 +107,19 @@ async def forbind():
     return ws
 
 
+# Events der lander mens kald() venter på et resultat (et knaptryk under en
+# gen-sending) — ventesløjfen læser dem før den læser fra socket'en.
+VENTENDE: list[dict] = []
+
+
 async def kald(ws, mid, msg):
     await ws.send(json.dumps({"id": mid, **msg}))
     async with asyncio.timeout(15):
         while True:
             m = json.loads(await ws.recv())
+            if m.get("type") == "event":
+                VENTENDE.append(m)
+                continue
             if m.get("type") == "result" and m.get("id") == mid:
                 if not m.get("success"):
                     raise RuntimeError(f"{msg.get('type')}: {m.get('error')}")
@@ -115,6 +129,29 @@ async def kald(ws, mid, msg):
 async def service(ws, mid, domain, svc, data):
     await kald(
         ws, mid, {"type": "call_service", "domain": domain, "service": svc, "service_data": data}
+    )
+
+
+async def send_push(ws, mid, titel, tekst, rid):
+    await service(
+        ws,
+        mid,
+        "notify",
+        NOTIFY,
+        {
+            "title": titel,
+            "message": tekst,
+            "data": {
+                "tag": TAG,
+                "priority": "high",
+                "ttl": 0,
+                "actions": [
+                    {"action": f"CLAUDE_GODKEND_{rid}", "title": "Godkend"},
+                    {"action": f"CLAUDE_AFVIS_{rid}", "title": "Afvis"},
+                    {"action": f"CLAUDE_OM20_{rid}", "title": f"Om {OM_MIN} min"},
+                ],
+            },
+        },
     )
 
 
@@ -133,6 +170,8 @@ async def runde(hvad, slags, minutter, frist_s, rid, nr):
     }
     frist = time.time() + frist_s
     sendt = False
+    sendt_kl = time.time()
+    gensendt = 0  # uden for genforbindelses-løkken: et fald må ikke gen-sende i stød
     while True:
         try:
             ws = await forbind()
@@ -140,35 +179,30 @@ async def runde(hvad, slags, minutter, frist_s, rid, nr):
                 # Abonnér FØR pushen, så et hurtigt tryk ikke går tabt.
                 await kald(ws, 1, {"type": "subscribe_events", "event_type": EVENT})
                 if not sendt:
-                    await service(
-                        ws,
-                        2,
-                        "notify",
-                        NOTIFY,
-                        {
-                            "title": titel,
-                            "message": tekst,
-                            "data": {
-                                "tag": TAG,
-                                "priority": "high",
-                                "ttl": 0,
-                                "actions": [
-                                    {"action": f"CLAUDE_GODKEND_{rid}", "title": "Godkend"},
-                                    {"action": f"CLAUDE_AFVIS_{rid}", "title": "Afvis"},
-                                    {"action": f"CLAUDE_OM20_{rid}", "title": f"Om {OM_MIN} min"},
-                                ],
-                            },
-                        },
-                    )
+                    await send_push(ws, 2, titel, tekst, rid)
                     sendt = True
+                    sendt_kl = time.time()
                     print(f"SPURGT ({nr}/{MAX_RUNDER}): {hvad}", flush=True)
                 svar = "intet"
                 while time.time() < frist:
+                    # Næste gen-sendings-tidspunkt (eller fristen), så en push der
+                    # aldrig nåede frem bliver sendt igen mens vi venter.
+                    naeste = frist
+                    if gensendt < len(GENSEND_MIN):
+                        naeste = min(frist, sendt_kl + GENSEND_MIN[gensendt] * 60)
                     try:
-                        async with asyncio.timeout(frist - time.time()):
-                            m = json.loads(await ws.recv())
+                        if VENTENDE:
+                            m = VENTENDE.pop(0)
+                        else:
+                            async with asyncio.timeout(max(0.1, naeste - time.time())):
+                                m = json.loads(await ws.recv())
                     except TimeoutError:
-                        break
+                        if time.time() >= frist:
+                            break
+                        gensendt += 1
+                        await send_push(ws, 10 + gensendt, titel, tekst, rid)
+                        print(f"GENSENDT ({gensendt}): intet svar endnu", flush=True)
+                        continue
                     if m.get("type") == "event":
                         a = m["event"].get("data", {}).get("action", "")
                         if a in svar_paa:
@@ -179,14 +213,14 @@ async def runde(hvad, slags, minutter, frist_s, rid, nr):
                 try:
                     await service(
                         ws,
-                        3,
+                        20,
                         "notify",
                         NOTIFY,
                         {"message": "clear_notification", "data": {"tag": TAG}},
                     )
                     await service(
                         ws,
-                        4,
+                        21,
                         "logbook",
                         "log",
                         {"name": "Claude-godkendelse", "message": f"{svar}: {hvad}"},

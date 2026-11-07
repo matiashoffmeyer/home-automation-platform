@@ -1,0 +1,127 @@
+# =============================================================================
+# Trail Buddy — status for dem derhjemme + 24 t-alarm (2026-11-06)
+# =============================================================================
+# User-spec 2026-11-06: "en side i HA med en portal ind til Trail Buddy, så
+# Parent B kan se om vi bevæger os, hvornår vi sidst gjorde det, om vi holder
+# tidsplanen, og som sender en alarm til Parent B efter 24 t uden GPS-signal
+# eller med stillestående GPS-signal". Valg: alarmen kun når HELE gruppen er
+# stille; tidsplanen = gruppens km på ruten mod dagens etape i plan.csv.
+#
+# scripts/trailbuddy_watch.py henter gruppens seneste positioner fra add-on'et
+# (internt, local-trailbuddy:8080) og husker et anker pr. vandrer i
+# /config/.trailbuddy_watch_state.json. Ankeret flytter sig først når en fix
+# ligger > 250 m væk → "sidst bevæget". Intet signal og stillestående signal
+# giver samme tal, så ÉN tærskel dækker begge. Stilhed tæller fra turens dag 1
+# (datoerne i plan.csv, tyrkisk tid) til 2 dage efter sidste dag.
+#
+# Dashboard: dashboards/trailbuddy.yaml (trailbuddy-dash). Gruppe-koden står i
+# secrets (trailbuddy_trip_code), tailnet-adressen hentes fra add-on'et (B299).
+# AirBnB: notif_trailbuddy_stille_airbnb er ON — en sikkerheds-alarm til
+# Parent B, ikke et familiemønster på gæstens telefon (går kun til hendes).
+# =============================================================================
+
+command_line:
+  - sensor:
+      name: "Trail Buddy status"
+      unique_id: trail_buddy_status
+      icon: mdi:hiking
+      command: "python3 /config/scripts/trailbuddy_watch.py --timer 24 --radius 250"
+      command_timeout: 30
+      scan_interval: 300
+      value_template: "{{ value_json.state }}"
+      json_attributes:
+        - aktiv
+        - bevaeger_sig
+        - stille
+        - stille_grund
+        - sidst_bevaeget
+        - sidst_signal
+        - km
+        - hentet_ok
+        - timer
+        - dag
+        - plan_km_start
+        - plan_km_slut
+        - tidsplan
+        - vandrere
+        - public_url
+
+automation:
+  - id: trailbuddy_stille_alarm
+    alias: "Trail Buddy: gruppen stille i 24 t"
+    description: >
+      sensor.trail_buddy_status siger stille (hele gruppen uden bevægelse eller
+      signal i 24 t under turen) → push til Parent B (notif_id
+      trailbuddy_stille), igen hver 12. time så længe det varer.
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: sensor.trail_buddy_status
+        attribute: stille
+        from: false
+        to: true
+      # En genstart nulstiller attributten → backstop.
+      - trigger: time_pattern
+        minutes: "/30"
+    conditions:
+      - condition: template
+        value_template: "{{ state_attr('sensor.trail_buddy_status', 'stille') is true }}"
+      - condition: template
+        value_template: >
+          {{ as_timestamp(now()) - as_timestamp(this.attributes.last_triggered, 0) > 12 * 3600 }}
+    actions:
+      - variables:
+          s: sensor.trail_buddy_status
+          fmt: >-
+            {% set t = state_attr(s, 'sidst_bevaeget') %}
+            {{ as_timestamp(t) | timestamp_custom('%-d/%-m kl. %H:%M') if t else 'aldrig' }}
+          sig: >-
+            {% set t = state_attr(s, 'sidst_signal') %}
+            {{ as_timestamp(t) | timestamp_custom('%-d/%-m kl. %H:%M') if t else 'aldrig' }}
+          navne: >-
+            {{ (state_attr(s, 'vandrere') or []) | map(attribute='navn') | join(', ') or 'ingen' }}
+      - action: script.push_notify
+        data:
+          notif_id: trailbuddy_stille
+          title: "🥾 Ingen bevægelse i over 24 timer"
+          message: >-
+            Trail Buddy: {{ state_attr(s, 'stille_grund') }}. Sidst bevæget
+            {{ fmt }}, sidste signal {{ sig }} ({{ navne }}). Det kan være
+            dårlig dækning — prøv at ringe.
+          payload:
+            url: /trailbuddy-dash/oversigt
+            clickAction: /trailbuddy-dash/oversigt
+
+  - id: trailbuddy_stille_igen
+    alias: "Trail Buddy: gruppen bevæger sig igen"
+    description: >
+      Efter en 24 t-alarm: stille går true → false mens turen er aktiv (et
+      anker har flyttet sig) → én beroligende push.
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: sensor.trail_buddy_status
+        attribute: stille
+        from: true
+        to: false
+    conditions:
+      # Turens slut sætter også stille false — det er ikke bevægelse.
+      - condition: template
+        value_template: "{{ state_attr('sensor.trail_buddy_status', 'aktiv') is true }}"
+      # Kun hvis alarmen faktisk blev sendt siden sidste all-clear.
+      - condition: template
+        value_template: >
+          {{ as_timestamp(state_attr('automation.trail_buddy_gruppen_stille_i_24_t', 'last_triggered'), 0)
+             > as_timestamp(this.attributes.last_triggered, 0) }}
+    actions:
+      - action: script.push_notify
+        data:
+          notif_id: trailbuddy_stille
+          title: "🥾 De bevæger sig igen"
+          message: >-
+            Trail Buddy: ny bevægelse
+            {{ as_timestamp(state_attr('sensor.trail_buddy_status', 'sidst_bevaeget'))
+               | timestamp_custom('kl. %H:%M') }}.
+          payload:
+            url: /trailbuddy-dash/oversigt
+            clickAction: /trailbuddy-dash/oversigt

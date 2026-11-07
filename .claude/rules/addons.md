@@ -19,6 +19,10 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   svarer `{"result":"ok"}`, alt ser rigtigt ud, og `info` melder stadig den
   GAMLE `version`.** → `cp` FØRST, så `/store/reload`, så **`update` UDEN body**.
   Verificér på `version` i `/addons/<slug>/info`, aldrig på et sundt log.
+- **SSH-add-on'et kan ikke opdatere sig selv** — Supervisor svarer `403 Forbidden`
+  på `/addons/a0d7b954_ssh/update` fra add-on'et selv (de andre add-ons går fint).
+  → kald Core-servicen `hassio.addon_update` (`addon: a0d7b954_ssh`, `backup: true`)
+  via `/core/api/services/…`; genstarten lukker Claude-terminalen (B304, 6/11).
 - **Et add-on's host-port er en dør UDEN login på LAN + tailnet** — ingress
   beskytter kun UI-vejen, og add-ons taler sammen over Docker-nettet
   (`core-mosquitto`, `local-gesture-frame-shim:8090`). **Signatur: en `ports:`-

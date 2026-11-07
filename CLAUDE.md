@@ -236,10 +236,11 @@ deploy. Channel: `notify/mobile_app_phone_a` via
 `input_select.house_mode` == `AirBnB` → NO push, not even the deploy summary (the phone
 may be in the guest's hands). **Check the mode BEFORE you push.** Code/dashboards/
 reloads are fine; only notifications are suppressed — say in your summary that the push
-was skipped. **Three deliberate exceptions** MUST push in AirBnB (they reach the user
+was skipped. **Four deliberate exceptions** MUST push in AirBnB (they reach the user
 the second they flip the mode themselves): `packages/kamera_airbnb_vagt.yaml`
 (user-spec 2026-09-11), the checkout date in `packages/airbnb_udtjekning.yaml`
-(2026-10-28), the welcome-message reminder in `packages/airbnb_velkomst.yaml` (2026-10-29).
+(2026-10-28), the welcome-message reminder in `packages/airbnb_velkomst.yaml` (2026-10-29),
+a new device on the MAIN wifi in `packages/wifi_vagt.yaml` (2026-11-07).
 
 ### 🧪 Test physically + measure when something new goes live (2026-05-03)
 
@@ -385,7 +386,8 @@ Hand-curated, so they **drift when the code changes** — update in the SAME spr
   first, or Auto turns the light off again.
 - **Button presses (Styrbar/RODRET/SOMRIG) are always respected — mis-presses too**
   (user-spec 11-01): no guard, goodnight lock or suppressor may override a press; only
-  automation. New button in a bedroom → add it to the `bedroom_styrbar_intent_at`
+  automation. **Exception: the bike plug** — max 6 on/off per hour for everyone, presses
+  too (user 11-07, `packages/cykel_plug_skiftloft.yaml`). New button in a bedroom → add it to the `bedroom_styrbar_intent_at`
   stamp. `grep -n "Knap-tryk respekteres" docs/standing_instructions.md`.
 - **New problems** → [BACKLOG.md](BACKLOG.md) in the right category with the next free
   ID (`python3 scripts/backlog_ids.py --next`; never reused). **Solved** → "Done" with

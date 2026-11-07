@@ -12,7 +12,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `input_select.house_state` | 75 | 250 |
 | `binary_sensor.stue_apollo_occupancy_filtered` | 50 | 122 |
 | `light.spisestue_loft` | 49 | 125 |
-| `script.push_notify` | 48 | 104 |
+| `script.push_notify` | 49 | 106 |
 | `binary_sensor.entre_valhorn_occupancy` | 48 | 109 |
 | `binary_sensor.boernevaerelse_apollo_occupancy` | 47 | 127 |
 | `binary_sensor.sovevaerelse_apollo_occupancy` | 45 | 90 |

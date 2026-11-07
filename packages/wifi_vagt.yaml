@@ -1,0 +1,289 @@
+# Wifi-vagt — nye enheder på husets wifi skal godkendes eller blokeres (2026-11-07)
+#
+# User-spec 7/11: "byg notifikationen og find bloker-API'et. både parent_b og
+# jeg skal kunne godkende nye devices. hvis en enhed blokeres eller skal
+# godkendes så læs en besked op på højttaleren om det HVIS VI ER HJEMME."
+# Valgt 7/11 (b): push + Bloker-knap, ingen automatisk smid-af (tilfældige
+# "private" MAC'er og egne nye enheder ville blive smidt af).
+#
+# scripts/wifi_vagt.py læser routerens host-liste hvert 5. min og husker selv
+# kendte/afventende/blokerede MAC'er (/config/.wifi_vagt_state.json, git-
+# ignoreret). Kun NYE enheder kommer ud af scan → én push pr. enhed, aldrig
+# igen (dedupe i scriptet, ikke i HA). Bloker = routerens MAC-filter i
+# blokliste-tilstand; målt 7/11 på Roborock'en: tavs på ping fra første
+# sekund, tilbage ~10 s efter "fjern".
+#
+# AirBnB / gæste-wifi-test: scan kører `--stille` → kun en ny enhed på
+# HUSETS net (routerens assoclist for de to hoved-SSID'er, eller kabel)
+# varsles; gæsternes enheder på gæste-nettet ignoreres (user 7/11: "under
+# airbnb, hvis nogen connector til main wifi (ikke gæste-nettet), så skal
+# alerten også gå af"). Pushen går derfor OGSÅ i AirBnB (notif_wifi_airbnb,
+# en bevidst undtagelse fra AirBnB = tavs); højttaleren aldrig — gæsterne
+# hører den.
+#
+# Knapper (begge telefoner, samme tag → den anden telefons push ryddes):
+#   WIFI_GODKEND:<mac>  → kendt
+#   WIFI_BLOKER:<mac>   → MAC-filter + oplæsning hvis nogen er hjemme
+#   WIFI_FJERN:<mac>    → fortryd en blokering (fra kvitterings-pushen)
+# MAC'en valideres med regex før den når shell_command (event-data kan
+# principielt komme fra en kompromitteret telefon, jf. notif_actions.yaml).
+
+input_boolean:
+  wifi_vagt_enabled:
+    name: "Wifi-vagt: varsl nye enheder"
+    icon: mdi:wifi-lock
+  # Notifikations-toggles (script.push_notify-framework, notif_id: wifi).
+  notif_wifi_enabled:
+    name: "📶 Ny wifi-enhed — send"
+    icon: mdi:wifi-alert
+    initial: true
+  notif_wifi_parent_a:
+    name: "📶 Ny wifi-enhed — Parent A"
+    icon: mdi:cellphone
+    initial: true
+  notif_wifi_parent_b:
+    name: "📶 Ny wifi-enhed — Parent B"
+    icon: mdi:cellphone
+    initial: true
+  # Uden `initial:` (ville tvinge den ved hver start); sat on 7/11 + snapshot.
+  notif_wifi_airbnb:
+    name: "📶 Ny wifi-enhed — også i AirBnB"
+    icon: mdi:home-account
+  notif_wifi_hjemme:
+    name: "📶 Ny wifi-enhed — vent til hjemkomst"
+    icon: mdi:home-clock
+    initial: false   # en fremmed på nettet skal ses STRAKS
+
+input_datetime:
+  # Begge 00:00:00 = altid aktiv (push_notify's gate_ok: s == e -> True).
+  notif_wifi_start:
+    name: "📶 Ny wifi-enhed — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_wifi_slut:
+    name: "📶 Ny wifi-enhed — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+
+input_text:
+  # Sidste scan/handlings udfald, vist på Indstillinger → Notifikationer.
+  wifi_vagt_status:
+    name: "Wifi-vagt status"
+    icon: mdi:wifi-check
+    max: 120
+
+shell_command:
+  # cmd tvinges til en kendt kommando og mac til en gyldig MAC her — intet
+  # andet når shellen. Max ~20 s (login + 2-4 kald).
+  wifi_vagt: >-
+    python3 /config/scripts/wifi_vagt.py
+    {{ cmd if cmd in ['scan', 'godkend', 'bloker', 'fjern', 'status'] else 'status' }}
+    {{ mac if (mac | default('') | string | lower) is match('^[0-9a-f]{2}(:[0-9a-f]{2}){5}$') else '' }}
+    {{ '--stille' if (stille | default(false) | string | lower) == 'true' else '' }}
+
+script:
+  wifi_vagt_oplaes:
+    alias: "Wifi-vagt: læs op hvis nogen er hjemme"
+    mode: queued
+    max: 5
+    fields:
+      besked:
+        description: "Teksten"
+        required: true
+    sequence:
+      # "HVIS VI ER HJEMME": Parent A's proxy eller Parent B's anker (hendes GPS
+      # lyver, personer_telefon.md). Aldrig i AirBnB — gæsterne hører den.
+      # Godnat/Sleep Over/musik der spiller håndterer hoejttaler_annoncer selv.
+      - condition: template
+        value_template: >-
+          {{ (is_state('input_boolean.parent_a_home', 'on')
+              or is_state('binary_sensor.parent_b_hjemme_anker', 'on'))
+             and not is_state('input_select.house_mode', 'AirBnB') }}
+      - service: script.hoejttaler_annoncer
+        continue_on_error: true
+        data:
+          besked: "{{ besked }}"
+
+automation:
+  - id: wifi_vagt_scan
+    alias: "Wifi-vagt: find nye enheder på wifi'en"
+    description: >-
+      Hvert 5. min (og 2 min efter HA-start): spørg routeren om nye enheder.
+      Hver ny enhed giver én push til begge med Godkend/Bloker og en
+      oplæsning hvis nogen er hjemme. I AirBnB eller under gæste-wifi-test
+      varsles kun nye enheder på husets net (ikke gæste-nettet).
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: time_pattern
+        minutes: "/5"
+      - trigger: homeassistant
+        event: start
+        id: start
+    conditions:
+      - condition: state
+        entity_id: input_boolean.wifi_vagt_enabled
+        state: "on"
+    actions:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay: "00:02:00"
+      - service: shell_command.wifi_vagt
+        continue_on_error: true
+        response_variable: svar
+        data:
+          cmd: scan
+          stille: >-
+            {{ is_state('input_select.house_mode', 'AirBnB')
+               or is_state('input_boolean.gaeste_wifi_test', 'on') }}
+      - variables:
+          res: >-
+            {% set ud = (svar.stdout | default('')) if svar is defined else '' %}
+            {{ (ud | trim | from_json) if (ud | trim).startswith('{') else {'ok': false} }}
+      - if:
+          - condition: template
+            value_template: "{{ not (res.ok | default(false)) }}"
+        then:
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.wifi_vagt_status
+            data:
+              value: >-
+                Fejl {{ now().strftime('%H:%M') }}: {{ (res.fejl | default('intet svar'))
+                ~ ' ' ~ (res.detalje | default('')) }}
+          - stop: "Routeren svarede ikke"
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.wifi_vagt_status
+        data:
+          value: >-
+            {{ res.kendte }} kendte · {{ res.afventer }} afventer ·
+            {{ res.blokeret }} blokeret{{ ' · stille (gæste-net)' if res.stille else '' }}
+      - repeat:
+          for_each: "{{ res.nye | default([]) }}"
+          sequence:
+            - variables:
+                navn: "{{ repeat.item.navn if repeat.item.navn else 'Ukendt enhed (privat MAC)' }}"
+                tag: "wifi_{{ repeat.item.mac | replace(':', '') }}"
+            - service: script.push_notify
+              continue_on_error: true
+              data:
+                notif_id: wifi
+                title: "📶 Ny enhed på wifi'en"
+                message: >-
+                  {{ navn }} · {{ repeat.item.band or '?' }} · {{ repeat.item.mac }}{{
+                  '' if repeat.item.aktiv else ' (var forbundet kort)' }}{{
+                  ' · på husets net, ikke gæste-nettet'
+                  if is_state('input_select.house_mode', 'AirBnB') else '' }}.
+                  Kender I den?
+                payload:
+                  tag: "{{ tag }}"
+                  actions:
+                    - action: "WIFI_GODKEND:{{ repeat.item.mac }}"
+                      title: "Godkend"
+                    - action: "WIFI_BLOKER:{{ repeat.item.mac }}"
+                      title: "Bloker"
+            - service: logbook.log
+              data:
+                name: "Wifi-vagt"
+                message: "Ny enhed: {{ navn }} ({{ repeat.item.mac }}, {{ repeat.item.band }})."
+      - if:
+          - condition: template
+            value_template: "{{ (res.nye | default([]) | length) > 0 }}"
+        then:
+          - service: script.wifi_vagt_oplaes
+            data:
+              besked: >-
+                {% set n = res.nye | length %}
+                {{ 'En ny enhed er' if n == 1 else n ~ ' nye enheder er' }} kommet
+                på wifi'en. Godkend eller bloker på telefonen.
+
+  - id: wifi_vagt_svar
+    alias: "Wifi-vagt: Godkend / Bloker / Fortryd fra pushen"
+    description: >-
+      Knapsvar fra Parent A's eller Parent B's telefon. Rydder pushen på begge
+      telefoner, kvitterer med en ny push, og læser en blokering op hvis
+      nogen er hjemme.
+    mode: queued
+    max: 10
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+    conditions:
+      - condition: template
+        value_template: >-
+          {% set a = trigger.event.data.action | default('') | string %}
+          {{ a.split(':')[0] in ['WIFI_GODKEND', 'WIFI_BLOKER', 'WIFI_FJERN']
+             and (a[a.find(':') + 1:] | lower) is match('^[0-9a-f]{2}(:[0-9a-f]{2}){5}$') }}
+    actions:
+      - variables:
+          a: "{{ trigger.event.data.action | string }}"
+          handling: "{{ a.split(':')[0] }}"
+          mac: "{{ a[a.find(':') + 1:] | lower }}"
+          cmd: "{{ {'WIFI_GODKEND': 'godkend', 'WIFI_BLOKER': 'bloker', 'WIFI_FJERN': 'fjern'}[handling] }}"
+          tag: "wifi_{{ mac | replace(':', '') }}"
+          hvem: >-
+            {% set uid = trigger.event.context.user_id %}
+            {% set p = states.person | selectattr('attributes.user_id', 'eq', uid) | map(attribute='entity_id') | list %}
+            {{ {'person.parent_a': 'Parent A', 'person.parent_b': 'Parent B'}.get(p[0], 'telefonen')
+               if p and uid else 'telefonen' }}
+      - service: shell_command.wifi_vagt
+        continue_on_error: true
+        response_variable: svar
+        data:
+          cmd: "{{ cmd }}"
+          mac: "{{ mac }}"
+      - variables:
+          res: >-
+            {% set ud = (svar.stdout | default('')) if svar is defined else '' %}
+            {{ (ud | trim | from_json) if (ud | trim).startswith('{') else {'ok': false} }}
+          navn: "{{ res.navn if res.navn | default('') else mac }}"
+      # Ryd den oprindelige push på begge telefoner (svar, ikke varsel → ikke gatet).
+      - repeat:
+          for_each: [mobile_app_phone_a, mobile_app_phone_b]
+          sequence:
+            - service: "notify.{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                message: clear_notification
+                data:
+                  tag: "{{ tag }}"
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: wifi
+          title: >-
+            {% if not (res.ok | default(false)) %}⚠️ Wifi-vagt: {{ cmd }} fejlede
+            {% elif cmd == 'godkend' %}✅ Godkendt på wifi'en
+            {% elif cmd == 'bloker' %}⛔ Blokeret fra wifi'en
+            {% else %}↩️ Blokering fjernet{% endif %}
+          message: >-
+            {{ navn }} ({{ mac }}) — af {{ hvem }}.{% if not (res.ok | default(false)) %}
+            {{ res.fejl | default('intet svar fra routeren') }} {{ res.detalje | default('') }}{% endif %}
+          payload:
+            tag: "{{ tag }}"
+            actions: >-
+              {{ [{'action': 'WIFI_FJERN:' ~ mac, 'title': 'Fortryd'}]
+                 if cmd == 'bloker' and res.ok | default(false) else [] }}
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.wifi_vagt_status
+        data:
+          value: >-
+            {% if res.ok | default(false) %}{{ res.kendte }} kendte · {{ res.afventer }} afventer ·
+            {{ res.blokeret }} blokeret{% else %}Fejl {{ now().strftime('%H:%M') }}: {{ cmd }}{% endif %}
+      - service: logbook.log
+        data:
+          name: "Wifi-vagt"
+          message: "{{ cmd }} {{ navn }} ({{ mac }}) af {{ hvem }}: {{ 'ok' if res.ok | default(false) else 'FEJL' }}."
+      - if:
+          - condition: template
+            value_template: "{{ cmd == 'bloker' and res.ok | default(false) }}"
+        then:
+          - service: script.wifi_vagt_oplaes
+            data:
+              besked: "En ukendt enhed er blevet blokeret fra wifi'en af {{ hvem }}."

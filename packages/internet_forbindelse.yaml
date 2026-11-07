@@ -1,0 +1,89 @@
+# =============================================================================
+# Internet-forbindelse — ved huset selv at det er offline? (B254/B256, 2026-11-06)
+# =============================================================================
+# User 6/11: "ja, byg ping-sensoren" (BACKLOG Til Parent A punkt 10).
+#
+# IKKE ping: WAN-testen 31/10 (docs/offline_audit.md → "Testen 31/10") viste at
+# routeren LYVER når coax'en er ude — den svarer selv på ping/TCP til 1.1.1.1
+# og 8.8.8.8, DNS svarer fra cache, og HTTPS får routerens eget certifikat.
+# Proben er derfor et HTTPS-kald MED certifikat-tjek (curl's default; uden -k)
+# mod to uafhængige værter ad DNS-navn. Én af dem svarer 2xx/3xx → oppe.
+# Begge fejler (DNS, timeout, forkert cert) → nede. Målt 6/11: 0,08-0,11 s
+# pr. kald; et selvsigneret cert giver curl exit 60.
+#
+# input_datetime.internet_nede_siden = SKREVET stempel (#5: last_changed
+# nulstilles ved genstart): tidspunktet nettet blev set nede, 1970 når oppe.
+# B256 (inaktivitets-detektoren) skal læse det, så et langt net-udfald ikke
+# tælles som inaktivitet. Ingen push: uden net når den ikke frem alligevel.
+# AirBnB: ingen flag, ingen beskeder → intet at rydde.
+# =============================================================================
+
+command_line:
+  - binary_sensor:
+      name: "Internet forbindelse"
+      unique_id: internet_forbindelse
+      device_class: connectivity
+      command: >-
+        for u in https://www.cloudflare.com/cdn-cgi/trace https://www.google.com/generate_204;
+        do curl -fsS -o /dev/null --max-time 8 "$u" 2>/dev/null && { echo on; exit 0; }; done; echo off
+      payload_on: "on"
+      payload_off: "off"
+      command_timeout: 25
+      scan_interval: 60
+
+input_datetime:
+  internet_nede_siden:
+    name: "Internet nede siden"
+    icon: mdi:web-off
+    has_date: true
+    has_time: true
+
+automation:
+  - id: internet_nede_stempel
+    alias: "Internet: stempl udfaldet"
+    description: >
+      Skriver input_datetime.internet_nede_siden når binary_sensor.internet_forbindelse
+      går off, og 1970 når den kommer tilbage. Efter en genstart rettes stemplet
+      til den nuværende tilstand (et udfald set første gang ved boot = boot-tid,
+      en nedre grænse).
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.internet_forbindelse
+        from: "on"
+        to: "off"
+        id: nede
+      - trigger: state
+        entity_id: binary_sensor.internet_forbindelse
+        from: "off"
+        to: "on"
+        id: oppe
+      # Genstart: proben skal have kørt første gang; ingen kant at vente på.
+      - trigger: homeassistant
+        event: start
+        id: start
+    actions:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay: "00:01:30"
+      - variables:
+          oppe: "{{ is_state('binary_sensor.internet_forbindelse', 'on') }}"
+          nede: "{{ is_state('binary_sensor.internet_forbindelse', 'off') }}"
+          stempel_sat: "{{ (state_attr('input_datetime.internet_nede_siden', 'timestamp') | float(0)) > 86400 }}"
+      - choose:
+          - conditions: "{{ nede and not stempel_sat }}"
+            sequence:
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.internet_nede_siden
+                data:
+                  timestamp: "{{ as_timestamp(now()) | int }}"
+          - conditions: "{{ oppe and stempel_sat }}"
+            sequence:
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.internet_nede_siden
+                data:
+                  datetime: "1970-01-01 00:00:00"

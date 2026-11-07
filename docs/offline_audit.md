@@ -61,10 +61,10 @@ Lokale og dermed uberørte: ZHA, Matter/Thread (OTBR), Hue, ESPHome
 - DNS: HA → Supervisor-DNS → routeren, med fallback. Husets egne mål er
   IP-adresser, og `*.local` går over mDNS → lokale navne virker uden WAN.
 - NTP: ikke målt. Et kort udfald er harmløst, da NUC'ens ur kører videre.
-- **Huset ved ikke selv, at det er offline**: der er ingen `ping`-sensor mod
-  internettet. Det er ikke et problem for lyset, men B256 må ikke tolke et
-  langt net-udfald som inaktivitet, hvis git eller Claude tæller som aktivitet
-  (spørgsmål til B256).
+- **Huset ved nu selv, at det er offline** (6/11): `binary_sensor.internet_forbindelse`
+  laver HTTPS med cert-tjek hvert minut (ikke ping, se testen 31/10), og
+  `input_datetime.internet_nede_siden` er et skrevet stempel (1970 = oppe), som
+  B256 skal læse, så et langt net-udfald ikke tælles som inaktivitet.
 
 ## Gardinerne (vurderet 2026-10-28, kode + historik)
 
