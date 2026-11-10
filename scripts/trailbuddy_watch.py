@@ -106,8 +106,20 @@ def iso(ms: float | None) -> str | None:
 
 
 def update_members(state: dict, fetched: list[dict], radius: float) -> None:
-    """Flyt ankre og husk sidste kendte km/rute-afstand pr. vandrer."""
+    """Flyt ankre og husk sidste kendte km/rute-afstand pr. vandrer.
+
+    Et navn serveren ikke længere har, ryger også her (et gammelt navn efter en
+    omdøbning (10/11), eller ✕ i appen) — ellers lå det som
+    en ekstra vandrer i sensoren for altid. Serveren glemmer ikke folk uden
+    signal (kun > 20 navne eller et aktivt ✕), så det rammer ikke en der er
+    offline. En tom liste beskærer intet: hellere et spøgelse end at miste alle
+    ankre på et midlertidigt tomt svar.
+    """
     mem = state.setdefault("members", {})
+    names = {str(e.get("name") or "").strip().lower() for e in fetched} - {""}
+    if names:
+        for k in [k for k in mem if k not in names]:
+            del mem[k]
     for e in fetched:
         name = str(e.get("name") or "").strip()
         lat, lon, t = e.get("lat"), e.get("lon"), e.get("time") or e.get("received")

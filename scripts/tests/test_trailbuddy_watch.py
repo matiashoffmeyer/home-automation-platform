@@ -53,6 +53,16 @@ class Watch(unittest.TestCase):
         self.assertEqual(out["state"], "Går")
         self.assertIn("Følger planen", out["tidsplan"])
 
+    def test_renamed_hiker_is_pruned(self):
+        t = ms(2026, 11, 9, 10)
+        s = self.run_fixes([fix("Old", t - H), fix("B", t - H)], [fix("New", t), fix("B", t)])
+        self.assertEqual(sorted(s["members"]), ["b", "new"])
+
+    def test_empty_fetch_prunes_nothing(self):
+        t = ms(2026, 11, 9, 10)
+        s = self.run_fixes([fix("A", t)], [])
+        self.assertEqual(list(s["members"]), ["a"])
+
     def test_jitter_is_not_movement(self):
         t = ms(2026, 11, 9, 10)
         s = self.run_fixes([fix("A", t - 3 * H)], [fix("A", t, dlat=0.001)])  # ~110 m
