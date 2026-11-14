@@ -1,0 +1,307 @@
+# Cyber-vagt — bevis-spor for at ingen udefra har prøvet eller er kommet ind (2026-11-14)
+#
+# User-spec 14/11: "lav en cybersecurity side i ha som viser logs og stats og
+# kan bevise at vi er i sikkerhed og at udefrakommende ikke har prøvet eller
+# lykkedes med at komme ind" + "close the gaps … we can use knock-knock
+# notifications to my phone if someone tries to do anything".
+#
+# scripts/cyber_vagt.py (kørt af core hvert 10. min, :x0:45 så routerens ene
+# login-session ikke deles med wifi-vagtens /5-kørsel) læser HA-, SSH- og
+# Trail Buddy-loggene, login-tokens, lyttende porte og — en gang i timen —
+# routerens perimeter, add-ons, backups og de målte svagheder. Hændelser
+# gemmes af scriptet (/config/.cyber_vagt_state.json + cyber_vagt_log.jsonl);
+# journalen rækker kun ~1 uge, og HA skriver ikke længere home-assistant.log.
+#
+# Et afvist HA-login trigger en kørsel STRAKS (HA's egen http-login-besked),
+# så bank-på-pushen kommer inden for sekunder, ikke 10 min.
+#
+# Niveauer: alarm (noget ER åbent/kommet ind: fremmed IP på et login, ny port,
+# router åbnet, ny bruger, IP-ban) · forsøg (afvist login, 3 forkerte turkoder)
+# · info (nyt login fra husets egne net, enkelt forkert turkode, loghul).
+# Alarm/forsøg holder sensor.cyber_status indtil "Kvittér" (eller 7 døgn).
+#
+# AirBnB: pushen følger AirBnB = tavs (notif_cyber_airbnb fra); hændelserne
+# står stadig på siden. Ingen lys/lyd — intet en gæst kan mærke.
+
+input_boolean:
+  # Uden `initial:` (ville tvinge den ved hver start); sat on 14/11 + snapshot.
+  cyber_vagt_enabled:
+    name: "Cyber-vagt: overvåg adgangsveje"
+    icon: mdi:shield-lock
+  notif_cyber_enabled:
+    name: "🛡️ Cyber-vagt — send"
+    icon: mdi:shield-alert
+    initial: true
+  notif_cyber_parent_a:
+    name: "🛡️ Cyber-vagt — Parent A"
+    icon: mdi:cellphone
+    initial: true
+  notif_cyber_parent_b:
+    name: "🛡️ Cyber-vagt — Parent B"
+    icon: mdi:cellphone
+    initial: false
+  notif_cyber_airbnb:
+    name: "🛡️ Cyber-vagt — også i AirBnB"
+    icon: mdi:home-account
+  notif_cyber_hjemme:
+    name: "🛡️ Cyber-vagt — vent til hjemkomst"
+    icon: mdi:home-clock
+    initial: false   # et forsøg på at komme ind skal ses STRAKS
+
+input_datetime:
+  # Begge 00:00:00 = altid aktiv (push_notify's gate_ok: s == e -> True).
+  notif_cyber_start:
+    name: "🛡️ Cyber-vagt — fra kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  notif_cyber_slut:
+    name: "🛡️ Cyber-vagt — til kl."
+    has_date: false
+    has_time: true
+    icon: mdi:clock-end
+
+input_button:
+  cyber_kvitter:
+    name: "Cyber-vagt: kvittér hændelser"
+    icon: mdi:check-decagram
+  cyber_godkend_porte:
+    name: "Cyber-vagt: godkend nuværende porte"
+    icon: mdi:lan-check
+
+shell_command:
+  # cmd tvinges til en kendt kommando — intet andet når shellen.
+  cyber_vagt: >-
+    python3 /config/scripts/cyber_vagt.py
+    {{ cmd if cmd in ['koer', 'koer-alt', 'kvitter', 'godkend-porte'] else 'status' }}
+
+automation:
+  - id: cyber_vagt_koer
+    alias: "Cyber-vagt: læs adgangsveje og varsl forsøg"
+    description: >-
+      Hvert 10. min, 3 min efter HA-start og straks ved et afvist login:
+      læs logs, tokens, porte og router. Nye forsøg/alarmer og nye logins
+      giver én samlet push. Knapperne Kvittér og Godkend porte kører samme vej.
+    mode: queued
+    max: 3
+    max_exceeded: silent
+    triggers:
+      - trigger: time_pattern
+        minutes: "/10"
+        seconds: 45
+      - trigger: homeassistant
+        event: start
+        id: start
+      - trigger: persistent_notification
+        update_type: [added, updated]
+        notification_id: http-login
+        id: bank
+      - trigger: persistent_notification
+        update_type: [added, updated]
+        notification_id: ip-ban
+        id: bank
+      - trigger: state
+        entity_id: input_button.cyber_kvitter
+        not_from: [unavailable, unknown]
+        not_to: [unavailable, unknown]
+        id: kvitter
+      - trigger: state
+        entity_id: input_button.cyber_godkend_porte
+        not_from: [unavailable, unknown]
+        not_to: [unavailable, unknown]
+        id: godkend-porte
+    conditions:
+      # Knapperne er brugerens egne tryk og virker også med vagten slået fra.
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.cyber_vagt_enabled', 'on')
+             or (trigger is defined and trigger.id in ['kvitter', 'godkend-porte']) }}
+    actions:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay: "00:03:00"
+      - if:
+          - condition: trigger
+            id: bank
+        then:
+          # Log-linjen skal nå journalen før vi læser den.
+          - delay: "00:00:05"
+      - service: shell_command.cyber_vagt
+        continue_on_error: true
+        response_variable: svar
+        data:
+          cmd: "{{ trigger.id if trigger.id in ['kvitter', 'godkend-porte'] else 'koer' }}"
+      - variables:
+          res: >-
+            {% set ud = (svar.stdout | default('')) if svar is defined else '' %}
+            {{ (ud | trim | from_json) if (ud | trim).startswith('{') else {'ok': false} }}
+      - if:
+          - condition: template
+            value_template: "{{ not (res.ok | default(false)) }}"
+        then:
+          - event: cyber_vagt_fejl
+            event_data:
+              fejl: "{{ res.fejl | default('intet svar') }} {{ res.detalje | default('') }}"
+          - stop: "Opsamleren svarede ikke"
+      - event: cyber_vagt_resultat
+        event_data:
+          d: "{{ res }}"
+      - if:
+          - condition: template
+            value_template: "{{ (res.nye | default([]) | length) > 0 }}"
+        then:
+          - variables:
+              vaerst: >-
+                {% set n = res.nye | map(attribute='niveau') | list %}
+                {{ 'alarm' if 'alarm' in n else 'forsoeg' if 'forsoeg' in n else 'info' }}
+          - service: script.push_notify
+            continue_on_error: true
+            data:
+              notif_id: cyber
+              title: >-
+                {{ {'alarm': '🚨 Cyber-vagt: ALARM', 'forsoeg': '🛡️ Cyber-vagt: nogen bankede på',
+                    'info': '🛡️ Cyber-vagt'}[vaerst] }}
+              message: "{{ res.nye | map(attribute='tekst') | join('\n') }}"
+              payload:
+                tag: cyber_vagt
+                clickAction: /cyber-dash/oversigt
+                url: /cyber-dash/oversigt
+          - repeat:
+              for_each: "{{ res.nye }}"
+              sequence:
+                - service: logbook.log
+                  data:
+                    name: "Cyber-vagt"
+                    message: "{{ repeat.item.niveau }}: {{ repeat.item.tekst }}"
+
+template:
+  # Rå-resultatet: holdes over genstart (trigger-sensorer gendanner state +
+  # attributter). cyber_log bærer de store lister og er ude af recorderen.
+  - trigger:
+      - trigger: event
+        event_type: cyber_vagt_resultat
+    sensor:
+      - name: "Cyber vagt dom"
+        unique_id: cyber_vagt_dom
+        icon: mdi:shield-search
+        state: "{{ trigger.event.data.d.status }}"
+        attributes:
+          grunde: "{{ trigger.event.data.d.grunde }}"
+          koert: "{{ trigger.event.data.d.koert }}"
+          maalt_fra: "{{ trigger.event.data.d.maalt_fra }}"
+          kvitteret: "{{ trigger.event.data.d.kvitteret }}"
+      - name: "Cyber log"
+        unique_id: cyber_log
+        icon: mdi:text-box-search
+        state: "{{ trigger.event.data.d.log | length }}"
+        attributes:
+          log: "{{ trigger.event.data.d.log }}"
+          uge: "{{ trigger.event.data.d.uge }}"
+          tokens: "{{ trigger.event.data.d.tokens }}"
+          svagheder: "{{ trigger.event.data.d.svagheder }}"
+          ssh_kilder: "{{ trigger.event.data.d.ssh_kilder }}"
+          porte: "{{ trigger.event.data.d.porte }}"
+          porte_ukendte: "{{ trigger.event.data.d.porte_ukendte }}"
+          porte_efemere: "{{ trigger.event.data.d.porte_efemere }}"
+          addon_porte: "{{ trigger.event.data.d.addon_porte }}"
+          router_aabent: "{{ trigger.event.data.d.router_aabent }}"
+          router_laest: "{{ trigger.event.data.d.router_laest }}"
+          router_ok: "{{ trigger.event.data.d.router_ok }}"
+          backup: "{{ trigger.event.data.d.backup }}"
+          core: "{{ trigger.event.data.d.core }}"
+          brugere: "{{ trigger.event.data.d.brugere }}"
+          tb_ok_7d: "{{ trigger.event.data.d.tb_ok_7d }}"
+          tb_afvist_i_dag: "{{ trigger.event.data.d.tb_afvist_i_dag }}"
+          tb_bank_i_dag: "{{ trigger.event.data.d.tb_bank_i_dag }}"
+      - name: "Cyber forsoeg"
+        unique_id: cyber_forsoeg
+        icon: mdi:door-closed-lock
+        unit_of_measurement: "stk"
+        state_class: measurement
+        state: "{{ trigger.event.data.d.forsoeg_7d }}"
+      - name: "Cyber HA afvist"
+        unique_id: cyber_ha_afvist
+        icon: mdi:account-lock
+        unit_of_measurement: "stk"
+        state_class: measurement
+        state: "{{ trigger.event.data.d.ha_fejl_7d }}"
+      - name: "Cyber fremmede logins"
+        unique_id: cyber_fremmede_logins
+        icon: mdi:account-alert
+        unit_of_measurement: "stk"
+        state_class: measurement
+        state: "{{ trigger.event.data.d.token_fremmede }}"
+      - name: "Cyber SSH afvist"
+        unique_id: cyber_ssh_afvist
+        icon: mdi:console
+        unit_of_measurement: "stk"
+        state_class: measurement
+        state: "{{ trigger.event.data.d.ssh_fejl_7d }}"
+      - name: "Cyber SSH logins"
+        unique_id: cyber_ssh_logins
+        icon: mdi:console
+        unit_of_measurement: "stk"
+        state_class: measurement
+        state: "{{ trigger.event.data.d.ssh_ok_7d }}"
+      - name: "Cyber Trail Buddy kald"
+        unique_id: cyber_trail_buddy_kald
+        icon: mdi:hiking
+        unit_of_measurement: "stk"
+        state_class: measurement
+        state: "{{ trigger.event.data.d.tb_ok_i_dag }}"
+      - name: "Cyber Trail Buddy afvist"
+        unique_id: cyber_trail_buddy_afvist
+        icon: mdi:hand-back-left
+        unit_of_measurement: "stk"
+        state_class: measurement
+        state: "{{ trigger.event.data.d.tb_afvist_7d }}"
+      - name: "Cyber Trail Buddy bank"
+        unique_id: cyber_trail_buddy_bank
+        icon: mdi:door
+        unit_of_measurement: "stk"
+        state_class: measurement
+        state: "{{ trigger.event.data.d.tb_bank_7d }}"
+      - name: "Cyber ukendte porte"
+        unique_id: cyber_ukendte_porte
+        icon: mdi:lan-pending
+        unit_of_measurement: "stk"
+        state_class: measurement
+        state: "{{ trigger.event.data.d.porte_ukendte | length }}"
+      - name: "Cyber router"
+        unique_id: cyber_router
+        icon: mdi:router-wireless
+        state: "{{ trigger.event.data.d.router }}"
+      - name: "Cyber svagheder"
+        unique_id: cyber_svagheder
+        icon: mdi:shield-half-full
+        unit_of_measurement: "stk"
+        state_class: measurement
+        state: "{{ trigger.event.data.d.svagheder | length }}"
+
+  # Sidste FEJL-stempel: en opsamler der ikke svarer må ikke ligne "ingen tegn".
+  - trigger:
+      - trigger: event
+        event_type: cyber_vagt_fejl
+    sensor:
+      - name: "Cyber vagt fejl"
+        unique_id: cyber_vagt_fejl
+        icon: mdi:shield-off
+        device_class: timestamp
+        state: "{{ now().isoformat() }}"
+        attributes:
+          fejl: "{{ trigger.event.data.fejl }}"
+
+  # Det tal siden viser: dommen er kun gyldig hvis opsamleren har kørt for nylig.
+  - sensor:
+      - name: "Cyber status"
+        unique_id: cyber_status
+        icon: >-
+          {{ {'Ingen tegn': 'mdi:shield-check', 'Forsøg set': 'mdi:shield-alert',
+              'Alarm': 'mdi:shield-alert', 'Blind': 'mdi:shield-off'}.get(this.state, 'mdi:shield-off') }}
+        state: >-
+          {% set k = state_attr('sensor.cyber_vagt_dom', 'koert') %}
+          {% set alder = (now() - (k | as_datetime)).total_seconds() if k else 99999 %}
+          {% set d = states('sensor.cyber_vagt_dom') %}
+          {{ 'Blind' if alder > 1800 or d in ['unknown', 'unavailable'] else d }}

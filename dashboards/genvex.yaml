@@ -37,7 +37,8 @@ views:
           - type: tile
             entity: input_datetime.genvex_trin_skiftet
             name: Trin skiftet
-          # A/B: skift hver lørdag fra 17/10 (trin 2 først); push med Gjort-knap når
+          # A/B/C: skift hver lørdag. Kørt: 2, 1, 2, 1 (17/10-13/11); fra 14/11
+          # roterer 3 → 2 → 1 (sensor.genvex_trin_denne_uge). Push med Gjort-knap når
           # du er hjemme og trinnet står forkert (packages/genvex_fugt.yaml).
           - type: tile
             entity: input_boolean.genvex_ab_eksperiment
@@ -131,39 +132,63 @@ views:
           - type: heading
             heading: Effekt
             heading_style: title
-          # A/B (12/10): trin 1 mod trin 2, uanset hvilket der kører nu. Trin 2
-          # tæller kun fra fyringen 12/10 (radiatorerne tændt samme dag som
-          # trin 1 — se pakkens header); første trin 2-uge fra lør 17/10.
-          # Døgn = 15-min-samples / 96. ± = 2 × 0,35 × √(1/d1 + 1/d2).
+          # A/B/C (12/10, trin 3 med fra 14/11): trin 1 og trin 3 holdes hver for sig
+          # op mod trin 2, uanset hvilket der kører nu. Trin 2 tæller kun fra fyringen
+          # 12/10 (radiatorerne tændt samme dag som trin 1 — se pakkens header).
+          # Døgn = 15-min-samples / 96. ± = 2 × 0,35 × √(1/d_x + 1/d_2) pr. par;
+          # bad: 2 × 1,57 × √(1/n_x + 1/n_2) på henfalds-raten k, fra 5 bade.
+          # Pakken tæller allerede trin 3 (acc/maalinger har nøglerne '1'-'4').
+          # Håndklæde-rækken: sensor.bad_efter_bad (badets overskud mod stuen 0,5-4 t
+          # efter toppen, pr. kvarter). Backfillet 13/11 fra historikken 14/10 →
+          # (trin 1: 0,91 over 16 bade, trin 2: 0,82 over 18; sd pr. bad 0,43, ~11
+          # kvarterer pr. bad) → ± = 2 × 0,43 × √(11/n_x + 11/n_2), fra 5 bade.
           - type: markdown
             content: |-
               {% set acc = state_attr('sensor.genvex_effekt', 'acc') or {} %}
               {% set ml = state_attr('sensor.bad_torretid', 'maalinger') or {} %}
               {% set T = states('sensor.indoor_temperature_resilient') | float(22) %}
               {% set sat = 216.7 * 6.112 * (e ** (17.62 * T / (243.12 + T))) / (273.15 + T) %}
-              {% set b1 = ml.get('1', []) %}{% set b2 = ml.get('2', []) %}
-              {% set a1 = acc.get('1', [0, 0]) %}{% set a2 = acc.get('2', [0, 0]) %}
-              {% set d1 = a1[1] / 96 %}{% set d2 = a2[1] / 96 %}
-              {% set m1 = a1[0] / a1[1] if a1[1] > 0 else 0 %}{% set m2 = a2[0] / a2[1] if a2[1] > 0 else 0 %}
-              {% set dif = m1 - m2 %}
-              {% set fejl = 2 * 0.35 * ((1 / d1 + 1 / d2) ** 0.5) if d1 > 0 and d2 > 0 else 0 %}
-              | | Trin 2 | Trin 1 |
-              |---|---|---|
-              | Fugt over forventet | {% if a2[1] > 0 %}{{ '%+.2f' | format(m2) | replace('.', ',') }} g/m³{% else %}—{% endif %} | {% if a1[1] > 0 %}{{ '%+.2f' | format(m1) | replace('.', ',') }} g/m³{% else %}—{% endif %} |
-              | Målt i | {{ '%.1f' | format(d2) | replace('.', ',') }} døgn | {{ '%.1f' | format(d1) | replace('.', ',') }} døgn |
-              | Badet tørt efter | {% if b2 | count > 0 %}{{ b2 | map('first') | list | median | round(0) | int }} min ({{ b2 | count }} bade){% else %}ingen bade endnu{% endif %} | {% if b1 | count > 0 %}{{ b1 | map('first') | list | median | round(0) | int }} min ({{ b1 | count }} bade){% else %}ingen bade endnu{% endif %} |
+              {% set a2 = acc.get('2', [0, 0]) %}{% set d2 = a2[1] / 96 %}{% set m2 = a2[0] / a2[1] if a2[1] > 0 else 0 %}
+              {% set b2 = ml.get('2', []) %}
+              {% set hk = state_attr('sensor.bad_efter_bad', 'acc') or {} %}{% set h2 = hk.get('2', [0, 0]) %}
+              | | Trin 1 | Trin 2 | Trin 3 |
+              |---|---|---|---|
+              | Fugt over forventet |{% for t in ['1', '2', '3'] %}{% set a = acc.get(t, [0, 0]) %} {% if a[1] > 0 %}{{ '%+.2f' | format(a[0] / a[1]) | replace('.', ',') }} g/m³{% else %}—{% endif %} |{% endfor %}
 
-              {% if d1 < 3 or d2 < 3 %}**For tidligt:** vent til 3 døgn på begge trin (trin 1: {{ '%.1f' | format(d1) | replace('.', ',') }}, trin 2: {{ '%.1f' | format(d2) | replace('.', ',') }}).
-              {% elif dif | abs > fejl %}**Trin 1 giver {{ '%+.2f' | format(dif) | replace('.', ',') }} ± {{ '%.2f' | format(fejl) | replace('.', ',') }} g/m³ fugt** ≈ {{ '%+.0f' | format(dif / sat * 100) }} %RH i stuen.
-              {% else %}**Ingen målbar forskel** på lejlighedens fugt (± {{ '%.2f' | format(fejl) | replace('.', ',') }} g/m³).{% endif %}
+              | Målt i |{% for t in ['1', '2', '3'] %} {{ '%.1f' | format(acc.get(t, [0, 0])[1] / 96) | replace('.', ',') }} døgn |{% endfor %}
+
+              | Badet tørt efter |{% for t in ['1', '2', '3'] %}{% set b = ml.get(t, []) %} {% if b | count > 0 %}{{ b | map('first') | list | median | round(0) | int }} min ({{ b | count }} bade){% else %}ingen bade{% endif %} |{% endfor %}
+
+              | Bad over stue, ½-4 t efter bad |{% for t in ['1', '2', '3'] %}{% set h = hk.get(t, [0, 0]) %} {% if h[1] > 0 %}{{ '%.2f' | format(h[0] / h[1]) | replace('.', ',') }} g/m³ (~{{ (h[1] / 11) | round(0) | int }} bade){% else %}—{% endif %} |{% endfor %}
+
+
+              {% for t in ['1', '3'] %}{% set a = acc.get(t, [0, 0]) %}{% set d = a[1] / 96 %}
+              {% if d < 3 or d2 < 3 %}**Trin {{ t }}: for tidligt** — {{ '%.1f' | format(d) | replace('.', ',') }} af 3 døgn.
+              {% else %}{% set dif = a[0] / a[1] - m2 %}{% set fejl = 2 * 0.35 * ((1 / d + 1 / d2) ** 0.5) %}
+              {% if dif | abs > fejl %}**Trin {{ t }} giver {{ '%+.2f' | format(dif) | replace('.', ',') }} ± {{ '%.2f' | format(fejl) | replace('.', ',') }} g/m³ fugt** mod trin 2 ≈ {{ '%+.0f' | format(dif / sat * 100) }} %RH i stuen.
+              {% else %}**Trin {{ t }}: ingen målbar forskel** mod trin 2 (± {{ '%.2f' | format(fejl) | replace('.', ',') }} g/m³).{% endif %}{% endif %}
+
+              {% endfor %}
               Fugten tæller kun, når mindst 2 er hjemme.
-              {% if b1 | count >= 5 and b2 | count > 0 %}
-              {% set k2 = b2 | map('last') | list %}{% set k1 = b1 | map('last') | list %}
-              {% set dk = (k1 | median) - (k2 | median) %}
-              {% set fk = 2 * 1.57 * ((1 / (k2 | count) + 1 / (k1 | count)) ** 0.5) %}
-              {% if dk | abs > fk %}**Badet tørrer {{ 'langsommere' if dk < 0 else 'hurtigere' }} på trin 1:** {{ (k1 | median / (k2 | median) * 100) | round(0) | int }} % af trin 2's udsugningstakt.
-              {% else %}Badets tørretid: ingen målbar forskel endnu.{% endif %}
-              {% endif %}
+
+              {% for t in ['1', '3'] %}{% set b = ml.get(t, []) %}
+              {% if b | count >= 5 and b2 | count > 0 %}
+              {% set k2 = b2 | map('last') | list %}{% set k = b | map('last') | list %}
+              {% set dk = (k | median) - (k2 | median) %}
+              {% set fk = 2 * 1.57 * ((1 / (k2 | count) + 1 / (k | count)) ** 0.5) %}
+              {% if dk | abs > fk %}**Badet tørrer {{ 'langsommere' if dk < 0 else 'hurtigere' }} på trin {{ t }}:** {{ (k | median / (k2 | median) * 100) | round(0) | int }} % af trin 2's udsugningstakt.
+              {% else %}Badets tørretid på trin {{ t }}: ingen målbar forskel mod trin 2.{% endif %}
+              {% elif t == '3' %}Badets tørretid på trin 3: {{ b | count }} af 5 bade.{% endif %}
+
+              {% endfor %}
+              {% for t in ['1', '3'] %}{% set h = hk.get(t, [0, 0]) %}
+              {% if h[1] >= 55 and h2[1] >= 55 %}
+              {% set dh = h[0] / h[1] - h2[0] / h2[1] %}{% set fh = 2 * 0.43 * ((11 / h[1] + 11 / h2[1]) ** 0.5) %}
+              {% if dh | abs > fh %}**Håndklædet: badet er {{ '%.2f' | format(dh | abs) | replace('.', ',') }} g/m³ {{ 'fugtigere' if dh > 0 else 'tørrere' }} på trin {{ t }}** i timerne efter et bad (± {{ '%.2f' | format(fh) | replace('.', ',') }}).
+              {% else %}Håndklædet på trin {{ t }}: ingen målbar forskel mod trin 2 (± {{ '%.2f' | format(fh) | replace('.', ',') }} g/m³).{% endif %}
+              {% elif t == '3' %}Håndklædet på trin 3: ~{{ (h[1] / 11) | round(0) | int }} af 5 bade.{% endif %}
+
+              {% endfor %}
 
       # Radiatorerne tændt 12/10, samme dag som trin 1 (user 13/10). Pr. rum:
       # temperatur minus model uden fyring (a + b × udetemp 24 t, fit 14/9–12/10,
@@ -215,22 +240,24 @@ views:
               - Fugt måles i g/m³ (vandmængden) — varme ændrer kun %RH. I køkkenet, hvor fugten måles, svarer {{ '%+.1f' | format(dk) | replace('.', ',') }} °C til {{ '%+.1f' | format(rh - rh * s1 / s0) | replace('.', ',') }} %RH.
               - Trin 2 tæller kun fra 12/10, så begge trin måles med radiatorerne tændt. Første uge på trin 2: fra 17/10.
               - Genvex' fugtstyring (44 %) booster mindre, når varmen sænker %RH — det rammer begge trin ens.
-          # Trin 1 mod trin 2 ved SAMME radiator-opsætning (nøgle = nuværende
+          # Trin 1 og trin 3 mod trin 2 ved SAMME radiator-opsætning (nøgle = nuværende
           # input_number.radiator_trin_*). ± som ovenfor, kun når begge har data.
           - type: markdown
             content: |-
               {% set p = state_attr('sensor.radiator_effekt', 'pr_trin') or {} %}
               {% set ns = namespace(o=[]) %}{% for r in ['sove', 'stue', 'spisestue', 'boernevaerelse', 'bad'] %}{% set ns.o = ns.o + ['%g' | format(states('input_number.radiator_trin_' ~ r) | float(0))] %}{% endfor %}
               {% set opst = ns.o | join('-') %}
-              {% set g1 = p.get('1|' ~ opst, {}) %}{% set g2 = p.get('2|' ~ opst, {}) %}
+              {% set g1 = p.get('1|' ~ opst, {}) %}{% set g2 = p.get('2|' ~ opst, {}) %}{% set g3 = p.get('3|' ~ opst, {}) %}
               {% set sd = {'sove': 0.56, 'stue': 0.28, 'kokken': 0.19, 'bad': 0.15} %}
               {% set navn = {'sove': 'Soveværelse', 'stue': 'Stue', 'kokken': 'Køkken', 'bad': 'Bad'} %}
               {% if opst == '0-0-0-0-0' %}Log radiatorernes trin ovenfor for at sammenligne Genvex-trinnene.{% else %}
               Genvex-trin ved denne radiator-opsætning, °C over forventet:
 
-              | Rum | Trin 2 | Trin 1 | Forskel |
-              |---|---|---|---|{% for r in ['sove', 'stue', 'kokken', 'bad'] %}{% set a = g2.get(r, [0, 0]) %}{% set b = g1.get(r, [0, 0]) %}{% set d2 = a[1] / 96 %}{% set d1 = b[1] / 96 %}{% set m2 = a[0] / a[1] if a[1] > 0 else 0 %}{% set m1 = b[0] / b[1] if b[1] > 0 else 0 %}{% set f = 2 * sd[r] * ((1 / d1 + 1 / d2) ** 0.5) if d1 > 0 and d2 > 0 else 0 %}
-              | {{ navn[r] }} | {% if a[1] > 0 %}{{ '%+.1f' | format(m2) | replace('.', ',') }} ({{ '%.1f' | format(d2) | replace('.', ',') }} d){% else %}—{% endif %} | {% if b[1] > 0 %}{{ '%+.1f' | format(m1) | replace('.', ',') }} ({{ '%.1f' | format(d1) | replace('.', ',') }} d){% else %}—{% endif %} | {% if f > 0 and (d1 >= 3 and d2 >= 3 or (m1 - m2) | abs > f) %}{% if (m1 - m2) | abs > f %}**trin 2 {{ '%+.1f' | format(m2 - m1) | replace('.', ',') }} °C**{% else %}ingen{% endif %}{% else %}for tidligt{% endif %} |{% endfor %}
+              | Rum | Trin 1 | Trin 2 | Trin 3 |
+              |---|---|---|---|{% for r in ['sove', 'stue', 'kokken', 'bad'] %}{% set a = g2.get(r, [0, 0]) %}{% set d2 = a[1] / 96 %}{% set m2 = a[0] / a[1] if a[1] > 0 else 0 %}
+              | {{ navn[r] }} |{% for g in [g1, g2, g3] %}{% set b = g.get(r, [0, 0]) %}{% set d = b[1] / 96 %} {% if b[1] > 0 %}{% set m = b[0] / b[1] %}{% set f = 2 * sd[r] * ((1 / d + 1 / d2) ** 0.5) if d2 > 0 else 0 %}{% set sig = not loop.index == 2 and f > 0 and (m - m2) | abs > f %}{{ '**' if sig }}{{ '%+.1f' | format(m) | replace('.', ',') }}{{ '**' if sig }} ({{ '%.1f' | format(d) | replace('.', ',') }} d){% else %}—{% endif %} |{% endfor %}{% endfor %}
+
+              Fed = målbar forskel mod trin 2.
               {% endif %}
 
       - type: grid

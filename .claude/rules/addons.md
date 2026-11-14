@@ -23,6 +23,11 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   på `/addons/a0d7b954_ssh/update` fra add-on'et selv (de andre add-ons går fint).
   → kald Core-servicen `hassio.addon_update` (`addon: a0d7b954_ssh`, `backup: true`)
   via `/core/api/services/…`; genstarten lukker Claude-terminalen (B304, 6/11).
+- **SSH-add-on'ets `packages:` springes HELT over hvis `apk update` fejler ved
+  start** (DNS ikke klar efter boot). **Signatur: `No module named 'websockets'`,
+  ingen `node`, og add-on-loggen siger "Skipping installation of custom packages".**
+  → `scripts/ssh_pakker.sh` (init_commands) prøver igen hvert 30 s i 30 min og
+  læser listen fra add-on'ets egne options; log `/tmp/ssh_pakker.log` (12/11).
 - **Et add-on's host-port er en dør UDEN login på LAN + tailnet** — ingress
   beskytter kun UI-vejen, og add-ons taler sammen over Docker-nettet
   (`core-mosquitto`, `local-gesture-frame-shim:8090`). **Signatur: en `ports:`-

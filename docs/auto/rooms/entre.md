@@ -150,7 +150,7 @@ Search keywords: `entre`
 
 ### `switch.*`
 
-- `switch.entre_cykel_lader_plug` — 17 refs in 5 file(s)
+- `switch.entre_cykel_lader_plug` — 20 refs in 6 file(s)
 
 ### `update.*`
 

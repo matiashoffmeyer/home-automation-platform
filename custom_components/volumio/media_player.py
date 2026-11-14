@@ -142,6 +142,7 @@ class Volumio(MediaPlayerEntity):
         self._push_refresh: asyncio.Task | None = None
         # Radio-tilstand set i pushState: spiller nu / stoppede (monotonic).
         self._radio_spiller = False
+        self._vol_maal: tuple[int, float] | None = None  # (niveau, monotonic) for seneste trin
         self._radio_stoppet = 0.0
         self.thumbnail_cache = {}
         self._attr_source_list = []
@@ -795,17 +796,44 @@ class Volumio(MediaPlayerEntity):
         await self._volumio.set_volume_level(int(volume * 100))
         self._refresh_soon()
 
-    @override
-    async def async_volume_up(self) -> None:
-        """Service to send the Volumio the command for volume up."""
-        await self._volumio.volume_up()
+    async def _async_volume_step(self, retning: int) -> None:
+        """Et trin op/ned som et EKSPLICIT niveau.
+
+        Volumios egen `volume=plus/minus` gør intet på N3'ens firmware: målt
+        24/10-13/11, 41 korte OP/NED-tryk på Styrbar stue ændrede volumen 0
+        gange, mens `volume=<tal>` (fade, standby, radio-start) virker hver
+        gang. Trinnet er input_number.hoejttaler_volumen_trin (%-point).
+        Hurtige tryk lægges oven på det SENEST sendte niveau (< 3 s gammelt),
+        ellers ville to tryk inden næste state-opdatering regne fra samme tal.
+        """
+        trin_state = self.hass.states.get("input_number.hoejttaler_volumen_trin")
+        try:
+            trin = int(float(trin_state.state)) if trin_state else 5
+        except ValueError:
+            trin = 5
+        nu = time.monotonic()
+        if self._vol_maal is not None and nu - self._vol_maal[1] < 3:
+            fra = self._vol_maal[0]
+        else:
+            raw = self._state.get("volume")
+            if raw is None or raw == "":
+                return
+            fra = int(raw)
+        til = max(0, min(100, fra + retning * max(1, trin)))
+        self._vol_maal = (til, nu)
+        if til != fra:
+            await self._volumio.set_volume_level(til)
         self._refresh_soon()
 
     @override
+    async def async_volume_up(self) -> None:
+        """Et trin højere (se _async_volume_step)."""
+        await self._async_volume_step(1)
+
+    @override
     async def async_volume_down(self) -> None:
-        """Service to send the Volumio the command for volume down."""
-        await self._volumio.volume_down()
-        self._refresh_soon()
+        """Et trin lavere (se _async_volume_step)."""
+        await self._async_volume_step(-1)
 
     @override
     async def async_mute_volume(self, mute: bool) -> None:

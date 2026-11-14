@@ -314,7 +314,7 @@ Search keywords: `stue, open_plan`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
 - `light.spisestue_loft` — 125 refs in 49 file(s)
-- `light.spisestue_pendel` — 137 refs in 40 file(s)
+- `light.spisestue_pendel` — 139 refs in 40 file(s)
 - `light.stue_all` — 24 refs in 13 file(s)
 - `light.stue_apollo_rgb_light` — 5 refs in 3 file(s)
 - `light.stue_hjoernelampe` — 58 refs in 27 file(s)

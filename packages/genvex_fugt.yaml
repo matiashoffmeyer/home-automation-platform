@@ -31,7 +31,9 @@
 #
 # A/B (user 12/10: "ja send mig en notifiation når jeg er hjemme og skal skrue
 # på noget for vores eksperimenter"): 7-døgns-blokke fra lørdag 17/10, skift
-# hver lørdag; 17/10 = trin 2, 24/10 = trin 1, osv. (Oprindeligt lige ISO-uge =
+# hver lørdag; 17/10 = trin 2, 24/10 = trin 1, 31/10 = 2, 7/11 = 1. Fra 14/11
+# er trin 3 med (user 13/11): 14/11 = trin 3, 21/11 = 2, 28/11 = 1, og forfra.
+# (Oprindeligt lige ISO-uge =
 # trin 1 fra 12/10; user satte trin 2 17/10 07:50 — "planen er ændret".) Står trinnet forkert og du er hjemme, kommer
 # én push med en Gjort-knap (der sætter genvex_trin); max 1 pr. 20 t. Ingen
 # push i AirBnB. Slå A/B fra med input_boolean.genvex_ab_eksperiment.
@@ -332,13 +334,18 @@ template:
             {{ (as_local(bt).replace(hour=12, minute=0, second=0, microsecond=0)
                 + timedelta(days=1)).isoformat() if bt else none }}
   - sensor:
-      # Ugeplanen: 7-døgns-blokke fra lør 17/10 (header: A/B), start trin 2.
+      # Ugeplanen: 7-døgns-blokke fra lør 17/10 (header: A/B). Blok 0-3 er de
+      # KØRTE uger (2, 1, 2, 1) og må aldrig regnes om — en ny formel der også
+      # flytter den igangværende blok beder om et skift midt i ugen (13/11:
+      # `[2, 1, 3][n % 3]` gjorde uge 3 til trin 2 i 10 min). Fra blok 4
+      # (lør 14/11) roterer planen 3 → 2 → 1 (user 13/11: "we will try Genvex
+      # level 3 also"; trin 3 først, for det har nul data).
       - name: "Genvex trin denne uge"
         unique_id: genvex_trin_denne_uge
         icon: mdi:calendar-week
         state: >-
           {% set n = (now().date() - as_datetime('2026-10-17').date()).days // 7 %}
-          {{ 2 if n % 2 == 0 else 1 }}
+          {{ (2 if n % 2 == 0 else 1) if n < 4 else [3, 2, 1][(n - 4) % 3] }}
   - sensor:
       - name: "Fugt-overskud"
         unique_id: fugt_overskud
@@ -669,3 +676,61 @@ template:
           acc: "{{ acc }}"
           dag: "{{ res.dag }}"
           pp: "{{ res.pp }}"
+  # ---------------------------------------------------------------------------
+  # HÅNDKLÆDE-MÅLET (user 12/10: "mit håndklæde tørrer dårligere på trin 1";
+  # 13/11 med trin 3): badets fugt-overskud mod stuen (g/m³) i timerne EFTER et
+  # bad, 0,5-4 t efter toppen (sensor.bad_torretid.peak_ts) — dér hvor
+  # tørretiden ("damp væk") er ens for trinnene, men håndklædet stadig hænger.
+  # Pr. trin [sum, antal kvarterer]; samme porte som sensor.genvex_effekt
+  # (trinnet stået ≥ 3 t, ikke tøj inde; tøj-knappen trækker dagens kvarterer
+  # ud igen). Et nyt bad flytter toppen → vinduet starter forfra.
+  # State = middel for det AKTUELLE trin, aldrig none (attribut-gendannelse).
+  # ---------------------------------------------------------------------------
+  - trigger:
+      - trigger: time_pattern
+        minutes: "/15"
+        id: tick
+      - trigger: state
+        entity_id: input_button.genvex_toej_inde
+        not_from: [unavailable, unknown]
+        id: toej
+    action:
+      - variables:
+          res: >-
+            {% set nul = {'1': [0, 0], '2': [0, 0], '3': [0, 0], '4': [0, 0]} %}
+            {% set idag = now().strftime('%Y-%m-%d') %}
+            {% set g = state_attr('sensor.bad_efter_bad', 'dag') %}
+            {% set ns = namespace(d=state_attr('sensor.bad_efter_bad', 'acc') or nul,
+                                  g=g if g is mapping and g.get('d') == idag else dict(nul, d=idag)) %}
+            {% if trigger.id == 'toej' %}
+              {% for k in ['1', '2', '3', '4'] %}
+                {% set ns.d = dict(ns.d, **{k: [(ns.d[k][0] - ns.g[k][0]) | round(2), ns.d[k][1] - ns.g[k][1]]}) %}
+              {% endfor %}
+              {% set ns.g = dict(nul, d=idag) %}
+            {% else %}
+              {% set x = states('sensor.bad_fugt_overskud') | float(none) %}
+              {% set t = states('input_number.genvex_trin') | int(0) | string %}
+              {% set sk = state_attr('input_datetime.genvex_trin_skiftet', 'timestamp') | float(0) %}
+              {% set alder = as_timestamp(now()) - state_attr('sensor.bad_torretid', 'peak_ts') | float(0) %}
+              {% if x is not none and t in ['1', '2', '3', '4']
+                    and 1800 <= alder <= 14400
+                    and as_timestamp(now()) - sk >= 3 * 3600
+                    and not is_state('binary_sensor.genvex_toj_inde', 'on') %}
+                {% set ns.d = dict(ns.d, **{t: [(ns.d[t][0] + x) | round(2), ns.d[t][1] + 1]}) %}
+                {% set ns.g = dict(ns.g, **{t: [(ns.g[t][0] + x) | round(2), ns.g[t][1] + 1]}) %}
+              {% endif %}
+            {% endif %}
+            {{ {'acc': ns.d, 'dag': ns.g} }}
+          acc: "{{ res.acc }}"
+    sensor:
+      - name: "Bad efter bad"
+        unique_id: bad_efter_bad
+        unit_of_measurement: "g/m³"
+        icon: mdi:hanger
+        state: >-
+          {% set t = states('input_number.genvex_trin') | int(0) | string %}
+          {% if t in acc and acc[t][1] > 0 %}{{ (acc[t][0] / acc[t][1]) | round(2) }}
+          {% else %}0{% endif %}
+        attributes:
+          acc: "{{ acc }}"
+          dag: "{{ res.dag }}"

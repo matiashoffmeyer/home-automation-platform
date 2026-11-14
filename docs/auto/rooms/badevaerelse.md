@@ -6,7 +6,7 @@ Search keywords: `badevaerelse, bad`
 
 ## Indhold
 - [Automations](badevaerelse.md#automations) (22)
-- [Entities](badevaerelse.md#entities) (167)
+- [Entities](badevaerelse.md#entities) (168)
 - [Helpers](badevaerelse.md#helpers) (41)
 
 ---
@@ -229,10 +229,11 @@ Search keywords: `badevaerelse, bad`
 
 ### `sensor.*`
 
-- `sensor.bad_fugt_overskud` — 4 refs in 3 file(s)
+- `sensor.bad_efter_bad` — 3 refs in 2 file(s)
+- `sensor.bad_fugt_overskud` — 5 refs in 3 file(s)
 - `sensor.bad_lux` — 2 refs in 2 file(s)
 - `sensor.bad_sidste_tryk` — 1 refs in 1 file(s)
-- `sensor.bad_torretid` — 5 refs in 2 file(s)
+- `sensor.bad_torretid` — 6 refs in 2 file(s)
 - `sensor.badevaerelse_airbnb_off_factor` — 8 refs in 1 file(s)
 - `sensor.badevaerelse_aktiv_fase` — 5 refs in 2 file(s)
 - `sensor.badevaerelse_aktivitet_30min` — 5 refs in 2 file(s)

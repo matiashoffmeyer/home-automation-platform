@@ -44,7 +44,7 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 RATE = 44100
 CHANNELS = 2
 FRAME = 4  # s16 stereo
@@ -69,6 +69,7 @@ DEFAULTS: dict[str, Any] = {
     "format": "l16",
     "icy": True,
     "lead_ms": 300,
+    "connect_burst_s": 0.0,
     "backlog_s": 0.5,
     "start_hold_s": 3.0,
     "client_queue_s": 4.0,
@@ -264,6 +265,10 @@ class Bro:
         # that then sits as lag in MPD for the rest of the session).
         self.hold_until = 0.0
         self.client_came = asyncio.Event()
+        # Head start for a listener that has just connected (connect_burst_s):
+        # seconds the stream may run ahead of real time, and when it was granted.
+        self.burst = 0.0
+        self.burst_at = 0.0
         self._confirm_task: asyncio.Task | None = None
         self._stop_task: asyncio.Task | None = None
         self._tasks: set[asyncio.Task] = set()
@@ -817,6 +822,11 @@ class Bro:
                 # Start, or a pause/stall: restart the real-time clock.
                 t0 = now
                 sent = 0
+                # The head start belongs to the connection it was granted for.
+                # A later skip or resume gets none: MPD still holds its buffer,
+                # and every extra burst would put the room further behind the app.
+                if now - self.burst_at > 1.5:
+                    self.burst = 0.0
             last = now
             self.pcm_bytes += len(data)
             self.pcm_last = time.time()
@@ -828,7 +838,7 @@ class Bro:
             sent += cut
             # Real-time pacing: go-librespot would otherwise race through the
             # song, and position/skip/pause would drift from what the room hears.
-            ahead = sent / BPS - (time.monotonic() - t0) - lead
+            ahead = sent / BPS - (time.monotonic() - t0) - lead - self.burst
             if ahead > 0:
                 await asyncio.sleep(ahead)
 
@@ -918,6 +928,16 @@ class Bro:
         for chunk in self.backlog:
             client.offer(chunk)
         self._clear_backlog()
+        # MPD plays nothing until its buffer has filled, and at real-time speed
+        # that took ~4 s of silence at every start (measured 17/10: MPD elapsed
+        # ~4 s behind librespot). With connect_burst_s > 0 the first seconds are
+        # sent at once to a listener that connects to an empty room. Never more
+        # than its queue holds, or the song's first notes would be dropped.
+        if not self.clients and float(self.o.get("connect_burst_s", 0)) > 0:
+            self.burst = max(
+                0.0, min(float(self.o["connect_burst_s"]), float(self.o["client_queue_s"]) - 1.0)
+            )
+            self.burst_at = time.monotonic()
         self.clients.add(client)
         self.client_came.set()
         LOG.info("Lytter forbundet: %s (icy=%s)", client.peer, icy)
@@ -1074,6 +1094,9 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    # charset_normalizer's DEBUG line every 20 s filled the add-on log (100 lines
+    # kept) and pushed out every line about the music.
+    logging.getLogger("charset_normalizer").setLevel(logging.WARNING)
     asyncio.run(Bro(opts).run())
 
 

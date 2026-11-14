@@ -44,6 +44,10 @@ docs/sprint_log.md`. A permanent lesson goes to "Permanent facts" or a failure c
   `binary_sensor.people_fest` (min(45-, 15-min mean of occupied zones) ≥ 4.2; max
   3.71 without a party over 30 days) lifts the bid to 3.0 × mass, ceiling 30. Mass
   does NOT count 1-4 people (p50 1.5-1.8 for all) — the factor rests on one party. B271.
+- **2026-11-14 — the open doors were our own: 5 orphaned Claude test servers on
+  0.0.0.0.** A test server binds 127.0.0.1 and dies in the SAME session. No
+  `home-assistant.log`, journal ≈ 1 week → `scripts/cyber_vagt.py` keeps the
+  evidence (`sensor.cyber_status`, push per attempt). Open: B309.
 ---
 
 ## 💡 Permanent facts (distilled from archived sprints)
