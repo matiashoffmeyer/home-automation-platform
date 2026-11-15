@@ -6,7 +6,7 @@ Search keywords: `stue, open_plan`
 
 ## Indhold
 - [Automations](stue.md#automations) (22)
-- [Entities](stue.md#entities) (312)
+- [Entities](stue.md#entities) (313)
 - [Helpers](stue.md#helpers) (95)
 
 ---
@@ -58,10 +58,10 @@ Search keywords: `stue, open_plan`
 ### `automations/presence_stue.yaml`
 
 - **Lysnet: Spisestue tænd** (line 17, mode=single)
-- **Lysnet: Sofa-stue tænd** (line 185, mode=single)
-- **Lysnet: Spisestue gradvis sluk** (line 391, mode=restart)
+- **Lysnet: Sofa-stue tænd** (line 189, mode=single)
+- **Lysnet: Spisestue gradvis sluk** (line 399, mode=restart)
   - 2026-06-19 (user-spec): spisestue-loftet slukker når spisebords-Apolloen
-- **Lysnet: Sofa-stue gradvis sluk** (line 521, mode=restart)
+- **Lysnet: Sofa-stue gradvis sluk** (line 529, mode=restart)
   - 2026-06-19: sofa-lamperne slukker når sofa-Apolloen (stue_apollo) har været
 
 ### `automations/somrig_buttons.yaml`
@@ -95,7 +95,7 @@ Search keywords: `stue, open_plan`
 ### `binary_sensor.*`
 
 - `binary_sensor.dark_mode_stue` — 20 refs in 8 file(s)
-- `binary_sensor.filmmoerke_stue` — 17 refs in 10 file(s)
+- `binary_sensor.filmmoerke_stue` — 18 refs in 11 file(s)
 - `binary_sensor.godnat_spisestue_sol_under_graense` — 1 refs in 1 file(s)
 - `binary_sensor.mood_pause_stue` — 15 refs in 7 file(s)
 - `binary_sensor.open_plan_empty_for_20m` — 4 refs in 3 file(s)
@@ -138,12 +138,13 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.stue_apollo_radar_zone_3_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.stue_apollo_still_bekraeftet` — 1 refs in 1 file(s)
 - `binary_sensor.stue_dagmorke_holdt` — 5 refs in 3 file(s)
+- `binary_sensor.stue_film_fritaget` — 6 refs in 3 file(s)
 - `binary_sensor.stue_ild_morgen_mulig` — 6 refs in 3 file(s)
 - `binary_sensor.stue_lys_on_effektiv` — 4 refs in 3 file(s)
 - `binary_sensor.stue_manuel_lys_hold` — 4 refs in 2 file(s)
 - `binary_sensor.stue_mork_morgen` — 5 refs in 5 file(s)
 - `binary_sensor.stue_sol_vindue` — 13 refs in 6 file(s)
-- `binary_sensor.stue_spots_ild_aktiv` — 9 refs in 3 file(s)
+- `binary_sensor.stue_spots_ild_aktiv` — 11 refs in 3 file(s)
 - `binary_sensor.stue_spots_ild_mulig` — 2 refs in 2 file(s)
 - `binary_sensor.stue_spots_ild_thread_pause` — 2 refs in 2 file(s)
 - `binary_sensor.stue_spots_spotify_aktiv` — 8 refs in 3 file(s)
@@ -163,7 +164,7 @@ Search keywords: `stue, open_plan`
 
 - `cover.gardin_spisestue_vest` — 77 refs in 22 file(s)
 - `cover.gardin_stue_syd` — 69 refs in 22 file(s)
-- `cover.gardin_stue_vest_1` — 67 refs in 22 file(s)
+- `cover.gardin_stue_vest_1` — 68 refs in 22 file(s)
 
 ### `input_boolean.*`
 
@@ -314,7 +315,7 @@ Search keywords: `stue, open_plan`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
 - `light.spisestue_loft` — 125 refs in 49 file(s)
-- `light.spisestue_pendel` — 139 refs in 40 file(s)
+- `light.spisestue_pendel` — 138 refs in 40 file(s)
 - `light.stue_all` — 24 refs in 13 file(s)
 - `light.stue_apollo_rgb_light` — 5 refs in 3 file(s)
 - `light.stue_hjoernelampe` — 58 refs in 27 file(s)

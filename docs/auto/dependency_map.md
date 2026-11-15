@@ -8,7 +8,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 
 | Entity | Files | Refs |
 |---|---|---|
-| `input_select.house_mode` | 129 | 311 |
+| `input_select.house_mode` | 130 | 312 |
 | `input_select.house_state` | 75 | 250 |
 | `script.push_notify` | 52 | 110 |
 | `binary_sensor.stue_apollo_occupancy_filtered` | 50 | 122 |
@@ -17,13 +17,13 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `binary_sensor.boernevaerelse_apollo_occupancy` | 47 | 127 |
 | `binary_sensor.sovevaerelse_apollo_occupancy` | 45 | 90 |
 | `light.koekken_lyskaede` | 45 | 194 |
-| `input_boolean.godnat_active` | 44 | 98 |
+| `input_boolean.godnat_active` | 44 | 99 |
 | `sun.sun` | 44 | 151 |
 | `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 112 |
 | `input_boolean.godnat_boern_active` | 42 | 101 |
 | `binary_sensor.spisestue_apollo_occupancy_filtered` | 41 | 114 |
 | `binary_sensor.badevaerelse_inde_occupancy` | 40 | 135 |
-| `light.spisestue_pendel` | 40 | 139 |
+| `light.spisestue_pendel` | 40 | 138 |
 | `light.stue_laesehygge` | 38 | 87 |
 | `light.boernevaerelse_loft` | 37 | 95 |
 | `sensor.open_plan_lux` | 35 | 107 |
@@ -31,15 +31,15 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `light.boernevaerelse_hygge_strip` | 33 | 95 |
 | `binary_sensor.godnat_common_active` | 33 | 89 |
 | `binary_sensor.depot_valhorn_occupancy` | 32 | 72 |
-| `input_boolean.cinema_active` | 30 | 60 |
-| `light.stue_plug` | 30 | 81 |
+| `input_boolean.cinema_active` | 30 | 61 |
+| `light.terrasse_paerelyskaede` | 30 | 101 |
 
 ## State machine entities (kritiske)
 
 | Entity | Purpose | Files |
 |---|---|---|
 | `input_select.house_state` | Top-level state: Active vs Dormant | 75 |
-| `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 129 |
+| `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 130 |
 | `input_boolean.godnat_active` | Godnat night mode | 44 |
 | `input_boolean.godnat_pending` | Godnat in progress | 19 |
 | `input_boolean.cinema_active` | Cinema mode (mood) | 30 |
@@ -49,7 +49,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `input_boolean.kalde_active` | Kids' kalde-button active | 20 |
 | `input_boolean.airbnb_mode` | AirBnB shortcut (rare) | 0 |
 | `sensor.activity_state` | Computed activity classifier | 14 |
-| `sensor.people_estimate` | Computed people count estimate | 15 |
+| `sensor.people_estimate` | Computed people count estimate | 16 |
 | `binary_sensor.presence_sensors_available` | Master gate for all presence-driven automations | 28 |
 | `binary_sensor.terrasse_active` | Terrasse activity (Sherlock-deduktion) | 10 |
 | `sensor.open_plan_lux` | Lux fallback chain (spisestue→sove→stue) | 35 |

@@ -23,7 +23,7 @@ Ejer nu: `sensor.koekken_lyskaede_ejer` (state = krav-id eller `hus`). `binary_s
 | 15 | `nattur` Godnat/nattur | godnat er aktiv (nattur-lyset ejer kæden; viger for madlavning) | ingen |
 | — | `hus` husets mål | ingen krav aktive | — |
 
-**Når ejer = hus** vælger mål-sensorerne udseendet: dark_mode_stue > filmmoerke_koekken > madlavningslys/arbejdslys (morgen- og hjemkomstlys) > maaltidslys > hygge (sliders × elpris). Styrke: `sensor.koekken_lyskaede_target_brightness`; farve: `script.koekken_lyskaede_maal`.
+**Når ejer = hus** vælger mål-sensorerne udseendet: film (dark_mode_stue ELLER filmmoerke_koekken; samme Film-sliders) > madlavningslys/arbejdslys (morgen- og hjemkomstlys) > maaltidslys > hygge (sliders × elpris). Styrke: `sensor.koekken_lyskaede_target_brightness`; farve: `script.koekken_lyskaede_maal`.
 
 **Regler (pre-commit `ejerskab.py lint` blokerer brud på 1):**
 1. Enhver ny skriver skal stå i registret: under sit kravs `skrivere:` eller i `skrivere:` (rolle + via).

@@ -48,6 +48,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime
 
 import ha_secrets
 
@@ -70,6 +71,7 @@ SESSION_MAX_ALDER = 6 * 3600
 GATEWAY_SOEG = "https://webapi.prod.knl.nemlig.it/searchgateway/api/search"
 GATEWAY_TOKEN_S = 240  # /webapi/Token udsteder JWT'er med expires_in 300
 RATE_LIMIT_S = 0.7  # schourode brugte 1,0 — vi er lidt hurtigere, stadig høfligt
+SOEG_LOFT = 100  # searchgatewayen når aldrig længere end de første 100 (skip virker ikke)
 
 # Under denne score lægger vi IKKE varen i kurven af os selv. Målt 2026-08-31:
 # "pasta" gav 0,00 mod "Penne rigate" — et relevant produkt, men intet i navnet
@@ -364,6 +366,43 @@ class Nemlig:
         `Favorite`-flaget — og en vare brugeren HAR købt før er et stærkere
         match end navne-lighed. `includeFavorites` skal være debitor-id'et
         (målt: "1" giver 0 favoritter); leveringszonen styrer lagerstatus."""
+        svar = self._gateway({"query": query, "take": take, "skip": 0, "recipeCount": 0})
+        return (svar.get("Products") or {}).get("Products") or []
+
+    def tilbud(self, kun_favoritter=True, soeg=()):
+        """Varer på tilbud → rå produkter, deduperet på Id (2026-11-14).
+
+        `tilbud=true` (+ `favorit=true` = købt før) er Nemligs eget filter.
+        **Søgningen når KUN de første SOEG_LOFT resultater** (målt 15/11: ethvert
+        skip ≥ 100 svarer med den SAMME faste liste, også uden for filteret) —
+        paging virker ikke. Er der flere tilbud end loftet, findes resten ved
+        målrettede søgninger: `soeg` = søgeord (danske bogstaver), hvert med
+        tilbuds-filteret; et ord rammer typisk < 100."""
+        ud, set_ = [], set()
+
+        def hent(query):
+            params = {"query": query, "take": SOEG_LOFT, "skip": 0, "recipeCount": 0}
+            params["tilbud"] = "true"
+            if kun_favoritter:
+                params["favorit"] = "true"
+            pr = self._gateway(params).get("Products") or {}
+            for p in pr.get("Products") or []:
+                pid = str(p.get("Id"))
+                if pid not in set_:
+                    set_.add(pid)
+                    ud.append(p)
+            return int(pr.get("NumFound") or 0)
+
+        fundet = hent("*")
+        if fundet > SOEG_LOFT:
+            for q in dict.fromkeys(q.strip() for q in soeg if q and q.strip()):
+                hent(q)
+        return ud
+
+    def _gateway(self, params):
+        """Ét kald til searchgatewayen → hele svaret. Sender kurvens
+        leveringstid og -zone med, så lager og kampagner er dem der gælder
+        ved levering."""
         self.login()
         if self._gw_params is None:
             kurv = self._kald("GET", "/basket/GetBasket")
@@ -373,7 +412,8 @@ class Nemlig:
                 "deliveryZoneId": kurv.get("DeliveryZoneId"),
                 "includeFavorites": bruger.get("DebitorId"),
             }
-        params = {"query": query, "take": take, "skip": 0, "recipeCount": 0}
+        query = params.get("query")
+        params = dict(params)
         params.update({k: v for k, v in self._gw_params.items() if v})
         url = GATEWAY_SOEG + "?" + urllib.parse.urlencode(params)
         for forsoeg in (0, 1):
@@ -399,7 +439,7 @@ class Nemlig:
                 raise NemligFejl(f"søgning {query!r} -> HTTP {e.code}") from e
             except (urllib.error.URLError, TimeoutError) as e:
                 raise NemligFejl(f"søgning {query!r} -> {e}") from e
-        return (svar.get("Products") or {}).get("Products") or []
+        return svar
 
     @staticmethod
     def _kvalitet(traef, query):
@@ -1604,6 +1644,9 @@ def find_bedste(kandidater, soegt):
                 "enhedspris_label": p.get("UnitPriceLabel"),
                 "oeko": er_oeko(p),
                 "tilbud": paa_tilbud(p),
+                # Normalprisen står i "pris"/"enhedspris"; kampagnen regnes
+                # ind af vaelg_produkt, når mængden er kendt (_med_kampagne).
+                "kampagne": kampagne(p),
                 "beskrivelse": p.get("Description"),
                 "brand": p.get("Brand"),
                 "pakning": (f"{pm:g}{pe}" if pm else None),
@@ -1664,12 +1707,171 @@ def er_oeko(produkt):
 
 
 def paa_tilbud(produkt):
-    if produkt.get("DiscountItem"):
+    """En GYLDIG kampagne (se `kampagne`) eller mærket «Prisfald».
+
+    Mærket «Discount» og `DiscountItem` er IKKE tilbud (2026-11-14): det er
+    Nemligs lavpris-sortiment (278 af 1310 målte varer), og som "tilbud" gjorde
+    de flaget næsten meningsløst — mens de ægte kampagner slet ikke blev set."""
+    if kampagne(produkt):
         return True
-    return any(
-        (m or "").lower() in ("discount", "tilbud", "prisfald")
-        for m in (produkt.get("Labels") or [])
-    )
+    return any((m or "").lower() == "prisfald" for m in (produkt.get("Labels") or []))
+
+
+# =============================================================================
+# Kampagner (2026-11-14) — Nemligs EGNE tilbud, læst af `Campaign`
+# =============================================================================
+# Searchgatewayen bærer et `Campaign`-objekt på ~62 % af varerne (målt 14/11
+# over 1310 varer: 419 mixtilbud, 214 "X for Y", 91 kr-rabat, 89 %-rabat).
+# Den gamle søgning havde dem ikke (docs/nemlig_kurv.md, fase 4), så alt her
+# regnede med NORMALPRISEN — tilbud kunne hverken vælge vare eller tælles.
+#   ProductCampaignDiscountPercent / -Discount  → CampaignPrice pr. stk
+#   ProductCampaignBuyXForY / -MixOffer         → MinQuantity for TotalPrice
+# `Price`/`UnitPriceCalc` er ALTID normalprisen. Rabatten regnes ud ved kassen,
+# og en multikøbs-pris gælder kun HELE sæt. Nemligs `DiscountSavings` regnes
+# ikke med: målt 0,00 på et mixtilbud der sparer 13,85 kr.
+# Søgningen sendes med kurvens leveringstid (`timeslotUtc`), så de kampagner
+# den viser er dem der gælder ved levering; `IntervalEnd` er en ekstra vagt.
+_KAMP_ENKELT = ("ProductCampaignDiscountPercent", "ProductCampaignDiscount")
+_KAMP_SAET = ("ProductCampaignBuyXForY", "ProductCampaignMixOffer")
+# "Undgå madspild" (kode UM): ét døgns vindue og holdbarhed 0 på kød, der
+# ellers har 2-7 dage. Fin til i aften, aldrig til lager. (US ligner det, men
+# er en ugekampagne med normal holdbarhed — målt 14/11.)
+_MADSPILD_KODER = ("UM",)
+# Holdbarhed ved levering (`SaleBeforeLastSalesDate`, dage), målt 14/11:
+# tørvarer 90, frost 30, smør/ost 14, køl 7, kød 2-7. 0 = ingen dato, og det
+# betyder holdbart for husholdning/pleje, men frisk for frugt, grønt og brød.
+LAGER_MIN_DAGE = 14
+_UDATERET_HOLDBAR = {"husholdning", "nonfood", "pleje", "baby og boern", "dyremad og tilbehoer"}
+
+
+def kr(x):
+    """206.95 → '206,95' (dansk komma, uden ',00' på hele kroner)."""
+    s = f"{float(x):.2f}".replace(".", ",")
+    return s[:-3] if s.endswith(",00") else s
+
+
+def kampagne(produkt, nu=None):
+    """→ dict eller None. Kun en kampagne der faktisk er billigere end
+    normalprisen og ikke er udløbet:
+
+        {type, min_antal, total, stk_pris, max_antal, rabat_pct, slut,
+         madspild, tekst}
+
+    `total` er prisen for `min_antal` stk (1 for en almindelig rabat);
+    `max_antal` 0 = ingen grænse."""
+    c = produkt.get("Campaign") or {}
+    typ = c.get("Type")
+    try:
+        pris = float(produkt.get("Price") or 0)
+    except TypeError, ValueError:
+        return None
+    if not c or pris <= 0 or typ not in _KAMP_ENKELT + _KAMP_SAET:
+        return None
+    slut = c.get("IntervalEnd")
+    if slut:
+        try:
+            if datetime.fromisoformat(slut.replace("Z", "+00:00")) < (nu or datetime.now(UTC)):
+                return None
+        except ValueError:
+            pass
+    try:
+        if typ in _KAMP_ENKELT:
+            m, total = 1, float(c.get("CampaignPrice") or 0)
+        else:
+            m = int(c.get("MinQuantity") or 0)
+            total = float(c.get("TotalPrice") or c.get("CampaignPrice") or 0)
+        maks = int(c.get("MaxQuantity") or 0)
+    except TypeError, ValueError:
+        return None
+    if m < 1 or total <= 0 or total >= m * pris - 0.005:
+        return None
+    stk = total / m
+    rabat = (1 - stk / pris) * 100
+    if m == 1:
+        tekst = f"{kr(total)} kr (normalt {kr(pris)})"
+    else:
+        tekst = f"{m} for {kr(total)} kr (normalt {kr(m * pris)})"
+    return {
+        "type": typ,
+        "min_antal": m,
+        "total": round(total, 2),
+        "stk_pris": round(stk, 2),
+        "max_antal": maks,
+        "rabat_pct": round(rabat),
+        "slut": slut,
+        "madspild": (c.get("Code") or "") in _MADSPILD_KODER,
+        "tekst": tekst,
+    }
+
+
+def pris_for(kamp, pris, antal):
+    """Hvad koster `antal` stk, med kampagnen? Kun hele sæt får sætprisen;
+    resten koster normalpris (sådan regner Nemligs kasse)."""
+    pris = float(pris or 0)
+    antal = max(0, int(antal))
+    if not kamp or not antal:
+        return round(pris * antal, 2)
+    m = kamp["min_antal"]
+    saet = antal // m
+    if kamp.get("max_antal"):
+        saet = min(saet, kamp["max_antal"] // m)
+    return round(saet * kamp["total"] + (antal - saet * m) * pris, 2)
+
+
+def lager_holdbar(produkt):
+    """Kan en EKSTRA pakke vente til næste indkøb? Kun da må et multikøb runde
+    op (en for meget pakke kylling er ikke en besparelse, men madspild)."""
+    p = produkt.get("_raw", produkt)
+    k = kampagne(p)
+    if k and k["madspild"]:
+        return False
+    try:
+        dage = int(p.get("SaleBeforeLastSalesDate") or 0)
+    except TypeError, ValueError:
+        dage = 0
+    if dage >= LAGER_MIN_DAGE:
+        return True
+    return dage == 0 and _n(p.get("ProductMainGroupName")) in _UDATERET_HOLDBAR
+
+
+def multikoeb(kamp, pris, antal):
+    """→ (nyt_antal, ekstra_kr, spar_kr) eller None: rund op til næste HELE sæt
+    i et "X for Y"-tilbud. `ekstra_kr` er hvad oprundingen koster oven i, og
+    `spar_kr` hvad de ekstra stk sparer mod normalprisen. Holdbarhed og loft
+    afgør kalderen (nemlig_kurv.multikoeb_runding)."""
+    if not kamp or kamp["min_antal"] <= 1 or antal <= 0 or antal % kamp["min_antal"] == 0:
+        return None
+    m = kamp["min_antal"]
+    nyt = -(-int(antal) // m) * m
+    if kamp.get("max_antal") and nyt > kamp["max_antal"]:
+        return None
+    ekstra = pris_for(kamp, pris, nyt) - pris_for(kamp, pris, antal)
+    normal = (nyt - antal) * float(pris)
+    if ekstra >= normal - 0.005:
+        return None
+    return nyt, round(ekstra, 2), round(normal - ekstra, 2)
+
+
+def _med_kampagne(x, behov, soegt):
+    """Kandidaten med den enhedspris man FAKTISK betaler for opskriftens mængde.
+
+    En %-rabat gælder fra første stk; et "2 for Y" kun hvis behovet selv når
+    et helt sæt (oprunding for lagerets skyld er nemlig_kurvs valg, ikke en
+    grund til at vælge en anden vare)."""
+    k = x.get("kampagne")
+    if not k or not x.get("enhedspris") or not x.get("pris"):
+        return x
+    n = 1
+    if behov and behov[0]:
+        n = antal_pakker(behov[0], behov[1], x.get("_raw") or {}, navn=soegt)[0]
+    faktor = pris_for(k, x["pris"], n) / (n * float(x["pris"]))
+    if faktor >= 0.9995:
+        return x
+    return {
+        **x,
+        "enhedspris": round(x["enhedspris"] * faktor, 2),
+        "normal_enhedspris": x["enhedspris"],
+    }
 
 
 def _sammenlignelig(a, b):
@@ -1947,7 +2149,13 @@ def vaelg_produkt(
 
     `soegt` (valgfri) slår FORM-REGLEN og STYKVÆGT/net-før-enkelt til.
     `behov` (valgfri) = (mængde, enhed) slår PAKKE-LOFTET til.
+
+    Alle prissammenligninger herunder (favorit-loft, øko-loft, billigst) sker
+    på KAMPAGNEPRISEN for den mængde der skal bruges (2026-11-14): et tilbud
+    der gør den dyre vare billigst, skal vinde — og en favorit eller øko-vare
+    på tilbud kan nu komme under sit loft.
     """
+    rangeret = [_med_kampagne(x, behov, soegt) for x in rangeret]
     # FORM før lager: er råvaren udsolgt, må et glas ikke tage dens plads.
     # Kun blandt kandidater med hovedord-træf, ellers kunne en fremmed vare
     # i en ikke-forarbejdet kategori "redde" feltet fra den rigtige dressing.
@@ -2009,9 +2217,8 @@ def vaelg_produkt(
     if behov:
 
         def i_alt(x):
-            return antal_pakker(behov[0], behov[1], x.get("_raw") or {}, navn=soegt)[0] * (
-                x.get("pris") or 0
-            )
+            n = antal_pakker(behov[0], behov[1], x.get("_raw") or {}, navn=soegt)[0]
+            return pris_for(x.get("kampagne"), x.get("pris") or 0, n)
 
         def mindst_lige_generisk(y, x):
             return y.get("ekstra") is None or x.get("ekstra") is None or y["ekstra"] <= x["ekstra"]
@@ -2187,6 +2394,89 @@ def gem_varer(d):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=1, sort_keys=True)
     os.replace(tmp, VARER_FILE)
+
+
+# =============================================================================
+# Faste varer (2026-11-14) — hvad I faktisk køber igen og igen
+# =============================================================================
+# Ordrehistorikken er den eneste kilde der skiller "købt én gang" fra "købes
+# hver gang": `Favorite` er sat på alt der nogensinde er købt. Målt over de
+# sidste 16 ordrer: 280 forskellige varer, 69 købt i ≥ 2 ordrer.
+# Svaret indeholder også leveringsadresse og dørkode — kun de navngivne
+# vare-felter læses, og intet andet gemmes eller logges.
+# `ProductNumber` i en ordrelinje = søgningens `Id` (målt: 99 af 99 fælles).
+FASTE_FIL = "/config/.nemlig_faste.json"
+FASTE_ORDRER = 16
+FASTE_MIN_GANGE = 2
+FASTE_MAX_ALDER_S = 7 * 86400
+
+
+def _ordre_dato(s):
+    """'15/10-2026 kl. 16-19' → '2026-10-15' (None hvis formatet ændrer sig)."""
+    m = re.match(r"(\d{1,2})/(\d{1,2})-(\d{4})", s or "")
+    return f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}" if m else None
+
+
+def faste_soegeord(faste):
+    """Faste varer → søgeord til `Nemlig.tilbud(soeg=…)`: navnets første ord
+    (≥ 3 tegn), så "Smør, saltet" og "Smør usaltet" deler ét kald."""
+    ord_ = []
+    for v in faste.values():
+        w = re.split(r"[\s,./()-]+", (v.get("navn") or "").strip())
+        if w and len(w[0]) >= 3:
+            ord_.append(w[0].lower())
+    return sorted(set(ord_))
+
+
+def faste_varer(n=None, tving=False):
+    """→ {produkt-id: {navn, gange, stk, sidst}} over de sidste FASTE_ORDRER
+    ordrer — alle købte varer; `gange` ≥ FASTE_MIN_GANGE er de faste.
+
+    Cachet en uge i FASTE_FIL. Uden `n` (eller hvis Nemlig fejler) svares med
+    cachen, også en gammel, og ellers {}."""
+    gemt = {}
+    try:
+        with open(FASTE_FIL, encoding="utf-8") as f:
+            gemt = json.load(f)
+    except FileNotFoundError, json.JSONDecodeError, OSError:
+        pass
+    if not tving and time.time() - float(gemt.get("tid") or 0) < FASTE_MAX_ALDER_S:
+        return gemt.get("varer") or {}
+    if n is None:
+        return gemt.get("varer") or {}
+    try:
+        ordrer, skip = [], 0
+        while len(ordrer) < FASTE_ORDRER:
+            side = n._kald(
+                "GET", "/order/GetBasicOrderHistory", params={"skip": skip, "take": 10}
+            ).get("Orders")
+            if not side:
+                break
+            ordrer += side
+            skip += len(side)
+        varer = {}
+        for o in ordrer[:FASTE_ORDRER]:
+            dato = _ordre_dato(o.get("OrderDate"))
+            svar = n._kald("GET", "/order/GetOrderHistory", params={"orderNumber": o["Id"]})
+            for linje in svar.get("Lines") or []:
+                pid = str(linje.get("ProductNumber") or "")
+                if not linje.get("IsProductLine") or not pid:
+                    continue
+                v = varer.setdefault(
+                    pid, {"navn": linje.get("ProductName"), "gange": 0, "stk": 0, "sidst": None}
+                )
+                v["gange"] += 1
+                v["stk"] += int(linje.get("Quantity") or 0)
+                if dato and (v["sidst"] is None or dato > v["sidst"]):
+                    v["sidst"] = dato
+    except (NemligFejl, KeyError, TypeError, ValueError) as e:
+        print(f"faste_varer: ordrehistorikken fejlede ({e}) — bruger cachen", file=sys.stderr)
+        return gemt.get("varer") or {}
+    tmp = f"{FASTE_FIL}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"tid": time.time(), "ordrer": len(ordrer[:FASTE_ORDRER]), "varer": varer}, f)
+    os.replace(tmp, FASTE_FIL)
+    return varer
 
 
 # =============================================================================

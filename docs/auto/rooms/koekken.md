@@ -27,14 +27,14 @@ Search keywords: `koekken, kokken`
 ### `automations/presence_koekken.yaml`
 
 - **Lysnet: Køkken tænd** (line 32, mode=single)
-- **Lysnet: Køkken-spots ved madlavning (central zone + lux-gated)** (line 193, mode=single)
+- **Lysnet: Køkken-spots ved madlavning (central zone + lux-gated)** (line 196, mode=single)
   - 2026-06-17 (item 1 user-spec, omlagt): tænd KUN køkken-spots
-- **Lysnet: Køkken-spots sluk (køkken tomt)** (line 611, mode=restart)
+- **Lysnet: Køkken-spots sluk (køkken tomt)** (line 618, mode=restart)
   - 2026-06-17 rev.2 (user-spec "wider zone only"): spots slukker når man
-- **Lysnet: Køkken-spots sluk ved dagslys** (line 764, mode=single)
+- **Lysnet: Køkken-spots sluk ved dagslys** (line 771, mode=single)
   - Slukker switch.koekken_spots når køkkenets egen lux har ligget over
-- **Lysnet: Køkken-lyskæde sluk (køkken tomt / lys stiger)** (line 828, mode=restart)
-- **Lysnet: Køkken-session slut (tomt X min / godnat / væk)** (line 1107, mode=restart)
+- **Lysnet: Køkken-lyskæde sluk (køkken tomt / lys stiger)** (line 835, mode=restart)
+- **Lysnet: Køkken-session slut (tomt X min / godnat / væk)** (line 1114, mode=restart)
   - Afslut madlavnings-sessionen (input_boolean.koekken_session_active) når
 
 ---
@@ -57,7 +57,7 @@ Search keywords: `koekken, kokken`
 
 ### `binary_sensor.*`
 
-- `binary_sensor.filmmoerke_koekken` — 6 refs in 2 file(s)
+- `binary_sensor.filmmoerke_koekken` — 12 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_bevaegelse_frisk` — 3 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_central_zone` — 6 refs in 3 file(s)
@@ -155,14 +155,14 @@ Search keywords: `koekken, kokken`
 - `input_number.koekken_klar_puls_pct` — 3 refs in 2 file(s)
 - `input_number.koekken_lav_krop_antal` — 3 refs in 2 file(s)
 - `input_number.koekken_lav_krop_vindue_min` — 2 refs in 2 file(s)
-- `input_number.koekken_lyskaede_brightness` — 6 refs in 2 file(s)
+- `input_number.koekken_lyskaede_brightness` — 5 refs in 2 file(s)
 - `input_number.koekken_lyskaede_cooking_brightness` — 3 refs in 2 file(s)
 - `input_number.koekken_lyskaede_cooking_kelvin` — 2 refs in 2 file(s)
 - `input_number.koekken_lyskaede_cooking_moerk_brightness` — 2 refs in 2 file(s)
 - `input_number.koekken_lyskaede_cooking_morgen_kelvin` — 2 refs in 2 file(s)
 - `input_number.koekken_lyskaede_dark_hold_sekunder` — 3 refs in 3 file(s)
-- `input_number.koekken_lyskaede_dark_pct` — 4 refs in 3 file(s)
-- `input_number.koekken_lyskaede_dark_session_pct` — 3 refs in 3 file(s)
+- `input_number.koekken_lyskaede_dark_pct` — 5 refs in 3 file(s)
+- `input_number.koekken_lyskaede_dark_session_pct` — 4 refs in 3 file(s)
 - `input_number.koekken_lyskaede_doed_fade_sekunder` — 4 refs in 3 file(s)
 - `input_number.koekken_lyskaede_doed_minutter` — 3 refs in 3 file(s)
 - `input_number.koekken_lyskaede_efter_session_minutter` — 5 refs in 3 file(s)

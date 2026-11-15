@@ -141,6 +141,7 @@ E_RETTER_MAX = "input_number.mad_retter_max"
 E_BV_PCT = "input_number.mad_boernevenlig_pct"
 E_SALAT_HVER = "input_number.mad_salat_hver"
 E_SUNDHED = "input_number.mad_sundhed_maal"
+E_TILBUD_VAEGT = "input_number.mad_tilbud_vaegt"  # 0 = tilbud ignoreres i retvalget
 E_SKIP_BASIS = "input_boolean.mad_basisvarer_filter_enabled"
 E_FJERN = "input_select.mad_fjern_ret"
 # Faste knap-slots på Mad → Afstemning. Lovelace kan ikke loope, så listen har
@@ -1399,6 +1400,36 @@ def nylige_retter(*logs):
     return ud
 
 
+def tilbud_matcher(dishes):
+    """→ (bonus(d) 0..1, tekst(d) til pushen) fra dagens Nemlig-scanning.
+    Ingen/forældet scanning → ingen bonus (planen kører som før)."""
+    try:
+        import nemlig_tilbud as NT
+
+        m = NT.Matcher(NT.laes())
+        basis = NT.basis_ingredienser(dishes, ingredienser_for)
+    except Exception as e:  # tilbud er en bonus, aldrig en grund til at fejle
+        log(f"tilbud: ingen matcher ({e})")
+        m = None
+    if m is None or not m.tilbud:
+        return None, lambda d: ""
+    memo = {}
+
+    def ret(d):
+        k = id(d)
+        if k not in memo:
+            memo[k] = m.ret(ingredienser_for(d), basis)
+        return memo[k]
+
+    def tekst(d):
+        b, t = ret(d)
+        if b <= 0 or not t:
+            return ""
+        return " 💰 " + t[0].split(":")[0] + (f" +{len(t) - 1}" if len(t) > 1 else "")
+
+    return (lambda d: ret(d)[0]), tekst
+
+
 def vaelg_indkoeb(
     pulje,
     maal,
@@ -1410,8 +1441,16 @@ def vaelg_indkoeb(
     nylige=None,
     bredere=None,
     vist_i_dag=None,
+    tilbud_bonus=None,
+    tilbud_vaegt=1.0,
 ):
     """Fyld kurven til VÆGT `maal` med et mix på fire akser.
+
+    `tilbud_bonus` (2026-11-15, user: "retter og indkøb skal være mere baseret
+    på nemlig tilbud"): d → 0..1 (nemlig_tilbud.Matcher.ret; 1 = ingredienser
+    med ≥ 40 rabat-% i alt). Trækkes fra scoren × 0,8 × `tilbud_vaegt` — samme
+    størrelse som sæson-bonussen, så den afgør valget INDEN FOR et trin af
+    stigen, men aldrig slår friskhed eller godkendelse.
 
     Vægt (1d): et tilbehør tæller 0,5 — ellers ville "4 retter" kunne blive
     fire salater. Akserne (lavest score vinder, tilfældig rækkefølge bryder
@@ -1550,6 +1589,7 @@ def vaelg_indkoeb(
                 + 2.0 * abs(bv_efter - andel_bv)
                 + 0.5 * abs(sund_efter - sundhed_maal) / 10.0
                 - (0.8 if saeson and saeson_eksplicit(d, saeson) else 0.0)
+                - (0.8 * tilbud_vaegt * tilbud_bonus(d) if tilbud_bonus else 0.0)
             )
 
         d = min(kandidater, key=score)
@@ -3125,6 +3165,7 @@ def mode_indkoeb(token, states, dishes, kilde, dry, force=False):
     def ikke_tvunget(liste):
         return [d for d in liste if normaliser_navn(d.get("ret", "")) not in tvungne_navne]
 
+    tilbud_bonus, tilbud_tekst = tilbud_matcher(dishes)
     valgt = tvungne + vaelg_indkoeb(
         ikke_tvunget(pulje),
         max(0.0, maal - sum(kurv_vaegt(d) for d in tvungne)),
@@ -3142,6 +3183,8 @@ def mode_indkoeb(token, states, dishes, kilde, dry, force=False):
         nylige=nylige,
         bredere=ikke_tvunget(bredere),
         vist_i_dag=vist_i_dag,
+        tilbud_bonus=tilbud_bonus,
+        tilbud_vaegt=num(states, E_TILBUD_VAEGT, 1.0),
     )
     nyl_stammer = [ret_stamme(n) for n in nylige]
     gengangere = sum(
@@ -3156,7 +3199,8 @@ def mode_indkoeb(token, states, dishes, kilde, dry, force=False):
     # Varer, fakta og ingredienser står uændret i sensorens `tekst`-attribut =
     # Mad-siden, som notifikationen linker til.
     push = "\n".join(
-        f"{i + 1}. {d['ret']}" + (" ⭐" if har_superja(d) else "") for i, d in enumerate(valgt)
+        f"{i + 1}. {d['ret']}" + (" ⭐" if har_superja(d) else "") + tilbud_tekst(d)
+        for i, d in enumerate(valgt)
     )
     push += f"\n\n{len(linjer)} varer — se listen på Mad-siden."
     sj_navne = sorted({PEOPLE[d["superja"]]["navn"] for d in tvungne if d.get("superja") in PEOPLE})

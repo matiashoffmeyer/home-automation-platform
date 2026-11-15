@@ -1815,6 +1815,15 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   som bedste bud, `sødmælk` gav 1,15 mod «Sødmælk 3,5%». Resten af koden
   normaliserer ø→oe internt (parringsnøgler), men det der SENDES til dem skal
   være dansk. Signatur: et helt almindeligt ord finder kun sodavand.
+- **Nemligs searchgateway når kun de første 100 resultater (målt 2026-11-15).**
+  `query=*&tilbud=true` siger NumFound 6618, men `skip=100`, `200` … `2000` gav
+  alle den samme faste liste (102729, 106585, …), og `page`/`pageIndex`/`offset`/
+  `from`/`start` ignoreres; `take=50, skip=50` virker (inden for de første 100).
+  Selv favorit-tilbuddene (158) blev kun 100 unikke. Løsning i
+  `nemlig_api.Nemlig.tilbud(soeg=…)`: "*" først, og er NumFound > 100, én
+  tilbuds-søgning pr. søgeord (rettepuljens ~450 ingredienser + faste varers
+  første ord, `faste_soegeord`) → 1127 mad-tilbud i stedet for 56; ~12 min kl. 05:45.
+
 - **Nemligs søgesvar bærer et VARETRÆ i tre niveauer — og BLADET er varearten.**
   Hvert produkt har `ProductMainGroupName › ProductCategoryGroupName ›
   ProductSubGroupName` («Frugt og grønt › Grønt › Svampe» for Portobello,

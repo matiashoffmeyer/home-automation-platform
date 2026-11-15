@@ -66,6 +66,13 @@
 #     median tomt-hul 33 s), og uden hold ville kæden pumpe 40 % ↔ 1 % gennem
 #     hele filmen. Holdet bor i mål-SENSOREN, ikke i triggeren, så tænd-grenen
 #     og tune-grenen ikke kan blive uenige.
+#     FILM UDEN DARK MODE (2026-11-14, user-bug "film nogen i køkkenet følger
+#     ikke slider-værdien"): alle film-gates (mål-sensor, fade-faktor, ned/op-
+#     triggere, tune-rampe) læser nu dark_mode_stue ELLER filmmoerke_koekken.
+#     Før gjaldt Film-sliderne kun mens stuen var i Dark Mode; en projektor-film
+#     (eller Dark Mode der havde undtaget stuen) faldt i en predark-clamp, der
+#     ignorerede begge sliders. Tænd-grenen kræver desuden cinema_active ved
+#     filmmoerke_koekken alene — samme gate som spærrer presence-tænd.
 #
 # Skrive-steder (54 statiske + dynamiske): `python3 scripts/ejerskab.py steder light.koekken_lyskaede`.
 # =============================================================================
@@ -265,7 +272,7 @@ input_number:
     mode: slider
 
   koekken_lyskaede_dark_pct:
-    name: "Køkken-lyskæde: styrke under Dark Mode (tomt køkken)"
+    name: "Køkken-lyskæde: styrke under film (tomt køkken)"
     icon: mdi:theater
     min: 1
     max: 40
@@ -274,7 +281,7 @@ input_number:
     mode: slider
 
   koekken_lyskaede_dark_session_pct:
-    name: "Køkken-lyskæde: styrke ved køkken-session under Dark Mode"
+    name: "Køkken-lyskæde: styrke ved køkken-session under film"
     icon: mdi:silverware-fork-knife
     min: 5
     max: 100
@@ -1067,8 +1074,23 @@ template:
           {# 2026-08-05 (user-spec): DARK MODE vinder over alt andet. Spots er
              hård-blokeret af cinema_active mens filmen kører, så lyskæden ER
              køkkenlyset: helt nede når køkkenet er tomt, rampet op til et
-             meget lavt niveau når nogen faktisk står derude. #}
-          {% if is_state('binary_sensor.dark_mode_stue', 'on') %}
+             meget lavt niveau når nogen faktisk står derude.
+             2026-08-27b (user-valg): FILM vinder over cooking — køkkenet er
+             open-plan med lærredet, så lyskæden er glare i billedet, også
+             mens der laves mad.
+             2026-11-14 (user-bug: "film nogen i køkkenet fungerer ikke. følger
+             ikke slider værdien"): ÉN film-gren for hele det filmmørke køkken.
+             Før havde filmmoerke_koekken UDEN dark_mode_stue sin egen gren, der
+             clampede til predark_dim_pct og ignorerede både occupancy og de
+             tre "Film:"-sliders. Ramt 14/11 20:11:01: Styrbar stue op-hold
+             fritog stuen fra Dark Mode (dark_mode_rooms → tom), projektoren
+             holdt køkkenet filmmørkt, og målet faldt 55 → 10 % med folk i
+             køkkenet; begge sliders blev trukket 20:42-20:43 uden virkning.
+             filmmoerke_koekken er et supersæt af dark_mode_stue; dark_mode_stue
+             står med eksplicit, så grenen ikke afhænger af at ankeret er
+             tilgængeligt i et reload-sekund. #}
+          {% if is_state('binary_sensor.dark_mode_stue', 'on')
+                or is_state('binary_sensor.filmmoerke_koekken', 'on') %}
             {# Runde 2: HOLD-vinduet bor her og ikke i triggeren, så alle veje
                (tænd-grenen, tune-grenen, presence-on) ser SAMME svar på "er der
                nogen i køkkenet lige nu" (fejlklasse #2). now() → re-render hvert
@@ -1083,17 +1105,6 @@ template:
             {% else %}
               {{ states('input_number.koekken_lyskaede_dark_pct') | int(1) }}
             {% endif %}
-          {# 2026-08-27b (user-valg): FILM vinder over cooking. Køkkenet er
-             open-plan med lærredet, så lyskæden er glare i billedet — også
-             mens der laves mad. Clampet (ikke sat) til predark-niveauet, så
-             en allerede lavere styrke ikke bliver LØFTET af filmen; samme
-             regel som pre-dark selv følger. Dark Mode ligger bevidst over
-             dette: det er en manuel, stærkere hensigt. #}
-          {% elif is_state('binary_sensor.filmmoerke_koekken', 'on') %}
-            {% set bri = states('input_number.koekken_lyskaede_brightness') | float(100) %}
-            {% set pf = states('sensor.elpris_dim_factor') | float(1.0) %}
-            {% set normal = [[(bri * pf) | round(0) | int, 100] | min, 1] | max %}
-            {{ [[normal, states('input_number.predark_dim_pct') | int(10)] | min, 1] | max }}
           {% elif is_state('binary_sensor.koekken_madlavningslys', 'on')
                   or is_state('binary_sensor.koekken_arbejdslys', 'on') %}
             {# 2026-08-08: mørkt udenfor → egen, lavere cooking-styrke.
@@ -1114,8 +1125,11 @@ template:
           {% endif %}
 
       # --- Effektive fade-ind-tider (2026-08-08, gate omlagt 08-21) --------
-      # ÉN autoritet for "hvor langsomt ramper lyskæden op" — Dark Mode og
-      # godnat ganger begge segmenter med faktoren. ALLE kaldsteder (presence-tænd,
+      # ÉN autoritet for "hvor langsomt ramper lyskæden op" — film og godnat
+      # ganger begge segmenter med faktoren (film = Dark Mode i stuen ELLER
+      # filmmoerke_koekken, 2026-11-14 — samme film-gren som mål-styrken, så
+      # tile-navnet "film/godnat" også passer når projektoren alene mørklægger).
+      # ALLE kaldsteder (presence-tænd,
       # enforcerens segment 2 + dens delay, dark-mode-tænd, tune-grenen) læser
       # disse i stedet for de rå sliders, så delay og transition ikke kan
       # divergere (fejlklasse #2). Clampet til [1, 6500] s: Zigbee-transition er
@@ -1132,6 +1146,7 @@ template:
         state: >-
           {% set f = states('input_number.koekken_lyskaede_moerk_fade_faktor') | float(2.0) %}
           {% set m = f if (is_state('binary_sensor.dark_mode_stue', 'on')
+                           or is_state('binary_sensor.filmmoerke_koekken', 'on')
                            or is_state('binary_sensor.godnat_common_active', 'on')) else 1.0 %}
           {% set mm = (states('input_number.openplan_moerk_morgen_fade_faktor') | float(2.0))
                       if is_state('input_boolean.openplan_entre_velkomst_venter', 'on') else 1.0 %}
@@ -1145,6 +1160,7 @@ template:
         state: >-
           {% set f = states('input_number.koekken_lyskaede_moerk_fade_faktor') | float(2.0) %}
           {% set m = f if (is_state('binary_sensor.dark_mode_stue', 'on')
+                           or is_state('binary_sensor.filmmoerke_koekken', 'on')
                            or is_state('binary_sensor.godnat_common_active', 'on')) else 1.0 %}
           {% set mm = (states('input_number.openplan_moerk_morgen_fade_faktor') | float(2.0))
                       if is_state('input_boolean.openplan_entre_velkomst_venter', 'on') else 1.0 %}
@@ -1733,6 +1749,12 @@ automation:
           - sensor.koekken_lyskaede_cooking_kelvin_effektiv
           - input_number.koekken_lyskaede_maaltid_pct
           - input_number.koekken_lyskaede_maaltid_kelvin
+          # 2026-11-14 (user-bug "følger ikke slider værdien"): de to film-
+          # niveauer manglede her, så et træk mens man STOD i køkkenet først
+          # landede ved næste occupancy-flanke. Tune-grenen retter kun en
+          # TÆNDT kæde — et træk tænder aldrig noget midt i en film.
+          - input_number.koekken_lyskaede_dark_pct
+          - input_number.koekken_lyskaede_dark_session_pct
         id: tune
       # 2026-09-28: måltidslyset skifter farve+styrke — langsomt (se `basis`),
       # "abrupt" var netop klagen.
@@ -1795,9 +1817,13 @@ automation:
       # i timen (målt), hvilket ville sende en Zigbee-kommando pr. pris-tick.
       # Op mod 60 s forsinkelse er indbygget: sensoren re-renderer på minut-
       # kanten, så det effektive hold er hold → hold + 60 s.
+      # 2026-11-14: film-gaten er den SAMME som mål-sensorens film-gren
+      # (Dark Mode i stuen ELLER filmmoerke_koekken) — ellers ville et filmmørkt
+      # køkken uden Dark Mode blive hængende på session-niveauet efter holdet.
       - platform: template
         value_template: >-
-          {{ is_state('binary_sensor.dark_mode_stue', 'on')
+          {{ (is_state('binary_sensor.dark_mode_stue', 'on')
+              or is_state('binary_sensor.filmmoerke_koekken', 'on'))
              and (states('sensor.koekken_lyskaede_target_brightness') | int(0))
                  == (states('input_number.koekken_lyskaede_dark_pct') | int(1)) }}
         id: tune
@@ -1828,9 +1854,13 @@ automation:
         id: tune
       # OP-retningen har sin EGEN id, fordi den som den eneste må TÆNDE et
       # slukket lys — et slider-træk må ikke lyse køkkenet op midt i en film.
+      # 2026-11-14: samme film-gate som mål-sensoren (se NED-retningen ovenfor).
+      # Er kæden tændt, lander flanken i tune-grenen (rampe til session-niveau);
+      # om den må TÆNDE, afgør dark_on-grenens egne betingelser.
       - platform: template
         value_template: >-
-          {{ is_state('binary_sensor.dark_mode_stue', 'on')
+          {{ (is_state('binary_sensor.dark_mode_stue', 'on')
+              or is_state('binary_sensor.filmmoerke_koekken', 'on'))
              and is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'on') }}
         id: dark_on
       # Cooking-mode ind/ud → arbejdslys / tilbage til hygge-sliders.
@@ -2028,9 +2058,14 @@ automation:
               - condition: state
                 entity_id: light.koekken_lyskaede
                 state: "off"
-              - condition: state
-                entity_id: binary_sensor.dark_mode_stue
-                state: "on"
+              # 2026-11-14: Dark Mode i stuen, ELLER filmmørkt køkken mens
+              # cinema_active står — præcis den gate der spærrer presence-tænd
+              # (presence_koekken), så netop ÉN vej tænder kæden under film.
+              - condition: template
+                value_template: >-
+                  {{ is_state('binary_sensor.dark_mode_stue', 'on')
+                     or (is_state('binary_sensor.filmmoerke_koekken', 'on')
+                         and is_state('input_boolean.cinema_active', 'on')) }}
               - condition: template
                 value_template: "{{ not is_state('input_select.room_mode_koekken', 'Manual') }}"
               # Samme manuel-sluk-grace som presence-tænd (fejlklasse #2):
@@ -2063,7 +2098,7 @@ automation:
                 data:
                   name: "Køkken-lyskæde"
                   message: >-
-                    Tændt af køkken-session under Dark Mode (mål
+                    Tændt af køkken-session under film (mål
                     {{ states('sensor.koekken_lyskaede_target_brightness') }} %).
           # --- SLIDER-TRÆK (tune): live-preview mens tændt — hurtig apply som før.
           - conditions:
@@ -2111,6 +2146,7 @@ automation:
                   langsom: "{{ states('sensor.koekken_lyskaede_fade_langsom_effektiv') | int(15) }}"
                   basis: >-
                     {{ langsom if (is_state('binary_sensor.dark_mode_stue', 'on')
+                                   or is_state('binary_sensor.filmmoerke_koekken', 'on')
                                    or (trigger is defined
                                        and trigger.id in ['morgenlys', 'maaltid']))
                        else 1 }}

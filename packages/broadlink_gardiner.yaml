@@ -120,12 +120,30 @@ input_number:
     mode: slider
     icon: mdi:curtains
 
+  # 2026-11-14 (user: "Hvis de er manuelt sat klar til projektor skal dark
+  # mode ikke gøre noget ved stue vest gardinet for så har vi allerede klaret
+  # det"): målt 12-14/11 — appen lukker/stopper vest (17:08:55, 13/11 18:28),
+  # og 3,5-6,5 min senere re-homer mørklægningen hele vejen op og lukker igen.
+  # Har en bruger sidst lukket/stoppet vest i appen inden for så mange minutter,
+  # rører gardin_film_luk ikke vest. Et app-ÅBN rydder stemplet. 0 = fra.
+  gardin_vest_film_manuel_minutter:
+    name: "Vest-gardin: manuel film-klargøring gælder (min)"
+    min: 0
+    max: 240
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+    icon: mdi:projector-screen-outline
+
   # Ekstra nedkørsel KUN ved mørklægning (Dark Mode + projektor pre-dark), user
   # 2026-08-08: "2 sek længere ned" → afprøvet fysisk samme aften, "2 sek was to
   # much so 1 sek instead" → 1,0 s. Almindelige lukninger (RODRET, godnat,
   # sommerforsvar) er urørt
   # og stopper fortsat ved 85 % — det er kun film/mørklægning der har brug for at
-  # lukke lysstriben i bunden. 0 = slået fra.
+  # lukke lysstriben i bunden. 0 = slået fra. 15/10 sat til 0,5 s; 14/11 (user:
+  # "vestgardinet kører i øvrigt 0,5 sek for langt ned når den selv gør det
+  # (auto) til dark mode") → 0: mørklægning stopper nu ved samme 85 % som
+  # alle andre lukninger.
   gardin_vest_moerklaeg_ekstra_sekunder:
     name: "Vest-gardin: ekstra ned ved mørklægning (sekunder)"
     min: 0
@@ -174,6 +192,12 @@ input_text:
     icon: mdi:arrow-collapse-down
 
 input_datetime:
+  # Sidste app-luk/stop af stue vest fra en BRUGER (context.user_id); et app-
+  # åbn sætter den til 1970. Læses af gardin_film_luk. Runtime.
+  gardin_vest_bruger_at:
+    name: "Gardin vest: sidst lukket/stoppet manuelt i appen"
+    has_date: true
+    has_time: true
   # Spisestue-vest: sidste position scriptet/endestop selv kørte til + hvornår
   # (reference for relativ nedkørsel, se gardin_spisestue_position). Runtime.
   gardin_syd_antaget_at:
@@ -499,7 +523,7 @@ template:
 #     køretiden → close. Landing = 85 % uanset hvor gardinet stod, og vi kan
 #     ALDRIG ramme bunden ("der står nogle ting"). Prisen er ~20 s ekstra ved
 #     filmstart; det er billigere end at køre ned i inventaret. Derefter et
-#     kort ekstra NED (gardin_vest_moerklaeg_ekstra_sekunder, 1 s) — KUN her,
+#     kort ekstra NED (gardin_vest_moerklaeg_ekstra_sekunder; 0 = fra siden 14/11) — KUN her,
 #     ikke i almindelige lukninger.
 # =============================================================================
 script:
@@ -912,6 +936,21 @@ script:
                   - condition: template
                     value_template: "{{ 'cover.gardin_stue_vest_1' in liste }}"
                 then:
+                  # 2026-11-14: brugeren har selv sat vest klar i appen (luk/
+                  # stop inden for gardin_vest_film_manuel_minutter) → rør den
+                  # ikke. Stopper kun vest-grenen.
+                  - if:
+                      - condition: template
+                        value_template: >-
+                          {% set m = states('input_number.gardin_vest_film_manuel_minutter') | float(0) %}
+                          {% set ts = state_attr('input_datetime.gardin_vest_bruger_at', 'timestamp') | float(0) %}
+                          {{ m > 0 and ts > 0 and (as_timestamp(now()) - ts) / 60 <= m }}
+                    then:
+                      - service: logbook.log
+                        data:
+                          name: "Gardin film-luk"
+                          message: "Stue vest springes over — sat manuelt i appen kl. {{ states('input_datetime.gardin_vest_bruger_at')[11:16] }}"
+                      - stop: "Vest er sat manuelt — mørklægningen rører den ikke"
                   - service: cover.open_cover
                     continue_on_error: true
                     target:
@@ -973,3 +1012,33 @@ script:
                         continue_on_error: true
                         target:
                           entity_id: cover.gardin_stue_vest_1
+
+automation:
+  # Stempel for gardin_film_luk's manuel-undtagelse (se slideren
+  # gardin_vest_film_manuel_minutter). Kun app/UI-kald med et user_id — knap-
+  # tryk (Somrig/RODRET) bærer intet user_id og tæller ikke (fejlklasse #3).
+  - id: gardin_vest_bruger_stempel
+    alias: "Gardin vest: stempl manuel app-betjening"
+    mode: queued
+    max: 10
+    triggers:
+      - trigger: event
+        event_type: call_service
+        event_data:
+          domain: cover
+    conditions:
+      - condition: template
+        value_template: >-
+          {% set e = trigger.event.data.service_data.entity_id | default([]) %}
+          {% set e = [e] if e is string else e %}
+          {{ trigger.event.context.user_id is not none
+             and 'cover.gardin_stue_vest_1' in e
+             and trigger.event.data.service in ['close_cover', 'stop_cover', 'set_cover_position', 'open_cover'] }}
+    actions:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.gardin_vest_bruger_at
+        data:
+          timestamp: >-
+            {{ 0 if trigger.event.data.service == 'open_cover'
+               else as_timestamp(now()) | int }}

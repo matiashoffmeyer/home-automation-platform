@@ -26,3 +26,8 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   ER varearten**; `Favorite` = "købt før" (dækker næsten alle varianter), og en
   multipak prissættes PR. STYK. → `nemlig_api.taksonomi()`; mål enhver
   matcher-ændring med `nemlig_selftest.py --offline --diff` + en audit af VALGENE.
+- **Searchgatewayen når KUN de første 100 hits — `skip` virker ikke** (målt
+  15/11: ethvert skip ≥ 100 svarer med den SAMME faste liste, også uden for
+  `tilbud=true`). **Signatur: en "alle tilbud"-liste med mange rækker men kun
+  100 unikke id'er.** → målrettede søgninger (`Nemlig.tilbud(soeg=…)`: én pr.
+  ingrediens/fast vare), dedupe på Id.

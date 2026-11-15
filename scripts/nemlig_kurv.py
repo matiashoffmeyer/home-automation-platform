@@ -28,6 +28,7 @@ CLI:
     --ryd-vores       fjern kun det DENNE integration har lagt i kurven
     --vis             vis hvad listen ville blive parret med (ingen skrivning)
     --republish       gen-publicér sensoren fra sidste kørsel (rører ikke Nemlig)
+    --tilbud          læg ugens tilbud på de faste varer i kurven (inden for budget)
     --toem-alt        tøm HELE kurven + regnskab + sensor
     --svar ACTION     besvar et parrings-spørgsmål (kaldes af action-handleren)
 
@@ -82,6 +83,12 @@ E_OEKO = "input_boolean.nemlig_foretraek_oeko"
 E_OEKO_LOFT = "input_number.nemlig_oeko_loft_pct"
 E_FAV_LOFT = "input_number.nemlig_favorit_loft_pct"
 E_TILBUD = "input_boolean.nemlig_foretraek_tilbud"
+# Multikøb (2026-11-14): rund op til et helt "X for Y"-sæt, når den ekstra
+# pakke kan holde sig til næste indkøb (`NA.lager_holdbar`) og er købt før.
+E_MULTI = "input_boolean.nemlig_multikoeb"
+E_MULTI_MAX = "input_number.nemlig_multikoeb_max_kr"
+E_TILBUD_MIN = "input_number.nemlig_tilbud_min_pct"
+E_TILBUD_BUDGET = "input_number.nemlig_tilbud_budget_kr"
 NID = "nemlig"
 
 # =============================================================================
@@ -95,6 +102,17 @@ NID = "nemlig"
 # læses som opskrift-linjer.
 KILDE_LISTE = "opskrift"
 KILDE_BASIS = "basis"
+# En TREDJE kilde: en færdig liste fra en fil (samme format som BASISKURV:
+# {"titel": …, "poster": [{"navn", "maengde", "enhed"}]}). Skrives af det
+# script der ejer listen lige før kørslen; filen er runtime (gitignoreret).
+KILDE_EKSTRA = "ekstra"
+EKSTRA_FIL = "/config/.nemlig_ekstra.json"
+# En FJERDE kilde (2026-11-14, user: "spare flere penge … 2 for 1 tilbud og
+# lignende"): ugens tilbud på de FASTE varer (købt i ≥ 2 af de seneste 16
+# ordrer), holdbare og på lager. Knappen "Læg tilbud i kurven" → `--tilbud`;
+# mængden er ét helt sæt i et "X for Y" (ellers det antal vi plejer at købe),
+# billigste besparelse pr. krone først, inden for et budget pr. tryk.
+KILDE_TILBUD = "tilbud"
 
 # =============================================================================
 # BASISKURVEN — den faste husholdningsliste bag knappen "Tilføj basisvarer"
@@ -180,6 +198,23 @@ def aktuel_liste(states):
 # =============================================================================
 # Parring
 # =============================================================================
+def tilbudsfelter(x, antal):
+    """Kampagnen på et søge-træf og hvad den sparer på `antal` pakker.
+
+    `spar_kr` er Nemligs egen rabat: normalpris × antal minus det kassen tager
+    (et "X for Y" kun for hele sæt, `NA.pris_for`). `holdbar`/`favorit` er
+    multikøbets to krav (`multikoeb_runding`)."""
+    k = x.get("kampagne")
+    pris = x.get("pris") or 0
+    spar = round(antal * float(pris) - NA.pris_for(k, pris, antal), 2) if k else 0.0
+    return {
+        "kampagne": k,
+        "spar_kr": spar if spar > 0.005 else 0.0,
+        "holdbar": NA.lager_holdbar(x),
+        "favorit": bool(x.get("favorit")),
+    }
+
+
 def parr(
     n,
     poster,
@@ -237,11 +272,13 @@ def parr(
                 continue
 
         antal, hvorfor = NA.antal_pakker(p["maengde"], p["enhed"], valgt["_raw"], navn=soegeord)
-        # Merprisen for øko og besparelsen på tilbud regnes mod den billigste
-        # SAMMENLIGNELIGE konventionelle vare i samme match-felt. Det er ikke
-        # Nemligs "før-pris" — den findes ikke i deres API (Campaign og
-        # CampaignAttribute er null overalt, målt 2026-08-31). Det er
-        # forskellen mod det alternativ vi faktisk valgte fra.
+        # Merprisen for øko og `besparelse_est` regnes mod den billigste
+        # SAMMENLIGNELIGE vare i samme match-felt — forskellen mod det
+        # alternativ vi valgte FRA, med kampagnepris på begge sider
+        # (vaelg_produkt → NA._med_kampagne). Nemligs EGEN rabat (normalpris
+        # minus det vi betaler) står i `spar_kr`. 31/8 så det ud som om API'et
+        # ingen kampagner havde; de står i `Campaign` (målt 14/11: 777 gyldige
+        # af 1310 produkter), og `Price` er altid normalprisen.
         merpris = besparelse = None
         if (
             reference is not None
@@ -269,6 +306,7 @@ def parr(
             "begrundelse": begrundelse,
             "merpris_oeko": merpris,
             "besparelse_est": besparelse,
+            **tilbudsfelter(valgt, antal),
             # Ekskludér det VALGTE produkt eksplicit. traef[1:] ville
             # være forkert: øko-/tilbuds-reglerne kan vælge noget andet
             # end traef[0], og så ville det valgte dukke op som sit eget
@@ -376,6 +414,7 @@ def _byt(b, ny, grund):
         kategori=ny.get("kategori"),
         merpris_oeko=None,
         besparelse_est=None,
+        **tilbudsfelter(ny, antal),
         status="ok",
         begrundelse=f"AI: {grund}" if grund else "AI-rettet",
         ai_rettet_fra=gammel,
@@ -439,9 +478,73 @@ def ai_tjek(beslutninger):
 
 
 # =============================================================================
+# Multikøb (2026-11-14)
+# =============================================================================
+# "2 for 206,95" sparer kun noget hvis man køber TO. Behovet er ofte én, og så
+# betaler kassen normalpris. Er varen holdbar (`NA.lager_holdbar`: ≥ 14 dages
+# salgsdato, aldrig "undgå madspild") og købt før, runder vi op til et helt
+# sæt — den ekstra pakke venter til næste gang. Målt 14/11 over 649 holdbare
+# oprundinger: oprundingen koster p50 28 kr / p90 67 kr / max 159 kr ekstra og
+# sparer p50 20 % / p90 53 % på de ekstra stk. Rækkefølge: gratis oprundinger
+# først (nogle sæt er billigere end færre stk), dernæst mest sparet pr. krone,
+# inden for `max_kr` pr. kørsel.
+def multikoeb_runding(beslutninger, mine, andres, politik):
+    """→ {pid: {ekstra, i_alt, ekstra_kr, spar_kr, tekst}} for de id'er DENNE
+    kilde runder op. `mine`/`andres` er stk pr. id før oprunding; summen er
+    det kurven ellers ville få (andres egne oprundinger tæller med)."""
+    if not politik:
+        return {}
+    bud = []
+    for pid, egne in mine.items():
+        b = next(
+            (
+                b
+                for b in beslutninger
+                if str(b.get("id")) == pid and b.get("status") == "ok" and b.get("kampagne")
+            ),
+            None,
+        )
+        if b is None:
+            continue
+        k, pris = b["kampagne"], float(b.get("pris") or 0)
+        nu = egne + andres.get(pid, 0)
+        r = NA.multikoeb(k, pris, nu)
+        if r is None:
+            continue
+        nyt, ekstra_kr, spar_kr = r
+        normal = (nyt - nu) * pris
+        pct = 100 * spar_kr / normal if normal else 0
+        gratis = ekstra_kr <= 0.005
+        if not gratis and not (b.get("holdbar") and b.get("favorit") and pct >= politik["min_pct"]):
+            continue
+        bud.append(
+            (
+                gratis,
+                spar_kr / max(ekstra_kr, 0.01),
+                pid,
+                {
+                    "ekstra": nyt - nu,
+                    "i_alt": nyt,
+                    "ekstra_kr": ekstra_kr,
+                    "spar_kr": spar_kr,
+                    "tekst": k["tekst"],
+                },
+            )
+        )
+    ud, brugt = {}, 0.0
+    for gratis, _ratio, pid, r in sorted(bud, key=lambda x: (not x[0], -x[1])):
+        if not gratis and brugt + r["ekstra_kr"] > politik["max_kr"] + 0.005:
+            log(f"multikøb over budget: {pid} ({r['tekst']}, +{NA.kr(r['ekstra_kr'])} kr)")
+            continue
+        brugt += max(r["ekstra_kr"], 0.0)
+        ud[pid] = r
+    return ud
+
+
+# =============================================================================
 # Kurven
 # =============================================================================
-def laeg_i_kurv(n, beslutninger, kilde=KILDE_LISTE, dry=False):
+def laeg_i_kurv(n, beslutninger, kilde=KILDE_LISTE, dry=False, multikoeb=None):
     """Sender ØNSKET SLUT-ANTAL pr. produkt (absolut → idempotent).
 
     Flere råvarer kan pege på samme produkt (fx to opskrifter der begge vil
@@ -454,6 +557,12 @@ def laeg_i_kurv(n, beslutninger, kilde=KILDE_LISTE, dry=False):
     1 smør, ville den sidste kørsel sætte linjen til 1 og tavst slette den
     anden. Vi sender summen over BEGGE kilder for hvert rørt id, og rydder kun
     de id'er DENNE kilde lagde sidst, som ingen kilde længere vil have.
+
+    2026-11-14 — MULTIKØB. `multikoeb` = {max_kr, min_pct} (None = slået fra)
+    runder et "X for Y" op til et helt sæt (`multikoeb_runding`). De ekstra stk
+    står i regnskabslinjens `antal` (summen skal passe med kurven, ellers ligner
+    næste kørsel en rettelse i hånden) og desuden i `ekstra`; beslutningen får
+    `multikoeb` til rapporten og siden.
     """
     mine = {}
     for b in beslutninger:
@@ -507,7 +616,21 @@ def laeg_i_kurv(n, beslutninger, kilde=KILDE_LISTE, dry=False):
             kurv_kendt and lagde_sidst.get(pid, 0) > 0 and i_kurven.get(pid, 0) != lagde_sidst[pid]
         )
 
-    lagt = [{"id": pid, "antal": antal, "kilde": kilde} for pid, antal in mine.items()]
+    def glem_multikoeb(pid):
+        for b in beslutninger:
+            if str(b.get("id")) == pid:
+                b.pop("multikoeb", None)
+
+    runding = multikoeb_runding(beslutninger, mine, andres, multikoeb)
+    for pid, r in runding.items():
+        mine[pid] += r["ekstra"]
+        b = next(b for b in beslutninger if str(b.get("id")) == pid and b.get("status") == "ok")
+        b["multikoeb"] = r
+    lagt = [
+        {"id": pid, "antal": antal, "kilde": kilde}
+        | ({"ekstra": runding[pid]["ekstra"]} if pid in runding else {})
+        for pid, antal in mine.items()
+    ]
     mine_gamle = {str(l["id"]) for l in tidligere if (l.get("kilde") or KILDE_LISTE) == kilde}
     if not dry:
         # Kun id'er DENNE kilde har en andel i — nu eller sidst. Et id kun den
@@ -525,8 +648,12 @@ def laeg_i_kurv(n, beslutninger, kilde=KILDE_LISTE, dry=False):
                     None,
                 )
                 lagt = [l for l in lagt if l["id"] != pid]
+                glem_multikoeb(pid)
                 if gammel:
-                    lagt.append({"id": pid, "antal": int(gammel["antal"]), "kilde": kilde})
+                    lagt.append(
+                        {"id": pid, "antal": int(gammel["antal"]), "kilde": kilde}
+                        | ({"ekstra": int(gammel["ekstra"])} if gammel.get("ekstra") else {})
+                    )
                 log(
                     f"rettet i hånden ({i_kurven.get(pid, 0)} mod vores "
                     f"{lagde_sidst[pid]}) — fredet: {pid}"
@@ -539,6 +666,7 @@ def laeg_i_kurv(n, beslutninger, kilde=KILDE_LISTE, dry=False):
                 # når vi aldrig ned til gem_koersel(), og regnskabet over hvad
                 # vi selv lagde i kurven bliver aldrig skrevet.
                 lagt = [l for l in lagt if l["id"] != pid]
+                glem_multikoeb(pid)
                 for b in beslutninger:
                     if str(b.get("id")) == pid and b.get("status") == "ok":
                         b["status"], b["grund"] = "fejl", str(e)
@@ -596,6 +724,21 @@ def gem_koersel(lagt, kilde=KILDE_LISTE, foraeldet=()):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"tid": time.time(), "linjer": beholdt + lagt}, f)
     os.replace(tmp, KOERSEL_FIL)
+
+
+# Sensor-attributterne er ~23 KB (52 varer, 14/11) — over recorderens 16 KB, så
+# kun det siden viser skrives ud: kampagnen som tekst, holdbar/favorit (multi-
+# købets interne krav) og et 0-spar udelades.
+SENSOR_UDEN = ("alternativer", "kampagne", "holdbar", "favorit", "koster")
+
+
+def til_sensor(b):
+    v = {k: x for k, x in b.items() if k not in SENSOR_UDEN}
+    if b.get("kampagne"):
+        v["tilbud_tekst"] = b["kampagne"]["tekst"]
+    if not v.get("spar_kr"):
+        v.pop("spar_kr", None)
+    return v
 
 
 def gem_sensor(state, attrs):
@@ -661,6 +804,8 @@ def toem_sensor(token, state, tekst):
         retter=[],
         total=0,
         basis_antal=0,
+        ekstra_antal=0,
+        tilbud_antal=0,
         liste_antal=0,
         regnskab={},
         tekst=tekst,
@@ -919,28 +1064,110 @@ def besvar(token, action):
 
 
 # =============================================================================
+# Tilbuds-kilden (--tilbud)
+# =============================================================================
+def tilbud_beslutninger(n, budget_kr, min_pct, i_kurven=None, egne_sidst=None):
+    """→ (beslutninger, over_budget) for ugens tilbud på de FASTE varer.
+
+    Kun varer vi har købt i ≥ `NA.FASTE_MIN_GANGE` af de seneste ordrer, som
+    kan holde sig til næste indkøb, er på lager og har mindst `min_pct` rabat.
+    En vare der allerede ligger i kurven fra en anden kilde (eller brugerens
+    egen hånd) springes over — dens tilbud er allerede i spil. Budgettet
+    fyldes med mest sparet pr. krone først (grådig rygsæk)."""
+    i_kurven, egne_sidst = i_kurven or {}, egne_sidst or {}
+    faste = NA.faste_varer(n)
+    kandidater, set_ = [], set()
+    for p in n.tilbud(kun_favoritter=True, soeg=NA.faste_soegeord(faste)):
+        pid = str(p.get("Id"))
+        if pid in set_:  # tilbud() deduperer allerede; værn mod kilder der ikke gør
+            continue
+        set_.add(pid)
+        f = faste.get(pid)
+        k = NA.kampagne(p)
+        if not f or f.get("gange", 0) < NA.FASTE_MIN_GANGE or not k or k["madspild"]:
+            continue
+        if k["rabat_pct"] < min_pct or not NA.lager_holdbar(p):
+            continue
+        if not (p.get("Availability") or {}).get("IsAvailableInStock"):
+            continue
+        if i_kurven.get(pid, 0) - egne_sidst.get(pid, 0) > 0:
+            continue
+        m = k["min_antal"]
+        typisk = max(1, round(f.get("stk", 1) / max(1, f["gange"])))
+        antal = max(1, round(typisk / m)) * m
+        if k["max_antal"]:
+            antal = min(antal, k["max_antal"] // m * m)
+        pris = float(p.get("Price") or 0)
+        koster = NA.pris_for(k, pris, antal)
+        spar = round(antal * pris - koster, 2)
+        if antal < 1 or spar <= 0.005:
+            continue
+        pm, pe = NA.pakning(p)
+        kandidater.append(
+            {
+                "navn": f.get("navn") or p.get("Name"),
+                "maengde": antal,
+                "enhed": "stk",
+                "produkt": p.get("Name"),
+                "id": pid,
+                "antal": antal,
+                "pakke": f"{pm:g}{pe}" if pm else None,
+                "hvorfor": f"købt {f['gange']} gange, typisk {typisk} stk",
+                "pris": p.get("Price"),
+                "laert": False,
+                "oeko": NA.er_oeko(p),
+                "tilbud": True,
+                "kategori": p.get("ProductCategoryGroupName") or "",
+                "begrundelse": "tilbud på fast vare",
+                "kampagne": k,
+                "spar_kr": spar,
+                "holdbar": True,
+                "favorit": True,
+                "koster": koster,
+                "status": "ok",
+            }
+        )
+    kandidater.sort(key=lambda c: -c["spar_kr"] / max(c["koster"], 0.01))
+    valgt, over, brugt = [], [], 0.0
+    for c in kandidater:
+        if brugt + c["koster"] > budget_kr + 0.005:
+            over.append(c)
+            continue
+        brugt += c["koster"]
+        valgt.append(c)
+    return valgt, over
+
+
+# =============================================================================
 # Rapport
 # =============================================================================
 def regnskab(beslutninger):
     """→ dict med øko-/tilbuds-opgørelsen for de varer der kom i kurven.
 
-    ⚠️ `besparelse_est` er IKKE Nemligs rabat. Deres API har ingen før-pris
-    (Campaign/CampaignAttribute er null overalt, målt 2026-08-31), så en ægte
-    "spar X kr"-opgørelse kan ikke laves. Det her er forskellen mod det
-    alternativ vi valgte FRA — hvilket er det tal der faktisk siger noget om
-    vores eget valg.
+    `spar_kr` er Nemligs EGEN rabat på det vi køber — normalpris minus
+    kampagnepris (`tilbudsfelter`) plus det multikøbenes oprunding sparer på de
+    ekstra stk. `besparelse_est` er noget andet: forskellen mod det alternativ
+    matcheren valgte FRA (begge med kampagnepris siden 14/11).
     """
     ok = [b for b in beslutninger if b["status"] == "ok"]
+    multi = [b["multikoeb"] for b in ok if b.get("multikoeb")]
     return {
         "varer": len(ok),
         "oeko_antal": sum(1 for b in ok if b.get("oeko")),
         "tilbud_antal": sum(1 for b in ok if b.get("tilbud")),
         "merpris_oeko": round(sum(b.get("merpris_oeko") or 0 for b in ok), 2),
         "besparelse_est": round(sum(b.get("besparelse_est") or 0 for b in ok), 2),
+        "spar_kr": round(
+            sum(b.get("spar_kr") or 0 for b in ok) + sum(m["spar_kr"] for m in multi), 2
+        ),
+        "multikoeb_antal": len(multi),
+        "multikoeb_kr": round(sum(m["ekstra_kr"] for m in multi), 2),
     }
 
 
-def rapport(beslutninger, lagt, kurv_total, retter, tørkørsel, kilde=KILDE_LISTE, ai_rettet=()):
+def rapport(
+    beslutninger, lagt, kurv_total, retter, tørkørsel, kilde=KILDE_LISTE, ai_rettet=(), titel=""
+):
     udsolgt = [b for b in beslutninger if b["status"] == "udsolgt"]
     usikre = [b for b in beslutninger if b["status"] in ("usikker", "ingen_traef", "fejl")]
 
@@ -956,6 +1183,20 @@ def rapport(beslutninger, lagt, kurv_total, retter, tørkørsel, kilde=KILDE_LIS
         if kilde == KILDE_BASIS
         else f"{len(retter)} retter · {len(beslutninger)} varer"
     )
+    if kilde == KILDE_EKSTRA:
+        hoved = (
+            f"🥤 Tørkørsel ({titel}) — intet lagt i kurven"
+            if tørkørsel
+            else f"🥤 {titel} lagt i Nemlig-kurven"
+        )
+        omfang = f"{len(beslutninger)} varer"
+    if kilde == KILDE_TILBUD:
+        hoved = (
+            "🏷️ Tørkørsel (tilbud) — intet lagt i kurven"
+            if tørkørsel
+            else "🏷️ Tilbud lagt i Nemlig-kurven"
+        )
+        omfang = f"{len(beslutninger)} tilbud på faste varer"
     linjer = [f"{hoved}", f"{omfang} · {len(lagt)} produkter"]
     if kurv_total is not None:
         linjer.append(
@@ -968,8 +1209,25 @@ def rapport(beslutninger, lagt, kurv_total, retter, tørkørsel, kilde=KILDE_LIS
             f"🌱 øko: {r['oeko_antal']}/{r['varer']}"
             + (f" (+{r['merpris_oeko']:.0f} kr)" if r["merpris_oeko"] else "")
             + f"  ·  🏷️ tilbud: {r['tilbud_antal']}/{r['varer']}"
-            + (f" (−{r['besparelse_est']:.0f} kr vs. fravalgte)" if r["besparelse_est"] else "")
+            + (f" · spar {r['spar_kr']:.0f} kr" if r["spar_kr"] >= 0.5 else "")
         )
+    if kilde == KILDE_TILBUD:
+        linjer.append("")
+        linjer += [
+            f"• {b['produkt']} ×{b['antal']} — {b['kampagne']['tekst']}"
+            f" · spar {NA.kr(b['spar_kr'])} kr"
+            for b in beslutninger
+            if b["status"] == "ok"
+        ]
+    multi = [b for b in beslutninger if b["status"] == "ok" and b.get("multikoeb")]
+    if multi:
+        linjer.append("\n📦 MULTIKØB (rundet op til et helt tilbud):")
+        for b in multi:
+            m = b["multikoeb"]
+            linjer.append(
+                f"• {b['produkt']}: {m['i_alt'] - m['ekstra']} → {m['i_alt']} ({m['tekst']})"
+                f" · +{NA.kr(m['ekstra_kr'])} kr · spar {NA.kr(m['spar_kr'])} kr"
+            )
     if ai_rettet:
         linjer.append("\n🤖 AI RETTEDE:")
         linjer += [
@@ -1010,6 +1268,10 @@ def main():
     )
     ap.add_argument(
         "--svar", metavar="ACTION", help="besvar et parrings-spørgsmål (NEMLIG_<id>_<valg>)"
+    )
+    ap.add_argument("--ekstra", action="store_true", help=f"læg listen i {EKSTRA_FIL} i kurven")
+    ap.add_argument(
+        "--tilbud", action="store_true", help="læg ugens tilbud på de faste varer i kurven"
     )
     ap.add_argument("--force", action="store_true", help="ignorér kill-switch")
     ap.add_argument("--dry", action="store_true")
@@ -1062,8 +1324,33 @@ def main():
     tørkørsel = a.vis or a.dry or not MP.is_on(states, E_AUTO, default=False)
     min_score = MP.num(states, E_SCORE, NA.SIKKER_SCORE)
 
-    kilde = KILDE_BASIS if a.basis else KILDE_LISTE
-    if a.basis:
+    kilde = (
+        KILDE_TILBUD
+        if a.tilbud
+        else KILDE_EKSTRA
+        if a.ekstra
+        else KILDE_BASIS
+        if a.basis
+        else KILDE_LISTE
+    )
+    ekstra_titel = "Ekstra varer"
+    if a.tilbud:
+        return koer_tilbud(token, states, tørkørsel, a.json, vis=a.vis)
+    if a.ekstra:
+        try:
+            with open(EKSTRA_FIL, encoding="utf-8") as f:
+                ekstra = json.load(f)
+            ekstra_titel = str(ekstra.get("titel") or ekstra_titel)[:60]
+            poster = [
+                {"navn": str(p["navn"]), "maengde": float(p["maengde"]), "enhed": str(p["enhed"])}
+                for p in ekstra["poster"]
+            ]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log(f"--ekstra: kan ikke læse {EKSTRA_FIL}: {e}")
+            print(json.dumps({"ok": False, "fejl": "ingen ekstra-liste"}))
+            return 1
+        retter = (laes_sensor().get("attrs") or {}).get("retter") or []
+    elif a.basis:
         # Den faste liste er DATA, ikke en indkøbsliste — den skal ikke hentes
         # fra arket og skal ikke kunne blive tom fordi ingen har valgt retter.
         poster = [dict(b) for b in BASISKURV]
@@ -1077,7 +1364,14 @@ def main():
         MP.publish_sensor(
             token,
             "sensor.nemlig_kurv",
-            ("kører … %d basisvarer" if a.basis else "kører … %d varer") % len(poster),
+            (
+                "kører … %d basisvarer"
+                if a.basis
+                else "kører … %d ekstra varer"
+                if a.ekstra
+                else "kører … %d varer"
+            )
+            % len(poster),
             {
                 "friendly_name": "Nemlig — kurv",
                 "icon": "mdi:progress-clock",
@@ -1111,11 +1405,15 @@ def main():
     # sensoren, hvor siden viser de to grupper hver for sig.
     for b in beslutninger:
         b["kilde"] = kilde
-    lagt, foraeldet = laeg_i_kurv(n, beslutninger, kilde, dry=tørkørsel)
+    lagt, foraeldet = laeg_i_kurv(
+        n, beslutninger, kilde, dry=tørkørsel, multikoeb=multikoeb_politik(states)
+    )
     if not tørkørsel:
         gem_koersel(lagt, kilde, foraeldet)
     andre = varer_fra_andre_kilder(kilde, foraeldet)
-    if a.basis and not any(v.get("status") == "ok" for v in andre):
+    if (a.basis or a.ekstra) and not any(
+        v.get("status") == "ok" and (v.get("kilde") or KILDE_LISTE) == KILDE_LISTE for v in andre
+    ):
         retter = []  # listen er ude af kurven — vis ikke dens retter (B217)
 
     total = None
@@ -1131,17 +1429,52 @@ def main():
     if not tørkørsel:
         spurgt = stil_spoergsmaal(token, beslutninger, int(MP.num(states, E_SPOERG_MAX, 8)))
 
-    besked = rapport(beslutninger, lagt, total, retter, tørkørsel, kilde, ai_rettet)
+    besked = rapport(beslutninger, lagt, total, retter, tørkørsel, kilde, ai_rettet, ekstra_titel)
     # Sensoren viser BEGGE kilder: denne kørsels varer + hvad den anden knap
     # lagde i sidst. Ellers ville et tryk på den ene knap tømme den anden
     # gruppe af siden, selv om varerne stadig ligger i kurven. Gælder også en
     # tørkørsel — den anden gruppe er fra en ÆGTE kørsel og ligger der stadig.
-    varer = [{k: v for k, v in b.items() if k != "alternativer"} for b in beslutninger] + andre
+    varer = [til_sensor(b) for b in beslutninger] + andre
     sensor_state = (
         f"{len(lagt)} produkter · "
         f"{len([b for b in beslutninger if b['status'] != 'ok'])} til afklaring"
     )
-    sensor_attrs = {
+    sensor_attrs = sensor_attributter(
+        retter, total, tørkørsel, kilde, varer, spurgt, ai_rettet, besked
+    )
+    MP.publish_sensor(token, "sensor.nemlig_kurv", sensor_state, sensor_attrs)
+    gem_sensor(sensor_state, sensor_attrs)
+
+    if a.json:
+        print(
+            json.dumps(
+                {"ok": True, "toerkoersel": tørkørsel, "lagt": lagt, "beslutninger": beslutninger},
+                ensure_ascii=False,
+                indent=1,
+            )
+        )
+    else:
+        print(besked)
+    return 0
+
+
+def multikoeb_politik(states):
+    """{max_kr, min_pct} fra skyderne, eller None når multikøb er slået fra."""
+    if not MP.is_on(states, E_MULTI, default=True):
+        return None
+    return {
+        "max_kr": MP.num(states, E_MULTI_MAX, 200.0),
+        "min_pct": MP.num(states, E_TILBUD_MIN, 15.0),
+    }
+
+
+def sensor_attributter(retter, total, tørkørsel, kilde, varer, spurgt, ai_rettet, besked):
+    def antal(k):
+        return len(
+            [v for v in varer if (v.get("kilde") or KILDE_LISTE) == k and v.get("status") == "ok"]
+        )
+
+    return {
         "friendly_name": "Nemlig — kurv",
         "icon": "mdi:cart-arrow-down",
         "retter": retter,
@@ -1149,26 +1482,85 @@ def main():
         "toerkoersel": tørkørsel,
         "kilde": kilde,
         "varer": varer,
-        "basis_antal": len(
-            [v for v in varer if v.get("kilde") == KILDE_BASIS and v.get("status") == "ok"]
-        ),
-        "liste_antal": len(
-            [
-                v
-                for v in varer
-                if (v.get("kilde") or KILDE_LISTE) == KILDE_LISTE and v.get("status") == "ok"
-            ]
-        ),
+        "basis_antal": antal(KILDE_BASIS),
+        "ekstra_antal": antal(KILDE_EKSTRA),
+        "tilbud_antal": antal(KILDE_TILBUD),
+        "liste_antal": antal(KILDE_LISTE),
         "spurgt": spurgt,
         "ai_rettet": ai_rettet,
         "regnskab": regnskab(varer),
         "aabne_spoergsmaal": len(hent_spoerg().get("aabne") or {}),
         "tekst": besked,
     }
-    MP.publish_sensor(token, "sensor.nemlig_kurv", sensor_state, sensor_attrs)
-    gem_sensor(sensor_state, sensor_attrs)
 
-    if a.json:
+
+def koer_tilbud(token, states, tørkørsel, som_json=False, vis=False):
+    """--tilbud: ugens tilbud på de faste varer i kurven, inden for budget.
+
+    `vis` = kun vis: hverken kurv, regnskab eller sensor røres.
+    """
+    n = NA.Nemlig(dry=tørkørsel)
+    retter = (laes_sensor().get("attrs") or {}).get("retter") or []
+    if not vis:
+        MP.publish_sensor(
+            token,
+            "sensor.nemlig_kurv",
+            "kører … tilbud",
+            {"friendly_name": "Nemlig — kurv", "icon": "mdi:progress-clock", "koerer": True},
+            dry=False,
+        )
+    try:
+        i_kurven = {l["id"]: int(l["antal"] or 0) for l in n.basket_linjer()}
+    except NA.NemligFejl as e:
+        log(f"kunne ikke læse kurven ({e})")
+        i_kurven = {}
+    egne_sidst = {}
+    for l in hent_koersel():
+        if l.get("kilde") == KILDE_TILBUD:
+            egne_sidst[str(l["id"])] = egne_sidst.get(str(l["id"]), 0) + int(l["antal"])
+    try:
+        beslutninger, over = tilbud_beslutninger(
+            n,
+            MP.num(states, E_TILBUD_BUDGET, 300.0),
+            MP.num(states, E_TILBUD_MIN, 15.0),
+            i_kurven,
+            egne_sidst,
+        )
+    except NA.NemligFejl as e:
+        log(f"tilbuddene kunne ikke hentes: {e}")
+        if not vis:
+            republish(token)
+        print(json.dumps({"ok": False, "fejl": str(e)}, ensure_ascii=False))
+        return 1
+    for b in beslutninger:
+        b["kilde"] = KILDE_TILBUD
+    lagt, foraeldet = laeg_i_kurv(n, beslutninger, KILDE_TILBUD, dry=tørkørsel)
+    if not tørkørsel:
+        gem_koersel(lagt, KILDE_TILBUD, foraeldet)
+    andre = varer_fra_andre_kilder(KILDE_TILBUD, foraeldet)
+    if not any(
+        v.get("status") == "ok" and (v.get("kilde") or KILDE_LISTE) == KILDE_LISTE for v in andre
+    ):
+        retter = []
+    total = None
+    try:
+        total = n.basket().get("TotalPrice")
+    except NA.NemligFejl:
+        pass
+    besked = rapport(beslutninger, lagt, total, retter, tørkørsel, KILDE_TILBUD)
+    if over:
+        besked += "\n\n💸 Over budget (ikke lagt i): " + ", ".join(
+            f"{c['produkt']} ({c['kampagne']['tekst']})" for c in over[:8]
+        )
+    varer = [til_sensor(b) for b in beslutninger] + andre
+    state = (
+        f"{len(lagt)} tilbud lagt i" if not tørkørsel else f"{len(beslutninger)} tilbud (tørkørsel)"
+    )
+    attrs = sensor_attributter(retter, total, tørkørsel, KILDE_TILBUD, varer, 0, [], besked)
+    if not vis:
+        MP.publish_sensor(token, "sensor.nemlig_kurv", state, attrs)
+        gem_sensor(state, attrs)
+    if som_json:
         print(
             json.dumps(
                 {"ok": True, "toerkoersel": tørkørsel, "lagt": lagt, "beslutninger": beslutninger},

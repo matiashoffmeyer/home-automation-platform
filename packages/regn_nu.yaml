@@ -54,6 +54,16 @@
 #     udslag som regn hvis DMI SAMTIDIG måler skydække over sky-slideren.
 #     I går 21:00: 90 % skydække og 6,7 m/s vind (dug fysisk umuligt) ⇒ pluggen
 #     var slukket 21:04 i stedet for aldrig.
+#
+# INCIDENT 2026-11-14 (user: "17.01 lyskæden udenfor er tændt i regnvejr"):
+# spanden målte 0,0 mm HELE eftermiddagen, men stationens VEJRKODE (parameter
+# `weather`, optisk nedbørssensor, WMO 4680 + 100) meldte 161 let regn 16:40,
+# 181 let byge 17:10, 123 "regn for nylig" 17:40. Støvregn tipper ikke en
+# 0,1 mm-spand. MÅLT 30 døgn (15/10-14/11, 951 kode-obs): koden var våd
+# (140-199) i 229 af 243 våde buckets — og i 280 obs med TØR spand, heraf 59
+# uden noget udslag ±30 min (13 dage). Skydække ved de 280: p10 = 90 %, 4 under
+# 50 %. Koden er derfor et selvstændigt vidne: våd kode < 30 min gammel = regn.
+# 120-126 ("for nylig") tæller ikke; hold-tiden dækker halen.
 # =============================================================================
 
 rest_command:
@@ -74,6 +84,14 @@ rest_command:
     # seneste ~30 min; kun den nyeste bruges, resten er luft hvis et poll mangler.
     url: >-
       https://opendataapi.dmi.dk/v2/metObs/collections/observation/items?stationId=06180&parameterId=cloud_cover&limit=3
+    method: GET
+    timeout: 30
+
+  dmi_metobs_weather:
+    # Stationens vejrkode (se INCIDENT 2026-11-14 i headeren). Sendes kun når
+    # der ER vejr, så en gammel kode er normalt — forbrugeren ser på alderen.
+    url: >-
+      https://opendataapi.dmi.dk/v2/metObs/collections/observation/items?stationId=06180&parameterId=weather&limit=3
     method: GET
     timeout: 30
 
@@ -164,6 +182,9 @@ template:
       - service: rest_command.dmi_metobs_cloud
         response_variable: sky_resp
         continue_on_error: true
+      - service: rest_command.dmi_metobs_weather
+        response_variable: kode_resp
+        continue_on_error: true
       - variables:
           payload: >-
             {% if resp is defined and resp.content is defined %}
@@ -218,6 +239,27 @@ template:
               {% endif %}
             {% endfor %}
             {{ ns.v if ns.v is not none else 'none' }}
+          # Nyeste VÅDE vejrkode (140-199) og dens tidspunkt. '0|0' = ingen våd
+          # kode i svaret (eller fejlet fetch — så bæres den gamle videre, og
+          # dens alder vokser af sig selv).
+          kode_vaad: >-
+            {% if kode_resp is defined and kode_resp.content is defined %}
+              {% if kode_resp.content is mapping %}{% set kp = kode_resp.content %}
+              {% elif kode_resp.content is string and kode_resp.content[:1] == '{' %}
+                {% set kp = kode_resp.content | from_json %}
+              {% else %}{% set kp = {} %}{% endif %}
+            {% else %}{% set kp = {} %}{% endif %}
+            {% set ns = namespace(t=0, v=0) %}
+            {% for f in kp.get('features', []) %}
+              {% set p = f.get('properties', {}) %}
+              {% set obs = p.get('observed') %}
+              {% set v = p.get('value') | int(0) %}
+              {% if obs is not none and 140 <= v <= 199 %}
+                {% set t = as_timestamp(obs | as_datetime, 0) | int %}
+                {% if t > ns.t %}{% set ns.t = t %}{% set ns.v = v %}{% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.t ~ '|' ~ ns.v }}
     sensor:
       # State = mm målt i de seneste 30 minutter. this-fallback som i
       # regn_rapport: et 429/timeout må ikke se ud som "det holdt op med at
@@ -260,6 +302,18 @@ template:
             {% if sky_pct != 'none' %}{{ sky_pct }}
             {% elif this is defined %}{{ this.attributes.get('skydaekke_pct') }}
             {% else %}none{% endif %}
+          # Seneste våde vejrkode + tidspunkt (unix). Kun en NYERE våd kode
+          # flytter stemplet; ellers bæres det videre og ældes.
+          vaad_kode_ts: >-
+            {% set ny = (kode_vaad | string).split('|')[0] | int(0) %}
+            {% set gl = (this.attributes.get('vaad_kode_ts') | int(0)) if this is defined else 0 %}
+            {{ [ny, gl] | max }}
+          vaad_kode: >-
+            {% set dele = (kode_vaad | string).split('|') %}
+            {% set gl = (this.attributes.get('vaad_kode_ts') | int(0)) if this is defined else 0 %}
+            {% if dele[0] | int(0) >= gl and dele[0] | int(0) > 0 %}{{ dele[1] | int(0) }}
+            {% elif this is defined and this.attributes.get('vaad_kode') is not none %}{{ this.attributes.get('vaad_kode') }}
+            {% else %}0{% endif %}
           station: "06180 Københavns Lufthavn"
           fetched_at: >-
             {% if ok %}{{ now().isoformat() }}
@@ -305,7 +359,11 @@ template:
           {% set sky = state_attr('sensor.regn_nu', 'skydaekke_pct') | float(100) %}
           {% set sky_min = states('input_number.regn_nu_let_regn_sky_pct') | float(50) %}
           {% set let_regn = mm30 > 0 and mm30 < thr and sky >= sky_min %}
-          {{ frisk and (mm30 >= thr or let_regn) }}
+          {# 2026-11-14: stationens optiske vejrkode ser støvregn som spanden
+             ikke tipper for (se header). Egen friskhed: kodens EGET tidsstempel. #}
+          {% set kode_ts = state_attr('sensor.regn_nu', 'vaad_kode_ts') | int(0) %}
+          {% set kode_regn = kode_ts > 0 and (as_timestamp(now()) - kode_ts) / 60 <= 30 %}
+          {{ (frisk and (mm30 >= thr or let_regn)) or kode_regn }}
 
 automation:
   # ---------------------------------------------------------------------------

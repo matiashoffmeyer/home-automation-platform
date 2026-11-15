@@ -308,3 +308,26 @@ gennemført handel.
 | Konto-låsning ved for mange kald | 0,7 s rate limit + session-cache; en indkøbsrunde er ~20-40 kald hver 14. dag |
 
 [repo]: https://github.com/schourode/nemlig
+
+### Fase 5 — tilbud styrer retter og kurv ✅ *(live 2026-11-15)*
+
+User 14/11: "Nemlig retter og indkøb skal være mere baseret på nemlig tilbud …
+spare … ift at købe 2 for 1 tilbud og lignende."
+
+- **Scanning** (`scripts/nemlig_tilbud.py scan`, kl. 05:45): én tilbuds-søgning
+  pr. ingrediens i rettepuljen + pr. fast vare (søgningen når kun 100 hits, se
+  `.claude/rules/nemlig.md`) → `/config/.nemlig_tilbud.json` (gyldig 3 dage) +
+  `sensor.nemlig_tilbud`. Mad, ≥ `nemlig_tilbud_min_pct`, på lager i vores
+  leveringstid. Felt `spar_kr` = normalpris − tilbudspris pr. styk.
+- **Retvalget** (`mad_planner.vaelg_indkoeb`, `tilbud_bonus`): `Matcher` finder
+  tilbud på SAMME vare (alle navneord fælles, ingen fyldord som "rød"; samme
+  vareart når søge-cachen kender ingrediensen). Bonus = sparede kr (max 20 pr.
+  ingrediens) / 40 kr, × 0,8 × `mad_tilbud_vaegt` — samme størrelse som
+  sæson-bonussen, så den afgør valg INDEN FOR et trin af friskheds-stigen.
+  Basisvarer (i ≥ 8 % af retterne: olie, smør, løg …) giver ingen bonus.
+  Målt 15/11 over 30 replays: gennemsnitlig bonus i valget 0,42 → 0,80.
+  Pushen viser `💰 <ingrediens> +N`.
+- **Kurven** (`nemlig_kurv.py --tilbud`, knappen "Læg tilbud i kurven"): faste
+  (købt ≥ 2 gange), holdbare varer på tilbud, mest sparet pr. krone indtil
+  `nemlig_tilbud_budget_kr`. **Multikøb** (`nemlig_multikoeb`) runder en vare
+  med "N for X kr" op til N når merprisen ≤ `nemlig_multikoeb_max_kr`.

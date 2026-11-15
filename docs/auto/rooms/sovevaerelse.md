@@ -6,8 +6,8 @@ Search keywords: `sovevaerelse, sove`
 
 ## Indhold
 - [Automations](sovevaerelse.md#automations) (37)
-- [Entities](sovevaerelse.md#entities) (242)
-- [Helpers](sovevaerelse.md#helpers) (86)
+- [Entities](sovevaerelse.md#entities) (244)
+- [Helpers](sovevaerelse.md#helpers) (87)
 
 ---
 
@@ -138,7 +138,7 @@ Search keywords: `sovevaerelse, sove`
 ### `binary_sensor.*`
 
 - `binary_sensor.dark_mode_sove` — 3 refs in 3 file(s)
-- `binary_sensor.filmmoerke_sove` — 13 refs in 7 file(s)
+- `binary_sensor.filmmoerke_sove` — 14 refs in 7 file(s)
 - `binary_sensor.mood_pause_sovevaerelse` — 3 refs in 2 file(s)
 - `binary_sensor.parasoll_sovedoer` — 22 refs in 7 file(s)
 - `binary_sensor.sove_aften_laasevindue` — 2 refs in 2 file(s)
@@ -169,7 +169,7 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sovevaerelse_dvale_vidne` — 23 refs in 10 file(s)
 - `binary_sensor.sovevaerelse_empty_effective` — 2 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_lys_on_effektiv` — 1 refs in 1 file(s)
-- `binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv` — 41 refs in 16 file(s)
+- `binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv` — 41 refs in 17 file(s)
 - `binary_sensor.sovevaerelse_optaget_reelt` — 7 refs in 3 file(s)
 - `binary_sensor.sovevaerelse_radiator_spoegelse` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_voksne_oppe` — 5 refs in 3 file(s)
@@ -207,8 +207,8 @@ Search keywords: `sovevaerelse, sove`
 - `input_boolean.sove_gardin_aftenluk_enabled` — 6 refs in 5 file(s)
 - `input_boolean.sove_gardin_bad_foerste_besoeg_ovre` — 13 refs in 4 file(s)
 - `input_boolean.sove_gardin_op_afventer` — 8 refs in 2 file(s)
-- `input_boolean.sove_lyskaede_enabled` — 6 refs in 4 file(s)
-- `input_boolean.sove_lyskaede_manuel_slukket` — 7 refs in 2 file(s)
+- `input_boolean.sove_lyskaede_enabled` — 6 refs in 3 file(s)
+- `input_boolean.sove_lyskaede_manuel_slukket` — 8 refs in 2 file(s)
 - `input_boolean.sove_morgen_anden_krop` — 5 refs in 2 file(s)
 - `input_boolean.sove_radar_watchdog_enabled` — 2 refs in 2 file(s)
 - `input_boolean.sove_retur_enabled` — 2 refs in 2 file(s)
@@ -239,7 +239,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_datetime.sove_seng_udgang_bevist` — 4 refs in 2 file(s)
 - `input_datetime.sove_snooze_until` — 10 refs in 3 file(s)
 - `input_datetime.sove_winddown_at` — 12 refs in 3 file(s)
-- `input_datetime.styrbar_last_press_sovevaerelse` — 11 refs in 7 file(s)
+- `input_datetime.styrbar_last_press_sovevaerelse` — 12 refs in 8 file(s)
 
 ### `input_number.*`
 
@@ -274,8 +274,9 @@ Search keywords: `sovevaerelse, sove`
 - `input_number.sove_gardin_privacy_min_sol_elevation` — 5 refs in 4 file(s)
 - `input_number.sove_godmorgen_fade_sekunder` — 3 refs in 3 file(s)
 - `input_number.sove_hygge_brightness` — 2 refs in 2 file(s)
-- `input_number.sove_lyskaede_min_loft_pct` — 4 refs in 4 file(s)
+- `input_number.sove_lyskaede_min_loft_pct` — 3 refs in 3 file(s)
 - `input_number.sove_lyskaede_presence_minutter` — 3 refs in 3 file(s)
+- `input_number.sove_lyskaede_vaekning_minutter` — 3 refs in 3 file(s)
 - `input_number.sove_moerke_godnat_minutter` — 6 refs in 3 file(s)
 - `input_number.sove_morgen_2p_doerzone_cm` — 10 refs in 5 file(s)
 - `input_number.sove_morgen_afgang_entre_sekunder` — 3 refs in 3 file(s)
@@ -327,7 +328,7 @@ Search keywords: `sovevaerelse, sove`
 
 ### `light.*`
 
-- `light.sove_lyskaede` — 25 refs in 12 file(s)
+- `light.sove_lyskaede` — 25 refs in 11 file(s)
 - `light.sovevaerelse_all` — 17 refs in 9 file(s)
 - `light.sovevaerelse_apollo_rgb_light` — 13 refs in 8 file(s)
 - `light.sovevaerelse_loft` — 12 refs in 8 file(s)
@@ -356,6 +357,7 @@ Search keywords: `sovevaerelse, sove`
 - `script.sove_gardin_op` — 18 refs in 9 file(s)
 - `script.sove_gardin_privacy_morgen` — 2 refs in 1 file(s)
 - `script.sove_godmorgen_fade` — 5 refs in 2 file(s)
+- `script.sove_lyskaede_vaekning` — 1 refs in 1 file(s)
 - `script.sove_radar_hang_probe` — 1 refs in 1 file(s)
 - `script.sove_seng_facit` — 4 refs in 1 file(s)
 - `script.sove_snooze_clear` — 2 refs in 1 file(s)
@@ -491,6 +493,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_number.sove_godmorgen_fade_sekunder` (defined in `packages/sove_lyskaede.yaml`)
 - `input_number.sove_lyskaede_min_loft_pct` (defined in `packages/sove_lyskaede.yaml`)
 - `input_number.sove_lyskaede_presence_minutter` (defined in `packages/sove_lyskaede.yaml`)
+- `input_number.sove_lyskaede_vaekning_minutter` (defined in `packages/sove_lyskaede.yaml`)
 - `input_number.sove_moerke_godnat_minutter` (defined in `packages/godnat_auto_declare.yaml`)
 - `input_number.sove_morgen_2p_doerzone_cm` (defined in `packages/sove_alarm_morgen.yaml`)
 - `input_number.sove_morgen_afgang_entre_sekunder` (defined in `packages/sove_alarm_morgen.yaml`)

@@ -24,7 +24,7 @@ Search keywords: `spisestue`
 ### `automations/presence_stue.yaml`
 
 - **Lysnet: Spisestue tænd** (line 17, mode=single)
-- **Lysnet: Spisestue gradvis sluk** (line 391, mode=restart)
+- **Lysnet: Spisestue gradvis sluk** (line 399, mode=restart)
   - 2026-06-19 (user-spec): spisestue-loftet slukker når spisebords-Apolloen
 
 ---
@@ -127,7 +127,7 @@ Search keywords: `spisestue`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
 - `light.spisestue_loft` — 125 refs in 49 file(s)
-- `light.spisestue_pendel` — 139 refs in 40 file(s)
+- `light.spisestue_pendel` — 138 refs in 40 file(s)
 
 ### `number.*`
 

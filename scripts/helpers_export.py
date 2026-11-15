@@ -178,6 +178,10 @@ RUNTIME_NUMBERS = {
     "gardin_vest_antaget_pos",
     "gardin_spisestue_antaget_pos",
     "thread_watchdog_forsoeg",  # thread_otbr_watchdog.yaml: kure i igangværende nedetid
+    # parent_b_helbred.yaml: indtastnings-felter — vægten er helbredsdata og må
+    # aldrig i et snapshot (privat, se privat/README.md).
+    "parent_b_helbred_vaegt",
+    "parent_b_helbred_minutter",
 }
 
 
