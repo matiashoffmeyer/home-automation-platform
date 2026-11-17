@@ -39,7 +39,7 @@ HA-siden: `packages/spotify_bro.yaml`.
 
 ## Design
 
-`go-librespot 0.10.5` (0.9.0 = MA's binær indtil 16/10; 0.10.x gen-sender tabt
+`go-librespot` bygget fra commit 9085364 (v0.10.5 + 10, fra 0.1.6 15/11: rettelsen af upstream #434 — Android-appen lukkede ned, når man valgte en sang fra en anden playliste — er merget men ikke udgivet; tilbage til en release-binær når en nyere end v0.10.5 udkommer) (0.9.0 = MA's binær indtil 16/10; 0.10.x gen-sender tabt
 connect-state og opgiver et hængende AP-handshake; state-formatet i `/data` er
 uændret) med pipe-output → `bro.py`, som:
 

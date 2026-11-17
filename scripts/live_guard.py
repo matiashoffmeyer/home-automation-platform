@@ -14,7 +14,10 @@ the reason on stderr, a Bash command that
 - restarts Home Assistant, the host or an add-on (``ha_restart.sh`` included)
   without a valid approval of kind ``genstart``. If Home Assistant does not
   answer, the restart is let through: nothing can be asked, and a dead house
-  has nothing to disturb.
+  has nothing to disturb. **A restart is also let through while the house is
+  Dormant** (``input_select.house_state``; user-spec 2026-11-16: "ha må altid
+  restarte hvis huset er dormant") — nobody is home to notice. Live tests
+  (lights/sound) still need a yes in Dormant.
 
 Reloads, notifications, helper writes and reads pass. Commands that only
 mention a pattern (grep, git, echo, a heredoc fed to cat or git) pass. Fails
@@ -135,6 +138,22 @@ def ha_svarer():
         return False
 
 
+def huset_sover():
+    """Er huset Dormant (ingen hjemme)? Ukendt → nej (spørg hellere)."""
+    tok = os.environ.get("SUPERVISOR_TOKEN")
+    if not tok:
+        return False
+    req = urllib.request.Request(
+        "http://supervisor/core/api/states/input_select.house_state",
+        headers={"Authorization": f"Bearer {tok}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2) as r:
+            return json.load(r).get("state") == "Dormant"
+    except OSError, ValueError:
+        return False
+
+
 def main():
     if (ROD / ".claude" / "live_guard_off").exists():
         return 0
@@ -149,7 +168,7 @@ def main():
         return 0
     g = gyldig()
     mangler = behov - set(g["slags"] if g else [])
-    if mangler == {"genstart"} and not ha_svarer():
+    if mangler == {"genstart"} and (not ha_svarer() or huset_sover()):
         return 0
     if not mangler:
         return 0

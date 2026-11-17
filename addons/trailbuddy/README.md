@@ -1,11 +1,16 @@
 # Trail Buddy add-on
 
 Publishes the Trail Buddy hiking app from the NUC on its **own** public HTTPS
-address (`https://trail.<tailnet>.ts.net`) using Tailscale Funnel. The four
+address (`https://trail.<tailnet>.ts.net:10000`) using Tailscale Funnel. The four
 hikers open the link: no VPN, no Tailscale app, no Home Assistant account.
 
+The old address (`https://trail.<tailnet>.ts.net`, until 0.6.79) now only moves
+phones: its pages hand the phone's saved routes/settings/track to the new address
+and open it there, and its service worker removes the old app's worker and caches
+(they kept serving old versions, 2026-11-16). Its API still answers.
+
 Only this add-on is public. It runs its own small Tailscale node in userspace
-mode and funnels only its port 8080. Home Assistant is **not** exposed and keeps
+mode and funnels only its ports 8080 (the app, :10000) and 8090 (the old address, :443). Home Assistant is **not** exposed and keeps
 its current posture (no Nabu Casa, no Funnel/Serve on the NUC's node). The
 add-on has no host ports; HA reads it on the Docker network as
 `http://local-trailbuddy:8080`.
@@ -18,7 +23,9 @@ add-on has no host ports; HA reads it on the Docker network as
   (`?code=<trip_code>` or header `X-Trip-Code`).
 - `/api/group/<trip_code>`: each hiker's latest position and progress. The trip
   code is required, and without it nobody's position is visible.
-- `/api/camps/<trip_code>`: where the group actually camps each night (moved in the app).
+- `/api/camps/<trip_code>`: where the group actually camps each night (moved in the app), kept per route.
+- `/api/routes/<trip_code>`: the route library (every GPX kept on the server); `{"delete": id}`
+  takes one out (moved to `routes/deleted/`, not the group's route).
 - `/api/om`, `/api/proxy`: Open-Meteo / Google Sheets / Overpass for the app.
 
 ## Install

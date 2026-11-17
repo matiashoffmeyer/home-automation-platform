@@ -223,7 +223,10 @@ kræver et nyt ja).
 `scene`, `script`, `media_player`, `tts`, `cover`, `siren`, `remote`, `button`,
 `fan`, `vacuum`, `automation.trigger`, `homeassistant.turn_on/off/toggle` — og
 enhver genstart (`ha_restart.sh`, `ha core restart/stop/rebuild/update`, host
-reboot, add-on restart/stop/update). **Kræver intet:** reloads, notifikationer,
+reboot, add-on restart/stop/update). **Undtagelse (user-spec 2026-11-16: "ha må altid restarte hvis huset er
+dormant"):** genstarter kræver INTET ja når `input_select.house_state` =
+`Dormant` — ingen hjemme at forstyrre (`live_guard.py huset_sover`). Live-tests
+med lys/lyd kræver stadig ja. **Kræver intet:** reloads, notifikationer,
 helper-skrivninger (`input_*`), læsninger og passivt bevis i history.
 
 **Sådan:**

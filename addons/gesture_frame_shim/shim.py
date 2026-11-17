@@ -39,6 +39,17 @@ except ImportError:
     cv2 = None
     np = None
 
+# ONE OpenCV thread (0.16.3, 2026-11-15). The default pool (4 on the NUC's
+# 2-core/4-thread i5) cost twice the CPU for the same wall time — measured in
+# this container on a live 1280x720 frame: YuNet 424 -> 177 ms CPU, the two
+# gaze passes 387 -> 219, the palm net 224 -> 110, wall time ~unchanged
+# (166 -> 177, 155 -> 221, 96 -> 111 ms). The pool's workers spin while they
+# wait, and the shim ran ~40-80 % of a core whenever the kitchen was occupied,
+# which put the NUC at 77 °C under sustained load. A gaze tick (~400 ms) still
+# fits its 1 s PACE, and a palm pass fits the 0.5 s snapshot burst.
+if cv2 is not None:
+    cv2.setNumThreads(1)
+
 SOI = b"\xff\xd8"
 EOI = b"\xff\xd9"
 

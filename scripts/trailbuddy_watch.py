@@ -23,7 +23,13 @@ ville hendes bevægelse i byen holde alarmen tilbage.
 Tidsplan: appen sender `day` ud fra KALENDEREN på turens datoer (app.js
 myProgress), så den siger intet om fremdrift. I stedet: gruppens km på ruten
 (`along`, den forreste) mod dagens strækning i plan.csv (km ved dagens lejr),
-skaleret til rutens faktiske længde (along + toGo). Datoerne er tyrkisk tid.
+skaleret til rutens faktiske længde (along + toGo). Datoerne er turens tid.
+
+Næste tur (user 16/11: "intet hardcoded til tyrkiet-turen"): tidszonen er
+serverens (`/api/health` → `tz`, gruppens vejrplan), og har gruppen sat turen i
+appen (Setup → Trip: første dag + nætter, `/api/hiking`), er planen de datoer
+med lige store bidder af ruten (appen lægger lejrene efter lige gåtid — tæt
+nok til "følger planen"). Ellers den indbyggede rutes plan.csv.
 
   python3 scripts/trailbuddy_watch.py [--timer 24] [--radius 250] [--dry-run]
 """
@@ -44,7 +50,7 @@ from zoneinfo import ZoneInfo
 
 import ha_secrets
 
-TRIP_TZ = ZoneInfo("Europe/Istanbul")
+TRIP_TZ = ZoneInfo("UTC")  # sættes fra serveren i main()
 HOME_TZ = ZoneInfo("Europe/Copenhagen")
 BASE = "http://local-trailbuddy:8080"
 INTERNAL = "http://local-trailbuddy:8081"
@@ -82,6 +88,26 @@ def load_plan(path: str = PLAN_FILE) -> list[dict]:
             )
             cur["km_end"] = max(cur["km_end"], km)
     return [days[k] for k in sorted(days)]
+
+
+def server_plan(hiking: dict) -> list[dict] | None:
+    """Planen fra appens Setup → Trip, eller None når gruppen ikke har sat den.
+
+    km_end er brøkdele af ruten (`rel`): dag i af n+1 slutter ved i/(n+1).
+    """
+    start = (hiking.get("tripStart") or {}).get("v") or ""
+    nights = (hiking.get("tripNights") or {}).get("v") or 0
+    try:
+        d0 = date.fromisoformat(start)
+    except ValueError:
+        return None
+    if not isinstance(nights, int) or nights < 0:
+        return None
+    n = nights + 1
+    return [
+        {"day": i, "date": d0 + timedelta(days=i - 1), "km_end": i / n, "rel": True}
+        for i in range(1, n + 1)
+    ]
 
 
 def load_state() -> dict:
@@ -156,7 +182,11 @@ def schedule(plan: list[dict], km: float | None, route_km: float | None, today: 
     if i is None:
         return {"tidsplan": "Hviledag", "dag": None}
     scale = 1.0
-    if route_km and 0.7 < route_km / plan[-1]["km_end"] < 1.3:
+    if plan[-1].get("rel"):
+        if not route_km:
+            return {"tidsplan": "Ukendt (ingen position på ruten)", "dag": plan[i]["day"]}
+        scale = route_km
+    elif route_km and 0.7 < route_km / plan[-1]["km_end"] < 1.3:
         scale = route_km / plan[-1]["km_end"]
     start = (plan[i - 1]["km_end"] if i else 0.0) * scale
     end = plan[i]["km_end"] * scale
@@ -266,10 +296,21 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="skriv ikke state-filen")
     a = ap.parse_args()
 
+    global TRIP_TZ
     state = load_state()
     hentet = False
+    hiking: dict | None = None
+    try:
+        TRIP_TZ = ZoneInfo(get_json(f"{BASE}/api/health", 5).get("tz") or "UTC")
+        state["tz"] = TRIP_TZ.key
+    except Exception:  # nede eller ukendt navn: sidst kendte
+        TRIP_TZ = ZoneInfo(state.get("tz") or "UTC")
     try:
         code = urllib.parse.quote(ha_secrets.get(CODE_KEY), safe="")
+        try:
+            hiking = get_json(f"{BASE}/api/hiking/{code}").get("hiking", {})
+        except Exception:
+            hiking = None
         fetched = get_json(f"{BASE}/api/group/{code}").get("members", [])
         update_members(state, fetched, a.radius)
         hentet = True
@@ -280,10 +321,12 @@ def main() -> int:
         state["public_url"] = url if url.startswith("https://") else state.get("public_url")
     except Exception:
         pass
-    try:
-        plan = load_plan()
-    except OSError, ValueError, KeyError:
-        plan = []
+    plan = server_plan(hiking or {}) if hiking is not None else None
+    if plan is None:
+        try:
+            plan = load_plan()
+        except OSError, ValueError, KeyError:
+            plan = []
     out = evaluate(state, plan, time.time() * 1000, a.timer, hentet)
     out["public_url"] = state.get("public_url")
     if not a.dry_run and hentet:

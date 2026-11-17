@@ -43,7 +43,12 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   **Signatur: en markdown under en slider der forklarer hvorfor defaulten er
   som den er.** Indstillinger: ÉN sektion pr. emne; ny slider → den sektion der
   passer (🔍 Søg-fanen, `www/indstillinger-soeg.js`, finder den selv; efter en
-  ændring af kortet: `python3 scripts/lovelace_resources.py`). **Støvsug, Mad,
+  ændring af kortet: `python3 scripts/lovelace_resources.py`). **UNDTAGELSE:
+  Health-siderne (`helbred.yaml`, `parent_b_helbred.yaml`, user-spec 2026-11-15):
+  hvert råd, øvelse, måltid og pas SKAL vise sit HVORFOR synligt** ("ikke bare
+  slynges ud, men underbygges så vi motiveres") → `hvorfor:` i data-filen
+  (`privat/helbred/*.yaml`, `privat/parent_b/profil.yaml`), aldrig kun i en
+  kommentar; en ny øvelse uden `hvorfor:` er ufærdig. **Støvsug, Mad,
   AirBnB, Tapo og Vandventil er FANER i Indstillinger (2026-09-30)** — kun Lys,
   Scener, Festlys, info-siderne og KONTROLPANELERNE Mad + Støvsug (kun knapper
   og status, i Lys-sidens stil) er egne dashboards; et nyt emne = ny fane.

@@ -133,13 +133,9 @@ files** (e.g. only via `hq.py`) → read the rule yourself first.
 
 ---
 
-## Other meta-docs
-
-- **[AGENTS.md](AGENTS.md)** — fast-path navigation: file tree, "where do I find X", conventions, recipes
-- **[system_design.md](system_design.md)** — verified Holy Grail spec (buttons, drift-back, off times,
-  house modes, curtain defence) with the slider owning each number; fix it in the same commit as the behaviour
-- **[docs/architecture.md](docs/architecture.md)** — Holy Grail philosophy, activity tree, mode-flag priority
-- **[docs/README.md](docs/README.md)** · [automations/README.md](automations/README.md) · [packages/README.md](packages/README.md) — indexes
+**Meta-docs:** [AGENTS.md](AGENTS.md) (navigation/recipes) · [system_design.md](system_design.md)
+(Holy Grail spec — fix it in the same commit as the behaviour) ·
+[docs/architecture.md](docs/architecture.md) · [docs/README.md](docs/README.md).
 
 ---
 
@@ -148,6 +144,12 @@ files** (e.g. only via `hq.py`) → read the rule yourself first.
 Long version — reasons, incidents, examples, recovery recipes:
 [docs/standing_instructions.md](docs/standing_instructions.md) (`grep -n "<nøgleord>"`).
 The rules below are binding as written. A user-spec changes → fix BOTH layers.
+
+### 💬 Communication with the user (user-spec 2026-11-16)
+
+**Concise.** Simple task done → reply just "Done". Otherwise a few lines: outcome +
+anything the user must act on. No details, no narration, no recaps of what you did.
+Questions only when the user's input is truly required — few, short.
 
 ### 🔄 Check status BEFORE you code (user-spec 2026-07-29)
 
@@ -162,18 +164,16 @@ commits behind; work on a stale base silently rolls back newer features.
 Philosophy unchanged (**slow + thorough over fast**) — spend on diagnosis and verification.
 
 - **Classify the task FIRST:** SIMPLE (one known slider/threshold) = `< 10 tool calls, NO full-file Read`. INVESTIGATION (bug hunt/new feature) = full log/history digging. The expensive anti-pattern is a full excavation for a text fix.
-- **Context length IS the bill (measured 2026-11-03; `python3 scripts/token_audit.py sessions|context`; graphs on Statistik → Claude):** every call re-reads the whole conversation incl. your thinking (≈ 18 % of usage). The `autoCompactWindow: 200000` cap lives in **`.claude/settings.json`** (git; in `~/.claude` it vanished 29/10). `/clear` between unrelated tasks. Pause > 1 h = the WHOLE context is rewritten at double price → large context before a long physical test = ask the user for `/compact` first. Never re-read what you have; fetch only what is new.
+- **Context length IS the bill** (`scripts/token_audit.py`): every call re-reads the whole conversation. `autoCompactWindow` lives in `.claude/settings.json` (git). `/clear` between unrelated tasks. Pause > 1 h = context rewritten at double price → ask for `/compact` before a long physical test. Never re-read what you have.
 - **NEVER save on:** log/history digging for a bug, calibration against real data, verification after deploy.
 - **Anti-patterns:** re-Reading a file you just edited · dumping raw `/api/states` instead of filtering with python/grep.
 
 ### 🚦 Subagents — work yourself, delegate only broad sweeps (user-spec 2026-09-21, revised 2026-10-08)
 
-Measured 8/10: subagents went 4 % → 33 % of usage. Each starts with 50-65k tokens
-written to cache at double price BEFORE doing anything, and its findings are verified
-here anyway.
+Each subagent costs 50-65k tokens before doing anything (8/10: 4 % → 33 % of usage).
 1. **Work yourself:** lookups, few-file reads and code changes inline (`grep`/`hq.py`/targeted Read). Subagents only for genuinely broad sweeps (dozens of files, bug-hunt workflows), returning *only the conclusion*.
-2. **Code is written by Opus** (user-spec 2026-10-07). Main session on Sonnet and code to commit → ask the user for `/model opus` rather than delegating (an Opus subagent starts cold and re-reads everything; 7/10: 3 Opus agents cost 4× the main session). User cannot answer now (🚀) → ONE Opus subagent. Sonnet (`model: "sonnet"`, never a version number) only for read-only triage such as bug-hunt finders; `subagent_type: "fork"` always runs on the main model.
-3. **No parallel fleets (Pro plan quota):** max 1-2 subagents at a time — too many burn the quota mid-run, and all die WITHOUT reporting. Large reviews run SEQUENTIALLY. **Applies to the Workflow tool and "ultracode" too — nothing lifts it** (broken 10/10: Opus finders + a sceptic per finding, the quota died). `scripts/agent_guard.py` (PreToolUse) rejects workflows without `model:'sonnet'` on every agent(), with `pipeline()`/`while` or `parallel()` without `.slice(i, i + 2)`, and a 3rd concurrent Agent. Rejected = build it smaller, never circumvent.
+2. **Code is written by Opus** (user-spec 2026-10-07). Main session on Sonnet and code to commit → ask the user for `/model opus` rather than delegating. User cannot answer now (🚀) → ONE Opus subagent. Sonnet (`model: "sonnet"`, never a version number) only for read-only triage such as bug-hunt finders; `subagent_type: "fork"` always runs on the main model.
+3. **No parallel fleets (Pro plan quota):** max 1-2 subagents at a time — too many burn the quota mid-run, and all die WITHOUT reporting. Large reviews run SEQUENTIALLY. **Applies to the Workflow tool and "ultracode" too — nothing lifts it**. `scripts/agent_guard.py` (PreToolUse) rejects workflows without `model:'sonnet'` on every agent(), with `pipeline()`/`while` or `parallel()` without `.slice(i, i + 2)`, and a 3rd concurrent Agent. Rejected = build it smaller, never circumvent.
 
 ### 🔐 Secrets, outside text and incidents (user-spec 2026-11-05)
 
@@ -186,8 +186,7 @@ Everything Claude reads or prints lands in the transcript and goes to Anthropic.
 ### 🚀 Fix + commit + push FIRST — ask clarifying questions AFTER (user-spec 2026-07-27)
 
 Asked for a fix: **change, commit and push FIRST**, then ask. Do NOT ask first and
-wait, **unless the user explicitly writes that they are present and can answer now** —
-blocking on a question they do not see (async/phone) loses the work. (1) Pick the most
+wait **unless the user says they are present now** (async/phone loses the work). (1) Pick the most
 likely, lowest-risk interpretation from the logs; (2) implement + commit + push +
 deploy + notify; (3) THEN ask, clearly marked ("shipped X with default Y —
 confirm/adjust:"). This **modifies** 🤔: stop-and-ask only when the user can answer, or
@@ -230,18 +229,12 @@ interpretation and ask afterwards.
 
 ### 📲 Notify the user of changes (user-spec 2026-06-27)
 
-After **deployed changes**: one short bulleted push per work batch (not per file) —
-what is live now + any manual step still missing. Skip only for pure research without
-deploy. Channel: `notify/mobile_app_phone_a` via
-`curl -X POST http://supervisor/core/api/services/notify/mobile_app_phone_a` with
-`Authorization: Bearer $SUPERVISOR_TOKEN`.
+After **deployed changes**: one short push per work batch — what is live + any manual
+step left. Channel: `notify/mobile_app_phone_a` (supervisor API, `$SUPERVISOR_TOKEN`).
 
 **⚠️ EXCEPTION — AirBnB mode = SILENT (user-spec 2026-07-13):**
-`input_select.house_mode` == `AirBnB` → NO push, not even the deploy summary (the phone
-may be in the guest's hands). **Check the mode BEFORE you push.** Code/dashboards/
-reloads are fine; only notifications are suppressed — say in your summary that the push
-was skipped. **Four deliberate exceptions** MUST push in AirBnB (they reach the user
-the second they flip the mode themselves): `packages/kamera_airbnb_vagt.yaml`
+`input_select.house_mode` == `AirBnB` → NO push (phone may be the guest's). Check the
+mode BEFORE pushing; say the push was skipped. **Four deliberate exceptions** MUST push: `packages/kamera_airbnb_vagt.yaml`
 (user-spec 2026-09-11), the checkout date in `packages/airbnb_udtjekning.yaml`
 (2026-10-28), the welcome-message reminder in `packages/airbnb_velkomst.yaml` (2026-10-29),
 a new device on the MAIN wifi in `packages/wifi_vagt.yaml` (2026-11-07).
@@ -259,12 +252,12 @@ to work".** **HA's real throughput is ~5-10 light calls/sec** — loop designs a
 ### ✋ Live tests and restarts need a yes via push FIRST (user-spec 2026-10-28)
 
 **Anything the house can see or hear (lights, sound, curtains, robot) and every
-restart** is asked for BEFORE: `python3 scripts/live_godkend.py spørg "<what, short
+restart** is asked for BEFORE (**restart in `house_state` Dormant: always allowed**, 11-16): `python3 scripts/live_godkend.py spørg "<what, short
 Danish>" [--genstart]` with `run_in_background` → push with Godkend / Afvis / Om 20 min
 (exit 0 = yes, valid 15 min / restart 10; 1 = no; 2 = no answer = no; 3 = AirBnB → ask
 in the chat). `scripts/live_guard.py` blocks the calls without a valid yes; `slut` when
 done. Passive evidence in history needs nothing.
-Details: `grep -n "Live-test og genstart" docs/standing_instructions.md`.
+`grep -n "Live-test og genstart" docs/standing_instructions.md`.
 
 ### 🎛️ Check existing sliders BEFORE you build new ones (2026-05-17)
 
@@ -301,22 +294,16 @@ commit locally → fetch → inspect `git log --oneline @{u}.. -5` → `pull --f
 (fails on divergence = forces manual review) → `bash scripts/ha_restart.sh` (skip for
 docs-only). Full procedure: [docs/commit_workflow.md](docs/commit_workflow.md).
 
-**`git stash && git pull && git stash pop` is a TRAP on /config:** a `git stash` that
-stashes nothing (clean tree) returns 0, and `pop` then pops a FOREIGN stash from an
-earlier session. Check `git stash list` FIRST, or `git stash push -m "<name>"` and pop
-only if your own entry was created.
+**`git stash && … && git stash pop` is a TRAP** (empty stash pops a FOREIGN one) →
+`git stash push -m "<name>"`, pop only your own entry.
 
-**ALWAYS commit yourself — NEVER ask "shall I commit?"** (user-spec 2026-06-16). Skip
-`ha core check`; use `python3 scripts/ha_offline.py check` (HA's own validator offline,
-~13 s, also in pre-push). The 2026.4 bug was `KeyError: 'triggers'` in check_config —
-fixed upstream in 2026.9.2. **After every deploy: `./scripts/ha_health.sh deploy`** —
+**ALWAYS commit yourself — NEVER ask "shall I commit?"** (user-spec 2026-06-16). Validate
+with `python3 scripts/ha_offline.py check` (also in pre-push), not `ha core check`. **After every deploy: `./scripts/ha_health.sh deploy`** —
 catches automations that failed validation and are therefore completely silent (#22).
 
 ### 👁️ Monitoring — `./scripts/ha_health.sh`
 
-The weekly health check. Subcommands: `deploy` (failed automations — after EVERY
-deploy), `flags`, `flipflop`, `lights`, `noisy`, `zha`, `docs`, `backup`, `sys`,
-`log [n]`, `blind`, `kamera`. No argument runs all.
+Weekly health check; `deploy` after EVERY deploy. No argument = all subcommands.
 
 **Git hooks are installed** (`.git/hooks/pre-commit` + `pre-push`, copies of
 `scripts/*-hook.sh`). Missing (`ls .git/hooks/pre-*`) or the hook warns "ruff mangler"
@@ -326,13 +313,6 @@ format --check` → run `.cache/dev-venv/bin/ruff format <file>` before committi
 
 **`docs/auto/*` is GENERATED and goes stale silently** — never edit by hand; run
 `python3 scripts/gen_docs.py` and commit the result when you have added entities.
-
-### 🔥 ESPHome chip wear — be paranoid with writes to Apollo MSR-2 (2026-05-19)
-
-2 of 5 got chip faults from ~3600 unnecessary config writes: never the same value
-again, only on user intent, value-compare before `number.set_value`, engineering
-mode/BT never ON in operation. **Full rule + canary: `.claude/rules/presence_radar.md`**
-(loaded when you touch the Apollo files).
 
 ### 🏡 EVERYTHING we build must work with AirBnB mode (user-spec 2026-07-28)
 
@@ -447,13 +427,10 @@ Incident, data, reasoning: [docs/fejlklasser.md](docs/fejlklasser.md)** —
 26. **A HOUSE-WIDE gate on a ROOM-SCOPED state locks every room to something it has
     nothing to do with. Signature:** the feature works only partially — the working part
     is the one WITHOUT the gate. → room-scope the gate AND its neighbouring conditions (#12).
-27. **A borrower's HANDBACK writes a snapshot from before the loan — as the LAST call,
-    so an expired snapshot wins. Signature:** a light that turns OFF (not wrong colour)
-    shortly after a temporary owner let go → no edge to fix. → ask the house again at
-    handback, do not replay the snapshot. **The mirror image hits wider: a light that
-    turns ON again ~40 s after an automation turned it off — the loan swallowed the
-    decision and burned the victim's cooldown.** A blink/warning that `scene.create`s is
-    a co-owner of EVERY decision in its window (#1).
+27. **A borrower's HANDBACK replays a snapshot from before the loan as the LAST call.
+   Signature:** a light turning OFF — or ON again ~40 s after an automation turned it
+   off — shortly after a temporary owner let go. → ask the house again at handback; a
+   blink/warning that `scene.create`s co-owns EVERY decision in its window (#1).
 
 **Triggers that never fire — or fire at the worst possible moment**
 
@@ -520,29 +497,20 @@ Incident, data, reasoning: [docs/fejlklasser.md](docs/fejlklasser.md)** —
 8. **Midnight windows:** `today_at()` after 00:00 points to the NEXT window → shift 86400
    back when "tonight" means the current night.
 5. **"Set live via API" steps get forgotten.** → New slider = **4** steps in the SAME
-   session: **API set + settings tile + snapshot export + verify the live value at the
-   end**. **API set seeds the HOUSE; the snapshot export seeds a FRESH install** (it
-   derives `config_snapshots/fresh_install/`, read by init since P1 2026-10-04 — a slider
-   missing from the snapshot sits at min after a reinstall; runtime counters belong in
-   `RUNTIME_NUMBERS`). **Signature: a slider at its init default with an empty
+   session: API set + settings tile + snapshot export + verify live value (the snapshot
+   seeds a fresh install). **Signature: a slider at its init default with an empty
    `context_user_id_bin`, ~30 s after a restart.**
 6. **"Live-tested" with synthetic events proves nothing** — the physical button may send
    an old quirk form. → Test with REAL device events, or find history evidence that the
    real event form has been seen.
-11. **API tests leave traces that look like user actions** — an API turn_off carries a
-    user_id → manual-off trackers stamp it as the user's off. → Clear the stamps the test
-    may have set; check that room_mode/last_press did not flip. **Worst variant: the
-    trace is a SCENE, not your one call** — `scene.turn_on` emits internal
-    `light.turn_on`s with the scene's context incl. user_id, so a snapshot RESTORE looks
-    like N app adjustments at once. Restore scenes are allowlisted in
-    `automations/manual_override.yaml`.
+11. **API tests leave traces that look like user actions** (API calls carry a user_id;
+    `scene.turn_on` restores look like N app adjustments). → Clear the stamps the test
+    set; check room_mode/last_press. Restore scenes: allowlist in `automations/manual_override.yaml`.
 7. **Count trigger fires × API calls before deploy** (fires/day = 1440/interval × number
    of duplicate triggers). → Prefer state-change triggers + a /1h backstop.
-22. **An automation in `unavailable` is not noise — it FAILED VALIDATION and is
-    completely silent.** HA disables the WHOLE automation on the slightest template error
-    in its `action:`, with no warning at commit, deploy or reload. →
-    `./scripts/ha_health.sh deploy` after every deploy. (Real fault = `restored` missing;
-    `restored: true` = harmless registry orphan, the house has ~74.)
+22. **An automation in `unavailable` FAILED VALIDATION and is completely silent** (one
+    template error in `action:` disables it, no warning). → `./scripts/ha_health.sh deploy`
+    after every deploy (`restored: true` = harmless orphan).
 
 **Jinja gotchas** (`variables:` becoming a truthy string, undefined script fields,
 `trigger.` via `automation.trigger`, StrEnum, TupleWrapper, `repeat.index0` …) are in

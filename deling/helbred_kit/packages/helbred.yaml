@@ -1,0 +1,180 @@
+# =============================================================================
+# helbred.yaml — Health: trænings-, vægt- og kostprogram i Home Assistant
+# =============================================================================
+# Motoren er scripts/helbred.py; dine data bor i /config/helbred/ (se README.md).
+#
+#   sensor.helbred_idag|kost|statistik|historik (command_line) → `status <navn>`.
+#     Genlæses efter hver handling og hvert kvarter/time.
+#   Siden (dashboards/helbred.yaml + www/helbred-card.js) → script.helbred_cmd
+#     med handlingen som base64-JSON (scriptet validerer alt igen).
+#   Push-knapper HELBRED_<OP>_<emne> → automationen herunder → `svar`.
+#   Påmindelser: `tick` hvert 5. min; tiderne står i helbred/profil.yaml.
+#
+# Tip: undtag sensor.helbred_* fra recorderen (se README.md), så helbredsdata
+# ikke også ender i HA's database.
+# =============================================================================
+
+input_boolean:
+  helbred_paamindelser:
+    name: "Helbred: påmindelser"
+    icon: mdi:bell-ring-outline
+
+command_line:
+  - sensor:
+      name: "Helbred idag"
+      unique_id: helbred_idag
+      icon: mdi:run
+      command: "python3 /config/scripts/helbred.py status idag"
+      command_timeout: 30
+      scan_interval: 900
+      value_template: "{{ value_json.state }}"
+      json_attributes:
+        - dato
+        - ugedag
+        - dag_nr
+        - sted
+        - steder
+        - session
+        - daglig_navn
+        - daglig_hvorfor
+        - daglig
+        - hoved
+        - andre
+        - bannere
+        - vaegt
+        - smerte_navn
+        - smerte_sidst
+  - sensor:
+      name: "Helbred kost"
+      unique_id: helbred_kost
+      icon: mdi:food-apple
+      command: "python3 /config/scripts/helbred.py status kost"
+      command_timeout: 30
+      scan_interval: 3600
+      value_template: "{{ value_json.state }}"
+      json_attributes:
+        - dato
+        - i_dag
+        - protein
+        - justering
+        - ekstra
+        - hvorfor_maal
+        - dage
+        - afsnit
+        - indkoeb
+  - sensor:
+      name: "Helbred statistik"
+      unique_id: helbred_statistik
+      icon: mdi:chart-line
+      command: "python3 /config/scripts/helbred.py status statistik"
+      command_timeout: 30
+      scan_interval: 3600
+      value_template: "{{ value_json.state }}"
+      json_attributes:
+        - vurdering
+        - vurderinger
+        - foreloebig
+        - vaegt
+        - forventet
+        - forventet_tekst
+        - basis
+        - trend
+        - milepaele
+        - smerte_navn
+        - smerte
+        - styrke_pr_uge
+        - uger
+        - loeft
+        - maal
+  - sensor:
+      name: "Helbred historik"
+      unique_id: helbred_historik
+      icon: mdi:clipboard-pulse-outline
+      command: "python3 /config/scripts/helbred.py status historik"
+      command_timeout: 30
+      scan_interval: 3600
+      value_template: "{{ value_json.state }}"
+      json_attributes:
+        - tekst
+        - spoergsmaal
+        - maalinger
+
+shell_command:
+  helbred_cmd: "python3 /config/scripts/helbred.py cmd {{ b64 }}"
+  helbred_svar: "python3 /config/scripts/helbred.py svar {{ knap }} {{ tekst }}"
+  helbred_tick: "python3 /config/scripts/helbred.py tick"
+
+script:
+  # Én vej ind fra siden. queued: to hurtige tryk må ikke skrive samme fil samtidig.
+  helbred_cmd:
+    alias: "Helbred: gem fra siden"
+    icon: mdi:content-save
+    mode: queued
+    max: 20
+    fields:
+      b64:
+        description: "Handlingen som base64-kodet JSON (bygges af helbred-card)"
+        required: true
+    sequence:
+      - variables:
+          b: "{{ (b64 if b64 is defined else '') | string | trim }}"
+      - condition: template
+        value_template: "{{ b | regex_match('^[A-Za-z0-9+/=]{4,8000}$') }}"
+      - action: shell_command.helbred_cmd
+        data:
+          b64: "{{ b }}"
+      - action: homeassistant.update_entity
+        target:
+          entity_id:
+            - sensor.helbred_idag
+            - sensor.helbred_statistik
+            - sensor.helbred_historik
+            - sensor.helbred_kost
+
+automation:
+  - id: helbred_push_svar
+    alias: "Helbred: svar fra push-knap"
+    description: "Knapper og tekstsvar (vægt, smerte 0-10) fra påmindelserne."
+    mode: queued
+    max: 10
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+    conditions:
+      - condition: template
+        value_template: >
+          {{ trigger.event.data.action | default('')
+             | regex_match('^HELBRED_(SVAR|OK|U1T|U1D|SKIP)_[a-z]{2,20}$') }}
+    actions:
+      - action: shell_command.helbred_svar
+        data:
+          knap: "{{ trigger.event.data.action }}"
+          tekst: "{{ (trigger.event.data.reply_text | default('') | string)[:200] | base64_encode }}"
+      - action: homeassistant.update_entity
+        target:
+          entity_id:
+            - sensor.helbred_idag
+            - sensor.helbred_statistik
+            - sensor.helbred_historik
+
+  - id: helbred_tick
+    alias: "Helbred: påmindelser"
+    description: "Hvert 5. minut: send de påmindelser der er forfaldne (tider i helbred/profil.yaml)."
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: "/5"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.helbred_paamindelser
+        state: "on"
+      - condition: time
+        after: "06:30:00"
+        before: "21:50:00"
+    actions:
+      - action: shell_command.helbred_tick
+      - action: homeassistant.update_entity
+        target:
+          entity_id:
+            - sensor.helbred_idag
+            - sensor.helbred_statistik

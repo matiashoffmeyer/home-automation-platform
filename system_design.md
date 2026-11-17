@@ -74,6 +74,9 @@ Kill-switch: `input_boolean.drift_back_enabled`.
   - `input_number.badevaerelse_manual_til_auto_minutes` (bad)
 
   Triggerens `for:` bindes ved load, så en ændret slider kræver reload.
+- **Automatisk sluk af ALT lyset → Auto med det samme** (bad: `presence_badevaerelse.yaml`;
+  børn 2026-11-16: morgen-sanity-sluk og tomt-sluk). Der er ingen manuel indstilling
+  tilbage at beskytte, og ellers blokerer Manual næste indgangs bevægelses-tænd.
 - **Race-vindue:** aldrig drift < 30 min efter et tryk. Bad og open plan bruger
   min(30, egen slider).
 - **Optaget-fallback** (erstattede 12-t-loftet 2026-07-25): bliver man i
