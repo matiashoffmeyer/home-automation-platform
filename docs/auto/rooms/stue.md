@@ -113,7 +113,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.spisestue_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_frossen_ghost` — 2 refs in 2 file(s)
 - `binary_sensor.spisestue_apollo_occupancy` — 29 refs in 19 file(s)
-- `binary_sensor.spisestue_apollo_occupancy_filtered` — 114 refs in 41 file(s)
+- `binary_sensor.spisestue_apollo_occupancy_filtered` — 115 refs in 41 file(s)
 - `binary_sensor.spisestue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_radar_moving_target` — 12 refs in 11 file(s)
 - `binary_sensor.spisestue_apollo_radar_still_target` — 1 refs in 1 file(s)
@@ -129,7 +129,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.stue_apollo_bevaegelse_frisk` — 2 refs in 2 file(s)
 - `binary_sensor.stue_apollo_frossen_ghost` — 4 refs in 3 file(s)
 - `binary_sensor.stue_apollo_occupancy` — 24 refs in 16 file(s)
-- `binary_sensor.stue_apollo_occupancy_filtered` — 122 refs in 50 file(s)
+- `binary_sensor.stue_apollo_occupancy_filtered` — 123 refs in 50 file(s)
 - `binary_sensor.stue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.stue_apollo_radar_moving_target` — 10 refs in 9 file(s)
 - `binary_sensor.stue_apollo_radar_still_target` — 1 refs in 1 file(s)
@@ -163,7 +163,7 @@ Search keywords: `stue, open_plan`
 ### `cover.*`
 
 - `cover.gardin_spisestue_vest` — 77 refs in 22 file(s)
-- `cover.gardin_stue_syd` — 69 refs in 22 file(s)
+- `cover.gardin_stue_syd` — 73 refs in 22 file(s)
 - `cover.gardin_stue_vest_1` — 68 refs in 22 file(s)
 
 ### `input_boolean.*`
@@ -314,15 +314,15 @@ Search keywords: `stue, open_plan`
 ### `light.*`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
-- `light.spisestue_loft` — 125 refs in 49 file(s)
+- `light.spisestue_loft` — 126 refs in 50 file(s)
 - `light.spisestue_pendel` — 138 refs in 40 file(s)
-- `light.stue_all` — 24 refs in 13 file(s)
+- `light.stue_all` — 26 refs in 14 file(s)
 - `light.stue_apollo_rgb_light` — 5 refs in 3 file(s)
 - `light.stue_hjoernelampe` — 58 refs in 27 file(s)
 - `light.stue_laesehygge` — 87 refs in 38 file(s)
 - `light.stue_loft` — 2 refs in 2 file(s)
 - `light.stue_plug` — 81 refs in 30 file(s)
-- `light.stue_room` — 20 refs in 13 file(s)
+- `light.stue_room` — 21 refs in 14 file(s)
 - `light.stue_sofa_lampe` — 56 refs in 26 file(s)
 - `light.stue_sofa_lampe_2` — 55 refs in 26 file(s)
 - `light.stue_spot_1` — 41 refs in 17 file(s)
@@ -362,10 +362,10 @@ Search keywords: `stue, open_plan`
 ### `script.*`
 
 - `script.gardin_spisestue_position` — 1 refs in 1 file(s)
-- `script.roborock_grundig_spisestue` — 1 refs in 1 file(s)
-- `script.roborock_grundig_stue` — 1 refs in 1 file(s)
-- `script.roborock_hurtig_spisestue` — 1 refs in 1 file(s)
-- `script.roborock_hurtig_stue` — 1 refs in 1 file(s)
+- `script.roborock_grundig_spisestue` — 2 refs in 1 file(s)
+- `script.roborock_grundig_stue` — 2 refs in 1 file(s)
+- `script.roborock_hurtig_spisestue` — 2 refs in 1 file(s)
+- `script.roborock_hurtig_stue` — 2 refs in 1 file(s)
 - `script.roborock_start_let_stue` — 4 refs in 1 file(s)
 - `script.spisestue_apollo_apply_all_gates` — 1 refs in 1 file(s)
 - `script.stue_apollo_apply_all_gates` — 1 refs in 1 file(s)
@@ -390,7 +390,7 @@ Search keywords: `stue, open_plan`
 - `sensor.sleepover_stue_nat_minutter` — 3 refs in 1 file(s)
 - `sensor.sleepover_stue_siden_0030` — 3 refs in 1 file(s)
 - `sensor.sofa_stue_off_sekunder` — 5 refs in 2 file(s)
-- `sensor.spisestue_apollo_esp_temperature` — 4 refs in 3 file(s)
+- `sensor.spisestue_apollo_esp_temperature` — 5 refs in 4 file(s)
 - `sensor.spisestue_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
 - `sensor.spisestue_apollo_lux` — 11 refs in 7 file(s)
 - `sensor.spisestue_apollo_radar_move_energy` — 1 refs in 1 file(s)
@@ -407,7 +407,7 @@ Search keywords: `stue, open_plan`
 - `sensor.spisestue_lys_timer_dag` — 1 refs in 1 file(s)
 - `sensor.spisestue_off_sekunder` — 4 refs in 2 file(s)
 - `sensor.spisestue_sofa_off_sekunder` — 2 refs in 1 file(s)
-- `sensor.stue_apollo_esp_temperature` — 4 refs in 3 file(s)
+- `sensor.stue_apollo_esp_temperature` — 5 refs in 4 file(s)
 - `sensor.stue_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
 - `sensor.stue_apollo_lux` — 6 refs in 4 file(s)
 - `sensor.stue_apollo_radar_move_energy` — 1 refs in 1 file(s)

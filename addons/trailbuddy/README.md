@@ -24,6 +24,10 @@ add-on has no host ports; HA reads it on the Docker network as
 - `/api/group/<trip_code>`: each hiker's latest position and progress. The trip
   code is required, and without it nobody's position is visible.
 - `/api/camps/<trip_code>`: where the group actually camps each night (moved in the app), kept per route.
+- `/api/days/<trip_code>`: the day log (broke camp, made camp, 🚕 skipped), kept per route.
+- `/api/hiking/<trip_code>`: shared settings, each route's trip (name, first day, nights) and each
+  walked trip's record (its logged days time the trips not walked yet).
+- `/api/archive/<trip_code>`: earlier data kept on the server; `{"restore": stamp}` brings it back.
 - `/api/routes/<trip_code>`: the route library (every GPX kept on the server); `{"delete": id}`
   takes one out (moved to `routes/deleted/`, not the group's route).
 - `/api/om`, `/api/proxy`: Open-Meteo / Google Sheets / Overpass for the app.

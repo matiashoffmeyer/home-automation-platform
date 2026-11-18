@@ -66,7 +66,7 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.koekken_apollo_naer_bekraeftet` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_naer_kandidat` — 4 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_occupancy` — 33 refs in 18 file(s)
-- `binary_sensor.koekken_apollo_occupancy_filtered` — 112 refs in 43 file(s)
+- `binary_sensor.koekken_apollo_occupancy_filtered` — 113 refs in 43 file(s)
 - `binary_sensor.koekken_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_radar_moving_target` — 19 refs in 12 file(s)
 - `binary_sensor.koekken_apollo_radar_still_target` — 2 refs in 2 file(s)
@@ -164,7 +164,7 @@ Search keywords: `koekken, kokken`
 - `input_number.koekken_lyskaede_dark_pct` — 5 refs in 3 file(s)
 - `input_number.koekken_lyskaede_dark_session_pct` — 4 refs in 3 file(s)
 - `input_number.koekken_lyskaede_doed_fade_sekunder` — 4 refs in 3 file(s)
-- `input_number.koekken_lyskaede_doed_minutter` — 3 refs in 3 file(s)
+- `input_number.koekken_lyskaede_doed_minutter` — 4 refs in 4 file(s)
 - `input_number.koekken_lyskaede_efter_session_minutter` — 5 refs in 3 file(s)
 - `input_number.koekken_lyskaede_eget_lys_lx` — 2 refs in 2 file(s)
 - `input_number.koekken_lyskaede_fade_ind_hurtig` — 4 refs in 3 file(s)
@@ -228,7 +228,7 @@ Search keywords: `koekken, kokken`
 
 - `light.koekken_apollo_rgb_light` — 13 refs in 5 file(s)
 - `light.koekken_loft` — 2 refs in 2 file(s)
-- `light.koekken_lyskaede` — 194 refs in 45 file(s)
+- `light.koekken_lyskaede` — 195 refs in 46 file(s)
 - `light.koekken_room` — 11 refs in 8 file(s)
 
 ### `number.*`
@@ -269,14 +269,14 @@ Search keywords: `koekken, kokken`
 - `script.koekken_skift_registrer` — 1 refs in 1 file(s)
 - `script.koekken_stemme_kvittering` — 2 refs in 2 file(s)
 - `script.koekken_timer_stemme` — 2 refs in 1 file(s)
-- `script.roborock_grundig_koekken` — 1 refs in 1 file(s)
-- `script.roborock_hurtig_koekken` — 1 refs in 1 file(s)
+- `script.roborock_grundig_koekken` — 2 refs in 1 file(s)
+- `script.roborock_hurtig_koekken` — 2 refs in 1 file(s)
 
 ### `sensor.*`
 
 - `sensor.koekken_aktiv_15m` — 5 refs in 2 file(s)
 - `sensor.koekken_apollo_bevaegelse_5min` — 2 refs in 2 file(s)
-- `sensor.koekken_apollo_esp_temperature` — 4 refs in 3 file(s)
+- `sensor.koekken_apollo_esp_temperature` — 5 refs in 4 file(s)
 - `sensor.koekken_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
 - `sensor.koekken_apollo_lux` — 9 refs in 6 file(s)
 - `sensor.koekken_apollo_radar_move_energy` — 1 refs in 1 file(s)

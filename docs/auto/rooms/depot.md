@@ -96,8 +96,8 @@ Search keywords: `depot`
 
 - `script.depot_foh_dance_restore` — 1 refs in 1 file(s)
 - `script.depot_foh_dance_solo` — 2 refs in 1 file(s)
-- `script.roborock_grundig_depot` — 1 refs in 1 file(s)
-- `script.roborock_hurtig_depot` — 1 refs in 1 file(s)
+- `script.roborock_grundig_depot` — 2 refs in 1 file(s)
+- `script.roborock_hurtig_depot` — 2 refs in 1 file(s)
 
 ### `sensor.*`
 

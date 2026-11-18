@@ -29,6 +29,12 @@
 # dag — 90% reduktion.
 #
 # Cinema, cirkus, guest_mode og enkelte activity-states blokerer watcher'en.
+#
+# OPEN PLAN (2026-11-18, user: "respekter nu mine manuelle lysvalg"): et
+# open-plan-rum hvis eget lys er TÆNDT, drifter først når ALLE TRE open-plan-
+# radarer har været tomme i open_plan_drift_back_empty_minutes (ikke kun rummets
+# egen) — og ikke mens projektoren kører med svaret "stue". Mørke rum drifter
+# stadig på eget felt (B173). Loft og 24-t-fallback uændrede.
 # =============================================================================
 
 - id: room_drift_back_watcher
@@ -215,9 +221,18 @@
     - variables:
         # Hvis state-trigger: kun det rum sensor'en tilhoerer.
         # Hvis time-tick: alle rum (catches ceiling/24h cases).
+        # 2026-11-18: en open-plan-radar der går tom, kan være den SIDSTE af
+        # de tre → tjek alle tre open-plan-rum (et tændt rum venter nu på at
+        # HELE open plan er tomt, se op_lys_taendt). Ellers ventede et tændt
+        # køkken på næste /15-tick efter at stuen blev tom.
         rooms_to_check: >
           {% if trigger.id == 'sensor_off' %}
-            {{ [sensor_to_room.get(trigger.entity_id, '')] | reject('eq', '') | list }}
+            {% set r = sensor_to_room.get(trigger.entity_id, '') %}
+            {% if r in ['stue', 'spisestue', 'koekken'] %}
+              {{ ['stue', 'spisestue', 'koekken'] }}
+            {% else %}
+              {{ [r] | reject('eq', '') | list }}
+            {% endif %}
           {% else %}
             {{ presence_map.keys() | list }}
           {% endif %}
@@ -255,6 +270,38 @@
                 {{ (state_attr('input_datetime.styrbar_last_press_' ~ room, 'timestamp') | float(0)) if last_ts not in ['unknown','unavailable',''] else 0 }}
               elapsed_h: >-
                 {{ ((as_timestamp(now()) - last_epoch) / 3600) if last_epoch > 0 else 0 }}
+              # 2026-11-18 (user: "respekter nu mine manuelle lysvalg. se
+              # aftenen den 17. november. vi er i open plan og jeg har sat
+              # lyset manuelt ... vi bevæger os ikke i køkken og spisestue. så
+              # det skal deduceres."). 17/11: user tændte køkken-lyskæden i
+              # appen 21:00:49 og 21:43:48 (→ Manual) fra sofaen; drift-back gav
+              # køkkenet Auto 21:30:00 og 22:18:47 fordi KØKKEN-radaren var tom
+              # (siden 20:37:59) — stue-radaren var optaget 80 % af aftenen
+              # (største hul 2m21s). 21:39:59 slukkede kædens efter_session-vej
+              # (en Auto-politik) så det lys user lige havde valgt.
+              # Et open-plan-rum hvis EGET lys er tændt, er et rum man SER fra
+              # sofaen: B173's "hvert rum på sit eget felt" gælder kun mørke
+              # rum. Tændt → tom-tjekket kræver ALLE TRE open-plan-radarer tomme
+              # i op_drift_min. Loft (room_manual_on_hold_hours) og 24-t-
+              # fallback er uændrede. Målt 30 døgn: ændrer 5 udslip (11-04
+              # 08:00, 11-11 18:13, 11-14 18:00, 11-17 21:30, 11-17 22:18).
+              op_lys_taendt: >-
+                {% set m = {'koekken': 'light.koekken_lyskaede',
+                            'spisestue': 'light.spisestue_loft',
+                            'stue': 'light.stue_room'} %}
+                {{ room in m and is_state(m[room], 'on') }}
+              tom_sensorer: >-
+                {% from 'rosters.jinja' import open_plan_occupancy %}{{ open_plan_occupancy if op_lys_taendt else sensors }}
+              # Sofaen står foran stue-Apolloen (user 17/11), så en stille
+              # filmaften kan se tom ud. Kører projektoren og har user svaret
+              # "stue" (packages/projektor_rum.yaml), er stuen beboet — et
+              # tændt open-plan-rum slippes ikke. Loft + 24 t gælder stadig.
+              # NB: kun en cast-session ses (projektor_aktiv); en projektor
+              # der viser via HDMI uden cast, er usynlig for huset.
+              film_i_stuen: >-
+                {{ op_lys_taendt
+                   and is_state('binary_sensor.projektor_aktiv', 'on')
+                   and is_state('input_select.projektor_rum', 'stue') }}
               # Alle sensorer skal vaere 'off' (eller behandles som off) OG
               # have vaeret det laenge nok.
               # F2 fix 2026-05-22: behandl unavailable/unknown sensor som "off"
@@ -265,10 +312,10 @@
               # default — vent paa sensor recovery).
               empty_long_enough: >-
                 {% set ns = namespace(ok=true) %}
-                {% if sensors | length == 0 %}
+                {% if tom_sensorer | length == 0 %}
                   {% set ns.ok = false %}
                 {% endif %}
-                {% for s in sensors %}
+                {% for s in tom_sensorer %}
                   {% set st = states(s) %}
                   {% set last_chg = states[s].last_changed if states[s] else none %}
                   {% set since = (as_timestamp(now()) - as_timestamp(last_chg)) if last_chg else 0 %}
@@ -354,6 +401,8 @@
                               and is_state('input_boolean.sove_evening_hold', 'on'))
                      and not (room in ['stue', 'spisestue', 'koekken']
                               and is_state('input_boolean.open_plan_fuldt_lys', 'on')
+                              and not ceiling_hit and not hard_24h_fallback)
+                     and not (film_i_stuen
                               and not ceiling_hit and not hard_24h_fallback)
                      and (empty_long_enough or ceiling_hit or hard_24h_fallback) }}
             then:

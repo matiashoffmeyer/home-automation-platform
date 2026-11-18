@@ -64,7 +64,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - **Morgen: Børn lys auto-sluk (lyst eller tomt)** (line 39, mode=single)
   - Slukker børnelyset hvis (a) rummet er lyst nok i 5 min ELLER (b) occupancy
-- **Morgen: Børn lys fast-off ved LUX surge (gardin rolled)** (line 305, mode=single)
+- **Morgen: Børn lys fast-off ved LUX surge (gardin rolled)** (line 324, mode=single)
   - 5 sek above 80*factor → fade off. Reagerer hurtigt naar user manuelt
 
 ### `automations/presence_boernevaerelse.yaml`
@@ -155,7 +155,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `input_boolean.boern_morgen_bevaeget` — 16 refs in 5 file(s)
 - `input_boolean.boern_morgen_nedtoning_aktiv` — 22 refs in 5 file(s)
 - `input_boolean.boern_sov_her_i_nat` — 25 refs in 9 file(s)
-- `input_boolean.boernevaerelse_gaest_sover` — 20 refs in 7 file(s)
+- `input_boolean.boernevaerelse_gaest_sover` — 21 refs in 8 file(s)
 - `input_boolean.boernevaerelse_manual_off_lock` — 49 refs in 15 file(s)
 - `input_boolean.dance_room_boern` — 15 refs in 7 file(s)
 - `input_boolean.festlys_boern_styrbar` — 8 refs in 3 file(s)
@@ -234,7 +234,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `input_select.*`
 
-- `input_select.room_mode_boernevaerelse` — 26 refs in 19 file(s)
+- `input_select.room_mode_boernevaerelse` — 30 refs in 20 file(s)
 
 ### `input_text.*`
 
@@ -249,10 +249,10 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `light.boernevaerelse_all` — 19 refs in 10 file(s)
 - `light.boernevaerelse_apollo_rgb_light` — 5 refs in 5 file(s)
-- `light.boernevaerelse_hygge_strip` — 95 refs in 33 file(s)
-- `light.boernevaerelse_hyggelys` — 54 refs in 21 file(s)
-- `light.boernevaerelse_lampe` — 44 refs in 20 file(s)
-- `light.boernevaerelse_loft` — 95 refs in 37 file(s)
+- `light.boernevaerelse_hygge_strip` — 97 refs in 33 file(s)
+- `light.boernevaerelse_hyggelys` — 56 refs in 21 file(s)
+- `light.boernevaerelse_lampe` — 46 refs in 21 file(s)
+- `light.boernevaerelse_loft` — 97 refs in 37 file(s)
 
 ### `number.*`
 
@@ -277,8 +277,8 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `script.boern_natlys_set` — 7 refs in 5 file(s)
 - `script.boernevaerelse_apollo_apply_all_gates` — 1 refs in 1 file(s)
 - `script.festlys_boern_slut` — 3 refs in 2 file(s)
-- `script.roborock_grundig_boernevaerelse` — 1 refs in 1 file(s)
-- `script.roborock_hurtig_boernevaerelse` — 1 refs in 1 file(s)
+- `script.roborock_grundig_boernevaerelse` — 2 refs in 1 file(s)
+- `script.roborock_hurtig_boernevaerelse` — 2 refs in 1 file(s)
 
 ### `sensor.*`
 
@@ -292,7 +292,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `sensor.boern_temperatur` — 1 refs in 1 file(s)
 - `sensor.boern_vaerelse_eftermiddag_timer` — 3 refs in 2 file(s)
 - `sensor.boern_vaerelse_ophold_holdt` — 2 refs in 1 file(s)
-- `sensor.boernevaerelse_apollo_esp_temperature` — 4 refs in 3 file(s)
+- `sensor.boernevaerelse_apollo_esp_temperature` — 5 refs in 4 file(s)
 - `sensor.boernevaerelse_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
 - `sensor.boernevaerelse_apollo_lux` — 6 refs in 4 file(s)
 - `sensor.boernevaerelse_apollo_radar_move_energy` — 1 refs in 1 file(s)

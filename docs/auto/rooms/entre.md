@@ -30,7 +30,7 @@ Search keywords: `entre`
   - Lights on in entré when motion detected during the day.
 - **Entré: Lys sluk efter bevægelse** (line 280, mode=restart)
   - Entré is exempt from the global 5-minute fade rule — it is a
-- **Entré: Svagt lys om natten** (line 400, mode=single)
+- **Entré: Svagt lys om natten** (line 410, mode=single)
 
 ### `automations/entre_somrig.yaml`
 
@@ -130,8 +130,8 @@ Search keywords: `entre`
 
 - `script.entre_fade_ud` — 5 refs in 4 file(s)
 - `script.entre_ned_sluk_alt` — 7 refs in 3 file(s)
-- `script.roborock_grundig_entre` — 1 refs in 1 file(s)
-- `script.roborock_hurtig_entre` — 1 refs in 1 file(s)
+- `script.roborock_grundig_entre` — 2 refs in 1 file(s)
+- `script.roborock_hurtig_entre` — 2 refs in 1 file(s)
 
 ### `sensor.*`
 

@@ -224,8 +224,8 @@ Search keywords: `badevaerelse, bad`
 
 - `script.badevaerelse_fugt_ventesluk` — 9 refs in 2 file(s)
 - `script.badevaerelse_sluk_alt_udskyd` — 4 refs in 2 file(s)
-- `script.roborock_grundig_badevaerelse` — 1 refs in 1 file(s)
-- `script.roborock_hurtig_badevaerelse` — 1 refs in 1 file(s)
+- `script.roborock_grundig_badevaerelse` — 2 refs in 1 file(s)
+- `script.roborock_hurtig_badevaerelse` — 2 refs in 1 file(s)
 
 ### `sensor.*`
 

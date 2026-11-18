@@ -77,6 +77,13 @@ Kill-switch: `input_boolean.drift_back_enabled`.
 - **Automatisk sluk af ALT lyset → Auto med det samme** (bad: `presence_badevaerelse.yaml`;
   børn 2026-11-16: morgen-sanity-sluk og tomt-sluk). Der er ingen manuel indstilling
   tilbage at beskytte, og ellers blokerer Manual næste indgangs bevægelses-tænd.
+- **Open plan med lyset tændt** (2026-11-18): står rummets eget lys tændt
+  (køkken: lyskæden, spisestue: loftet, stue: `light.stue_room`), kræver
+  tom-tjekket at ALLE TRE open plan-radarer har været tomme
+  (`open_plan_occupancy`) — rummet ses fra sofaen. Mørke rum drifter på eget
+  felt (B173). Kører projektoren (`binary_sensor.projektor_aktiv`) med
+  `input_select.projektor_rum` = stue, drifter et tændt open plan-rum ikke;
+  optaget-fallback og 24 t gælder stadig.
 - **Race-vindue:** aldrig drift < 30 min efter et tryk. Bad og open plan bruger
   min(30, egen slider).
 - **Optaget-fallback** (erstattede 12-t-loftet 2026-07-25): bliver man i
@@ -212,6 +219,12 @@ betyder at den globale faktor ikke anvendes.
 | Depot | `input_number.depot_quick_off_seconds` / `_medium_` / `_long_` (`packages/depot_visit_quality.yaml`) |
 | Entré | `input_number.entre_off_sekunder` |
 
+- **Super-watchdog** (`automations/light_watchdog.yaml`, sidste net mod
+  fastlåst hardware): slukker et lys tændt uafbrudt ≥
+  `input_number.global_max_light_hours`. Undtaget: grupper, Apollo-RGB, børnenes
+  natlys-strip under godnat, open plan-lys mens
+  `binary_sensor.openplan_beboet_langsom` er on, og terrasse-kæden i dens
+  dusk-vindue (2026-11-18).
 - **Fade:** `sensor.fade_living_effective` (sove, børn) og
   `sensor.fade_extended_effective` (stue, spisestue) = basis ×
   `sensor.global_fade_factor`, som styres af `input_number.global_fade_speed`.
@@ -282,3 +295,15 @@ Måler **udetemperaturen** (`sensor.udetemp`), ikke indendørs.
 - **Sol-opvarmning** (åbner ved sol på ruden): `input_boolean.winter_solar_enabled`.
 - **Kuldebølge** under `input_number.winter_cold_snap_temp` tvangslukker.
 - Der er ingen samlet kill-switch og ingen generel "åbn om dagen"-regel.
+
+### 6.3 Mørkt ude — `binary_sensor.gardin_moerkt_ude` (2026-11-18)
+
+Sol under `input_number.gardin_moerkt_ude_sol_elevation` (−3°)
+(`packages/gardin_manual_grace.yaml`).
+
+- **Film:** Dark Mode og Pre-Dark lukker ingen gardiner i mørke — intet luk,
+  intet grace-stempel, intet bogført til genåbning.
+- **Morgen:** mens solen stiger og det er mørkt, står stue syd i
+  `sensor.gardiner_manual_hold`'s `held` (ikke `held_luk`), så ingen
+  auto-åbner ruller den op. `morning_curtains_open_on_activity` åbner den på
+  ankerets on → off (+ /15-backstop). Knapper og vækning læser ikke `held`.

@@ -42,7 +42,7 @@ Search keywords: `spisestue`
 - `binary_sensor.spisestue_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_frossen_ghost` — 2 refs in 2 file(s)
 - `binary_sensor.spisestue_apollo_occupancy` — 29 refs in 19 file(s)
-- `binary_sensor.spisestue_apollo_occupancy_filtered` — 114 refs in 41 file(s)
+- `binary_sensor.spisestue_apollo_occupancy_filtered` — 115 refs in 41 file(s)
 - `binary_sensor.spisestue_apollo_online` — 2 refs in 1 file(s)
 - `binary_sensor.spisestue_apollo_radar_moving_target` — 12 refs in 11 file(s)
 - `binary_sensor.spisestue_apollo_radar_still_target` — 1 refs in 1 file(s)
@@ -126,7 +126,7 @@ Search keywords: `spisestue`
 ### `light.*`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
-- `light.spisestue_loft` — 125 refs in 49 file(s)
+- `light.spisestue_loft` — 126 refs in 50 file(s)
 - `light.spisestue_pendel` — 138 refs in 40 file(s)
 
 ### `number.*`
@@ -147,8 +147,8 @@ Search keywords: `spisestue`
 ### `script.*`
 
 - `script.gardin_spisestue_position` — 1 refs in 1 file(s)
-- `script.roborock_grundig_spisestue` — 1 refs in 1 file(s)
-- `script.roborock_hurtig_spisestue` — 1 refs in 1 file(s)
+- `script.roborock_grundig_spisestue` — 2 refs in 1 file(s)
+- `script.roborock_hurtig_spisestue` — 2 refs in 1 file(s)
 - `script.spisestue_apollo_apply_all_gates` — 1 refs in 1 file(s)
 
 ### `sensor.*`
@@ -156,7 +156,7 @@ Search keywords: `spisestue`
 - `sensor.hjemmearbejde_spisestue_ophold_vindue` — 1 refs in 1 file(s)
 - `sensor.maaltid_spisestue_bekraeft_min_i_vindue` — 2 refs in 2 file(s)
 - `sensor.maaltid_spisestue_bekraeft_vindue` — 1 refs in 1 file(s)
-- `sensor.spisestue_apollo_esp_temperature` — 4 refs in 3 file(s)
+- `sensor.spisestue_apollo_esp_temperature` — 5 refs in 4 file(s)
 - `sensor.spisestue_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
 - `sensor.spisestue_apollo_lux` — 11 refs in 7 file(s)
 - `sensor.spisestue_apollo_radar_move_energy` — 1 refs in 1 file(s)

@@ -15,9 +15,9 @@ Search keywords: `sovevaerelse, sove`
 
 ### `automations/bedroom_night_guard.yaml`
 
-- **Sikkerhed: Soveværelser ALDRIG auto-fuldt-lys om natten (refleks-lås)** (line 24, mode=parallel)
+- **Sikkerhed: Soveværelser ALDRIG auto-fuldt-lys om natten (refleks-lås)** (line 25, mode=parallel)
   - Snapper et soveværelse-lys tilbage til nat-tilstand hvis det auto-ramper OP
-- **Sikkerhed: Stamp soveværelse-knap nød-intent (FØR lys-logik)** (line 171, mode=parallel)
+- **Sikkerhed: Stamp soveværelse-knap nød-intent (FØR lys-logik)** (line 181, mode=parallel)
   - Stempler input_datetime.bedroom_styrbar_intent_at øjeblikkeligt når en
 
 ### `automations/godmorgen_godnat.yaml`
@@ -50,14 +50,14 @@ Search keywords: `sovevaerelse, sove`
 
 ### `automations/morning_curtains.yaml`
 
-- **Gardiner: Åbn sove-gardin om morgenen når soveværelset er tomt** (line 103, mode=single)
+- **Gardiner: Åbn sove-gardin om morgenen når soveværelset er tomt** (line 119, mode=single)
   - 2026-07-28 (item 7 user-spec: "åbner sove-gardinet automatisk om morgenen?
 
 ### `automations/morning_lights_sanity_check.yaml`
 
-- **Morgen: Sove lys auto-sluk (lyst eller tomt)** (line 179, mode=single)
+- **Morgen: Sove lys auto-sluk (lyst eller tomt)** (line 198, mode=single)
   - Slukker sove_loft hvis (a) Apollo lux > 50 i 5 min ELLER (b) occupancy
-- **Morgen: Sove lys fast-off ved LUX surge (gardin rolled)** (line 407, mode=single)
+- **Morgen: Sove lys fast-off ved LUX surge (gardin rolled)** (line 426, mode=single)
   - 5 sek above 80*factor → fade off. Reagerer hurtigt naar user manuelt
 
 ### `automations/presence_lights.yaml`
@@ -192,7 +192,7 @@ Search keywords: `sovevaerelse, sove`
 ### `input_boolean.*`
 
 - `input_boolean.airbnb_velkomst_move_sove` — 3 refs in 2 file(s)
-- `input_boolean.boernevaerelse_gaest_sover` — 20 refs in 7 file(s)
+- `input_boolean.boernevaerelse_gaest_sover` — 21 refs in 8 file(s)
 - `input_boolean.dark_mode_kun_sove` — 6 refs in 2 file(s)
 - `input_boolean.notif_sove_radar_airbnb` — 1 refs in 1 file(s)
 - `input_boolean.notif_sove_radar_parent_b` — 1 refs in 1 file(s)
@@ -351,8 +351,8 @@ Search keywords: `sovevaerelse, sove`
 ### `script.*`
 
 - `script.gaest_sover_sluk` — 3 refs in 3 file(s)
-- `script.roborock_grundig_sovevaerelse` — 1 refs in 1 file(s)
-- `script.roborock_hurtig_sovevaerelse` — 1 refs in 1 file(s)
+- `script.roborock_grundig_sovevaerelse` — 2 refs in 1 file(s)
+- `script.roborock_hurtig_sovevaerelse` — 2 refs in 1 file(s)
 - `script.sove_apollo_apply_all_gates` — 1 refs in 1 file(s)
 - `script.sove_gardin_op` — 18 refs in 9 file(s)
 - `script.sove_gardin_privacy_morgen` — 2 refs in 1 file(s)
@@ -391,7 +391,7 @@ Search keywords: `sovevaerelse, sove`
 - `sensor.sove_still_afstand_p25` — 4 refs in 2 file(s)
 - `sensor.sove_still_afstand_p75` — 3 refs in 2 file(s)
 - `sensor.sove_temperatur` — 3 refs in 2 file(s)
-- `sensor.sovevaerelse_apollo_esp_temperature` — 4 refs in 3 file(s)
+- `sensor.sovevaerelse_apollo_esp_temperature` — 5 refs in 4 file(s)
 - `sensor.sovevaerelse_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
 - `sensor.sovevaerelse_apollo_lux` — 10 refs in 6 file(s)
 - `sensor.sovevaerelse_apollo_radar_move_energy` — 1 refs in 1 file(s)

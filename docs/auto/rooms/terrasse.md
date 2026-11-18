@@ -37,13 +37,13 @@ Search keywords: `terrasse`
 - **Styrbar Terrasse: top/bund styrer pærelyskæde** (line 125, mode=queued)
 - **Terrasse: auto-tænd pærelyskæde ved dusk (indtil godnat)** (line 288, mode=single)
   - Ved dusk (sol < -4°) tændes pærelyskæden automatisk på sol-tilpasset styrke
-- **Terrasse Plug: manuel sluk → hold (til regn er forbi)** (line 423, mode=single)
-- **Terrasse Plug: manuel tænd → ryd hold** (line 462, mode=single)
-- **Terrasse Plug: regn-hold release-evaluator** (line 492, mode=single)
-- **Terrasse: nat-auto-sluk af pærelyskæden (fra sluk-tid, open-plan-ro)** (line 588, mode=single)
+- **Terrasse Plug: manuel sluk → hold (til regn er forbi)** (line 426, mode=single)
+- **Terrasse Plug: manuel tænd → ryd hold** (line 465, mode=single)
+- **Terrasse Plug: regn-hold release-evaluator** (line 495, mode=single)
+- **Terrasse: nat-auto-sluk af pærelyskæden (fra sluk-tid, open-plan-ro)** (line 591, mode=single)
   - Slukker pærelyskæden i nat-vinduet (sluk-tid-slider → 06:00) når open-plan
-- **Terrasse: manuel nat-tænd sætter hold (auto-sluk viger)** (line 666, mode=single)
-- **Terrasse: ryd nat-manuel-hold om morgenen** (line 700, mode=single)
+- **Terrasse: manuel nat-tænd sætter hold (auto-sluk viger)** (line 669, mode=single)
+- **Terrasse: ryd nat-manuel-hold om morgenen** (line 703, mode=single)
 
 ### `automations/terrace_presence.yaml`
 
@@ -67,7 +67,7 @@ Search keywords: `terrasse`
 - `binary_sensor.terrasse_active` — 14 refs in 10 file(s)
 - `binary_sensor.terrasse_lights_on` — 5 refs in 5 file(s)
 - `binary_sensor.terrasse_lys_on_effektiv` — 1 refs in 1 file(s)
-- `binary_sensor.terrasse_nat_sluk_vindue` — 9 refs in 3 file(s)
+- `binary_sensor.terrasse_nat_sluk_vindue` — 10 refs in 4 file(s)
 - `binary_sensor.terrasse_regn_aktiv` — 15 refs in 6 file(s)
 
 ### `button.*`
@@ -106,7 +106,7 @@ Search keywords: `terrasse`
 - `input_number.terrasse_regn_dmi_threshold_mm` — 2 refs in 2 file(s)
 - `input_number.terrasse_regn_dry_release_hours` — 3 refs in 2 file(s)
 - `input_number.terrasse_regn_hold_max_hours` — 3 refs in 2 file(s)
-- `input_number.terrasse_skumring_elevation` — 11 refs in 5 file(s)
+- `input_number.terrasse_skumring_elevation` — 12 refs in 6 file(s)
 
 ### `input_select.*`
 
@@ -115,7 +115,7 @@ Search keywords: `terrasse`
 ### `light.*`
 
 - `light.terrasse_all` — 2 refs in 1 file(s)
-- `light.terrasse_paerelyskaede` — 101 refs in 30 file(s)
+- `light.terrasse_paerelyskaede` — 102 refs in 30 file(s)
 
 ### `script.*`
 
