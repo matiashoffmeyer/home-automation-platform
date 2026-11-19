@@ -44,10 +44,12 @@ python3 scripts/ha_offline.py check   # Home Assistant's own validator, ~13 s, a
 - Restart only when a reload cannot load the change, and only with
   `bash scripts/ha_restart.sh`. It saves restore-state first, because Home
   Assistant segfaults during shutdown on this host. A plain `ha core restart`
-  is blocked by the restart guard, and every restart first needs the
+  is blocked by the restart guard. **While `input_select.house_state` is
+  Dormant, restart (or update an add-on) without asking** — nobody is home
+  (user-spec 2026-11-16, repeated 2026-11-18). Otherwise it first needs the
   household's yes: `python3 scripts/live_godkend.py spørg "<why>" --genstart`
-  (run it in the background; exit 0 = approved for 10 min). The live guard
-  blocks the restart without it.
+  (run it in the background; exit 0 = approved for 10 min, or at once without
+  a push if the house is Dormant). The live guard blocks the restart without it.
 - Skip this step for docs-only commits.
 
 ## 4. Prove it loaded

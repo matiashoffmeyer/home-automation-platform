@@ -13,7 +13,10 @@ listening any more.
         file is written and is valid for N minutes), 1 = rejected, 2 = no
         answer within M minutes, 3 = AirBnB (no push is sent: the phone may be
         in a guest's hands, ask in the chat), 4 = error. The wait can be long:
-        run it in the background.
+        run it in the background. With --genstart while the house is Dormant
+        (input_select.house_state) it sends nothing and exits 0 at once: a
+        restart then needs no yes (user-spec 2026-11-16), and live_guard.py
+        lets it through on the same check.
     python3 scripts/live_godkend.py status
     python3 scripts/live_godkend.py slut        # withdraw it when the test is done
     python3 scripts/live_godkend.py chat "<the user's own words>" [--genstart]
@@ -59,13 +62,17 @@ def token():
     return t
 
 
-def house_mode():
+def tilstand(entity):
     req = urllib.request.Request(
-        f"{REST}/states/input_select.house_mode",
+        f"{REST}/states/{entity}",
         headers={"Authorization": f"Bearer {token()}"},
     )
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.load(r)["state"]
+
+
+def house_mode():
+    return tilstand("input_select.house_mode")
 
 
 def log(linje):
@@ -246,6 +253,14 @@ def spoerg(a):
         print(f"FEJL: HA svarer ikke ({e}) — ingen push mulig", file=sys.stderr)
         return 4
     slags = ["genstart"] if a.genstart else ["test"]
+    # User-spec 2026-11-16 ("ha må altid restarte hvis huset er dormant"), gentaget
+    # 18/11 ("you still ask. fix that rule"): en genstart i Dormant spørger ingen.
+    # Intet push og ingen godkendelsesfil — live_guard.py tjekker Dormant igen ved
+    # selve kaldet, så vågner huset imellem, bliver der spurgt alligevel.
+    if a.genstart and tilstand("input_select.house_state") == "Dormant":
+        log(f"dormant  genstart  {a.hvad}")
+        print(f"DORMANT: ingen hjemme — genstart kræver intet ja, intet push sendt: {a.hvad}")
+        return 0
     if mode == "AirBnB":
         print(
             "AIRBNB: ingen push (telefonen kan være hos gæsten). Spørg user i chatten; "

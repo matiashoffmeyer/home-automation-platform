@@ -1,0 +1,160 @@
+# Film-pause ved hoveddøren
+#
+# 2026-11-18 (user-spec: "ikke i airbnb mode, men ellers pause og notification
+# med resume eller sluk projektor ved hoveddør åben. notifikation til begge
+# hjemme.")
+#
+# Kanal: Android TV Remote (media_player.projektor_android_tv, parret 18/11).
+# Den melder kun skærm-strøm + app — IKKE titel eller play/pause
+# (assumed_state) → vi sender en eksplicit MEDIA_PAUSE (media_pause), aldrig en
+# toggle: står filmen allerede på pause, sker der intet. Launcheren springes
+# over (intet at pause). Fortsæt = MEDIA_PLAY; Sluk = POWER (turn_off) →
+# projektor_aktiv falder efter predark_off_delay_sekunder, og Dark Mode slutter
+# ad sin normale vej.
+#
+# Push: kun til telefoner der er hjemme (Parent A: person, Parent B:
+# binary_sensor.parent_b_hjemme_anker — iOS-GPS er tavs, .claude/rules/
+# personer_telefon.md). Siger ingen sensor "hjemme", går den til begge:
+# projektoren er tændt, så nogen ER hjemme.
+#
+# Børn: ingen pause når binary_sensor.kids_home er on (user 18/11).
+#
+# AirBnB: house_mode-condition på begge automationer + ingen
+# notif_film_pause_airbnb-toggle. Intet flag/stempel → intet at rydde ved
+# mode-skift; intet håndhæves (gæsten rammes slet ikke).
+
+input_boolean:
+  film_pause_hoveddoer_enabled:
+    name: "⏸️ Film-pause ved hoveddør"
+    icon: mdi:pause-circle
+
+automation:
+  - id: film_pause_hoveddoer
+    alias: "Film: pause når hoveddøren åbnes"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.parasoll_hoveddoer
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.film_pause_hoveddoer_enabled
+        state: "on"
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+      # 2026-11-18 (user): "skal ikke ske når vi har børnene". Strengt `off`:
+      # en unavailable kids_home (reload/flap) pauser heller ikke (#9).
+      - condition: state
+        entity_id: binary_sensor.kids_home
+        state: "off"
+      - condition: state
+        entity_id: media_player.projektor_android_tv
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ (state_attr('media_player.projektor_android_tv', 'app_id') or '')
+             not in ['', 'com.google.android.tvlauncher', 'com.google.android.apps.tv.launcherx'] }}
+    action:
+      - variables:
+          app: >-
+            {% set n = state_attr('media_player.projektor_android_tv', 'app_name') or '' %}
+            {{ n if n and '.' not in n else 'Filmen' }}
+          hjemme: >-
+            {% set ns = namespace(t=[]) %}
+            {% if is_state('person.parent_a', 'home') %}{% set ns.t = ns.t + ['mobile_app_phone_a'] %}{% endif %}
+            {% if is_state('binary_sensor.parent_b_hjemme_anker', 'on') %}{% set ns.t = ns.t + ['mobile_app_phone_b'] %}{% endif %}
+            {{ (ns.t if ns.t else ['mobile_app_phone_a', 'mobile_app_phone_b']) | join(',') }}
+      - service: media_player.media_pause
+        continue_on_error: true
+        target:
+          entity_id: media_player.projektor_android_tv
+      - service: script.push_notify
+        continue_on_error: true
+        data:
+          notif_id: film_pause
+          title: "⏸️ Pause — hoveddøren åbnede"
+          message: "{{ app }} er sat på pause. Fortsæt, eller sluk projektoren?"
+          kun_til: "{{ hjemme }}"
+          payload:
+            tag: film_pause
+            actions:
+              - action: FILM_PAUSE_FORTSAET
+                title: Fortsæt
+              - action: FILM_PAUSE_SLUK
+                title: Sluk projektor
+      - service: logbook.log
+        data:
+          name: "Film-pause"
+          message: "Hoveddøren åbnede → {{ app }} sat på pause (push: {{ hjemme }})"
+          entity_id: media_player.projektor_android_tv
+
+  - id: film_pause_hoveddoer_svar
+    alias: "Film: svar på dør-pausen"
+    mode: queued
+    max: 4
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        id: svar
+      # Projektoren slukket på anden vis (fjernbetjening) → tag varslet væk.
+      - platform: state
+        entity_id: media_player.projektor_android_tv
+        from: "on"
+        to:
+          - "off"
+          - "unavailable"
+        for: "00:01:00"
+        id: slukket
+    condition:
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+      - condition: template
+        value_template: >-
+          {% if trigger.id == 'svar' %}
+            {{ (trigger.event.data.action | default('')) in ['FILM_PAUSE_FORTSAET', 'FILM_PAUSE_SLUK'] }}
+          {% else %}
+            {% set t = state_attr('automation.film_pause_nar_hoveddoren_abnes', 'last_triggered') %}
+            {{ t is not none and (now() - t).total_seconds() < 12 * 3600 }}
+          {% endif %}
+    action:
+      - variables:
+          svar: "{{ trigger.event.data.action if trigger.id == 'svar' else 'slukket' }}"
+      # Et gammelt varsel kan trykkes efter projektoren er slukket — så gør intet.
+      - if:
+          - condition: state
+            entity_id: media_player.projektor_android_tv
+            state: "on"
+        then:
+          - choose:
+              - conditions: "{{ svar == 'FILM_PAUSE_FORTSAET' }}"
+                sequence:
+                  - service: media_player.media_play
+                    continue_on_error: true
+                    target:
+                      entity_id: media_player.projektor_android_tv
+              - conditions: "{{ svar == 'FILM_PAUSE_SLUK' }}"
+                sequence:
+                  - service: media_player.turn_off
+                    continue_on_error: true
+                    target:
+                      entity_id: media_player.projektor_android_tv
+      # Tag varslet af BEGGE telefoner — den anden skal ikke svare igen.
+      - repeat:
+          for_each:
+            - mobile_app_phone_a
+            - mobile_app_phone_b
+          sequence:
+            - service: "notify.{{ repeat.item }}"
+              continue_on_error: true
+              data:
+                message: clear_notification
+                data:
+                  tag: film_pause
+      - service: logbook.log
+        data:
+          name: "Film-pause"
+          message: >-
+            {{ {'FILM_PAUSE_FORTSAET': 'Fortsæt trykket', 'FILM_PAUSE_SLUK': 'Sluk projektor trykket'}.get(svar, 'Projektoren slukket — varslet fjernet') }}
+          entity_id: media_player.projektor_android_tv

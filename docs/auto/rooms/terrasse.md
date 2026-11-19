@@ -34,16 +34,16 @@ Search keywords: `terrasse`
 
 - **Terrasse Plug: power controller (altid ON undtagen Dormant/regn)** (line 36, mode=restart)
   - Single source of truth for plug-tilstand. ON medmindre huset er Dormant,
-- **Styrbar Terrasse: top/bund styrer pærelyskæde** (line 125, mode=queued)
-- **Terrasse: auto-tænd pærelyskæde ved dusk (indtil godnat)** (line 288, mode=single)
+- **Styrbar Terrasse: top/bund styrer pærelyskæde** (line 133, mode=queued)
+- **Terrasse: auto-tænd pærelyskæde ved dusk (indtil godnat)** (line 296, mode=single)
   - Ved dusk (sol < -4°) tændes pærelyskæden automatisk på sol-tilpasset styrke
-- **Terrasse Plug: manuel sluk → hold (til regn er forbi)** (line 426, mode=single)
-- **Terrasse Plug: manuel tænd → ryd hold** (line 465, mode=single)
-- **Terrasse Plug: regn-hold release-evaluator** (line 495, mode=single)
-- **Terrasse: nat-auto-sluk af pærelyskæden (fra sluk-tid, open-plan-ro)** (line 591, mode=single)
+- **Terrasse Plug: manuel sluk → hold (til regn er forbi)** (line 434, mode=single)
+- **Terrasse Plug: manuel tænd → ryd hold** (line 473, mode=single)
+- **Terrasse Plug: regn-hold release-evaluator** (line 503, mode=single)
+- **Terrasse: nat-auto-sluk af pærelyskæden (fra sluk-tid, open-plan-ro)** (line 599, mode=single)
   - Slukker pærelyskæden i nat-vinduet (sluk-tid-slider → 06:00) når open-plan
-- **Terrasse: manuel nat-tænd sætter hold (auto-sluk viger)** (line 669, mode=single)
-- **Terrasse: ryd nat-manuel-hold om morgenen** (line 703, mode=single)
+- **Terrasse: manuel nat-tænd sætter hold (auto-sluk viger)** (line 677, mode=single)
+- **Terrasse: ryd nat-manuel-hold om morgenen** (line 711, mode=single)
 
 ### `automations/terrace_presence.yaml`
 

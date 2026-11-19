@@ -73,7 +73,7 @@ lint: `scripts/claude_rules.py check`).
   `ALLOWLIST` with a reason). **A `delay_on` sensor makes a REAL `off → on` exactly
   `delay_on` after the reload** → guard on the off phase's length; reload automations
   BEFORE templates. **Reload ONLY via `python3 scripts/ha_reload.py templates`**
-  (restores darkened lights; `reload_guard.py` rejects the bare service, #30).
+  (restores darkened lights — not a LASTING automation consequence, 18/11; `reload_guard.py` rejects the bare service, #30).
 - **HA SEGFAULTS on shutdown (pychromecast thread, Python 3.14) → the final
   restore-state write NEVER happens**; only the 15-min dump survives. **Signature:
   slider/boolean changes from the last < 15 min before a restart are gone, without
@@ -252,7 +252,9 @@ to work".** **HA's real throughput is ~5-10 light calls/sec** — loop designs a
 ### ✋ Live tests and restarts need a yes via push FIRST (user-spec 2026-10-28)
 
 **Anything the house can see or hear (lights, sound, curtains, robot) and every
-restart** is asked for BEFORE (**restart in `house_state` Dormant: always allowed**, 11-16): `python3 scripts/live_godkend.py spørg "<what, short
+restart** is asked for BEFORE. **Restart/add-on update while `house_state` = Dormant:
+NO ask — just do it** (user-spec 11-16, repeated 11-18; `spørg --genstart` exits 0
+there without a push). Else: `python3 scripts/live_godkend.py spørg "<what, short
 Danish>" [--genstart]` with `run_in_background` → push with Godkend / Afvis / Om 20 min
 (exit 0 = yes, valid 15 min / restart 10; 1 = no; 2 = no answer = no; 3 = AirBnB → ask
 in the chat). `scripts/live_guard.py` blocks the calls without a valid yes; `slut` when

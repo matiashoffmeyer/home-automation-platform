@@ -6,8 +6,8 @@ Search keywords: `hoveddoer, parasoll_hoveddoer`
 
 ## Indhold
 - [Automations](hoveddor.md#automations) (1)
-- [Entities](hoveddor.md#entities) (4)
-- [Helpers](hoveddor.md#helpers) (1)
+- [Entities](hoveddor.md#entities) (5)
+- [Helpers](hoveddor.md#helpers) (2)
 
 ---
 
@@ -23,7 +23,11 @@ Search keywords: `hoveddoer, parasoll_hoveddoer`
 
 ### `binary_sensor.*`
 
-- `binary_sensor.parasoll_hoveddoer` — 58 refs in 23 file(s)
+- `binary_sensor.parasoll_hoveddoer` — 59 refs in 24 file(s)
+
+### `input_boolean.*`
+
+- `input_boolean.film_pause_hoveddoer_enabled` — 2 refs in 2 file(s)
 
 ### `input_datetime.*`
 
@@ -40,6 +44,10 @@ Search keywords: `hoveddoer, parasoll_hoveddoer`
 ---
 
 ## Helpers
+
+### `input_boolean.*`
+
+- `input_boolean.film_pause_hoveddoer_enabled` (defined in `packages/projektor_doerpause.yaml`)
 
 ### `input_number.*`
 

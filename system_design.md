@@ -82,14 +82,17 @@ Kill-switch: `input_boolean.drift_back_enabled`.
   tom-tjekket at ALLE TRE open plan-radarer har været tomme
   (`open_plan_occupancy`) — rummet ses fra sofaen. Mørke rum drifter på eget
   felt (B173). Kører projektoren (`binary_sensor.projektor_aktiv`) med
-  `input_select.projektor_rum` = stue, drifter et tændt open plan-rum ikke;
-  optaget-fallback og 24 t gælder stadig.
+  `input_select.projektor_rum` = stue, drifter et tændt open plan-rum ikke.
+  Et tændt open plan-rum har heller intet optaget-loft; 24 t gælder stadig.
 - **Race-vindue:** aldrig drift < 30 min efter et tryk. Bad og open plan bruger
   min(30, egen slider).
 - **Optaget-fallback** (erstattede 12-t-loftet 2026-07-25): bliver man i
   rummet, drifter det når tiden siden sidste tryk ≥
   `input_number.room_manual_on_hold_hours`. Sove bruger
   `input_number.sovevaerelse_manual_on_hold_hours`, badet sin egen slider.
+  Et open plan-rum med sit eget lys TÆNDT har intet loft (2026-11-18): det
+  holder til hele open plan er tom eller huset går Dormant (alle
+  Dormant-veje slukker `light.alle_indvendige`, så loftet gælder igen).
 - **24-t hård fallback:** ikke-Auto i 24 t, målt på det skrevne stempel
   `input_datetime.room_mode_<rum>_ikke_auto_siden` (sat af
   `room_mode_ikke_auto_stempel` når rummet forlader Auto; overlever restart).

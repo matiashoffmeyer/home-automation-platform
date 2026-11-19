@@ -225,8 +225,11 @@ kræver et nyt ja).
 enhver genstart (`ha_restart.sh`, `ha core restart/stop/rebuild/update`, host
 reboot, add-on restart/stop/update). **Undtagelse (user-spec 2026-11-16: "ha må altid restarte hvis huset er
 dormant"):** genstarter kræver INTET ja når `input_select.house_state` =
-`Dormant` — ingen hjemme at forstyrre (`live_guard.py huset_sover`). Live-tests
-med lys/lyd kræver stadig ja. **Kræver intet:** reloads, notifikationer,
+`Dormant` — ingen hjemme at forstyrre (`live_guard.py huset_sover`). Gælder også
+add-on-opdateringer. **Spørg ikke** — tjek `house_state` og genstart; 18/11 spurgte
+jeg alligevel ved en Trail Buddy-opdatering (user: "you still ask. fix that rule"),
+så `live_godkend.py spørg --genstart` svarer nu selv exit 0 uden push i Dormant.
+Live-tests med lys/lyd kræver stadig ja. **Kræver intet:** reloads, notifikationer,
 helper-skrivninger (`input_*`), læsninger og passivt bevis i history.
 
 **Sådan:**

@@ -274,6 +274,7 @@ med `E27 WS globe`-quirken (2 %-bug ved bri+ct+transition i samme kald):
 
 - **Status (2026-10-31):** parret via Google Cast (dukkede op 31/10 som "Bedroom TV", model "Chromecast") og omdøbt til `media_player.projektor_chromecast`. Sidder i projektorens HDMI og følger den rundt; strømmen følger projektoren. En cast-session på den tæller som "projektor aktiv" (`packages/projektor_predark.yaml`); rummet gættes og spørges om (`packages/projektor_rum.yaml`).
 - **Åbent:** er det Chromecast med Google TV, kan apps startet fra dens egen fjernbetjening være usynlige for Cast → Android TV Remote-integrationen giver tændt/slukket + aktuel app.
+- **2026-11-18:** selve projektoren (Askey, Android TV) er parret med Android TV Remote → `media_player.projektor_android_tv` + `remote.projektor` (tændt/slukket + aktuel app, også apps fra projektorens egen fjernbetjening). Indgang til `binary_sensor.projektor_aktiv`.
 - **Formål (gammelt):** Cinema mode tænder/slukker projektor via HDMI CEC. Pt. kommenteret ud i scene_cinema.
 
 ---
