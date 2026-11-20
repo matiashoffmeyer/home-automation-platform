@@ -48,7 +48,9 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   hvert råd, øvelse, måltid og pas SKAL vise sit HVORFOR synligt** ("ikke bare
   slynges ud, men underbygges så vi motiveres") → `hvorfor:` i data-filen
   (`privat/helbred/*.yaml`, `privat/parent_b/profil.yaml`), aldrig kun i en
-  kommentar; en ny øvelse uden `hvorfor:` er ufærdig. **Støvsug, Mad,
+  kommentar; en ny øvelse uden `hvorfor:` er ufærdig. Øvelsens `billede:` skal vise den
+  SOM BESKREVET (stilling, udstyr, dybde) — ellers en tegning i `www/oevelser/egne/`
+  (`scripts/oevelse_tegninger.py`, user 19/11: "hellere tegninger end forkert billede"). **Støvsug, Mad,
   AirBnB, Tapo og Vandventil er FANER i Indstillinger (2026-09-30)** — kun Lys,
   Scener, Festlys, info-siderne og KONTROLPANELERNE Mad + Støvsug (kun knapper
   og status, i Lys-sidens stil) er egne dashboards; et nyt emne = ny fane.

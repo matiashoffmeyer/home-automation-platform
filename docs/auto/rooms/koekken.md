@@ -6,7 +6,7 @@ Search keywords: `koekken, kokken`
 
 ## Indhold
 - [Automations](koekken.md#automations) (9)
-- [Entities](koekken.md#entities) (244)
+- [Entities](koekken.md#entities) (245)
 - [Helpers](koekken.md#helpers) (42)
 
 ---
@@ -57,11 +57,12 @@ Search keywords: `koekken, kokken`
 
 ### `binary_sensor.*`
 
+- `binary_sensor.festlys_frost_koekken_i_brug` — 2 refs in 1 file(s)
 - `binary_sensor.filmmoerke_koekken` — 12 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_afstand_jitter` — 1 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_bevaegelse_frisk` — 3 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_central_zone` — 6 refs in 3 file(s)
-- `binary_sensor.koekken_apollo_central_zone_filtered` — 4 refs in 1 file(s)
+- `binary_sensor.koekken_apollo_central_zone_filtered` — 5 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_frossen_ghost` — 6 refs in 4 file(s)
 - `binary_sensor.koekken_apollo_naer_bekraeftet` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_apollo_naer_kandidat` — 4 refs in 1 file(s)
@@ -75,7 +76,7 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.koekken_apollo_radar_zone_3_occupancy` — 2 refs in 2 file(s)
 - `binary_sensor.koekken_apollo_still_bekraeftet` — 1 refs in 1 file(s)
 - `binary_sensor.koekken_arbejdslys` — 8 refs in 3 file(s)
-- `binary_sensor.koekken_bevaegelse_nylig` — 5 refs in 2 file(s)
+- `binary_sensor.koekken_bevaegelse_nylig` — 6 refs in 3 file(s)
 - `binary_sensor.koekken_bevaegelse_raa` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_dvale_vidne` — 3 refs in 3 file(s)
 - `binary_sensor.koekken_hjemkomstlys` — 1 refs in 1 file(s)
@@ -101,12 +102,12 @@ Search keywords: `koekken, kokken`
 
 ### `input_boolean.*`
 
-- `input_boolean.dance_room_koekken` — 9 refs in 6 file(s)
+- `input_boolean.dance_room_koekken` — 13 refs in 6 file(s)
 - `input_boolean.koekken_blik_arm_enabled` — 3 refs in 3 file(s)
 - `input_boolean.koekken_cooking_ramp` — 4 refs in 3 file(s)
 - `input_boolean.koekken_kamera_krop_enabled` — 7 refs in 5 file(s)
 - `input_boolean.koekken_lav_krop_boern_enabled` — 3 refs in 3 file(s)
-- `input_boolean.koekken_session_active` — 11 refs in 3 file(s)
+- `input_boolean.koekken_session_active` — 12 refs in 4 file(s)
 - `input_boolean.koekken_stemme_arm_enabled` — 5 refs in 5 file(s)
 - `input_boolean.roborock_styrbar_kort_op_koekken` — 1 refs in 1 file(s)
 - `input_boolean.roborock_styrbar_lang_op_koekken` — 1 refs in 1 file(s)
@@ -213,7 +214,7 @@ Search keywords: `koekken, kokken`
 - `input_text.koekken_apollo_last_flap` — 1 refs in 1 file(s)
 - `input_text.koekken_gate_flapcount` — 1 refs in 1 file(s)
 - `input_text.koekken_gate_floors` — 1 refs in 1 file(s)
-- `input_text.koekken_gestus_alarm` — 19 refs in 7 file(s)
+- `input_text.koekken_gestus_alarm` — 20 refs in 8 file(s)
 - `input_text.koekken_gestus_alarm_rum` — 5 refs in 1 file(s)
 - `input_text.koekken_gestus_nedtael` — 17 refs in 4 file(s)
 - `input_text.koekken_gestus_pending` — 7 refs in 3 file(s)
@@ -258,7 +259,7 @@ Search keywords: `koekken, kokken`
 - `script.koekken_gestus_alarm_burst` — 3 refs in 1 file(s)
 - `script.koekken_gestus_alarm_stop` — 5 refs in 1 file(s)
 - `script.koekken_gestus_burst_once` — 5 refs in 1 file(s)
-- `script.koekken_gestus_kvittering` — 3 refs in 2 file(s)
+- `script.koekken_gestus_kvittering` — 4 refs in 3 file(s)
 - `script.koekken_gestus_saet` — 11 refs in 2 file(s)
 - `script.koekken_gestus_set_signal` — 2 refs in 2 file(s)
 - `script.koekken_gestus_telefon_alarm` — 2 refs in 1 file(s)
@@ -311,7 +312,7 @@ Search keywords: `koekken, kokken`
 - `sensor.koekken_spots_dagslys_sluk_effektiv` — 6 refs in 3 file(s)
 - `sensor.koekken_spots_lux_gate_effektiv` — 10 refs in 5 file(s)
 - `sensor.koekken_stemme_kommando` — 6 refs in 1 file(s)
-- `sensor.koekken_stemme_sidst` — 4 refs in 3 file(s)
+- `sensor.koekken_stemme_sidst` — 5 refs in 3 file(s)
 - `sensor.koekken_timer_varsel_tid` — 1 refs in 1 file(s)
 - `sensor.koekken_trigger_log` — 4 refs in 2 file(s)
 - `sensor.radiator_effekt_kokken` — 2 refs in 2 file(s)
@@ -328,7 +329,7 @@ Search keywords: `koekken, kokken`
 
 ### `timer.*`
 
-- `timer.koekken_gestus` — 36 refs in 6 file(s)
+- `timer.koekken_gestus` — 46 refs in 7 file(s)
 
 ---
 

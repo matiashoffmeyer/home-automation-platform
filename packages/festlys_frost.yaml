@@ -19,6 +19,16 @@
 #     Thread-budget (B260), stop-rostere og release følger med gratis.
 #   - Kørte festlys ikke i forvejen, danser KUN open-plan (de andre rum-
 #     knapper slås fra). Kørte en fest, kommer open-plan med i den.
+#   - KØKKENET FREDES når nogen er i det (user 19/11: "hvis der er frozen lys
+#     så fred køkkenet for det hvis der er bevægelse i køkkenet så man kan lave
+#     mad"): binary_sensor.festlys_frost_koekken_i_brug (madlavnings-session,
+#     bevægelse eller nogen i central-zonen) holder køkkenet ude ved starten,
+#     og kommer nogen ind under sangen, slippes køkkenet (dance_room_koekken
+#     off → dance_room_change_restart giver det tilbage til Auto og looket).
+#     Det kommer ikke med igen før næste sang. Kun den SANG-startede frost —
+#     vælger man frost selv på Festlys-siden, bestemmer rum-knapperne.
+#     Begge afspilninger hidtil (4/11 18:10, 12/11 16:27) havde bevægelse i
+#     køkkenet de forudgående 5-14 min, og 12/11 kørte en session fra 16:15.
 #   - Tilstanden før sangen gemmes i input_text.festlys_frost_foer (JSON:
 #     d = dance_mode, e = låst event, r = rum-knapper der var tændt) og
 #     overlever en restart. Når sangen slutter, gendannes den — men KUN hvis
@@ -67,6 +77,18 @@ template:
              and not is_state('input_boolean.godnat_boern_active', 'on')
              and not is_state('input_boolean.sleepover_i_nat', 'on') }}
 
+      # Nogen i køkkenet → Frost-sangen lader det være (se headeren).
+      # Session = madlavning (slutter først når feltet har været tomt i
+      # koekken_session_timeout_minutes); bevægelse/central-zone = nogen står
+      # der nu (begge ≤ 250 cm fra køkken-Apolloen).
+      - name: "Festlys frost koekken i brug"
+        unique_id: festlys_frost_koekken_i_brug
+        icon: mdi:chef-hat
+        state: >-
+          {{ is_state('input_boolean.koekken_session_active', 'on')
+             or is_state('binary_sensor.koekken_bevaegelse_nylig', 'on')
+             or is_state('binary_sensor.koekken_apollo_central_zone_filtered', 'on') }}
+
 script:
   festlys_frost_start:
     alias: "Festlys: Frost-sangen starter — iskrystal i open-plan"
@@ -78,6 +100,7 @@ script:
       koerte: >-
         {{ is_state('input_boolean.dance_mode', 'on')
            or not is_state('input_select.dance_manual_event', 'off') }}
+      koekken_fredet: "{{ is_state('binary_sensor.festlys_frost_koekken_i_brug', 'on') }}"
       andre: >-
         {% set ns = namespace(l=[]) %}
         {% for k in rum %}{% if k not in openplan and is_state('input_boolean.dance_room_' ~ k, 'on') %}{% set ns.l = ns.l + ['input_boolean.dance_room_' ~ k] %}{% endif %}{% endfor %}
@@ -107,12 +130,19 @@ script:
         then:
           - service: input_boolean.turn_off
             target: {entity_id: "{{ andre }}"}
+      # Nogen i køkkenet → det fredes, også fra en fest der kørte i forvejen
+      # (slut-vejen lægger knappen tilbage). Slås fra FØR de andre tændes.
+      - if:
+          - condition: template
+            value_template: "{{ koekken_fredet and is_state('input_boolean.dance_room_koekken', 'on') }}"
+        then:
+          - service: input_boolean.turn_off
+            target: {entity_id: input_boolean.dance_room_koekken}
       - service: input_boolean.turn_on
         target:
-          entity_id:
-            - input_boolean.dance_room_stue
-            - input_boolean.dance_room_spisestue
-            - input_boolean.dance_room_koekken
+          entity_id: >-
+            {{ ['input_boolean.dance_room_stue', 'input_boolean.dance_room_spisestue']
+               + ([] if koekken_fredet else ['input_boolean.dance_room_koekken']) }}
       # sensor.dance_active_bulbs gen-renderer på rum-skiftet (samme 300 ms
       # som dance_room_change_restart venter).
       - delay: {milliseconds: 400}
@@ -133,7 +163,7 @@ script:
           name: "Festlys"
           message: >-
             Frost: "{{ state_attr('sensor.spotify_bro', 'titel') }}" spiller — iskrystal i
-            stue, spisestue og køkken.
+            stue{{ ' og spisestue; køkkenet fredes (nogen er i det)' if koekken_fredet else ', spisestue og køkken' }}.
 
   festlys_frost_slut:
     alias: "Festlys: Frost-sangen slut — tilbage til før"
@@ -227,7 +257,8 @@ automation:
     alias: "Festlys: Frost-sangene → iskrystal i open-plan"
     description: >-
       Let It Go (Frozen) / Lad det ske (Frost) på højttaleren → festlys-eventet
-      frost i stue, spisestue og køkken; tilbage til før når sangen slutter.
+      frost i stue, spisestue og køkken (køkkenet fredes når nogen er i det);
+      tilbage til før når sangen slutter.
     mode: queued
     max: 5
     trigger:
@@ -242,6 +273,12 @@ automation:
         from: "on"
         to: "off"
         id: slut
+      # Nogen kommer ind i køkkenet under sangen → køkkenet slippes.
+      - platform: state
+        entity_id: binary_sensor.festlys_frost_koekken_i_brug
+        from: "off"
+        to: "on"
+        id: koekken
     action:
       - choose:
           - conditions:
@@ -254,6 +291,27 @@ automation:
                 id: slut
             sequence:
               - service: script.festlys_frost_slut
+          # Kun den sang-startede frost (sensoren on + eventet frost): en frost
+          # valgt på Festlys-siden styres af rum-knapperne alene.
+          - conditions:
+              - condition: trigger
+                id: koekken
+              - condition: state
+                entity_id: binary_sensor.festlys_frost_sang
+                state: "on"
+              - condition: state
+                entity_id: input_select.dance_manual_event
+                state: frost
+              - condition: state
+                entity_id: input_boolean.dance_room_koekken
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_off
+                target: {entity_id: input_boolean.dance_room_koekken}
+              - service: logbook.log
+                data:
+                  name: "Festlys"
+                  message: "Frost: nogen kom ind i køkkenet — køkkenet tilbage til Auto resten af sangen."
 
   # Efter en restart er dance_manual_event "off" (initial), og sensorens første
   # state er ingen flanke: spiller sangen stadig, start igen; er en fest-

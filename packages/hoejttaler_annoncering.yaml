@@ -33,6 +33,10 @@
 # højttaler over hvis der er noget der spiller (selvfølgelig)". Før: radioen
 # blev pauset og genoptaget — den vej findes ikke længere.
 #   · `vigtig` gennembryder kun STILLE (godnat/Sleep Over).
+#   · ÉN undtagelse (user 19/11: "regnvarsel om morgen, du må gerne afbryde
+#     højttaleren"): `afbryd_radio` — kun morgenens regn-oplæsning sender den.
+#     Spiller HUSETS DR-radio, siges beskeden og samme kanal genoptages på
+#     samme volumen. En persons Spotify/AirPlay springes stadig over.
 #
 # STILLE: godnat (fælles eller børnenes putning) og Sleep Over (en gæst sover
 # i open plan) → kun `vigtig` spiller. Vejr-oplæsningen om morgenen kræver
@@ -120,7 +124,7 @@ template:
 
 script:
   hoejttaler_annoncer:
-    alias: "Højttaler: sig en besked (kun når intet spiller)"
+    alias: "Højttaler: sig en besked (kun når intet spiller, regnvarslet afbryder radioen)"
     icon: mdi:bullhorn
     # queued: to beskeder lige efter hinanden (timer + vejr) må hverken tabes
     # eller tale oven i hinanden — og hver kørsel genopretter sin egen musik.
@@ -139,6 +143,13 @@ script:
         description: >-
           true = spil også under godnat og Sleep Over (afbryder ALDRIG
           noget der spiller — så springes beskeden over)
+        required: false
+        example: false
+      afbryd_radio:
+        description: >-
+          true = spiller husets DR-radio, afbrydes den til beskeden og
+          genoptages bagefter (kun morgenens regnvarsel, user 19/11). En
+          persons Spotify/AirPlay afbrydes aldrig.
         required: false
         example: false
     sequence:
@@ -164,6 +175,17 @@ script:
             {{ is_state('binary_sensor.godnat_common_active', 'on')
                or is_state('input_boolean.godnat_boern_active', 'on')
                or is_state('input_boolean.sleepover_i_nat', 'on') }}
+      # Radioen må afbrydes (afbryd_radio) når det er HUSETS radio der spiller:
+      # kanalen kendes, så den kan genoptages. Ikke under dyrespillet, og
+      # aldrig en persons musik (anden_kilde) — den kan HA ikke give tilbage.
+      - variables:
+          radio_kanal: "{{ states('input_text.hoejttaler_radio_kanal') }}"
+          genoptag: >-
+            {{ (afbryd_radio | default(false)) in [true, 'true', 'True', 'on', 1, '1']
+               and is_state('binary_sensor.hoejttaler_radio_tilstand', 'on')
+               and not anden_kilde
+               and not is_state('script.dyrespil_afspil', 'on')
+               and radio_kanal not in ['', 'unknown', 'unavailable'] }}
       # Højttaleren skal være der og tændt (se headeren).
       - condition: template
         value_template: >-
@@ -175,9 +197,11 @@ script:
       # manuelle ting" + "oplæsninger som timer og vejr varsel skal springe
       # højttaler over hvis der er noget der spiller"). Timer-færdig har
       # telefonens TTS-løkke + lys-alarmen ved siden af.
+      # UNDTAGELSE 19/11: morgenens regnvarsel må afbryde radioen (genoptag) —
+      # den var sprunget over hver regnmorgen siden 2/11, fordi P4 spillede.
       - if:
           - condition: template
-            value_template: "{{ spillede or anden_kilde or (not er_vigtig and stille) }}"
+            value_template: "{{ (spillede and not genoptag) or anden_kilde or (not er_vigtig and stille) }}"
         then:
           - service: logbook.log
             data:
@@ -236,9 +260,11 @@ script:
           milliseconds: >-
             {% set s = sekunder if sekunder > 0 else (tekst.split() | count) * 0.55 + 1 %}
             {{ ((s + 2) * 1000) | int }}
-      # Bagefter: intet at genoptage (der spillede intet, ellers var beskeden
-      # sprunget over). Ryd køen, så Volumio-appens play-knap ikke siger
-      # beskeden igen (og stop den, hvis køen står på gentag).
+      # Bagefter: ryd køen, så Volumio-appens play-knap ikke siger beskeden
+      # igen (og stop den, hvis køen står på gentag). Der er intet at genoptage
+      # — UNDTAGEN radioen som afbryd_radio afbrød: samme kanal igen, på
+      # volumen fra før (radio-scriptet sætter den FØR afspilning, så
+      # morgenradioens fade-in genkender sit eget trin og fortsætter).
       - service: media_player.media_stop
         continue_on_error: true
         target:
@@ -247,6 +273,15 @@ script:
         continue_on_error: true
         target:
           entity_id: media_player.hoejttaler
+      - if:
+          - condition: template
+            value_template: "{{ genoptag }}"
+        then:
+          - service: script.hoejttaler_radio
+            continue_on_error: true
+            data:
+              kanal: "{{ radio_kanal }}"
+              volumen: "{{ (vol_foer * 100) | round(0) | int if vol_foer >= 0 else -1 }}"
       - if:
           - condition: template
             value_template: "{{ vol_foer >= 0 }}"
@@ -261,7 +296,7 @@ script:
         data:
           name: "Højttaler"
           message: >-
-            Sagde "{{ tekst }}" ({{ sekunder }} s).
+            Sagde "{{ tekst }}" ({{ sekunder }} s){{ ' — afbrød ' ~ radio_kanal ~ ' og genoptog den' if genoptag else '' }}.
 
   # ---------------------------------------------------------------------------
   # B205 (2026-10-09) — HA spiller ÉN bestemt sang fra Spotify. User: "ingen
@@ -712,7 +747,7 @@ script:
                  'windy': 'blæst', 'windy-variant': 'blæst og skyer'} -%}
             {%- set liste = (fc.get('weather.forecast_home', {}).get('forecast', []))
                  if fc is defined and fc is mapping else [] -%}
-            {%- set ns = namespace(t='', tmin=none) -%}
+            {%- set ns = namespace(t='', tmin=none, p=[], dele=[], sum=0) -%}
             {%- if per == 'morgen' -%}
               {%- set v = 'sensor.vejr_varsel_i_dag' -%}
               {%- set ns.t = 'Godmorgen.' -%}
@@ -741,8 +776,48 @@ script:
                 {%- endif -%}
               {%- endfor -%}
             {%- endif -%}
-            {%- if state_attr(v, 'is_rain') == true -%}
-              {%- set mm = state_attr(v, 'precip_mm') | float(0) -%}
+            {%- set perioder = (state_attr(v, 'regn_perioder') or []) if per == 'morgen' else [] -%}
+            {%- set h_nu = now().hour -%}
+            {%- set ns.p = [] -%}
+            {%- for p in perioder if p is mapping and (p.til | int(0)) > h_nu -%}
+              {%- set ns.p = ns.p + [p] -%}
+            {%- endfor -%}
+            {%- if state_attr(v, 'is_rain') == true and per == 'morgen' and ns.p | count > 0 -%}
+              {#- 19/11 (user: "fortælle hvornår på dagen der falder regn og hvor
+                  meget"): perioderne fra sensoren, hvor meget pr. periode.
+                  Over 3 perioder = byger hele dagen → ét spænd + summen. -#}
+              {%- macro kl(h) -%}{{ 'midnat' if h | int >= 24 else 'klokken ' ~ (h | int) }}{%- endmacro -%}
+              {%- macro maengde(mm) -%}
+                {{- 'lidt regn' if mm < 0.5 else ('under 1 millimeter' if mm < 1
+                    else 'cirka ' ~ (mm | round(0) | int) ~ ' millimeter') -}}
+              {%- endmacro -%}
+              {%- macro spaend(fra, til) -%}
+                {{- ('fra nu til ' ~ kl(til)) if fra | int <= h_nu
+                    else ('omkring ' ~ kl(fra)) if (til | int) - (fra | int) == 1
+                    else ('fra ' ~ kl(fra) ~ ' til ' ~ kl(til)) -}}
+              {%- endmacro -%}
+              {%- if ns.p | count > 3 -%}
+                {%- set ns.sum = 0 -%}
+                {%- for p in ns.p %}{% set ns.sum = ns.sum + (p.mm | float(0)) %}{% endfor -%}
+                {%- set ns.t = ns.t ~ ' Byger i løbet af dagen, ' ~ spaend(ns.p[0].fra, ns.p[-1].til)
+                     ~ ', i alt ' ~ maengde(ns.sum) ~ '.' -%}
+              {%- else -%}
+                {%- set ns.dele = [] -%}
+                {%- for p in ns.p -%}
+                  {%- set ns.dele = ns.dele + [spaend(p.fra, p.til) ~ ', ' ~ maengde(p.mm | float(0))] -%}
+                {%- endfor -%}
+                {%- set ns.t = ns.t ~ ' Regn ' ~ ns.dele | join(', og ') ~ '.' -%}
+                {%- set stoerst = ns.p | sort(attribute='mm') | last -%}
+                {%- if (stoerst.mm | float(0)) >= 2 and (stoerst.til | int) - (stoerst.fra | int) >= 3 -%}
+                  {%- set ns.t = ns.t ~ ' Mest omkring ' ~ kl(stoerst.top) ~ '.' -%}
+                {%- endif -%}
+              {%- endif -%}
+              {%- set ns.t = ns.t ~ ' Husk regntøj.' -%}
+            {%- elif state_attr(v, 'is_rain') == true -%}
+              {#- Aften, eller ingen met.no-timer (kun DMI så regn) → mængden
+                  uden tidspunkt; den største af de to kilder, som pushen. -#}
+              {%- set mm = [state_attr(v, 'precip_mm') | float(0),
+                            state_attr(v, 'dmi_mm_today') | float(0) if per == 'morgen' else 0] | max -%}
               {%- if mm >= 1 -%}
                 {%- set ns.t = ns.t ~ ' Der kommer regn, cirka ' ~ (mm | round(0) | int) ~ ' millimeter.' -%}
               {%- else -%}
@@ -768,10 +843,14 @@ script:
               {%- set ns.t = ns.t ~ ' Temperaturen falder til ' ~ lav ~ (' grad.' if lav | abs == 1 else ' grader.') -%}
             {%- endif -%}
             {{ ns.t }}
+      # 19/11 (user: "regnvarsel om morgen, du må gerne afbryde højttaleren"):
+      # KUN morgen + regn må afbryde husets radio (som så genoptages). Alt
+      # andet følger stadig 14/10-reglen: spiller noget, springes over.
       - service: script.hoejttaler_annoncer
         data:
           besked: "{{ tekst }}"
           sprog: "da"
+          afbryd_radio: "{{ per == 'morgen' and state_attr('sensor.vejr_varsel_i_dag', 'is_rain') == true }}"
 
 automation:
   # ---------------------------------------------------------------------------

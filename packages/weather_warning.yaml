@@ -106,7 +106,9 @@ template:
             {% set ns = namespace(precip=0, pprob=0, wmean=0, wgust=0,
                                   uveff=0, uvcs=0, wet=false, snow=false,
                                   thunder=false, mincloud=100) %}
-            {% for h in hrs if (h.datetime | string)[:10] == today %}
+            {# met.no's timer er UTC ("…T23:00:00+00:00" = 00-01 i morgen,
+               dansk tid) → dagen afgøres i LOKAL tid (#18; 19/11). #}
+            {% for h in hrs if (as_datetime(h.datetime | string) | as_local).strftime('%Y-%m-%d') == today %}
               {% set ns.precip = ns.precip + (h.precipitation | float(0)) %}
               {% set ns.pprob = [ns.pprob, h.precipitation_probability | float(0)] | max %}
               {% set ns.wmean = [ns.wmean, h.wind_speed | float(0)] | max %}
@@ -131,6 +133,41 @@ template:
                 'uvcs': ns.uvcs | round(1),
                 'wet': ns.wet, 'snow': ns.snow, 'thunder': ns.thunder,
                 'mincloud': ns.mincloud | round(0) | int} }}
+          # 2026-11-19 (user: "fortælle hvornår på dagen der falder regn og hvor
+          # meget"): dagens regn-perioder fra SAMME timeserie som agg.precip, så
+          # summen af perioderne = precip_mm. En time tæller fra 0,1 mm (met.no's
+          # opløsning); én tør time imellem slår to perioder sammen (byger i
+          # samme eftermiddag er én periode at sige). til = time EFTER sidste
+          # regn-time (24 = midnat); top = den vådeste time.
+          perioder: >-
+            {% set hrs = fc.get('weather.forecast_home', {}).get('forecast', []) %}
+            {% set today = now().strftime('%Y-%m-%d') %}
+            {% set ns = namespace(ud=[], fra=-1, til=-1, mm=0, top=-1, topmm=0) %}
+            {% for h in hrs %}
+              {% set t = as_datetime(h.datetime | string) | as_local %}
+              {% set p = h.precipitation | float(0) %}
+              {% if t.strftime('%Y-%m-%d') == today and p >= 0.1 %}
+                {% if ns.fra >= 0 and t.hour <= ns.til + 1 %}
+                  {% set ns.til = t.hour + 1 %}
+                  {% set ns.mm = ns.mm + p %}
+                {% else %}
+                  {% if ns.fra >= 0 %}
+                    {% set ns.ud = ns.ud + [{'fra': ns.fra, 'til': ns.til,
+                                             'mm': ns.mm | round(1), 'top': ns.top}] %}
+                  {% endif %}
+                  {% set ns.fra = t.hour %}
+                  {% set ns.til = t.hour + 1 %}
+                  {% set ns.mm = p %}
+                  {% set ns.topmm = 0 %}
+                {% endif %}
+                {% if p > ns.topmm %}{% set ns.topmm = p %}{% set ns.top = t.hour %}{% endif %}
+              {% endif %}
+            {% endfor %}
+            {% if ns.fra >= 0 %}
+              {% set ns.ud = ns.ud + [{'fra': ns.fra, 'til': ns.til,
+                                       'mm': ns.mm | round(1), 'top': ns.top}] %}
+            {% endif %}
+            {{ ns.ud }}
       # B34 (2026-06-11): DMI HARMONIE som anden regn-kilde — varsl hvis BARE
       # ÉN kilde ser regn. packages/dmi_weather.yaml. Unavailable/none → 0
       # (= met.no alene, graceful fallback).
@@ -213,6 +250,9 @@ template:
             {% endif %}
             {{ msg | join('\n') }}
           precip_mm: "{{ agg.precip }}"
+          # Liste af {fra, til, mm, top} (lokale timer) — morgen-oplæsningen
+          # (packages/hoejttaler_annoncering.yaml) siger hvornår og hvor meget.
+          regn_perioder: "{{ perioder }}"
           dmi_mm_today: "{{ dmi_today }}"
           rain_source: >-
             {{ 'met.no+DMI' if metno_rain and dmi_rain

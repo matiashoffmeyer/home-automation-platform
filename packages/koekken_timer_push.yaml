@@ -1,0 +1,202 @@
+# =============================================================================
+# Køkken-timer på telefonen: nedtælling + tre knapper (user-spec 2026-11-20:
+# "ved timer skal jeg ha en notifikation med tre action buttons så jeg kan
+# lægge tid til eller stoppe den").
+#
+# Én notifikation pr. timer (tag koekken_timer), opdateret i stedet for stablet:
+#   • timer.started / timer.restarted → "⏲️ N min — færdig kl. HH:MM" med
+#     Androids chronometer (tæller selv ned på låseskærmen) og +1 min /
+#     +5 min / Stop.
+#   • timer.finished → samme tag: "Tiden er gået" med Stop / +1 min / +5 min
+#     (+N mens alarmen ringer = slumre: alarmen stoppes, ny N-min timer).
+#   • timer.cancelled, eller alarmen er slut og ingen timer kører → fjernet.
+#
+# HA ejer stadig nedtællingen alene (B149: en NATIV telefon-timer kan ikke
+# fjernes igen). Notifikationen er kun et vindue + fjernbetjening; den kan
+# hænge efter et HA-nedbrud, men den kan aldrig ringe.
+#
+# Knapperne går ad husets EKSISTERENDE veje (#2):
+#   Stop  → script.koekken_gestus_kvittering (= knytnæven/stemmen: stopper
+#           alarmen hvis den ringer, ellers annulleres nedtællingen).
+#   +N    → timeren kører: timer.start med resterende + N (et timer.restarted;
+#           lyskæden er stadig lånt, højttaleren siger den nye længde).
+#           Timeren kører ikke: koekken_gestus_start-eventet (kilde 'telefon'),
+#           så alarm-stop, gates og trigger-loggen arves gratis.
+#
+# Kun PHONE_A — samme modtager som resten af køkken-timeren (alarmlyden,
+# "løbet ud"-pushen). AirBnB: hele timeren er gatet til Normal/Home Vacation
+# (en gæst kan ikke starte den), og pushen har samme gate + master-toggle.
+# =============================================================================
+automation:
+  - id: koekken_timer_push_vis
+    alias: "Køkken-timer: push med nedtælling og knapper"
+    mode: queued
+    max: 5
+    trigger:
+      - platform: event
+        event_type: timer.started
+        event_data:
+          entity_id: timer.koekken_gestus
+        id: koerer
+      - platform: event
+        event_type: timer.restarted
+        event_data:
+          entity_id: timer.koekken_gestus
+        id: koerer
+      - platform: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.koekken_gestus
+        id: slut
+      - platform: event
+        event_type: timer.cancelled
+        event_data:
+          entity_id: timer.koekken_gestus
+        id: ryd
+      # Alarmen slut (kvitteret, slumret eller løbet ud) → væk, medmindre en ny
+      # timer allerede kører (dens egen push er så den gældende).
+      - platform: template
+        value_template: >-
+          {{ not states('input_text.koekken_gestus_alarm').startswith('aktiv') }}
+        id: alarm_slut
+    condition:
+      - condition: state
+        entity_id: input_boolean.notifikationer_master_enabled
+        state: "on"
+      - condition: template
+        value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+      - condition: template
+        value_template: >-
+          {{ trigger.id != 'alarm_slut' or not is_state('timer.koekken_gestus', 'active') }}
+    action:
+      - choose:
+          - conditions: "{{ trigger.id == 'koerer' }}"
+            sequence:
+              - variables:
+                  slut_ts: >-
+                    {% set f = state_attr('timer.koekken_gestus', 'finishes_at') %}
+                    {{ as_timestamp(f, 0) | int(0) if f not in [none, ''] else 0 }}
+                  rest_min: >-
+                    {{ (((slut_ts | int(0)) - as_timestamp(now())) / 60) | round(0) | int(0) }}
+              - condition: template
+                value_template: "{{ slut_ts | int(0) > as_timestamp(now()) }}"
+              - action: notify.mobile_app_phone_a
+                continue_on_error: true
+                data:
+                  title: "⏲️ Køkken-timer: {{ rest_min }} min"
+                  message: "Færdig kl. {{ (slut_ts | int(0)) | timestamp_custom('%H:%M:%S', true) }}"
+                  data:
+                    tag: koekken_timer
+                    channel: Koekken_timer
+                    notification_icon: mdi:timer-outline
+                    chronometer: true
+                    when: "{{ slut_ts | int(0) }}"
+                    alert_once: true
+                    actions:
+                      - action: KOEKKEN_TIMER_PLUS1
+                        title: "+1 min"
+                      - action: KOEKKEN_TIMER_PLUS5
+                        title: "+5 min"
+                      - action: KOEKKEN_TIMER_STOP
+                        title: Stop
+          - conditions: "{{ trigger.id == 'slut' }}"
+            sequence:
+              - action: notify.mobile_app_phone_a
+                continue_on_error: true
+                data:
+                  title: "⏲️ Køkken-timeren er færdig"
+                  message: "Stop alarmen, eller giv den lidt mere tid."
+                  data:
+                    tag: koekken_timer
+                    channel: Koekken_timer
+                    notification_icon: mdi:timer-alert-outline
+                    alert_once: true
+                    # Alarmen ringer højst ~5 min; bagefter er knapperne uden mening.
+                    timeout: 1800
+                    actions:
+                      - action: KOEKKEN_TIMER_STOP
+                        title: Stop
+                      - action: KOEKKEN_TIMER_PLUS1
+                        title: "+1 min"
+                      - action: KOEKKEN_TIMER_PLUS5
+                        title: "+5 min"
+        default:
+          - action: notify.mobile_app_phone_a
+            continue_on_error: true
+            data:
+              message: clear_notification
+              data:
+                tag: koekken_timer
+
+  - id: koekken_timer_push_svar
+    alias: "Køkken-timer: svar på pushens knapper"
+    # queued: tre hurtige "+1" skal give tre minutter, hver læst fra den
+    # sluttid det forrige tryk efterlod.
+    mode: queued
+    max: 6
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: KOEKKEN_TIMER_PLUS1
+        id: plus
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: KOEKKEN_TIMER_PLUS5
+        id: plus
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: KOEKKEN_TIMER_STOP
+        id: stop
+    action:
+      - choose:
+          # Stop er altid lovligt — det kan kun de-eskalere.
+          - conditions: "{{ trigger.id == 'stop' }}"
+            sequence:
+              - action: script.koekken_gestus_kvittering
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.id == 'plus' }}"
+              - condition: template
+                value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+            sequence:
+              - variables:
+                  plus_min: "{{ 5 if trigger.event.data.action == 'KOEKKEN_TIMER_PLUS5' else 1 }}"
+                  rest_s: >-
+                    {% set f = state_attr('timer.koekken_gestus', 'finishes_at') %}
+                    {% if is_state('timer.koekken_gestus', 'active') and f not in [none, ''] %}
+                      {{ [(as_timestamp(f, 0) - as_timestamp(now())) | round(0) | int(0), 0] | max }}
+                    {% else %}0{% endif %}
+              - if:
+                  - condition: template
+                    value_template: "{{ rest_s | int(0) > 0 }}"
+                then:
+                  # Loft 120 min: to tryk for meget må ikke give en timer i
+                  # timevis; højere end stemmens 60, så +5 på en 60'er virker.
+                  - variables:
+                      ny_s: "{{ [rest_s | int(0) + (plus_min | int(1)) * 60, 7200] | min }}"
+                  - action: timer.start
+                    target:
+                      entity_id: timer.koekken_gestus
+                    data:
+                      duration: >-
+                        {{ '%02d:%02d:%02d' | format((ny_s | int) // 3600,
+                           ((ny_s | int) % 3600) // 60, (ny_s | int) % 60) }}
+                  - action: logbook.log
+                    data:
+                      name: "Køkken-timer"
+                      message: >-
+                        +{{ plus_min }} min fra telefonen —
+                        {{ '%d:%02d' | format((ny_s | int) // 60, (ny_s | int) % 60) }} tilbage
+                      entity_id: timer.koekken_gestus
+                else:
+                  # Ingen nedtælling (alarmen ringer, eller den er lige slut)
+                  # = slumre: husets egen start-vej stopper alarmen og starter
+                  # en ny timer med fuld kvittering og log.
+                  - event: koekken_gestus_start
+                    event_data:
+                      minutter: "{{ plus_min | int(1) }}"
+                      kilde: telefon
+                      bevis: "+{{ plus_min }} min på pushen"

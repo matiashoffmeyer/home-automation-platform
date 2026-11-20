@@ -30,6 +30,10 @@ add-on has no host ports; HA reads it on the Docker network as
 - `/api/archive/<trip_code>`: earlier data kept on the server; `{"restore": stamp}` brings it back.
 - `/api/routes/<trip_code>`: the route library (every GPX kept on the server); `{"delete": id}`
   takes one out (moved to `routes/deleted/`, not the group's route).
+- `/api/trails/<trip_code>` (POST, the app's Overpass queries): the paths, tracks and roads
+  (dirt roads drawn as tracks, since 0.6.97; cycleways and pedestrian streets since 0.6.98) for "Satellite + trails". The server fetches them itself and keeps asking while the public
+  Overpass servers are busy (up to 6 h), keeps the newest 12 trips' in `trails/`, and the
+  phone asks again until it answers `ready` (2026-11-19: Overpass was at capacity for hours).
 - `/api/om`, `/api/proxy`: Open-Meteo / Google Sheets / Overpass for the app.
 
 ## Install

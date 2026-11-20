@@ -1209,6 +1209,13 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   entré-faden 10 trin á ~4,5 s med `wait_template` på bevægelse (flaren er
   nu øjeblikkelig). Frikendt: party mode (ikke tændt siden 25/9), dance,
   stedfortræder-pakken (0 Thread-kald), ild-pausen, read-polling, højttaleren.
+  **19/11 — meshdiag'en ER en målt årsag:** OTBR-loggen 15-19/11 (140 RCP-
+  resets, ~1,4/t, én hård hang 18/11 02:39, ~4-5 min ude): 65 (46 %) afbrød
+  en TMF-frame (port 61631) fra OTBR'en til en router-RLOC, klumpet om
+  ot-ctl-kørslerne (`Daemon read: Connection reset by peer`); 50 (36 %) var Matter-frames til bad-spot 1-3. 15/10's "ens ved 2 og 30 min"
+  blev målt mens ilden dominerede. Fix: kortet måler hændelses-drevet
+  (fingeraftryk af den lokale router-tabel + offline-noder + split, højst
+  hvert 4. min) og ellers hvert `thread_kort_maaling_minutter` = 30.
 - **En Matter-pære svarer på hver kommando med subscription-rapporter — de er
   det meste af trafikken (målt 15/10 16:32-16:35 på entré-loftet, matter-
   serverens websocket `start_listening`, stue-spots trukket ud).** Tænd

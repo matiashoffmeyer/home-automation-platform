@@ -128,4 +128,4 @@ Alle filerne i `/config/helbred/` er almindelig tekst. Ret dem frit, og kør `tj
 
 Dine logs ligger i `/config/helbred/log/*.jsonl`, én linje pr. registrering. Tag dem med i din backup.
 
-Billederne er fra [free-exercise-db](https://github.com/yuhonas/free-exercise-db) (Unlicense). Se `www/oevelser/KILDE.md`.
+Billederne er fra [free-exercise-db](https://github.com/yuhonas/free-exercise-db) (Unlicense); stregtegningerne i `www/oevelser/egne/` er lavet til kittet, hvor intet foto viste øvelsen som beskrevet. Se `www/oevelser/KILDE.md`.

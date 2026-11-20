@@ -88,7 +88,10 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   (`custom_templates/festlys.jinja`, `input_number.festlys_thread_skrivninger`
   pr. minut, default 8 ≈ 0,27 kommandoer/s), skriv kun når udseendet skifter.
   **Diagnose-trafik tæller også:** `meshdiag` spørger hver router over luften
-  → Thread-kortets måle-interval er `input_number.thread_kort_maaling_minutter` (4 min fra 15/10; RCP-resets/t var ens ved 2 og 30 min).
+  → 19/11: 65/140 RCP-resets afbrød netop dem (TMF port 61631). Kortet måler
+  kun når OTBR'ens LOKALE tabel skifter (højst hvert 4. min) + mindst hvert
+  `input_number.thread_kort_maaling_minutter` (30). 15/10's "ens ved 2 og 30
+  min" var målt under ilden — stale.
 - **Entré-loftet + stue-spotsene er husets SKRØBELIGSTE Thread-led (user-spec
   15/10: "meget forsigtige med at belaste dem")** — indtil 15/10 18:51 nåede
   stuen kun OTBR'en via entré-loftet (74-92 % frame-fejl på stue→entré).

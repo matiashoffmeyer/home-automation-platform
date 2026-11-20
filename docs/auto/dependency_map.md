@@ -8,7 +8,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 
 | Entity | Files | Refs |
 |---|---|---|
-| `input_select.house_mode` | 131 | 314 |
+| `input_select.house_mode` | 132 | 316 |
 | `input_select.house_state` | 75 | 250 |
 | `script.push_notify` | 53 | 111 |
 | `light.spisestue_loft` | 50 | 126 |
@@ -39,7 +39,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | Entity | Purpose | Files |
 |---|---|---|
 | `input_select.house_state` | Top-level state: Active vs Dormant | 75 |
-| `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 131 |
+| `input_select.house_mode` | Top-level mode: Normal vs AirBnB | 132 |
 | `input_boolean.godnat_active` | Godnat night mode | 44 |
 | `input_boolean.godnat_pending` | Godnat in progress | 19 |
 | `input_boolean.cinema_active` | Cinema mode (mood) | 30 |

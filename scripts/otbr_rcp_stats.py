@@ -225,9 +225,20 @@ DIAG_CACHE = "/tmp/otbr_child_macs.json"
 # og hvert 30. (16:30-19:15, p50 3), og stue-klyngen faldt ud 18:09-18:51 også
 # med 30 min → intervallet er nu en slider, default 4 min (~250 udvekslinger/t
 # i hele nettet, ~5 pr. måling gennem entré mod ildens ~120 kommandoer/t).
+# 19/11 (user: "smart indsats for at optimere thread stabilitet"): målt over
+# OTBR-loggen 15-19/11 (140 RCP-resets, ~1,4/t): 65 af dem (46 %) afbrød en
+# TMF-frame (port 61631) fra OTBR'en til en router-RLOC = netop disse
+# forespørgsler, klumpet om ot-ctl-kørslerne. Ved
+# 15 målinger/t koster en måling ~4 % risiko for en reset; 15/10's "ens ved 2
+# og 30 min" blev målt mens ilden dominerede. → HÆNDELSES-DREVET: mål straks
+# (højst hvert LUFT_MIN_S) når nettets lokale fingeraftryk skifter (router-ID/
+# MAC i OTBR'ens egen tabel, offline Matter-noder, split); ellers kun hvert
+# `thread_kort_maaling_minutter` (30 fra 19/11). Kortets status pr. enhed er
+# stadig frisk hvert 2. min — den læses lokalt.
 LUFT_ENTITY = "input_number.thread_kort_maaling_minutter"
 LUFT_S = 1800  # fallback hvis slideren ikke kan læses
-LUFT_STEMPEL = "/tmp/otbr_luft_sidst"
+LUFT_MIN_S = 240  # ændring i nettet → mål igen, men højst hvert 4. min
+LUFT_STEMPEL = "/tmp/otbr_luft_sidst"  # mtime = seneste måling, indhold = signaturen da
 
 
 def luft_interval():
@@ -237,17 +248,43 @@ def luft_interval():
         return LUFT_S
 
 
-def luft_tilladt():
+def net_signatur(noder, split_peer):
+    """Nettets billige fingeraftryk — ingen luft-trafik: router-ID + MAC fra
+    OTBR'ens LOKALE router-tabel, Matter-noder der er offline, og et split.
+    Link-kvalitet og Link-kolonnen er med vilje udeladt (skifter hvert tick)."""
+    ids = []
+    try:
+        for line in ot("router table").splitlines():
+            f = [x.strip() for x in line.strip().strip("|").split("|")]
+            if len(f) >= 8 and f[0].isdigit():
+                ids.append(f"{f[0]}:{f[7].lower()}")
+    except Exception:
+        pass
+    off = sorted(
+        str(n.get("node_id"))
+        for n in noder
+        if not n.get("available") and n.get("node_id") not in PASSIVE_NODER
+    )
+    return f"{'|'.join(sorted(ids))}#{','.join(off)}#{split_peer}"
+
+
+def luft_tilladt(sig):
     # -20 s: daemonens 2-min-tik har jitter — ellers bliver "4 min" til 6.
     try:
-        return time.time() - os.path.getmtime(LUFT_STEMPEL) >= luft_interval() - 20
+        alder = time.time() - os.path.getmtime(LUFT_STEMPEL)
+        with open(LUFT_STEMPEL) as f:
+            sidst = f.read()
     except OSError:
         return True
+    if alder >= luft_interval() - 20:
+        return True
+    return sig != sidst and alder >= LUFT_MIN_S - 20
 
 
-def luft_brugt():
+def luft_brugt(sig):
     try:
-        open(LUFT_STEMPEL, "w").close()
+        with open(LUFT_STEMPEL, "w") as f:
+            f.write(sig)
     except OSError:
         pass
 
@@ -534,14 +571,19 @@ def main():
             start, slut = t, t
         split_min = round((up - start) / 60)
     offline = routere = sovende = None
-    luft = luft_tilladt() and not dry
-    if luft:
-        luft_brugt()
+    noder = navne = None
     try:
         noder = asyncio.run(matter_noder())
         navne = ha_navne_map()
-        offline = ha_navne(offline_noder(noder), navne)
-        routere, sovende = enhed_status(noder, navne, luft)
+    except Exception:
+        pass
+    luft = not dry and luft_tilladt(net_signatur(noder or [], split_peer))
+    if luft:
+        luft_brugt(net_signatur(noder or [], split_peer))
+    try:
+        if noder is not None and navne is not None:
+            offline = ha_navne(offline_noder(noder), navne)
+            routere, sovende = enhed_status(noder, navne, luft)
     except Exception:
         pass
     try:
