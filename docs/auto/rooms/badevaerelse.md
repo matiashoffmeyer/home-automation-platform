@@ -6,7 +6,7 @@ Search keywords: `badevaerelse, bad`
 
 ## Indhold
 - [Automations](badevaerelse.md#automations) (22)
-- [Entities](badevaerelse.md#entities) (168)
+- [Entities](badevaerelse.md#entities) (169)
 - [Helpers](badevaerelse.md#helpers) (41)
 
 ---
@@ -24,39 +24,39 @@ Search keywords: `badevaerelse, bad`
 
 - **Lysnet: Badeværelse tænd** (line 24, mode=single)
   - Mindre skarpt aften-lys — undgaa at blaende moerketilpasset syn.
-- **Lysnet: Badeværelse 60→100% langsom optrapning (kun ved ophold)** (line 376, mode=restart)
+- **Lysnet: Badeværelse 60→100% langsom optrapning (kun ved ophold)** (line 385, mode=restart)
   - User-spec 2026-06-18: bad-spots hopper ALDRIG direkte til 100%. Efter 60%-
-- **Lysnet: Badeværelse besøg bekræftet → løft probe til memory** (line 481, mode=single)
+- **Lysnet: Badeværelse besøg bekræftet → løft probe til memory** (line 490, mode=single)
   - visit_serious flippede on (Quick → Medium/Fuld) → løft det tentative probe-
-- **Lysnet: Badeværelse gradvis sluk** (line 540, mode=restart)
+- **Lysnet: Badeværelse gradvis sluk** (line 549, mode=restart)
   - Sprint 2026-05-20: Reclassified fra passage → ophold-tier (private 5 min).
-- **Lysnet: Badeværelse godnat nat-toilet hurtig-sluk** (line 770, mode=restart)
+- **Lysnet: Badeværelse godnat nat-toilet hurtig-sluk** (line 796, mode=restart)
   - Mens badets natlys er aktivt — eller under de voksnes godnat, når
-- **Lysnet: Badeværelse natlys-slut opgradering** (line 949, mode=single)
+- **Lysnet: Badeværelse natlys-slut opgradering** (line 975, mode=single)
   - Solopgang (eller godnat-slut) mens nogen er i badet og lyset stadig hænger
-- **Lysnet: Badeværelse approach-lys hurtig-sluk** (line 1033, mode=restart)
+- **Lysnet: Badeværelse approach-lys hurtig-sluk** (line 1059, mode=restart)
   - Approach tændte badet men ingen gik ind (approach_lit stadig on, inde off,
-- **Lysnet: Badeværelse probe quick-off (ubekræftet = sok)** (line 1141, mode=restart)
+- **Lysnet: Badeværelse probe quick-off (ubekræftet = sok)** (line 1167, mode=restart)
   - Ubekræftet besøg (kun dør-PIR, ingen deep/sustain → visit_serious off) og
-- **Lysnet: Badeværelse Medium-besøg sluk (kortere hold)** (line 1274, mode=restart)
+- **Lysnet: Badeværelse Medium-besøg sluk (kortere hold)** (line 1300, mode=restart)
   - Stadie Medium + ingen indre-bevægelse i badevaerelse_medium_off_minutes →
-- **Lysnet: Badeværelse leave-off (Fuld + dør åben + ro)** (line 1414, mode=restart)
+- **Lysnet: Badeværelse leave-off (Fuld + dør åben + ro)** (line 1440, mode=restart)
   - Fuld-besøg (du lukkede døren = committet) hvor døren NU er åben og der ikke
-- **Lysnet: Badeværelse spots resync efter reconnect** (line 1586, mode=queued)
+- **Lysnet: Badeværelse spots resync efter reconnect** (line 1612, mode=queued)
   - KAJPLATS (Matter) + Innr (Zigbee) skal være 100% i sync. Spot der
-- **Lysnet: Badeværelse spots sync-healer (blandet on/off)** (line 1703, mode=single)
+- **Lysnet: Badeværelse spots sync-healer (blandet on/off)** (line 1729, mode=single)
   - Heler blandet on/off-tilstand på de 5 bad-spots NÅR alle er available
-- **Lysnet: Badeværelse spots confirm-off (Matter missed-command)** (line 1873, mode=restart)
+- **Lysnet: Badeværelse spots confirm-off (Matter missed-command)** (line 1909, mode=restart)
   - Re-sender turn_off til de 5 bad-spots efter gruppen er gået off + fade
-- **Lysnet: Badeværelse restart-recovery (nogen står derinde når HA kommer op)** (line 1964, mode=single)
+- **Lysnet: Badeværelse restart-recovery (nogen står derinde når HA kommer op)** (line 2000, mode=single)
   - 30 s efter HA-start: er inde-PIR'en on og lyset stadig off i et Auto-rum,
-- **Lysnet: Badeværelse sluk → Auto mode** (line 2035, mode=single)
+- **Lysnet: Badeværelse sluk → Auto mode** (line 2071, mode=single)
   - Når bad-lyset bliver helt off (manuelt eller auto) — eller sættes i Manual
-- **Lysnet: Badeværelse max-on watchdog** (line 2091, mode=single)
+- **Lysnet: Badeværelse max-on watchdog** (line 2127, mode=single)
   - Sikkerhedsnet 2026-06-15 (user-spec): Når bad-presence-sensorerne (VALLHORN/
-- **Lysnet: Badeværelse wasp-probe (dæmp→sluk ved stilhed bag lukket dør)** (line 2195, mode=restart)
+- **Lysnet: Badeværelse wasp-probe (dæmp→sluk ved stilhed bag lukket dør)** (line 2231, mode=restart)
   - Lukket dør + Fuld + ingen inde-motion i badevaerelse_wasp_probe_minutes →
-- **Lysnet: Badeværelse wasp-probe re-arm (flanke tabt over restart)** (line 2420, mode=single)
+- **Lysnet: Badeværelse wasp-probe re-arm (flanke tabt over restart)** (line 2456, mode=single)
   - Lys tændt + Fuld + lukket dør + stilhed langt ud over probe-vinduet =
 
 ### `automations/styrbar_rooms.yaml`
@@ -114,13 +114,13 @@ Search keywords: `badevaerelse, bad`
 
 - `input_boolean.airbnb_velkomst_move_bad` — 3 refs in 2 file(s)
 - `input_boolean.bad_zigbee_nodlys_aktiv` — 14 refs in 3 file(s)
-- `input_boolean.badevaerelse_approach_lit` — 13 refs in 3 file(s)
+- `input_boolean.badevaerelse_approach_lit` — 14 refs in 3 file(s)
 - `input_boolean.badevaerelse_brusebad_lys_genrejst` — 7 refs in 2 file(s)
-- `input_boolean.badevaerelse_brusebad_session` — 18 refs in 6 file(s)
+- `input_boolean.badevaerelse_brusebad_session` — 20 refs in 6 file(s)
 - `input_boolean.badevaerelse_bruser_vagt` — 11 refs in 4 file(s)
 - `input_boolean.badevaerelse_bruser_vagt_enabled` — 8 refs in 4 file(s)
 - `input_boolean.badevaerelse_first_deep_today` — 4 refs in 1 file(s)
-- `input_boolean.badevaerelse_fugt_venteslukket` — 9 refs in 3 file(s)
+- `input_boolean.badevaerelse_fugt_venteslukket` — 10 refs in 4 file(s)
 - `input_boolean.badevaerelse_fuld_spot_1` — 2 refs in 2 file(s)
 - `input_boolean.badevaerelse_fuld_spot_2` — 2 refs in 2 file(s)
 - `input_boolean.badevaerelse_fuld_spot_3` — 2 refs in 2 file(s)
@@ -213,7 +213,7 @@ Search keywords: `badevaerelse, bad`
 
 ### `light.*`
 
-- `light.badevaerelse_all` — 131 refs in 23 file(s)
+- `light.badevaerelse_all` — 132 refs in 23 file(s)
 - `light.badevaerelse_spot_1` — 37 refs in 23 file(s)
 - `light.badevaerelse_spot_2` — 43 refs in 23 file(s)
 - `light.badevaerelse_spot_3` — 34 refs in 20 file(s)
@@ -249,6 +249,7 @@ Search keywords: `badevaerelse, bad`
 - `sensor.badevaerelse_fugt_maks_10m` — 1 refs in 1 file(s)
 - `sensor.badevaerelse_fugt_min_10m` — 1 refs in 1 file(s)
 - `sensor.badevaerelse_fugt_min_5m` — 1 refs in 1 file(s)
+- `sensor.badevaerelse_fugt_sessions_top` — 1 refs in 1 file(s)
 - `sensor.badevaerelse_fugt_stigning` — 7 refs in 4 file(s)
 - `sensor.badevaerelse_fugt_stigning_maks_15m` — 2 refs in 1 file(s)
 - `sensor.badevaerelse_inde_2_battery` — 1 refs in 1 file(s)
@@ -263,7 +264,7 @@ Search keywords: `badevaerelse, bad`
 - `sensor.badevaerelse_temp_stigning` — 5 refs in 3 file(s)
 - `sensor.badevaerelse_temp_stigning_maks_15m` — 1 refs in 1 file(s)
 - `sensor.badevaerelse_timmerflotte_battery` — 1 refs in 1 file(s)
-- `sensor.badevaerelse_timmerflotte_humidity` — 20 refs in 5 file(s)
+- `sensor.badevaerelse_timmerflotte_humidity` — 22 refs in 5 file(s)
 - `sensor.badevaerelse_timmerflotte_temperature` — 10 refs in 5 file(s)
 - `sensor.badevaerelse_tom_sluk_sekunder` — 3 refs in 1 file(s)
 - `sensor.parasoll_badevaerelse_battery` — 2 refs in 2 file(s)

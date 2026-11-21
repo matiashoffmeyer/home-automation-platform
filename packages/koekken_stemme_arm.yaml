@@ -75,6 +75,15 @@ input_boolean:
     name: "Køkken: blik i kameraet armerer mikrofonen"
     icon: mdi:eye-check-outline
 
+  # 2026-11-20 (user: "pause højttaleren når jeg har øjenkontakt med kameraet
+  # så den kan høre mig"). Kill-switch for script.koekken_arm_pause_hoejttaler
+  # — scriptets egen første condition, så den dækker enhver vej ind (#21).
+  # Målt 13-20/11: 12 armeringer, 9 mens højttaleren spillede, 3 med en hørt
+  # kommando → en falsk armering pauser musikken ~12 s ca. én gang i døgnet.
+  koekken_arm_pause_hoejttaler_enabled:
+    name: "Køkken: pause højttaleren mens mikrofonen lytter"
+    icon: mdi:speaker-pause
+
 input_number:
   # Hvor længe en løftet hånd holder mikrofonen åben.
   #
@@ -450,6 +459,13 @@ automation:
              and ((now().timestamp() | int) - foer) > vindue }}
 
     actions:
+      # Musikken FØRST og uden at vente (script.turn_on blokerer ikke): mikro-
+      # fonen skal kunne høre den næste sætning, og pulsen tager ~1-2 s.
+      # Scriptet afgør selv om der er noget at pause (kill-switch, kilde).
+      - action: script.turn_on
+        continue_on_error: true
+        target:
+          entity_id: script.koekken_arm_pause_hoejttaler
       # Husets EKSISTERENDE vink med lyskæden (packages/voice_commands.yaml) —
       # ikke en ny lys-formel (#2). Den ved allerede at røgalarmens nødbelysning
       # går forud, at kæden kan stå i color_temp eller hs, og hvordan den
@@ -462,6 +478,162 @@ automation:
         continue_on_error: true
         data:
           moenster: puls
+
+script:
+  # 2026-11-20 (user: "pause højttaleren når jeg har øjenkontakt med kameraet
+  # så den kan høre mig"). Startes af kvitteringen ovenfor — altså KUN når
+  # vinduet ÅBNER, uanset om det var et blik eller en hånd (#2: reglen for
+  # "vinduet åbner" findes ét sted).
+  #
+  # Kun de to kilder HA selv kan give tilbage, ad husets egne veje (#2):
+  #  * Spotify-broen: pause/resume som Styrbar stue (packages/hoejttaler_radio.yaml),
+  #  * husets DR-radio: stop + samme kanal igen på volumen fra før, præcis som
+  #    beskeden der afbryder radioen (script.hoejttaler_annoncer, afbryd_radio).
+  # En persons AirPlay/MA-strøm røres ikke (anden_kilde — den kan HA ikke
+  # genoptage).
+  #
+  # Genoptages når vinduet er lukket (sidste stempel + vinduet + 1 s), 1,5 s
+  # efter en hørt kommando, eller senest efter 60 s (et blik der hænger fast
+  # i kameraet må ikke tie musikken væk). KUN hvis ingen andre har rørt
+  # højttaleren imens: et Styrbar-stop, et nyt nummer, en anden kanal eller en
+  # pause fra telefonen vinder.
+  # Kendt hul: en HA-genstart midt i de ~12 s efterlader musikken pauset.
+  koekken_arm_pause_hoejttaler:
+    alias: "🎙️ Køkken: pause højttaleren mens mikrofonen lytter"
+    icon: mdi:speaker-pause
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - variables:
+          start: "{{ now().timestamp() }}"
+          kanal: "{{ states('input_text.hoejttaler_radio_kanal') }}"
+          vol_foer: "{{ state_attr('media_player.hoejttaler', 'volume_level') | float(-1) }}"
+          kilde: >-
+            {% if is_state('sensor.spotify_bro', 'playing')
+                  and is_state('binary_sensor.styrbar_stue_spotify', 'on') %}spotify
+            {% elif is_state('binary_sensor.hoejttaler_radio_tilstand', 'on')
+                    and is_state('media_player.hoejttaler', 'playing')
+                    and kanal not in ['', 'unknown', 'unavailable'] %}radio
+            {% else %}ingen{% endif %}
+      - condition: state
+        entity_id: input_boolean.koekken_arm_pause_hoejttaler_enabled
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}
+      - condition: template
+        value_template: "{{ kilde | trim in ['spotify', 'radio'] }}"
+      # HA's egen lyd (besked, sang, dyrespil) og et radio-skift i gang er ikke
+      # musik at pause — og deres egne genoptag-veje må ikke krydses.
+      - condition: template
+        value_template: >-
+          {{ ['script.hoejttaler_annoncer', 'script.hoejttaler_vejr_oplaesning',
+              'script.hoejttaler_spil_sang', 'script.dyrespil_afspil',
+              'script.hoejttaler_radio'] | select('is_state', 'on') | list | count == 0 }}
+      - if:
+          - condition: template
+            value_template: "{{ kilde | trim == 'spotify' }}"
+        then:
+          - action: rest_command.spotify_bro_cmd
+            continue_on_error: true
+            data:
+              cmd: pause
+          - wait_template: "{{ is_state('sensor.spotify_bro', 'paused') }}"
+            timeout: 3
+            continue_on_timeout: false
+        else:
+          - action: media_player.media_stop
+            continue_on_error: true
+            target:
+              entity_id: media_player.hoejttaler
+          # Volumio-entity'en opdateres ~1 s efter stoppet; først derefter
+          # betyder 'playing' at NOGEN ANDEN har startet noget.
+          - wait_template: "{{ not is_state('media_player.hoejttaler', 'playing') }}"
+            timeout: 5
+            continue_on_timeout: false
+      # Broens pause-række: rører telefonen Spotify imens, flytter den sig.
+      - variables:
+          sp_lc: >-
+            {% set s = states.sensor.spotify_bro %}
+            {{ s.last_changed.timestamp() if s is not none else 0 }}
+      - action: logbook.log
+        data:
+          name: "Højttaler"
+          message: >-
+            {{ 'Spotify' if kilde | trim == 'spotify' else kanal }} pauset —
+            mikrofonen i køkkenet lytter.
+      - repeat:
+          sequence:
+            - delay: 1
+          until:
+            - condition: template
+              value_template: >-
+                {% set nu = now().timestamp() %}
+                {% set arm = states('input_text.koekken_stemme_armeret_at') | int(0) %}
+                {% set vindue = states('input_number.stemme_arm_vindue_sek') | int(12) %}
+                {% set kmd = states('sensor.koekken_stemme_kommando') | float(0) %}
+                {% set roert = (not is_state('sensor.spotify_bro', 'paused'))
+                              if kilde | trim == 'spotify'
+                              else is_state('media_player.hoejttaler', 'playing') %}
+                {{ nu - arm > vindue + 1 or kmd > start or nu - start > 60 or roert }}
+      - if:
+          - condition: template
+            value_template: >-
+              {{ (states('sensor.koekken_stemme_kommando') | float(0)) > start }}
+        then:
+          - delay:
+              milliseconds: 1500
+      # Ingen andre har rørt højttaleren imens (Styrbar-stoppet stempler FØR
+      # det stopper). Spotify læses i broens PUSHEDE state (Volumio-entity'en
+      # halter og kan hænge på 'playing'), radioen i Volumio-entity'en.
+      - variables:
+          urort: >-
+            {% set st = state_attr('input_datetime.hoejttaler_styrbar_stop_at', 'timestamp') | float(0) %}
+            {{ st < start
+               and (kilde | trim == 'spotify' or not is_state('media_player.hoejttaler', 'playing'))
+               and ['script.hoejttaler_annoncer', 'script.hoejttaler_vejr_oplaesning',
+                    'script.hoejttaler_spil_sang', 'script.dyrespil_afspil',
+                    'script.hoejttaler_radio'] | select('is_state', 'on') | list | count == 0 }}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {% set s = states.sensor.spotify_bro %}
+                  {{ kilde | trim == 'spotify' and urort
+                     and s is not none and s.state == 'paused'
+                     and s.attributes.ejer_hoejttaler | default(false) == true
+                     and (s.last_changed.timestamp() - (sp_lc | float(0))) | abs < 0.01 }}
+            sequence:
+              - action: rest_command.spotify_bro_cmd
+                continue_on_error: true
+                data:
+                  cmd: resume
+              - action: logbook.log
+                data:
+                  name: "Højttaler"
+                  message: "Spotify genoptaget — mikrofonen i køkkenet er lukket."
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ kilde | trim == 'radio' and urort
+                     and states('input_text.hoejttaler_radio_kanal') == kanal }}
+            sequence:
+              - action: script.hoejttaler_radio
+                continue_on_error: true
+                data:
+                  kanal: "{{ kanal }}"
+                  volumen: "{{ (vol_foer * 100) | round(0) | int if vol_foer >= 0 else -1 }}"
+              - action: logbook.log
+                data:
+                  name: "Højttaler"
+                  message: "{{ kanal }} genoptaget — mikrofonen i køkkenet er lukket."
+        default:
+          - action: logbook.log
+            data:
+              name: "Højttaler"
+              message: >-
+                Musikken blev ikke genoptaget efter mikrofonen — nogen rørte
+                højttaleren imens.
 
 template:
   - sensor:

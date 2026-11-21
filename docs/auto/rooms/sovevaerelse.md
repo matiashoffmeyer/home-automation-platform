@@ -6,7 +6,7 @@ Search keywords: `sovevaerelse, sove`
 
 ## Indhold
 - [Automations](sovevaerelse.md#automations) (37)
-- [Entities](sovevaerelse.md#entities) (244)
+- [Entities](sovevaerelse.md#entities) (245)
 - [Helpers](sovevaerelse.md#helpers) (87)
 
 ---
@@ -77,10 +77,10 @@ Search keywords: `sovevaerelse, sove`
   - 60-sek empty + lux>40 + morning → fade off sove. Catches scenarie hvor
 - **Lysnet: Soveværelse gang-early-detect pre-lys** (line 578, mode=single)
   - Bevægelse i entréen tænder sove-lyset svagt+varmt når mørkt + ikke godnat,
-- **Lysnet: Soveværelse gang-early-detect hurtig-sluk** (line 727, mode=restart)
+- **Lysnet: Soveværelse gang-early-detect hurtig-sluk** (line 744, mode=restart)
   - Entré i ro + sove stadig på pre-lys + ingen bevægelse i rummet siden
-- **Lysnet: Soveværelse ryd approach-flag ved lys-sluk** (line 776, mode=single)
-- **Lysnet: Soveværelse hygge-fade (ligger stille)** (line 819, mode=restart)
+- **Lysnet: Soveværelse ryd approach-flag ved lys-sluk** (line 793, mode=single)
+- **Lysnet: Soveværelse hygge-fade (ligger stille)** (line 836, mode=restart)
   - Still-target on + ingen bevægelse i settle_delay = man ligger i sengen →
 
 ### `automations/somrig_buttons.yaml`
@@ -128,7 +128,7 @@ Search keywords: `sovevaerelse, sove`
 - `automation.god_morgen_sovevaerelse_gardin_abner_kl_09_00_weekend` — 2 refs in 1 file(s)
 - `automation.godnat_auto_declare_efter_2t_kun_sovevaerelse_presence` — 3 refs in 2 file(s)
 - `automation.godnat_born_oppe_i_stuen_foraeldre_sover_stadig` — 2 refs in 1 file(s)
-- `automation.lysnet_sovevaerelse_gang_early_detect_hurtig_sluk` — 1 refs in 1 file(s)
+- `automation.lysnet_sovevaerelse_gang_early_detect_hurtig_sluk` — 2 refs in 2 file(s)
 - `automation.lysnet_sovevaerelse_gradvis_sluk` — 1 refs in 1 file(s)
 - `automation.lysnet_sovevaerelse_no_motion_watchdog_spogelses_still` — 1 refs in 1 file(s)
 - `automation.lysnet_sovevaerelse_sluk_ved_lux_stigning` — 1 refs in 1 file(s)
@@ -161,7 +161,7 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sove_stille_krop_bag_lukket_dor` — 2 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_occupancy` — 90 refs in 45 file(s)
 - `binary_sensor.sovevaerelse_apollo_online` — 1 refs in 1 file(s)
-- `binary_sensor.sovevaerelse_apollo_radar_moving_target` — 22 refs in 11 file(s)
+- `binary_sensor.sovevaerelse_apollo_radar_moving_target` — 23 refs in 11 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_still_target` — 23 refs in 9 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_zone_1_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_apollo_radar_zone_2_occupancy` — 1 refs in 1 file(s)
@@ -303,6 +303,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_number.sovevaerelse_dagslys_sluk_lux` — 3 refs in 2 file(s)
 - `input_number.sovevaerelse_default_warmth_k` — 5 refs in 3 file(s)
 - `input_number.sovevaerelse_early_brightness` — 2 refs in 2 file(s)
+- `input_number.sovevaerelse_early_karantaene_minutter` — 3 refs in 3 file(s)
 - `input_number.sovevaerelse_early_lux_threshold` — 3 refs in 3 file(s)
 - `input_number.sovevaerelse_gardin_morgen_tom_minutter` — 4 refs in 3 file(s)
 - `input_number.sovevaerelse_lux_threshold` — 4 refs in 3 file(s)

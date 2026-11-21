@@ -265,12 +265,20 @@ automation:
           - "Ingen"
       # Fallback-gate: kun sluk hvis valhorn har været off længe nok (samme clampede
       # ventetid som state-triggeren) — undgår at fallback'en slukker midt i et besøg.
+      # 2026-11-20 (bug-hunt, #29): et entré-forvarsel tænder strippen mens
+      # valhornen allerede har været i ro i timevis → fallback'en slukkede det ved
+      # første /5-tick (17× på 7 døgn, 0-5 min efter tænd, de fleste mens entréen
+      # stadig var optaget). Ventetiden tælles nu OGSÅ fra approach-flagets
+      # seneste skift; depot_approach_fast_clear er den primære udgang.
       - condition: template
         value_template: >-
           {% set s = states('binary_sensor.depot_valhorn_occupancy') %}
           {% set t = states.binary_sensor.depot_valhorn_occupancy.last_changed %}
           {% set wait = states('input_number.depot_long_off_seconds') | int(300) %}
-          {{ s == 'off' and t is not none and (now() - t).total_seconds() >= wait }}
+          {% set f = states.input_boolean.depot_approach_lit %}
+          {{ s == 'off' and t is not none and (now() - t).total_seconds() >= wait
+             and (f is none or f.state != 'on'
+                  or (now() - f.last_changed).total_seconds() >= wait) }}
     action:
       - service: light.turn_off
         target:
@@ -302,8 +310,8 @@ automation:
   # når den er forældet. Diskriminator: light.depot_loft OFF = enten er hoved-
   # sluk allerede kørt (besøg slut → strippen skal følge), ELLER det er en
   # approach-pre-lys (kun strip). Begge skal væk når depot-valhorn har været i
-  # ro ≥3 min. Et AKTIVT besøg holder loftet tændt (depot_all) → condition
-  # fejler → watchdog rører ikke. FoH I-lås (depot_light_lock) = bevidst hold →
+  # ro ≥3 min (approach: OGSÅ ≥3 min siden flaget, 2026-11-20). Et AKTIVT
+  # besøg holder loftet tændt (depot_all) → condition fejler → watchdog rører ikke. FoH I-lås (depot_light_lock) = bevidst hold →
   # skip. Direkte entity-target undgår gruppe-flap-droppet der skabte hanget.
   - id: depot_strip_orphan_watchdog
     alias: "Depot: strip-orphan sluk (loft slukket men strip hænger)"
@@ -340,11 +348,21 @@ automation:
                   and is_state('input_boolean.dance_room_depot', 'on')) }}
       # Depot-valhorn i ro ≥3 min → ingen i depotet; enhver legitim strip-on
       # (besøgs-flap-survivor ELLER approach uden indgang) er nu forældet.
+      # 2026-11-20 (bug-hunt, #29): de 3 min tælles OGSÅ fra approach-flagets
+      # seneste skift. Valhornen var i ro længe FØR forvarslet tændte, så vagten
+      # slukkede 59 af 60 forvarsler på 7 døgn ved første /2-tick (1-113 s efter
+      # tænd, 38× mens entréen stadig var optaget; 11-20 19:16:00 slukket, 4 s
+      # senere gik man ind) og tog depot_approach_fast_clear's job. Nu er
+      # fast-clear'en (entré i ro early_detect_clear_seconds) primær udgang og
+      # vagten det ydre net efter 3 min — også hvis entré-radaren hænger (#25).
       - condition: template
         value_template: >-
           {% set t = states.binary_sensor.depot_valhorn_occupancy.last_changed %}
+          {% set f = states.input_boolean.depot_approach_lit %}
           {{ is_state('binary_sensor.depot_valhorn_occupancy', 'off')
-             and t is not none and (now() - t).total_seconds() >= 180 }}
+             and t is not none and (now() - t).total_seconds() >= 180
+             and (f is none or f.state != 'on'
+                  or (now() - f.last_changed).total_seconds() >= 180) }}
     action:
       - service: light.turn_off
         continue_on_error: true

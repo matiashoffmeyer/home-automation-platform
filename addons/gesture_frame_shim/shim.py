@@ -58,6 +58,8 @@ YUNET_PATH = "/models/yunet.onnx"
 GAZE_PATH = "/models/mobileone_s0_gaze.onnx"
 PALM_PATH = "/models/palm_detection_full.tflite"
 PALM_LOG = "/share/gesture_frame_shim/palms.jsonl"
+# Every gated gaze frame with a half-size shadow detection (GazeWatcher._shadow).
+GAZE_LOG = "/share/gesture_frame_shim/gaze.jsonl"
 # MobileGaze answers in 90 bins of 4 degrees, centred on straight ahead, and
 # wants ImageNet normalisation on a 448 px crop. These are the model's, not ours.
 GAZE_BINS, GAZE_BINW, GAZE_OFFSET = 90, 4, 180
@@ -96,6 +98,20 @@ VOICE_FEAT_MIN_RMS = 200
 # large enough that the pump is not woken hundreds of times a second.
 VOICE_PUMP_BYTES = VOICE_RATE * 2 // 10
 VOICE_STALE_S = 6.0
+# A pause inside a phrase cuts it in two: VOICE_GAP_S closes a region after
+# 0.45 s of quiet, and a cook who hesitates ("timer ... eight minutes") gets two
+# pieces that each mean nothing — 'tom' or "too short". Replayed 2026-11-20
+# over the whole clip ring: 11-05 17:23:45 + :46 came back '' and '' alone and
+# 'timer eight minutes' together (the user then settled for a 5-minute timer
+# four minutes later). A longer gap is NOT the fix: 11-04 18:03:22-38 was
+# eleven regions with ≤ 0.7 s between them, and one region of all that would
+# have been dropped as too long — 'set timer for 12 minutes' with it. So the
+# pieces stay as they are, and only when a piece fails on its own is it heard
+# again together with the pieces just before it. Gap is first word of this
+# piece minus close of the previous one (= pause − ~0.48 s), so 1.0 joins
+# pauses up to ~1.5 s.
+VOICE_JOIN_GAP_S = 1.0
+VOICE_JOIN_PIECES = 3
 # Calibration trail (2026-09-28). A transcript alone cannot tell a badly CUT
 # phrase from a badly HEARD one: "timer twenty minutes" said twice came back as
 # 'pause timer' (1.17 s) and 'timer eleven minutes' (2.04 s), and the regions
@@ -1094,6 +1110,8 @@ class GazeWatcher:
     TALK_FRAMES = 2
     # Comfortably longer than the longest phrase (4 s) plus TALK_PRE.
     SEEN_KEEP = 15.0
+    # ~150 bytes a row, a row a second while a face is in view.
+    TRAIL_MAX_BYTES = 2_000_000
 
     def __init__(self, name, grabber, gate, presence, voice_gate, switch, arm_entity, tunables):
         self.name = name
@@ -1320,7 +1338,98 @@ class GazeWatcher:
             if now >= self._cool_until:
                 self._arm(median)
         self._publish(median)
+        # After the arming, so the trail never delays one.
+        try:
+            self._shadow(img, face, angle, grabbed, median)
+        except Exception:  # noqa: BLE001 - a measurement must not cost a frame
+            log.debug("[%s] gaze trail failed", self.name, exc_info=True)
         self._pace(started)
+
+    @staticmethod
+    def _iou(a, b):
+        ax, ay, aw, ah = (float(v) for v in a[:4])
+        bx, by, bw, bh = (float(v) for v in b[:4])
+        iw = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+        ih = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+        inter = iw * ih
+        union = aw * ah + bw * bh - inter
+        return inter / union if union > 0 else 0.0
+
+    def _row(self, face, ref):
+        return [
+            int(face[2]),
+            round(float(face[14]), 3),
+            round(self.frontal(face), 3),
+            round(self._iou(face, ref), 2),
+        ]
+
+    def _shadow(self, img, face, angle, grabbed, median):
+        """Log this gated frame, and what a cheaper finder would have said.
+
+        The question (2026-11-20, user: "øjenkontakt hurtigere"): YuNet on a
+        half-size frame costs 51 ms against 181 ms on the full one (measured in
+        this container), which is the CPU for two frames a second while a face
+        is in view — arming in ~1.5 s instead of ~3. Whether the half-size
+        finder sees every face the full one passes, and whether a full-size
+        re-detection inside its box gives the same score and frontal, needs
+        real faces, and the kitchen had three in 25 minutes that evening. So
+        every gated frame (~1 s, only while a face is in view) is logged with
+        both answers, and the pace changes only once they agree.
+        """
+        if not GAZE_LOG:
+            return
+        height, width = img.shape[:2]
+        small = cv2.resize(img, (width // 2, height // 2), interpolation=cv2.INTER_AREA)
+        self._det.setInputSize((small.shape[1], small.shape[0]))
+        began = time.process_time()
+        _, faces = self._det.detect(small)
+        half_ms = (time.process_time() - began) * 1000
+        half = roi = None
+        roi_ms = 0.0
+        best = None
+        for cand in faces if faces is not None else ():
+            cand = cand.copy()
+            cand[:14] *= 2
+            if best is None or self._iou(cand, face) > self._iou(best, face):
+                best = cand
+        if best is not None:
+            half = self._row(best, face)
+            side = max(float(best[2]), float(best[3])) * 2
+            cx, cy = float(best[0]) + float(best[2]) / 2, float(best[1]) + float(best[3]) / 2
+            x0, y0 = int(max(0, cx - side / 2)), int(max(0, cy - side / 2))
+            x1, y1 = int(min(width, cx + side / 2)), int(min(height, cy + side / 2))
+            crop = img[y0:y1, x0:x1]
+            if crop.size:
+                self._det.setInputSize((crop.shape[1], crop.shape[0]))
+                began = time.process_time()
+                _, found = self._det.detect(crop)
+                roi_ms = (time.process_time() - began) * 1000
+                near = None
+                for cand in found if found is not None else ():
+                    cand = cand.copy()
+                    # x y w h, then five (x, y) landmarks: w and h stay put
+                    cand[0] += x0
+                    cand[1] += y0
+                    cand[4:14:2] += x0
+                    cand[5:14:2] += y0
+                    if near is None or self._iou(cand, face) > self._iou(near, face):
+                        near = cand
+                if near is not None:
+                    roi = self._row(near, face)
+        row = {
+            "t": round(grabbed, 1),
+            "fuld": self._row(face, face)[:3],
+            "vinkel": round(angle, 1),
+            "median": None if median is None else round(median, 1),
+            "halv": half,
+            "roi": roi,
+            "ms": [round(half_ms), round(roi_ms)],
+        }
+        os.makedirs(os.path.dirname(GAZE_LOG), exist_ok=True)
+        if os.path.exists(GAZE_LOG) and os.path.getsize(GAZE_LOG) > self.TRAIL_MAX_BYTES:
+            os.replace(GAZE_LOG, GAZE_LOG + ".1")
+        with open(GAZE_LOG, "a") as out:
+            out.write(json.dumps(row) + "\n")
 
     def _pace(self, started):
         time.sleep(max(0.0, self.PACE - (time.monotonic() - started)))
@@ -1548,6 +1657,10 @@ class VoiceWatcher:
         self._lead = deque(maxlen=self._pad_frames)
         self._cur = None
         self._buf = b""
+        # Speech-like regions just closed, as (pcm, seconds, began, closed):
+        # the pieces a later region may be the end of (VOICE_JOIN_GAP_S).
+        # Capture thread only.
+        self._recent = deque(maxlen=VOICE_JOIN_PIECES - 1)
 
         self._sock = None
         self._file = None
@@ -1573,6 +1686,8 @@ class VoiceWatcher:
             "no_body": 0,
             "unarmed": 0,
             "hits": 0,
+            "joins": 0,
+            "join_hits": 0,
             "last": None,
             "last_ms": 0,
         }
@@ -1702,6 +1817,7 @@ class VoiceWatcher:
         self._buf = b""
         self._cur = None
         self._lead.clear()
+        self._recent.clear()
 
     # ---------------------------------------------------------------- capture
 
@@ -1742,26 +1858,64 @@ class VoiceWatcher:
             if overlong:
                 # Continuous sound is a running tap or a conversation, not one of
                 # three fixed phrases. Dropping it also bounds memory.
+                self._recent.clear()
                 return
             trim = max(0, silence - self._pad_frames)
-            self._close(frames[: len(frames) - trim] if trim else frames, began)
+            self._close(frames[: len(frames) - trim] if trim else frames, began, time.time())
 
-    def _close(self, frames, began):
+    def _joined(self, pcm, seconds, began):
+        """This region heard together with the pieces just before it, or None.
+
+        Walks back while each pause stays under VOICE_JOIN_GAP_S and the whole
+        stays within the longest phrase allowed (max_utt) — a join is still one
+        phrase, and long windows are what the STT returns nothing for.
+        """
+        parts, total, start = [pcm], seconds, began
+        for p_pcm, p_seconds, p_began, p_closed in reversed(self._recent):
+            if start - p_closed > VOICE_JOIN_GAP_S or total + p_seconds > self._tun.get("max_utt"):
+                break
+            parts.insert(0, p_pcm)
+            total += p_seconds
+            start = p_began
+        if len(parts) < 2:
+            return None
+        return b"".join(parts), total, start, len(parts)
+
+    def _close(self, frames, began, closed=None):
         self._stats["regions"] += 1
         seconds = len(frames) * VOICE_FRAME_MS / 1000.0
+        voiced = sorted(c for _, rms, c in frames if rms >= VOICE_FEAT_MIN_RMS)
+        zcr = voiced[len(voiced) // 2] if voiced else -1
+        # Every region that sounds like speech is remembered as a possible
+        # first half of the next one, whatever becomes of it below — the half
+        # that failed is exactly the one needed (VOICE_JOIN_GAP_S).
+        join = None
+        if voiced and zcr <= self._zcr_max and len(frames) <= self._max_frames:
+            pcm = b"".join(f for f, _, _ in frames)
+            if not self.calibrating():
+                join = self._joined(pcm, seconds, began)
+            self._recent.append(
+                (pcm, seconds, began, began + seconds if closed is None else closed)
+            )
         if len(frames) < self._min_frames:
             self._reject_armed("short", seconds, -1, frames, began)
+            # Too short to be a phrase, not too short to END one ('… minutes').
+            # Only inside an open window: the join is still an armed phrase.
+            if (
+                join is not None
+                and self._gate.enabled()
+                and (self.arm is None or self.arm.armed(self._arm_window, began))
+            ):
+                self._enqueue(None, seconds, zcr, began, join=join)
             return
         if len(frames) > self._max_frames:
             self._reject_armed("long", seconds, -1, frames, began)
             return
-        voiced = sorted(c for _, rms, c in frames if rms >= VOICE_FEAT_MIN_RMS)
         if not voiced:
             self._reject("silent", seconds, -1)
             return
-        zcr = voiced[len(voiced) // 2]
         if self.calibrating() and self._gate.enabled():
-            self._enqueue(frames, zcr, began, calib=True)
+            self._enqueue(b"".join(f for f, _, _ in frames), seconds, zcr, began, calib=True)
             return
         if zcr > self._zcr_max:
             self._reject_armed("noisy", seconds, zcr, frames, began)
@@ -1784,16 +1938,14 @@ class VoiceWatcher:
                 return
         if not self._gate.enabled():
             return
-        self._enqueue(frames, zcr, began)
+        self._enqueue(b"".join(f for f, _, _ in frames), seconds, zcr, began, join=join)
 
-    def _enqueue(self, frames, zcr, began, calib=False):
-        pcm = b"".join(f for f, _, _ in frames)
+    def _enqueue(self, pcm, seconds, zcr, began, calib=False, join=None):
+        """pcm None = a piece only worth hearing as the end of `join`."""
         with self._cond:
             if len(self._queue) == self._queue.maxlen:
                 self._stats["dropped"] += 1
-            self._queue.append(
-                (pcm, len(frames) * VOICE_FRAME_MS / 1000.0, zcr, time.monotonic(), began, calib)
-            )
+            self._queue.append((pcm, seconds, zcr, time.monotonic(), began, calib, join))
             self._cond.notify()
 
     # --------------------------------------------------------------- recognise
@@ -1803,7 +1955,7 @@ class VoiceWatcher:
             with self._cond:
                 while not self._queue:
                     self._cond.wait()
-                pcm, seconds, zcr, queued, began, calib = self._queue.popleft()
+                pcm, seconds, zcr, queued, began, calib, join = self._queue.popleft()
             if time.monotonic() - queued > VOICE_STALE_S and not calib:
                 self._stats["stale"] += 1
                 continue
@@ -1811,7 +1963,7 @@ class VoiceWatcher:
                 if calib:
                     self._handle_calib(pcm, seconds, zcr, began)
                 else:
-                    self._handle(pcm, seconds, zcr, began)
+                    self._handle(pcm, seconds, zcr, began, join)
             except Exception:  # noqa: BLE001 - a bad utterance must not kill the thread
                 log.exception("[%s] voice worker failed", self.name)
 
@@ -1829,22 +1981,49 @@ class VoiceWatcher:
         )
         self._save_clip(pcm, began, f"kal-{text or 'tom'}-{seconds:.2f}s")
 
-    def _handle(self, pcm, seconds, zcr, began):
+    def _handle(self, pcm, seconds, zcr, began, join=None):
+        # The region alone first: a phrase that works today must not wait for,
+        # or be spoiled by, the audio before it. Only a miss is retried joined.
+        if pcm is not None and self._act(self._hear(pcm, seconds, zcr, began), seconds, zcr, began):
+            return
+        if join is None:
+            return
+        joined, joined_seconds, joined_began, pieces = join
+        self._stats["joins"] += 1
+        text = self._hear(joined, joined_seconds, zcr, joined_began, pieces)
+        # Armed on THIS region's first word — the one _close() let through.
+        self._act(text, joined_seconds, zcr, began, pieces)
+
+    def _hear(self, pcm, seconds, zcr, began, pieces=1):
         started = time.monotonic()
         text = self._transcribe(pcm)
         elapsed = int((time.monotonic() - started) * 1000)
         self._stats["sent"] += 1
         self._stats["last_ms"] = elapsed
-        log.info("[%s] heard %r (%.2fs, zcr %d, %d ms)", self.name, text, seconds, zcr, elapsed)
+        log.info(
+            "[%s] heard %r (%.2fs%s, zcr %d, %d ms)",
+            self.name,
+            text,
+            seconds,
+            f", {pieces} pieces joined" if pieces > 1 else "",
+            zcr,
+            elapsed,
+        )
         # Only armed regions reach the STT, so this is the whole armed trail.
         # An EMPTY answer is logged and kept too: on 2026-09-28 three of six
         # armed regions came back empty and left no trace at all.
-        self._save_clip(pcm, began, f"{text or 'tom'}-{seconds:.2f}s")
+        prefix = f"samlet{pieces}-" if pieces > 1 else ""
+        self._save_clip(pcm, began, f"{prefix}{text or 'tom'}-{seconds:.2f}s")
+        return text
+
+    def _act(self, text, seconds, zcr, began, pieces=1):
+        """Push the command `text` names. True when it named one at all —
+        fired, cooled down or out of window alike — so it is not re-heard."""
         if not text:
-            return
+            return False
         parsed = parse_command(text)
         if parsed is None:
-            return
+            return False
         command, minutes = parsed
         now = time.monotonic()
         # One spoken phrase lands in several overlapping windows, so the same
@@ -1853,7 +2032,7 @@ class VoiceWatcher:
         # after it.
         if now - self._last_fire.get(command, -999) < self._cooldown:
             log.info("[%s] %s still in cooldown", self.name, command)
-            return
+            return True
         # The second half of the arming check, and the one that actually spends
         # the hand. Re-reading it here rather than trusting the check in
         # _close() matters because several noise regions can pass _close() on
@@ -1863,10 +2042,12 @@ class VoiceWatcher:
             if not self.arm.armed(self._arm_window, began):
                 log.info("[%s] %s dropped — arming window closed", self.name, command)
                 self._stats["unarmed"] += 1
-                return
+                return True
             self.arm.consume(self._arm_window, began)
         self._last_fire[command] = now
         self._stats["hits"] += 1
+        if pieces > 1:
+            self._stats["join_hits"] += 1
         self._stats["last"] = text
         push_state(
             self._entity,
@@ -1878,9 +2059,11 @@ class VoiceWatcher:
                 "tekst": text,
                 "varighed": round(seconds, 2),
                 "zcr": zcr,
+                "stykker": pieces,
                 "kilde": "gesture_frame_shim",
             },
         )
+        return True
 
     def _close_sock(self):
         for handle in (self._file, self._sock):

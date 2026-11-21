@@ -8,10 +8,10 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 
 | Entity | Files | Refs |
 |---|---|---|
-| `input_select.house_mode` | 132 | 316 |
+| `input_select.house_mode` | 132 | 317 |
 | `input_select.house_state` | 75 | 250 |
 | `script.push_notify` | 53 | 111 |
-| `light.spisestue_loft` | 50 | 126 |
+| `light.spisestue_loft` | 50 | 127 |
 | `binary_sensor.stue_apollo_occupancy_filtered` | 50 | 123 |
 | `binary_sensor.entre_valhorn_occupancy` | 48 | 109 |
 | `binary_sensor.boernevaerelse_apollo_occupancy` | 47 | 127 |
@@ -29,7 +29,7 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `sensor.open_plan_lux` | 35 | 107 |
 | `light.entre_loft` | 35 | 83 |
 | `light.boernevaerelse_hygge_strip` | 33 | 97 |
-| `binary_sensor.godnat_common_active` | 33 | 89 |
+| `binary_sensor.godnat_common_active` | 33 | 90 |
 | `binary_sensor.depot_valhorn_occupancy` | 32 | 72 |
 | `binary_sensor.godnat_any_active` | 30 | 64 |
 | `input_boolean.cinema_active` | 30 | 61 |

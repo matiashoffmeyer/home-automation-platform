@@ -344,17 +344,26 @@
     # slider 2026-06-28) — depot ligger klos op ad badet. Går man faktisk
     # ind i depotet, skruer depot_harry_potter_on (valhorn-trigger) HELT op
     # på alle depot-lys og overskriver pre-niveauet. Går man ikke derind, slukker
-    # depot-off-fallback'en (2026-06-11) strippen igen indenfor ~5-15 min.
+    # depot_approach_fast_clear strippen når entréen har været i ro
+    # early_detect_clear_seconds; strip-orphan-vagten og depot_off_long tæller
+    # deres ventetid fra approach-flaget og er det ydre net (2026-11-20).
     # Kun ved entré-triggeren — bad-sensorernes egne triggers rører ikke depot.
     # Ikke i godnat (nat-toilet-tur skal ikke lyse depotet op).
     # 2026-07-08 (#12, user-spec): depot-lys skal fungere som i NORMAL mode i
     # AirBnB (user fik det fejlagtigt deaktiveret). AirBnB-gaten fjernet — kun
     # godnat blokerer stadig (nat-toilet-tur skal ikke lyse depotet op).
+    # 2026-11-20 (bug-hunt): ikke mens depot-LOFTET lyser — så er der et besøg
+    # i gang, og strippen er besøgets (100 %), ikke et forvarsel. Uden vagten
+    # dæmpede entré-passagen den til 40 % og satte approach-flaget, og
+    # depot_approach_fast_clear slukkede den 30 s efter at depot-Valhornen faldt
+    # (en stille krop) — 9× på 10 døgn (11-11 → 11-18), mens loftet brændte
+    # videre 1-14 min til depotets egen sluk-vej. Søster-vagt i fast-clear'en.
     - if:
         - condition: template
           value_template: >-
             {{ trigger.entity_id == 'binary_sensor.entre_valhorn_occupancy'
-               and is_state('input_boolean.godnat_active', 'off') }}
+               and is_state('input_boolean.godnat_active', 'off')
+               and not is_state('light.depot_loft', 'on') }}
       then:
         - service: light.turn_on
           continue_on_error: true
@@ -706,6 +715,23 @@
             {% endif %}
           {% endif %}
         {% endfor %}
+        {# 2026-11-20 (bug-hunt, fejlklasse 29): et entré-forvarsel tænder badet
+           mens inde-PIR'en har været i ro længe, så /5-fallback'en slukkede det
+           ved første tick (16 gange på 7 døgn, 14 inden for ventetiden, 8 mens
+           entréen stadig var optaget; 11-20 19:15:00 slukket 12 s efter tænd).
+           Ventetiden tælles nu OGSÅ fra approach-flagets seneste skift;
+           badevaerelse_approach_fast_clear er den primære udgang. Flaget
+           skrives først når Matter-kaldet har svaret (148 approach-tænd på 7
+           døgn: p90 5 s, max 6 s efter lyset) → et tick i det hul så intet
+           flag; lysets egen tænd-flanke under 30 s lukker hullet. #}
+        {% set f = states.input_boolean.badevaerelse_approach_lit %}
+        {% set l = states.light.badevaerelse_all %}
+        {% if f is not none and f.state == 'on'
+              and (now() - f.last_changed).total_seconds() < wait %}
+          {% set ns.ok = false %}
+        {% elif l is not none and (now() - l.last_changed).total_seconds() < 30 %}
+          {% set ns.ok = false %}
+        {% endif %}
         {{ ns.ok }}
   action:
     # 2026-10-01 (user-spec): "jeg vil ikke ha at du slukker lys i badet uden at
@@ -1737,6 +1763,16 @@
     # Rør ikke hvis bruger har manuel kontrol over rummet.
     - condition: template
       value_template: "{{ not is_state('input_select.room_mode_badevaerelse', 'Manual') }}"
+    # 2026-11-20 (bug-hunt): mens en sluk-vej venter på fugt-målingen står kun
+    # spot 2 tændt MED VILJE (script.badevaerelse_fugt_ventesluk) — det ER
+    # blandet, men ikke en desync. Uden denne vagt slukkede default-grenen spot
+    # 2 8 s efter (41× på 7 døgn, uden frisk fugt-måling = user-spec 1/10
+    # brudt), og frisk-grenen re-tændte 1,3,4,5 i et tomt bad (29×), når spot 2
+    # var tændt < 120 s før. Samme vagt som enforceren (badevaerelse_faser.yaml);
+    # genrejsning og oprydning ejes af badevaerelse_fugt_ventesluk_genrejs.
+    - condition: state
+      entity_id: input_boolean.badevaerelse_fugt_venteslukket
+      state: "off"
   action:
     - choose:
         # Flertal ON → tænd resten med donor-brightness/CT.

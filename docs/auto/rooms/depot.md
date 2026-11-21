@@ -23,7 +23,7 @@ Search keywords: `depot`
 - **Harry Potter rum: Tænd hyggelig lys** (line 21, mode=single)
 - **Harry Potter rum: approach-lys hurtig-sluk** (line 129, mode=restart)
   - Pre-tændt depot-strip uden reel indgang (depot_approach_lit on, valhorn off)
-- **Harry Potter rum: approach-flag clear (strip slukket)** (line 168, mode=single)
+- **Harry Potter rum: approach-flag clear (strip slukket)** (line 177, mode=single)
 
 ---
 
@@ -47,7 +47,7 @@ Search keywords: `depot`
 ### `input_boolean.*`
 
 - `input_boolean.dance_room_depot` — 8 refs in 4 file(s)
-- `input_boolean.depot_approach_lit` — 8 refs in 3 file(s)
+- `input_boolean.depot_approach_lit` — 10 refs in 3 file(s)
 - `input_boolean.depot_valhorn_stuck_alerted` — 3 refs in 1 file(s)
 - `input_boolean.roborock_styrbar_kort_op_depot` — 1 refs in 1 file(s)
 - `input_boolean.roborock_styrbar_lang_op_depot` — 1 refs in 1 file(s)
@@ -80,7 +80,7 @@ Search keywords: `depot`
 ### `light.*`
 
 - `light.depot_all` — 27 refs in 11 file(s)
-- `light.depot_loft` — 20 refs in 13 file(s)
+- `light.depot_loft` — 22 refs in 15 file(s)
 - `light.depot_loft_hue_1` — 12 refs in 10 file(s)
 - `light.depot_loft_hue_2` — 12 refs in 10 file(s)
 - `light.depot_loft_ikea` — 12 refs in 10 file(s)

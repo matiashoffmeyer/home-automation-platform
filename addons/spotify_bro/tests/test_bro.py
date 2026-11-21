@@ -50,6 +50,8 @@ class FakeSpeaker:
         self.icy_titles: list[str] = []
         self.first_sample: int | None = None
         self.connect_delay = 1.5  # MPD fetches the stream a while after replaceAndPlay
+        self.reconnect_delay = 0.2  # ... and at once after 'stop; play' (same song)
+        self.connects = 0
         self.http: aiohttp.ClientSession | None = None
 
     # --- state push
@@ -59,20 +61,26 @@ class FakeSpeaker:
             s["q"].put_nowait(msg)
 
     # --- the "MPD player": pull the stream at real time
-    async def play(self, uri: str) -> None:
+    async def play(self, uri: str, delay: float | None = None, push: bool = True) -> None:
         if self.reader:
             self.reader.cancel()
         self.st.update(status="play", uri=uri)
         self.paused.clear()
         self.first_sample = None
-        self.reader = asyncio.ensure_future(self._read(uri))
-        self.push()
+        self.last_sample = None  # a new connection: its start is not a break
+        self._carry = b""
+        self.reader = asyncio.ensure_future(
+            self._read(uri, self.connect_delay if delay is None else delay)
+        )
+        if push:
+            self.push()
 
-    async def _read(self, uri: str) -> None:
+    async def _read(self, uri: str, delay: float) -> None:
         if not uri.startswith("http://127.0.0.1"):
             return  # "radio": nothing to fetch
         try:
-            await asyncio.sleep(self.connect_delay)
+            await asyncio.sleep(delay)
+            self.connects += 1
             async with self.http.get(
                 uri, headers={"Icy-MetaData": "1"}, timeout=aiohttp.ClientTimeout(total=None)
             ) as r:
@@ -185,12 +193,32 @@ class FakeSpeaker:
     # --- MPD
     async def mpd(self, reader, writer):
         writer.write(b"OK MPD 0.20.0\n")
+        batch: list[str] | None = None
         while line := await reader.readline():
             c = line.decode().strip()
             self.mpd_log.append(c)
             if c == "close":
                 break
-            if c == "status":
+            if c == "command_list_begin":
+                batch = []
+                continue
+            if batch is not None and c != "command_list_end":
+                batch.append(c)
+                continue
+            if c == "command_list_end":
+                # One OK for the list, and Volumio sees only the end state:
+                # 'stop; play' is play -> play, never a stop.
+                for b in batch:
+                    if b == "stop":
+                        if self.reader:
+                            self.reader.cancel()
+                        self.st["status"] = "stop"
+                    elif b == "play":
+                        self.paused.clear()
+                        await self.play(self.st["uri"], self.reconnect_delay, push=False)
+                batch = None
+                self.push()
+            elif c == "status":
                 writer.write(f"volume: {self.st['volume']}\nstate: {self.st['status']}\n".encode())
             elif c == "currentsong":
                 if self.st["uri"]:
@@ -213,7 +241,7 @@ class FakeSpeaker:
         writer.close()
 
 
-EXPECTED = 26
+EXPECTED = 30
 GRACE = 1.0  # stop_grace_s in the test
 
 
@@ -480,6 +508,74 @@ async def main() -> None:
         assert time.monotonic() - t0 >= GRACE - 0.1, time.monotonic() - t0
         assert not (await status())["ejer_hoejttaler"]
         ok("køen slut (stopped uden playing) → Volumio stop efter stop_grace_s")
+
+        # 11d. a skip while playing (0.1.7, B308): the old song's rest in the
+        #      pipe is dropped and MPD refetches (stop; play as ONE command
+        #      list) - the room hears the new song without MPD's ~4 s of the
+        #      old, and Volumio never sees a stop
+        await fake("play")
+        await wait_for(lambda: _try(lambda: _hoejttaler(status, "spiller")), 6, "spiller før skip")
+        await wait_for(lambda: sp.first_sample is not None, 5, "MPD henter strømmen")
+        await asyncio.sleep(2)  # steady state: the pipe full, MPD's buffer full
+        lst = ["command_list_begin", "stop", "play", "command_list_end"]
+
+        async def flushed(what, **q):
+            n_rep, c0, m0, b0 = len(sp.replace), sp.connects, len(sp.mpd_log), sp.breaks
+            seen = []
+            watch = asyncio.create_task(_watch_status(sp, seen))
+            await fake(what, **q)
+            await wait_for(
+                lambda: sp.connects > c0 and sp.first_sample is not None, 5, f"ny strøm ({what})"
+            )
+            watch.cancel()
+            log = sp.mpd_log[m0:]
+            i = log.index("command_list_begin")
+            assert log[i : i + 4] == lst, log
+            assert "pause 0" not in log and "stop" not in seen, (log, seen)
+            assert len(sp.replace) == n_rep, sp.replace
+            # Samples wrap every 0.74 s, so the first one alone cannot prove
+            # that no old audio leaked: a leak shows as a jump INSIDE the new
+            # connection, where the old audio ends and the new begins.
+            fs, by = sp.first_sample, sp.bytes
+            await wait_for(lambda: sp.bytes - by > BPS // 2, 4, f"lyd efter {what}")
+            assert sp.breaks == b0, (sp.breaks, b0)
+            return fs
+
+        fs = await flushed("skip", sample=20000)
+        assert 20000 <= fs <= 20000 + 6615, fs  # the new song, at most 0.15 s in
+        st = await status()
+        assert st["buffer_toemninger"] == 1 and st["titel"] == "Sang 3", st
+        ok(f"skip mens den spiller → gammel lyd droppet, MPD henter forfra (sample {fs})")
+
+        # 11e. the queue moving on by itself (not_playing first): gapless,
+        #      the next song is already in the pipe - nothing is flushed
+        await asyncio.sleep(1.5)
+        c0, m0 = sp.connects, len(sp.mpd_log)
+        await fake("natural")
+        await asyncio.sleep(GRACE + 1)
+        st = await status()
+        assert "command_list_begin" not in sp.mpd_log[m0:] and sp.connects == c0
+        assert st["buffer_toemninger"] == 1 and st["titel"] == "Sang 4", st
+        assert st["hoejttaler"] == "spiller", st
+        ok("nummeret slutter af sig selv → ingen tømning (gapless)")
+
+        # 11f. a seek while playing flushes the same way
+        fs = await flushed("seek", sample=5000)
+        assert 5000 <= fs <= 5000 + 6615, fs
+        ok(f"spoling → bufferen tømt (sample {fs})")
+
+        # 11g. a skip while paused: play must not start with MPD's paused
+        #      ~4 s of the old song ('pause 0') but with the new one
+        await asyncio.sleep(1.5)
+        n_p = sp.mpd_log.count("pause 1")
+        await fake("pause")
+        await wait_for(lambda: sp.mpd_log.count("pause 1") > n_p, 3, "MPD pause 1")
+        await wait_for(lambda: _try(lambda: _tilstand(status, "paused")), 3, "status paused")
+        await asyncio.sleep(1)
+        fs = await flushed("skip", sample=12000)
+        assert 12000 <= fs <= 12000 + 6615, fs
+        assert (await status())["buffer_toemninger"] == 3
+        ok(f"skip på pause → play starter på det nye nummer, ikke 'pause 0' (sample {fs})")
 
         # 11b. a zeroconf re-login mid-song replaces go-librespot's player
         #      without an event: the bridge must let go of the speaker

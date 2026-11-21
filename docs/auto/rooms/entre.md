@@ -40,13 +40,13 @@ Search keywords: `entre`
   - 2026-10-15 (user-spec): "langt tryk op og 3 hurtige piletryk og 3 hurtige
 - **Entré Styrbar: BUND quick -> sluk ALT lys (uden gardiner) + grace** (line 300, mode=single)
   - 2026-06-16 (user-spec) — REDESIGN: kort NED dæmper IKKE længere entré ned
-- **Entré Styrbar: Auto-ryd undo grace efter 10 min** (line 397, mode=single)
+- **Entré Styrbar: Auto-ryd undo grace efter 10 min** (line 400, mode=single)
   - Naar grace har staaet on i 10 min uden TOP-press, slukker vi den.
-- **Entré Styrbar: Auto-ryd nedluknings-grace efter slider-min** (line 436, mode=restart)
+- **Entré Styrbar: Auto-ryd nedluknings-grace efter slider-min** (line 439, mode=restart)
   - Nedluknings-grace (set af NED kort/lang i Normal OG AirBnB) holder ALLE
-- **Entré Styrbar: BUND long -> sluk alt (uden gardiner) + Roborock full** (line 473, mode=single)
+- **Entré Styrbar: BUND long -> sluk alt (uden gardiner) + Roborock full** (line 476, mode=single)
   - 2026-06-16 (user-spec): "det samme som NED kort PLUS grundig rengøring".
-- **Entré Styrbar: L/R mode cycle [auto, zen, all_bright, all_off]** (line 560, mode=restart)
+- **Entré Styrbar: L/R mode cycle [auto, zen, all_bright, all_off]** (line 563, mode=restart)
   - L/R quick på entré Styrbar = cycle mellem 4 modes. Cursor wraps via
 
 ---
@@ -76,7 +76,7 @@ Search keywords: `entre`
 
 - `input_boolean.airbnb_velkomst_move_entre` — 3 refs in 2 file(s)
 - `input_boolean.dance_room_entre` — 5 refs in 5 file(s)
-- `input_boolean.entre_shutdown_grace` — 26 refs in 9 file(s)
+- `input_boolean.entre_shutdown_grace` — 28 refs in 10 file(s)
 - `input_boolean.entre_somrig_undo_grace` — 8 refs in 3 file(s)
 - `input_boolean.entre_valhorn_outage_alerted` — 4 refs in 2 file(s)
 - `input_boolean.entre_valhorn_stuck_alerted` — 3 refs in 1 file(s)
@@ -135,7 +135,7 @@ Search keywords: `entre`
 
 ### `sensor.*`
 
-- `sensor.entre_cykel_lader_effekt` — 14 refs in 6 file(s)
+- `sensor.entre_cykel_lader_effekt` — 16 refs in 6 file(s)
 - `sensor.entre_cykel_lader_energi` — 4 refs in 2 file(s)
 - `sensor.entre_dagslys_sample` — 6 refs in 1 file(s)
 - `sensor.entre_lux_reel` — 6 refs in 3 file(s)

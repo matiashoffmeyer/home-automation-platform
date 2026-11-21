@@ -6,7 +6,7 @@ Search keywords: `terrasse`
 
 ## Indhold
 - [Automations](terrasse.md#automations) (16)
-- [Entities](terrasse.md#entities) (53)
+- [Entities](terrasse.md#entities) (56)
 - [Helpers](terrasse.md#helpers) (16)
 
 ---
@@ -69,6 +69,7 @@ Search keywords: `terrasse`
 - `binary_sensor.terrasse_lys_on_effektiv` — 1 refs in 1 file(s)
 - `binary_sensor.terrasse_nat_sluk_vindue` — 10 refs in 4 file(s)
 - `binary_sensor.terrasse_regn_aktiv` — 15 refs in 6 file(s)
+- `binary_sensor.terrasse_saeson` — 8 refs in 5 file(s)
 
 ### `button.*`
 
@@ -106,6 +107,8 @@ Search keywords: `terrasse`
 - `input_number.terrasse_regn_dmi_threshold_mm` — 2 refs in 2 file(s)
 - `input_number.terrasse_regn_dry_release_hours` — 3 refs in 2 file(s)
 - `input_number.terrasse_regn_hold_max_hours` — 3 refs in 2 file(s)
+- `input_number.terrasse_saeson_slut_maaned` — 3 refs in 2 file(s)
+- `input_number.terrasse_saeson_start_maaned` — 3 refs in 2 file(s)
 - `input_number.terrasse_skumring_elevation` — 12 refs in 6 file(s)
 
 ### `input_select.*`

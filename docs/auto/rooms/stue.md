@@ -6,7 +6,7 @@ Search keywords: `stue, open_plan`
 
 ## Indhold
 - [Automations](stue.md#automations) (22)
-- [Entities](stue.md#entities) (313)
+- [Entities](stue.md#entities) (314)
 - [Helpers](stue.md#helpers) (95)
 
 ---
@@ -20,7 +20,7 @@ Search keywords: `stue, open_plan`
 
 ### `automations/arrival.yaml`
 
-- **Hjemkomst: Velkomstlys stue+køkken** (line 109, mode=single)
+- **Hjemkomst: Velkomstlys stue+køkken** (line 117, mode=single)
 
 ### `automations/godmorgen_godnat.yaml`
 
@@ -61,7 +61,7 @@ Search keywords: `stue, open_plan`
 - **Lysnet: Sofa-stue tænd** (line 189, mode=single)
 - **Lysnet: Spisestue gradvis sluk** (line 399, mode=restart)
   - 2026-06-19 (user-spec): spisestue-loftet slukker når spisebords-Apolloen
-- **Lysnet: Sofa-stue gradvis sluk** (line 529, mode=restart)
+- **Lysnet: Sofa-stue gradvis sluk** (line 548, mode=restart)
   - 2026-06-19: sofa-lamperne slukker når sofa-Apolloen (stue_apollo) har været
 
 ### `automations/somrig_buttons.yaml`
@@ -84,6 +84,7 @@ Search keywords: `stue, open_plan`
 - `automation.activity_bedroom_only_winddown_soft_fade_af_stue_koekken` — 2 refs in 1 file(s)
 - `automation.godnat_born_oppe_i_stuen_foraeldre_sover_stadig` — 2 refs in 1 file(s)
 - `automation.godnat_gendan_stuelys_ved_godnat_slut_stue_allerede_beboet` — 2 refs in 1 file(s)
+- `automation.godnat_voksen_nattur_dim_stue_kokken` — 1 refs in 1 file(s)
 - `automation.hojttaler_bt_synlig_kun_for_airbnb_gaester_i_open_plan` — 1 refs in 1 file(s)
 - `automation.kokken_lyskaede_forste_lys_kulsort_open_plan_bevaegelse` — 2 refs in 2 file(s)
 - `automation.lysnet_sofa_stue_taend` — 5 refs in 5 file(s)
@@ -149,7 +150,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.stue_spots_ild_thread_pause` — 2 refs in 2 file(s)
 - `binary_sensor.stue_spots_spotify_aktiv` — 8 refs in 3 file(s)
 - `binary_sensor.styrbar_stue_radio` — 7 refs in 5 file(s)
-- `binary_sensor.styrbar_stue_spotify` — 3 refs in 1 file(s)
+- `binary_sensor.styrbar_stue_spotify` — 4 refs in 2 file(s)
 
 ### `button.*`
 
@@ -314,7 +315,7 @@ Search keywords: `stue, open_plan`
 ### `light.*`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
-- `light.spisestue_loft` — 126 refs in 50 file(s)
+- `light.spisestue_loft` — 127 refs in 50 file(s)
 - `light.spisestue_pendel` — 138 refs in 40 file(s)
 - `light.stue_all` — 26 refs in 14 file(s)
 - `light.stue_apollo_rgb_light` — 5 refs in 3 file(s)

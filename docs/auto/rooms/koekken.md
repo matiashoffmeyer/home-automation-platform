@@ -6,7 +6,7 @@ Search keywords: `koekken, kokken`
 
 ## Indhold
 - [Automations](koekken.md#automations) (9)
-- [Entities](koekken.md#entities) (245)
+- [Entities](koekken.md#entities) (248)
 - [Helpers](koekken.md#helpers) (42)
 
 ---
@@ -29,12 +29,12 @@ Search keywords: `koekken, kokken`
 - **Lysnet: Køkken tænd** (line 32, mode=single)
 - **Lysnet: Køkken-spots ved madlavning (central zone + lux-gated)** (line 196, mode=single)
   - 2026-06-17 (item 1 user-spec, omlagt): tænd KUN køkken-spots
-- **Lysnet: Køkken-spots sluk (køkken tomt)** (line 618, mode=restart)
+- **Lysnet: Køkken-spots sluk (køkken tomt)** (line 620, mode=restart)
   - 2026-06-17 rev.2 (user-spec "wider zone only"): spots slukker når man
-- **Lysnet: Køkken-spots sluk ved dagslys** (line 771, mode=single)
+- **Lysnet: Køkken-spots sluk ved dagslys** (line 821, mode=single)
   - Slukker switch.koekken_spots når køkkenets egen lux har ligget over
-- **Lysnet: Køkken-lyskæde sluk (køkken tomt / lys stiger)** (line 835, mode=restart)
-- **Lysnet: Køkken-session slut (tomt X min / godnat / væk)** (line 1114, mode=restart)
+- **Lysnet: Køkken-lyskæde sluk (køkken tomt / lys stiger)** (line 885, mode=restart)
+- **Lysnet: Køkken-session slut (tomt X min / godnat / væk)** (line 1164, mode=restart)
   - Afslut madlavnings-sessionen (input_boolean.koekken_session_active) når
 
 ---
@@ -47,6 +47,7 @@ Search keywords: `koekken, kokken`
 - `automation.airbnb_kokken_vedvarende_bevaegelse_active_thread_uafhaengig` — 1 refs in 1 file(s)
 - `automation.gestus_bevaegelse_i_kokkenet_bed_kameraet_kigge_efter_fingre` — 1 refs in 1 file(s)
 - `automation.gestus_fingre_i_kokkenet_kokken_timer` — 1 refs in 1 file(s)
+- `automation.godnat_voksen_nattur_dim_stue_kokken` — 1 refs in 1 file(s)
 - `automation.kokken_gestus_start_timer_pa_n_minutter` — 1 refs in 1 file(s)
 - `automation.kokken_lyskaede_farve_preview_nar_du_skruer_pa_farven` — 2 refs in 1 file(s)
 - `automation.kokken_lyskaede_forste_lys_kulsort_open_plan_bevaegelse` — 2 refs in 2 file(s)
@@ -80,8 +81,8 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.koekken_bevaegelse_raa` — 2 refs in 1 file(s)
 - `binary_sensor.koekken_dvale_vidne` — 3 refs in 3 file(s)
 - `binary_sensor.koekken_hjemkomstlys` — 1 refs in 1 file(s)
-- `binary_sensor.koekken_kamera_krop` — 9 refs in 5 file(s)
-- `binary_sensor.koekken_kamera_krop_gyldig` — 2 refs in 2 file(s)
+- `binary_sensor.koekken_kamera_krop` — 13 refs in 5 file(s)
+- `binary_sensor.koekken_kamera_krop_gyldig` — 3 refs in 3 file(s)
 - `binary_sensor.koekken_kamera_vaagen` — 6 refs in 3 file(s)
 - `binary_sensor.koekken_lys_on_effektiv` — 2 refs in 2 file(s)
 - `binary_sensor.koekken_lyskaede_laant` — 4 refs in 3 file(s)
@@ -103,9 +104,10 @@ Search keywords: `koekken, kokken`
 ### `input_boolean.*`
 
 - `input_boolean.dance_room_koekken` — 13 refs in 6 file(s)
+- `input_boolean.koekken_arm_pause_hoejttaler_enabled` — 2 refs in 2 file(s)
 - `input_boolean.koekken_blik_arm_enabled` — 3 refs in 3 file(s)
 - `input_boolean.koekken_cooking_ramp` — 4 refs in 3 file(s)
-- `input_boolean.koekken_kamera_krop_enabled` — 7 refs in 5 file(s)
+- `input_boolean.koekken_kamera_krop_enabled` — 9 refs in 5 file(s)
 - `input_boolean.koekken_lav_krop_boern_enabled` — 3 refs in 3 file(s)
 - `input_boolean.koekken_session_active` — 12 refs in 4 file(s)
 - `input_boolean.koekken_stemme_arm_enabled` — 5 refs in 5 file(s)
@@ -197,8 +199,8 @@ Search keywords: `koekken, kokken`
 - `input_number.koekken_skift_min_segment_sek` — 2 refs in 2 file(s)
 - `input_number.koekken_spots_dagslys_sluk_lux` — 6 refs in 4 file(s)
 - `input_number.koekken_spots_hang_pct` — 2 refs in 2 file(s)
-- `input_number.koekken_spots_lux_threshold` — 6 refs in 4 file(s)
-- `input_number.koekken_spots_off_seconds` — 10 refs in 3 file(s)
+- `input_number.koekken_spots_lux_threshold` — 7 refs in 4 file(s)
+- `input_number.koekken_spots_off_seconds` — 11 refs in 3 file(s)
 - `input_number.koekken_spots_ramp_pct` — 2 refs in 2 file(s)
 - `input_number.koekken_still_ghost_sekunder` — 4 refs in 2 file(s)
 - `input_number.koekken_taend_bevaegelse_min_sekunder` — 3 refs in 2 file(s)
@@ -223,7 +225,7 @@ Search keywords: `koekken, kokken`
 - `input_text.koekken_lyskaede_preview` — 10 refs in 3 file(s)
 - `input_text.koekken_stemme_arm_gestus` — 4 refs in 3 file(s)
 - `input_text.koekken_stemme_arm_run` — 2 refs in 1 file(s)
-- `input_text.koekken_stemme_armeret_at` — 4 refs in 2 file(s)
+- `input_text.koekken_stemme_armeret_at` — 5 refs in 2 file(s)
 
 ### `light.*`
 
@@ -256,6 +258,7 @@ Search keywords: `koekken, kokken`
 ### `script.*`
 
 - `script.koekken_apollo_apply_all_gates` — 1 refs in 1 file(s)
+- `script.koekken_arm_pause_hoejttaler` — 3 refs in 2 file(s)
 - `script.koekken_gestus_alarm_burst` — 3 refs in 1 file(s)
 - `script.koekken_gestus_alarm_stop` — 5 refs in 1 file(s)
 - `script.koekken_gestus_burst_once` — 5 refs in 1 file(s)
@@ -290,7 +293,7 @@ Search keywords: `koekken, kokken`
 - `sensor.koekken_bevaegelse_akkumuleret` — 1 refs in 1 file(s)
 - `sensor.koekken_blik_sidst` — 1 refs in 1 file(s)
 - `sensor.koekken_cooking_threshold_min` — 4 refs in 1 file(s)
-- `sensor.koekken_dagslys_lx` — 24 refs in 7 file(s)
+- `sensor.koekken_dagslys_lx` — 25 refs in 7 file(s)
 - `sensor.koekken_dagslys_sample` — 4 refs in 3 file(s)
 - `sensor.koekken_felt_aktiv_30m` — 2 refs in 1 file(s)
 - `sensor.koekken_kamera_blik` — 3 refs in 1 file(s)
@@ -310,8 +313,8 @@ Search keywords: `koekken, kokken`
 - `sensor.koekken_occupancy_recent` — 3 refs in 1 file(s)
 - `sensor.koekken_skift_segment` — 9 refs in 2 file(s)
 - `sensor.koekken_spots_dagslys_sluk_effektiv` — 6 refs in 3 file(s)
-- `sensor.koekken_spots_lux_gate_effektiv` — 10 refs in 5 file(s)
-- `sensor.koekken_stemme_kommando` — 6 refs in 1 file(s)
+- `sensor.koekken_spots_lux_gate_effektiv` — 11 refs in 5 file(s)
+- `sensor.koekken_stemme_kommando` — 8 refs in 2 file(s)
 - `sensor.koekken_stemme_sidst` — 5 refs in 3 file(s)
 - `sensor.koekken_timer_varsel_tid` — 1 refs in 1 file(s)
 - `sensor.koekken_trigger_log` — 4 refs in 2 file(s)

@@ -72,20 +72,32 @@ Kendt pris:
   er ikke målt. Afgøres ved live-testen med Parent B's konto.
 - UBEKRÆFTET: om broen skifter pænt mellem to konti (zeroconf `addUser` fra
   en anden telefon, mens en anden konto er gemt med `persist_credentials`).
-- Start/skip-latens afhænger af MPD's buffer. Det er ikke målt på den ægte
-  N3 endnu.
+- Start/skip-latens afhænger af MPD's buffer (~3,8 s på N3'en) plus ~0,8 s i
+  broen (pipe + StreamReader). **0.1.7 (`skip_flush`, default til):** et skip,
+  et nyt nummer eller en spoling mens højttaleren spiller dropper broens rest
+  af det gamle nummer (byte-præcist: StreamReader + pipe via FIONREAD + den
+  ene 8 KB-skrivning go-librespot hænger i) og sender MPD `stop; play` som ÉN
+  command list — MPD smider sin buffer og henter strømmen igen, Volumio ser
+  play → play (et nøgent `stop` får den til at genstarte webradioen). På pause
+  gemmes tømningen til play (i stedet for `pause 0`, der spillede det gamle
+  nummers ~4 s først). Naturligt nummerskift (`not_playing` først) røres ikke:
+  gapless, næste nummer ligger allerede i pipen. Forventet: skip ~4,5 s → MPD's
+  genforbindelse + `connect_burst_s`-starten (~1 s). Ikke lyttetestet;
+  `buffer_toemninger` i /status og "Højttaler: buffer tømt" i loggen.
 
 ## Filer
 
 | Fil | Indhold |
 |---|---|
 | `config.yaml`, `build.yaml`, `Dockerfile`, `run.sh` | add-on'en (Debian bookworm-base, go-librespot hentet med sha256-tjek pr. arch) |
-| `bro.py` | broen (aiohttp, ~860 linjer) |
+| `bro.py` | broen (aiohttp, ~1200 linjer) |
 | (HA-siden) | `packages/spotify_bro.yaml`: `sensor.spotify_bro`, `binary_sensor.spotify_bro_spiller`, `rest_command.spotify_bro_cmd`. Knappen `input_boolean.hoejttaler_spotify_bro` + start/stop-automationen i `packages/hoejttaler.yaml` |
-| `tests/test_bro.py` + `tests/fake_librespot.py` | 23 offline-trin mod en falsk N3 (Volumio REST + socket.io + MPD) og en falsk go-librespot med blokerende stdout |
+| `tests/test_bro.py` + `tests/fake_librespot.py` | 30 offline-trin mod en falsk N3 (Volumio REST + socket.io + MPD) og en falsk go-librespot med blokerende stdout |
 
-Køres med `python3 tests/test_bro.py` (kræver aiohttp; `flac` for flac-trinnet).
-Resultat 16/10 (0.1.4): 26/26 i venv. (0.1.2: 23/23.) 0.1.0: 16/16 både i venv og i det byggede image (Python 3.11 /
+Køres med `PATH=.cache/dev-venv/bin:$PATH python3 tests/test_bro.py` (kræver aiohttp —
+også fake_librespot, der starter via `#!/usr/bin/env python3`; `flac` for flac-trinnet).
+Resultat 20/11 (0.1.7): 30/30 + test_burst 4/4; en kunstig lækage (drop uden pipe-resten)
+fanges af 11d. 16/10 (0.1.4): 26/26 i venv. (0.1.2: 23/23.) 0.1.0: 16/16 både i venv og i det byggede image (Python 3.11 /
 aiohttp 3.8). Den ægte go-librespot accepterede broens config i imaget
 (API oppe på 127.0.0.1:38950). Den døde kun på apresolve, fordi testen var
 uden net.

@@ -1902,6 +1902,26 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   gemmes i `/share/gesture_frame_shim/clips` (ring på 80) — start dér næste gang
   en stemme-kommando "hørte noget andet".
 
+- **En tøven midt i en stemme-kommando skærer den i to regioner** — `VOICE_GAP_S`
+  lukker efter 0,45 s stilhed, og 'timer … eight minutes' kom tilbage `''` + `''`
+  hver for sig, men 'timer eight minutes' samlet (replay af klip-ringen
+  2026-11-20; 11-05 17:23). Et længere gap er IKKE løsningen: 11-04 18:03 var 11
+  regioner med ≤ 0,7 s imellem, og én region af det hele var droppet som for lang.
+  → shim 0.16.4 prøver regionen alene først og hører den kun IGEN sammen med op
+  til to stykker lige før (pause ≤ ~1,5 s, samlet ≤ `max_utt`). **Signatur: klip
+  med præfikset `samlet2-`/`samlet3-` i klip-ringen, og `stykker` > 1 på
+  `sensor.koekken_stemme_kommando`.**
+
+- **Et blik/en hånd der armerer mikrofonen pauser også højttaleren** (Spotify-broen
+  og DR-radioen, aldrig AirPlay/MA) i armerings-vinduet, så kommandoen kan høres
+  (`script.koekken_arm_pause_hoejttaler`, kill switch
+  `input_boolean.koekken_arm_pause_hoejttaler_enabled`, 2026-11-20). Genoptages når
+  vinduet lukker / 1,5 s efter en hørt kommando / senest 60 s — men KUN hvis
+  ingen rørte højttaleren imens (Styrbar-stop-stempel, ny kanal, et HA-lydscript).
+  Målt 7 døgn før: 12 armeringer, 9 mens højttaleren spillede, 3 hørte kommandoer
+  → ~1 falsk 12-s pause pr. døgn. En HA-genstart midt i ventetiden efterlader
+  musikken pauset.
+
 - **Køkken-kameraet hænger ~30 cm over users hoved — øjenkontakt kræver et
   vippet hoved, og blik-modellen læser det bevidste kig HØJT og ustabilt**
   (user 2026-10-03). Målt samme dag tæt på (ansigt 111-142 px, score 0,85-0,93,

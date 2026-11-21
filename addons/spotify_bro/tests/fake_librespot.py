@@ -3,7 +3,8 @@
 (/status, /player/*, /events WebSocket) and - the point of it - the same
 blocking PCM writes to stdout, as fast as the reader accepts.
 
-/fake/<play|load_paused|pause|stop|inactive|volume?v=N> plays the phone's part.
+/fake/<play|load_paused|pause|stop|inactive|volume?v=N|skip|natural|seek> plays
+the phone's part.
 /fake/reset is a zeroconf re-login: the player is replaced without an event,
 only the "accepted zeroconf" log line; /fake/reset_silent leaves even that out.
 /fake/stats reports the longest single stdout write (the dealer-hang proxy).
@@ -32,13 +33,17 @@ loop: asyncio.AbstractEventLoop
 
 def writer() -> None:
     out = sys.stdout.buffer
-    n = 44100 // 20
+    n = 2048  # go-librespot hands the pipe 8192 bytes per write
     while True:
         if not state["playing"]:
             wake.wait(0.2)
             wake.clear()
             continue
-        s0 = state["sample"]
+        # A skip/seek moves the sample counter: popped here, so it can never
+        # be lost to the line below (the writer thread races the handler).
+        s0 = state.pop("jump", None)
+        if s0 is None:
+            s0 = state["sample"]
         buf = b"".join(struct.pack("<hh", (s0 + i) % 32768, (s0 + i) % 32768) for i in range(n))
         state["sample"] = (s0 + n) % 32768
         t = time.monotonic()
@@ -113,7 +118,9 @@ async def h_player(req):
 
 async def h_fake(req):
     name = req.match_info["name"]
-    if name in ("play", "load_paused"):
+    if name == "play" and state["active"] and not state["stopped"]:
+        await set_playing(True)  # resume: go-librespot says only "playing"
+    elif name in ("play", "load_paused"):
         if not state["active"]:
             state["active"] = True
             await emit("active", {})
@@ -151,6 +158,37 @@ async def h_fake(req):
         state.update(playing=True, stopped=False)
         wake.set()
         await emit("playing", {})
+    elif name in ("skip", "natural"):
+        # go-librespot (9085364) on a skip from the app: will_play while the
+        # old song still plays, then the swap (metadata) and playing. At a
+        # natural end not_playing comes first, and the next song is already
+        # in the pipe (gapless): nothing to drop.
+        if name == "natural":
+            await emit("not_playing", {})
+        await emit("will_play", {})
+        await asyncio.sleep(0.3)
+        if name == "skip":
+            state["jump"] = int(req.query.get("sample", 20000))
+            # the swap and the event come together; 20 ms lets a buffer the
+            # writer thread built before the jump reach the pipe first
+            await asyncio.sleep(0.02)
+        await emit(
+            "metadata",
+            {
+                "uri": "spotify:track:z",
+                "name": "Sang 3" if name == "skip" else "Sang 4",
+                "artist_names": ["Kunstner"],
+                "album_name": "Album",
+                "duration": 200000,
+                "position": 0,
+            },
+        )
+        # a skip on pause starts the next song too (advanceNext: IsPaused = false)
+        await set_playing(True)
+    elif name == "seek":
+        state["jump"] = int(req.query.get("sample", 20000))
+        await asyncio.sleep(0.02)
+        await emit("seek", {"position": 60000, "duration": 200000})
     elif name in ("reset", "reset_silent"):
         state.update(playing=False, active=False, stopped=True)
         if name == "reset":

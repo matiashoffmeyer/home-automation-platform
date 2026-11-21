@@ -280,8 +280,8 @@ Resten sættes i add-on'ets web-UI. Værdier for den Frigate-frie vej:
 | `mqtt_topic` | `house/gesture/scan` | vores eget emne |
 | `topic_filters` | tomt | vi publicerer kun når vi mener det |
 | `snapshot_mode` | `continuous` | se fælden nedenfor |
-| `continuous_snapshot_count` | `7` | 2026-10-11 (før 5) — bygen skal være kortere end scan-løkkens 5 s |
-| `continuous_snapshot_interval` | `0.5` | 2026-10-11 (før 1): målt ~0,62 s pr. billede → ~3,8 s pr. byge |
+| `continuous_snapshot_count` | `10` | 2026-11-20 (før 7, før det 5) — bygen skal være kortere end scan-løkkens 5 s; byge-længden holdt uændret |
+| `continuous_snapshot_interval` | `0.25` | 2026-11-20 (før 0.5, før det 1): 7×0.5 målte 4,14 s pr. byge (p90 4,37, 104 droppede af 8198 på 26 t) = ~0,68 s pr. billede → 3 hold-frames spændte ~1,4 s; nu ~0,43 s pr. billede → ~0,9 s. Sættes via web-UI'ets `POST /api/config` (live, ingen genstart) |
 | `recognizer_backend` | `landmarks` | `three_fingers` findes kun her |
 | `output_topic_template` | `hand-recognition/{camera}` | |
 | `max_snapshots` | `10` | 2026-10-28 (før 100), B273: hvert billede gemmes som jpg, og med 10 slettes det efter ~7 s — før kernen skriver det til disken (30 s) → ~4 KiB pr. billede mod 134. **Aldrig 0:** crasher (`popleft` på tom deque) |
@@ -692,6 +692,17 @@ mere af de pixels MediaPipe ser — shimmen ejer kropsdetektionen selv, så
 `/api/<kamera>/latest.jpg` bruges KUN af hand_recognition og kan beskæres uden at
 røre #9/#10. Beskæring fjerner desuden billedindhold i stedet for at tilføje
 det, så den rører ikke ved børne-randbetingelsen.
+
+**Hurtigere øjenkontakt (2026-11-20, ikke bygget endnu).** Blikket armerer på
+medianen af 3 billeder à 1 s (`PACE`) → ~3 s. YuNet koster 181 ms på det fulde
+billede og 51 ms på et halvt (målt i shim-containeren); det er CPU'en til 2
+billeder/s mens et ansigt er i billedet → ~1,5 s. Før tempoet ændres skal to ting
+måles på RIGTIGE ansigter: (a) finder den halve opløsning hvert ansigt den fulde
+lader igennem, og (b) giver en fuld-opløsnings-gendetektion inde i dens boks
+samme score/frontal. Shim 0.16.4 logger begge svar for hvert godkendt billede i
+`/share/gesture_frame_shim/gaze.jsonl` (`fuld`/`halv`/`roi` = w, score, frontal,
+IoU). Og hurtigere = flere falske armeringer, som nu også pauser højttaleren —
+regn den falske rate ud på sporets vinkler før `koekken_blik_frames`/`PACE` røres.
 
 ---
 

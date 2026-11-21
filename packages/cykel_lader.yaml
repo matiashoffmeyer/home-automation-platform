@@ -42,7 +42,11 @@
 # EFFEKT-MÅLINGEN GØR DET SMART (user-spec):
 #   • FÆRDIG-detektion: pluggen tændt + effekt under `idle_watt` i
 #     `faerdig_minutter` → alt tilsluttet er fuldt → sluk + kvittering.
-#     Fanger også "der var slet ikke sat noget til".
+#     Fanger IKKE "der var slet ikke sat noget til" (rettet 2026-11-20):
+#     numeric_state kræver en krydsning NED, og uden batteri står effekten
+#     i tomgang hele natten → pluggen står tændt i de billige timer (≈ 0 W;
+#     et batteri der sættes til senere lader med det samme). Deadline-pushen
+#     er derfor gatet på en MÅLT ladning (`cykel_lader_nyt_vindue`).
 #   • BATTERI NR. 2: når `faerdig` er sat er pluggen slukket, og så kan vi
 #     IKKE se at et nyt batteri sættes i (ingen strøm = ingen måling). Derfor
 #     PROBE: inde i en planlagt billig-time tændes pluggen i `probe_minutter`
@@ -1199,6 +1203,20 @@ automation:
               - condition: state
                 entity_id: input_boolean.cykel_lader_alarm_lock
                 state: "off"
+              # 2026-11-20 (user: "i get bike notifications while we're not
+              # charging these days"): uden et batteri på pluggen krydser
+              # effekten aldrig NED gennem tomgang, så færdig-detektionen fyrer
+              # aldrig og `faerdig` står off ved deadline. Alle 7 deadline-
+              # pushes på 30 døgn (10-22 … 11-20; 11-16/17/18/20 med pluggen
+              # tændt 9-10 t ved 0 W) kom på nætter UDEN målt ladning
+              # (`effekt_cursor` = 0). Push kun når der faktisk blev ladet i
+              # vinduet (`effekt_cursor` > 0 = et lade-plateau ≥ 3 min siden
+              # sidste deadline; nulstilles længere nede) eller der lades nu.
+              - condition: template
+                value_template: >-
+                  {{ states('input_number.cykel_lader_effekt_cursor') | float(0) > 0
+                     or (states('sensor.entre_cykel_lader_effekt') | float(0))
+                        > (states('input_number.cykel_lader_idle_watt') | float(5)) }}
             sequence:
               - service: script.push_notify
                 data:
@@ -1206,8 +1224,11 @@ automation:
                   title: "🔋 Cykelbatterier ikke meldt fulde"
                   message: >-
                     Deadline nået uden at effekten faldt til tomgang. Effekt nu:
-                    {{ states('sensor.entre_cykel_lader_effekt') }} W. Enten
-                    lader den stadig, eller der har ikke været noget tilsluttet.
+                    {{ states('sensor.entre_cykel_lader_effekt') }} W.
+                    {% if (states('sensor.entre_cykel_lader_effekt') | float(0))
+                          > (states('input_number.cykel_lader_idle_watt') | float(5)) %}Den
+                    lader stadig — batteriet er ikke fuldt endnu.{% else %}Der blev
+                    ladet i nat, men laderen meldte aldrig tomgang.{% endif %}
                   # Denne skal HØRES — den kommer kl. 07 og er handlingsbar
                   # (batteriet er ikke fuldt inden du skal ud ad døren).
                   payload:

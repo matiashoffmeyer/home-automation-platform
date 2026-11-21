@@ -74,6 +74,12 @@ RE_SSH_FEJL = re.compile(
     r"(?:Failed \S+ for (?:invalid user )?(\S*) from (\S+)|Invalid user (\S*) from (\S+))"
 )
 RE_TB = re.compile(r': (\S+) - - \[[^\]]+\] "(\w+) (\S+) HTTP/[\d.]+" (\d{3})')
+RE_TB_TLS = re.compile(r"TLS handshake error from (\[[0-9a-fA-F:]+\]|[\d.]+):\d+")
+# Trail Buddys EGEN støj er ikke en afvisning (B309 pkt. 12, målt 10-21/11:
+# 60 % af tb_afvist): app.js' anonDiag-beacon er en BEVIDST 404 (max 80 pr.
+# indlæsning, siden 16/11), Android spørger efter assetlinks, browsere efter
+# favicon — og en 5xx er vores egen proxy, ikke en afvist klient.
+TB_EGEN_STOEJ = ("/api/anon-diag", "/.well-known/assetlinks.json", "/favicon.ico")
 
 
 def nu() -> float:
@@ -272,7 +278,12 @@ class Vagt:
         koder = [x for x in self.d.get("tb403", []) if x > nu() - 86400]
         for t, s in self.nye_linjer("tb"):
             if "TLS handshake error" in s:
-                self.tael(t, "tb_bank")
+                # B309 pkt. 8 (målt 10-21/11): 100 % fra egne tailnet-enheder
+                # (EOF når telefonen dropper en halvåben forbindelse) → kun en
+                # afsender uden for huset er et bank på døren.
+                mt = RE_TB_TLS.search(s)
+                if ip_klasse(mt.group(1) if mt else None) not in ("tailnet", "LAN", "intern"):
+                    self.tael(t, "tb_bank")
                 continue
             m = RE_TB.search(s)
             if not m or m.group(1).startswith(
@@ -280,7 +291,7 @@ class Vagt:
             ):  # alt andet end HA selv = udefra (Funnel)
                 continue
             kode = int(m.group(4))
-            if kode < 400:
+            if kode < 400 or kode >= 500 or m.group(3).split("?")[0] in TB_EGEN_STOEJ:
                 self.tael(t, "tb_ok")
                 continue
             self.tael(t, "tb_afvist")

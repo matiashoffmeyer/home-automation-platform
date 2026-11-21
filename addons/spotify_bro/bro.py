@@ -32,11 +32,13 @@ every change; /cmd/<name> lets HA pause/resume/stop the session.
 
 import array
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import re
 import signal
+import termios
 import time
 from collections import deque
 from typing import Any
@@ -44,12 +46,16 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
-VERSION = "0.1.5"
+VERSION = "0.1.7"
 RATE = 44100
 CHANNELS = 2
 FRAME = 4  # s16 stereo
 BPS = RATE * FRAME  # bytes of PCM per second
 CHUNK = BPS // 20  # 50 ms reads
+# go-librespot's pipe writer hands the kernel 8192 bytes per write (4096 s16
+# samples); when the pipe is full one such write is half-way in, still unread.
+LIB_WRITE = 8192
+F_GETPIPE_SZ = getattr(fcntl, "F_GETPIPE_SZ", 1032)
 
 LOG = logging.getLogger("bro")
 
@@ -77,6 +83,7 @@ DEFAULTS: dict[str, Any] = {
     "confirm_s": 2.5,
     "stop_grace_s": 2.0,
     "reconcile_s": 10.0,
+    "skip_flush": True,
     "speaker_control": True,
     "volume_sync": True,
     "ha_entity": "sensor.spotify_bro",
@@ -222,6 +229,12 @@ class Client:
             self.dropped += 1
         self.queue.put_nowait(data)
 
+    def close(self) -> None:
+        """Drop what is queued and end the HTTP response (the b"" sentinel)."""
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.queue.put_nowait(b"")
+
 
 class Bro:
     def __init__(self, opts: dict[str, Any]) -> None:
@@ -273,6 +286,21 @@ class Bro:
         self._stop_task: asyncio.Task | None = None
         self._tasks: set[asyncio.Task] = set()
         self.resets = 0
+        # Skip flush (0.1.7, B308): a skip, a new song or a seek while the room
+        # plays. go-librespot swaps to the new audio at once, but ~0.8 s of the
+        # old is still in the pipe and our StreamReader, and ~3.8 s in MPD's
+        # buffer - so the room heard the change ~4.5 s after the app.
+        # Offsets count every byte read from the pipe since go-librespot
+        # started; the pump throws away everything before drop_to.
+        self.pcm_in = 0
+        self.drop_to = 0
+        self.dropped_bytes = 0
+        self.flushes = 0
+        self._reader: asyncio.StreamReader | None = None
+        self._pipe_fd: int | None = None
+        self._user_load = False  # will_play the user asked for (not the queue moving on)
+        self._end_loads = False  # not_playing came first: the next load is the queue's
+        self.flush_pending = False  # skip/seek while paused: flush at resume
 
     # ------------------------------------------------------------- helpers
     def ours(self, uri: str | None) -> bool:
@@ -317,6 +345,8 @@ class Bro:
             "max_laese_pause_s": round(self.max_read_gap, 2),
             "librespot_genstarter": self.lib_restarts,
             "session_nulstillet": self.resets,
+            "buffer_toemninger": self.flushes,
+            "droppet_gammel_lyd_s": round(self.dropped_bytes / BPS, 1),
             "events": self.events_up,
             "sidste_event": self.last_event,
             "url": self.url,
@@ -350,11 +380,14 @@ class Bro:
             LOG.debug("HA-opdatering fejlede: %s", e)
 
     # ------------------------------------------------------------- speaker IO
-    async def mpd(self, *cmds: str) -> list[str]:
+    async def mpd(self, *cmds: str, as_list: bool = False) -> list[str]:
+        """as_list: one atomic command list (one OK for all of them)."""
         r, w = await asyncio.wait_for(
             asyncio.open_connection(self.o["speaker_host"], self.o["mpd_port"]), 3
         )
         lines: list[str] = []
+        if as_list:
+            cmds = ("\n".join(("command_list_begin", *cmds, "command_list_end")),)
         try:
             greet = await asyncio.wait_for(r.readline(), 3)
             if not greet.startswith(b"OK MPD"):
@@ -450,11 +483,111 @@ class Bro:
                     item,
                 )
                 self.owns = True
+                self.flush_pending = False
                 LOG.info("Højttaler: replaceAndPlay %s", self.url)
             except Exception as e:  # noqa: BLE001
                 self.hold_until = 0.0
                 LOG.warning("Højttaler: start fejlede: %s", e)
         self.changed()
+
+    def _in_pipe(self) -> tuple[int, bool]:
+        """(bytes in the pipe, full: go-librespot is blocked half-way into a write)."""
+        if self._pipe_fd is None:
+            return 0, False
+        try:
+            q = array.array("i", [0])
+            fcntl.ioctl(self._pipe_fd, termios.FIONREAD, q, True)
+            return q[0], fcntl.fcntl(self._pipe_fd, F_GETPIPE_SZ) - q[0] < LIB_WRITE
+        except OSError:
+            return 0, False
+
+    def _unread(self) -> int:
+        """Bytes go-librespot has produced that the pump has not read yet: our
+        StreamReader's buffer, the pipe, and the write half-way into a full pipe."""
+        n, full = self._in_pipe()
+        return n + len(getattr(self._reader, "_buffer", b"") or b"") + (LIB_WRITE if full else 0)
+
+    async def _frozen(self) -> None:
+        """A skip/seek on pause: not one byte of the new audio to the old
+        listener (MPD paused on ~4 s of the old) before the flush at play has
+        cut it loose. go-librespot does not write while paused; if it does
+        anyway (a lost 'playing'), it may block for 2 s at most - never the
+        B204 hang."""
+        full_at = 0.0
+        while self.flush_pending and self.status == "paused":
+            if self._in_pipe()[1]:
+                full_at = full_at or time.monotonic()
+                if time.monotonic() - full_at > 2.0:
+                    LOG.warning("librespot skriver under pausen - tømning ved play opgivet")
+                    self.flush_pending = False
+                    return
+            else:
+                full_at = 0.0
+            await asyncio.sleep(0.05)
+
+    def _mark_old(self) -> float:
+        """Everything go-librespot wrote before this moment is old audio. Call
+        it in the event handler itself, before any await: the pump must not
+        read one more chunk before the offset is fixed. → seconds marked."""
+        end = self.pcm_in + self._unread()
+        end += -end % FRAME
+        old = max(0, end - max(self.pcm_in, self.drop_to))
+        self.drop_to = max(self.drop_to, end)
+        return old / BPS
+
+    async def _user_change(self, why: str) -> None:
+        """A skip, a new song or a seek the user asked for: called at the
+        moment go-librespot moves to the new audio (metadata/seek while
+        playing), or before it can write any (will_play/seek while paused)."""
+        if not self.o.get("skip_flush", True) or not self.o["speaker_control"] or not self.owns:
+            return
+        if self.status == "playing" and self.clients:
+            old = self._mark_old()
+            await self.speaker_flush(why, old)
+        elif self.status == "paused" and not self.flush_pending:
+            # What is old now is the pipe's rest, the listener's queue and
+            # MPD's buffer: the flush at play drops all three (instead of
+            # 'pause 0', which would play them first). The pump freezes so
+            # the new song's start waits in the pipe for the new listener.
+            self._mark_old()
+            self.flush_pending = True
+            LOG.info("Højttaler: %s på pause - bufferen tømmes ved play", why)
+
+    async def speaker_flush(self, why: str, old_s: float = 0.0) -> bool:
+        """Make MPD drop its buffer and fetch the stream again, starting at the
+        new audio: an atomic 'stop; play' (Volumio sees play -> play; a bare
+        stop makes it restart the webradio). → True if flushed."""
+        async with self.speaker_lock:
+            old: list[Client] = []
+            try:
+                state, fil = await self.mpd_state()
+                if not self.ours(fil) or state not in ("play", "pause"):
+                    return False
+                # The old listener's queue is old audio: nothing more to it,
+                # and the pump holds until MPD is back, so the new song's start
+                # waits in the pipe for the new connection.
+                old = list(self.clients)
+                self.clients.clear()
+                self._clear_backlog()
+                self.hold_until = time.monotonic() + self.o["start_hold_s"]
+                self.flush_pending = False
+                self._mark_own()
+                await self.mpd("stop", "play", as_list=True)
+                for c in old:
+                    c.close()
+                self.flushes += 1
+                LOG.info("Højttaler: buffer tømt (%s, %.2f s gammel lyd droppet)", why, old_s)
+                return True
+            except Exception as e:  # noqa: BLE001
+                # MPD did not take it: the old listener plays on, as before 0.1.7.
+                self.clients.update(old)
+                self.hold_until = 0.0
+                self.client_came.set()
+                LOG.warning("Højttaler: tømning fejlede (%s): %s", why, e)
+                return False
+            finally:
+                self.flush_pending = False  # ends a freeze, flushed or not
+                self.changed()
 
     async def speaker_pause(self) -> None:
         if not self.o["speaker_control"]:
@@ -539,20 +672,38 @@ class Bro:
             LOG.info("Session inaktiv")
             self.active = False
             self.status = "idle"
+            self._user_load = self._end_loads = self.flush_pending = False
             self._clear_backlog()
             if self.owns:
                 await self.speaker_stop()
+        elif kind == "will_play":
+            # A load. The queue moving on by itself says not_playing first
+            # (the old song has played out, gapless: nothing to drop); a skip,
+            # a new song or prev goes straight to will_play while the old song
+            # still plays, and go-librespot swaps to the new one at metadata.
+            self._user_load = not self._end_loads
+            self._end_loads = False
+            if self._user_load and self.status == "paused":
+                await self._user_change("nyt nummer")
         elif kind == "metadata":
             self.track = data
             self.position_ms = int(data.get("position") or 0)
             self.position_at = time.time()
             LOG.info("Nummer: %s", self._icy_title())
+            if self._user_load:
+                self._user_load = False
+                await self._user_change("nyt nummer")
         elif kind == "playing":
             # Only on "playing", never "will_play": a transfer can load the
             # session PAUSED (will_play, then paused). Starting the speaker
             # then left MPD on a silent stream, Volumio fell back to P4, and
             # the bridge paused the app as "another source" (16/10).
             self._cancel_stop()
+            self._user_load = self._end_loads = False
+            if self.flush_pending:
+                # Still 'paused' here, so the pump stays frozen until the old
+                # listener is cut loose.
+                await self.speaker_flush("skift på pause")
             self.status = "playing"
             self.position_at = time.time()
             await self.speaker_play()
@@ -564,6 +715,8 @@ class Bro:
         elif kind in ("stopped", "not_playing"):
             self._freeze_position()
             self.status = "stopped"
+            self._end_loads = kind == "not_playing"
+            self._user_load = self.flush_pending = False
             self._clear_backlog()
             if self.owns:
                 # A skip can come as stopped → playing within a second (17:43
@@ -576,6 +729,7 @@ class Bro:
         elif kind == "seek":
             self.position_ms = int(data.get("position") or 0)
             self.position_at = time.time()
+            await self._user_change("spoling")
         elif kind == "volume" and data.get("value") is not None:
             await self._on_lib_volume(data)
         self.changed()
@@ -714,6 +868,7 @@ class Bro:
         self.active = False
         self.status = "idle"
         self.hold_until = 0.0
+        self._user_load = self._end_loads = self.flush_pending = False
         self._clear_backlog()
         if self.owns:
             await self.speaker_stop()
@@ -800,9 +955,16 @@ class Bro:
         sent = 0
         rest = b""
         last = 0.0
+        self._reader = stdout
+        self.pcm_in = self.drop_to = 0
+        try:
+            self._pipe_fd = stdout._transport.get_extra_info("pipe").fileno()  # noqa: SLF001
+        except (AttributeError, OSError, ValueError):
+            self._pipe_fd = None  # the tests' fed reader: its buffer is all there is
         while True:
             wait = self.hold_until - time.monotonic()
             if wait > 0 and not self.clients:
+                held = self.hold_until
                 self.client_came.clear()
                 try:
                     await asyncio.wait_for(self.client_came.wait(), wait)
@@ -810,14 +972,21 @@ class Bro:
                     LOG.warning(
                         "Højttaleren hentede ikke strømmen inden %.0f s", self.o["start_hold_s"]
                     )
-                self.hold_until = 0.0
+                if self.hold_until == held:  # not renewed by a flush meanwhile
+                    self.hold_until = 0.0
+                continue
             before = time.monotonic()
             data = await stdout.read(CHUNK)
             if not data:
                 return
+            at = self.pcm_in - len(rest)  # stream offset of rest + data
+            self.pcm_in += len(data)
             now = time.monotonic()
             if last and self.status == "playing":
                 self.max_read_gap = max(self.max_read_gap, now - before)
+            if self.flush_pending:
+                await self._frozen()
+                now = time.monotonic()
             if not last or now - last > 0.25:
                 # Start, or a pause/stall: restart the real-time clock.
                 t0 = now
@@ -831,6 +1000,11 @@ class Bro:
             self.pcm_bytes += len(data)
             self.pcm_last = time.time()
             data = rest + data
+            if self.drop_to > at:
+                # Old audio from before a skip/seek: never delivered, never paced.
+                skip = min(len(data), self.drop_to - at)
+                self.dropped_bytes += skip
+                data = data[skip:]
             cut = len(data) - len(data) % FRAME
             rest = data[cut:]
             if cut:
@@ -963,9 +1137,10 @@ class Bro:
                 )
 
                 async def feed() -> None:
-                    while True:
-                        enc.stdin.write(await client.queue.get())
+                    while b := await client.queue.get():
+                        enc.stdin.write(b)
                         await enc.stdin.drain()
+                    enc.stdin.close()  # cut loose by a flush
 
                 feeder = asyncio.ensure_future(feed())
 
@@ -975,7 +1150,10 @@ class Bro:
                     if not b:
                         raise ConnectionResetError("flac-encoder stoppede")
                     return b
-                return await client.queue.get()
+                b = await client.queue.get()
+                if not b:
+                    raise ConnectionResetError("skilt fra ved buffer-tømning")
+                return b
 
             until_meta = metaint
             last_title = None

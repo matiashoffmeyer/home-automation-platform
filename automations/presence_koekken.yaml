@@ -426,6 +426,8 @@
     # koekken_session_lux_bonus_pct (20 %) når køkkenet har været aktivt i mere
     # end koekken_session_aktiv_minutter (5) af de sidste 15. "Er du SÅ meget i
     # køkkenet, tænder jeg allerede selv om det ikke er heeelt mørkt nok endnu."
+    # 2026-11-20 (B319): SAMME "mørkt nok"-regel som kamera-holdet i
+    # presence_koekken_spots_off — ret begge (fejlklasse #2).
     - condition: template
       value_template: >
         {{ (states('sensor.koekken_dagslys_lx') | float(50))
@@ -627,6 +629,8 @@
     Apollo-occupancy inkluderer still-target i hele feltet → spots slukker IKKE
     mens nogen står stille i køkkenet; først når feltet faktisk er tomt.
     Backstop: hele open-plan tomt 20 min. Slukker KUN — tænder aldrig (cooking-on).
+    2026-11-20 (B319): ser kameraet en krop (nu eller inden for sluk-
+    forsinkelsen) i et mørkt køkken, holdes spots tændt — undtagen ved film.
   mode: restart
   trigger:
     # 2026-06-28 (flicker-fix): brug `for:` på selve off-transitionen i stedet
@@ -655,10 +659,18 @@
     # watchdog'en dækker ikke switches. Spejlet er væk (09-03), men vejen bliver:
     # den er cause-agnostisk og dækker enhver anden tænd-vej. Level-baseret:
     # spots on + felt tomt i N sek → sluk, uanset hvordan de blev tændt.
+    # 2026-11-20 (B319): også "kameraet ser ingen krop" — så er det DENNE vej der
+    # slukker N s efter kameraets sidste krop, når kamera-holdet i action
+    # har stoppet field_clear/openplan_empty/hang. Loft 120 s på et kamera der
+    # hænger på 'on' (max målt 36 s over 30 døgn; fejlklasse #25).
     - platform: template
       value_template: >-
+        {% set c = states.binary_sensor.koekken_kamera_krop %}
         {{ is_state('switch.koekken_spots', 'on')
-           and is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'off') }}
+           and is_state('binary_sensor.koekken_apollo_occupancy_filtered', 'off')
+           and not (is_state('input_boolean.koekken_kamera_krop_enabled', 'on')
+                    and c is not none and c.state == 'on'
+                    and (now() - c.last_changed).total_seconds() < 120) }}
       for:
         seconds: "{{ states('input_number.koekken_spots_off_seconds') | int(10) }}"
       id: rearm
@@ -730,6 +742,44 @@
                and is_state(o, 'off')
                and (now() - states[o].last_changed).total_seconds()
                    >= (states('input_number.koekken_spots_off_seconds') | int(10))) }}
+    # 2026-11-20 (B319, user-spec: "the camera only views the kitchen and only
+    # parts of it. the spots shouldnt turn off if the camera can see a human
+    # and its dark enough"): kameraet ser kun køkken, så en krop i billedet ER
+    # en person i køkkenet — radarens "tomt" er så forkert. Hold spots tændt når
+    # kameraet ser en krop nu (loft 120 s, #25) eller så inden for sluk-
+    # forsinkelsen, kameraet er gyldigt og køkkenet er mørkt nok (SAMME regel
+    # som tænd-vejens lux-gate — ret begge, #2). Kameraets FRAVÆR beviser intet
+    # (det ser kun en del af køkkenet). Film er undtaget: den sluk er en bevidst
+    # glare-regel, ikke et presence-gæt. Re-arm: `rearm`-triggeren slukker N s
+    # efter kameraets sidste krop, hvis radaren stadig siger tomt (#4).
+    # Simuleret på 10 døgn: 11 sluk med krop i billedet → 4 sluk→tænd-flimmer
+    # undgået, 5 forsinket 6-15 s, 0 hængt; kamera-falske 23/2334.
+    - if:
+        - condition: template
+          value_template: >-
+            {% set c = states.binary_sensor.koekken_kamera_krop %}
+            {% set n = states('input_number.koekken_spots_off_seconds') | int(10) %}
+            {% set alder = (now() - c.last_changed).total_seconds() if c is not none else 9999 %}
+            {{ trigger.id != 'film'
+               and is_state('input_boolean.koekken_kamera_krop_enabled', 'on')
+               and is_state('binary_sensor.koekken_kamera_krop_gyldig', 'on')
+               and (states('sensor.koekken_dagslys_lx') | float(50))
+                   < (states('sensor.koekken_spots_lux_gate_effektiv')
+                      | float(states('input_number.koekken_spots_lux_threshold') | float(60)))
+               and c is not none
+               and ((c.state == 'on' and alder < 120)
+                    or (c.state == 'off' and alder < n - 1)) }}
+      then:
+        - service: logbook.log
+          data:
+            name: "Køkken madlavnings-lys"
+            message: >-
+              Spots holdt tændt ({{ trigger.id }}): kameraet så en krop
+              {{ 'lige nu' if is_state('binary_sensor.koekken_kamera_krop', 'on')
+                 else (((now() - states.binary_sensor.koekken_kamera_krop.last_changed
+                        ).total_seconds()) | round(0) | int) ~ ' s siden' }}
+              i et mørkt køkken — radaren siger tomt.
+        - stop: "B319: kameraet ser en krop i mørke"
     - service: switch.turn_off
       target:
         entity_id: switch.koekken_spots

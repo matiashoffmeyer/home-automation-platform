@@ -57,8 +57,10 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   confidence**, så støj og tale er samme streng → falske positiver kan kun
   bekæmpes UDEN FOR lyden: en HOLDT hånd eller et BLIK armerer mikrofonen i 12 s
   (`packages/koekken_stemme_arm.yaml`; `ArmGate`/`GazeWatcher` fejler LUKKET og
-  skriver SAMME stempel). **Kameraet hænger 30 cm over users hoved → et bevidst
-  kig læses 14-29°**; et blik MENS man taler armerer derfor med løsere vinkel.
+  skriver SAMME stempel) og pauser Spotify/DR-radio imens
+  (`script.koekken_arm_pause_hoejttaler`). En tøven > 0,45 s skærer en sætning i
+  to; shimmen hører en fejlet brik igen samlet med de forrige (`samlet2-`-klip).
+  **Kameraet hænger 30 cm over users hoved → et bevidst kig læses 14-29°**; et blik MENS man taler armerer derfor med løsere vinkel.
   **Tal: -teen/-ty forveksles akustisk** (fifteen→50, sixteen→60; 8 kHz) —
   replay med pad/norm ændrer intet → dobbelt vink ved tvetydige tal. Mishør?
   Klippene ligger i `/share/gesture_frame_shim/clips` → `scripts/stemme_replay.py`.
