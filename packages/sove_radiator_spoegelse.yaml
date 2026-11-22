@@ -27,7 +27,8 @@
 # FORBRUGERE af `binary_sensor.sovevaerelse_optaget_reelt` (kun "er rummet
 # tomt om morgenen"-veje): morning_lights_sanity_check (empty), morning_curtains
 # backstop, hoejttaler_radio (én voksen oppe). Tænd-veje og nat-logik læser
-# fortsat den rå occupancy — de skal SE en sovende.
+# fortsat den rå occupancy — de skal SE en sovende. (2026-11-22: de to radar-
+# tænd-veje kræver desuden `binary_sensor.sove_bevaegelse_bevist`, nederst.)
 # =============================================================================
 
 sensor:
@@ -135,3 +136,68 @@ template:
         state: >-
           {{ is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'on')
              and not is_state('binary_sensor.sovevaerelse_radiator_spoegelse', 'on') }}
+
+  # 2026-11-22 (user-valg "a) ja, altid" om 21/11 19:36: "der var ikke først
+  # move der blev til still"): et soveværelses-ophold tæller først som et
+  # MENNESKE når der er BEVIST bevægelse i det — moving holdt ≥ 2,5 s, eller et
+  # nyt moving-udslag ≤ 15 s efter det forrige sluttede. Latchen holder til
+  # occupancy slipper (opholdet er slut) og nulstilles ved HA-start (den sikre
+  # retning: næste bevægelse beviser igen). Forbrugere = de to radar-tænd-veje:
+  # presence_light_sovevaerelse_on (cold start, automations/presence_sovevaerelse.yaml)
+  # og presence_lux_sovevaerelse_on (automations/presence_lights.yaml) — SAMME
+  # regel begge steder (#2). Upgrade af gang-pre-lyset kræver den ikke.
+  #
+  # MÅLT 9-22/11 (moving_target er ikke i recorderen → `sove_bevaegelse_mens_
+  # lys_taendt`, + ~0,6 s før lyset tændte): spøgelset 21/11 = ÉT udslag på
+  # ~2,1 s i SAMME sekund som still, intet mere i 62 min. 11 ægte still-
+  # koldstarter: korteste holdte udslag ~3,1 s; 9 bevist ≤ ~2,5 s efter første
+  # bevægelse, 20/11 20:00 efter 7,8 s, 9/11 19:52 efter 12 s (andet udslag
+  # 1,1-2,1 s efter det første sluttede). Udslagene er kvantiseret i ~1 s-trin
+  # (1,0 / 2,1 / 3,1 s) → 2,5 s ligger midt mellem spøgelsets og den korteste
+  # ægte. Ingen bevægelse overhovedet (15/11 09:04 på radiator-afstanden
+  # 206-212 cm, 9/11 10:50) = ingen tænd. Pris: still-koldstarten (før +0,5 s)
+  # kommer nu typisk ~2,5 s efter første bevægelse.
+  # Kendt hul efter genstart/genforbindelse: et moving-udslag ≤ 15 s efter at
+  # ESPHome-noden kom tilbage tæller som "andet udslag" (from_state.last_changed
+  # = genforbindelsen). Én blip i det vindue; accepteret.
+  # Kendt hul 2 (#25): latchen slipper først når occupancy gør. Står spøgelset
+  # videre efter at et BEVIST menneske gik, holder latchen — samme adfærd som
+  # før 22/11 (tom-vejene ovenfor + no-motion-watchdoggen ejer det tilfælde).
+  - trigger:
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_apollo_radar_moving_target
+        from: "off"
+        to: "on"
+        for:
+          milliseconds: 2500
+        id: holdt
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_apollo_radar_moving_target
+        from: "off"
+        to: "on"
+        id: kant
+      - platform: state
+        entity_id: binary_sensor.sovevaerelse_apollo_occupancy
+        not_to: "on"
+        id: tom
+      - platform: homeassistant
+        event: start
+        id: tom
+    binary_sensor:
+      - name: "Sove bevaegelse bevist"
+        unique_id: sove_bevaegelse_bevist
+        icon: mdi:walk
+        state: >-
+          {% set f = trigger.from_state if trigger.id == 'kant' else none %}
+          {% if trigger.id == 'tom' %}{{ false }}
+          {% elif trigger.id == 'holdt' %}{{ true }}
+          {% elif f is not none and (now() - f.last_changed).total_seconds() <= 15 %}{{ true }}
+          {% else %}{{ this.state == 'on' }}{% endif %}
+        attributes:
+          # Hvordan opholdet blev bevist (holdt/gentaget) — sat på off→on, kun til fejlsøgning.
+          bevis: >-
+            {% set f = trigger.from_state if trigger.id == 'kant' else none %}
+            {% set gentaget = f is not none and (now() - f.last_changed).total_seconds() <= 15 %}
+            {% if trigger.id == 'tom' %}
+            {% elif this.state != 'on' and (trigger.id == 'holdt' or gentaget) %}{{ 'holdt' if trigger.id == 'holdt' else 'gentaget' }}
+            {% else %}{{ this.attributes.bevis | default('') }}{% endif %}

@@ -924,6 +924,19 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   IKEA KAJPLATS Thread-spots til** (`light.stue_spot_1`/`_2`) — stuen har nu
   FIRE fysiske lys, ikke to.
 
+  **2026-11-21 kom `light.stue_sofa_lampe_2` ud af skabet** (user: "udskiftet
+  glødepæren … med en innr fra skuffen"): Innr RB 282 C'en sidder nu i
+  hyggelampen, registry-omdøbt til `light.stue_hyggelampe_paere`. Samme morgen
+  kom `switch.stue_plug` ud ("hyggelampe plug skal i dvale") → pæren er på
+  FAST strøm med egen tile i stuen. **`light.stue_plug` er stadig
+  "hyggelampen" for automationerne** (navn beholdt, som `spisestue_pendel`):
+  en tænd/sluk-wrapper om pæren, der tænder i glødepære-lyset fra
+  `input_number.stue_hyggelampe_kelvin`/`_styrke` og spejler pærens state og
+  availability (`packages/stue_plug.yaml`). Pæren selv står UDE af rosters,
+  grupper og effekter — et scene-/effekt-kald direkte på den ville overskrive
+  glødepære-lyset. NVRAM power-on On + start-up niveau/farve = sliderne.
+  8,6 W målt ved fuld styrke (glødepæren: 53-58 W) → 9 W i watt-kortet.
+
   **De bliver liggende — det er user's eget valg** (*"bare lad dem være og gør
   det til et permanent fact"*), så ryd dem IKKE ud af `sofa_lights`-rosteret,
   `light.stue_all` (7 medlemmer) eller `light.stue_room` (5 medlemmer). Se B132.
@@ -935,7 +948,7 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   | Entity | Unavailable | Flanker | Status |
   |---|---|---|---|
   | `light.stue_sofa_lampe` | **100 %** (333,8 t) | 28 | i et skab |
-  | `light.stue_sofa_lampe_2` | 100 % | — | i et skab |
+  | `light.stue_sofa_lampe_2` | 100 % | — | i et skab (fra 21/11 i hyggelampen) |
   | `light.stue_hjoernelampe` | 100 % | — | i et skab |
   | `light.stue_laesehygge` | 26,5 % (88,5 t) | 11 | **rask** — vægkontakt |
   | `light.stue_plug` | 0,0 % | 0 | rask |
@@ -2384,3 +2397,31 @@ API'et eller users telefon (HA-appen, push-knapper, engangslinks). Derfor:
   A/B-boot falder selv tilbage efter en mislykket OS-opdatering, men en fejl
   i HA's egen konfiguration rettes kun over SSH — derfor `ha_offline.py check`
   før push og husets eget genstarts-script i stedet for en bar genstart.
+
+## OAuth uden egen udvikler-app kræver `cloud:` — huset har ingen default_config (2026-11-21)
+
+Nabu Casa "account linking" (Miele, Spotify, Netatmo m.fl. — listen:
+`account-link.nabucasa.com/services`) leveres af core-komponenten `cloud`, og
+den loades kun via `default_config` eller en eksplicit `cloud:`. Uden den
+falder en OAuth-integration tilbage til application credentials og beder om
+Client ID/Secret fra producentens udviklerportal. **Signatur: config-flowet
+siger "opret en app hos X" for en integration hvis docs kun nævner login.**
+Kræver hverken abonnement eller Nabu Casa-login (`cloud/account_link.py`
+tjekker det ikke). Tilføjet i `configuration.yaml` 21/11 for Miele.
+**Mieles login fejler med "Oops, an error occurred" efter accept, hvis
+e-mailen tastes med store bogstaver** — HA logger intet, fejlen er Mieles.
+**Miele-fjernstart kræver Mobile Start trykket PÅ maskinen** (ingen action i
+API'et; `miele.set_program` lykkes uden, men `button.*_start` er `unavailable`)
+**— og G6895 slår den SELV fra når lågen åbnes** (målt 21/11: on 11:28:02,
+låge 11:28:20, off 11:28:24) → fyld, luk, tryk Mobile Start til sidst.
+**MEN Mieles åbne API styrer IKKE G6895 (EK039W 02.65) i tilstanden "program
+valgt"** (målt 21/11 11:44-12:06, Mobile Start + fjernstyring TIL, frisk
+reload): `actions` er tomme (ingen `processAction`, `programId`, `startTime`,
+`powerOn`), `programs` = "Not implemented", og `miele.set_program` → 400 Bad
+Request. Kun Mieles egen app (privat API) kan starte den. Uafprøvet: om en
+udskudt start der TÆLLER NED (status `waiting_to_start`) åbner START.
+**Miele-uret kan ikke stilles fra HA** (ingen action i Mieles API eller HA's
+`miele`-services) — en WiFi-tilmeldt maskine henter selv tiden via Miele@home,
+en offline maskine skifter ikke til sommer-/vintertid. Miele-entities
+`unavailable` = status 255 `not_connected`; en slukket maskine er `off` og
+forbundet. Vagt: `opvasker_ur_tidsskifte` (`packages/opvasker.yaml`).

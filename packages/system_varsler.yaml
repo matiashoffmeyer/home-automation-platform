@@ -194,6 +194,18 @@ input_number:
     step: 1
     unit_of_measurement: "°C"
     icon: mdi:chip
+  # B314 (21/11, user "ja" til grænse pr. placering): spisestue + køkken står
+  # på køleskabet og ligger varmere med engineering mode + BT slukket — 10 døgn
+  # (sensor.apollo_esp_temp_max, 15-min snapshots): max 52,4 / p95 50,4 °C mod
+  # max ≤ 49,1 i de tre andre rum. 52 fyrede på parret (12/11 + 15/11) uden at
+  # noget hamrede chippen → egen grænse 54; 52 bliver for resten.
+  apollo_esp_temp_graense_koeleskab:
+    name: "🌡️ Apollo ESP-temp køleskab — push over (°C)"
+    min: 45
+    max: 70
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:fridge
 
 shell_command:
   # Stdout = én JSON-linje (response_variable). Se scriptets docstring.
@@ -380,7 +392,7 @@ automation:
   - id: apollo_esp_temp_canary
     alias: "Apollo: ESP-temperatur for høj (chip-wear-canary)"
     description: >
-      En Apollo-ESP over slider-grænsen i 15 min = noget hammer chippen
+      En Apollo-ESP over sin slider-grænse i 15 min = noget hammer chippen
       (engineering mode glemt on / tuner-loop / defekt). 2 sensor-chips er
       allerede døde af varmestress. 6 t dedupe. Unavailable trigger ikke.
       Backstop /30 (fejlklasse #4): numeric_state-flanken re-fyrer ALDRIG hvis
@@ -395,10 +407,17 @@ automation:
         entity_id:
           - sensor.sovevaerelse_apollo_esp_temperature
           - sensor.stue_apollo_esp_temperature
-          - sensor.spisestue_apollo_esp_temperature
           - sensor.boernevaerelse_apollo_esp_temperature
-          - sensor.koekken_apollo_esp_temperature
         above: input_number.apollo_esp_temp_graense
+        for:
+          minutes: 15
+      # B314: køleskabs-parret har sin egen grænse (sliderens kommentar).
+      - platform: numeric_state
+        id: flanke
+        entity_id:
+          - sensor.spisestue_apollo_esp_temperature
+          - sensor.koekken_apollo_esp_temperature
+        above: input_number.apollo_esp_temp_graense_koeleskab
         for:
           minutes: 15
       - platform: time_pattern
@@ -412,17 +431,22 @@ automation:
           {{ alder > 6 * 3600 and (trigger.id != 'backstop' or alder < 24 * 3600) }}
     action:
       - variables:
-          graense: "{{ states('input_number.apollo_esp_temp_graense') | float(52) }}"
+          # Grænsen pr. sensor — samme deling som de to flanke-triggere (B314).
           varme: >-
+            {% set g_rest = states('input_number.apollo_esp_temp_graense') | float(52) %}
+            {% set g_kold = states('input_number.apollo_esp_temp_graense_koeleskab') | float(54) %}
             {% set ns = namespace(h=[]) %}
             {% for e in ['sensor.sovevaerelse_apollo_esp_temperature',
                          'sensor.stue_apollo_esp_temperature',
                          'sensor.spisestue_apollo_esp_temperature',
                          'sensor.boernevaerelse_apollo_esp_temperature',
                          'sensor.koekken_apollo_esp_temperature'] %}
+              {% set g = g_kold if e in ['sensor.spisestue_apollo_esp_temperature',
+                                         'sensor.koekken_apollo_esp_temperature'] else g_rest %}
               {% set v = states(e) | float(-1) %}
-              {% if v > graense | float %}
-                {% set ns.h = ns.h + [(state_attr(e, 'friendly_name') or e) ~ ' (' ~ v | round(1) ~ '°C)'] %}
+              {% if v > g %}
+                {% set ns.h = ns.h + [(state_attr(e, 'friendly_name') or e) ~ ' ('
+                   ~ v | round(1) ~ '°C, grænse ' ~ g | int ~ ')'] %}
               {% endif %}
             {% endfor %}
             {{ ns.h | join(' · ') }}
@@ -441,10 +465,9 @@ automation:
           notif_id: apollo
           title: "🌡️ Apollo kører varm"
           message: >-
-            {{ varme }} — over grænsen {{ graense | int }}°C
-            {{ 'i 15+ min' if trigger.id == 'flanke' else '(stadig, 6 t efter sidste push)' }}.
-            Status: {{ hamre }}. Spisestue/køkken står på køleskabet og
-            ligger varmere — ellers tjek tuner-loops (2 chips er døde).
+            {{ varme }}
+            {{ '— over i 15+ min' if trigger.id == 'flanke' else '— stadig, 6 t efter sidste push' }}.
+            Status: {{ hamre }}. Tjek tuner-loops (2 chips er døde).
           payload:
             tag: apollo_esp_canary
             actions:
@@ -454,8 +477,7 @@ automation:
         data:
           name: "Apollo ESP-canary"
           message: >-
-            {{ varme }} over {{ graense | int }}°C ({{ trigger.id }}) —
-            push sendt (6 t dedupe).
+            {{ varme }} ({{ trigger.id }}) — push sendt (6 t dedupe).
       - service: input_datetime.set_datetime
         target:
           entity_id: input_datetime.apollo_esp_temp_sidste_push

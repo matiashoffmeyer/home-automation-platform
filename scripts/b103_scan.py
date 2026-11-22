@@ -16,13 +16,34 @@ evidence is listed in ``ALLOWLIST``, with the reason.
 """
 
 import glob
+import json
 import os
 import sys
 from functools import cache
 
 import yaml
 
-DOMAINS = ("sensor", "binary_sensor", "switch", "number", "select", "button", "image")
+# Alle domæner template-integrationen kan bygge. `light` manglede indtil bug-
+# hunten 21/11: husets fem template-lys (light.stue_plug m.fl.) var usynlige.
+DOMAINS = (
+    "sensor",
+    "binary_sensor",
+    "switch",
+    "number",
+    "select",
+    "button",
+    "image",
+    "light",
+    "cover",
+    "fan",
+    "lock",
+    "vacuum",
+    "alarm_control_panel",
+    "weather",
+    "event",
+    "update",
+)
+REGISTRY = os.path.join(".storage", "core.entity_registry")
 
 # Automations der BEVIDST skal fyre på `unavailable -> X`, fordi det er hele
 # deres formål. Et mekanisk indsat `from:` gør dem til en garanteret no-op —
@@ -43,6 +64,34 @@ ALLOWLIST = {
     # allerførste ægte retur efter en restart. Vurderet 2026-10-07 (P9).
     "sove_voksen_afgang_sweep": (
         "falsk retur rydder kun et stempel (sikker retning); from: sluger første ægte retur"
+    ),
+    # Vægkontakt-strøm-wake ER kanten `unavailable -> on` (from != on står i
+    # condition). Template-wrapperen light.stue_plug får samme kant ved hvert
+    # reload, men kun hvis pæren lyser — og så er wrapperens turn_on en no-op.
+    "airbnb_power_recovery_all": (
+        "lever af `unavailable -> on`; reload-ekkoet på light.stue_plug er en no-op"
+    ),
+    # Reaktiv håndhæver: ENHVER tænding af et børneværelse-lys i AirBnB slukkes,
+    # også strøm-wake (`unavailable -> on`). Et reload-ekko på template-lyset
+    # light.boernevaerelse_hyggelys kommer kun når det lyser = det skal slukkes.
+    "airbnb_block_depot_boern_lights": (
+        "kanten er beviset; reload-ekkoet kommer kun når lyset står tændt i AirBnB"
+    ),
+    # Template-gardinerne (cover, synlige fra 21/11). Open-plan-positionerne er
+    # `unknown` efter en restart (gardiner_sol.md), så et `not_from: unknown`
+    # ville sluge den FØRSTE ægte åbning/lukning efter en genstart.
+    # Manuel-stemplerne kræver context.user_id — reload-ekkoet har tom context
+    # (målt 21/11 08:53:24: "intet context-ophav") og afvises af conditionen.
+    "mosbillede_manuel_op_stempel": (
+        "user_id-gaten afviser reload-ekkoet; not_from: unknown sluger første åbning efter genstart"
+    ),
+    "mosbillede_manuel_hold_ryd": (
+        "user_id-gaten afviser reload-ekkoet; not_from: unknown sluger første luk efter genstart"
+    ),
+    # Open-grenene handler kun når det ÅBNE gardin stadig står som "sidst
+    # nedrullede" — dvs. trackingen var allerede forkert, og ekkoet retter den.
+    "stue_curtain_track_last_lowered": (
+        "open-ekkoet retter kun en allerede forkert tracking; not_from: unknown sluger første åbning"
     ),
 }
 
@@ -71,8 +120,28 @@ def _load(path):
         return yaml.load(f, Loader=_Loader)  # noqa: S506 - a SafeLoader subclass
 
 
+def _registry_ids() -> dict:
+    """(domæne, unique_id) → entity_id for template-entities i registry'et.
+
+    En entity hvis registry-entry er omdøbt eller genbrugt via bevaret
+    unique_id (light.stue_plug, scene_*_active) har et andet entity_id end
+    sluggen af `name:` — 17 stk. var usynlige for scanneren (bug-hunt 21/11).
+    Uden .storage (cloud-session) falder vi tilbage til sluggen alene."""
+    try:
+        with open(REGISTRY, encoding="utf-8") as f:
+            entities = json.load(f)["data"]["entities"]
+    except OSError, ValueError, KeyError, TypeError:
+        return {}
+    return {
+        (e["entity_id"].split(".", 1)[0], e.get("unique_id")): e["entity_id"]
+        for e in entities
+        if e.get("platform") == "template"
+    }
+
+
 def collect_template_entities() -> set:
     found = set()
+    registry = _registry_ids()
 
     def walk(block):
         if isinstance(block, list):
@@ -85,6 +154,9 @@ def collect_template_entities() -> set:
                     for e in entries:
                         if isinstance(e, dict) and e.get("name"):
                             found.add(f"{dom}.{slug(str(e['name']))}")
+                            real = registry.get((dom, e.get("unique_id")))
+                            if real:
+                                found.add(real)
 
     for path in glob.glob("packages/*.yaml") + glob.glob("*.yaml"):
         try:

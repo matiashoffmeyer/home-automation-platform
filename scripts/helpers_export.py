@@ -49,6 +49,7 @@ DOMAINS = ("input_number", "input_boolean", "input_datetime", "input_select", "i
 # Kun KONFIG/tunable helpers — ikke runtime-state (learning, cursors, timestamps),
 # så filen er stabil i git (ændres kun når en faktisk indstilling ændres).
 DATETIME_CONFIG = {
+    "opvasker_plan_tid",  # planlagt opvask: brugerens faste tid
     "puttelys_start",
     "hoejttaler_morgenradio_tidligst",
     "natlys_start",
@@ -118,6 +119,7 @@ DATETIME_CONFIG = {
 # input_select er som udgangspunkt RUNTIME state (room_mode, visit_stage,
 # house_mode…) og snapshottes IKKE. Kun eksplicitte konfig-selects herunder.
 SELECT_CONFIG = {
+    "opvasker_plan_program",  # planlagt opvask: brugerens faste program
     "mad_indkoeb_ugedag",
     # Styrbar-fjernbetjeningens to OP-handlinger (2026-08-24) —
     # rent brugervalg, ikke runtime.

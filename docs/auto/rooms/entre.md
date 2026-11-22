@@ -6,7 +6,7 @@ Search keywords: `entre`
 
 ## Indhold
 - [Automations](entre.md#automations) (13)
-- [Entities](entre.md#entities) (64)
+- [Entities](entre.md#entities) (66)
 - [Helpers](entre.md#helpers) (13)
 
 ---
@@ -15,7 +15,7 @@ Search keywords: `entre`
 
 ### `automations/airbnb_mode.yaml`
 
-- **AirBnB: Dormant -> Active ved entré presence (comfort welcome)** (line 1104, mode=single)
+- **AirBnB: Dormant -> Active ved entré presence (comfort welcome)** (line 1109, mode=single)
   - Hvis huset er Dormant og guest entrer entré, tænd lys "behageligt"
 
 ### `automations/arrival.yaml`
@@ -28,9 +28,9 @@ Search keywords: `entre`
   - Stampler input_datetime.entre_loft_manual_on_at når et MENNESKE tændte
 - **Entré: Lys tænd ved bevægelse** (line 103, mode=single)
   - Lights on in entré when motion detected during the day.
-- **Entré: Lys sluk efter bevægelse** (line 280, mode=restart)
+- **Entré: Lys sluk efter bevægelse** (line 308, mode=restart)
   - Entré is exempt from the global 5-minute fade rule — it is a
-- **Entré: Svagt lys om natten** (line 410, mode=single)
+- **Entré: Svagt lys om natten** (line 438, mode=single)
 
 ### `automations/entre_somrig.yaml`
 
@@ -64,8 +64,9 @@ Search keywords: `entre`
 - `binary_sensor.entre_lys_rent` — 3 refs in 1 file(s)
 - `binary_sensor.entre_morgen_passager_nok` — 1 refs in 1 file(s)
 - `binary_sensor.entre_roegalarm` — 2 refs in 2 file(s)
-- `binary_sensor.entre_stedfortraeder_bevaegelse` — 6 refs in 2 file(s)
-- `binary_sensor.entre_valhorn_occupancy` — 109 refs in 48 file(s)
+- `binary_sensor.entre_sol_hold` — 5 refs in 3 file(s)
+- `binary_sensor.entre_stedfortraeder_bevaegelse` — 7 refs in 2 file(s)
+- `binary_sensor.entre_valhorn_occupancy` — 110 refs in 48 file(s)
 - `binary_sensor.entre_vallhorn_haengt` — 6 refs in 3 file(s)
 
 ### `button.*`
@@ -106,6 +107,7 @@ Search keywords: `entre`
 - `input_number.entre_ned_dormant_vindue_minutter` — 3 refs in 2 file(s)
 - `input_number.entre_off_sekunder` — 4 refs in 3 file(s)
 - `input_number.entre_shutdown_grace_minutes` — 5 refs in 2 file(s)
+- `input_number.entre_sol_hold_minutter` — 4 refs in 4 file(s)
 - `input_number.global_entre_manual_grace_minutes` — 3 refs in 2 file(s)
 - `input_number.godmorgen_entre_passager_antal` — 2 refs in 2 file(s)
 - `input_number.open_plan_entre_fallback_faktor` — 2 refs in 2 file(s)
@@ -138,7 +140,7 @@ Search keywords: `entre`
 - `sensor.entre_cykel_lader_effekt` — 16 refs in 6 file(s)
 - `sensor.entre_cykel_lader_energi` — 4 refs in 2 file(s)
 - `sensor.entre_dagslys_sample` — 6 refs in 1 file(s)
-- `sensor.entre_lux_reel` — 6 refs in 3 file(s)
+- `sensor.entre_lux_reel` — 8 refs in 4 file(s)
 - `sensor.entre_lys_on_idag` — 8 refs in 2 file(s)
 - `sensor.entre_lys_timer_dag` — 1 refs in 1 file(s)
 - `sensor.entre_passager_5min` — 2 refs in 2 file(s)

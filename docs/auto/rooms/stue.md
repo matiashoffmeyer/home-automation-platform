@@ -6,8 +6,8 @@ Search keywords: `stue, open_plan`
 
 ## Indhold
 - [Automations](stue.md#automations) (22)
-- [Entities](stue.md#entities) (314)
-- [Helpers](stue.md#helpers) (95)
+- [Entities](stue.md#entities) (324)
+- [Helpers](stue.md#helpers) (97)
 
 ---
 
@@ -46,9 +46,9 @@ Search keywords: `stue, open_plan`
   - Daylight fades while spisebordet er besat — spisestue-loftet kommer blidt på.
 - **Lysnet: Spisestue tænd på mørk indedag** (line 256, mode=single)
 - **Lysnet: Sofa-stue tænd ved LUX-fald** (line 328, mode=single)
-- **Lysnet: Stue sluk ved LUX-stigning** (line 797, mode=single)
+- **Lysnet: Stue sluk ved LUX-stigning** (line 801, mode=single)
   - Dagslys tilbage i open-plan mens lys står tændt — blid fade off af
-- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 950, mode=single)
+- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 952, mode=single)
   - Lux-præmissen bag dagslys-sluk faldt bort mens rummet stadig er optaget →
 
 ### `automations/presence_resync_on_start.yaml`
@@ -59,9 +59,9 @@ Search keywords: `stue, open_plan`
 
 - **Lysnet: Spisestue tænd** (line 17, mode=single)
 - **Lysnet: Sofa-stue tænd** (line 189, mode=single)
-- **Lysnet: Spisestue gradvis sluk** (line 399, mode=restart)
+- **Lysnet: Spisestue gradvis sluk** (line 403, mode=restart)
   - 2026-06-19 (user-spec): spisestue-loftet slukker når spisebords-Apolloen
-- **Lysnet: Sofa-stue gradvis sluk** (line 548, mode=restart)
+- **Lysnet: Sofa-stue gradvis sluk** (line 552, mode=restart)
   - 2026-06-19: sofa-lamperne slukker når sofa-Apolloen (stue_apollo) har været
 
 ### `automations/somrig_buttons.yaml`
@@ -98,7 +98,7 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.dark_mode_stue` — 20 refs in 8 file(s)
 - `binary_sensor.filmmoerke_stue` — 18 refs in 11 file(s)
 - `binary_sensor.godnat_spisestue_sol_under_graense` — 1 refs in 1 file(s)
-- `binary_sensor.mood_pause_stue` — 15 refs in 7 file(s)
+- `binary_sensor.mood_pause_stue` — 16 refs in 8 file(s)
 - `binary_sensor.open_plan_empty_for_20m` — 4 refs in 3 file(s)
 - `binary_sensor.open_plan_gardin_op_tilladt` — 8 refs in 4 file(s)
 - `binary_sensor.open_plan_lys_rent` — 5 refs in 2 file(s)
@@ -139,6 +139,8 @@ Search keywords: `stue, open_plan`
 - `binary_sensor.stue_apollo_radar_zone_3_occupancy` — 1 refs in 1 file(s)
 - `binary_sensor.stue_apollo_still_bekraeftet` — 1 refs in 1 file(s)
 - `binary_sensor.stue_dagmorke_holdt` — 5 refs in 3 file(s)
+- `binary_sensor.stue_direkte_sol` — 15 refs in 5 file(s)
+- `binary_sensor.stue_direkte_sol_episode` — 1 refs in 1 file(s)
 - `binary_sensor.stue_film_fritaget` — 6 refs in 3 file(s)
 - `binary_sensor.stue_ild_morgen_mulig` — 6 refs in 3 file(s)
 - `binary_sensor.stue_lys_on_effektiv` — 4 refs in 3 file(s)
@@ -164,7 +166,7 @@ Search keywords: `stue, open_plan`
 ### `cover.*`
 
 - `cover.gardin_spisestue_vest` — 77 refs in 22 file(s)
-- `cover.gardin_stue_syd` — 73 refs in 22 file(s)
+- `cover.gardin_stue_syd` — 78 refs in 23 file(s)
 - `cover.gardin_stue_vest_1` — 68 refs in 22 file(s)
 
 ### `input_boolean.*`
@@ -181,7 +183,7 @@ Search keywords: `stue, open_plan`
 - `input_boolean.stue_hyggelampe_fravalgt` — 12 refs in 8 file(s)
 - `input_boolean.stue_ild_morgen_aktiv` — 13 refs in 3 file(s)
 - `input_boolean.stue_ild_morgen_enabled` — 3 refs in 3 file(s)
-- `input_boolean.stue_spots_ild` — 4 refs in 4 file(s)
+- `input_boolean.stue_spots_ild` — 5 refs in 4 file(s)
 - `input_boolean.stue_spots_spotify` — 6 refs in 3 file(s)
 - `input_boolean.styrbar_lr_grace_stue` — 3 refs in 2 file(s)
 - `input_boolean.styrbar_lr_holding_stue` — 9 refs in 4 file(s)
@@ -195,7 +197,7 @@ Search keywords: `stue, open_plan`
 - `input_datetime.open_plan_fuldt_lys_start` — 2 refs in 1 file(s)
 - `input_datetime.stue_rodret_seq_at` — 4 refs in 1 file(s)
 - `input_datetime.stue_spots_ild_rcp_byge_til` — 2 refs in 1 file(s)
-- `input_datetime.styrbar_last_press_stue` — 7 refs in 5 file(s)
+- `input_datetime.styrbar_last_press_stue` — 8 refs in 6 file(s)
 
 ### `input_number.*`
 
@@ -248,6 +250,9 @@ Search keywords: `stue, open_plan`
 - `input_number.stue_dagmoerke_minutter` — 3 refs in 3 file(s)
 - `input_number.stue_dagslys_sluk_lux` — 4 refs in 3 file(s)
 - `input_number.stue_dagslys_sluk_minutter` — 6 refs in 3 file(s)
+- `input_number.stue_direkte_sol_min_lux` — 3 refs in 2 file(s)
+- `input_number.stue_direkte_sol_sluk_min_elevation` — 3 refs in 3 file(s)
+- `input_number.stue_direkte_sol_sluk_minutter` — 4 refs in 3 file(s)
 - `input_number.stue_g0_move` — 2 refs in 2 file(s)
 - `input_number.stue_g0_still` — 2 refs in 2 file(s)
 - `input_number.stue_g1_move` — 2 refs in 2 file(s)
@@ -266,6 +271,8 @@ Search keywords: `stue, open_plan`
 - `input_number.stue_g7_still` — 2 refs in 2 file(s)
 - `input_number.stue_g8_move` — 2 refs in 2 file(s)
 - `input_number.stue_g8_still` — 2 refs in 2 file(s)
+- `input_number.stue_hyggelampe_kelvin` — 6 refs in 4 file(s)
+- `input_number.stue_hyggelampe_styrke` — 7 refs in 4 file(s)
 - `input_number.stue_ild_morgen_fade_minutter` — 3 refs in 3 file(s)
 - `input_number.stue_ild_morgen_hurtigere` — 3 refs in 3 file(s)
 - `input_number.stue_ild_morgen_naer_cm` — 3 refs in 3 file(s)
@@ -294,7 +301,7 @@ Search keywords: `stue, open_plan`
 ### `input_select.*`
 
 - `input_select.room_mode_spisestue` — 27 refs in 20 file(s)
-- `input_select.room_mode_stue` — 38 refs in 25 file(s)
+- `input_select.room_mode_stue` — 40 refs in 26 file(s)
 
 ### `input_text.*`
 
@@ -316,16 +323,16 @@ Search keywords: `stue, open_plan`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
 - `light.spisestue_loft` — 127 refs in 50 file(s)
-- `light.spisestue_pendel` — 138 refs in 40 file(s)
+- `light.spisestue_pendel` — 140 refs in 41 file(s)
 - `light.stue_all` — 26 refs in 14 file(s)
 - `light.stue_apollo_rgb_light` — 5 refs in 3 file(s)
-- `light.stue_hjoernelampe` — 58 refs in 27 file(s)
-- `light.stue_laesehygge` — 87 refs in 38 file(s)
+- `light.stue_hjoernelampe` — 59 refs in 27 file(s)
+- `light.stue_hyggelampe_paere` — 24 refs in 11 file(s)
+- `light.stue_laesehygge` — 88 refs in 38 file(s)
 - `light.stue_loft` — 2 refs in 2 file(s)
-- `light.stue_plug` — 81 refs in 30 file(s)
+- `light.stue_plug` — 77 refs in 27 file(s)
 - `light.stue_room` — 21 refs in 14 file(s)
 - `light.stue_sofa_lampe` — 56 refs in 26 file(s)
-- `light.stue_sofa_lampe_2` — 55 refs in 26 file(s)
 - `light.stue_spot_1` — 41 refs in 17 file(s)
 - `light.stue_spot_2` — 41 refs in 17 file(s)
 
@@ -359,6 +366,8 @@ Search keywords: `stue, open_plan`
 - `number.stue_apollo_g4_still_threshold` — 1 refs in 1 file(s)
 - `number.stue_apollo_g5_move_threshold` — 1 refs in 1 file(s)
 - `number.stue_apollo_g5_still_threshold` — 1 refs in 1 file(s)
+- `number.stue_hyggelampe_paere_power_on_level` — 2 refs in 1 file(s)
+- `number.stue_hyggelampe_paere_start_up_color_temperature` — 2 refs in 1 file(s)
 
 ### `script.*`
 
@@ -374,6 +383,10 @@ Search keywords: `stue, open_plan`
 - `script.stue_rodret_koerer_saet` — 7 refs in 1 file(s)
 - `script.stue_spots_ild` — 3 refs in 2 file(s)
 
+### `select.*`
+
+- `select.stue_hyggelampe_paere_power_on_behavior` — 2 refs in 1 file(s)
+
 ### `sensor.*`
 
 - `sensor.hjemmearbejde_spisestue_ophold_vindue` — 1 refs in 1 file(s)
@@ -383,7 +396,7 @@ Search keywords: `stue, open_plan`
 - `sensor.open_plan_fade_ind_effektiv` — 10 refs in 5 file(s)
 - `sensor.open_plan_haendelse_lux_gate` — 4 refs in 3 file(s)
 - `sensor.open_plan_lampe_tilstand` — 1 refs in 1 file(s)
-- `sensor.open_plan_lux` — 107 refs in 35 file(s)
+- `sensor.open_plan_lux` — 102 refs in 35 file(s)
 - `sensor.open_plan_lux_snapshot` — 1 refs in 1 file(s)
 - `sensor.open_plan_mork_indedag_lux_gate` — 3 refs in 2 file(s)
 - `sensor.radiator_effekt_stue` — 2 refs in 2 file(s)
@@ -391,7 +404,7 @@ Search keywords: `stue, open_plan`
 - `sensor.sleepover_stue_nat_minutter` — 3 refs in 1 file(s)
 - `sensor.sleepover_stue_siden_0030` — 3 refs in 1 file(s)
 - `sensor.sofa_stue_off_sekunder` — 5 refs in 2 file(s)
-- `sensor.spisestue_apollo_esp_temperature` — 5 refs in 4 file(s)
+- `sensor.spisestue_apollo_esp_temperature` — 6 refs in 4 file(s)
 - `sensor.spisestue_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
 - `sensor.spisestue_apollo_lux` — 11 refs in 7 file(s)
 - `sensor.spisestue_apollo_radar_move_energy` — 1 refs in 1 file(s)
@@ -425,7 +438,7 @@ Search keywords: `stue, open_plan`
 - `sensor.stue_lys_timer_dag` — 1 refs in 1 file(s)
 - `sensor.stue_plug_current` — 1 refs in 1 file(s)
 - `sensor.stue_plug_energy` — 1 refs in 1 file(s)
-- `sensor.stue_plug_power` — 5 refs in 5 file(s)
+- `sensor.stue_plug_power` — 2 refs in 1 file(s)
 - `sensor.stue_plug_voltage` — 1 refs in 1 file(s)
 - `sensor.stue_sidste_tryk` — 1 refs in 1 file(s)
 - `sensor.stue_spotify_stemning` — 11 refs in 4 file(s)
@@ -438,7 +451,7 @@ Search keywords: `stue, open_plan`
 - `switch.spisestue_apollo_radar_engineering_mode` — 1 refs in 1 file(s)
 - `switch.stue_apollo_ld2410_bluetooth` — 1 refs in 1 file(s)
 - `switch.stue_apollo_radar_engineering_mode` — 1 refs in 1 file(s)
-- `switch.stue_plug` — 12 refs in 6 file(s)
+- `switch.stue_plug` — 3 refs in 2 file(s)
 
 ### `update.*`
 
@@ -526,6 +539,8 @@ Search keywords: `stue, open_plan`
 - `input_number.stue_g7_still` (defined in `packages/apollo_per_gate.yaml`)
 - `input_number.stue_g8_move` (defined in `packages/apollo_per_gate.yaml`)
 - `input_number.stue_g8_still` (defined in `packages/apollo_per_gate.yaml`)
+- `input_number.stue_hyggelampe_kelvin` (defined in `packages/stue_plug.yaml`)
+- `input_number.stue_hyggelampe_styrke` (defined in `packages/stue_plug.yaml`)
 - `input_number.stue_ild_morgen_fade_minutter` (defined in `packages/stue_ild_morgen.yaml`)
 - `input_number.stue_ild_morgen_hurtigere` (defined in `packages/stue_ild_morgen.yaml`)
 - `input_number.stue_ild_morgen_naer_cm` (defined in `packages/stue_ild_morgen.yaml`)

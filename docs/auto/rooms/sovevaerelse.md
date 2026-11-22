@@ -62,8 +62,8 @@ Search keywords: `sovevaerelse, sove`
 
 ### `automations/presence_lights.yaml`
 
-- **Lysnet: Soveværelse tænd ved LUX-fald** (line 486, mode=single)
-- **Lysnet: Soveværelse sluk ved LUX-stigning** (line 1063, mode=single)
+- **Lysnet: Soveværelse tænd ved LUX-fald** (line 490, mode=single)
+- **Lysnet: Soveværelse sluk ved LUX-stigning** (line 1083, mode=single)
   - Dagslys tilbage i soveværelset mens sove-pendlen står tændt — blid fade off.
 
 ### `automations/presence_sovevaerelse.yaml`
@@ -193,7 +193,7 @@ Search keywords: `sovevaerelse, sove`
 
 - `input_boolean.airbnb_velkomst_move_sove` — 3 refs in 2 file(s)
 - `input_boolean.boernevaerelse_gaest_sover` — 21 refs in 8 file(s)
-- `input_boolean.dark_mode_kun_sove` — 6 refs in 2 file(s)
+- `input_boolean.dark_mode_kun_sove` — 8 refs in 3 file(s)
 - `input_boolean.notif_sove_radar_airbnb` — 1 refs in 1 file(s)
 - `input_boolean.notif_sove_radar_parent_b` — 1 refs in 1 file(s)
 - `input_boolean.notif_sove_radar_enabled` — 1 refs in 1 file(s)
@@ -331,8 +331,8 @@ Search keywords: `sovevaerelse, sove`
 
 - `light.sove_lyskaede` — 25 refs in 11 file(s)
 - `light.sovevaerelse_all` — 17 refs in 9 file(s)
-- `light.sovevaerelse_apollo_rgb_light` — 13 refs in 8 file(s)
-- `light.sovevaerelse_loft` — 12 refs in 8 file(s)
+- `light.sovevaerelse_apollo_rgb_light` — 15 refs in 9 file(s)
+- `light.sovevaerelse_loft` — 14 refs in 9 file(s)
 
 ### `number.*`
 
@@ -403,7 +403,7 @@ Search keywords: `sovevaerelse, sove`
 - `sensor.sovevaerelse_apollo_uptime` — 2 refs in 1 file(s)
 - `sensor.sovevaerelse_dagslys_sluk_effektiv` — 9 refs in 4 file(s)
 - `sensor.sovevaerelse_lux_gate` — 11 refs in 5 file(s)
-- `sensor.sovevaerelse_lux_reel` — 38 refs in 16 file(s)
+- `sensor.sovevaerelse_lux_reel` — 40 refs in 17 file(s)
 - `sensor.sovevaerelse_lys_on_idag` — 8 refs in 2 file(s)
 - `sensor.sovevaerelse_lys_timer_dag` — 1 refs in 1 file(s)
 - `sensor.sovevaerelse_styrbar_battery` — 9 refs in 5 file(s)

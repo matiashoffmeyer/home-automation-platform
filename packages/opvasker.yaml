@@ -1,0 +1,358 @@
+# =============================================================================
+# Opvasker — start et Miele-program fra HA (2026-11-21)
+# =============================================================================
+# User-spec 21/11: "lav en opvaskemaskine side i ha med alle kontroller og
+# muligheder". Siden er dashboards/opvasker.yaml; HER bor kun det ene stykke
+# logik siden ikke kan klare med rå entities: at vælge et program.
+#
+# Miele-API'et (core-integrationen `miele`, entities koekken_opvasker_*) har
+# ingen program-select — kun servicen `miele.set_program` med et program-ID,
+# og ID'erne er MODEL-afhængige (HA's DishWasherProgramId: eco = 3, 22, 28 eller
+# 200 alt efter generation). Derfor slår scriptet maskinens EGEN liste op live
+# (`miele.get_programs`) og tager det første kandidat-ID den kender. Listen er
+# tom når maskinen er slukket eller Mobile Start ikke er aktiveret — så er der
+# intet at gøre fra HA's side, og brugeren får besked i stedet for en fejl.
+#
+# Om `set_program` selv starter vasken på en opvasker er ikke målt endnu (første
+# brug); bliver status `programmed` (valgt, ikke startet), trykker scriptet
+# Start bagefter. `waiting_to_start` (udskudt start sat på maskinen) røres ikke.
+#
+# Ingen sæbeskuffe-sensor: API'et melder kun låge, salt og afspændingsmiddel
+# (og PowerDisk på AutoDos-modeller — denne har ingen).
+#
+# URET VED SOMMER-/VINTERTID (user 21/11: "sørg for at uret på opvaskemaskinen
+# holdes opdateret ved tidsskifte"): HA KAN IKKE stille det — hverken Mieles
+# API (actions: program, start/stop, starttid, navn, tænd/sluk, lys) eller HA's
+# integration (services: get_programs, set_program, set_program_oven) har et
+# ur. Mieles manualer for WiFi-modeller (G 7314: "updated automatically if a
+# connection is established to the Wi-Fi network"; G 1730 med Miele@home-modul)
+# siger at maskinen henter tiden selv mens den er tilmeldt Miele@home; G 6895's
+# egen manual er ikke fundet. Uden forbindelse skifter den IKKE selv (flere
+# Miele-manualer: "does not automatically adjust between summer and winter
+# time"). Derfor: på skiftedagen kl. 10 tjekker HA om maskinen er forbundet
+# (entities unavailable = Miele-status 255 not_connected; slukket maskine er
+# `off` og stadig forbundet) — offline → push, forbundet → kun logbog.
+#
+# PLANLAGT START (user 21/11: "starte den på et bestemt program på et bestemt
+# tidspunkt"; "mobile start skal on. kan ikke starte når den er lukket"): HA's
+# integration har ingen udskudt start (Mieles `startTime`-action er ikke
+# eksponeret), så HA holder tiden selv og kalder opvasker_start_program på
+# klokkeslættet. Fjernstart kræver Mobile Start trykket på en TÆNDT maskine,
+# og kun på maskinen (Mieles API har ingen action til det). G6895 slår SELV
+# Mobile Start fra når lågen åbnes (målt 21/11: on 11:28:02, låge 11:28:20,
+# off 11:28:24) → fyld, luk lågen, tryk Mobile Start TIL SIDST. Hvor længe den
+# ellers holder (sluk, timeout) er ikke målt — derfor pusher opvasker_plan_mobile_start_tabt hvis det slår fra
+# mens en plan venter, så det kan rettes inden natten. Planen er ét skud
+# (slås fra når den fyrer) og ryddes ved AirBnB-start (airbnb_mode.yaml).
+# =============================================================================
+
+input_boolean:
+  # Runtime (eksporteres ikke): ét skud, slås fra når planen fyrer.
+  opvasker_plan_aktiv:
+    name: "Opvasker — planlagt start"
+    icon: mdi:calendar-clock
+
+input_select:
+  # Navnene oversættes til integrationens nøgler i opvasker_planlagt_start.
+  opvasker_plan_program:
+    name: "Opvasker — planlagt program"
+    icon: mdi:dishwasher
+    options:
+      - Auto
+      - ECO
+      - Hurtig
+      - Intensiv
+      - Skånsom
+      - Ekstra stille
+      - Hygiejne
+      - Forskyl
+
+input_datetime:
+  opvasker_plan_tid:
+    name: "Opvasker — start kl."
+    icon: mdi:clock-outline
+    has_date: false
+    has_time: true
+
+script:
+  opvasker_start_program:
+    alias: "Opvasker — start program"
+    icon: mdi:dishwasher
+    # restart: et nyt program-tryk mens scriptet venter på Mobile Start
+    # erstatter det forrige valg i stedet for at blive ignoreret.
+    mode: restart
+    fields:
+      program:
+        description: "Programnøgle fra HA's Miele-integration (automatic, eco, quick_power_wash, …)"
+        example: eco
+        required: true
+        selector:
+          text:
+      vent_min:
+        description: "Minutter at vente på Mobile Start hvis den er slået fra (0 = giv op straks)"
+        example: 10
+        selector:
+          number:
+            min: 0
+            max: 30
+    sequence:
+      - variables:
+          enhed: "{{ device_id('sensor.koekken_opvasker') }}"
+          noegle: "{{ program | default('') }}"
+          # Kopieret fra homeassistant/components/miele/const.py
+          # (DishWasherProgramId, core 2026.10) — kun de programmer siden viser.
+          kandidater: >-
+            {% set k = {
+              'automatic': [6, 7, 31, 32, 201, 202],
+              'eco': [3, 22, 28, 200],
+              'quick_power_wash': [13, 38, 216],
+              'intensive': [1, 26, 205],
+              'gentle': [10, 35, 210],
+              'extra_quiet': [11, 36, 207],
+              'hygiene': [12, 37, 206],
+              'pre_wash': [24],
+              'rinse_and_hold': [219],
+            } %}{{ k.get(noegle, []) }}
+      - action: miele.get_programs
+        data:
+          device_id: "{{ enhed }}"
+        response_variable: svar
+        continue_on_error: true
+      - variables:
+          tilgaengelige: >-
+            {{ (svar.programs | default([])) | map(attribute='program_id') | list
+               if svar is defined else [] }}
+          valgt: >-
+            {% set ns = namespace(id=-1) %}
+            {% for i in kandidater %}
+              {% if ns.id < 0 and i in tilgaengelige %}{% set ns.id = i %}{% endif %}
+            {% endfor %}{{ ns.id }}
+      - if:
+          - condition: template
+            value_template: "{{ tilgaengelige | count == 0 }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              notification_id: opvasker_start
+              title: "Opvaskeren kan ikke startes herfra lige nu"
+              # Målt 21/11 (G6895, EK039W 02.65): med Mobile Start + fjernstyring
+              # TIL svarer Miele programs = "Not implemented" og actions er tomme
+              # (ingen programId, processAction eller startTime) — listen er altså
+              # ikke kun tom når Mobile Start mangler.
+              message: >-
+                {% if is_state('binary_sensor.koekken_opvasker_mobile_start', 'on') %}Mobile
+                Start er slået til, men Miele tillader ikke programvalg eller start
+                udefra i maskinens nuværende tilstand. Vælg og start på maskinen.
+                {% else %}Luk lågen og tryk Mobile Start på maskinen — prøv så igen.{% endif %}
+          - stop: "Ingen programmer fra maskinen"
+      - if:
+          - condition: template
+            value_template: "{{ valgt | int(-1) < 0 }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              notification_id: opvasker_start
+              title: "Programmet findes ikke på opvaskeren"
+              message: >-
+                {{ noegle }} er ikke på maskinens liste
+                ({{ (svar.programs | default([])) | map(attribute='program') | join(', ') }}).
+          - stop: "Program ikke på maskinen"
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: opvasker_start
+      - action: miele.set_program
+        data:
+          device_id: "{{ enhed }}"
+          program_id: "{{ valgt | int }}"
+      - wait_template: >-
+          {{ states('sensor.koekken_opvasker') in
+             ['programmed', 'waiting_to_start', 'in_use'] }}
+        timeout: "00:00:30"
+        continue_on_timeout: true
+      - if:
+          - condition: state
+            entity_id: sensor.koekken_opvasker
+            state: programmed
+          # En knap-entity står på 'unknown' indtil første tryk — kun
+          # 'unavailable' betyder at API'et har slået Start fra.
+          - condition: template
+            value_template: "{{ not is_state('button.koekken_opvasker_start', 'unavailable') }}"
+        then:
+          - action: button.press
+            target:
+              entity_id: button.koekken_opvasker_start
+        else:
+          # Programmeret, men Start er slået fra = Mobile Start mangler (målt
+          # 21/11: set_program lykkes uden, Start gør ikke — og maskinen slår
+          # selv Mobile Start fra når lågen åbnes). Før stod scriptet tavst.
+          - if:
+              - condition: state
+                entity_id: sensor.koekken_opvasker
+                state: programmed
+              - condition: template
+                value_template: "{{ vent_min | default(10) | int(10) > 0 }}"
+            then:
+              - action: persistent_notification.create
+                data:
+                  notification_id: opvasker_start
+                  title: "Tryk Mobile Start på opvaskeren"
+                  message: >-
+                    Programmet er valgt. Luk lågen og tryk Mobile Start på
+                    maskinen — så starter den.
+              - wait_template: >-
+                  {{ is_state('sensor.koekken_opvasker', 'programmed')
+                     and not is_state('button.koekken_opvasker_start', 'unavailable') }}
+                timeout:
+                  minutes: "{{ vent_min | default(10) | int(10) }}"
+                continue_on_timeout: true
+              - action: persistent_notification.dismiss
+                data:
+                  notification_id: opvasker_start
+              - if:
+                  - condition: template
+                    value_template: "{{ wait.completed }}"
+                then:
+                  - action: button.press
+                    target:
+                      entity_id: button.koekken_opvasker_start
+
+automation:
+  - id: opvasker_ur_tidsskifte
+    alias: "Opvasker: uret ved sommer-/vintertid"
+    description: >
+      På dagen for sommer-/vintertid: er opvaskeren offline, følger dens ur
+      ikke med — push. Forbundet = Miele@home stiller det selv (logbog).
+    mode: single
+    trigger:
+      - platform: time
+        at: "10:00:00"
+    condition:
+      # Skiftedag: UTC-offset nu ≠ for 24 t siden (ZoneInfo regner offset af
+      # væguret, så gårsdagens kl. 10 har den gamle offset).
+      - condition: template
+        value_template: "{{ now().utcoffset() != (now() - timedelta(days=1)).utcoffset() }}"
+    action:
+      - if:
+          - condition: state
+            entity_id: sensor.koekken_opvasker
+            state: unavailable
+        then:
+          - service: script.push_notify
+            data:
+              notif_id: opvasker
+              title: "Opvaskerens ur"
+              message: >-
+                Det er {{ 'sommertid' if now().utcoffset().total_seconds() > 3600 else 'vintertid' }},
+                men opvaskeren er ikke på nettet, så dens ur går forkert. Få den
+                på WiFi igen (så stiller den selv uret), eller stil det på
+                maskinen under Indstillinger → Klokkeslæt.
+        else:
+          - service: logbook.log
+            data:
+              name: "Opvasker"
+              message: >-
+                {{ 'sommertid' if now().utcoffset().total_seconds() > 3600 else 'vintertid' }}:
+                opvaskeren er forbundet — Miele@home stiller selv dens ur
+
+  - id: opvasker_planlagt_start
+    alias: "Opvasker: planlagt start"
+    description: >
+      Starter opvaskeren med det valgte program på det valgte klokkeslæt
+      (kræver Mobile Start på maskinen). Ét skud; push med resultatet.
+    mode: single
+    trigger:
+      - id: tid
+        platform: time
+        at: input_datetime.opvasker_plan_tid
+      # En genstart over klokkeslættet sluger tids-triggeren → tag planen op
+      # hvis tiden passerede for under 30 min siden (CLAUDE.md, HA-genstart).
+      - id: boot
+        platform: homeassistant
+        event: start
+    condition:
+      - condition: state
+        entity_id: input_boolean.opvasker_plan_aktiv
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% if trigger.id == 'boot' %}
+            {% set d = (now() - today_at(states('input_datetime.opvasker_plan_tid'))).total_seconds() %}
+            {% set d = d + 86400 if d < 0 else d %}
+            {{ d <= 1800 }}
+          {% else %}{{ true }}{% endif %}
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.opvasker_plan_aktiv
+      - if:
+          - condition: template
+            value_template: "{{ trigger.id == 'boot' }}"
+        then:
+          # Miele-integrationen skal have hentet maskinens status efter boot.
+          - delay: "00:01:30"
+      - variables:
+          navn: "{{ states('input_select.opvasker_plan_program') }}"
+          noegle: >-
+            {{ {'Auto': 'automatic', 'ECO': 'eco', 'Hurtig': 'quick_power_wash',
+                'Intensiv': 'intensive', 'Skånsom': 'gentle',
+                'Ekstra stille': 'extra_quiet', 'Hygiejne': 'hygiene',
+                'Forskyl': 'pre_wash'}.get(navn, 'eco') }}
+          mobile_start_foer: "{{ is_state('binary_sensor.koekken_opvasker_mobile_start', 'on') }}"
+      - service: script.opvasker_start_program
+        continue_on_error: true
+        data:
+          program: "{{ noegle }}"
+          vent_min: 0
+      - wait_template: >-
+          {{ states('sensor.koekken_opvasker') in ['in_use', 'waiting_to_start'] }}
+        timeout: "00:01:00"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ states('sensor.koekken_opvasker') in ['in_use', 'waiting_to_start'] }}"
+        then:
+          - service: script.push_notify
+            data:
+              notif_id: opvasker
+              title: "Opvaskeren er startet"
+              message: >-
+                {{ navn }}{% set f = states('sensor.koekken_opvasker_finish') %}
+                {%- if as_datetime(f) is not none %}, færdig ca. kl.
+                {{ as_local(as_datetime(f)).strftime('%H:%M') }}{% endif %}.
+        else:
+          - service: script.push_notify
+            data:
+              notif_id: opvasker
+              title: "Opvaskeren startede ikke"
+              message: >-
+                {% set st = states('sensor.koekken_opvasker') %}
+                {% if st in ['unavailable', 'unknown', 'not_connected'] %}Den var ikke på nettet.
+                {% elif not mobile_start_foer %}Mobile Start var ikke slået til (lågen slår den fra — tryk den til sidst).
+                {% else %}Den stod på "{{ st }}".{% endif %}
+                Planen ({{ navn }}) er slået fra.
+
+  # Mobile Start slår fra mens en plan venter (låge åbnet, slukket, model-
+  # timeout) → planen kan ikke starte maskinen. 2 min: forbindelses-blips
+  # (not_connected 0 s) går over unknown, ikke on → off.
+  - id: opvasker_plan_mobile_start_tabt
+    alias: "Opvasker: planlagt start mistede Mobile Start"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.koekken_opvasker_mobile_start
+        from: "on"
+        to: "off"
+        for:
+          minutes: 2
+    condition:
+      - condition: state
+        entity_id: input_boolean.opvasker_plan_aktiv
+        state: "on"
+    action:
+      - service: script.push_notify
+        data:
+          notif_id: opvasker
+          title: "Opvasker: Mobile Start er slået fra"
+          message: >-
+            Den planlagte opvask kl. {{ states('input_datetime.opvasker_plan_tid')[:5] }}
+            kan ikke starte. Tænd maskinen, luk lågen og tryk Mobile Start igen.

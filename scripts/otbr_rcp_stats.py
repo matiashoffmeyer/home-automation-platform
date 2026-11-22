@@ -51,10 +51,12 @@ MATTER_WS = "ws://172.30.32.1:5580/ws"
 TS = re.compile(r"^(?:(\d+)d\.)?(\d+):(\d\d):(\d\d)\.(\d+)")
 PEER = re.compile(r"Different partition \(peer:(\d+)")
 # Matter-noder der er parret men BEVIDST strømløse — tæller aldrig som "faldet
-# af". Tom siden 15/10: 498 (GRILLPLATS 0x1F2, nu "Stue Plug") stod her mens den
-# lå i skuffen, var 14-15/10 Thread-router i depotet og driver fra 15/10 hyggelampen i stuen (B234)
-# og var 15/10 netværkets LEDER — undtaget ville den aldrig blive meldt væk.
-PASSIVE_NODER = set()
+# af". 498 (GRILLPLATS 0x1F2, "Stue Plug") stod her mens den lå i skuffen, var
+# 14-15/10 Thread-router i depotet (15/10 netværkets LEDER) og drev 15/10-21/11
+# hyggelampen i stuen (B234). Fra 21/11 i DVALE (user: "hyggelampe plug skal i
+# dvale" — taget ud, pæren er på fast strøm) → her igen. Sættes den i en
+# stikkontakt som router, skal den UD af listen, ellers meldes den aldrig væk.
+PASSIVE_NODER = {498}
 
 
 def sup(path, data=None):

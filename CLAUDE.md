@@ -34,11 +34,6 @@ One verdict per sprint, 3-5 lines, **max 3 notes** (`claude_rules.py check` coun
 roll the oldest out in the SAME commit. Full note: `grep -n "Sprint <date>"
 docs/sprint_log.md`. A permanent lesson goes to "Permanent facts" or a failure class.
 
-- **2026-10-26 — a witness for a sleeping partner protects no one once both
-  adults have provably left.** The sleep ghost (06:39-09:24; g2_still = 100 does not
-  damp energy 100, B269) blocked every fast dormant path; the prel guard set Active
-  again. `binary_sensor.sove_efterslaeb_efter_afgang` (episode before the door +
-  Parent B's anchor edge at the door) removes the witness; the latch's child ring is broken. B268.
 - **2026-10-27 — a party is counted in zone MASS, not heads.** 15 guests showed 3:
   zones are capped at 8 (ceiling 6), and the extra floor resets at every door.
   `binary_sensor.people_fest` (min(45-, 15-min mean of occupied zones) ≥ 4.2; max
@@ -48,6 +43,11 @@ docs/sprint_log.md`. A permanent lesson goes to "Permanent facts" or a failure c
   0.0.0.0.** A test server binds 127.0.0.1 and dies in the SAME session. No
   `home-assistant.log`, journal ≈ 1 week → `scripts/cyber_vagt.py` keeps the
   evidence (`sensor.cyber_status`, push per attempt). Open: B309.
+- **2026-11-21 — the living room's south sun is measured in the BEDROOM.** No
+  open-plan meter sees it (`open_plan_lux` measured the reading lamp, 50-73 lx).
+  `binary_sensor.stue_direkte_sol` (bedroom `lux_reel` ≥ 40 + 3 lx/° over 6°,
+  facade 176°) defers the sofa zone; after 10 min sun (× 2 at cloud ≥ 60 %:
+  median 20 vs 53 min more sun) `stue_direkte_sol_sofa_sluk` turns it off. B323.
 ---
 
 ## 💡 Permanent facts (distilled from archived sprints)

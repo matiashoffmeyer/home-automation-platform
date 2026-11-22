@@ -25,7 +25,8 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
 - **Husets Thread-routere (09/10, 8 stk): badets KAJPLATS-spots, entré-loftet,
   stue-spotsene og GRILLPLATS-pluggene
   (`switch.thread_router_koekken` i køkkenet, altid tændt — før sove-lyskæden;
-  hyggelampens `switch.stue_plug` i stuen; begge fra 15/10).** Stue-spotsene er BROEN mellem OTBR'en
+  fra 15/10). Stuens `switch.stue_plug` (node 498) var router 15/10-21/11 og
+  er i DVALE (taget ud, i `PASSIVE_NODER`) → 7 routere.** Stue-spotsene er BROEN mellem OTBR'en
   og badet: trækkes de ud, falder badet af (08/10 20:38 → 20:56). Gen-verificér
   rollerne med `ot-ctl router table` (extended MAC ↔ matter-nodens `0/51/0`).
 - **Zombie-router: står i `router table` med Age < 30 s men er døv for ping/

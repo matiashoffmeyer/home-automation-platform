@@ -15,9 +15,9 @@ Search keywords: `terrasse`
 
 ### `automations/activity_aware.yaml`
 
-- **Activity: Terrasse-only winddown — slow dim af indendørs ceiling lys** (line 258, mode=single)
+- **Activity: Terrasse-only winddown — slow dim af indendørs ceiling lys** (line 257, mode=single)
   - Efter 10 min terrasse_only fade ceiling-lights (stue/koekken/spisestue)
-- **Activity: Clear terrasse-winddown notification ved skift væk** (line 320, mode=single)
+- **Activity: Clear terrasse-winddown notification ved skift væk** (line 319, mode=single)
   - A65 fix audit-3 2026-05-06 PM: tilfojet conditions for at undgå over-firing
 
 ### `automations/security.yaml`

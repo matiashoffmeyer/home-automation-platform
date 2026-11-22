@@ -106,5 +106,7 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
 5. Nyt ESPHome-config-push: spørg "kan dette fyre periodisk?" (= bad) og "kunne
    brugeren leve med ét manuelt kald?" (= ofte ja) → lav `script.X_apply_now`.
 
-**Canary:** `sensor.*_apollo_esp_temperature` over ~50 °C steady-state. Efter ny
+**Canary:** `sensor.*_apollo_esp_temperature` over
+`input_number.apollo_esp_temp_graense` (52 °C) — spisestue + køkken står på
+køleskabet og har `_koeleskab` (54 °C, B314). Efter ny
 parring/factory-reset: `script.apollo_radar_apply_now`.

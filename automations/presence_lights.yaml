@@ -400,6 +400,10 @@
     # tænder som før (packages/stue_sol_vindue.yaml). Unavailable = normal drift.
     - condition: template
       value_template: "{{ not is_state('binary_sensor.stue_sol_vindue', 'on') }}"
+    # B323 (2026-11-21): direkte sol på sydfacaden → sofa-zonen venter
+    # (packages/stue_sol_vindue.yaml). Slut = re-arm i presence_lux_stue_rearm.
+    - condition: template
+      value_template: "{{ not is_state('binary_sensor.stue_direkte_sol', 'on') }}"
     - condition: template
       value_template: "{{ not is_state('input_select.room_mode_stue', 'Manual') }}"
     - condition: template
@@ -543,6 +547,13 @@
       value_template: "{{ not is_state('binary_sensor.roborock_blokerer_lys', 'on') }}"
     - condition: state
       entity_id: binary_sensor.sovevaerelse_apollo_radar_still_target
+      state: "on"
+    # 2026-11-22 (user-valg "a) ja, altid"): opholdet skal have BEVIST bevægelse
+    # — et still-spøgelse i skumringen er ikke et menneske. SAMME regel som
+    # still-tænd i presence_sovevaerelse.yaml (#2); latch + målinger i
+    # packages/sove_radiator_spoegelse.yaml.
+    - condition: state
+      entity_id: binary_sensor.sove_bevaegelse_bevist
       state: "on"
     # 2026-11-04 (#12, søster til still-vejen i presence_sovevaerelse.yaml):
     # radiator-spøgelset (B269) holder still on bag en LUKKET dør, og skumringen
@@ -816,7 +827,6 @@
            and (states('sensor.open_plan_lux') | float(0)) > thr
            and (is_state('light.spisestue_loft', 'on')
                 or is_state('light.stue_sofa_lampe', 'on')
-                or is_state('light.stue_sofa_lampe_2', 'on')
                 or is_state('light.stue_hjoernelampe', 'on')
                 or is_state('light.stue_plug', 'on')
                 or is_state('light.stue_laesehygge', 'on')) }}
@@ -837,7 +847,6 @@
         {{ is_state('sensor.sun_bracket', 'day') and g > 0
            and (states('sensor.open_plan_lux') | float(0)) > g * 1.2
            and (is_state('light.stue_sofa_lampe', 'on')
-                or is_state('light.stue_sofa_lampe_2', 'on')
                 or is_state('light.stue_hjoernelampe', 'on')
                 or is_state('light.stue_plug', 'on')
                 or is_state('light.stue_laesehygge', 'on')) }}
@@ -988,6 +997,17 @@
       from: "on"
       to: "off"
       id: sol_slut
+    # B323 (2026-11-21): direkte sol på sydfacaden udskød sofa-tænd (og
+    # stue_direkte_sol_sofa_sluk kan have slukket den). 2 min uden sol: en sky
+    # der kun strejfer, tænder ikke lyset for at det slukker igen. from: "on"
+    # (B103) som sol_slut.
+    - platform: state
+      entity_id: binary_sensor.stue_direkte_sol
+      from: "on"
+      to: "off"
+      for:
+        minutes: 2
+      id: direkte_sol_slut
   condition:
     - condition: state
       entity_id: binary_sensor.presence_sensors_available
@@ -1002,7 +1022,8 @@
       value_template: >-
         {% set lux = states('sensor.open_plan_lux') | float(-1) %}
         {% set gate = states('sensor.stue_lux_gate') | float(0) %}
-        {{ trigger.id == 'sol_slut' or (lux >= 0 and gate > 0 and lux < gate) }}
+        {{ trigger.id in ['sol_slut', 'direkte_sol_slut']
+           or (lux >= 0 and gate > 0 and lux < gate) }}
     # No-op hvis intet optaget open-plan-rum står mørkt.
     - condition: template
       value_template: >-
@@ -1020,6 +1041,10 @@
         - delay:
             seconds: 30
     - if:
+        # B323: den direkte sol udskyder kun sofa-zonen — spisestue-loftet
+        # har intet at re-arme på dens slut.
+        - condition: template
+          value_template: "{{ trigger.id != 'direkte_sol_slut' }}"
         - condition: state
           entity_id: binary_sensor.spisestue_apollo_occupancy_filtered
           state: "on"
@@ -1053,7 +1078,9 @@
           data:
             name: "Stue re-arm"
             message: >-
-              sofa-zonen er optaget men mørk → re-armer Lysnet: Sofa-stue tænd
+              {% if trigger.id == 'direkte_sol_slut' %}direkte sol på sydfacaden
+              sluttede, og {% endif %}sofa-zonen er optaget men mørk → re-armer
+              Lysnet: Sofa-stue tænd
         - service: automation.trigger
           target:
             entity_id: automation.lysnet_sofa_stue_taend

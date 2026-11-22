@@ -45,9 +45,14 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
 - **En pære med `power_on_behavior = Off` er usynligt død fra vægkontakten.**
   **Signatur:** masser af `off→on` i history, men **nul `unavailable→on`**.
 - **Stuen har fire fysiske lys:** to Thread-spots (`light.stue_spot_1/2`),
-  `light.stue_plug` (effektmålt, som sove-lyskæden — resten er estimat) og
-  `light.stue_laesehygge` (vægkontakt ⇒ dens unavailable-andel er
-  brugeren). De tre øvrige er pærer i et skab, bevidst bevaret i rosters (B132).
+  hyggelampen `light.stue_plug` og `light.stue_laesehygge` (vægkontakt ⇒ dens
+  unavailable-andel er brugeren). **Hyggelampen er en Innr-pære på fast strøm**
+  (21/11, pluggen i dvale): `light.stue_plug` er stadig lampen for
+  automationerne — en tænd/sluk-wrapper der tænder `light.stue_hyggelampe_paere`
+  (ex `stue_sofa_lampe_2`) i sliders' lys og spejler dens state/availability.
+  Pæren har egen tile, men står UDE af rosters, grupper og effekter (de ville
+  overskrive look'et); watt er estimat (9 W). De to øvrige (`stue_sofa_lampe`,
+  `stue_hjoernelampe`) er pærer i et skab, bevidst bevaret i rosters (B132).
   **Generelt: en permanent død entity er ubrugelig som BEVIS** — mål
   unavailable-andelen over 14 døgn før du vælger kanariefugl eller gate-kilde.
   **Signatur: en test der kun kan fejle.**

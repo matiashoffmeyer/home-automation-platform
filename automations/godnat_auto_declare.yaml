@@ -3,7 +3,7 @@
 # =============================================================================
 # Per user-request 2026-05-04. Konservativt design der auto-declarer godnat
 # hvis presence har været KUN i soveværelser (sove + boern) i 2 timer i
-# nat-vinduet (21:00-07:00).
+# nat-vinduet (sliderne global_auto_godnat_start/end_hour, i dag 23-06).
 #
 # DESIGNFILOSOFI: ikke aggressivt — lange soak-times + bred bedroom-only
 # check forhindrer "vi læser i seng" eller "kids er i deres rum"-falske.
@@ -12,7 +12,7 @@
 # Denne version er mere konservativ:
 # 1. 2-timer soak (vs tidligere kortere)
 # 2. ALLE non-bedroom rum SKAL være tomme (vs evt. partial check)
-# 3. Kun aktiv 21-07 (vs døgnet rundt)
+# 3. Kun aktiv i nat-vinduet (vs døgnet rundt) — også mørke-vejen siden 21/11
 # 4. Kill-switch via input_boolean.auto_godnat_enabled
 # 5. Notification ved fire (synlig audit-trail)
 #
@@ -74,8 +74,8 @@
       minutes: "/5"
       id: backstop
   variables:
-    # Hvilken vej fyrede? Backstop'en kan opfylde begge — mørke-vejen vinder,
-    # fordi den ikke er bundet til auto-godnat-vinduet (låsen ER aften-vinduet).
+    # Hvilken vej fyrede? Backstop'en kan opfylde begge — mørke-vejen vinder
+    # (kortere soak); begge er bundet til auto-godnat-vinduet (2026-11-21).
     moerke_vej: >-
       {% set m = states.binary_sensor.sove_moerke_godnat_kandidat %}
       {{ trigger.id == 'moerke'
@@ -115,14 +115,45 @@
     # input_number.global_auto_godnat_start_hour default 21
     # input_number.global_auto_godnat_end_hour default 7
     # Logikken haandterer cross-midnight: aktivt hvis hour >= start OR hour < end.
-    # Mørke-vejen er undtaget: aften-låsen kan kun være armeret i aften-vinduet
-    # (input_datetime.sove_manual_off_lock_start → 05:00).
+    # 2026-11-21 (user-bug "absurd aggressiv … den går altid på når vi putter.
+    # Efter 23 er fair, men ikke før"): mørke-vejen var undtaget vinduet (låsen
+    # = aftenen), og 21/11 20:21 erklærede den voksen-godnat mens Parent B hvilede
+    # i sengen (sove-loftet slukket 20:06 af no-motion-watchdoggen → låsen
+    # armeret; ét bevægelses-udslag 19:36, still-afstanden levende 202-222 cm i
+    # 1 t) og Parent A puttede — open plan blev nat-dæmpet resten af aftenen.
+    # Nu gælder vinduet ALLE veje (ét anker, slideren står på 23).
     - condition: template
       value_template: >
-        {% set start_h = states('input_number.global_auto_godnat_start_hour') | int(21) %}
+        {% set start_h = states('input_number.global_auto_godnat_start_hour') | int(23) %}
         {% set end_h = states('input_number.global_auto_godnat_end_hour') | int(7) %}
         {% set h = now().hour %}
-        {{ moerke_vej or h >= start_h or h < end_h }}
+        {{ h >= start_h or h < end_h }}
+    # 2026-11-21 (samme user-spec: "kræve aktivitet i soveværelset når vi går i
+    # seng, eller still-presence"): mørke-vejens senge-bevis er dvale-vidnet, og
+    # dets 16-min bro bærer det hen over et TOMT soveværelse — længere end den
+    # 15-min soak. Mørke-vejen kræver derfor soveværelsets RÅ radar (bevægelse
+    # eller still) i fyrings-sekundet. En sovende der er tabt et øjeblik (5-15
+    # min) koster kun ventetid: backstop'en (/5) prøver igen, og kandidaten
+    # holder over hullet.
+    - condition: template
+      value_template: >-
+        {{ not moerke_vej
+           or is_state('binary_sensor.sovevaerelse_apollo_occupancy', 'on') }}
+    # …og "personen" i sengen skal være GÅET derind: bevægelse i soveværelset
+    # fra 10 min før aften-låsen armerede og frem (sensor.sove_sidst_bevaegelse,
+    # packages/godnat_auto_declare.yaml). 21/11 var det et still-spøgelse uden
+    # bevægelse i 30 min før låsen — låsen blev armeret af no-motion-
+    # watchdoggen, som pr. definition aldrig består denne test. Stemplet
+    # unknown (ny/aldrig sat) → mørke-vejen spærret, den lange vej gælder. NB
+    # låsens last_changed nulstilles ved restart → efter en genstart bliver
+    # kravet STRENGERE (fejler lukket), aldrig løsere.
+    - condition: template
+      value_template: >-
+        {% set laas = states.input_boolean.sovevaerelse_manual_off_lock %}
+        {% set mv = states('sensor.sove_sidst_bevaegelse') | as_datetime(none) %}
+        {{ not moerke_vej
+           or (laas is not none and mv is not none
+               and (mv - laas.last_changed).total_seconds() >= -600) }}
     # Don't re-declare hvis allerede godnat
     - condition: state
       entity_id: input_boolean.godnat_active

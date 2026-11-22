@@ -15,7 +15,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/airbnb_mode.yaml`
 
-- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 958, mode=queued)
+- **AirBnB: Bloker børneværelse-lys (slukkes straks)** (line 963, mode=queued)
   - Undtagelse 1 (user 2026-06-30; rev. 2026-07-08 #12): BØRNEVÆRELSE må aldrig
 
 ### `automations/boern_ankomst_detekter.yaml`
@@ -79,9 +79,9 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/presence_lights.yaml`
 
-- **Lysnet: Børneværelse tænd ved LUX-fald** (line 656, mode=single)
+- **Lysnet: Børneværelse tænd ved LUX-fald** (line 660, mode=single)
   - Daylight fades while børneværelse occupied — gentle light for kids.
-- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1134, mode=single)
+- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1154, mode=single)
   - Dagslys tilbage i børneværelset mens loftet står tændt — blid fade off.
 
 ### `automations/putning_auto_detect.yaml`

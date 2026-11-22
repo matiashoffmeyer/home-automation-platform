@@ -6,7 +6,7 @@ Search keywords: `koekken, kokken`
 
 ## Indhold
 - [Automations](koekken.md#automations) (9)
-- [Entities](koekken.md#entities) (248)
+- [Entities](koekken.md#entities) (273)
 - [Helpers](koekken.md#helpers) (42)
 
 ---
@@ -96,6 +96,18 @@ Search keywords: `koekken, kokken`
 - `binary_sensor.koekken_morgenlys` — 1 refs in 1 file(s)
 - `binary_sensor.koekken_naer_menneske` — 4 refs in 1 file(s)
 - `binary_sensor.koekken_openplan_kulsort` — 1 refs in 1 file(s)
+- `binary_sensor.koekken_opvasker_door` — 1 refs in 1 file(s)
+- `binary_sensor.koekken_opvasker_mobile_start` — 5 refs in 2 file(s)
+- `binary_sensor.koekken_opvasker_notification_active` — 1 refs in 1 file(s)
+- `binary_sensor.koekken_opvasker_problem` — 1 refs in 1 file(s)
+- `binary_sensor.koekken_opvasker_remote_control` — 1 refs in 1 file(s)
+- `binary_sensor.koekken_opvasker_smart_grid` — 1 refs in 1 file(s)
+
+### `button.*`
+
+- `button.koekken_opvasker_pause` — 2 refs in 1 file(s)
+- `button.koekken_opvasker_start` — 6 refs in 2 file(s)
+- `button.koekken_opvasker_stop` — 2 refs in 1 file(s)
 
 ### `counter.*`
 
@@ -280,7 +292,7 @@ Search keywords: `koekken, kokken`
 
 - `sensor.koekken_aktiv_15m` — 5 refs in 2 file(s)
 - `sensor.koekken_apollo_bevaegelse_5min` — 2 refs in 2 file(s)
-- `sensor.koekken_apollo_esp_temperature` — 5 refs in 4 file(s)
+- `sensor.koekken_apollo_esp_temperature` — 6 refs in 4 file(s)
 - `sensor.koekken_apollo_ghost_flaps_1h` — 3 refs in 2 file(s)
 - `sensor.koekken_apollo_lux` — 9 refs in 6 file(s)
 - `sensor.koekken_apollo_radar_move_energy` — 1 refs in 1 file(s)
@@ -311,6 +323,21 @@ Search keywords: `koekken, kokken`
 - `sensor.koekken_lyskaede_target_brightness` — 8 refs in 4 file(s)
 - `sensor.koekken_naer_pulser` — 1 refs in 1 file(s)
 - `sensor.koekken_occupancy_recent` — 3 refs in 1 file(s)
+- `sensor.koekken_opvasker` — 12 refs in 4 file(s)
+- `sensor.koekken_opvasker_elapsed_time` — 1 refs in 1 file(s)
+- `sensor.koekken_opvasker_energy_consumption` — 1 refs in 1 file(s)
+- `sensor.koekken_opvasker_energy_forecast` — 1 refs in 1 file(s)
+- `sensor.koekken_opvasker_finish` — 4 refs in 4 file(s)
+- `sensor.koekken_opvasker_program` — 1 refs in 1 file(s)
+- `sensor.koekken_opvasker_program_phase` — 1 refs in 1 file(s)
+- `sensor.koekken_opvasker_program_type` — 1 refs in 1 file(s)
+- `sensor.koekken_opvasker_remaining_time` — 1 refs in 1 file(s)
+- `sensor.koekken_opvasker_rinse_aid_level` — 3 refs in 3 file(s)
+- `sensor.koekken_opvasker_salt_level` — 3 refs in 3 file(s)
+- `sensor.koekken_opvasker_start` — 1 refs in 1 file(s)
+- `sensor.koekken_opvasker_start_in` — 1 refs in 1 file(s)
+- `sensor.koekken_opvasker_water_consumption` — 1 refs in 1 file(s)
+- `sensor.koekken_opvasker_water_forecast` — 1 refs in 1 file(s)
 - `sensor.koekken_skift_segment` — 9 refs in 2 file(s)
 - `sensor.koekken_spots_dagslys_sluk_effektiv` — 6 refs in 3 file(s)
 - `sensor.koekken_spots_lux_gate_effektiv` — 11 refs in 5 file(s)
@@ -327,6 +354,7 @@ Search keywords: `koekken, kokken`
 
 - `switch.koekken_apollo_ld2410_bluetooth` — 1 refs in 1 file(s)
 - `switch.koekken_apollo_radar_engineering_mode` — 1 refs in 1 file(s)
+- `switch.koekken_opvasker_power` — 1 refs in 1 file(s)
 - `switch.koekken_spots` — 46 refs in 19 file(s)
 - `switch.thread_router_koekken` — 5 refs in 3 file(s)
 
