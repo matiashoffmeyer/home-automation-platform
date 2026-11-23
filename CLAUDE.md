@@ -172,7 +172,7 @@ Philosophy unchanged (**slow + thorough over fast**) — spend on diagnosis and 
 
 Each subagent costs 50-65k tokens before doing anything (8/10: 4 % → 33 % of usage).
 1. **Work yourself:** lookups, few-file reads and code changes inline (`grep`/`hq.py`/targeted Read). Subagents only for genuinely broad sweeps (dozens of files, bug-hunt workflows), returning *only the conclusion*.
-2. **Code is written by Opus** (user-spec 2026-10-07). Main session on Sonnet and code to commit → ask the user for `/model opus` rather than delegating. User cannot answer now (🚀) → ONE Opus subagent. Sonnet (`model: "sonnet"`, never a version number) only for read-only triage such as bug-hunt finders; `subagent_type: "fork"` always runs on the main model.
+2. **Code is written by Opus** (user-spec 2026-10-07). Main session on Sonnet and code to commit → ask the user for `/model opus` rather than delegating. User cannot answer now (🚀) → ONE Opus subagent. Sonnet (`model: "sonnet"`, never a version number) only for read-only triage such as bug-hunt finders, and the hiking-route routine (its skill: Opus decides camps + review); `subagent_type: "fork"` always runs on the main model.
 3. **No parallel fleets (Pro plan quota):** max 1-2 subagents at a time — too many burn the quota mid-run, and all die WITHOUT reporting. Large reviews run SEQUENTIALLY. **Applies to the Workflow tool and "ultracode" too — nothing lifts it**. `scripts/agent_guard.py` (PreToolUse) rejects workflows without `model:'sonnet'` on every agent(), with `pipeline()`/`while` or `parallel()` without `.slice(i, i + 2)`, and a 3rd concurrent Agent. Rejected = build it smaller, never circumvent.
 
 ### 🔐 Secrets, outside text and incidents (user-spec 2026-11-05)
