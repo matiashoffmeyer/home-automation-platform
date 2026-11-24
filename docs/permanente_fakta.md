@@ -1055,10 +1055,14 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   spærre for gardin. men rigtigt at vest stue kun skal 85% ned". Spærren blev
   fjernet igen samme dag. 85 %-grænsen ("der står nogle ting", user 2026-06-11)
   er implementeret som NED → `gardin_vest_ned_sekunder` (målt top→85 %) →
-  My-stop; den antager start fra TOP, så et 2. luk uden en åbning imellem kører
-  forbi grænsen og ned i inventaret. 14 døgns historik (23/9-7/10): vest kun
-  lukket én gang (RODRET), intet dobbelt-luk set — men en ny luk-vej skal enten
-  re-home (som `script.gardin_film_luk`) eller være flag-gated til ét luk.
+  My-stop; den antog start fra TOP, så et 2. luk uden en åbning imellem kørte
+  forbi grænsen og ned i inventaret. **Ramt 2026-11-23 19:46** (user: "den gik
+  alt for langt ned"): vinter-luk 16:20 havde sat vest på 20 %, RODRET'ens 2.
+  ned-klik kørte de fulde 13 s → bund; efter stop-klik var positionen ukendt, og
+  næste luk 19:47:01 ramte bunden igen. Rettet: close = `gardin_vest_position(15,
+  kun_ned)` fra kendt position (`pos_nu()` i `custom_templates/gardin_vest.jinja`,
+  hver kørsel bogført i `input_text.gardin_vest_koersel`), stop regner
+  positionen ud, ukendt → re-home.
 - **2026-10-04 (B123): ankeret har nu TO lister — `held` (ÅBN-blokliste, med
   AirBnB-tæppet) og `held_luk` (LUK-blokliste, uden tæppet).** Teksten herunder
   forklarer hvorfor `held` aldrig må læses på en luk-vej; det skete alligevel i

@@ -259,6 +259,52 @@ D["flutter_1"] = svg(
     ),
 )
 
+# Hamstring bridge: heels up on a bench (no leg curl machine needed).
+lowbench = wood("M198 124 L282 124 M212 124 L212 168 M268 124 L268 168", 7)
+D["baglaarsloeft_0"] = svg(
+    "Hælene på bænken, knæene let bøjet",
+    lowbench
+    + fig(
+        ("h", 54, 152),
+        "M72 160 L150 160",
+        "M80 161 L140 165",
+        "M150 160 L180 114",
+        ("M180 114 L235 116", RED),
+    ),
+)
+D["baglaarsloeft_1"] = svg(
+    "Pres hælene ned, løft til ret linje",
+    lowbench
+    + fig(
+        ("h", 54, 152),
+        ("M72 160 L136 120 L182 91", RED),
+        "M80 161 L140 165",
+        "M182 91 L235 116",
+    ),
+)
+
+
+# Eccentric wrist extension, right arm: seated, forearm on
+# the thigh, palm down, hand past the knee. Up with help, down slowly alone.
+def _haandled(haand, vaegt, cap):
+    return svg(
+        cap,
+        wood("M40 134 L112 134 M50 134 L50 168 M102 134 L102 168", 7)
+        + fig(
+            ("h", 82, 58),
+            "M82 73 L82 126",
+            "M82 126 L150 126 L150 166",
+            "M82 82 L94 119 L156 119",
+            (haand, RED),
+        )
+        + f'<circle cx="{vaegt[0]}" cy="{vaegt[1]}" r="8" fill="{INK}"/>',
+        floor="gulv",
+    )
+
+
+D["haandled_0"] = _haandled("M156 119 L166 99", (170, 93), "Underarmen på låret, håndfladen ned")
+D["haandled_1"] = _haandled("M156 119 L166 141", (170, 148), "Sænk langsomt på 4 sek")
+
 # Side-lying leg raise.
 D["sideben_0"] = svg(
     "På siden, kroppen lige",

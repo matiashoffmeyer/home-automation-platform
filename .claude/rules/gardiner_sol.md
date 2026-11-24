@@ -39,9 +39,12 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
 - **Terrassedøren har INTET gardin** (user 2026-10-07) → en åben terrassedør må
   aldrig spærre et gardin (en spærre på stue vest blev bygget og fjernet igen
   samme dag). **Stue vest må højst 85 % ned — der står ting under:** close =
-  NED → `input_number.gardin_vest_ned_sekunder` → stop, målt fra TOP. Derfor er
-  vest-luk IKKE idempotent: et 2. luk uden åbning imellem kører i bund. Re-home
-  (op først) som `script.gardin_film_luk`, eller luk kun fra kendt top.
+  `script.gardin_vest_position(15, kun_ned)` fra den KENDTE position (står den
+  ≤ 15 %: intet; ukendt: re-home). Position = `pos_nu()` i
+  `custom_templates/gardin_vest.jinja` (hver kørsel bogført i
+  `input_text.gardin_vest_koersel`, så et stop regnes ud). **Signatur på det
+  gamle hul: vest i bund efter et luk fra 20 % eller efter et stop halvvejs**
+  (23/11). En NY RF-vej til vest skal bogføre via `script.gardin_vest_koersel_saet`.
 - **`sensor.gardiner_manual_hold` har TO lister: `held` = auto-ÅBN-blokliste
   (bærer AirBnB-tæppet: alle fire permanent), `held_luk` = auto-LUK-blokliste
   (samme minus tæppet).** **Signatur: en LUK-vej der læser `held` kan aldrig

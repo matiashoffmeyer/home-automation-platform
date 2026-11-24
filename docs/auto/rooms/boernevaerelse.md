@@ -74,14 +74,14 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - **Lysnet: Børneværelse auto-hyggelys efter bevægelse** (line 210, mode=single)
 - **Lysnet: Børneværelse adult-vækning under godnat (moving target)** (line 333, mode=single)
   - Tænder boern-loft 60% warm når en adult går ind i kids rum efter 06:00
-- **Lysnet: Børneværelse gradvis sluk** (line 422, mode=restart)
+- **Lysnet: Børneværelse gradvis sluk** (line 439, mode=restart)
   - 5-minute absence rule (private-rum standard). Stamps input_datetime.boernevaerelse_last_off
 
 ### `automations/presence_lights.yaml`
 
-- **Lysnet: Børneværelse tænd ved LUX-fald** (line 660, mode=single)
+- **Lysnet: Børneværelse tænd ved LUX-fald** (line 667, mode=single)
   - Daylight fades while børneværelse occupied — gentle light for kids.
-- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1154, mode=single)
+- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1161, mode=single)
   - Dagslys tilbage i børneværelset mens loftet står tændt — blid fade off.
 
 ### `automations/putning_auto_detect.yaml`
@@ -91,8 +91,8 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/somrig_buttons.yaml`
 
-- **Dark Mode-RODRET: Dark Mode ON (klik/hold øverste)** (line 689, mode=single)
-- **Dark Mode-RODRET: Dark Mode OFF (klik/hold nederste)** (line 733, mode=single)
+- **Dark Mode-RODRET: Dark Mode ON (klik/hold øverste)** (line 690, mode=single)
+- **Dark Mode-RODRET: Dark Mode OFF (klik/hold nederste)** (line 734, mode=single)
 
 ### `automations/styrbar_rooms.yaml`
 

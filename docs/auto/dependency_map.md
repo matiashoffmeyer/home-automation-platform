@@ -15,24 +15,24 @@ Alle fil:linjer for én entity: `python3 scripts/hq.py where <entity>`.
 | `binary_sensor.stue_apollo_occupancy_filtered` | 50 | 123 |
 | `binary_sensor.entre_valhorn_occupancy` | 48 | 110 |
 | `binary_sensor.boernevaerelse_apollo_occupancy` | 47 | 127 |
+| `binary_sensor.sovevaerelse_apollo_occupancy` | 46 | 92 |
 | `light.koekken_lyskaede` | 46 | 195 |
 | `sun.sun` | 46 | 163 |
-| `binary_sensor.sovevaerelse_apollo_occupancy` | 45 | 90 |
-| `input_boolean.godnat_active` | 44 | 99 |
+| `input_boolean.godnat_active` | 44 | 101 |
 | `binary_sensor.koekken_apollo_occupancy_filtered` | 43 | 113 |
 | `input_boolean.godnat_boern_active` | 42 | 101 |
 | `binary_sensor.spisestue_apollo_occupancy_filtered` | 41 | 115 |
-| `light.spisestue_pendel` | 41 | 140 |
+| `light.spisestue_pendel` | 41 | 141 |
 | `binary_sensor.badevaerelse_inde_occupancy` | 40 | 135 |
 | `light.stue_laesehygge` | 38 | 88 |
 | `light.boernevaerelse_loft` | 37 | 97 |
 | `sensor.open_plan_lux` | 35 | 102 |
 | `light.entre_loft` | 35 | 83 |
+| `binary_sensor.godnat_common_active` | 34 | 92 |
 | `light.boernevaerelse_hygge_strip` | 33 | 97 |
-| `binary_sensor.godnat_common_active` | 33 | 90 |
 | `binary_sensor.depot_valhorn_occupancy` | 32 | 72 |
-| `binary_sensor.godnat_any_active` | 31 | 65 |
 | `input_boolean.cinema_active` | 31 | 62 |
+| `light.terrasse_paerelyskaede` | 30 | 102 |
 
 ## State machine entities (kritiske)
 

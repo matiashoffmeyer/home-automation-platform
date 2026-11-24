@@ -18,7 +18,7 @@ Search keywords: `spisestue`
 - **Lysnet: Spisestue tænd ved LUX-fald** (line 78, mode=single)
   - Daylight fades while spisebordet er besat — spisestue-loftet kommer blidt på.
 - **Lysnet: Spisestue tænd på mørk indedag** (line 256, mode=single)
-- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 952, mode=single)
+- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 959, mode=single)
   - Lux-præmissen bag dagslys-sluk faldt bort mens rummet stadig er optaget →
 
 ### `automations/presence_stue.yaml`
@@ -127,7 +127,7 @@ Search keywords: `spisestue`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
 - `light.spisestue_loft` — 127 refs in 50 file(s)
-- `light.spisestue_pendel` — 140 refs in 41 file(s)
+- `light.spisestue_pendel` — 141 refs in 41 file(s)
 
 ### `number.*`
 

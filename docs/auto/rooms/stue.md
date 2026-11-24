@@ -24,9 +24,9 @@ Search keywords: `stue, open_plan`
 
 ### `automations/godmorgen_godnat.yaml`
 
-- **Godnat: Børn oppe i stuen (forældre sover stadig)** (line 1181, mode=single)
+- **Godnat: Børn oppe i stuen (forældre sover stadig)** (line 1229, mode=single)
   - Weekend mornings: kids enter stue while godnat is still active.
-- **Godnat: Gendan stuelys ved godnat-slut (stue allerede beboet)** (line 1262, mode=single)
+- **Godnat: Gendan stuelys ved godnat-slut (stue allerede beboet)** (line 1310, mode=single)
   - When godnat_active clears (parents got up, godnat_auto_clear fired, or
 
 ### `automations/godnat_night.yaml`
@@ -46,9 +46,9 @@ Search keywords: `stue, open_plan`
   - Daylight fades while spisebordet er besat — spisestue-loftet kommer blidt på.
 - **Lysnet: Spisestue tænd på mørk indedag** (line 256, mode=single)
 - **Lysnet: Sofa-stue tænd ved LUX-fald** (line 328, mode=single)
-- **Lysnet: Stue sluk ved LUX-stigning** (line 801, mode=single)
+- **Lysnet: Stue sluk ved LUX-stigning** (line 808, mode=single)
   - Dagslys tilbage i open-plan mens lys står tændt — blid fade off af
-- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 952, mode=single)
+- **Lysnet: Stue/spisestue re-arm efter dagslys-sluk** (line 959, mode=single)
   - Lux-præmissen bag dagslys-sluk faldt bort mens rummet stadig er optaget →
 
 ### `automations/presence_resync_on_start.yaml`
@@ -66,10 +66,10 @@ Search keywords: `stue, open_plan`
 
 ### `automations/somrig_buttons.yaml`
 
-- **Stue Gardin RODRET: smart klik (syd/vest-sekvens + stop)** (line 172, mode=parallel)
-- **Stue Gardin: track sidst nedrullede (syd/vest)** (line 389, mode=queued)
-- **Stue Gardin RODRET: begge gardiner helt op (hold øverste)** (line 455, mode=single)
-- **Stue Gardin RODRET: begge gardiner helt ned (hold nederste)** (line 488, mode=single)
+- **Stue Gardin RODRET: smart klik (syd/vest-sekvens + stop)** (line 173, mode=parallel)
+- **Stue Gardin: track sidst nedrullede (syd/vest)** (line 390, mode=queued)
+- **Stue Gardin RODRET: begge gardiner helt op (hold øverste)** (line 456, mode=single)
+- **Stue Gardin RODRET: begge gardiner helt ned (hold nederste)** (line 489, mode=single)
 
 ### `automations/styrbar_rooms.yaml`
 
@@ -167,7 +167,7 @@ Search keywords: `stue, open_plan`
 
 - `cover.gardin_spisestue_vest` — 77 refs in 22 file(s)
 - `cover.gardin_stue_syd` — 78 refs in 23 file(s)
-- `cover.gardin_stue_vest_1` — 68 refs in 22 file(s)
+- `cover.gardin_stue_vest_1` — 66 refs in 22 file(s)
 
 ### `input_boolean.*`
 
@@ -323,7 +323,7 @@ Search keywords: `stue, open_plan`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
 - `light.spisestue_loft` — 127 refs in 50 file(s)
-- `light.spisestue_pendel` — 140 refs in 41 file(s)
+- `light.spisestue_pendel` — 141 refs in 41 file(s)
 - `light.stue_all` — 26 refs in 14 file(s)
 - `light.stue_apollo_rgb_light` — 5 refs in 3 file(s)
 - `light.stue_hjoernelampe` — 59 refs in 27 file(s)

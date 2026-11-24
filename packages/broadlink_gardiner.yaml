@@ -21,9 +21,11 @@
 # (capture krævede holdt knap) — den STOPPER fint under kørsel (verificeret),
 # men trigger IKKE kør-til-preset i hvile (verificeret dud). Korte tryk kan
 # ikke fanges af RM4 ved fast frekvens (for få rammer). Timet stop er derfor
-# den robuste vej. NB: lukning antager start fra TOP (delay er top→85%) —
-# luk fra midt-position overskyder ikke nedad (My stopper altid), men kan
-# stoppe FØR 85%. Acceptabelt for godnat/defense-flows der lukker fra åben.
+# den robuste vej. 2026-11-23: luk antog start fra TOP og kørte ALTID de
+# fulde sekunder — fra 20 % (vinter-luk) eller efter et stop halvvejs gik den
+# i bund (user 23/11 19:46). Nu: close = script.gardin_vest_position(15,
+# kun_ned) fra den KENDTE position, og hver kørsel bogføres, så et stop
+# regner positionen ud (custom_templates/gardin_vest.jinja).
 #
 # Entities matcher de planlagte Matter-navne -> AL eksisterende automation
 # (somrig_buttons RODRETs, winter/summer_defense, godnat-flows, entre_somrig
@@ -102,6 +104,8 @@ input_number:
   # så mosbilledets gulv holder). Ét øjebliks-skøn, ikke et stopur: kan det
   # være et fast overløb pr. trin i stedet, ses det som at store enkeltkørsler
   # nu stopper for højt (sæt slideren til 50 % fra top og se efter) (📏).
+  # 2026-11-23 (user): "vest gardinet i spisestuen skal køre 1.5 sek kortere
+  # tid" → 16,5 → 15,0 s (hver timet kørsel 9 % kortere, endestop urørt).
   gardin_spisestue_fuld_sekunder:
     name: "Spisestue-gardin: fuld køretid top→bund"
     min: 10
@@ -190,6 +194,14 @@ input_text:
   stue_rodret_last_lowered:
     name: "Stue RODRET sidst nedrullede gardin"
     icon: mdi:arrow-collapse-down
+  # 2026-11-23: stue vests SENESTE kørsel {"t0": epoch, "fra": %, "til": %,
+  # "sek": s} — så et stop midt i en kørsel kender positionen, og et luk kun
+  # kører resten ned (custom_templates/gardin_vest.jinja). Skrives KUN af
+  # script.gardin_vest_koersel_saet. Runtime.
+  gardin_vest_koersel:
+    name: "Gardin vest: seneste kørsel"
+    icon: mdi:timer-play-outline
+    max: 255
 
 input_datetime:
   # Sidste app-luk/stop af stue vest fra en BRUGER (context.user_id); et app-
@@ -361,6 +373,14 @@ template:
         unique_id: gardin_stue_vest_1
         device_class: curtain
         open_cover:
+          # 2026-11-23: OP vinder over en igangværende timet kørsel (ellers sender
+          # dens afsluttende STOP gardinet i stå på vej op), og kørslen bogføres,
+          # så et stop undervejs kender positionen (custom_templates/gardin_vest.jinja).
+          - variables:
+              fra: "{% from 'gardin_vest.jinja' import pos_nu %}{{ pos_nu() | float(-1) }}"
+              fuld: "{{ (states('input_number.gardin_vest_ned_sekunder') | float(14) / 0.85) | round(1) }}"
+          - service: script.turn_off
+            target: {entity_id: script.gardin_vest_position}
           # Endestop top = frisk reference (2026-09-23, relativ slider-kørsel).
           - service: input_number.set_value
             target: {entity_id: input_number.gardin_vest_antaget_pos}
@@ -368,45 +388,36 @@ template:
           - service: input_datetime.set_datetime
             target: {entity_id: input_datetime.gardin_vest_antaget_at}
             data: {timestamp: "{{ as_timestamp(now()) | int }}"}
+          - service: script.gardin_vest_koersel_saet
+            data:
+              fra: "{{ fra }}"
+              til: 100
+              sek: "{{ (((100 - fra) / 100 * fuld) if fra >= 0 else fuld) | round(1) }}"
           - service: remote.send_command
             target:
               entity_id: remote.broadlink_rm4_pro
             data:
               command: &vest_op "b64:sMCwBAydBgAAAUzjUFBPUZopKSooFBUVFCooKigVFRQUKigqKCooFhQUFBYUFBUpKSoUFBUVKCoUFCoUFBYUKBYUKBYUKRUUKSkUFSkqKBUVKCooFRUUFSkpFBUUFSkAA2xQUVBQUFBQUU9RT1FPUZoqKCooFhMVFCooKigWFBQUKigqKSkpFRQVFBUUFRQqKCoUFRQVKSkUFSkUFRUUKhQUKhQUKhQUKigVFSgqKRQVKSkpFBUVFCkpFBYUFCoAA25QUU9RT1FPUVBRT1FPUZgrJysoFRQVFCopKSkVFBQVKSkpKSkqFBQVFRQUFRUoKikUFRQVKSkUFSkUFRUUKhQUKhQUKhQUKigWFCgqKBYUKSkpFRQUFSkpFRUUFCkAA25PUU9RUFBQUU9RT1FPUZopKSkpFRMVFSkpKSkVFBQVKSkpKigqFBQWFBQUFhQoKikVFBQVKSkVFCkVFBUUKRUUKRUUKhQUKigVFSgqKBYUKSkqFBQUFigqFBUUFSgAA25QUU9RT1FQUFBRT1FPUZopKSkpFBQWFCkpKSkVFBUUKSkpKSkpFRQWFBQUFhQoKikVFBQVKSkVFCoUFBUVKRQVKBUVKRQVKSkVFCkpKRUUKigqFBQUFigqFBQUFigAA25QUFBQUFFPUVBRT1FPUZkpKSkpFRQWEykqKCoUFBYUKigqKCooFRUUFBUVFBQqKCoUFRQVKSkVFCkVFBQVKRQWKBUVKBQWKCoUFCopKRUTKikpFBUVFSgqFBQVFSgAA29PUU9RUFBQUFBRT1FPUZkqKCsoFBUVFCooKigVFRQUKigqKCooFRUVExUVFRQpKSoUFBUVKCoUFCoUFBYUKBYUKBYUKRUUKCoUFSkpKRUUKSkqFBQVFSkpFBUUFSkAA2xQUFBQUFFPUVBQUFFPUZkqKSkpFBUVFCkpKSkVFBUUKigqKCooFhQUFBYUFBQqKCoUFRUUKSkVFCkVFBUVKBUVKRUUKRQVKSkUFigqKBQWKCooFBYUFCopFBUUFSkAA29QUE9RUFBQUE9RT1FPUZkrJysoFhMVFCooKigWFBQUKigqKCoqFBQVFRQUFBYoKikUFRQVKSkUFSkUFRUUKRUUKRUUKhQUKigUFigqKBYUKCopFRQUFSkpFRQUFSkAA21QUFBQUFBQUFBRT1FPUZgrKCkqFBQVFSkpKSkVFBQVKSkpKSkpFRQUFRUUFBUpKSkUFhQUKSkVFSgWFBQUKhQVKRUUKRUUKSkVFCkpKRUUKSooFRUUFCopFRQUFSkAA25QUFBQUFFPUU9RT1FQUZkpKSkpFRQUFSkpKSoUFBUVKCooKikpFBQWFBQVFRQpKSkVFRQUKSkVFSgWFBQUKhQUKhQUKhQUKikVFCooKhQUKigqFBQVFSgqFBUUFSgAA21QUFBQUFFPUU9RT1JPUJopKSkpFRQVFCkpKSoUFBYUKSkpKSkpFRQVFBUUFRQpKSkVFRQVKSkVFCkVFBQVKRQWKBQWKBQWKCoUFCooKhQUKigqFBUUFSkpFRQUFigAA29QUFBQUFFPUU9RT1FQUJopKSkpFRQVFCopKSgVFRUUKigqKCooFRUUFBUVFBQqKCoUFQ=="
         close_cover:
-          # Reference efter luk (2026-11-02): luk = NED i 85 % af køretiden,
-          # så kendt reference minus 85 (fra top → 15). Ukendt → ugyldig.
-          - variables:
-              ref_gyldig: "{{ (state_attr('input_datetime.gardin_vest_antaget_at', 'timestamp') | float(0)) > 0 }}"
-              ny_ref: "{{ [states('input_number.gardin_vest_antaget_pos') | float(100) - 85, 0] | max | round(0) }}"
-          - service: input_number.set_value
-            target: {entity_id: input_number.gardin_vest_antaget_pos}
-            data: {value: "{{ ny_ref }}"}
-          - service: input_datetime.set_datetime
-            target: {entity_id: input_datetime.gardin_vest_antaget_at}
-            data: {timestamp: "{{ as_timestamp(now()) | int if ref_gyldig else 0 }}"}
-          - service: remote.send_command
-            target:
-              entity_id: remote.broadlink_rm4_pro
+          # 2026-11-23 (user: "jeg trykkede ned for at få den ned i den højde der
+          # er god til projektor … den gik alt for langt ned"): vinter-lukningen
+          # havde sat vest på 20 % kl. 16:20, og RODRET'ens 2. ned-klik 19:46:34
+          # kørte ALLIGEVEL de fulde gardin_vest_ned_sekunder NED (tiden top →
+          # 85 %) → i bund. Luk = nu "kør til 85 %-linjen (15 %) fra den KENDTE
+          # position, kun nedad": står den dér eller lavere, sker intet; ukendt
+          # → re-home (op først). Samme queued-kanal som slideren (#2).
+          - service: script.gardin_vest_position
             data:
-              command: &vest_ned "b64:sMCwBAydBgAAAUziUFBQUJopKSkpFRQpFBUpKRUUFBUpFRQVFBUUKRQVFRUTFigqKBUVKBUVKBUVKRQVKSkUFSkUFRQVKSkUFRUUKRUUKSkpFRQpKSkVFCkVFCkVFSgVFSkUAANYUFBQUFBRT1FPUU9RUFCZKigqKBUUKhQVKSkUFRQVKRUUFBUUFSkVFBQVFRQpKSkVFCkUFSkVFCkVFCkpFRQpFRQVFCkpFRQVFCkVFCkqKRQVKSkpFBUpFBUpFBUpFBUpEwADW1BQUFBQUFBQUFFPUU9QmiooKigVFSgUFigqFBQVFSgWFBQUFhQoFhQUFBYUKCooFhQpFRQpFRQpFRQqKBQWKBUVFBQqKBUVFBQqFBQqKCoUFCooKhQVKRQUKhQUKhQUKhQAA1lQUFBQUFFPUU9RT1FPUZkpKSkpFRQpFRQpKRUVFBQpFRQVFRQUKhQVFBUUFSgqKRQVKRQVKRQVKRQVKSkUFSkUFRQVKSkVFBUUKRUUKSkpFRQpKSkVFSgVFSgVFSkUFCoUAANaUFBQUFBQUFBQUU9RT1GYKigqKRUUKRUUKSkUFRUUKRUUFBUVFCoUFBQWFBQqKCoUFCoUFCoUFCoUFCooFhQoFhQUFCopFRQUFSkUFigqKBUVKCooFRUoFRUoFRUoFRUoFAADWlBQUFBQUFBRT1FPUU9RmSooKigVFSkUFSgqFBUVFCgWFBUUFRQpFRQUFRUUKSkpFRQpFRQpFRQqFBQqKRQVKRQVFBUpKRQVFBUpFBUpKSkVFCkpKRUUKRUUKRUUKRUUKRQAA1tPUU9RT1FPUVBQUFBQUJopKSkpFBQqFBUpKRUUFBUpFBUVFBQVKRQWFBQUFigqKBUVKBQWKBQWKBQWKCoUFCoUFBYUKCoUFBYUKBYUKCooFhQpKSkVFCoUFCoUFCoUFCoTAANZUFBQUU9RT1FPUU9RT1GYKikpKRUUKRUUKigUFRUUKRUUFBUVFCkVFBQVFRQpKSkVFCoUFCoUFCoUFCooFRUoFRUUFCooFRQVFSkUFSkpKRQVKSkpFBUpFBUpFBUpFBUpEwADWlBQUFBQUU9RT1FPUU9RmSooKigUFSkVFSgqFBQVFSgVFBUUFRQpFRQVFBUVKCooFRUoFRUpFBUpFBUpKBUVKBUVFBQqKBUVFBQqFBQqKCoUFCooKhQUKhQUKhQUKhQUKhMAA1lQUFBQUFBQUE9RT1FPUZkpKSkpFRQpFRQpKRUUFRQpFRQVFBUUKRUVFBQVFSgqKBUVKBUVKBUVKBUVKCoUFCoUFBUVKCoUFBUVKBUVKCooFRUoKigVFSgVFSgVFSkUFSkUAANaUFBPUU9RT1FPUU9RT1GYKigqKRUUKRQVKSkUFRQVKRUUFBUUFCoUFRQVFBUpKCoUFSkUFSkUFSkUFSkpFRQpFRQUFSkpFRQUFSkUFCopKRQVKSkpFBUpFBUpFBUpFBUpEwADWk9RUFBPUU9RT1FPUU9RmSooKigVFSgUFigqFBQVFSgWFBQUFhQoFhQUFBYUKCooFhQoFhQoFhQoFhQoKhQVKRQWFBQqKBQWFBQpFRQpKSkVFCkpKRUUKRUUKRUUKRUUKRQAA1pQUA=="
-          - delay:
-              seconds: "{{ states('input_number.gardin_vest_ned_sekunder') | float(14) }}"
-          - service: remote.send_command
-            target:
-              entity_id: remote.broadlink_rm4_pro
-            data:
-              command: "b64:sMCwBAydBgAAAUziUFFPUZkpKSkpFRQqKBUVKSkpFBUoKhQVKSkpKRQVFRQUFRUUKSkUFigUFigVFRQUKhQUKigWFBQUKigWFCkVFBQVFRQpFRQVFBUUKRUUKRUUKRUVKBUVAANsUFBQUU9RT1FQUFBRT1GZKSkpKRUUKigUFigqKBUVKCoUFSkpKSkVFBQVFRQVFCkpFRQpFRQpFRUUFCoUFCooFhQUFCopFRQpFRQVFRQUKhQUFRUUFSkUFSkVFCkVFCkVFAADbVBQUFFPUU9RUFBQUU9RmSkpKSkVFCooFRUoKigVFSgqFBQqKSkpFRQUFRUUFBUpKRUUKhQUKhQVFBUoFRUpKRUUFBUpKRUUKRUUFBUVFCkVFBQWFBQqFBQqFBQqFBQqFBQAA21QUFBQUFBQUU9RT1FPUZkpKSkqFBQqKBYUKCopFRQqKBQWKCooKhQUFBYUFBUVKCoUFSkUFCoUFRQVKRQVKSkVFBQVKSkVFCoUFBUVFBQqFBQWFBQUKhQUKhQVKRQVKRUUAANuUFBQUFBRT1FPUVBQUFCaKigqKBUVKCoUFCooKhQVKSkUFSkpKSkVFBQVFRQVFCkqFBQqFBQqFBQVFSgWFCgqFBQWFCgqFBQqFRQVFBQVKRUUFRQVFCkVFCkVFCoUFSkUFQADbFBQUFBQUU9RT1FPUVBQmiooKSkVFCkpFRQqKCoUFCooFRUoKigqFBQWFBQVFRQoKhQVKRUUKRQVFRQpFRQpKRUUFRUpKBUVKRQVFRQUFSkUFRUUFBUpFBUpFBUpFBYoFBYAA25PUFBQT1FPUU9RT1FQUJoqKCooFRQpKhQUKigqFBQqKBYUKCooKhQVFRQUFRUUKigUFigVFSgVFRQUKhUTKigVFRQVKSkUFSkUFRUUFBUpFBUVFBQVKRQWKBUUKRUVKBUVAANsUFBQUU9RT1FPUVBQUFCZKigqKBYTKSoUFSkpKRQWKCoUFCkpKigUFhQUFRUUFCooFRUoFRUoFRUUFSkUFSkpFBUVFCkpFRQpFRQVFBUUKRUUFRQVFCkVFSgVFSgVFSgVFQADbk9RT1FPUVBQUFBQUU9RmSkpKSkVFCkpFBUpKSkUFigqFBQqKCooFBYUFBUVFBQqKBYUKBYUKBYUFBUpFBQqKRUUFBUpKRUUKRUUFRQVFCkVFBUUFRUoFRUpFRQpFBUpFRQAA2xQUFBQUFFPUU9RT1FQUJopKSkpFBQqKBUVKSkpFRQpKRQVKSkqKBUUFRQVFBUUKSkVFSgVFSgVFRQUKhQUKigVFRQUKikVFCkVFBQWFBQpFRQVFBUUKhQUKhQUKhQUKhQUAANuUFBQUE9RUFBQUFBRT1GZKSkpKRUUKSkVFCkpKRUVKCoUFCooKigVFRQUFRUUFCopFRQpFRQpFRQUFigUFigqFBQUFigqFBQqFBUUFRQUKhQUFRUVEyoUFSkVFCkVFCkVFAADbVBQUFBQUFBQUFBQUFBRmSkpKSkVEyooFhQpKSoUFCooFRUoKigqFBQVFRQUFRUoKhQUKhQUKhQVFBUpFBUpKRQVFBUpKRQVKRQVFRQUFSkVFBUUFRQpFRQpFRQpFRQpFRQAA21QUA=="
+              maal: 15
+              kun_ned: true
         stop_cover:
-          # Position ukendt efter luk/stop → ugyldiggør referencen (2026-09-23).
-          - service: input_datetime.set_datetime
-            target: {entity_id: input_datetime.gardin_vest_antaget_at}
-            data: {timestamp: 0}
-          - service: remote.send_command
-            target:
-              entity_id: remote.broadlink_rm4_pro
-            data:
-              command: &vest_stop "b64:sMCwBAydBgAAAUziUFFPUZkpKSkpFRQqKBUVKSkpFBUoKhQVKSkpKRQVFRQUFRUUKSkUFigUFigVFRQUKhQUKigWFBQUKigWFCkVFBQVFRQpFRQVFBUUKRUUKRUUKRUVKBUVAANsUFBQUU9RT1FQUFBRT1GZKSkpKRUUKigUFigqKBUVKCoUFSkpKSkVFBQVFRQVFCkpFRQpFRQpFRUUFCoUFCooFhQUFCopFRQpFRQVFRQUKhQUFRUUFSkUFSkVFCkVFCkVFAADbVBQUFFPUU9RUFBQUU9RmSkpKSkVFCooFRUoKigVFSgqFBQqKSkpFRQUFRUUFBUpKRUUKhQUKhQVFBUoFRUpKRUUFBUpKRUUKRUUFBUVFCkVFBQWFBQqFBQqFBQqFBQqFBQAA21QUFBQUFBQUU9RT1FPUZkpKSkqFBQqKBYUKCopFRQqKBQWKCooKhQUFBYUFBUVKCoUFSkUFCoUFRQVKRQVKSkVFBQVKSkVFCoUFBUVFBQqFBQWFBQUKhQUKhQVKRQVKRUUAANuUFBQUFBRT1FPUVBQUFCaKigqKBUVKCoUFCooKhQVKSkUFSkpKSkVFBQVFRQVFCkqFBQqFBQqFBQVFSgWFCgqFBQWFCgqFBQqFRQVFBQVKRUUFRQVFCkVFCkVFCoUFSkUFQADbFBQUFBQUU9RT1FPUVBQmiooKSkVFCkpFRQqKCoUFCooFRUoKigqFBQWFBQVFRQoKhQVKRUUKRQVFRQpFRQpKRUUFRUpKBUVKRQVFRQUFSkUFRUUFBUpFBUpFBUpFBYoFBYAA25PUFBQT1FPUU9RT1FQUJoqKCooFRQpKhQUKigqFBQqKBYUKCooKhQVFRQUFRUUKigUFigVFSgVFRQUKhUTKigVFRQVKSkUFSkUFRUUFBUpFBUVFBQVKRQWKBUUKRUVKBUVAANsUFBQUU9RT1FPUVBQUFCZKigqKBYTKSoUFSkpKRQWKCoUFCkpKigUFhQUFRUUFCooFRUoFRUoFRUUFSkUFSkpFBUVFCkpFRQpFRQVFBUUKRUUFRQVFCkVFSgVFSgVFSgVFQADbk9RT1FPUVBQUFBQUU9RmSkpKSkVFCkpFBUpKSkUFigqFBQqKCooFBYUFBUVFBQqKBYUKBYUKBYUFBUpFBQqKRUUFBUpKRUUKRUUFRQVFCkVFBUUFRUoFRUpFRQpFBUpFRQAA2xQUFBQUFFPUU9RT1FQUJopKSkpFBQqKBUVKSkpFRQpKRQVKSkqKBUUFRQVFBUUKSkVFSgVFSgVFRQUKhQUKigVFRQUKikVFCkVFBQWFBQpFRQVFBUUKhQUKhQUKhQUKhQUAANuUFBQUE9RUFBQUFBRT1GZKSkpKRUUKSkVFCkpKRUVKCoUFCooKigVFRQUFRUUFCopFRQpFRQpFRQUFigUFigqFBQUFigqFBQqFBUUFRQUKhQUFRUVEyoUFSkVFCkVFCkVFAADbVBQUFBQUFBQUFBQUFBRmSkpKSkVEyooFhQpKSoUFCooFRUoKigqFBQVFRQUFRUoKhQUKhQUKhQVFBUpFBUpKRQVFBUpKRQVKRQVFRQUFSkVFBUUFRQpFRQpFRQpFRQpFRQAA21QUA=="
+          # 2026-11-23: stop afbryder den timede kørsel (ellers sender den sit
+          # eget STOP/NED bagefter), og script.gardin_vest_stop REGNER positionen
+          # ud fra den bogførte kørsel i stedet for at glemme den (før: ukendt →
+          # næste luk kørte de fulde 13 s fra midt-position → i bund, 19:47:01).
+          - service: script.turn_off
+            target: {entity_id: script.gardin_vest_position}
+          - service: script.gardin_vest_stop
 
       # --- Spisestue vest (Somfy RTS, paret 2026-06-16) ----------------------
       # Ny vestvendt blackout-gardin i spisestuen. Helt-ned luk (close = NED;
@@ -550,9 +561,16 @@ script:
             {% set syd_ned = states('input_number.gardin_syd_ned_sekunder') | float(22) %}
             {% set syd_fuld = states('input_number.gardin_syd_fuld_sekunder') | float(25) %}
             {% set vest_ned = states('input_number.gardin_vest_ned_sekunder') | float(14) %}
+            {% set vest_fuld = vest_ned / 0.85 %}
+            {#- 2026-11-23: vest kører fra sin KENDTE position (gardin_vest.jinja) —
+                luk kun ned til 85 %-linjen (15 %), ukendt = re-home (op + ned). -#}
+            {% from 'gardin_vest.jinja' import pos_nu %}
+            {% set vp = pos_nu() | float(-1) %}
+            {% set vest_down = ([(vp - 15) / 100 * vest_fuld, 0] | max) if vp >= 0 else vest_fuld + 4 + vest_ned %}
+            {% set vest_up = ((100 - vp) / 100 * vest_fuld) if vp >= 0 else vest_fuld %}
             {% set t = {'syd': {'down': syd_ned if is_state('binary_sensor.filmmoerke_stue', 'off') else syd_fuld,
                                 'up': syd_fuld},
-                        'vest': {'down': vest_ned, 'up': vest_ned / 0.85}} %}
+                        'vest': {'down': vest_down, 'up': vest_up}} %}
             {% set ns = namespace(o={}) %}
             {% for c in ['syd', 'vest'] %}
               {% if gardin in [c, 'begge'] %}
@@ -675,6 +693,61 @@ script:
         data:
           timestamp: "{{ as_timestamp(now()) | int }}"
 
+  # 2026-11-23: bogfør stue vests kørsel (custom_templates/gardin_vest.jinja).
+  # Kaldes lige FØR hver RF-bevægelse; hvile = sek 0 (fra = til).
+  gardin_vest_koersel_saet:
+    alias: "Gardin vest: bogfør kørsel"
+    mode: parallel
+    max: 10
+    fields:
+      fra:
+        description: "Start-position i % (-1 = ukendt)"
+      til:
+        description: "Mål-position i % (-1 = ukendt)"
+      sek:
+        description: "Køretid i sekunder (0 = i hvile)"
+    sequence:
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.gardin_vest_koersel
+        data:
+          value: >-
+            {{ {'t0': as_timestamp(now()) | round(1),
+                'fra': fra | default(-1) | float(-1) | round(0) | int,
+                'til': til | default(-1) | float(-1) | round(0) | int,
+                'sek': sek | default(0) | float(0) | round(1)} | to_json }}
+
+  # 2026-11-23: STOP + bogfør hvor vest står (beregnet fra den igangværende
+  # kørsel; ukendt start → reference ugyldig som før). Bruges af vest-coverets
+  # stop_cover og af gardin_vest_position når en ny kørsel afbryder en igangværende.
+  gardin_vest_stop:
+    alias: "Gardin vest: stop og bogfør position"
+    mode: queued
+    max: 4
+    sequence:
+      - variables:
+          est: "{% from 'gardin_vest.jinja' import pos_nu %}{{ pos_nu() | float(-1) }}"
+      - service: remote.send_command
+        target:
+          entity_id: remote.broadlink_rm4_pro
+        data:
+          command: &vest_stop "b64:sMCwBAydBgAAAUziUFFPUZkpKSkpFRQqKBUVKSkpFBUoKhQVKSkpKRQVFRQUFRUUKSkUFigUFigVFRQUKhQUKigWFBQUKigWFCkVFBQVFRQpFRQVFBUUKRUUKRUUKRUVKBUVAANsUFBQUU9RT1FQUFBRT1GZKSkpKRUUKigUFigqKBUVKCoUFSkpKSkVFBQVFRQVFCkpFRQpFRQpFRUUFCoUFCooFhQUFCopFRQpFRQVFRQUKhQUFRUUFSkUFSkVFCkVFCkVFAADbVBQUFFPUU9RUFBQUU9RmSkpKSkVFCooFRUoKigVFSgqFBQqKSkpFRQUFRUUFBUpKRUUKhQUKhQVFBUoFRUpKRUUFBUpKRUUKRUUFBUVFCkVFBQWFBQqFBQqFBQqFBQqFBQAA21QUFBQUFBQUU9RT1FPUZkpKSkqFBQqKBYUKCopFRQqKBQWKCooKhQUFBYUFBUVKCoUFSkUFCoUFRQVKRQVKSkVFBQVKSkVFCoUFBUVFBQqFBQWFBQUKhQUKhQVKRQVKRUUAANuUFBQUFBRT1FPUVBQUFCaKigqKBUVKCoUFCooKhQVKSkUFSkpKSkVFBQVFRQVFCkqFBQqFBQqFBQVFSgWFCgqFBQWFCgqFBQqFRQVFBQVKRUUFRQVFCkVFCkVFCoUFSkUFQADbFBQUFBQUU9RT1FPUVBQmiooKSkVFCkpFRQqKCoUFCooFRUoKigqFBQWFBQVFRQoKhQVKRUUKRQVFRQpFRQpKRUUFRUpKBUVKRQVFRQUFSkUFRUUFBUpFBUpFBUpFBYoFBYAA25PUFBQT1FPUU9RT1FQUJoqKCooFRQpKhQUKigqFBQqKBYUKCooKhQVFRQUFRUUKigUFigVFSgVFRQUKhUTKigVFRQVKSkUFSkUFRUUFBUpFBUVFBQVKRQWKBUUKRUVKBUVAANsUFBQUU9RT1FPUVBQUFCZKigqKBYTKSoUFSkpKRQWKCoUFCkpKigUFhQUFRUUFCooFRUoFRUoFRUUFSkUFSkpFBUVFCkpFRQpFRQVFBUUKRUUFRQVFCkVFSgVFSgVFSgVFQADbk9RT1FPUVBQUFBQUU9RmSkpKSkVFCkpFBUpKSkUFigqFBQqKCooFBYUFBUVFBQqKBYUKBYUKBYUFBUpFBQqKRUUFBUpKRUUKRUUFRQVFCkVFBUUFRUoFRUpFRQpFBUpFRQAA2xQUFBQUFFPUU9RT1FQUJopKSkpFBQqKBUVKSkpFRQpKRQVKSkqKBUUFRQVFBUUKSkVFSgVFSgVFRQUKhQUKigVFRQUKikVFCkVFBQWFBQpFRQVFBUUKhQUKhQUKhQUKhQUAANuUFBQUE9RUFBQUFBRT1GZKSkpKRUUKSkVFCkpKRUVKCoUFCooKigVFRQUFRUUFCopFRQpFRQpFRQUFigUFigqFBQUFigqFBQqFBUUFRQUKhQUFRUVEyoUFSkVFCkVFCkVFAADbVBQUFBQUFBQUFBQUFBRmSkpKSkVEyooFhQpKSoUFCooFRUoKigqFBQVFRQUFRUoKhQUKhQUKhQVFBUpFBUpKRQVFBUpKRQVKRQVFRQUFSkVFBUUFRQpFRQpFRQpFRQpFRQAA21QUA=="
+      - service: script.gardin_vest_koersel_saet
+        data:
+          fra: "{{ est }}"
+          til: "{{ est }}"
+          sek: 0
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.gardin_vest_antaget_pos
+        data:
+          value: "{{ est if est >= 0 else states('input_number.gardin_vest_antaget_pos') | float(100) }}"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.gardin_vest_antaget_at
+        data:
+          timestamp: "{{ as_timestamp(now()) | int if est >= 0 else 0 }}"
+
   gardin_vest_position:
     alias: "Gardin Vest: kør til position (timet, min 15 %)"
     icon: mdi:arrow-expand-vertical
@@ -684,9 +757,13 @@ script:
       maal:
         description: "Mål-position i % (100 = helt oppe, 0 = helt nede)"
         example: 50
+      kun_ned:
+        description: "Kun nedad (luk): står gardinet allerede ved/under målet, sker intet"
+        example: true
     sequence:
-      # Timet positionering på en ENVEJS-kanal: fra kendt reference
-      # (antaget_pos) køres differencen; ukendt reference → fuld optur
+      # Timet positionering på en ENVEJS-kanal: fra kendt position
+      # (pos_nu() i gardin_vest.jinja: bogført kørsel, ellers antaget_pos)
+      # køres differencen; ukendt reference → fuld optur
       # (motorens eget endestop) + nedkørsel i (100-mål) % af køretiden.
       # 0 og 100 rammer motorens egne endestop, får INTET timet stop, og
       # nulstiller drift fra den FYSISKE Somfy-fjernbetjening.
@@ -694,15 +771,35 @@ script:
       # 85 % lukket ER bunden her), så målet klampes, og der er ingen
       # ned-i-bund-gren. 15 % rammer præcis den eksisterende 85 %-tid, fordi
       # køretiden udledes af SAMME slider som close_cover: ned/0.85.
+      # 2026-11-23: kører vest stadig (fx et app-OP), stop den først og bogfør
+      # hvor den står — så regnes den nye kørsel fra den rigtige position.
+      - if:
+          - "{% from 'gardin_vest.jinja' import i_gang %}{{ i_gang() == 'ja' }}"
+        then:
+          - service: script.gardin_vest_stop
       - variables:
           pos: "{{ [[maal | default(100) | float(100), 15] | max, 100] | min | round(0) }}"
           fuld: "{{ (states('input_number.gardin_vest_ned_sekunder') | float(14) / 0.85) | round(1) }}"
-          ref: "{{ states('input_number.gardin_vest_antaget_pos') | float(-1) }}"
-          ref_gyldig: "{{ (state_attr('input_datetime.gardin_vest_antaget_at', 'timestamp') | float(0)) > 0 }}"
+          # 2026-11-23: positionen NU fra den bogførte kørsel (gardin_vest.jinja) —
+          # også midt i en kørsel, og efter et stop.
+          ref: "{% from 'gardin_vest.jinja' import pos_nu %}{{ pos_nu() | float(-1) }}"
+          ref_gyldig: "{{ ref >= 0 }}"
+      # kun_ned (vest-coverets close_cover): luk = 85 %-linjen, aldrig opad og
+      # aldrig igen fra en position der allerede er dér eller lavere (user
+      # 2026-11-23: 2. ned-klik fra 20 % kørte i bund).
+      - if:
+          - "{{ (kun_ned | default(false)) | bool and ref_gyldig and pos >= ref - 1 }}"
+        then:
+          - stop: "Vest står allerede ved eller under 85 %-linjen"
       - choose:
           - conditions:
               - "{{ pos >= 99 }}"
             sequence:
+              - service: script.gardin_vest_koersel_saet
+                data:
+                  fra: "{{ ref }}"
+                  til: "100"
+                  sek: "{{ (((100 - ref) / 100 * fuld) if ref >= 0 else fuld) | round(1) }}"
               - service: remote.send_command
                 target:
                   entity_id: remote.broadlink_rm4_pro
@@ -721,11 +818,16 @@ script:
           - conditions:
               - "{{ ref >= 0 and ref_gyldig and pos < ref - 1 }}"
             sequence:
+              - service: script.gardin_vest_koersel_saet
+                data:
+                  fra: "{{ ref }}"
+                  til: "{{ pos }}"
+                  sek: "{{ ((ref - pos) / 100 * fuld) | round(1) }}"
               - service: remote.send_command
                 target:
                   entity_id: remote.broadlink_rm4_pro
                 data:
-                  command: *vest_ned
+                  command: &vest_ned "b64:sMCwBAydBgAAAUziUFBQUJopKSkpFRQpFBUpKRUUFBUpFRQVFBUUKRQVFRUTFigqKBUVKBUVKBUVKRQVKSkUFSkUFRQVKSkUFRUUKRUUKSkpFRQpKSkVFCkVFCkVFSgVFSkUAANYUFBQUFBRT1FPUU9RUFCZKigqKBUUKhQVKSkUFRQVKRUUFBUUFSkVFBQVFRQpKSkVFCkUFSkVFCkVFCkpFRQpFRQVFCkpFRQVFCkVFCkqKRQVKSkpFBUpFBUpFBUpFBUpEwADW1BQUFBQUFBQUFFPUU9QmiooKigVFSgUFigqFBQVFSgWFBQUFhQoFhQUFBYUKCooFhQpFRQpFRQpFRQqKBQWKBUVFBQqKBUVFBQqFBQqKCoUFCooKhQVKRQUKhQUKhQUKhQAA1lQUFBQUFFPUU9RT1FPUZkpKSkpFRQpFRQpKRUVFBQpFRQVFRQUKhQVFBUUFSgqKRQVKRQVKRQVKRQVKSkUFSkUFRQVKSkVFBUUKRUUKSkpFRQpKSkVFSgVFSgVFSkUFCoUAANaUFBQUFBQUFBQUU9RT1GYKigqKRUUKRUUKSkUFRUUKRUUFBUVFCoUFBQWFBQqKCoUFCoUFCoUFCoUFCooFhQoFhQUFCopFRQUFSkUFigqKBUVKCooFRUoFRUoFRUoFRUoFAADWlBQUFBQUFBRT1FPUU9RmSooKigVFSkUFSgqFBUVFCgWFBUUFRQpFRQUFRUUKSkpFRQpFRQpFRQqFBQqKRQVKRQVFBUpKRQVFBUpFBUpKSkVFCkpKRUUKRUUKRUUKRUUKRQAA1tPUU9RT1FPUVBQUFBQUJopKSkpFBQqFBUpKRUUFBUpFBUVFBQVKRQWFBQUFigqKBUVKBQWKBQWKBQWKCoUFCoUFBYUKCoUFBYUKBYUKCooFhQpKSkVFCoUFCoUFCoUFCoTAANZUFBQUU9RT1FPUU9RT1GYKikpKRUUKRUUKigUFRUUKRUUFBUVFCkVFBQVFRQpKSkVFCoUFCoUFCoUFCooFRUoFRUUFCooFRQVFSkUFSkpKRQVKSkpFBUpFBUpFBUpFBUpEwADWlBQUFBQUU9RT1FPUU9RmSooKigUFSkVFSgqFBQVFSgVFBUUFRQpFRQVFBUVKCooFRUoFRUpFBUpFBUpKBUVKBUVFBQqKBUVFBQqFBQqKCoUFCooKhQUKhQUKhQUKhQUKhMAA1lQUFBQUFBQUE9RT1FPUZkpKSkpFRQpFRQpKRUUFRQpFRQVFBUUKRUVFBQVFSgqKBUVKBUVKBUVKBUVKCoUFCoUFBUVKCoUFBUVKBUVKCooFRUoKigVFSgVFSgVFSkUFSkUAANaUFBPUU9RT1FPUU9RT1GYKigqKRUUKRQVKSkUFRQVKRUUFBUUFCoUFRQVFBUpKCoUFSkUFSkUFSkUFSkpFRQpFRQUFSkpFRQUFSkUFCopKRQVKSkpFBUpFBUpFBUpFBUpEwADWk9RUFBPUU9RT1FPUU9RmSooKigVFSgUFigqFBQVFSgWFBQUFhQoFhQUFBYUKCooFhQoFhQoFhQoFhQoKhQVKRQWFBQqKBQWFBQpFRQpKSkVFCkpKRUUKRUUKRUUKRUUKRQAA1pQUA=="
               - delay:
                   seconds: "{{ ((ref - pos) / 100 * fuld) | round(1) }}"
               - service: remote.send_command
@@ -736,6 +838,11 @@ script:
           - conditions:
               - "{{ ref >= 0 and ref_gyldig and pos > ref + 1 }}"
             sequence:
+              - service: script.gardin_vest_koersel_saet
+                data:
+                  fra: "{{ ref }}"
+                  til: "{{ pos }}"
+                  sek: "{{ ((pos - ref) / 100 * fuld) | round(1) }}"
               - service: remote.send_command
                 target:
                   entity_id: remote.broadlink_rm4_pro
@@ -749,6 +856,11 @@ script:
                 data:
                   command: *vest_stop
         default:
+          - service: script.gardin_vest_koersel_saet
+            data:
+              fra: "-1"
+              til: "100"
+              sek: "{{ fuld }}"
           - service: remote.send_command
             target:
               entity_id: remote.broadlink_rm4_pro
@@ -756,6 +868,11 @@ script:
               command: *vest_op
           - delay:
               seconds: "{{ (fuld + 4) | round(1) }}"
+          - service: script.gardin_vest_koersel_saet
+            data:
+              fra: "100"
+              til: "{{ pos }}"
+              sek: "{{ ((100 - pos) / 100 * fuld) | round(1) }}"
           - service: remote.send_command
             target:
               entity_id: remote.broadlink_rm4_pro
@@ -795,7 +912,7 @@ script:
       # 0 og 100 rammer motorens egne endestop, får INTET timet stop, og
       # nulstiller drift fra den FYSISKE Somfy-fjernbetjening.
       # ⚠️ Køretiden (gardin_spisestue_fuld_sekunder) er skønnet ud fra én
-      # observation 18/10 (16,5 s), ikke timet med stopur (📏).
+      # observation 18/10 (16,5 s; user 23/11: 1,5 s kortere → 15,0 s), ikke timet med stopur (📏).
       #
       # 2026-09-23 — RELATIV KØRSEL (mosbillede-reguleringen, user-spec
       # "løbende hvert N'te minut"): en regulering der re-homer hver 10. min
@@ -1000,18 +1117,31 @@ script:
                           seconds: >-
                             {{ ((states('input_number.gardin_vest_ned_sekunder')
                                  | float(14)) + 2) | round(1) }}
-                      - service: cover.close_cover
+                      # 2026-11-23: close_cover er nu "kør til 85 %-linjen, kun
+                      # nedad" og rører sig ikke herfra — og det gamle close_cover
+                      # BLOKEREDE sine fulde 13 s, så stop_cover først kom efter en
+                      # kørsel i bund. Nu: NED direkte, bogført (gardin_vest.jinja),
+                      # og gardin_vest_stop efter de ekstra sekunder.
+                      - variables:
+                          vx_fra: "{% from 'gardin_vest.jinja' import pos_nu %}{{ pos_nu() | float(-1) }}"
+                          vx_fuld: "{{ (states('input_number.gardin_vest_ned_sekunder') | float(14) / 0.85) | round(1) }}"
+                      - service: script.gardin_vest_koersel_saet
+                        data:
+                          fra: "{{ vx_fra }}"
+                          til: 0
+                          sek: "{{ ((vx_fra / 100 * vx_fuld) if vx_fra >= 0 else vx_fuld) | round(1) }}"
+                      - service: remote.send_command
                         continue_on_error: true
                         target:
-                          entity_id: cover.gardin_stue_vest_1
+                          entity_id: remote.broadlink_rm4_pro
+                        data:
+                          command: *vest_ned
                       - delay:
                           seconds: >-
                             {{ states('input_number.gardin_vest_moerklaeg_ekstra_sekunder')
                                | float(1) }}
-                      - service: cover.stop_cover
+                      - service: script.gardin_vest_stop
                         continue_on_error: true
-                        target:
-                          entity_id: cover.gardin_stue_vest_1
 
 automation:
   # Stempel for gardin_film_luk's manuel-undtagelse (se slideren

@@ -69,6 +69,16 @@ RE_HA_FEJL = re.compile(
     r"invalid authentication from (\S+?)(?: \(([^)]+)\))?\. Requested URL: '([^']*)'"
 )
 RE_HA_BAN = re.compile(r"Banned IP ([0-9a-fA-F.:]+)")
+RE_HA_UA = re.compile(r"Requested URL: '[^']*'\. \((.+)\)\s*$")
+# Husets EGNE HA-apps (telefon-widgets) sender af og til en udløbet adgangsnøgle
+# lige mens appen fornyer den — målt 23/11: én afvisning, ingen gentagelse, og
+# den næste kørsel lykkes (et vellykket login nulstiller HA's ban-tæller). En
+# enkelt afvisning fra app-UA'en på LAN/tailnet er derfor info; først
+# APP_GRAENSE på APP_VINDUE_S er et "forsøg" (appen er logget ud — eller en
+# på husets net udgiver sig for appen). Fremmed adresse = forsøg som altid.
+RE_HA_APP = re.compile(r"^Home Assistant/\S+ \((.+)\)$")
+APP_GRAENSE = 3
+APP_VINDUE_S = 1800
 RE_SSH_OK = re.compile(r"Accepted (\S+) for (\S+) from (\S+)")
 RE_SSH_FEJL = re.compile(
     r"(?:Failed \S+ for (?:invalid user )?(\S*) from (\S+)|Invalid user (\S*) from (\S+))"
@@ -224,11 +234,33 @@ class Vagt:
         return ud
 
     def ha_log(self) -> None:
+        app = [x for x in self.d.get("ha_app401", []) if x > nu() - APP_VINDUE_S]
         for t, s in self.nye_linjer("ha"):
             m = RE_HA_FEJL.search(s)
             if m:
                 ip = m.group(2) or m.group(1)
                 self.tael(t, "ha_fejl")
+                mu = RE_HA_UA.search(s)
+                ma = RE_HA_APP.match(mu.group(1)) if mu else None
+                if ma and ip_klasse(ip) in ("LAN", "tailnet"):
+                    app = [x for x in app if x > t - APP_VINDUE_S] + [t]
+                    self.haend(
+                        "info",
+                        "ha_app_afvist",
+                        f"HA-appen ({ma.group(1)[:30]}) brugte en udløbet nøgle fra {ip} "
+                        f"({ip_klasse(ip)}), adresse {m.group(3)[:60]}",
+                        t,
+                        push=False,
+                    )
+                    if len(app) == APP_GRAENSE:
+                        self.haend(
+                            "forsoeg",
+                            "ha_app_afvist_gentaget",
+                            f"HA-appen ({ma.group(1)[:30]}) afvist {APP_GRAENSE} gange på "
+                            f"{APP_VINDUE_S // 60} min fra {ip} — logget ud? (spærres ved 10)",
+                            t,
+                        )
+                    continue
                 self.haend(
                     "forsoeg",
                     "ha_login_afvist",
@@ -244,6 +276,7 @@ class Vagt:
                     f"Home Assistant har spærret {m.group(1)} efter 10 afviste logins",
                     t,
                 )
+        self.d["ha_app401"] = app
 
     def ssh_log(self) -> None:
         kendte = self.d["kilder"]["ssh"]

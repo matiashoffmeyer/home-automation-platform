@@ -39,10 +39,10 @@ Der er **9 room_mode-ankre** (`input_select.room_mode_<rum>`, `packages/room_mod
 - **Gardinmotorer:** sove (Zigbee) samt stue syd, stue vest 1 og spisestue vest
   (RF, antagne positioner, se `.claude/rules/gardiner_sol.md`).
   Børneværelset og terrassedøren har intet gardin.
-  - **Stue vest højst 85 % ned** (der står ting under): luk = ned → stop efter
-    `input_number.gardin_vest_ned_sekunder`, målt fra top. Et 2. luk uden en
-    åbning imellem kører i bund, så hver luk-vej skal være én-gangs eller
-    re-home først (`script.gardin_film_luk`).
+  - **Stue vest højst 85 % ned** (der står ting under): luk = kør fra den
+    kendte position ned til 85 %-linjen (står den der eller lavere: intet;
+    ukendt: op først). Hver kørsel bogføres, så et stop halvvejs kender
+    positionen (`custom_templates/gardin_vest.jinja`).
 
 ## 2. Room mode: Auto ↔ Manual
 
