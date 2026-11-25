@@ -365,6 +365,25 @@ template:
         state: >-
           {{ is_state('input_boolean.dark_mode', 'on')
              and 'boern' in states('input_text.dark_mode_rooms').split() }}
+      # 2026-11-25 (opg. 12; user: "around that time we wont be watching
+      # projektor in the kids room unless its friday … use notifications to ask
+      # when in doubt"): i putte-tiden må en film et ANDET sted ikke mørklægge
+      # børneværelset. 24/11 19:16:41 trak dark_mode_room_joins børneværelset
+      # ind i stuens film, da pigerne gik ind til putning — enforceren slukkede
+      # lyset, og Parent B måtte tænde i hånden. Fredet = join'en afviser
+      # 'boern', og dark_mode_boern_fredet_slip slipper rummet hvis det allerede
+      # var med. Vises filmen I børneværelset (fredags-showet), gælder intet af
+      # det. Kun familie-modes (AirBnB har intet putte-vindue).
+      - name: "Dark Mode boern fredet"
+        unique_id: dark_mode_boern_fredet
+        icon: mdi:teddy-bear
+        state: >-
+          {% set familie = states('input_select.house_mode') in ['Normal', 'Home Vacation'] %}
+          {% set putte = is_state('binary_sensor.putning_vindue_aktivt', 'on')
+             or is_state('input_boolean.godnat_boern_active', 'on') %}
+          {% set film_her = is_state('binary_sensor.projektor_aktiv', 'on')
+             and 'boern' in states('sensor.moerklaegning_scope_rum').split() %}
+          {{ familie and putte and not film_her }}
 
 script:
   dark_mode_toggle:
@@ -522,7 +541,6 @@ script:
             {% set ns = namespace(l=[]) %}
             {% for k, c in [('stue', 'cover.gardin_stue_syd'),
                             ('stue', 'cover.gardin_stue_vest_1'),
-                            ('stue', 'cover.gardin_spisestue_vest'),
                             ('sove', 'cover.gardin_sovevaerelse')] %}
             {% if k in r.split() %}
             {% set ns.l = ns.l + [c] %}
@@ -604,12 +622,16 @@ script:
       room:
         description: "stue | sove | boern"
         example: "stue"
+      grund:
+        description: "Valgfri logbogs-årsag (default: op-tryk på fjernbetjeningen)"
+        example: "putte-tid"
     sequence:
       - condition: state
         entity_id: input_boolean.dark_mode
         state: "on"
       - variables:
           k: "{{ room | default('') | string }}"
+          g: "{{ grund | default('') | string }}"
       # Idempotent: gentagne op-tryk (brightness-stigen) må ikke spamme logbogen.
       - condition: template
         value_template: >-
@@ -632,9 +654,10 @@ script:
         data:
           name: "Dark Mode"
           message: >-
-            {{ k }}: op-tryk på fjernbetjeningen → rummet er FRITAGET resten af
-            sessionen (normal auto-lys igen). Gardinet bliver liggende — det
-            genåbnes af OFF-grenen i dagslys som altid.
+            {{ k }}: {{ g if g | trim != '' else 'op-tryk på fjernbetjeningen' }}
+            → rummet er FRITAGET resten af sessionen (normal auto-lys igen).
+            Gardinet bliver liggende — det genåbnes af OFF-grenen i dagslys som
+            altid.
           entity_id: input_boolean.dark_mode
 
 automation:
@@ -1121,9 +1144,33 @@ automation:
                 i stuen (eget rum, egen dør). Erstatter user-spec 07-28. -#}
             {% set tilladt = ['sove'] if is_state('input_boolean.dark_mode_kun_sove', 'on')
                              else ['boern', 'stue'] %}
+            {#- 2026-11-25 (opg. 12): børneværelset er fredet i putte-tiden
+                (binary_sensor.dark_mode_boern_fredet, se dens kommentar). -#}
+            {% if is_state('binary_sensor.dark_mode_boern_fredet', 'on') %}
+              {% set tilladt = tilladt | reject('eq', 'boern') | list %}
+            {% endif %}
             {{ trigger.to_state.state.split() | select('in', tilladt)
                | reject('in', fra) | reject('in', cur)
                | reject('in', ex) | join(' ') }}
+          boern_fredet_afvist: >-
+            {% set cur = states('input_text.dark_mode_rooms').split() %}
+            {% set ex = states('input_text.dark_mode_exempt').split() %}
+            {% set fra = trigger.from_state.state.split() if trigger.from_state else [] %}
+            {{ not is_state('input_boolean.dark_mode_kun_sove', 'on')
+               and is_state('binary_sensor.dark_mode_boern_fredet', 'on')
+               and 'boern' in trigger.to_state.state.split()
+               and 'boern' not in fra and 'boern' not in cur and 'boern' not in ex }}
+      - if:
+          - condition: template
+            value_template: "{{ boern_fredet_afvist | bool(false) }}"
+        then:
+          - service: logbook.log
+            data:
+              name: "Dark Mode"
+              message: >-
+                boern fik presence under filmen, men det er putte-tid (børn
+                hjemme) → mørklægges IKKE med.
+              entity_id: input_boolean.dark_mode
       - condition: template
         value_template: "{{ nye != '' }}"
       - service: logbook.log
@@ -1135,6 +1182,58 @@ automation:
       - service: script.dark_mode_apply_rooms
         data:
           rooms: "{{ nye }}"
+
+  # 2026-11-25 (opg. 12): putte-tiden begynder MENS børneværelset er med i en
+  # film et andet sted (join før putte-vinduet, eller et dobbelttryk) → slip
+  # det, samme vej som brugerens op-tryk (fritaget resten af sessionen; et nyt
+  # dobbelttryk tager det med igen). Står nogen derinde, tændes puttelyset
+  # med det samme via presence-tændet (dets egne gates gælder).
+  # Kun på flanken: putte-vinduet åbner, børne-godnat, eller filmen viser sig
+  # IKKE at være i børneværelset. En projektor-session slippes kun mens
+  # projektoren kører — slukker den, afslutter dark_mode_projektor_styrer
+  # sessionen i samme øjeblik, og to skrivere på børnelyset ville kapløbe.
+  - id: dark_mode_boern_fredet_slip
+    alias: "Dark Mode: slip børneværelset i putte-tiden"
+    description: >
+      Putte-tiden begynder mens børneværelset er mørklagt af en film i et andet
+      rum → rummet fritages resten af sessionen, og puttelyset tænder hvis
+      nogen er derinde.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.dark_mode_boern_fredet
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.dark_mode
+        state: "on"
+      - condition: template
+        value_template: "{{ 'boern' in states('input_text.dark_mode_rooms').split() }}"
+      - condition: template
+        value_template: >-
+          {{ is_state('binary_sensor.projektor_aktiv', 'on')
+             or not is_state('input_boolean.dark_mode_projektor_session', 'on') }}
+    action:
+      - service: script.dark_mode_room_exempt
+        data:
+          room: boern
+          grund: "putte-tid (børn hjemme), og filmen er ikke i børneværelset"
+      # dark_mode_boern/filmmoerke_boern skal nå at falde, før presence-
+      # tændets gates læses.
+      - delay:
+          seconds: 2
+      - if:
+          - condition: state
+            entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+            state: "on"
+        then:
+          - service: automation.trigger
+            target:
+              entity_id: automation.lysnet_bornevaerelse_taend
+            data:
+              skip_condition: false
 
   - id: dark_mode_room_exempt_button
     alias: "Dark Mode: op-tryk fritager rummet"

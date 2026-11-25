@@ -42,7 +42,9 @@ Der er **9 room_mode-ankre** (`input_select.room_mode_<rum>`, `packages/room_mod
   - **Stue vest højst 85 % ned** (der står ting under): luk = kør fra den
     kendte position ned til 85 %-linjen (står den der eller lavere: intet;
     ukendt: op først). Hver kørsel bogføres, så et stop halvvejs kender
-    positionen (`custom_templates/gardin_vest.jinja`).
+    positionen (`custom_templates/gardin_vest.jinja`). Trykker brugeren ned
+    (RODRET/app) mens HA mener vest allerede står på linjen, tager modellen
+    fejl → positionen glemmes, og lukket kører op først (2026-11-25).
 
 ## 2. Room mode: Auto ↔ Manual
 
@@ -93,6 +95,12 @@ Kill-switch: `input_boolean.drift_back_enabled`.
   Et open plan-rum med sit eget lys TÆNDT har intet loft (2026-11-18): det
   holder til hele open plan er tom eller huset går Dormant (alle
   Dormant-veje slukker `light.alle_indvendige`, så loftet gælder igen).
+- **Dit sluk holder** (2026-11-25): har du slukket rummet selv (app/knap: alt
+  rummets lys slukket −15…+60 s omkring `styrbar_last_press_<rum>`), bliver det
+  Manual i `input_number.manuel_sluk_hold_timer` (2 t) uanset tom-tid og loft.
+  Gaten sidder i `script.room_drift_back`, så også `open_plan_fuldt_lys`' slip
+  respekterer den. Gælder ikke badet; 24-t-fallbacken slipper den; en genstart
+  slipper den (lysets `last_changed` nulstilles).
 - **24-t hård fallback:** ikke-Auto i 24 t, målt på det skrevne stempel
   `input_datetime.room_mode_<rum>_ikke_auto_siden` (sat af
   `room_mode_ikke_auto_stempel` når rummet forlader Auto; overlever restart).
@@ -141,6 +149,10 @@ handler (§3.2).
   (`terrace_plug_control.yaml`).
 - Børneværelset har putning-grene.
 - Er Dark Mode tændt, fritager et OP-tryk rummet fra den (`packages/dark_mode.yaml`).
+- I putte-tiden (familie, børn hjemme) mørklægger en film i et ANDET rum ikke
+  børneværelset (`binary_sensor.dark_mode_boern_fredet`); er det med, slippes
+  det. Projektor-gættet giver børneværelset 0 point i putte-tiden undtagen
+  fredag (`custom_templates/projektor_rum.jinja`).
 
 ### 3.2 Entré-Styrbar — `automations/entre_somrig.yaml` (filnavnet er et levn)
 
@@ -201,9 +213,13 @@ Huset kører **ingen Adaptive Lighting-integration**.
   - Badet bruger faste stadie-slidere (approach/medium/fuld/godnat).
   - Depotet har egen logik (`automations/depot_harry_potter.yaml`).
   - Entréen har egen kelvin-slider (`input_number.entre_kelvin`).
-  - Børneværelset efter sengetid (`sensor.boern_bedtime_hour`) med børn hjemme:
-    puttelys-udseendet (`script.puttelys_phase1_apply`, loft 30 % i
-    `input_number.global_putte_loft_kelvin`) — aldrig rødt.
+  - Børneværelset i putte-vinduet (`binary_sensor.putning_vindue_aktivt`: børn
+    hjemme, fra `input_datetime.putning_vindue_start`; 2026-11-25, før fra
+    sengetid): puttelys-udseendet (`script.puttelys_phase1_apply`, loft 30 % i
+    `input_number.global_putte_loft_kelvin`) — aldrig rødt. Presence- og
+    lux-fald-tænd giver det samme. Nedtrapningen starter først når læse-
+    stilstanden har HOLDT (`input_number.puttelys_bekraeft_minutter` uden
+    `…_bekraeft_tom_minutter` sammenhængende tomt rum), forkortet med ventetiden.
 
 ### 4.2 Sluk — der findes INGEN fælles 5-minutters regel
 
@@ -214,11 +230,11 @@ betyder at den globale faktor ikke anvendes.
 | Rum | Autoritet |
 |---|---|
 | Sove | `sensor.rum_tom_sluk_sekunder` (`packages/room_absence_tuning.yaml`) |
-| Børn | Som sove. Desuden 06 → sengetid: `input_number.boernevaerelse_uden_boern_sluk_sekunder` / `…_med_boern_sluk_sekunder`, uden faktor |
+| Børn | Som sove. Desuden 06 → sengetid (med børn kun til putte-vinduet): `input_number.boernevaerelse_uden_boern_sluk_sekunder` / `…_med_boern_sluk_sekunder`, uden faktor. Loftet fredet under nedtrapningen |
 | Sofa-zonen | `input_number.stue_sofa_off_minutter` → `sensor.sofa_stue_off_sekunder` |
 | Spisestue-loft | `input_number.spisestue_off_minutter` (¼ af tiden når spisebordet er tomt og sofa eller køkken er optaget — køkkenet holder IKKE loftet, user 1/11). Begge open plan-tider klampes til `input_number.solo_tom_rum_sluk_minutter` når én person er hjemme uden for open plan |
 | Køkken | `input_number.koekken_spots_off_seconds`, uden faktor. Køkken-lyskæden har ejerskabsregister (`ejerskab/`) |
-| Bad | `input_number.badevaerelse_off_minutter` + stadier, uden faktor. **Ingen automatisk sluk uden en frisk fugt-måling** (`binary_sensor.badevaerelse_fugt_frisk`, user-spec 1/10) |
+| Bad | `input_number.badevaerelse_off_minutter` + stadier, uden faktor. **Ingen automatisk sluk uden en frisk fugt-måling** (`binary_sensor.badevaerelse_fugt_frisk`, user-spec 1/10). Et brusebad (`input_boolean.badevaerelse_brusebad_session`) holder lyset; et fugt-fald slutter det først når faldet har holdt (`input_number.badevaerelse_brusebad_fald_holder_minutter`) eller er stort, og en ny burst gen-armerer (2026-11-25) |
 | Depot | `input_number.depot_quick_off_seconds` / `_medium_` / `_long_` (`packages/depot_visit_quality.yaml`) |
 | Entré | `input_number.entre_off_sekunder` |
 

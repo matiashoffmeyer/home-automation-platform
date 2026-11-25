@@ -6,7 +6,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ## Indhold
 - [Automations](boernevaerelse.md#automations) (27)
-- [Entities](boernevaerelse.md#entities) (178)
+- [Entities](boernevaerelse.md#entities) (179)
 - [Helpers](boernevaerelse.md#helpers) (51)
 
 ---
@@ -69,19 +69,19 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/presence_boernevaerelse.yaml`
 
-- **Lysnet: Børneværelse tænd** (line 27, mode=single)
-  - Før sengetid (eller uden børn hjemme): lux-styret varm hvid. Efter sengetid
-- **Lysnet: Børneværelse auto-hyggelys efter bevægelse** (line 210, mode=single)
-- **Lysnet: Børneværelse adult-vækning under godnat (moving target)** (line 333, mode=single)
+- **Lysnet: Børneværelse tænd** (line 34, mode=single)
+  - Før putte-vinduet (eller uden børn hjemme): lux-styret varm hvid. I
+- **Lysnet: Børneværelse auto-hyggelys efter bevægelse** (line 218, mode=single)
+- **Lysnet: Børneværelse adult-vækning under godnat (moving target)** (line 341, mode=single)
   - Tænder boern-loft 60% warm når en adult går ind i kids rum efter 06:00
-- **Lysnet: Børneværelse gradvis sluk** (line 439, mode=restart)
+- **Lysnet: Børneværelse gradvis sluk** (line 447, mode=restart)
   - 5-minute absence rule (private-rum standard). Stamps input_datetime.boernevaerelse_last_off
 
 ### `automations/presence_lights.yaml`
 
 - **Lysnet: Børneværelse tænd ved LUX-fald** (line 667, mode=single)
   - Daylight fades while børneværelse occupied — gentle light for kids.
-- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1161, mode=single)
+- **Lysnet: Børneværelse sluk ved LUX-stigning** (line 1176, mode=single)
   - Dagslys tilbage i børneværelset mens loftet står tændt — blid fade off.
 
 ### `automations/putning_auto_detect.yaml`
@@ -91,8 +91,8 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `automations/somrig_buttons.yaml`
 
-- **Dark Mode-RODRET: Dark Mode ON (klik/hold øverste)** (line 690, mode=single)
-- **Dark Mode-RODRET: Dark Mode OFF (klik/hold nederste)** (line 734, mode=single)
+- **Dark Mode-RODRET: Dark Mode ON (klik/hold øverste)** (line 698, mode=single)
+- **Dark Mode-RODRET: Dark Mode OFF (klik/hold nederste)** (line 742, mode=single)
 
 ### `automations/styrbar_rooms.yaml`
 
@@ -108,7 +108,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `automation.klima_bornevaerelse_for_koldt` — 2 refs in 1 file(s)
 - `automation.lysnet_bornevaerelse_gradvis_sluk` — 2 refs in 1 file(s)
 - `automation.lysnet_bornevaerelse_sluk_ved_lux_stigning` — 3 refs in 2 file(s)
-- `automation.lysnet_bornevaerelse_taend` — 4 refs in 3 file(s)
+- `automation.lysnet_bornevaerelse_taend` — 5 refs in 4 file(s)
 - `automation.lysnet_bornevaerelse_taend_ved_lux_fald` — 2 refs in 1 file(s)
 
 ### `binary_sensor.*`
@@ -117,7 +117,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `binary_sensor.boern_putte_zone_aktiv` — 4 refs in 3 file(s)
 - `binary_sensor.boern_set_i_eftermiddag` — 6 refs in 2 file(s)
 - `binary_sensor.boernevaerelse_any_lys` — 2 refs in 2 file(s)
-- `binary_sensor.boernevaerelse_apollo_occupancy` — 127 refs in 47 file(s)
+- `binary_sensor.boernevaerelse_apollo_occupancy` — 129 refs in 48 file(s)
 - `binary_sensor.boernevaerelse_apollo_online` — 1 refs in 1 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_moving_target` — 12 refs in 10 file(s)
 - `binary_sensor.boernevaerelse_apollo_radar_still_target` — 4 refs in 3 file(s)
@@ -134,6 +134,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `binary_sensor.boernevaerelse_vaekning_hold` — 5 refs in 4 file(s)
 - `binary_sensor.boernevaerelse_vaekning_koert_i_dag` — 2 refs in 1 file(s)
 - `binary_sensor.dark_mode_boern` — 5 refs in 5 file(s)
+- `binary_sensor.dark_mode_boern_fredet` — 4 refs in 1 file(s)
 - `binary_sensor.filmmoerke_boern` — 9 refs in 6 file(s)
 - `binary_sensor.mood_pause_boernevaerelse` — 2 refs in 1 file(s)
 
@@ -159,7 +160,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 - `input_boolean.boernevaerelse_manual_off_lock` — 49 refs in 15 file(s)
 - `input_boolean.dance_room_boern` — 15 refs in 7 file(s)
 - `input_boolean.festlys_boern_styrbar` — 8 refs in 3 file(s)
-- `input_boolean.godnat_boern_active` — 101 refs in 42 file(s)
+- `input_boolean.godnat_boern_active` — 103 refs in 43 file(s)
 - `input_boolean.koekken_lav_krop_boern_enabled` — 3 refs in 3 file(s)
 - `input_boolean.people_boern_set_efter_doer` — 12 refs in 2 file(s)
 - `input_boolean.roborock_styrbar_kort_op_boernevaerelse` — 1 refs in 1 file(s)
@@ -249,10 +250,10 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `light.boernevaerelse_all` — 19 refs in 10 file(s)
 - `light.boernevaerelse_apollo_rgb_light` — 5 refs in 5 file(s)
-- `light.boernevaerelse_hygge_strip` — 97 refs in 33 file(s)
-- `light.boernevaerelse_hyggelys` — 56 refs in 21 file(s)
+- `light.boernevaerelse_hygge_strip` — 98 refs in 33 file(s)
+- `light.boernevaerelse_hyggelys` — 57 refs in 21 file(s)
 - `light.boernevaerelse_lampe` — 46 refs in 21 file(s)
-- `light.boernevaerelse_loft` — 97 refs in 37 file(s)
+- `light.boernevaerelse_loft` — 98 refs in 37 file(s)
 
 ### `number.*`
 
@@ -282,7 +283,7 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 ### `sensor.*`
 
-- `sensor.boern_bedtime_hour` — 6 refs in 4 file(s)
+- `sensor.boern_bedtime_hour` — 5 refs in 4 file(s)
 - `sensor.boern_lux` — 2 refs in 2 file(s)
 - `sensor.boern_occupancy_4h` — 5 refs in 4 file(s)
 - `sensor.boern_occupancy_overnight` — 18 refs in 6 file(s)

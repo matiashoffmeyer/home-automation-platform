@@ -292,6 +292,20 @@ den korte bullet (CLAUDE.md eller regel-filen) og afsnittet her.
   (`to_state.last_changed - from_state.last_changed > delay_on + luft`,
   `badevaerelse_brusebad_arm`), og deploy `automation.reload` FØR
   `template.reload`, så guarden er på plads når flanken kommer.
+- **En TEMPLATED `delay_on`/`delay_off` springes OVER ved første render efter
+  restart/template-reload** (2026.11, `template/binary_sensor.py`): `__init__`
+  kalder `setup_state_template` FØR `setup_template(CONF_DELAY_ON, …)`, så
+  første `_update_state` ser `_delay_on is None` og sætter staten direkte —
+  modsat en FAST `delay_on` (afsnittet ovenfor: ægte `off`, så `on` efter
+  delayen). Målt ved deploy 25/11 06:13:40-41: den nye
+  `badevaerelse_fugt_fald_holder` (delay_on 300 s) stod `on` sekundet efter;
+  `presence_kanaler_blinde` gik `unavailable → on → off`;
+  `koekken_menneske_bevist` og `koekken_apollo_bevaegelse_frisk` gik `on → off`
+  uden deres delay_off. Ved restart gendannes sidste state, så kun et skift
+  mellem gendannet og første render rammes. → en ventetid der skal holde
+  efter en reload måles i forbrugeren på `last_changed` (nulstilles ved
+  reload/restart = sikker retning; brusebad-backstoppen) eller med en fast
+  `delay_on`. Audit af de 27: B330.
 - **En `platform: time`-trigger på en timestamp-sensor bygget af `sun.sun`s
   `next_setting` fyrer ALDRIG:** attributten hopper til I MORGEN i samme sekund
   solen går ned, så den armerede tid rykkes en dag frem hver dag før den nås.
@@ -1048,13 +1062,13 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   er IKKE ramt. Konsekvens: gates på position/`open`/`closed` er stumme efter en
   restart (#9), og forensik kan kun bevise "HA kommanderede det ikke" — aldrig
   "det bevægede sig ikke". → B76.
-- **Terrassedøren har INTET gardin; stue vest må højst 85 % ned** (user
+- **Terrassedøren har INTET gardin; stue vest må højst 90 % ned (85 % til 25/11)** (user
   2026-10-07). B198 byggede en "terrassedør-spærre" på `cover.gardin_stue_vest_1`
   ud fra april-specens løfte (§6.1) og en udelukkelse (spisestue vest er et
   vindue med 55 cm brystning) — user: "døren har intet gardin, så dør bør ikke
   spærre for gardin. men rigtigt at vest stue kun skal 85% ned". Spærren blev
   fjernet igen samme dag. 85 %-grænsen ("der står nogle ting", user 2026-06-11)
-  er implementeret som NED → `gardin_vest_ned_sekunder` (målt top→85 %) →
+  er implementeret som NED → `gardin_vest_ned_sekunder` (målt top→90 %, 17,65 s 25/11) →
   My-stop; den antog start fra TOP, så et 2. luk uden en åbning imellem kørte
   forbi grænsen og ned i inventaret. **Ramt 2026-11-23 19:46** (user: "den gik
   alt for langt ned"): vinter-luk 16:20 havde sat vest på 20 %, RODRET'ens 2.
@@ -1062,7 +1076,14 @@ ikke længere; aften-blinket går unicast til `light.spisestue_loft`. Medlemskab
   næste luk 19:47:01 ramte bunden igen. Rettet: close = `gardin_vest_position(15,
   kun_ned)` fra kendt position (`pos_nu()` i `custom_templates/gardin_vest.jinja`,
   hver kørsel bogført i `input_text.gardin_vest_koersel`), stop regner
-  positionen ud, ukendt → re-home.
+  positionen ud, ukendt → re-home. **Ramt igen 2026-11-24 16:10-16:15** (user:
+  "nu kan den slet ikke køre mere end 60% ned!!"): modellen sagde 15 %, gardinet
+  hang højere (RF-tab eller fart-ulinearitet — envejs, kan ikke bevises), og så
+  var HVERT luk en no-op: 8 RODRET-ned-klik + app-luk/slider på 93 s flyttede
+  intet. Rettet: et BRUGER-ned (RODRET ned #2/hold, app/stemme =
+  `context.user_id`) mens modellen siger ≤ 16 % glemmer positionen
+  (`script.gardin_vest_bruger_ned`) → re-home; automationers luk er stadig en
+  no-op dér. **Signatur: ned-tryk der intet flytter, mens HA siger `closed`.**
 - **2026-10-04 (B123): ankeret har nu TO lister — `held` (ÅBN-blokliste, med
   AirBnB-tæppet) og `held_luk` (LUK-blokliste, uden tæppet).** Teksten herunder
   forklarer hvorfor `held` aldrig må læses på en luk-vej; det skete alligevel i

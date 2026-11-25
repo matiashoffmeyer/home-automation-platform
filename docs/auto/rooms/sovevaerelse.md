@@ -63,7 +63,7 @@ Search keywords: `sovevaerelse, sove`
 ### `automations/presence_lights.yaml`
 
 - **Lysnet: Soveværelse tænd ved LUX-fald** (line 490, mode=single)
-- **Lysnet: Soveværelse sluk ved LUX-stigning** (line 1090, mode=single)
+- **Lysnet: Soveværelse sluk ved LUX-stigning** (line 1105, mode=single)
   - Dagslys tilbage i soveværelset mens sove-pendlen står tændt — blid fade off.
 
 ### `automations/presence_sovevaerelse.yaml`
@@ -172,7 +172,7 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sovevaerelse_lys_on_effektiv` — 1 refs in 1 file(s)
 - `binary_sensor.sovevaerelse_morgen_beskyttelse_aktiv` — 41 refs in 17 file(s)
 - `binary_sensor.sovevaerelse_optaget_reelt` — 7 refs in 3 file(s)
-- `binary_sensor.sovevaerelse_radiator_spoegelse` — 1 refs in 1 file(s)
+- `binary_sensor.sovevaerelse_radiator_spoegelse` — 2 refs in 2 file(s)
 - `binary_sensor.sovevaerelse_voksne_oppe` — 5 refs in 3 file(s)
 
 ### `button.*`
@@ -194,7 +194,7 @@ Search keywords: `sovevaerelse, sove`
 
 - `input_boolean.airbnb_velkomst_move_sove` — 3 refs in 2 file(s)
 - `input_boolean.boernevaerelse_gaest_sover` — 21 refs in 8 file(s)
-- `input_boolean.dark_mode_kun_sove` — 8 refs in 3 file(s)
+- `input_boolean.dark_mode_kun_sove` — 9 refs in 3 file(s)
 - `input_boolean.notif_sove_radar_airbnb` — 1 refs in 1 file(s)
 - `input_boolean.notif_sove_radar_parent_b` — 1 refs in 1 file(s)
 - `input_boolean.notif_sove_radar_enabled` — 1 refs in 1 file(s)
@@ -237,7 +237,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_datetime.sove_retur_seng_sidst` — 3 refs in 2 file(s)
 - `input_datetime.sove_seng_sidst_ind` — 2 refs in 1 file(s)
 - `input_datetime.sove_seng_sidst_talt` — 7 refs in 2 file(s)
-- `input_datetime.sove_seng_udgang_bevist` — 5 refs in 3 file(s)
+- `input_datetime.sove_seng_udgang_bevist` — 6 refs in 4 file(s)
 - `input_datetime.sove_snooze_until` — 10 refs in 3 file(s)
 - `input_datetime.sove_winddown_at` — 13 refs in 3 file(s)
 - `input_datetime.styrbar_last_press_sovevaerelse` — 12 refs in 8 file(s)

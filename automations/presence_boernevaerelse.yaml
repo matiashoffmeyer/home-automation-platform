@@ -2,10 +2,17 @@
 # Børneværelse Presence Lights — sengetids-bevidst
 # =============================================================================
 # To udseender:
-#   1. Før sengetid (sensor.boern_bedtime_hour, sliders i global_tuning), eller
-#      uden børn hjemme: lux-styret varm hvid (sensor.boernevaerelse_auto_lys_pct).
-#   2. Efter sengetid med børn hjemme: puttelys-UDSEENDET
-#      (script.puttelys_phase1_apply, saet_flag=false).
+#   1. Før putte-vinduet, uden børn hjemme eller med vildt strip-lys:
+#      lux-styret varm hvid (sensor.boernevaerelse_auto_lys_pct).
+#   2. I putte-vinduet (binary_sensor.putning_vindue_aktivt: børn hjemme, efter
+#      input_datetime.putning_vindue_start): puttelys-UDSEENDET
+#      (script.puttelys_phase1_apply, saet_flag=false). 2026-11-25 (user-spec
+#      opg. 12: "tænd putte lys på fase 1 ved bevægelse om aftenen og så se om
+#      der puttes bagefter"): før gjaldt det først fra sengetid
+#      (sensor.boern_bedtime_hour) — 23/11 19:19 gik Parent B ind til et mørkt
+#      rum, fordi 300 s-tom-reglen havde slukket loftet 18:56. Selve
+#      nedtrapningen starter først når putningen er BEKRÆFTET
+#      (godnat_night.yaml::puttelys_descent).
 #
 # Stamps input_datetime.boernevaerelse_last_off ved turn-off (læses af
 # lux-fald-vejen i presence_lights.yaml).
@@ -27,9 +34,10 @@
 - id: presence_light_boernevaerelse_on
   alias: "Lysnet: Børneværelse tænd"
   description: >
-    Før sengetid (eller uden børn hjemme): lux-styret varm hvid. Efter sengetid
-    med børn hjemme: puttelys-udseendet (loft 30 % + strip lyserød + plug, uden
-    fase 1-flaget). godnat_any_active blokerer alt (børnene sover).
+    Før putte-vinduet (eller uden børn hjemme): lux-styret varm hvid. I
+    putte-vinduet (putning_vindue_aktivt): puttelys-udseendet (loft 30 % + strip
+    lyserød + plug, uden fase 1-flaget). godnat_any_active blokerer alt
+    (børnene sover).
   mode: single
   trigger:
     - platform: state
@@ -164,14 +172,14 @@
            and not (f is not none and f.state == 'on'
                     and (now() - f.last_changed).total_seconds() < 60) }}
     - choose:
-        # ===== Efter sengetid med børn hjemme → puttelys-udseendet =====
-        # Uden børn hjemme er det en voksen, der skal have normalt lys (default).
+        # ===== I putte-vinduet → puttelys-udseendet =====
+        # putning_vindue_aktivt = børn hjemme + efter putning_vindue_start +
+        # ikke vildt strip-lys (pigerne leger → default-loftet, strippen
+        # urørt). Uden børn hjemme er det en voksen → normalt lys (default).
         - conditions:
-            - condition: template
-              value_template: >
-                {% set cutoff = states('sensor.boern_bedtime_hour') | float(19.5) %}
-                {{ now().hour + now().minute / 60 >= cutoff
-                   and is_state('binary_sensor.kids_home', 'on') }}
+            - condition: state
+              entity_id: binary_sensor.putning_vindue_aktivt
+              state: "on"
           sequence:
             # saet_flag=false: KUN udseendet — ingen strip-fredning, tom-sluk
             # tager det som ethvert presence-lys (samme kald som sen hjemkomst
@@ -492,6 +500,12 @@
     # del af natlyset (nedtrapningen slukker den selv ved 85 %).
     plug_fredet: >-
       {{ states('input_text.boern_aften_niveau_hold').startswith('hold') }}
+    # 2026-11-25: under nedtrapningen EJER script.puttelys_descent_run loftet
+    # (det fader det selv ud) — tom-reglen må ikke skære forløbet over
+    # (fejlklasse #2). descent_active ryddes af scriptet selv, og et strandet
+    # flag af godnat_subflag_safety, så fredningen kan ikke hænge.
+    loft_fredet: >-
+      {{ is_state('input_boolean.puttelys_descent_active', 'on') }}
   condition:
     # 2026-09-02: DENNE automation slukkede vækningen 2 min inde (06:23 → 06:25).
     # Et sovende barn giver ingen occupancy, så "tom i 5 min" er sandt hele
@@ -521,7 +535,7 @@
     # står on til dagtimernes oprydning (godnat_subflag_safety).
     - condition: template
       value_template: >-
-        {{ is_state('light.boernevaerelse_loft', 'on')
+        {{ (is_state('light.boernevaerelse_loft', 'on') and not loft_fredet)
            or (is_state('light.boernevaerelse_hygge_strip', 'on') and not strip_fredet)
            or (is_state('light.boernevaerelse_hyggelys', 'on') and not plug_fredet) }}
     # P2 fix: time_pattern requires Apollo been off ≥5 min siden last_changed.
@@ -535,6 +549,10 @@
     # fra 06:00 til børnenes sengetid (sensor.boern_bedtime_hour) — et barn
     # der sover om DAGEN skal ikke have loftet tændt, så tomt rum = sluk er
     # ufarligt. Efter sengetid: den lange regel (sovende børn, puttelys).
+    # 2026-11-25 (opg. 12): også i putte-vinduet (putning_vindue_aktivt, fra
+    # putning_vindue_start) — 23/11 slukkede 300 s-reglen puttelyset 18:56,
+    # og den ægte putning 19:19 fandt rummet mørkt. Samme vindue som
+    # presence-tændets puttelys-udseende (#2).
     - condition: template
       value_template: >-
         {% set t = states.binary_sensor.boernevaerelse_apollo_occupancy.last_changed %}
@@ -542,7 +560,8 @@
         {% set familie = states('input_select.house_mode') in ['Normal', 'Home Vacation']
            and not is_state('input_select.room_mode_boernevaerelse', 'Manual') %}
         {% set cutoff = states('sensor.boern_bedtime_hour') | float(19.5) %}
-        {% set dag = 6 <= now().hour + now().minute / 60 < cutoff %}
+        {% set dag = 6 <= now().hour + now().minute / 60 < cutoff
+           and not is_state('binary_sensor.putning_vindue_aktivt', 'on') %}
         {% if familie and is_state('binary_sensor.kids_home', 'off') %}
           {% set krav = states('input_number.boernevaerelse_uden_boern_sluk_sekunder') | float(90) %}
         {% elif familie and dag %}
@@ -565,12 +584,22 @@
     # døgn. Holdet fjerner KUN strippen fra målet; loftet slukker som før.
     # Gatede vi hele automationen, ville et manuelt natlys lade loftet brænde
     # hele natten, hvilket er langt værre end fejlen vi retter.
-    - service: light.turn_off
-      continue_on_error: true
-      target:
-        entity_id: "{{ ['light.boernevaerelse_loft'] + ([] if strip_fredet else ['light.boernevaerelse_hygge_strip']) }}"
-      data:
-        transition: "{{ states('sensor.fade_living_effective') | int(30) }}"
+    # 2026-11-25: loftet fredes under nedtrapningen (loft_fredet) → målet kan
+    # være tomt; så springes kaldet over.
+    - variables:
+        sluk_maal: >-
+          {{ ([] if loft_fredet else ['light.boernevaerelse_loft'])
+             + ([] if strip_fredet else ['light.boernevaerelse_hygge_strip']) }}
+    - if:
+        - condition: template
+          value_template: "{{ sluk_maal | length > 0 }}"
+      then:
+        - service: light.turn_off
+          continue_on_error: true
+          target:
+            entity_id: "{{ sluk_maal }}"
+          data:
+            transition: "{{ states('sensor.fade_living_effective') | int(30) }}"
     # Plug-lampen er non-dimmable (switch) → ingen transition. Eksplicit sluk her,
     # fordi strip→off-mirror'en ikke fyrer hvis strippen er unavailable (Innr-flap).
     # Fredet af dit aften-hold (plug_fredet, se variables).

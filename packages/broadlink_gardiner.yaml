@@ -13,10 +13,10 @@
 # koderne (procedure: docs/thread_pairing_drejebog.md har ikke denne — se
 # git-log for capture-script, /tmp/somfy/ paa NUC, eller spoerg Claude).
 #
-# VEST-SÆRREGEL (user 2026-06-11): "vest skal aldrig 100% ned, højst 85%
+# VEST-SÆRREGEL (user 2026-06-11, dybden 90 % fra 2026-11-25): "vest skal aldrig 100% ned, højst 85%
 # — der står nogle ting". Implementering v2 (empirisk testet 2026-06-11):
 #   close = NED → delay (input_number.gardin_vest_ned_sekunder, målt 14s
-#   fra top til 85%-grænsen) → My-STOP.
+#   fra top til luk-linjen, 90 % nede siden 25/11) → My-STOP.
 # Hvorfor ikke motor-preset? Vores fangne My-kode er en LANG-tryk-ramme
 # (capture krævede holdt knap) — den STOPPER fint under kørsel (verificeret),
 # men trigger IKKE kør-til-preset i hvile (verificeret dud). Korte tryk kan
@@ -26,6 +26,10 @@
 # i bund (user 23/11 19:46). Nu: close = script.gardin_vest_position(15,
 # kun_ned) fra den KENDTE position, og hver kørsel bogføres, så et stop
 # regner positionen ud (custom_templates/gardin_vest.jinja).
+# 2026-11-25: står modellen på linjen, glemmer et BRUGER-ned (RODRET, app)
+# positionen → re-home (script.gardin_vest_bruger_ned) — ellers kunne en
+# forkert model aldrig rettes (user 24/11: "kan slet ikke køre mere end 60%
+# ned").
 #
 # Entities matcher de planlagte Matter-navne -> AL eksisterende automation
 # (somrig_buttons RODRETs, winter/summer_defense, godnat-flows, entre_somrig
@@ -115,11 +119,16 @@ input_number:
     mode: slider
     icon: mdi:timer-cog-outline
 
+  # 2026-11-25 (user: "lad os bare få vest gardin stue til altid at gå ned til
+  # samme længde, nemlig den dybe version, ca 90% lukket. det tager så mange sek
+  # at komme derned fra toppen: 17,65 sek"): luk-linjen er nu 10 % (90 % nede),
+  # og fuld køretid = denne / 0.9 ALLE steder (op-tid, re-home, slider). 12,5 s
+  # stoppede den ~2/3 nede, og et nyt ned-tryk re-homede til samme sted.
   gardin_vest_ned_sekunder:
-    name: "Vest-gardin: sekunder til 85%-stop"
+    name: "Vest-gardin: sekunder fra top til luk-linjen (90 % nede)"
     min: 5
     max: 25
-    step: 0.5
+    step: 0.05
     unit_of_measurement: "s"
     mode: slider
     icon: mdi:curtains
@@ -378,7 +387,7 @@ template:
           # så et stop undervejs kender positionen (custom_templates/gardin_vest.jinja).
           - variables:
               fra: "{% from 'gardin_vest.jinja' import pos_nu %}{{ pos_nu() | float(-1) }}"
-              fuld: "{{ (states('input_number.gardin_vest_ned_sekunder') | float(14) / 0.85) | round(1) }}"
+              fuld: "{{ (states('input_number.gardin_vest_ned_sekunder') | float(17.65) / 0.9) | round(1) }}"
           - service: script.turn_off
             target: {entity_id: script.gardin_vest_position}
           # Endestop top = frisk reference (2026-09-23, relativ slider-kørsel).
@@ -403,12 +412,22 @@ template:
           # er god til projektor … den gik alt for langt ned"): vinter-lukningen
           # havde sat vest på 20 % kl. 16:20, og RODRET'ens 2. ned-klik 19:46:34
           # kørte ALLIGEVEL de fulde gardin_vest_ned_sekunder NED (tiden top →
-          # 85 %) → i bund. Luk = nu "kør til 85 %-linjen (15 %) fra den KENDTE
+          # 85 %) → i bund. Luk = nu "kør til luk-linjen (10 %) fra den KENDTE
           # position, kun nedad": står den dér eller lavere, sker intet; ukendt
           # → re-home (op først). Samme queued-kanal som slideren (#2).
+          # 2026-11-25 (user: "nu kan den slet ikke køre mere end 60% ned!!"):
+          # stod modellen på linjen, var også BRUGERENS luk en no-op — 24/11
+          # 16:14-16:15 flyttede 8 ned-klik og app-luk/slider intet. Et bruger-
+          # luk (app/stemme = context.user_id) på et "nede" gardin glemmer nu
+          # positionen → re-home. RODRET-tryk bærer intet user_id og kalder
+          # script.gardin_vest_bruger_ned selv (somrig_buttons.yaml).
+          - if:
+              - "{{ context is defined and context is not none and context.user_id is not none }}"
+            then:
+              - service: script.gardin_vest_bruger_ned
           - service: script.gardin_vest_position
             data:
-              maal: 15
+              maal: 10
               kun_ned: true
         stop_cover:
           # 2026-11-23: stop afbryder den timede kørsel (ellers sender den sit
@@ -512,7 +531,7 @@ template:
 # Baggrund (user 2026-07-29): "dark mode glemte vest gardin stue lige nu. det er
 # stadig åbent." Begge mørklægninger filtrerede på `states(c) in ['open',
 # 'opening', 'unknown']` for at undgå at lukke vest TO gange (2. luk kører forbi
-# 85 %-stoppet og rammer bunden). Men RTS er ENVEJS: HA's state er et GÆT, ikke
+# luk-stoppet (90 % nede) og rammer bunden). Men RTS er ENVEJS: HA's state er et GÆT, ikke
 # en måling. Stod gættet på 'closed' mens gardinet fysisk var oppe (RF-miss,
 # fysisk Somfy-fjernbetjening, sommerforsvar der ikke nåede frem), blev gardinet
 # sprunget over — præcis det brugeren så.
@@ -560,13 +579,13 @@ script:
             {% set nu = as_timestamp(now()) | round(0) %}
             {% set syd_ned = states('input_number.gardin_syd_ned_sekunder') | float(22) %}
             {% set syd_fuld = states('input_number.gardin_syd_fuld_sekunder') | float(25) %}
-            {% set vest_ned = states('input_number.gardin_vest_ned_sekunder') | float(14) %}
-            {% set vest_fuld = vest_ned / 0.85 %}
+            {% set vest_ned = states('input_number.gardin_vest_ned_sekunder') | float(17.65) %}
+            {% set vest_fuld = vest_ned / 0.9 %}
             {#- 2026-11-23: vest kører fra sin KENDTE position (gardin_vest.jinja) —
-                luk kun ned til 85 %-linjen (15 %), ukendt = re-home (op + ned). -#}
+                luk kun ned til luk-linjen (10 %), ukendt = re-home (op + ned). -#}
             {% from 'gardin_vest.jinja' import pos_nu %}
             {% set vp = pos_nu() | float(-1) %}
-            {% set vest_down = ([(vp - 15) / 100 * vest_fuld, 0] | max) if vp >= 0 else vest_fuld + 4 + vest_ned %}
+            {% set vest_down = ([(vp - 10) / 100 * vest_fuld, 0] | max) if vp >= 0 else vest_fuld + 4 + vest_ned %}
             {% set vest_up = ((100 - vp) / 100 * vest_fuld) if vp >= 0 else vest_fuld %}
             {% set t = {'syd': {'down': syd_ned if is_state('binary_sensor.filmmoerke_stue', 'off') else syd_fuld,
                                 'up': syd_fuld},
@@ -748,8 +767,41 @@ script:
         data:
           timestamp: "{{ as_timestamp(now()) | int if est >= 0 else 0 }}"
 
+  # 2026-11-25 (user: "nu kan den slet ikke køre mere end 60% ned!!", 24/11
+  # 16:10-16:15): luk kører kun ned fra den KENDTE position, og står modellen
+  # allerede på luk-linjen (90 % nede), sker intet. Men RTS er ENVEJS — HA troede vest
+  # stod på 15 %, og 8 RODRET-ned-klik + app-luk/stop/slider på 93 s flyttede
+  # den intet (stue_rodret_koerer: vest-ned 0 s). Et BRUGER-tryk ned på et
+  # gardin modellen mener er nede, er bevis på at modellen tager fejl → glem
+  # positionen, så lukket re-homer (op til motorens eget endestop, ned til
+  # linjen) og aldrig lander under den. Automationers luk er stadig en no-op
+  # dér — de ser ikke gardinet. Kaldes af vest-coverets close_cover (app/
+  # stemme) og RODRET'ens vest-ned (ned #2 og hold) FØR kører-bogføringen.
+  gardin_vest_bruger_ned:
+    alias: "Gardin vest: bruger-ned på et 'nede' gardin → glem positionen"
+    mode: queued
+    max: 4
+    sequence:
+      - variables:
+          p: "{% from 'gardin_vest.jinja' import pos_nu %}{{ pos_nu() | float(-1) }}"
+          koerer: "{% from 'gardin_vest.jinja' import i_gang %}{{ i_gang() == 'ja' }}"
+      - condition: template
+        value_template: "{{ not koerer and p >= 0 and p <= 11 }}"
+      - service: script.gardin_vest_koersel_saet
+        data:
+          fra: -1
+          til: -1
+          sek: 0
+      - service: logbook.log
+        data:
+          name: "Gardin vest"
+          entity_id: cover.gardin_stue_vest_1
+          message: >-
+            Ned-tryk mens HA mente vest stod på {{ p | int }} % → positionen
+            glemt, lukket re-homer (op, så ned til luk-linjen, 90 % nede)
+
   gardin_vest_position:
-    alias: "Gardin Vest: kør til position (timet, min 15 %)"
+    alias: "Gardin Vest: kør til position (timet, min 10 %)"
     icon: mdi:arrow-expand-vertical
     mode: queued
     max: 4
@@ -768,9 +820,9 @@ script:
       # 0 og 100 rammer motorens egne endestop, får INTET timet stop, og
       # nulstiller drift fra den FYSISKE Somfy-fjernbetjening.
       # VEST-SÆRREGEL: under 15 % findes ikke ("der står nogle ting" —
-      # 85 % lukket ER bunden her), så målet klampes, og der er ingen
-      # ned-i-bund-gren. 15 % rammer præcis den eksisterende 85 %-tid, fordi
-      # køretiden udledes af SAMME slider som close_cover: ned/0.85.
+      # 90 % lukket ER bunden her), så målet klampes, og der er ingen
+      # ned-i-bund-gren. 10 % rammer præcis slider-tiden, fordi
+      # køretiden udledes af SAMME slider som close_cover: ned/0.9.
       # 2026-11-23: kører vest stadig (fx et app-OP), stop den først og bogfør
       # hvor den står — så regnes den nye kørsel fra den rigtige position.
       - if:
@@ -778,19 +830,20 @@ script:
         then:
           - service: script.gardin_vest_stop
       - variables:
-          pos: "{{ [[maal | default(100) | float(100), 15] | max, 100] | min | round(0) }}"
-          fuld: "{{ (states('input_number.gardin_vest_ned_sekunder') | float(14) / 0.85) | round(1) }}"
+          # 2026-11-25: linjen er 10 % (user: "den dybe version, ca 90% lukket").
+          pos: "{{ [[maal | default(100) | float(100), 10] | max, 100] | min | round(0) }}"
+          fuld: "{{ (states('input_number.gardin_vest_ned_sekunder') | float(17.65) / 0.9) | round(1) }}"
           # 2026-11-23: positionen NU fra den bogførte kørsel (gardin_vest.jinja) —
           # også midt i en kørsel, og efter et stop.
           ref: "{% from 'gardin_vest.jinja' import pos_nu %}{{ pos_nu() | float(-1) }}"
           ref_gyldig: "{{ ref >= 0 }}"
-      # kun_ned (vest-coverets close_cover): luk = 85 %-linjen, aldrig opad og
+      # kun_ned (vest-coverets close_cover): luk = luk-linjen (90 % nede), aldrig opad og
       # aldrig igen fra en position der allerede er dér eller lavere (user
       # 2026-11-23: 2. ned-klik fra 20 % kørte i bund).
       - if:
           - "{{ (kun_ned | default(false)) | bool and ref_gyldig and pos >= ref - 1 }}"
         then:
-          - stop: "Vest står allerede ved eller under 85 %-linjen"
+          - stop: "Vest står allerede ved eller under luk-linjen (90 % nede)"
       - choose:
           - conditions:
               - "{{ pos >= 99 }}"
@@ -1047,7 +1100,7 @@ script:
                     continue_on_error: true
                     target:
                       entity_id: "{{ simple.split(',') }}"
-          # Vest: re-home først, så 85 %-stoppet altid rammes fra toppen.
+          # Vest: re-home først, så luk-stoppet (90 % nede) altid rammes fra toppen.
           - sequence:
               - if:
                   - condition: template
@@ -1072,12 +1125,12 @@ script:
                     continue_on_error: true
                     target:
                       entity_id: cover.gardin_stue_vest_1
-                  # Fuld køretid = 85 %-tiden / 0.85, + margin. Læser samme
+                  # Fuld køretid = luk-linje-tiden / 0.9, + margin. Læser samme
                   # slider som close_cover → ingen ny helper at holde synk.
                   - delay:
                       seconds: >-
                         {{ ((states('input_number.gardin_vest_ned_sekunder')
-                             | float(14) / 0.85) + 4) | round(1) }}
+                             | float(17.65) / 0.9) + 4) | round(1) }}
                   # 2026-09-23 (user-bug 21/09 21:43: "brugte gardin knappen til
                   # at stoppe gardinerne i stuen men det blev overrulet"): op-
                   # trykket fritog stuen 21:43:10, men denne kørsel var allerede
@@ -1100,7 +1153,7 @@ script:
                     continue_on_error: true
                     target:
                       entity_id: cover.gardin_stue_vest_1
-                  # Ekstra nedkørsel (user 2026-08-08): 85 %-stoppet efterlader
+                  # Ekstra nedkørsel (user 2026-08-08): luk-stoppet (90 % nede) efterlader
                   # en lysstribe ved sofaen. close_cover kan ikke forlænges
                   # undervejs (template-coverets eget STOP fyrer på slideren), så
                   # vi venter til den kørsel er HELT færdig og giver et kort NED
@@ -1116,15 +1169,15 @@ script:
                       - delay:
                           seconds: >-
                             {{ ((states('input_number.gardin_vest_ned_sekunder')
-                                 | float(14)) + 2) | round(1) }}
-                      # 2026-11-23: close_cover er nu "kør til 85 %-linjen, kun
+                                 | float(17.65)) + 2) | round(1) }}
+                      # 2026-11-23: close_cover er nu "kør til luk-linjen (90 % nede), kun
                       # nedad" og rører sig ikke herfra — og det gamle close_cover
                       # BLOKEREDE sine fulde 13 s, så stop_cover først kom efter en
                       # kørsel i bund. Nu: NED direkte, bogført (gardin_vest.jinja),
                       # og gardin_vest_stop efter de ekstra sekunder.
                       - variables:
                           vx_fra: "{% from 'gardin_vest.jinja' import pos_nu %}{{ pos_nu() | float(-1) }}"
-                          vx_fuld: "{{ (states('input_number.gardin_vest_ned_sekunder') | float(14) / 0.85) | round(1) }}"
+                          vx_fuld: "{{ (states('input_number.gardin_vest_ned_sekunder') | float(17.65) / 0.9) | round(1) }}"
                       - service: script.gardin_vest_koersel_saet
                         data:
                           fra: "{{ vx_fra }}"

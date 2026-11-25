@@ -40,6 +40,13 @@ BEGGE lag.
   `delay_off`, mens state-templaten renderer False. → split i BEVIS-sensor
   (`delay_on`, intet `delay_off`) + HOLD-sensor. NB templated `delay_off` skal
   være SEKUNDER som skalar.
+- **En TEMPLATED `delay_on`/`delay_off` springes OVER ved første render efter
+  restart/template-reload** (state-templaten sættes op før delay-templaten, så
+  delayen er stadig `None`). **Signatur: en delay-sensor der skifter i
+  reloadets eget sekund** (25/11 06:13:41: `presence_kanaler_blinde`
+  `unavailable → on → off`). → en ventetid der SKAL holde efter en reload:
+  mål den i forbrugeren på `last_changed` (nulstilles = sikker retning) eller
+  brug en fast `delay_on`. 27 sensorer har en templated delay (B330).
 - **Et `statistics`-vindue over en sensor der kun rapporterer ved ÆNDRING mister
   sin bund når værdien har stået stille længere end `max_age`** — præcis i
   hvilen før hændelsen. **Signatur: en stigning der måles fra hændelsens FØRSTE

@@ -38,13 +38,17 @@ Den lange version (måledata, incidents): `docs/permanente_fakta.md`
   er IKKE ramt. Gates på position/`open`/`closed` er stumme efter restart (#9).
 - **Terrassedøren har INTET gardin** (user 2026-10-07) → en åben terrassedør må
   aldrig spærre et gardin (en spærre på stue vest blev bygget og fjernet igen
-  samme dag). **Stue vest må højst 85 % ned — der står ting under:** close =
-  `script.gardin_vest_position(15, kun_ned)` fra den KENDTE position (står den
-  ≤ 15 %: intet; ukendt: re-home). Position = `pos_nu()` i
+  samme dag). **Stue vest må højst 90 % ned — der står ting under** (85 → 90 % 25/11,
+  user-målt 17,65 s fra top = `gardin_vest_ned_sekunder`, fuld = /0,9): close =
+  `script.gardin_vest_position(10, kun_ned)` fra den KENDTE position (står den
+  ≤ 10 %: intet — men et BRUGER-ned dér glemmer positionen,
+  `script.gardin_vest_bruger_ned`; ukendt: re-home). Position = `pos_nu()` i
   `custom_templates/gardin_vest.jinja` (hver kørsel bogført i
   `input_text.gardin_vest_koersel`, så et stop regnes ud). **Signatur på det
   gamle hul: vest i bund efter et luk fra 20 % eller efter et stop halvvejs**
-  (23/11). En NY RF-vej til vest skal bogføre via `script.gardin_vest_koersel_saet`.
+  (23/11); **på modellens fejl: ned-tryk der intet flytter, mens HA siger
+  `closed`** (24/11). En NY RF-vej til vest skal bogføre via
+  `script.gardin_vest_koersel_saet`.
 - **`sensor.gardiner_manual_hold` har TO lister: `held` = auto-ÅBN-blokliste
   (bærer AirBnB-tæppet: alle fire permanent), `held_luk` = auto-LUK-blokliste
   (samme minus tæppet).** **Signatur: en LUK-vej der læser `held` kan aldrig

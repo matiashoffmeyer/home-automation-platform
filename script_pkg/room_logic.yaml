@@ -152,13 +152,54 @@ room_drift_back:
   fields:
     room:
       description: "Room id"
+    tving:
+      description: "true = 24-t-fallback: slip også et manuelt sluk-hold"
   variables:
     targets: "light.{{ room }}_all"
     # Tjek om noget i rummet faktisk er on (group state OR expand and check)
     any_light_on: >
       {% set s = states(targets) %}
       {{ s == 'on' }}
+    # 2026-11-25 (user: "jeg vil i hvert fald ha at mine manuelle offs varer
+    # længere ... kun for manuelle offs (app eller styrbar)" → "lav slider til
+    # manuelle offs, 2 timer"). Har DU slukket rummet, forbliver det Manual
+    # (= bevægelse tænder ikke) i input_number.manuel_sluk_hold_timer, uanset
+    # tom-tid og loft. Gaten ligger HER, fordi begge veje til Auto går gennem
+    # scriptet (room_drift_back_watcher + open_plan_fuldt_lys' slip).
+    # "Dit sluk" = alt rummets lys er slukket, og det SIDSTE gik ud tæt på
+    # rummets tryk-stempel (styrbar_last_press_<rum>; app-kald stemples af
+    # manual_override.yaml, knapper af script.styrbar_stamp_press). Målt 14
+    # døgn, 8 rum: tryk → rum-sluk lander på −6…+35 s (68 tilfælde); auto-
+    # sluk efter et tryk tidligst 156 s → vindue −15…+60 s. Et tryk der
+    # TÆNDTE, efterfulgt af tom-sluk, holder derfor ikke rummet mørkt.
+    # Badet er bevidst udenfor: presence_badevaerelse.yaml giver et mørkt
+    # Manual-bad Auto med det samme (user-spec 2026-10-04).
+    # last_changed nulstilles ved genstart → holdet slipper efter en genstart
+    # (sikker retning: Auto). 24-t-fallbacken sender tving=true.
+    manuel_sluk_hold: >-
+      {% from 'rosters.jinja' import sove_lys, boern_alle_lys %}
+      {% set m = {'sovevaerelse': sove_lys, 'boernevaerelse': boern_alle_lys,
+                  'stue': ['light.stue_room'], 'spisestue': ['light.spisestue_loft'],
+                  'koekken': ['light.koekken_lyskaede', 'switch.koekken_spots'],
+                  'depot': ['light.depot_all'], 'entre': ['light.entre_all'],
+                  'terrasse': ['light.terrasse_all']} %}
+      {% set lys = m.get(room, []) %}
+      {% set tryk = state_attr('input_datetime.styrbar_last_press_' ~ room, 'timestamp') | float(0) %}
+      {% set hold_h = states('input_number.manuel_sluk_hold_timer') | float(2) %}
+      {% set ns = namespace(slukket=true, sidst=0) %}
+      {% for e in lys %}
+        {% if is_state(e, 'on') %}{% set ns.slukket = false %}{% endif %}
+        {% if states[e] is not none %}
+          {% set ns.sidst = [ns.sidst, as_timestamp(states[e].last_changed)] | max %}
+        {% endif %}
+      {% endfor %}
+      {{ (tving | default(false) | string | lower) != 'true'
+         and lys | length > 0 and tryk > 0 and hold_h > 0 and ns.slukket
+         and (now().timestamp() - tryk) < hold_h * 3600
+         and ns.sidst - tryk >= -15 and ns.sidst - tryk <= 60 }}
   sequence:
+    - condition: template
+      value_template: "{{ not manuel_sluk_hold }}"
     # Altid set mode til Auto (release manual-lock)
     - service: input_select.select_option
       target:

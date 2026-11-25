@@ -156,6 +156,35 @@ input_number:
     unit_of_measurement: "point"
     mode: slider
 
+  # PAUSE ≠ SLUT (2026-11-25, user-bug "24/11 gik badlyset ud mens jeg var
+  # derinde … tændte med den indre pir (fod ud af badet)"). Et fald på
+  # fald_point (3) ser ens ud om vandet er slukket for en sæbe-pause eller
+  # for godt — forskellen er at pausen VENDER. Målt 21 døgn, 38 sessioner:
+  # pause-dyk 4,1-7,5 point, 1,0-4,9 min fra første dyk-sample til fugten var
+  # tilbage (rapport-huller op til 3 m 54 s); en ægte slut falder videre.
+  # Simuleret: 5 min / 10 point fanger begge pauser der slukkede lyset (11-06
+  # 05:58, 11-24 06:05) og koster p50 1 min, p90 5 min længere session.
+  # 0 min = gammel adfærd (første dyk slutter sessionen).
+  badevaerelse_brusebad_fald_holder_minutter:
+    name: "Bad brusebad: fugt-fald skal holde i"
+    icon: mdi:timer-sand
+    min: 0
+    max: 15
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+
+  # … medmindre faldet er så stort at det ikke er en pause: største målte
+  # pause-dyk 7,5 point (to gange, begge i badets første 3 min).
+  badevaerelse_brusebad_fald_stort_point:
+    name: "Bad brusebad: stort fugt-fald = slut straks"
+    icon: mdi:water-remove
+    min: 3
+    max: 30
+    step: 0.5
+    unit_of_measurement: "point"
+    mode: slider
+
   # Mindste sessions-alder før et fugt-FALD må slutte den: en kraftig udsugning
   # kan trække fugten ned mens man stadig står i bruseren. 2026-10-01: var
   # "blanking før PIR tæller" (PIR-udgangen er fjernet), og fald-udgangen
@@ -608,6 +637,22 @@ template:
             {{ dh >= kh and db >= kb }}
           {% endif %}
 
+      # FUGT-FALDET HAR HOLDT (2026-11-25) — backstoppens krav før et fald under
+      # stort_point må slutte sessionen. on = faldet er over fald_point NU;
+      # "holdt" = on i ≥ fald_holder_minutter, målt på last_changed I
+      # backstoppen. Et nyt top-sample sætter faldet til 0 og nulstiller
+      # ventetiden; restart/reload nulstiller last_changed = ventetiden starter
+      # forfra (sikker retning). IKKE delay_on: en TEMPLATED delay_on springes
+      # over ved første render efter restart/reload (state-templaten sættes op
+      # før delay-templaten, template/binary_sensor.py 2026.11) — målt ved
+      # deploy 25/11 06:13:41: on med det samme. Kun condition, aldrig kant (b103).
+      - name: "Badeværelse fugt-fald holder"
+        unique_id: badevaerelse_fugt_fald_holder
+        icon: mdi:water-minus-outline
+        state: >-
+          {{ states('sensor.badevaerelse_fugt_fald') | float(0)
+             >= states('input_number.badevaerelse_brusebad_fald_point') | float(12) }}
+
       # FRISK FUGT-MÅLING (2026-10-01, user-spec). Alle badets automatiske
       # sluk-veje VENTER på denne før de slukker, og afgør derefter på
       # brusebad_hold — ét anker, så reglen ikke kodes 8 steder (#2/#21).
@@ -1003,6 +1048,21 @@ automation:
         entity_id: binary_sensor.badevaerelse_brusebad_signatur
         from: "off"
         to: "on"
+        id: signatur
+      # GEN-ARMERING (2026-11-25, #4). Signaturen er bygget af 15-min-latche og
+      # står STADIG on når sessionen slipper midt i et bad — så vand-på igen
+      # efter en lang pause (eller person nr. 2 i bad) giver ingen off→on-kant,
+      # og intet armerer. Målt 21 døgn: 7/38 sessioner sluttede og fugten steg
+      # ≥ 3 point igen inden for 15 min, signaturen on ved slut i alle 7, kun 2
+      # fik en ny kant; i 4 slukkede lyset på en der stod derinde (PIR'en
+      # genrejste det < 10 s efter). → en NY burst (øjebliksværdien, ikke
+      # latchen) mens signaturen stadig er on. Reload/fugt-flap: burst-sensoren
+      # kommer tilbage straks, signaturen først efter sin delay_on (30 s) →
+      # condition'en nedenfor afviser den kunstige flanke.
+      - platform: numeric_state
+        entity_id: sensor.badevaerelse_fugt_burst
+        above: input_number.badevaerelse_brusebad_fugt_burst_point
+        id: genarm
     condition:
       - condition: state
         entity_id: input_boolean.badevaerelse_brusebad_session
@@ -1013,10 +1073,16 @@ automation:
       # flanke 06:28:06, session armeret og lyset tændt i et TOMT bad. Den
       # kunstige off-fase varer præcis delay_on (30 s); en ægte varer fra
       # sidste latch-udløb. Broen i afventer_klimabevis dækker et ægte bad.
+      # (Gælder signatur-kanten; gen-armeringen kræver i stedet at signaturen
+      # STÅR on — dens 30 s delay_on er netop det der afviser reload-flanken.)
       - condition: template
         value_template: >-
-          {% set off_s = (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() %}
-          {{ off_s > 45 }}
+          {% if trigger.id == 'genarm' %}
+            {{ is_state('binary_sensor.badevaerelse_brusebad_signatur', 'on') }}
+          {% else %}
+            {% set off_s = (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() %}
+            {{ off_s > 45 }}
+          {% endif %}
       # Nogen er gået ind i badet inden for vinduet (skrevet stempel, ikke
       # last_changed). Lys tændt / stadie i gang / wasp armeret tæller også som
       # bevis — så et bad der detekteres MENS besøget kører, aldrig falder på
@@ -1104,7 +1170,8 @@ automation:
         data:
           name: "Bad brusebad"
           message: >-
-            Session ARMERET — fugt +{{ states('sensor.badevaerelse_fugt_stigning') }}
+            Session {{ 'GEN-ARMERET (ny burst efter et fald)' if trigger.id == 'genarm'
+                       else 'ARMERET' }} — fugt +{{ states('sensor.badevaerelse_fugt_stigning') }}
             point/10min (tærskel {{ states('input_number.badevaerelse_brusebad_fugt_stigning_point') }}),
             burst +{{ states('sensor.badevaerelse_fugt_burst') }} point/5min,
             RH nu {{ states('sensor.badevaerelse_timmerflotte_humidity') }} %.
@@ -1145,13 +1212,23 @@ automation:
           {% set blank = states('input_number.badevaerelse_brusebad_blank_minutter') | int(9) %}
           {% set fald = states('sensor.badevaerelse_fugt_fald') | float(0) %}
           {% set fald_k = states('input_number.badevaerelse_brusebad_fald_point') | float(12) %}
-          {{ alder >= maks or (alder >= blank and fald >= fald_k) }}
+          {# 2026-11-25: et dyk slutter kun hvis det er STORT eller har HOLDT —
+             en sæbe-pause falder lige så stejlt som en slut, men vender. #}
+          {% set stort = states('input_number.badevaerelse_brusebad_fald_stort_point') | float(10) %}
+          {% set h = states.binary_sensor.badevaerelse_fugt_fald_holder %}
+          {% set holdt = h is not none and h.state == 'on'
+             and (as_timestamp(now()) - as_timestamp(h.last_changed))
+                 >= (states('input_number.badevaerelse_brusebad_fald_holder_minutter') | float(5)) * 60 %}
+          {{ alder >= maks
+             or (alder >= blank and fald >= fald_k and (fald >= stort or holdt)) }}
     action:
       - variables:
           aarsag: >-
             {% if (states('sensor.badevaerelse_brusebad_alder') | int(0))
                   >= (states('input_number.badevaerelse_brusebad_maks_minutter') | int(45)) %}maks-tid
-            {% else %}fugt-fald{% endif %}
+            {% elif (states('sensor.badevaerelse_fugt_fald') | float(0))
+                    >= (states('input_number.badevaerelse_brusebad_fald_stort_point') | float(10)) %}stort fugt-fald
+            {% else %}fugt-fald holdt{% endif %}
       - service: input_boolean.turn_off
         target:
           entity_id: input_boolean.badevaerelse_brusebad_session

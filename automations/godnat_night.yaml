@@ -347,17 +347,31 @@
 # Loft/strip turn_on KUN hvis de allerede er ON (PRIME DIRECTIVE: boern-lys må
 # aldrig auto-tænde fra off når børn sover — vi dæmmer kun ned, aldrig op).
 # Timing bevares via else-delay hvis loft/strip var off.
-# mode: restart → forlader-og-vender-tilbage (still_target off→on→2min) genstarter
-# rent; kontinuerlig læse-stilstand giver ingen ny trigger.
+#
+# BEKRÆFTELSE (2026-11-25, user-spec opg. 12: "tænd putte lys på fase 1 ved
+# bevægelse … se om der puttes bagefter … når putning bekræftes kører du
+# faserne (og måske er det så allerede blevet tid til at dimme)"): triggeren
+# er en KANDIDAT. Læsningen skal holde puttelys_bekraeft_minutter (10) uden
+# puttelys_bekraeft_tom_minutter (4) sammenhængende tomt rum — ellers var det
+# et besøg (23/11 18:50: 6 min, flippede børne-godnat 19:07, og den ægte
+# putning 19:19 fandt rummet mørkt). Måling: global_tuning.yaml. Gates tjekkes
+# igen efter ventetiden, og nedtrapningen forkortes med den (som Styrbar OP),
+# så natlyset lander når det gjorde før. Fase 1 står imens (presence-tændet
+# giver putte-udseendet i hele putte-vinduet).
+# mode: single (før restart): en ny 2-min-stilstand midt i ventetiden må ikke
+# nulstille den — så ville en læser der flytter sig aldrig blive bekræftet.
+# Under selve nedtrapningen blokerer puttelys_descent_active alligevel.
 # ==========================================================================
 - id: puttelys_descent
   alias: "Puttelys: Apollo-nedtrapning (fase 1 → natlys over slider-tid)"
   description: >
-    Når Apollo ser sustained læse-stilstand (still_target 2 min + afstand) efter
-    puttelys_start, trappes børneværelset langsomt ned over en slider-tid: loft
-    fader ud først (~65 %), så hyggelys (~85 %), mens strippen late-fader til 1 %
-    blå-hvid natlys. Ender med godnat_boern_active=on (konvergerer til natlys).
-  mode: restart
+    Når Apollo ser sustained læse-stilstand (still_target 2 min + afstand) i
+    putte-vinduet, OG læsningen holder (puttelys_bekraeft_minutter uden
+    puttelys_bekraeft_tom_minutter sammenhængende tomt rum), trappes
+    børneværelset ned over slider-tiden minus ventetiden: loft fader ud,
+    hyggelys ved ~85 %, strippen late-fader til 1 % blå-hvid natlys. Ender med
+    godnat_boern_active=on (konvergerer til natlys).
+  mode: single
   max_exceeded: silent
   trigger:
     - platform: state
@@ -412,11 +426,84 @@
         {{ states('sensor.boernevaerelse_apollo_radar_still_distance') | float(0)
            >= states('input_number.boernevaerelse_putte_reading_min_cm') | float(120) }}
   action:
+    - variables:
+        t_trigger: "{{ as_timestamp(now()) }}"
+        hold_min: "{{ states('input_number.puttelys_bekraeft_minutter') | float(10) }}"
+        tom_min: "{{ states('input_number.puttelys_bekraeft_tom_minutter') | float(4) }}"
+    # Bekræftelsen (se headeren): et sammenhængende tomt stræk på tom_min inden
+    # for hold_min = besøg, ikke putning. Occupancy er on her (still_target har
+    # stået i 2 min), så to: "off" + for: fanger hele strækket.
+    - if:
+        - condition: template
+          value_template: "{{ hold_min | float(0) > 0 }}"
+      then:
+        - wait_for_trigger:
+            - platform: state
+              entity_id: binary_sensor.boernevaerelse_apollo_occupancy
+              to: "off"
+              for:
+                seconds: "{{ (tom_min | float(4) * 60) | int }}"
+          timeout:
+            seconds: "{{ (hold_min | float(10) * 60) | int }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ wait.trigger is not none }}"
+          then:
+            - service: logbook.log
+              data:
+                name: "Puttelys"
+                message: >-
+                  Læse-stilstand kl {{ as_datetime(t_trigger | float).astimezone().strftime('%H:%M') }}
+                  var ikke en putning: rummet stod tomt {{ tom_min | float | round(1) }} min
+                  i træk inden for {{ hold_min | float | round(0) | int }} min → ingen nedtrapning.
+                entity_id: input_boolean.puttelys_descent_active
+            - stop: "Læsningen holdt ikke (tomt rum)"
+    # Re-tjek gates efter ventetiden — en anden vej kan have landet putningen
+    # (Styrbar, natlys-bagkant), lyset kan være slukket i hånden, eller huset
+    # kan have skiftet tilstand.
+    - condition: state
+      entity_id: input_boolean.auto_putning_enabled
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.kids_home
+      state: "on"
+    - condition: template
+      value_template: "{{ states('input_select.house_mode') in ['Normal', 'Home Vacation'] }}"
+    - condition: state
+      entity_id: input_select.house_state
+      state: "Active"
+    - condition: state
+      entity_id: input_boolean.godnat_boern_active
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.puttelys_descent_active
+      state: "off"
+    - condition: time
+      before: input_datetime.natlys_start
+    - condition: template
+      value_template: >-
+        {{ is_state('light.boernevaerelse_loft', 'on')
+           or is_state('light.boernevaerelse_hygge_strip', 'on')
+           or is_state('light.boernevaerelse_hyggelys', 'on') }}
     # 2026-06-18: koreografien er flyttet til script.puttelys_descent_run (single
-    # source of truth, delt med Styrbar-OP-putningen). Fuld varighed her.
+    # source of truth, delt med Styrbar-OP-putningen). Varigheden forkortes med
+    # ventetiden, så natlyset lander slider-tiden efter triggeren (samme regel
+    # som Styrbar OP, putning_auto_detect.yaml — gulv 5 min).
+    - variables:
+        gaaet_min: "{{ ((as_timestamp(now()) - (t_trigger | float)) / 60) | round(1) }}"
+        varighed: >-
+          {{ [ (states('input_number.global_puttelys_descent_minutes') | float(20)) - (gaaet_min | float(0)), 5 ] | max | round(1) }}
+    - service: logbook.log
+      data:
+        name: "Puttelys"
+        message: >-
+          Læsningen holdt {{ gaaet_min | float | round(0) | int }} min → putning bekræftet,
+          nedtrapning {{ varighed | float | round(0) | int }} min.
+        entity_id: input_boolean.puttelys_descent_active
     - service: script.puttelys_descent_run
       data:
-        duration_minutes: "{{ states('input_number.global_puttelys_descent_minutes') | float(20) }}"
+        duration_minutes: "{{ varighed }}"
 
 # ==========================================================================
 # SCENARIO 2c — FASE 2: Natlys (1% blå-hvid strip) — slider-bagkant + tidlig auto
