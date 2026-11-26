@@ -253,7 +253,10 @@ betyder at den globale faktor ikke anvendes.
 - `cinema_active` + `mood_pause_stue` gater kun sluk af sofa-zonen og
   spisestue-loftet. Andre rum har ingen sådan gate.
 - Cirkus er rum-scoped via `mood_pause_<rum>` (`packages/scene_state.yaml`).
-- Dark Mode tænder `cinema_active`.
+- Dark Mode tænder `cinema_active`, når stigen lander på sofastuen. Knappen uden projektor
+  mørklægger kun soveværelset; tændt i appen (user_id) følger den stigen som en film
+  (B333, 2026-11-25). Starter projektoren under en app-session, slutter sessionen når
+  projektoren slukkes.
 - **Et Styrbar-tryk rører IKKE cinema-/cirkus-flaget.** Rummet går i Manual,
   og flaget bliver stående.
   - Kun entré L/R "auto" rydder flagene.
@@ -307,9 +310,10 @@ Måler **udetemperaturen** (`sensor.udetemp`), ikke indendørs.
 
 - Under `input_number.winter_heating_season_temp`:
   - Dormant → gardiner til position 20.
-  - Active om aftenen → luk samtidig med sove-gardinets aftenluk
-    (`input_number.sove_gardin_aftenluk_offset_min`), ved hjemkomst i mørke, eller
-    på godnat-knappen hvis den kommer før — aldrig efter godnat (støj)
+  - Active om aftenen → luk når solen er under
+    `input_number.vinter_aftenluk_sol_elevation` (−9,5°, ~45 min efter sove-gardinet),
+    én gang pr. aften, ved hjemkomst i mørke, eller på godnat-knappen hvis den
+    kommer før — aldrig efter godnat (støj)
     (`input_boolean.winter_active_dark_close_enabled`).
 - **Sol-opvarmning** (åbner ved sol på ruden): `input_boolean.winter_solar_enabled`.
 - **Kuldebølge** under `input_number.winter_cold_snap_temp` tvangslukker.

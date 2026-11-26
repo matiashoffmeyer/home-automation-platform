@@ -17,6 +17,14 @@ set -u
 LOG=/tmp/ssh_pakker.log
 exec >>"$LOG" 2>&1
 
+# Claude Code in tmux (user 2026-11-26: sessions survive wifi ↔ mobile): the login hook that
+# hangs on again, and `cca`. The container's /etc and /usr/local are new at every start.
+ln -sf /homeassistant/scripts/claude_tmux_login.sh /etc/profile.d/zz-claude-tmux.sh
+ln -sf /homeassistant/scripts/cca /usr/local/bin/cca
+# cclaude itself (the tmux wrap) is kept here in git; /share/node-global/bin/cclaude is the copy
+# that runs (first in PATH), put back if anything replaced it.
+cmp -s /homeassistant/scripts/cclaude /share/node-global/bin/cclaude || install -m 755 /homeassistant/scripts/cclaude /share/node-global/bin/cclaude
+
 pakker() {
   curl -fsS -H "Authorization: Bearer ${SUPERVISOR_TOKEN:-}" http://supervisor/addons/self/info \
     | jq -r '.data.options.packages[]?'

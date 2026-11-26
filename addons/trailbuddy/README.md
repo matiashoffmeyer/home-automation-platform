@@ -34,6 +34,21 @@ add-on has no host ports; HA reads it on the Docker network as
   (dirt roads drawn as tracks, since 0.6.97; cycleways and pedestrian streets since 0.6.98) for "Satellite + trails". The server fetches them itself and keeps asking while the public
   Overpass servers are busy (up to 6 h), keeps the newest 12 trips' in `trails/`, and the
   phone asks again until it answers `ready` (2026-11-19: Overpass was at capacity for hours).
+- `/api/snap/<trip_code>` (POST `{a, b}`, the route editor since 0.6.138): one leg a → b over
+  hiking trails (BRouter `hiking-mountain` on brouter.de; ≤ 60 km straight, 600 legs an hour,
+  kept per leg) → `{pts: [[lat, lon, ele]], m: {path, track, street, road}}`. `/api/trails` with
+  `kind: "edit"` fetches the editor's map cells (0.1°), kept apart from the trips' trails.
+- `/api/elevate/<trip_code>` (POST `{pts}`, ≤ 2000): Copernicus GLO-30 heights for the edited
+  stretches (`dem.py`, range reads from AWS's open bucket, no key).
+- `/api/closures/<trip_code>` (0.6.147): closed trails and tunnels on a route (`closures.py`).
+  POST `{pts}` (every 25 m, as `/api/hammock`) checks OpenStreetMap's closure tags and, with a
+  `mapy_api_key`, Mapy.com's closures (routing API, ~4 credits per 25 points; kept 3 days);
+  ask again with `{key}` until `ready`. The group's own list: GET, POST `{add, by}` / `{remove}`;
+  the route editor's legs go around what is on it (BRouter nogos). Mapy's closed stretches
+  join the list by themselves. Never copy Mapy's data into OpenStreetMap.
+- `/api/hammock/<trip_code>` (v2 in 0.6.148): tree cover and distances to people along a route
+  (POST `{pts}` every 25 m, then `{key}` until `ready`), and `detours`: woods up to 1 km off
+  where the trail has no trees, with the path there by BRouter, so no night is treeless.
 - `/api/om`, `/api/proxy`: Open-Meteo / Google Sheets / Overpass for the app.
 
 ## Install
@@ -45,6 +60,8 @@ add-on has no host ports; HA reads it on the Docker network as
    - `trip_code`: a word you share with the group, e.g. 2–3 random words.
    - `tailscale_authkey`: see below. Only needed for the first start.
    - `tailscale_hostname`: `trail` (gives `https://trail.<tailnet>.ts.net`).
+   - `mapy_api_key` (optional): a Mapy.com API key for the closure check (developer.mapy.com,
+     free tier 250 000 credits a month). Without it only OpenStreetMap's tags are checked.
 4. Start it. The log prints the public address.
 
 Updating the app later: run `./sync_app.sh` again, bump `version` in `config.yaml`,

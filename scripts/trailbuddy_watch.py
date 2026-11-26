@@ -317,8 +317,12 @@ def main() -> int:
     except Exception as e:  # add-on nede/forkert kode: ankrene står stille, og det ER signalet
         print(f"trailbuddy_watch: {type(e).__name__}", file=sys.stderr)
     try:
-        url = get_json(f"{INTERNAL}/health", 5).get("public_url", "")
+        health = get_json(f"{INTERNAL}/health", 5)
+        url = health.get("public_url", "")
         state["public_url"] = url if url.startswith("https://") else state.get("public_url")
+        # Venne-linket (add-on 0.6.136): læse-adgang uden turkoden, til Parent B og familien.
+        follow = health.get("follow_url", "")
+        state["follow_url"] = follow if follow.startswith("https://") else state.get("follow_url")
     except Exception:
         pass
     plan = server_plan(hiking or {}) if hiking is not None else None
@@ -329,6 +333,7 @@ def main() -> int:
             plan = []
     out = evaluate(state, plan, time.time() * 1000, a.timer, hentet)
     out["public_url"] = state.get("public_url")
+    out["follow_url"] = state.get("follow_url")
     if not a.dry_run and hentet:
         save_state(state)
     print(json.dumps(out, ensure_ascii=False))

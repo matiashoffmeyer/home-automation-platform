@@ -117,7 +117,7 @@ Search keywords: `terrasse`
 
 ### `light.*`
 
-- `light.terrasse_all` — 2 refs in 1 file(s)
+- `light.terrasse_all` — 3 refs in 2 file(s)
 - `light.terrasse_paerelyskaede` — 102 refs in 30 file(s)
 
 ### `script.*`

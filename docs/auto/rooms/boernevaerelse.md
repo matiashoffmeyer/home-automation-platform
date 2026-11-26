@@ -250,10 +250,10 @@ Search keywords: `boernevaerelse, bornevaerelse, boern`
 
 - `light.boernevaerelse_all` — 19 refs in 10 file(s)
 - `light.boernevaerelse_apollo_rgb_light` — 5 refs in 5 file(s)
-- `light.boernevaerelse_hygge_strip` — 98 refs in 33 file(s)
-- `light.boernevaerelse_hyggelys` — 57 refs in 21 file(s)
-- `light.boernevaerelse_lampe` — 46 refs in 21 file(s)
-- `light.boernevaerelse_loft` — 98 refs in 37 file(s)
+- `light.boernevaerelse_hygge_strip` — 99 refs in 34 file(s)
+- `light.boernevaerelse_hyggelys` — 58 refs in 22 file(s)
+- `light.boernevaerelse_lampe` — 47 refs in 22 file(s)
+- `light.boernevaerelse_loft` — 99 refs in 38 file(s)
 
 ### `number.*`
 

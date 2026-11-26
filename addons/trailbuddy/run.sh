@@ -12,7 +12,10 @@
 set -e
 
 export TRIP_CODE="$(bashio::config 'trip_code')"
+# Mapy.com's closures for the route check (server/closures.py); empty = OpenStreetMap only.
+export MAPY_API_KEY="$(bashio::config 'mapy_api_key')"
 export APP_DIR=/app DATA_DIR=/data PORT=8080 LEGACY_PORT=8090
+export EUROPE_DIR=/media/trailbuddy/europe
 HOSTNAME_TS="$(bashio::config 'tailscale_hostname')"
 AUTHKEY="$(bashio::config 'tailscale_authkey')"
 

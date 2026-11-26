@@ -96,7 +96,7 @@ Search keywords: `stue, open_plan`
 ### `binary_sensor.*`
 
 - `binary_sensor.dark_mode_stue` — 20 refs in 8 file(s)
-- `binary_sensor.filmmoerke_stue` — 18 refs in 11 file(s)
+- `binary_sensor.filmmoerke_stue` — 20 refs in 12 file(s)
 - `binary_sensor.godnat_spisestue_sol_under_graense` — 1 refs in 1 file(s)
 - `binary_sensor.mood_pause_stue` — 16 refs in 8 file(s)
 - `binary_sensor.open_plan_empty_for_20m` — 4 refs in 3 file(s)
@@ -165,9 +165,9 @@ Search keywords: `stue, open_plan`
 
 ### `cover.*`
 
-- `cover.gardin_spisestue_vest` — 77 refs in 22 file(s)
-- `cover.gardin_stue_syd` — 78 refs in 23 file(s)
-- `cover.gardin_stue_vest_1` — 67 refs in 22 file(s)
+- `cover.gardin_spisestue_vest` — 74 refs in 22 file(s)
+- `cover.gardin_stue_syd` — 80 refs in 23 file(s)
+- `cover.gardin_stue_vest_1` — 70 refs in 22 file(s)
 
 ### `input_boolean.*`
 
@@ -322,8 +322,8 @@ Search keywords: `stue, open_plan`
 ### `light.*`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
-- `light.spisestue_loft` — 127 refs in 50 file(s)
-- `light.spisestue_pendel` — 141 refs in 41 file(s)
+- `light.spisestue_loft` — 128 refs in 50 file(s)
+- `light.spisestue_pendel` — 142 refs in 42 file(s)
 - `light.stue_all` — 26 refs in 14 file(s)
 - `light.stue_apollo_rgb_light` — 5 refs in 3 file(s)
 - `light.stue_hjoernelampe` — 59 refs in 27 file(s)
@@ -331,7 +331,7 @@ Search keywords: `stue, open_plan`
 - `light.stue_laesehygge` — 88 refs in 38 file(s)
 - `light.stue_loft` — 2 refs in 2 file(s)
 - `light.stue_plug` — 77 refs in 27 file(s)
-- `light.stue_room` — 21 refs in 14 file(s)
+- `light.stue_room` — 22 refs in 15 file(s)
 - `light.stue_sofa_lampe` — 56 refs in 26 file(s)
 - `light.stue_spot_1` — 41 refs in 17 file(s)
 - `light.stue_spot_2` — 41 refs in 17 file(s)

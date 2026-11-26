@@ -61,7 +61,7 @@ Search keywords: `spisestue`
 
 ### `cover.*`
 
-- `cover.gardin_spisestue_vest` — 77 refs in 22 file(s)
+- `cover.gardin_spisestue_vest` — 74 refs in 22 file(s)
 
 ### `input_boolean.*`
 
@@ -126,8 +126,8 @@ Search keywords: `spisestue`
 ### `light.*`
 
 - `light.spisestue_apollo_rgb_light` — 2 refs in 2 file(s)
-- `light.spisestue_loft` — 127 refs in 50 file(s)
-- `light.spisestue_pendel` — 141 refs in 41 file(s)
+- `light.spisestue_loft` — 128 refs in 50 file(s)
+- `light.spisestue_pendel` — 142 refs in 42 file(s)
 
 ### `number.*`
 

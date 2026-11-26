@@ -152,6 +152,12 @@ async def send_push(ws, mid, titel, tekst, rid):
                 "tag": TAG,
                 "priority": "high",
                 "ttl": 0,
+                # Bliver til den er besvaret (user 2026-11-26: "the notification
+                # disappears when i tap it. make it persist until answered"):
+                # sticky = et tryk på selve boblen fjerner den ikke, persistent =
+                # kan ikke swipes væk. clear_notification i runde() fjerner den.
+                "sticky": "true",
+                "persistent": True,
                 "actions": [
                     {"action": f"CLAUDE_GODKEND_{rid}", "title": "Godkend"},
                     {"action": f"CLAUDE_AFVIS_{rid}", "title": "Afvis"},

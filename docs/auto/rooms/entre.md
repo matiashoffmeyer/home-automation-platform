@@ -120,7 +120,7 @@ Search keywords: `entre`
 
 ### `light.*`
 
-- `light.entre_all` — 11 refs in 6 file(s)
+- `light.entre_all` — 12 refs in 7 file(s)
 - `light.entre_loft` — 83 refs in 35 file(s)
 - `light.entre_loft_tradfri_udgaaet` — 1 refs in 1 file(s)
 

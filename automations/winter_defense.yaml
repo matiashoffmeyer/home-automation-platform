@@ -160,11 +160,9 @@
 # det er rigtig mørkt udenfor (slider bestemmer sol-vinkel — genbrug den
 # eksisterende) — så beskytter vi mod kuldestrøm ved gulvet."
 #
-# SOL-VINKEL GENBRUGT: binary_sensor.natlys_sol_under_graense (sol <
-#   input_number.natlys_sol_elevation, default -6° = civil tusmørke-slut =
-#   genuint mørkt) — samme slider som natlys/auto-tænd. Ingen egen slider.
-#   (natlys-signalet er REN sol-position, aldrig lux → fyrer IKKE på en mørk
-#   stormfuld dag, kun når solen faktisk er nede = "rigtig mørkt".)
+# SOL-VINKEL: input_number.vinter_aftenluk_sol_elevation (−9,5°, 2026-11-26 —
+#   før genbrugtes natlys-vinklen −4°, og user ville have 45 min mere mørke).
+#   REN sol-position, aldrig lux → fyrer IKKE på en mørk stormfuld dag.
 #
 # LUK-POSITION (user-valg): helt lukket (0) for max luft-lomme mod ruden —
 #   UNDTAGEN stue-vest (position 20 = 80% luk) fordi der står noget under den
@@ -176,11 +174,11 @@
 #   morgen-rutinerne (open-plan: morning_curtains; sove/boern: wakeup) → ingen
 #   reopen-automation her (spejler Dormant-close, som house_state_to_active åbner).
 #
-# EDGE-triggers (ingen periodisk backstop = ingen morgen-fight): sove-aftenluk-
-#   flanken (2026-11-05, samme tid som soveværelset) + hjemkomst-i-mørke
-#   (house_state→Active, kun før godnat; rører ikke gardiner Dormant har lukket)
-#   + godnat-knappen (også når prognosen siger koldt i nat). Kulde-flanken er
-#   fjernet: den fyrede kun på met.no-recovery midt om natten (støj).
+# EDGE-triggers (ingen periodisk backstop = ingen morgen-fight): solen under
+#   sliderens vinkel (2026-11-26; før sove-aftenluk-flanken) + ankerets egen
+#   flanke (kulden kommer efter mørket) — højst én af dem pr. aften + hjemkomst-
+#   i-mørke (house_state→Active, kun før godnat; rører ikke gardiner Dormant har
+#   lukket) + godnat-knappen (også når prognosen siger koldt i nat, og før mørket).
 # unavailable udetemp → numeric-condition false = ingen luk (#9). Manuelt åbnede
 #   gardiner respekteres via gardiner_manual_hold (samme reject-mønster som solar).
 # AirBnB: kører IKKE (user-valg 2026-10-04, B123 — kun sove-aftenluk lukker i
@@ -190,11 +188,11 @@
 - id: winter_active_dark_close
   alias: "Vinter: Luk gardiner ved mørkt+koldt (Active)"
   description: >
-    Active + aften (sove-aftenluk-vinduet eller sol < natlys_sol_elevation) +
-    koldt UDE (sensor.udetemp < winter_heating_season_temp) → luk gardiner
-    (stue-vest 80%, resten helt) mod gulv-kuldestrøm. Lukker samtidig med
-    sove-gardinet eller på godnat-knappen hvis den kommer før — aldrig senere
-    om natten (støj, user-spec 2026-11-05).
+    Active + koldt UDE (vinter_aftenluk_gaeldende) + sol under
+    vinter_aftenluk_sol_elevation (−9,5°) → luk gardiner (stue-vest 80%, resten
+    helt) mod gulv-kuldestrøm. Én gang pr. aften (et tryk op bagefter
+    respekteres), eller på godnat-knappen hvis den kommer før — aldrig efter
+    godnat (støj, user-spec 2026-11-05).
   mode: single
   trigger:
     # 2026-11-05 (user-spec): "winter gardiner om natten larmer når de kører
@@ -205,10 +203,16 @@
     # fyrede kun på met.no's recovery fra unavailable, og det skete midt om
     # natten (3/11 21:29, 4/11 22:35). udetemp har nu DMI-reserve, så skumrings-
     # tjekket ikke længere falder i et hul.
-    - platform: state
-      entity_id: binary_sensor.sove_gardin_aftenluk_vindue
-      from: "off"
-      to: "on"
+    # 2026-11-26 (user-spec): "gardinerne som kører ned om aftenen skal vente
+    # på at det bliver 45min mørkere end det var da den prøvede i dag" — i dag
+    # lukkede den 16:16 (natlys −4°) og igen 16:18 på sove-vinduet, 16 s efter
+    # et RODRET-op. Sove-vinduet er ikke længere en trigger (det lukker kun
+    # sove-gardinet); mørket er solen under sin EGEN slider (natlys styrer lys).
+    - platform: template
+      value_template: >-
+        {{ state_attr('sun.sun', 'rising') == false
+           and state_attr('sun.sun', 'elevation') | float(90)
+               <= states('input_number.vinter_aftenluk_sol_elevation') | float(-9.5) }}
       id: aften
     # 21/11: kulden kom EFTER vinduet (udetemp 5,2 → 4,2 kl. 16:46, vinduet åbnede
     # 16:24) → ankeret gik on uden en trigger, og stue syd stod oppe hele aftenen
@@ -258,14 +262,22 @@
           entity_id: input_boolean.godnat_voksne_active
           state: "off"
     # Aften + koldt + skumrings-fase bor i ÉT anker (packages/vinter_aftenluk.yaml),
-    # som hjemkomstens gardin-åbning også læser (#2). Godnat-trykket må lukke
-    # uden ankeret: aften (vindue/natlys) + 12-04 (`rising` vender ved
-    # sol-midnat ~00:45) — om det bliver koldt i nat afgøres i action'en.
+    # som hjemkomstens gardin-åbning også læser (#2) — det går on ved skumring,
+    # så hjemkomsten ikke ruller op; selve lukket venter på mørket (26/11).
+    # Godnat-trykket må lukke uden ankeret og før mørket: aften (vindue/natlys)
+    # + 12-04 (`rising` vender ved sol-midnat ~00:45) — om det bliver koldt i
+    # nat afgøres i action'en.
     - condition: or
       conditions:
-        - condition: state
-          entity_id: binary_sensor.vinter_aftenluk_gaeldende
-          state: "on"
+        - condition: and
+          conditions:
+            - condition: state
+              entity_id: binary_sensor.vinter_aftenluk_gaeldende
+              state: "on"
+            - condition: template
+              value_template: >-
+                {{ state_attr('sun.sun', 'elevation') | float(90)
+                   <= states('input_number.vinter_aftenluk_sol_elevation') | float(-9.5) }}
         - condition: and
           conditions:
             - condition: trigger
@@ -275,6 +287,17 @@
                 {{ (is_state('binary_sensor.sove_gardin_aftenluk_vindue', 'on')
                     or is_state('binary_sensor.natlys_sol_under_graense', 'on'))
                    and (now().hour >= 12 or now().hour < 4) }}
+    # Én aften-lukning pr. aften (26/11: lukket 16:16, op med RODRET 16:17:44,
+    # ned igen 16:18 på næste aften-flanke). Ankeret kan flimre om aftenen
+    # (udetemp om tærsklen) — et tryk op bagefter skal stå. last_triggered er
+    # forrige kørsel (sættes først når conditions er bestået); hjem/godnat er
+    # nye hændelser og må altid.
+    - condition: template
+      value_template: >-
+        {% set tid = trigger.id if trigger is defined and trigger.id is defined else '' %}
+        {% set lt = this.attributes.last_triggered | default(none) %}
+        {{ tid != 'aften' or lt is none
+           or as_timestamp(now()) - as_timestamp(lt, 0) > 8 * 3600 }}
   action:
     # Helt lukket (0) undtagen stue-vest (20 = 80%, noget står under den).
     # Manuelt-ned-holdte gardiner springes over (gardiner_manual_hold — den
@@ -362,7 +385,7 @@
       data:
         title: "Vinter-forsvar: mørkt+koldt luk (Active)"
         message: >
-          Rigtig mørkt ude (sol < {{ states('input_number.natlys_sol_elevation') }}°)
+          Rigtig mørkt ude (sol < {{ states('input_number.vinter_aftenluk_sol_elevation') }}°)
           + koldt ({{ states('sensor.udetemp') }}°C) → gardiner lukket mod
           gulv-kuldestrøm. Stue-vest 80% (noget står under), resten helt.
 

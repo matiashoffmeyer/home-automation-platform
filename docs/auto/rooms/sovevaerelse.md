@@ -138,7 +138,7 @@ Search keywords: `sovevaerelse, sove`
 ### `binary_sensor.*`
 
 - `binary_sensor.dark_mode_sove` — 3 refs in 3 file(s)
-- `binary_sensor.filmmoerke_sove` — 14 refs in 7 file(s)
+- `binary_sensor.filmmoerke_sove` — 16 refs in 8 file(s)
 - `binary_sensor.mood_pause_sovevaerelse` — 3 refs in 2 file(s)
 - `binary_sensor.parasoll_sovedoer` — 22 refs in 7 file(s)
 - `binary_sensor.sove_aften_laasevindue` — 2 refs in 2 file(s)
@@ -149,7 +149,7 @@ Search keywords: `sovevaerelse, sove`
 - `binary_sensor.sove_bevaegelse_bevist` — 3 refs in 2 file(s)
 - `binary_sensor.sove_doer_moerkhold` — 7 refs in 4 file(s)
 - `binary_sensor.sove_efterslaeb_efter_afgang` — 6 refs in 4 file(s)
-- `binary_sensor.sove_gardin_aftenluk_vindue` — 8 refs in 5 file(s)
+- `binary_sensor.sove_gardin_aftenluk_vindue` — 7 refs in 5 file(s)
 - `binary_sensor.sove_gardin_bad_klar` — 13 refs in 4 file(s)
 - `binary_sensor.sove_moerke_godnat_kandidat` — 2 refs in 1 file(s)
 - `binary_sensor.sove_morgen_moerklagt` — 7 refs in 5 file(s)
@@ -188,13 +188,13 @@ Search keywords: `sovevaerelse, sove`
 
 ### `cover.*`
 
-- `cover.gardin_sovevaerelse` — 99 refs in 25 file(s)
+- `cover.gardin_sovevaerelse` — 103 refs in 25 file(s)
 
 ### `input_boolean.*`
 
 - `input_boolean.airbnb_velkomst_move_sove` — 3 refs in 2 file(s)
 - `input_boolean.boernevaerelse_gaest_sover` — 21 refs in 8 file(s)
-- `input_boolean.dark_mode_kun_sove` — 9 refs in 3 file(s)
+- `input_boolean.dark_mode_kun_sove` — 10 refs in 3 file(s)
 - `input_boolean.notif_sove_radar_airbnb` — 1 refs in 1 file(s)
 - `input_boolean.notif_sove_radar_parent_b` — 1 refs in 1 file(s)
 - `input_boolean.notif_sove_radar_enabled` — 1 refs in 1 file(s)
@@ -209,7 +209,7 @@ Search keywords: `sovevaerelse, sove`
 - `input_boolean.sove_gardin_bad_foerste_besoeg_ovre` — 13 refs in 4 file(s)
 - `input_boolean.sove_gardin_op_afventer` — 8 refs in 2 file(s)
 - `input_boolean.sove_lyskaede_enabled` — 6 refs in 3 file(s)
-- `input_boolean.sove_lyskaede_manuel_slukket` — 8 refs in 2 file(s)
+- `input_boolean.sove_lyskaede_manuel_slukket` — 9 refs in 3 file(s)
 - `input_boolean.sove_morgen_anden_krop` — 5 refs in 2 file(s)
 - `input_boolean.sove_radar_watchdog_enabled` — 2 refs in 2 file(s)
 - `input_boolean.sove_retur_enabled` — 2 refs in 2 file(s)
@@ -330,10 +330,10 @@ Search keywords: `sovevaerelse, sove`
 
 ### `light.*`
 
-- `light.sove_lyskaede` — 25 refs in 11 file(s)
+- `light.sove_lyskaede` — 26 refs in 12 file(s)
 - `light.sovevaerelse_all` — 17 refs in 9 file(s)
-- `light.sovevaerelse_apollo_rgb_light` — 15 refs in 9 file(s)
-- `light.sovevaerelse_loft` — 14 refs in 9 file(s)
+- `light.sovevaerelse_apollo_rgb_light` — 16 refs in 10 file(s)
+- `light.sovevaerelse_loft` — 15 refs in 10 file(s)
 
 ### `number.*`
 

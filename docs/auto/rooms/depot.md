@@ -79,7 +79,7 @@ Search keywords: `depot`
 
 ### `light.*`
 
-- `light.depot_all` — 27 refs in 11 file(s)
+- `light.depot_all` — 28 refs in 12 file(s)
 - `light.depot_loft` — 22 refs in 15 file(s)
 - `light.depot_loft_hue_1` — 12 refs in 10 file(s)
 - `light.depot_loft_hue_2` — 12 refs in 10 file(s)

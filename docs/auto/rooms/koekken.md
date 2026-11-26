@@ -243,7 +243,7 @@ Search keywords: `koekken, kokken`
 
 - `light.koekken_apollo_rgb_light` — 13 refs in 5 file(s)
 - `light.koekken_loft` — 2 refs in 2 file(s)
-- `light.koekken_lyskaede` — 195 refs in 46 file(s)
+- `light.koekken_lyskaede` — 196 refs in 47 file(s)
 - `light.koekken_room` — 11 refs in 8 file(s)
 
 ### `number.*`
@@ -355,7 +355,7 @@ Search keywords: `koekken, kokken`
 - `switch.koekken_apollo_ld2410_bluetooth` — 1 refs in 1 file(s)
 - `switch.koekken_apollo_radar_engineering_mode` — 1 refs in 1 file(s)
 - `switch.koekken_opvasker_power` — 1 refs in 1 file(s)
-- `switch.koekken_spots` — 46 refs in 19 file(s)
+- `switch.koekken_spots` — 47 refs in 20 file(s)
 - `switch.thread_router_koekken` — 5 refs in 3 file(s)
 
 ### `timer.*`

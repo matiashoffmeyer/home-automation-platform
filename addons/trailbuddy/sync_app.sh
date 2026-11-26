@@ -28,6 +28,6 @@ rm -rf "$HERE/app"; mkdir -p "$HERE/app"
 for f in index.html reset.html reset.js move sw.js manifest.webmanifest css js vendor data icons tiles watch; do
   cp -R "$REPO/$f" "$HERE/app/"
 done
-cp "$REPO/server/trailbuddy_server.py" "$REPO/server/trees.py" "$HERE/"
+cp "$REPO/server/trailbuddy_server.py" "$REPO/server/trees.py" "$REPO/server/dem.py" "$REPO/server/closures.py" "$HERE/"
 echo "Synced app $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?') into $HERE/app ($(du -sh "$HERE/app" | cut -f1))"
 if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
